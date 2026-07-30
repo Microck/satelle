@@ -38,6 +38,7 @@ impl CommandGroupBuilder<'_, tokio::process::Command> {
             });
         }
 
+        self.command.kill_on_drop(self.kill_on_drop);
         self.command.spawn().map(AsyncGroupChild::new)
     }
 }

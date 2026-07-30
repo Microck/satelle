@@ -1653,6 +1653,7 @@ impl HostService {
             },
             bootstrap_auth: None,
             bootstrap_maintenance: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            doctor_tasks: crate::DoctorTaskRegistry::new(),
         })
     }
 
@@ -1678,6 +1679,7 @@ impl HostService {
             },
             bootstrap_auth: None,
             bootstrap_maintenance: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            doctor_tasks: crate::DoctorTaskRegistry::new(),
         })
     }
 
@@ -1729,6 +1731,7 @@ impl HostService {
             },
             bootstrap_auth: None,
             bootstrap_maintenance: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            doctor_tasks: crate::DoctorTaskRegistry::new(),
         })
     }
 

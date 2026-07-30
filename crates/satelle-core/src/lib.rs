@@ -17,6 +17,7 @@ pub mod control_plane;
 pub mod daemon_service;
 #[path = "direct-host-binding.rs"]
 mod direct_host_binding;
+pub mod doctor;
 mod events;
 pub mod ids;
 mod profiles;
@@ -3777,6 +3778,7 @@ fn edit_distance(left: &str, right: &str) -> usize {
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorCode {
     InvalidUsage,
+    ScopeSelectionConflict,
     PromptSourceConflict,
     CompletionInstallFailed,
     CompletionProfileUpdateFailed,
@@ -3873,6 +3875,7 @@ impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidUsage => "invalid-usage",
+            Self::ScopeSelectionConflict => "scope-selection-conflict",
             Self::PromptSourceConflict => "prompt-source-conflict",
             Self::CompletionInstallFailed => "completion-install-failed",
             Self::CompletionProfileUpdateFailed => "completion-profile-update-failed",
@@ -3975,6 +3978,7 @@ impl ErrorCode {
     pub fn exit_code(self) -> i32 {
         match self {
             Self::InvalidUsage
+            | Self::ScopeSelectionConflict
             | Self::PromptSourceConflict
             | Self::IdempotencyKeyConflict
             | Self::EventsWithDetach
@@ -5090,6 +5094,21 @@ impl SatelleError {
         }
     }
 
+    pub fn scope_selection_conflict(scopes: &[String]) -> Self {
+        Self {
+            code: ErrorCode::ScopeSelectionConflict,
+            message: "doctor scope 'all' cannot be combined with another scope".to_string(),
+            recovery_command: Some(
+                "choose either --scope all or one or more specific --scope values".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "scopes".to_string(),
+                Value::Array(scopes.iter().cloned().map(Value::String).collect()),
+            )]),
+        }
+    }
+
     pub fn doctor_refresh_scope_required() -> Self {
         Self {
             code: ErrorCode::DoctorRefreshScopeRequired,
@@ -6055,6 +6074,40 @@ pub struct DoctorFinding {
     pub recovery_command: Option<String>,
 }
 
+/// One transport observation produced at the selected CLI transport boundary.
+///
+/// The Host scheduler consumes this typed result instead of assuming that a
+/// transport is unavailable or re-running provider-specific transport logic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoctorTransportObservation {
+    ready: bool,
+    finding: Option<DoctorFinding>,
+}
+
+impl DoctorTransportObservation {
+    pub fn ready(finding: Option<DoctorFinding>) -> Self {
+        Self {
+            ready: true,
+            finding,
+        }
+    }
+
+    pub fn blocked(finding: DoctorFinding) -> Self {
+        Self {
+            ready: false,
+            finding: Some(finding),
+        }
+    }
+
+    pub const fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub const fn finding(&self) -> Option<&DoctorFinding> {
+        self.finding.as_ref()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DoctorFixability {
@@ -6088,18 +6141,35 @@ pub enum DoctorSchemaVersion {
     V1,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DoctorOptions {
     refresh: bool,
     probe_timeout: Option<std::time::Duration>,
+    serial_probes: bool,
 }
 
 impl DoctorOptions {
-    pub const fn new(refresh: bool, probe_timeout: Option<std::time::Duration>) -> Self {
-        Self {
+    pub const DEFAULT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    pub fn new(
+        refresh: bool,
+        probe_timeout: Option<std::time::Duration>,
+    ) -> Result<Self, SatelleError> {
+        if probe_timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(SatelleError::invalid_usage(
+                "duration must use a positive number",
+            ));
+        }
+        Ok(Self {
             refresh,
             probe_timeout,
-        }
+            serial_probes: false,
+        })
+    }
+
+    pub const fn with_serial_probes(mut self, serial_probes: bool) -> Self {
+        self.serial_probes = serial_probes;
+        self
     }
 
     pub const fn refresh(self) -> bool {
@@ -6109,11 +6179,29 @@ impl DoctorOptions {
     pub const fn probe_timeout(self) -> Option<std::time::Duration> {
         self.probe_timeout
     }
+
+    pub const fn effective_probe_timeout(self) -> std::time::Duration {
+        match self.probe_timeout {
+            Some(timeout) => timeout,
+            None => Self::DEFAULT_PROBE_TIMEOUT,
+        }
+    }
+
+    pub const fn serial_probes(self) -> bool {
+        self.serial_probes
+    }
 }
 
-impl Default for DoctorOptions {
-    fn default() -> Self {
-        Self::new(false, None)
+#[cfg(test)]
+mod doctor_options_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_zero_probe_timeout_is_a_typed_usage_error() {
+        let error = DoctorOptions::new(false, Some(std::time::Duration::ZERO))
+            .expect_err("explicit zero must not reach scheduler construction");
+        assert_eq!(error.code, ErrorCode::InvalidUsage);
+        assert_eq!(error.message, "duration must use a positive number");
     }
 }
 
@@ -6129,6 +6217,10 @@ pub struct DoctorReport {
     pub duration_ms: u64,
     pub summary: DoctorSummary,
     pub probe_results: Vec<DoctorProbeResult>,
+    /// Scheduler lifecycle order for event projection. This derived runtime
+    /// state is not part of the stable final Doctor JSON contract.
+    #[serde(skip)]
+    pub probe_schedule_events: Box<[doctor::DoctorProbeScheduleEvent]>,
     pub ready: bool,
     pub findings: Vec<DoctorFinding>,
     pub recovery_commands: Vec<String>,
@@ -6157,11 +6249,29 @@ pub struct DoctorProbeResult {
     pub finding_ids: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DoctorEventSchemaVersion {
+    #[serde(rename = "satelle.doctor.events.v1")]
+    V1,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorEventType {
+    DoctorStarted,
+    ProbeStarted,
+    ProbeFinished,
+    FindingReported,
+    CacheUpdated,
+    DoctorFinished,
+    DoctorFailed,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DoctorEventRecord {
-    pub schema_version: String,
+    pub schema_version: DoctorEventSchemaVersion,
     pub event_id: String,
-    pub event_type: String,
+    pub event_type: DoctorEventType,
     pub target: String,
     pub scope: String,
     pub probe_id: Option<String>,

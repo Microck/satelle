@@ -16,7 +16,7 @@ license = "MIT"
 
 [workspace.dependencies]
 base64 = "0.22.1"
-command-group = "5.0.1"
+command-group = { version = "5.0.1", features = ["with-tokio"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 clap = { version = "4.5.52", features = ["derive", "env"] }
 clap_complete = "4.6.7"
@@ -36,7 +36,7 @@ reqwest = { version = "0.13.4", default-features = false, features = ["blocking"
 rmcp = { version = "=2.2.0", default-features = false, features = ["server"] }
 rustls = "0.23.41"
 rustls-platform-verifier = "0.7.0"
-rustix = { version = "1.1.4", features = ["fs", "process"] }
+rustix = { version = "1.1.4", features = ["fs", "process", "pty", "termios"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.11.0"

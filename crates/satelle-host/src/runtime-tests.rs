@@ -1559,8 +1559,14 @@ fn setup_provider_binding_failure_occurs_after_returned_native_evidence() {
     let native = runtime
         .refresh_setup_native_readiness(LOCAL_DEMO_HOST, &intent)
         .expect("the explicit native phase completes before provider authorization");
+    let cancellation = crate::AdmissionCancellation::new();
     let error = runtime
-        .refresh_setup_provider_readiness(LOCAL_DEMO_HOST, &intent, native)
+        .refresh_setup_provider_readiness_with_cancellation(
+            LOCAL_DEMO_HOST,
+            &intent,
+            native,
+            &cancellation,
+        )
         .expect_err("the missing provider binding fails only in the provider phase");
 
     assert_eq!(error.code, ErrorCode::ModelProviderBindingMissing);

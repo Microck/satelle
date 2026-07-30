@@ -31,24 +31,27 @@ use satelle_core::daemon_service::WindowsServiceConfigV1;
 use satelle_core::daemon_service::{
     DaemonServicePlatform, PersistentServiceDecision, SetupModeSelection, SetupModeSource,
 };
+use satelle_core::doctor::{DoctorScopeSelection, DoctorScopeSelectionError};
 use satelle_core::session::{
     EffectiveModelRef, HostIdentityRef, ProviderBindingRef, PublicSession, PublicTurn,
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
 };
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
-    DoctorEventRecord, DoctorFixability, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode,
-    EventSource, EventType, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, MutationCommandFamily,
-    OwnerOnlyDirectory, PRODUCT_NAME, ProfileField, ProfileSelectionSource, ProviderSecretSource,
-    RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
-    SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
-    SetupSchemaVersion, SetupVerification, load_config, load_config_for_profile,
-    load_config_without_profile, load_user_api_rate_limits, open_or_create_owner_only_directory,
-    open_or_create_owner_only_file, open_owner_only_directory, read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
+    DoctorEventRecord, DoctorEventSchemaVersion, DoctorEventType, DoctorFixability, DoctorOptions,
+    DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig, HostSessionsReport,
+    LOCAL_DEMO_HOST, MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
+    ProfileSelectionSource, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN,
+    SatelleError, SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode,
+    SetupReadinessSummary, SetupReport, SetupRequiredInput, SetupSchemaVersion, SetupVerification,
+    load_config, load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_desktop_session,
+    resolve_path_set, utc_now,
 };
 use satelle_host::{
-    ApiBearerToken, HostService, ProviderComputerUseIntent, contains_api_bearer_token,
+    ApiBearerToken, DoctorExecutionFailure, DoctorExecutionResult, HostService,
+    ProviderComputerUseIntent, contains_api_bearer_token,
 };
 use satelle_transport::{
     DaemonServer, DaemonServerConfig, DaemonServerError, DaemonTlsConfig, DaemonTlsConfigError,
@@ -65,7 +68,9 @@ use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tailscale::transport_doctor_report;
+use tailscale::{
+    execute_transport_only_doctor, prepare_transport_only_doctor, transport_doctor_probe,
+};
 use transport::{
     AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, authenticated_ssh_bootstrap_user,
     discover_direct_host_identity, discover_ssh_host, transport_for, transport_for_setup,
@@ -331,7 +336,7 @@ struct DoctorCommand {
     #[arg(long)]
     host: Option<String>,
     #[arg(long)]
-    scope: Option<String>,
+    scope: Vec<String>,
     #[arg(long)]
     refresh: bool,
     #[arg(long)]
@@ -797,6 +802,7 @@ enum EventMode {
 struct CliFailure {
     error: SatelleError,
     history_session_id: Option<Box<SessionId>>,
+    error_reported: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -855,7 +861,9 @@ fn main() -> ExitCode {
     match try_main(cli, error_format) {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            print_error(&failure.error, error_format);
+            if !failure.error_reported {
+                print_error(&failure.error, error_format);
+            }
             process_exit_code(&failure.error)
         }
     }
@@ -4080,15 +4088,7 @@ fn run_doctor(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let target_hint = command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST);
-    if let Err(failure) = validate_doctor_scope(command.scope.as_deref()) {
-        return fail_doctor(
-            failure,
-            command.events,
-            target_hint,
-            command.scope.as_deref(),
-        );
-    }
+    let scope_selection = validate_doctor_scope(&command.scope)?;
     let timeout = match command
         .timeout
         .as_deref()
@@ -4096,102 +4096,85 @@ fn run_doctor(
         .transpose()
     {
         Ok(timeout) => timeout.map(std::time::Duration::from_millis),
-        Err(error) => {
-            return fail_doctor(
-                failure(error),
-                command.events,
-                target_hint,
-                command.scope.as_deref(),
-            );
-        }
+        Err(error) => return Err(failure(error)),
     };
-    if timeout.is_some()
-        && (!command.refresh || !doctor_scope_supports_refresh(command.scope.as_deref()))
-    {
-        return fail_doctor(
-            failure(SatelleError::doctor_refresh_timeout_without_refresh()),
-            command.events,
-            target_hint,
-            command.scope.as_deref(),
-        );
+    if timeout.is_some() && (!command.refresh || !scope_selection.supports_refresh()) {
+        return Err(failure(
+            SatelleError::doctor_refresh_timeout_without_refresh(),
+        ));
     }
-    if command.refresh && !doctor_scope_supports_refresh(command.scope.as_deref()) {
-        return fail_doctor(
-            failure(SatelleError::doctor_refresh_scope_required()),
-            command.events,
-            target_hint,
-            command.scope.as_deref(),
-        );
+    if command.refresh && !scope_selection.supports_refresh() {
+        return Err(failure(SatelleError::doctor_refresh_scope_required()));
     }
 
-    let resolved_config = match config.load() {
-        Ok(config) => config,
-        Err(failure) => {
-            return fail_doctor(
-                failure,
-                command.events,
-                target_hint,
-                command.scope.as_deref(),
-            );
+    let resolved_config = config.load()?;
+    let host = SelectedHost::from(
+        resolved_config
+            .resolve_host(command.host.as_deref())
+            .map_err(failure)?,
+    );
+    let options = DoctorOptions::new(command.refresh, timeout)
+        .map_err(failure)?
+        .with_serial_probes(command.serial_probes);
+    let transport_probe = transport_doctor_probe(&scope_selection, &host.config);
+    let transport_only =
+        prepare_transport_only_doctor(&host.config, &scope_selection, options).map_err(failure)?;
+    if let Some(prepared) = transport_only {
+        if command.events {
+            print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
         }
-    };
-    let host = match resolved_config.resolve_host(command.host.as_deref()) {
-        Ok(resolved) => SelectedHost::from(resolved),
-        Err(error) => {
-            return fail_doctor(
-                failure(error),
-                command.events,
-                target_hint,
-                command.scope.as_deref(),
-            );
-        }
-    };
-    if command.scope.as_deref() == Some("transport")
-        && let Some(report) = transport_doctor_report(&host.alias, &host.config)
-    {
-        return emit_doctor_report(report, command.events, json);
+        let outcome = execute_transport_only_doctor(
+            &host.alias,
+            &scope_selection,
+            &transport_probe,
+            prepared,
+        )
+        .map_err(DoctorExecutionFailure::from);
+        return finish_doctor_outcome(outcome, command.events, json, &host.alias, &scope_selection);
     }
-    let transport = match transport_for(&host) {
-        Ok(transport) => transport,
-        Err(failure) => {
-            return fail_doctor(
-                failure,
-                command.events,
-                &host.alias,
-                command.scope.as_deref(),
-            );
-        }
-    };
-    let options = DoctorOptions::new(command.refresh, timeout);
-    let provider_intent = match doctor_provider_intent(
+    let transport = transport_for(&host)?;
+    let provider_intent = doctor_provider_intent(
         resolved_config,
         &host.config,
         command.refresh,
         options.probe_timeout(),
-    ) {
-        Ok(intent) => intent,
-        Err(error) => {
-            return fail_doctor(
-                failure(error),
-                command.events,
-                &host.alias,
-                command.scope.as_deref(),
-            );
-        }
-    };
-    let report = match transport.doctor(command.scope.as_deref(), options, &provider_intent) {
-        Ok(report) => report,
-        Err(error) => {
-            return fail_doctor(
-                failure(error),
-                command.events,
-                &host.alias,
-                command.scope.as_deref(),
-            );
-        }
-    };
+    )
+    .map_err(failure)?;
+    if command.events {
+        print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
+    }
+    let outcome = transport.doctor(
+        &scope_selection,
+        Arc::new(transport_probe),
+        options,
+        &provider_intent,
+    );
 
-    emit_doctor_report(report, command.events, json)
+    finish_doctor_outcome(outcome, command.events, json, &host.alias, &scope_selection)
+}
+
+fn finish_doctor_outcome(
+    outcome: DoctorExecutionResult,
+    events: bool,
+    json: bool,
+    target: &str,
+    scope_selection: &DoctorScopeSelection,
+) -> Result<(), CliFailure> {
+    match outcome {
+        Ok(report) => emit_doctor_report(report, events, json),
+        Err(failed) if events => {
+            print_doctor_failed_event(
+                target,
+                scope_selection,
+                2,
+                &failed.error,
+                &failed.partial_probe_results,
+            )
+            .map_err(failure)?;
+            Err(reported_failure(failed.error))
+        }
+        Err(failed) => Err(failure(failed.error)),
+    }
 }
 
 fn emit_doctor_report(report: DoctorReport, events: bool, json: bool) -> Result<(), CliFailure> {
@@ -4206,7 +4189,7 @@ fn emit_doctor_report(report: DoctorReport, events: bool, json: bool) -> Result<
     if events {
         print_doctor_events(&report, readiness_error.as_ref()).map_err(failure)?;
         if let Some(error) = readiness_error {
-            return Err(failure(error));
+            return Err(reported_failure(error));
         }
         Ok(())
     } else if json {
@@ -4236,47 +4219,19 @@ fn emit_doctor_report(report: DoctorReport, events: bool, json: bool) -> Result<
     }
 }
 
-fn fail_doctor(
-    failure: CliFailure,
-    events: bool,
-    target: &str,
-    scope: Option<&str>,
-) -> Result<(), CliFailure> {
-    if events {
-        print_doctor_failed_event(target, scope, &failure.error).map_err(|error| CliFailure {
-            error,
-            history_session_id: None,
-        })?;
-    }
-
-    Err(failure)
-}
-
-fn validate_doctor_scope(scope: Option<&str>) -> Result<(), CliFailure> {
-    let Some(scope) = scope else {
-        return Ok(());
-    };
-
-    if [
-        "transport",
-        "codex",
-        "computer-use",
-        "provider",
-        "config",
-        "all",
-    ]
-    .contains(&scope)
-    {
-        return Ok(());
-    }
-
-    Err(failure(SatelleError::invalid_usage(format!(
-        "unsupported doctor scope '{scope}'; expected transport, codex, computer-use, provider, config, or all"
-    ))))
-}
-
-fn doctor_scope_supports_refresh(scope: Option<&str>) -> bool {
-    matches!(scope, None | Some("computer-use" | "provider" | "all"))
+fn validate_doctor_scope(scopes: &[String]) -> Result<DoctorScopeSelection, CliFailure> {
+    DoctorScopeSelection::parse(scopes).map_err(|error| {
+        failure(match error {
+            DoctorScopeSelectionError::UnsupportedScope(scope) => SatelleError::invalid_usage(
+                format!(
+                    "unsupported doctor scope '{scope}'; expected transport, codex, computer-use, provider, config, or all"
+                ),
+            ),
+            DoctorScopeSelectionError::AllWithSpecificScopes(scopes) => {
+                SatelleError::scope_selection_conflict(&scopes)
+            }
+        })
+    })
 }
 
 fn parse_duration_ms(value: &str) -> Result<u64, SatelleError> {
@@ -4319,43 +4274,76 @@ fn print_doctor_events(
     report: &DoctorReport,
     terminal_error: Option<&SatelleError>,
 ) -> Result<(), SatelleError> {
-    let mut seq = 1_u64;
-    let mut records = Vec::new();
-    records.push(doctor_event(
-        &mut seq,
-        "doctor_started",
-        report,
-        "all",
-        None,
-        "running",
-        json!({"scopes": report.scopes}),
-    ));
+    for record in doctor_event_records(report, terminal_error) {
+        println!(
+            "{}",
+            serde_json::to_string(&record).map_err(|source| SatelleError {
+                code: ErrorCode::InvalidUsage,
+                message: "could not serialize doctor event".to_string(),
+                recovery_command: None,
+                source_detail: Some(source.to_string()),
+                details: std::collections::BTreeMap::new(),
+            })?
+        );
+    }
 
-    for probe in &report.probe_results {
-        records.push(doctor_event(
-            &mut seq,
-            "probe_started",
-            report,
-            &probe.scope,
-            Some(&probe.probe_id),
-            "running",
-            json!({"cache_status": probe.cache_status}),
-        ));
-        records.push(doctor_event(
-            &mut seq,
-            "probe_finished",
-            report,
-            &probe.scope,
-            Some(&probe.probe_id),
-            &probe.status,
-            json!(probe),
-        ));
+    Ok(())
+}
+
+fn doctor_event_records(
+    report: &DoctorReport,
+    terminal_error: Option<&SatelleError>,
+) -> Vec<DoctorEventRecord> {
+    let mut seq = 2_u64;
+    let mut records = Vec::new();
+
+    for event in &report.probe_schedule_events {
+        let probe_id = event.probe_id();
+        let Some(probe) = report
+            .probe_results
+            .iter()
+            .find(|probe| probe.probe_id == probe_id)
+        else {
+            // Internal prerequisite probes do not have public result rows.
+            continue;
+        };
+        match event {
+            satelle_core::doctor::DoctorProbeScheduleEvent::Started { timestamp, .. } => {
+                if probe.dependency_status == "blocked" {
+                    continue;
+                }
+                let mut record = doctor_event(
+                    &mut seq,
+                    DoctorEventType::ProbeStarted,
+                    report,
+                    &probe.scope,
+                    Some(&probe.probe_id),
+                    "running",
+                    json!({"cache_status": probe.cache_status}),
+                );
+                record.timestamp.clone_from(timestamp);
+                records.push(record);
+            }
+            satelle_core::doctor::DoctorProbeScheduleEvent::Finished { timestamp, .. } => {
+                let mut record = doctor_event(
+                    &mut seq,
+                    DoctorEventType::ProbeFinished,
+                    report,
+                    &probe.scope,
+                    Some(&probe.probe_id),
+                    &probe.status,
+                    json!(probe),
+                );
+                record.timestamp.clone_from(timestamp);
+                records.push(record);
+            }
+        }
     }
 
     for finding in &report.findings {
         records.push(doctor_event(
             &mut seq,
-            "finding_reported",
+            DoctorEventType::FindingReported,
             report,
             &finding.scope,
             None,
@@ -4367,7 +4355,7 @@ fn print_doctor_events(
     for cache_update in &report.cache_updates {
         records.push(doctor_event(
             &mut seq,
-            "cache_updated",
+            DoctorEventType::CacheUpdated,
             report,
             "all",
             None,
@@ -4379,7 +4367,7 @@ fn print_doctor_events(
     if let Some(error) = terminal_error {
         records.push(doctor_event(
             &mut seq,
-            "doctor_failed",
+            DoctorEventType::DoctorFailed,
             report,
             "all",
             None,
@@ -4398,7 +4386,7 @@ fn print_doctor_events(
     } else {
         records.push(doctor_event(
             &mut seq,
-            "doctor_finished",
+            DoctorEventType::DoctorFinished,
             report,
             "all",
             None,
@@ -4407,33 +4395,228 @@ fn print_doctor_events(
         ));
     }
 
-    for record in records {
-        println!(
-            "{}",
-            serde_json::to_string(&record).map_err(|source| SatelleError {
-                code: ErrorCode::InvalidUsage,
-                message: "could not serialize doctor event".to_string(),
-                recovery_command: None,
-                source_detail: Some(source.to_string()),
-                details: std::collections::BTreeMap::new(),
-            })?
-        );
+    records
+}
+
+#[cfg(test)]
+mod doctor_event_tests {
+    use super::*;
+    use satelle_core::{DoctorProbeResult, DoctorSchemaVersion, DoctorSummary};
+
+    fn probe(probe_id: &str, scope: &str) -> DoctorProbeResult {
+        DoctorProbeResult {
+            probe_id: probe_id.to_string(),
+            scope: scope.to_string(),
+            status: "passed".to_string(),
+            started_at: "2026-07-29T00:00:00Z".to_string(),
+            finished_at: "2026-07-29T00:00:01Z".to_string(),
+            duration_ms: 1,
+            cache_status: "not_persisted".to_string(),
+            dependency_status: "satisfied".to_string(),
+            finding_ids: Vec::new(),
+        }
     }
 
-    Ok(())
+    #[test]
+    fn doctor_events_preserve_completion_order_without_changing_final_report_order() {
+        let mut skipped = probe("skipped-probe", "provider");
+        skipped.dependency_status = "blocked".to_string();
+        let report = DoctorReport {
+            schema_version: DoctorSchemaVersion::V1,
+            status: "ready".to_string(),
+            target: "local-demo".to_string(),
+            host: "local-demo".to_string(),
+            scopes: vec!["config".to_string(), "transport".to_string()],
+            started_at: "2026-07-29T00:00:00Z".to_string(),
+            finished_at: "2026-07-29T00:00:01Z".to_string(),
+            duration_ms: 1,
+            summary: DoctorSummary {
+                ready: true,
+                blocking_findings: 0,
+                repairable_findings: 0,
+                informational_findings: 0,
+            },
+            probe_results: vec![
+                probe("a-probe", "config"),
+                probe("computer-use.native.refresh", "computer-use"),
+                skipped,
+                probe("provider.smoke.refresh", "provider"),
+            ],
+            probe_schedule_events: vec![
+                satelle_core::doctor::DoctorProbeScheduleEvent::Started {
+                    probe_id: "provider.smoke.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:10Z".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
+                    probe_id: "provider.smoke.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:11Z".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Started {
+                    probe_id: "computer-use.native.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:12Z".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
+                    probe_id: "computer-use.native.refresh".to_string(),
+                    timestamp: "2026-07-29T00:00:13Z".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Started {
+                    probe_id: "a-probe".to_string(),
+                    timestamp: "2026-07-29T00:00:14Z".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
+                    probe_id: "a-probe".to_string(),
+                    timestamp: "2026-07-29T00:00:15Z".to_string(),
+                },
+                satelle_core::doctor::DoctorProbeScheduleEvent::Finished {
+                    probe_id: "skipped-probe".to_string(),
+                    timestamp: "2026-07-29T00:00:16Z".to_string(),
+                },
+            ]
+            .into_boxed_slice(),
+            ready: true,
+            findings: Vec::new(),
+            recovery_commands: Vec::new(),
+            changed: false,
+            cache_updates: Vec::new(),
+        };
+
+        let records = doctor_event_records(&report, None);
+        let event_position = |event_type, probe_id| {
+            records
+                .iter()
+                .position(|record| {
+                    record.event_type == event_type && record.probe_id.as_deref() == Some(probe_id)
+                })
+                .expect("expected probe lifecycle event")
+        };
+        assert!(
+            event_position(DoctorEventType::ProbeFinished, "provider.smoke.refresh")
+                < event_position(DoctorEventType::ProbeStarted, "computer-use.native.refresh"),
+            "a dependent probe must not start before its prerequisite finishes"
+        );
+        let started = records
+            .iter()
+            .filter(|record| record.event_type == DoctorEventType::ProbeStarted)
+            .collect::<Vec<_>>();
+        let finished = records
+            .iter()
+            .filter(|record| record.event_type == DoctorEventType::ProbeFinished)
+            .map(|record| record.probe_id.as_deref().expect("finished probe id"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            started
+                .iter()
+                .map(|record| record.probe_id.as_deref().expect("started probe id"))
+                .collect::<Vec<_>>(),
+            [
+                "provider.smoke.refresh",
+                "computer-use.native.refresh",
+                "a-probe",
+            ]
+        );
+        assert_eq!(
+            started
+                .iter()
+                .map(|record| record.timestamp.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "2026-07-29T00:00:10Z",
+                "2026-07-29T00:00:12Z",
+                "2026-07-29T00:00:14Z",
+            ],
+            "public start records must use this scheduler run, not cached probe timestamps"
+        );
+        assert_eq!(
+            finished,
+            [
+                "provider.smoke.refresh",
+                "computer-use.native.refresh",
+                "a-probe",
+                "skipped-probe"
+            ]
+        );
+        assert_eq!(
+            report
+                .probe_results
+                .iter()
+                .map(|probe| probe.probe_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "a-probe",
+                "computer-use.native.refresh",
+                "skipped-probe",
+                "provider.smoke.refresh"
+            ]
+        );
+        assert!(
+            serde_json::to_value(&report)
+                .expect("serialize final report")
+                .get("probe_schedule_events")
+                .is_none(),
+            "derived event order must not change the final JSON contract"
+        );
+    }
+}
+
+fn print_doctor_started_event(
+    target: &str,
+    scope_selection: &DoctorScopeSelection,
+) -> Result<(), SatelleError> {
+    let scopes = scope_selection
+        .scopes()
+        .iter()
+        .map(|scope| scope.as_str())
+        .collect::<Vec<_>>();
+    let scope = if scopes.len() == 1 { scopes[0] } else { "all" };
+    print_doctor_event_record(&DoctorEventRecord {
+        schema_version: DoctorEventSchemaVersion::V1,
+        event_id: "doctor_event_1".to_string(),
+        event_type: DoctorEventType::DoctorStarted,
+        target: target.to_string(),
+        scope: scope.to_string(),
+        probe_id: None,
+        timestamp: utc_now(),
+        status: "running".to_string(),
+        data: json!({"scopes": scopes}),
+    })
 }
 
 fn print_doctor_failed_event(
     target: &str,
-    scope: Option<&str>,
+    scope_selection: &DoctorScopeSelection,
+    seq: u64,
     error: &SatelleError,
+    partial_probe_results: &[satelle_core::DoctorProbeResult],
 ) -> Result<(), SatelleError> {
-    let record = DoctorEventRecord {
-        schema_version: "satelle.doctor.events.v1".to_string(),
-        event_id: "doctor_event_1".to_string(),
-        event_type: "doctor_failed".to_string(),
+    print_doctor_event_record(&doctor_failed_event_record(
+        target,
+        scope_selection,
+        seq,
+        error,
+        partial_probe_results,
+    ))
+}
+
+fn doctor_failed_event_record(
+    target: &str,
+    scope_selection: &DoctorScopeSelection,
+    seq: u64,
+    error: &SatelleError,
+    partial_probe_results: &[satelle_core::DoctorProbeResult],
+) -> DoctorEventRecord {
+    let scopes = scope_selection
+        .scopes()
+        .iter()
+        .map(|scope| scope.as_str())
+        .collect::<Vec<_>>();
+    let scope = if scopes.len() == 1 { scopes[0] } else { "all" };
+    DoctorEventRecord {
+        schema_version: DoctorEventSchemaVersion::V1,
+        event_id: format!("doctor_event_{seq}"),
+        event_type: DoctorEventType::DoctorFailed,
         target: target.to_string(),
-        scope: scope.unwrap_or("all").to_string(),
+        scope: scope.to_string(),
         probe_id: None,
         timestamp: utc_now(),
         status: error.code.as_str().to_string(),
@@ -4444,14 +4627,46 @@ fn print_doctor_failed_event(
                 "exit_code": error.exit_code(),
                 "recovery_command": error.recovery_command,
             },
-            "partial_probe_results": [],
+            "partial_probe_results": partial_probe_results,
+            "scopes": scopes,
             "recovery_commands": error.recovery_command.iter().collect::<Vec<_>>(),
         }),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn post_start_doctor_failure_event_includes_completed_probe_results() {
+    let scope_selection = DoctorScopeSelection::parse(&["config".to_string()])
+        .expect("config is a supported Doctor scope");
+    let partial = satelle_core::DoctorProbeResult {
+        probe_id: "config.selected_host_resolution".to_string(),
+        scope: "config".to_string(),
+        status: "passed".to_string(),
+        started_at: "2026-07-29T00:00:00Z".to_string(),
+        finished_at: "2026-07-29T00:00:00Z".to_string(),
+        duration_ms: 0,
+        cache_status: "not_persisted".to_string(),
+        dependency_status: "satisfied".to_string(),
+        finding_ids: Vec::new(),
     };
 
+    let record = doctor_failed_event_record(
+        LOCAL_DEMO_HOST,
+        &scope_selection,
+        2,
+        &SatelleError::state_conflict(),
+        std::slice::from_ref(&partial),
+    );
+
+    assert_eq!(record.event_type, DoctorEventType::DoctorFailed);
+    assert_eq!(record.data["partial_probe_results"], json!([partial]));
+}
+
+fn print_doctor_event_record(record: &DoctorEventRecord) -> Result<(), SatelleError> {
     println!(
         "{}",
-        serde_json::to_string(&record).map_err(|source| SatelleError {
+        serde_json::to_string(record).map_err(|source| SatelleError {
             code: ErrorCode::InvalidUsage,
             message: "could not serialize doctor event".to_string(),
             recovery_command: None,
@@ -4465,7 +4680,7 @@ fn print_doctor_failed_event(
 
 fn doctor_event(
     seq: &mut u64,
-    event_type: &str,
+    event_type: DoctorEventType,
     report: &DoctorReport,
     scope: &str,
     probe_id: Option<&str>,
@@ -4473,9 +4688,9 @@ fn doctor_event(
     data: serde_json::Value,
 ) -> DoctorEventRecord {
     let event = DoctorEventRecord {
-        schema_version: "satelle.doctor.events.v1".to_string(),
+        schema_version: DoctorEventSchemaVersion::V1,
         event_id: format!("doctor_event_{seq}"),
-        event_type: event_type.to_string(),
+        event_type,
         target: report.target.clone(),
         scope: scope.to_string(),
         probe_id: probe_id.map(str::to_string),
@@ -8175,10 +8390,12 @@ fn run_prompt(
                 .map_err(|error| CliFailure {
                     error,
                     history_session_id: history_session_id.clone(),
+                    error_reported: false,
                 })?;
             return Err(CliFailure {
                 error: attached_failure.into_error(),
                 history_session_id,
+                error_reported: false,
             });
         }
     };
@@ -8411,10 +8628,12 @@ fn steer_prompt(
                 .map_err(|error| CliFailure {
                     error,
                     history_session_id: history_session_id.clone(),
+                    error_reported: false,
                 })?;
             return Err(CliFailure {
                 error: attached_failure.into_error(),
                 history_session_id,
+                error_reported: false,
             });
         }
     };
@@ -9078,6 +9297,15 @@ fn failure(error: SatelleError) -> CliFailure {
     CliFailure {
         error,
         history_session_id: None,
+        error_reported: false,
+    }
+}
+
+fn reported_failure(error: SatelleError) -> CliFailure {
+    CliFailure {
+        error,
+        history_session_id: None,
+        error_reported: true,
     }
 }
 
@@ -9085,6 +9313,7 @@ fn failure_for_admitted_session(error: SatelleError, session_id: &SessionId) -> 
     CliFailure {
         error,
         history_session_id: Some(Box::new(session_id.clone())),
+        error_reported: false,
     }
 }
 

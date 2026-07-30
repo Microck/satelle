@@ -7,10 +7,12 @@ use super::{
     experimental_provider_computer_use_json, failure, model_provider_config_json,
     redacted_config_json, resolve_path_set, yolo_config_json,
 };
+use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::{DoctorOptions, DoctorReport, SatelleError};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 pub(super) fn config_check_report(
     host: Option<String>,
@@ -195,13 +197,31 @@ pub(super) fn doctor_for_host(
     host: &super::SelectedHost,
     scope: Option<&str>,
 ) -> Result<DoctorReport, CliFailure> {
+    let raw_scopes = scope.into_iter().map(str::to_string).collect::<Vec<_>>();
+    let scope_selection =
+        DoctorScopeSelection::parse(&raw_scopes).expect("read helpers use supported Doctor scopes");
+    let options = DoctorOptions::default();
+    let transport_probe = super::tailscale::transport_doctor_probe(&scope_selection, &host.config);
+    if let Some(prepared) =
+        super::tailscale::prepare_transport_only_doctor(&host.config, &scope_selection, options)
+            .map_err(failure)?
+    {
+        return super::tailscale::execute_transport_only_doctor(
+            &host.alias,
+            &scope_selection,
+            &transport_probe,
+            prepared,
+        )
+        .map_err(failure);
+    }
     transport_for(host)?
         .doctor(
-            scope,
-            DoctorOptions::default(),
+            &scope_selection,
+            Arc::new(transport_probe),
+            options,
             &satelle_host::ProviderComputerUseIntent::host_default(),
         )
-        .map_err(failure)
+        .map_err(|failed| failure(failed.error))
 }
 
 pub(super) fn host_status(

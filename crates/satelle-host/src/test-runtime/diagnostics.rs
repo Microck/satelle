@@ -1,20 +1,22 @@
 use super::FakeComputerUseAdapter;
 use crate::runtime::ComputerUseAdapter;
+use satelle_core::doctor::{DoctorProbeScheduleEvent, DoctorScope, DoctorScopeSelection};
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,
-    DoctorReport, DoctorSchemaVersion, DoctorSummary, SatelleError, SetupReadinessSummary,
-    SetupReport, SetupSchemaVersion, utc_now,
+    DoctorReport, DoctorSchemaVersion, DoctorSummary, DoctorTransportObservation, SatelleError,
+    SetupReadinessSummary, SetupReport, SetupSchemaVersion, utc_now,
 };
 
 pub(super) fn doctor(
     host: &str,
-    scope: Option<&str>,
+    scope_selection: &DoctorScopeSelection,
+    transport_observation: &DoctorTransportObservation,
     options: DoctorOptions,
     adapter: &FakeComputerUseAdapter,
 ) -> Result<DoctorReport, SatelleError> {
     let started_at = utc_now();
     let readiness = adapter.preflight(host, &crate::ProviderComputerUseIntent::host_default())?;
-    let probes = probe_plan(scope);
+    let probes = probe_plan(scope_selection);
     let mut findings = Vec::new();
     let mut probe_results = Vec::new();
 
@@ -54,6 +56,33 @@ pub(super) fn doctor(
             finding_ids: vec![finding_id],
         });
     }
+    if scope_selection
+        .scopes()
+        .iter()
+        .any(|scope| scope.as_str() == "transport")
+        && let Some(finding) = transport_observation.finding()
+    {
+        findings.retain(|finding| finding.scope != "transport");
+        probe_results.retain(|probe| probe.scope != "transport");
+        let finding_id = finding.finding_id.clone();
+        findings.push(finding.clone());
+        probe_results.push(DoctorProbeResult {
+            probe_id: "transport.selected".to_string(),
+            scope: "transport".to_string(),
+            status: if transport_observation.is_ready() {
+                "passed"
+            } else {
+                "blocked"
+            }
+            .to_string(),
+            started_at: started_at.clone(),
+            finished_at: utc_now(),
+            duration_ms: 0,
+            cache_status: "not_persisted".to_string(),
+            dependency_status: "satisfied".to_string(),
+            finding_ids: vec![finding_id],
+        });
+    }
 
     probe_results.sort_by(|left, right| {
         left.scope
@@ -73,15 +102,28 @@ pub(super) fn doctor(
         .iter()
         .filter_map(|finding| finding.recovery_command.clone())
         .collect::<Vec<_>>();
+    let transport_selected = scope_selection.scopes().contains(&DoctorScope::Transport);
+    let ready = readiness.is_ready() && (!transport_selected || transport_observation.is_ready());
 
+    let probe_schedule_events = probe_results
+        .iter()
+        .flat_map(|probe| {
+            [
+                DoctorProbeScheduleEvent::Started {
+                    probe_id: probe.probe_id.clone(),
+                    timestamp: probe.started_at.clone(),
+                },
+                DoctorProbeScheduleEvent::Finished {
+                    probe_id: probe.probe_id.clone(),
+                    timestamp: probe.finished_at.clone(),
+                },
+            ]
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     Ok(DoctorReport {
         schema_version: DoctorSchemaVersion::V1,
-        status: if readiness.is_ready() {
-            "ready"
-        } else {
-            "blocked"
-        }
-        .to_string(),
+        status: if ready { "ready" } else { "blocked" }.to_string(),
         target: host.to_string(),
         host: host.to_string(),
         scopes,
@@ -89,13 +131,20 @@ pub(super) fn doctor(
         finished_at: utc_now(),
         duration_ms: 0,
         summary: DoctorSummary {
-            ready: readiness.is_ready(),
-            blocking_findings: 0,
+            ready,
+            blocking_findings: findings
+                .iter()
+                .filter(|finding| finding.readiness_impact == "blocked")
+                .count(),
             repairable_findings: 0,
-            informational_findings: findings.len(),
+            informational_findings: findings
+                .iter()
+                .filter(|finding| finding.fixability == DoctorFixability::Informational)
+                .count(),
         },
         probe_results,
-        ready: readiness.is_ready(),
+        probe_schedule_events,
+        ready,
         findings,
         recovery_commands,
         changed: options.refresh(),
@@ -105,6 +154,59 @@ pub(super) fn doctor(
             Vec::new()
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blocked_transport_observation() -> DoctorTransportObservation {
+        DoctorTransportObservation::blocked(DoctorFinding {
+            finding_id: "transport.test.blocked".to_string(),
+            scope: "transport".to_string(),
+            severity: "error".to_string(),
+            fixability: DoctorFixability::Blocked,
+            readiness_impact: "blocked".to_string(),
+            summary: "the selected transport is blocked".to_string(),
+            evidence: Vec::new(),
+            recovery_command: Some("repair the selected transport".to_string()),
+        })
+    }
+
+    #[test]
+    fn transport_observation_changes_readiness_only_when_transport_is_selected() {
+        let adapter = FakeComputerUseAdapter;
+        let blocked_transport = blocked_transport_observation();
+        let config_scope = DoctorScopeSelection::parse(&["config".to_string()])
+            .expect("config scope should parse");
+        let config_report = doctor(
+            "local-demo",
+            &config_scope,
+            &blocked_transport,
+            DoctorOptions::default(),
+            &adapter,
+        )
+        .expect("unselected transport evidence must not block config diagnostics");
+
+        assert_eq!(config_report.status, "ready");
+        assert!(config_report.summary.ready);
+        assert!(config_report.ready);
+
+        let transport_scope = DoctorScopeSelection::parse(&["transport".to_string()])
+            .expect("transport scope should parse");
+        let transport_report = doctor(
+            "local-demo",
+            &transport_scope,
+            &blocked_transport,
+            DoctorOptions::default(),
+            &adapter,
+        )
+        .expect("selected transport evidence should produce a report");
+
+        assert_eq!(transport_report.status, "blocked");
+        assert!(!transport_report.summary.ready);
+        assert!(!transport_report.ready);
+    }
 }
 
 pub(super) fn setup(
@@ -220,14 +322,15 @@ const PROBES: &[ProbeDefinition] = &[
     },
 ];
 
-fn probe_plan(scope: Option<&str>) -> Vec<ProbeDefinition> {
-    if matches!(scope, None | Some("all")) {
-        return PROBES.to_vec();
-    }
-
+fn probe_plan(scope_selection: &DoctorScopeSelection) -> Vec<ProbeDefinition> {
     PROBES
         .iter()
         .copied()
-        .filter(|probe| Some(probe.scope) == scope)
+        .filter(|probe| {
+            scope_selection
+                .scopes()
+                .iter()
+                .any(|scope| scope.as_str() == probe.scope)
+        })
         .collect()
 }

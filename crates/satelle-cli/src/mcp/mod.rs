@@ -79,6 +79,7 @@ fn mcp_failure(message: impl Into<String>) -> CliFailure {
             details: Default::default(),
         },
         history_session_id: None,
+        error_reported: false,
     }
 }
 

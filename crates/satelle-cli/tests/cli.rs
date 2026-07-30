@@ -9,12 +9,18 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
 #[cfg(target_os = "linux")]
-use std::io::{Read, Write};
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::io::Write;
+#[cfg(unix)]
+use std::io::{BufRead, Read};
 use std::net::TcpListener;
 #[cfg(target_os = "linux")]
 use std::net::TcpStream;
 #[cfg(target_os = "linux")]
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::Child;
+#[cfg(unix)]
+use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::mpsc::{self, Receiver};
 #[cfg(target_os = "linux")]
@@ -510,13 +516,18 @@ fn ordinary_production_doctor_reports_blocked_probes_without_fake_readiness() {
     let probes = report["probe_results"]
         .as_array()
         .expect("production doctor probes should be an array");
-    for blocked_scope in ["codex", "computer-use", "provider", "transport"] {
+    for blocked_scope in ["codex", "computer-use", "provider"] {
         assert!(
             probes
                 .iter()
                 .any(|probe| { probe["scope"] == blocked_scope && probe["status"] == "blocked" })
         );
     }
+    assert!(
+        probes
+            .iter()
+            .any(|probe| probe["scope"] == "transport" && probe["status"] == "passed")
+    );
     assert!(
         probes
             .iter()
@@ -3437,11 +3448,7 @@ fn setup_interactive_json_decline_reports_typed_cancellation() {
 fn setup_interactive_prompt_interruption_uses_the_interrupted_exit_contract() {
     let state = state_dir();
     let executable = assert_cmd::cargo::cargo_bin!("satelle");
-    let command_line = format!(
-        "{} --error-format json setup --host local-demo",
-        executable.display()
-    );
-    let mut command = std::process::Command::new("script");
+    let mut command = std::process::Command::new(executable);
     for name in [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -3455,43 +3462,12 @@ fn setup_interactive_prompt_interruption_uses_the_interrupted_exit_contract() {
     ] {
         command.env_remove(name);
     }
-    let mut child = command
+    command
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_COMMAND_HISTORY", "false")
         .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
-        .args(["-qec", command_line.as_str(), "/dev/null"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn synchronized setup PTY");
-    let stdin = child.stdin.take().expect("take setup PTY stdin");
-    let mut stdout = child.stdout.take().expect("take setup PTY stdout");
-    let mut stderr = child.stderr.take().expect("take setup PTY stderr");
-    let (stdout_sender, stdout_receiver) = mpsc::channel();
-    let stdout_reader = thread::spawn(move || {
-        let mut byte = [0_u8; 1];
-        while stdout.read_exact(&mut byte).is_ok() {
-            if stdout_sender.send(byte[0]).is_err() {
-                break;
-            }
-        }
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr
-            .read_to_end(&mut bytes)
-            .expect("read setup PTY stderr");
-        bytes
-    });
-    let mut process = ProviderSecretPtyProcess {
-        child,
-        stdin: Some(stdin),
-        stdout: Vec::new(),
-        stdout_receiver,
-        stdout_reader,
-        stderr_reader,
-    };
+        .args(["--error-format", "json", "setup", "--host", "local-demo"]);
+    let mut process = spawn_pty_command(command);
     process.wait_for_after("Apply these setup mutations?", 0);
     process.write_input("\u{1b}");
     let output = process.finish();
@@ -4415,6 +4391,10 @@ fn doctor_json_emits_single_final_object_with_probe_contract() {
         serde_json::json!(["codex", "computer-use", "config", "provider", "transport"])
     );
     assert_eq!(report["summary"]["ready"], true);
+    assert!(
+        report.get("fix_flow").is_none(),
+        "ordinary diagnostics must not publish fix_flow fields"
+    );
 
     let probe = report["probe_results"][0]
         .as_object()
@@ -4561,7 +4541,7 @@ fn doctor_provider_refresh_reports_provider_cache_provenance() {
     assert_eq!(report["changed"], true);
     assert_eq!(
         report["cache_updates"],
-        serde_json::json!(["provider_smoke"])
+        serde_json::json!(["native_readiness", "provider_smoke"])
     );
     assert_eq!(
         report["probe_results"][0]["probe_id"],
@@ -4609,6 +4589,186 @@ fn doctor_timeout_requires_refresh_and_live_probe_scope() {
         ));
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_started_is_emitted_before_the_tailscale_probe_completes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = state_dir();
+    let config = state.path().join("tailscale-doctor.toml");
+    write_user_config(
+        &config,
+        r#"
+default_host = "selected"
+
+[hosts.selected]
+transport = "direct"
+adapter = "codex"
+address = "https://studio.example.test:3001"
+
+[hosts.selected.network]
+provider = "tailscale"
+tailnet_name = "example.test"
+hostname = "studio"
+"#,
+    )
+    .expect("write Tailscale Doctor config");
+    let bin = tempfile::tempdir().expect("create fake Tailscale bin");
+    let status_marker = state.path().join("tailscale-status-started");
+    let ping_marker = state.path().join("tailscale-ping-started");
+    let release_status = state.path().join("release-tailscale-status");
+    let tailscale = bin.path().join("tailscale");
+    std::fs::write(
+        &tailscale,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = status ]; then\n\
+             printf status > '{}'\n\
+             waited=0\n\
+             while [ ! -e '{}' ] && [ \"$waited\" -lt 300 ]; do\n\
+             sleep 0.01; waited=$((waited+1)); done\n\
+             if [ ! -e '{}' ]; then exit 1; fi\n\
+             printf '%s' '{{\"BackendState\":\"Running\",\"CurrentTailnet\":\
+             {{\"Name\":\"example.test\"}},\"Peer\":{{\"node\":{{\"HostName\":\"studio\",\
+             \"DNSName\":\"studio.example.test.\",\"TailscaleIPs\":[\"100.64.0.8\"],\
+             \"Online\":true}}}}}}'\n\
+             exit 0\n\
+             fi\n\
+             if [ \"$1\" = ping ]; then printf ping > '{}'; exit 0; fi\n\
+             exit 1\n",
+            status_marker.display(),
+            release_status.display(),
+            release_status.display(),
+            ping_marker.display(),
+        ),
+    )
+    .expect("write fake Tailscale executable");
+    std::fs::set_permissions(&tailscale, std::fs::Permissions::from_mode(0o700))
+        .expect("make fake Tailscale executable");
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin!("satelle"))
+        .env("SATELLE_CONFIG_FILE", &config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_COMMAND_HISTORY", "false")
+        .env("PATH", path)
+        .args([
+            "doctor",
+            "--host",
+            "selected",
+            "--scope",
+            "transport",
+            "--events",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn event-mode Tailscale Doctor");
+    let stdout = child.stdout.take().expect("take Doctor stdout");
+    let stderr = child.stderr.take().expect("take Doctor stderr");
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut stdout = std::io::BufReader::new(stdout);
+        let mut first = String::new();
+        let first_result = stdout.read_line(&mut first).map(|_| first.into_bytes());
+        stdout_sender
+            .send(first_result)
+            .expect("send first Doctor event");
+        let mut remaining = Vec::new();
+        let remaining_result = stdout.read_to_end(&mut remaining).map(|_| remaining);
+        stdout_sender
+            .send(remaining_result)
+            .expect("send remaining Doctor events");
+    });
+    let (stderr_sender, stderr_receiver) = std::sync::mpsc::channel();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = std::io::BufReader::new(stderr)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        stderr_sender.send(result).expect("send Doctor stderr");
+    });
+    let timeout = std::time::Duration::from_secs(5);
+    let first = stdout_receiver
+        .recv_timeout(timeout)
+        .unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Doctor did not emit its first event in time: {error}");
+        })
+        .expect("read first Doctor event");
+    let first: Value = serde_json::from_slice(&first).expect("first Doctor record is JSON");
+    assert_eq!(first["event_type"], "doctor_started");
+    let marker_deadline = std::time::Instant::now() + timeout;
+    while !status_marker.exists() && std::time::Instant::now() < marker_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        status_marker.exists(),
+        "status probe must start after doctor_started"
+    );
+    assert!(
+        !ping_marker.exists(),
+        "ping must wait for the status release handshake"
+    );
+    std::fs::write(&release_status, b"release").expect("release Tailscale status");
+
+    let remaining_stdout = stdout_receiver
+        .recv_timeout(timeout)
+        .unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Doctor stdout did not terminate in time: {error}");
+        })
+        .expect("drain remaining Doctor events");
+    let process_deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll Doctor process") {
+            break status;
+        }
+        if std::time::Instant::now() >= process_deadline {
+            child.kill().expect("kill timed-out Doctor process");
+            child.wait().expect("reap timed-out Doctor process");
+            panic!("Doctor process did not terminate in time");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(status.success());
+    let stderr = stderr_receiver
+        .recv_timeout(timeout)
+        .expect("Doctor stderr reader must finish in time")
+        .expect("drain Doctor stderr");
+    assert!(
+        stderr.is_empty(),
+        "event mode must not emit a second machine error on stderr"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&status_marker).expect("status marker"),
+        "status"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ping_marker).expect("ping marker"),
+        "ping"
+    );
+    let mut events = vec![first];
+    events.extend(parse_json_lines(&remaining_stdout));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event["event_type"].as_str(),
+                Some("doctor_finished" | "doctor_failed")
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(events.last().unwrap()["event_type"], "doctor_finished");
+    stdout_reader.join().expect("join completed stdout reader");
+    stderr_reader.join().expect("join completed stderr reader");
+}
+
 #[test]
 fn doctor_refresh_requires_a_live_probe_scope() {
     let state = state_dir();
@@ -4625,7 +4785,7 @@ fn doctor_refresh_requires_a_live_probe_scope() {
 #[test]
 fn doctor_timeout_must_be_positive() {
     let state = state_dir();
-    satelle()
+    let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "doctor",
@@ -4633,14 +4793,21 @@ fn doctor_timeout_must_be_positive() {
             "computer-use",
             "--refresh",
             "--timeout",
-            "0s",
-            "--json",
+            "0ms",
+            "--events",
         ])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
             "duration must use a positive number",
-        ));
+        ))
+        .get_output()
+        .clone();
+    assert!(output.stdout.is_empty());
+    assert!(
+        serde_json::from_slice::<Value>(&output.stderr).expect("typed pre-stream machine error")["code"]
+            == "invalid-usage"
+    );
 }
 
 #[test]
@@ -4654,7 +4821,7 @@ fn doctor_serial_no_input_run_remains_noninteractive() {
 }
 
 #[test]
-fn doctor_events_invalid_scope_emits_failed_terminal_event() {
+fn doctor_events_invalid_scope_uses_pre_stream_machine_error_contract() {
     let state = state_dir();
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -4664,12 +4831,156 @@ fn doctor_events_invalid_scope_emits_failed_terminal_event() {
         .stderr(predicate::str::contains("invalid-usage"))
         .get_output()
         .clone();
+
+    assert!(
+        output.stdout.is_empty(),
+        "a failure before doctor_started must leave stdout empty"
+    );
+}
+
+#[test]
+fn doctor_events_transport_preparation_failure_uses_pre_stream_machine_error_contract() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let missing_token = state.path().join("missing-api-token");
+    let token_path = toml::Value::String(missing_token.to_string_lossy().into_owned()).to_string();
+    write_user_config(
+        &user_config,
+        format!(
+            r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://127.0.0.1:3001"
+expected_host_id = "host-remote"
+api_token = {{ kind = "file", path = {token_path} }}
+"#,
+        ),
+    )
+    .expect("write direct Host config");
+
+    let output = production_satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--host", "remote", "--events"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert!(
+        output.stdout.is_empty(),
+        "transport preparation failed before doctor_started"
+    );
+    serde_json::from_slice::<Value>(&output.stderr).expect("typed pre-stream machine error");
+}
+
+#[test]
+fn doctor_events_after_start_emit_one_failed_terminal_without_stderr_error() {
+    let state = state_dir();
+    let output = production_satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--host", "local-demo", "--events"])
+        .assert()
+        .code(75)
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .clone();
     let events = parse_json_lines(&output.stdout);
 
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["event_type"], "doctor_failed");
-    assert_eq!(events[0]["data"]["error"]["code"], "invalid-usage");
-    assert_eq!(events[0]["data"]["error"]["exit_code"], 64);
+    assert_eq!(events[0]["event_type"], "doctor_started");
+    assert_eq!(events.last().unwrap()["event_type"], "doctor_failed");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event["event_type"].as_str(),
+                Some("doctor_finished" | "doctor_failed")
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events.last().unwrap()["data"]["error"]["code"],
+        "doctor-readiness-blockers-found"
+    );
+}
+
+#[test]
+fn doctor_refresh_without_scope_selects_computer_use_and_provider() {
+    let state = state_dir();
+    let provider_config = authorize_default_provider_binding(&state);
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--refresh", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    let scopes = report["probe_results"]
+        .as_array()
+        .expect("probe results should be an array")
+        .iter()
+        .filter_map(|probe| probe["scope"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert!(scopes.contains("computer-use"));
+    assert!(scopes.contains("provider"));
+}
+
+#[test]
+fn doctor_scope_all_combined_with_another_scope_is_typed_pre_stream_failure() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor", "--scope", "all", "--scope", "provider", "--events",
+        ])
+        .assert()
+        .code(64)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("scope-selection-conflict"))
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn doctor_repeatable_specific_scopes_are_deduplicated_and_canonical() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor",
+            "--host",
+            "local-demo",
+            "--scope",
+            "provider",
+            "--scope",
+            "codex",
+            "--scope",
+            "provider",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+
+    assert_eq!(report["scopes"], serde_json::json!(["codex", "provider"]));
+    assert!(
+        report["probe_results"]
+            .as_array()
+            .expect("probe results should be an array")
+            .iter()
+            .all(|probe| matches!(probe["scope"].as_str(), Some("codex" | "provider")))
+    );
 }
 
 #[test]
@@ -5383,6 +5694,24 @@ adapter = "fake"
         error["message"]
             .as_str()
             .is_some_and(|message| message.contains("reserved for implicit Codex defaults"))
+    );
+
+    let events_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--host", "local", "--events"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert!(
+        events_output.stdout.is_empty(),
+        "provider intent failed before doctor_started"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&events_output.stderr)
+            .expect("typed pre-stream machine error")["code"],
+        "configuration-error"
     );
 }
 
@@ -7402,11 +7731,11 @@ enum ProviderSecretPtyDecision<'a> {
 #[cfg(target_os = "linux")]
 struct ProviderSecretPtyProcess {
     child: Child,
-    stdin: Option<ChildStdin>,
+    input: Option<File>,
+    slave: Option<File>,
     stdout: Vec<u8>,
     stdout_receiver: Receiver<u8>,
-    stdout_reader: JoinHandle<()>,
-    stderr_reader: JoinHandle<Vec<u8>>,
+    stdout_reader: Option<JoinHandle<()>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -7442,25 +7771,149 @@ impl ProviderSecretPtyProcess {
         }
     }
 
-    fn write_input(&mut self, input: &str) {
-        let stdin = self.stdin.as_mut().expect("PTY stdin should remain open");
-        stdin
-            .write_all(input.as_bytes())
+    fn write_input(&mut self, bytes: &str) {
+        let input = self.input.as_mut().expect("PTY input should remain open");
+        input
+            .write_all(bytes.as_bytes())
             .expect("write synchronized PTY input");
-        stdin.flush().expect("flush synchronized PTY input");
+        input.flush().expect("flush synchronized PTY input");
+    }
+
+    fn wait_for_echo_disabled(&mut self) -> Result<(), String> {
+        use rustix::termios::{LocalModes, tcgetattr};
+
+        let slave = self
+            .slave
+            .as_ref()
+            .expect("PTY slave should remain open")
+            .try_clone()
+            .map_err(|error| error.to_string())?;
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let watcher = thread::spawn(move || {
+            loop {
+                match tcgetattr(&slave) {
+                    Ok(termios) if !termios.local_modes.contains(LocalModes::ECHO) => {
+                        let _ = ready_sender.send(());
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero()
+                    || shutdown_receiver
+                        .recv_timeout(remaining.min(Duration::from_millis(2)))
+                        .is_ok()
+                {
+                    return;
+                }
+            }
+        });
+
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                let _ = shutdown_sender.send(());
+                watcher
+                    .join()
+                    .map_err(|_| "join PTY echo watcher".to_string())?;
+                return Err("timed out waiting for PTY ECHO to be disabled".to_string());
+            }
+            if ready_receiver
+                .recv_timeout(remaining.min(Duration::from_millis(2)))
+                .is_ok()
+            {
+                watcher
+                    .join()
+                    .map_err(|_| "join PTY echo watcher".to_string())?;
+                return Ok(());
+            }
+            if self
+                .child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                let _ = shutdown_sender.send(());
+                watcher
+                    .join()
+                    .map_err(|_| "join PTY echo watcher".to_string())?;
+                return Err("PTY child exited before disabling ECHO".to_string());
+            }
+        }
     }
 
     fn finish(mut self) -> std::process::Output {
-        drop(self.stdin.take());
+        drop(self.input.take());
+        drop(self.slave.take());
         let status = self.child.wait().expect("wait for PTY command");
-        self.stdout_reader.join().expect("join PTY stdout reader");
+        self.stdout_reader
+            .take()
+            .expect("PTY stdout reader")
+            .join()
+            .expect("join PTY stdout reader");
         self.stdout.extend(self.stdout_receiver.try_iter());
-        let stderr = self.stderr_reader.join().expect("join PTY stderr reader");
         std::process::Output {
             status,
             stdout: self.stdout,
-            stderr,
+            stderr: Vec::new(),
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_pty_command(mut command: std::process::Command) -> ProviderSecretPtyProcess {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+
+    let controller = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)
+        .expect("open provider secret PTY");
+    grantpt(&controller).expect("grant provider secret PTY");
+    unlockpt(&controller).expect("unlock provider secret PTY");
+    let slave_path = ptsname(&controller, Vec::new()).expect("resolve provider secret PTY slave");
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(std::path::Path::new(
+            slave_path.to_str().expect("PTY slave path is UTF-8"),
+        ))
+        .expect("open provider secret PTY slave");
+    let controller = File::from(controller);
+    let child = command
+        .stdin(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdin"),
+        ))
+        .stdout(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdout"),
+        ))
+        .stderr(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stderr"),
+        ))
+        .spawn()
+        .expect("spawn synchronized provider secret PTY");
+    let input = controller.try_clone().expect("clone PTY controller input");
+    let mut output = controller;
+    let (stdout_sender, stdout_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let mut byte = [0_u8; 1];
+        while output.read_exact(&mut byte).is_ok() {
+            if stdout_sender.send(byte[0]).is_err() {
+                break;
+            }
+        }
+    });
+    ProviderSecretPtyProcess {
+        child,
+        input: Some(input),
+        slave: Some(slave),
+        stdout: Vec::new(),
+        stdout_receiver,
+        stdout_reader: Some(stdout_reader),
     }
 }
 
@@ -7474,20 +7927,22 @@ fn run_provider_secret_setup_in_pty(
     initial_input: Option<&str>,
     decision: ProviderSecretPtyDecision<'_>,
 ) -> (std::process::Output, usize, Option<usize>) {
+    let (secret, accepted) = match decision {
+        ProviderSecretPtyDecision::Decline(secret) => (secret, false),
+        ProviderSecretPtyDecision::Accept(secret) => (secret, true),
+    };
     let executable = assert_cmd::cargo::cargo_bin!("satelle");
-    let profile_argument = profile
-        .map(|profile| format!("--profile {profile} "))
-        .unwrap_or_default();
-    let yes_argument = if yes { " --yes" } else { "" };
-    let component_arguments = components
-        .iter()
-        .map(|component| format!(" --component {component}"))
-        .collect::<String>();
-    let command_line = format!(
-        "{} {profile_argument}setup --host selected{component_arguments}{yes_argument}",
-        executable.display()
-    );
-    let mut command = std::process::Command::new("script");
+    let mut command = std::process::Command::new(executable);
+    if let Some(profile) = profile {
+        command.args(["--profile", profile]);
+    }
+    command.args(["setup", "--host", "selected"]);
+    for component in components {
+        command.args(["--component", component]);
+    }
+    if yes {
+        command.arg("--yes");
+    }
     for name in [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -7501,54 +7956,23 @@ fn run_provider_secret_setup_in_pty(
     ] {
         command.env_remove(name);
     }
-    let mut child = command
+    command
         .env("SATELLE_CONFIG_FILE", user_config)
         .env("SATELLE_STATE_DIR", state_dir)
         .env("SATELLE_COMMAND_HISTORY", "false")
-        .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
-        .args(["-qec", command_line.as_str(), "/dev/null"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn synchronized provider secret PTY");
-    let stdin = child.stdin.take().expect("take PTY stdin");
-    let mut stdout = child.stdout.take().expect("take PTY stdout");
-    let mut stderr = child.stderr.take().expect("take PTY stderr");
-    let (stdout_sender, stdout_receiver) = mpsc::channel();
-    let stdout_reader = thread::spawn(move || {
-        let mut byte = [0_u8; 1];
-        while stdout.read_exact(&mut byte).is_ok() {
-            if stdout_sender.send(byte[0]).is_err() {
-                break;
-            }
-        }
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr
-            .read_to_end(&mut bytes)
-            .expect("read provider secret PTY stderr");
-        bytes
-    });
-    let mut process = ProviderSecretPtyProcess {
-        child,
-        stdin: Some(stdin),
-        stdout: Vec::new(),
-        stdout_receiver,
-        stdout_reader,
-        stderr_reader,
-    };
+        .env(TEST_SUPPORT_ADAPTER_ENV, "fake");
+    let mut process = spawn_pty_command(command);
 
     if let Some(initial_input) = initial_input {
         process.write_input(initial_input);
     }
     let preview_end = process.wait_for_after("Provider secret overwrite behavior:", 0);
     let secret_prompt_end = process.wait_for_after("Provider secret", preview_end);
-    let (secret, accepted) = match decision {
-        ProviderSecretPtyDecision::Decline(secret) => (secret, false),
-        ProviderSecretPtyDecision::Accept(secret) => (secret, true),
-    };
+    if accepted {
+        process
+            .wait_for_echo_disabled()
+            .expect("provider secret prompt disables PTY echo");
+    }
     process.write_input(&format!("{secret}\n"));
     let confirmation_end = process.wait_for_after(
         "Provision or replace the provider secret at this exact destination?",
@@ -7561,6 +7985,14 @@ fn run_provider_secret_setup_in_pty(
     }
     let output = process.finish();
     (output, confirmation_end, Some(secret_prompt_end))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_secret_pty_echo_watcher_stops_when_the_child_exits_early() {
+    let mut process = spawn_pty_command(std::process::Command::new("true"));
+    assert!(process.wait_for_echo_disabled().is_err());
+    assert!(process.finish().status.success());
 }
 
 #[cfg(target_os = "linux")]

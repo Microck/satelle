@@ -5,7 +5,10 @@ use crate::runtime::{
 };
 use crate::storage::IdempotentOperation;
 use crate::test_runtime::FakeComputerUseAdapter;
-use crate::{ApiBearerToken, ApiScopes, HostMode, HostService, MutationAuthority, TurnIntent};
+use crate::{
+    ApiBearerToken, ApiScopes, DoctorTaskRegistry, HostMode, HostService, MutationAuthority,
+    TurnIntent,
+};
 use satelle_core::session::{PublicSession, StopObservation, TurnExecutionMode};
 use satelle_core::{
     ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, SatelleError, SessionId, TurnId,
@@ -2401,6 +2404,7 @@ fn service(state_root: &Path, adapter: ControlledAdapter) -> HostService {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     }
 }
 

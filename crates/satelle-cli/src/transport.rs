@@ -3,6 +3,7 @@ use satelle_core::daemon_service::{
     DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentServiceDecision,
     SetupModeSelection, WindowsServiceConfigV1, WindowsTaskDefinition,
 };
+use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport, ErrorCode,
@@ -13,8 +14,9 @@ use satelle_core::{
     persist_new_owner_only_secret_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
 };
 use satelle_host::{
-    AdmissionCancellation, ApiBearerToken, ApiScopes, DaemonLogPage, HostService, HostStatus,
-    LogCursor, LogPageQuery, TurnIntent, TurnOutcome, admission_request_timeout,
+    AdmissionCancellation, ApiBearerToken, ApiScopes, ControllerTransportProbe, DaemonLogPage,
+    DoctorExecutionFailure, DoctorExecutionResult, HostService, HostStatus, LogCursor,
+    LogPageQuery, TurnIntent, TurnOutcome, admission_request_timeout,
 };
 use satelle_transport::{
     ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
@@ -269,10 +271,11 @@ pub(crate) trait TransportClient {
     ) -> Result<SetupReport, SatelleError>;
     fn doctor(
         &self,
-        scope: Option<&str>,
+        scope_selection: &DoctorScopeSelection,
+        transport_probe: Arc<dyn ControllerTransportProbe>,
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
-    ) -> Result<DoctorReport, SatelleError>;
+    ) -> DoctorExecutionResult;
     fn verify_setup(
         &self,
         request: &satelle_transport::SetupVerificationRequest,
@@ -621,12 +624,18 @@ impl TransportClient for LocalTransport {
 
     fn doctor(
         &self,
-        scope: Option<&str>,
+        scope_selection: &DoctorScopeSelection,
+        transport_probe: Arc<dyn ControllerTransportProbe>,
         options: DoctorOptions,
         provider_intent: &satelle_host::ProviderComputerUseIntent,
-    ) -> Result<DoctorReport, SatelleError> {
-        self.service
-            .doctor_with_provider_intent(&self.alias, scope, options, provider_intent)
+    ) -> DoctorExecutionResult {
+        self.service.doctor_with_provider_intent(
+            &self.alias,
+            scope_selection,
+            transport_probe,
+            options,
+            provider_intent,
+        )
     }
 
     fn verify_setup(
@@ -3366,11 +3375,12 @@ impl TransportClient for SshSetupTransport {
 
     fn doctor(
         &self,
-        _scope: Option<&str>,
+        _scope_selection: &DoctorScopeSelection,
+        _transport_probe: Arc<dyn ControllerTransportProbe>,
         _options: DoctorOptions,
         _provider_intent: &satelle_host::ProviderComputerUseIntent,
-    ) -> Result<DoctorReport, SatelleError> {
-        Err(self.unsupported("doctor"))
+    ) -> DoctorExecutionResult {
+        Err(DoctorExecutionFailure::from(self.unsupported("doctor")))
     }
 
     fn verify_setup(
@@ -3505,11 +3515,12 @@ impl TransportClient for DirectTransport {
 
     fn doctor(
         &self,
-        _scope: Option<&str>,
+        _scope_selection: &DoctorScopeSelection,
+        _transport_probe: Arc<dyn ControllerTransportProbe>,
         _options: DoctorOptions,
         _provider_intent: &satelle_host::ProviderComputerUseIntent,
-    ) -> Result<DoctorReport, SatelleError> {
-        Err(self.unsupported("doctor"))
+    ) -> DoctorExecutionResult {
+        Err(DoctorExecutionFailure::from(self.unsupported("doctor")))
     }
 
     fn verify_setup(

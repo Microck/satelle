@@ -16,6 +16,76 @@ fn turn_intent(prompt: &str) -> TurnIntent {
     TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("valid test Turn intent")
 }
 
+fn doctor_selection(scopes: &[&str]) -> DoctorScopeSelection {
+    DoctorScopeSelection::parse(
+        &scopes
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect::<Vec<_>>(),
+    )
+    .expect("valid Doctor test scopes")
+}
+
+struct ReadyTestTransportProbe;
+
+impl ControllerTransportProbe for ReadyTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
+fn ready_transport() -> ReadyTestTransportProbe {
+    ReadyTestTransportProbe
+}
+
+struct DelayedTestTransportProbe;
+
+impl ControllerTransportProbe for DelayedTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        std::thread::sleep(Duration::from_millis(40));
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
+struct PanickingTestTransportProbe;
+
+impl ControllerTransportProbe for PanickingTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        // Give the independent config worker time to publish its terminal row
+        // before this worker exercises the registry's panic boundary.
+        std::thread::sleep(Duration::from_millis(50));
+        panic!("intentional transport panic");
+    }
+}
+
+struct BlockingTestTransportProbe {
+    started: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ControllerTransportProbe for BlockingTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        self.started.send(()).expect("signal transport start");
+        self.release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv()
+            .expect("release blocking transport");
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
+struct RecordingTestTransportProbe {
+    started: std::sync::mpsc::Sender<()>,
+}
+
+impl ControllerTransportProbe for RecordingTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        self.started.send(()).expect("signal transport start");
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
 #[derive(Clone)]
 struct RecordingTurnExtrasAdapter {
     observations: Arc<Mutex<Vec<TurnExtrasObservation>>>,
@@ -609,6 +679,7 @@ fn service_with_provider_descriptor<A: ComputerUseAdapter>(
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     }
 }
 
@@ -636,6 +707,7 @@ where
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     }
 }
 
@@ -676,6 +748,7 @@ fn service_with_classified_provider_probe(
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     (service, native_probe_calls, provider_probe_calls)
 }
@@ -1135,6 +1208,7 @@ fn local_host_run_and_steer_forward_attachments_and_host_clamped_timeout() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     }
     .with_turn_execution_timeout_for_tests(5);
 
@@ -1205,6 +1279,7 @@ fn unsupported_image_capability_rejects_direct_run_and_steer_before_admission() 
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let image_intent = turn_intent_with_extras("unsupported image", 3);
 
@@ -1286,6 +1361,7 @@ fn configured_remote_alias_reaches_execution_and_session_keeps_host_identity() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
 
     let outcome = service
@@ -1344,9 +1420,14 @@ fn configured_remote_alias_is_accepted_by_host_diagnostics() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let doctor = service
-        .doctor(REMOTE_HOST_ALIAS, None, DoctorOptions::default())
+        .doctor(
+            REMOTE_HOST_ALIAS,
+            &doctor_selection(&[]),
+            DoctorOptions::default(),
+        )
         .expect("doctor should diagnose the already-routed Host alias");
     assert_eq!(doctor.host, REMOTE_HOST_ALIAS);
 
@@ -1442,6 +1523,7 @@ fn unsupported_or_unproven_production_execution_is_blocked_without_state_admissi
             mode: HostMode::Production { snapshot },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
+            doctor_tasks: DoctorTaskRegistry::new(),
         };
         let session_id = SessionId::new();
 
@@ -1560,6 +1642,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let run_failure = run_service
         .run(
@@ -1597,6 +1680,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let initial = seeded
         .run(
@@ -1620,6 +1704,7 @@ fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let steer_failure = steer_service
         .steer(
@@ -1681,6 +1766,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
         mode: HostMode::Production { snapshot },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     let clone = service.clone();
 
@@ -1737,13 +1823,588 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     assert_eq!(sessions.schema_version, HostSessionsSchemaVersion::V1);
     assert_eq!(sessions.host, LOCAL_DEMO_HOST);
     let doctor = clone
-        .doctor(LOCAL_DEMO_HOST, Some("codex"), DoctorOptions::default())
+        .doctor(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["codex"]),
+            DoctorOptions::default(),
+        )
         .expect("non-refresh doctor must read the refreshed snapshot");
     assert!(doctor.findings.iter().any(|finding| {
         finding
             .evidence
             .contains(&"reason=missing_codex_runtime".to_string())
     }));
+}
+
+fn production_doctor_test_service(state: &TestStateDir) -> HostService {
+    let evidence = Phase0CapabilityEvidence {
+        codex_version: CodexVersionEvidence::Detected {
+            version: REQUIRED_CODEX_VERSION,
+        },
+        host_platform: HostPlatform::Linux,
+        capabilities: CapabilityMatrix::unproven(),
+    };
+    let snapshot = Arc::new(RwLock::new(capability_snapshot(evidence, 1)));
+    let adapter = ProductionComputerUseAdapter::new(
+        Arc::clone(&snapshot),
+        Ok(state.path().join("codex-app-server-work")),
+    );
+    HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::Production { snapshot },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    }
+}
+
+#[test]
+fn fatal_doctor_failure_preserves_independent_terminal_probe_results() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let snapshot = Arc::new(RwLock::new(capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    )));
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::Production { snapshot },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let intent = ProviderComputerUseIntent::new(
+        Some(
+            satelle_core::session::EffectiveModelRef::new("failing-model")
+                .expect("valid model alias"),
+        ),
+        Some(
+            satelle_core::session::ProviderBindingRef::new("failing-provider")
+                .expect("valid provider alias"),
+        ),
+        true,
+    )
+    .with_experimental_provider_computer_use(true);
+
+    let failure = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["config", "provider", "transport"]),
+            Arc::new(ready_transport()),
+            DoctorOptions::default(),
+            &intent,
+        )
+        .expect_err("provider binding failure must remain a fatal Doctor outcome");
+
+    assert_eq!(failure.error.code, ErrorCode::ModelProviderBindingMissing);
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| { probe.scope == "config" && probe.status == "passed" })
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| { probe.scope == "transport" && probe.status == "passed" })
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| { probe.scope == "provider" && probe.status == "blocked" })
+    );
+}
+
+#[test]
+fn panicked_doctor_worker_preserves_completed_independent_probe_results() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+
+    let failure = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["config", "transport"]),
+            Arc::new(PanickingTestTransportProbe),
+            DoctorOptions::default(),
+            &ProviderComputerUseIntent::host_default(),
+        )
+        .expect_err("the panicked transport worker must fail Doctor");
+
+    assert_eq!(failure.error.code, ErrorCode::StorageIntegrityFailed);
+    assert_eq!(
+        failure.error.message,
+        "Doctor probe transport panicked inside the owned task registry"
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| probe.scope == "config" && probe.status == "passed"),
+        "the completed independent config row must survive the worker panic"
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .all(|probe| probe.scope != "transport"),
+        "the panicked probe must not be reported as completed evidence"
+    );
+}
+
+#[test]
+fn unrefreshed_provider_probe_keeps_unobserved_readiness_blocked() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["provider"]),
+            Arc::new(ReadyControllerTransportProbe),
+            DoctorOptions::new(false, Some(Duration::from_millis(100)))
+                .expect("positive timeout is valid"),
+            &ProviderComputerUseIntent::host_default(),
+        )
+        .expect("unrefreshed provider Doctor should return its finding");
+    let provider = report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "provider")
+        .expect("provider result");
+
+    assert_eq!(provider.status, "blocked");
+    assert!(
+        provider.finding_ids.iter().any(|finding_id| {
+            finding_id == "production.provider.provider_readiness_not_observed"
+        })
+    );
+    assert!(!report.ready);
+}
+
+#[test]
+fn production_doctor_report_times_the_full_scheduled_invocation() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["transport"]),
+            Arc::new(DelayedTestTransportProbe),
+            DoctorOptions::default(),
+            &ProviderComputerUseIntent::host_default(),
+        )
+        .expect("delayed transport Doctor should return");
+
+    assert_ne!(report.started_at, "2026-07-09T00:00:00Z");
+    assert_ne!(report.finished_at, "2026-07-09T00:00:01Z");
+    assert!(
+        report.duration_ms >= 40,
+        "top-level duration must include the delayed scheduled probe"
+    );
+}
+
+#[test]
+fn non_codex_phase0_findings_do_not_block_the_codex_result() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+    let proven = codex_capabilities::CapabilityEvidence::new(
+        codex_capabilities::EvidenceSurface::Stable,
+        codex_capabilities::LiveProofStatus::Passed,
+    );
+    let mut capabilities = CapabilityMatrix::unproven();
+    capabilities.handshake = proven;
+    capabilities.session_thread_creation = proven;
+    capabilities.turn_start = proven;
+    capabilities.lifecycle_events = proven;
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Windows,
+            capabilities,
+        },
+        1,
+    );
+    let HostMode::Production {
+        snapshot: snapshot_slot,
+    } = &service.mode
+    else {
+        unreachable!("the fixture is a production Host")
+    };
+    *snapshot_slot
+        .write()
+        .expect("production snapshot lock should be available") = snapshot;
+
+    let report = service
+        .doctor(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["codex"]),
+            DoctorOptions::default(),
+        )
+        .expect("scope-aware Codex Doctor should return");
+    let codex = report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "codex")
+        .expect("Codex result");
+
+    assert_eq!(codex.status, "passed", "{report:#?}");
+    assert!(codex.finding_ids.is_empty());
+    assert!(report.ready);
+}
+
+#[test]
+fn queued_probe_receives_its_full_timeout_after_resource_admission() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+    let selection = doctor_selection(&["transport"]);
+    let intent = ProviderComputerUseIntent::host_default();
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+    let first_service = service.clone();
+    let first_selection = selection.clone();
+    let first_intent = intent.clone();
+    let (first_result_tx, first_result_rx) = std::sync::mpsc::channel();
+    let first = std::thread::spawn(move || {
+        let report = first_service.doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &first_selection,
+            Arc::new(BlockingTestTransportProbe {
+                started: first_started_tx,
+                release: Mutex::new(release_first_rx),
+            }),
+            DoctorOptions::new(false, Some(Duration::from_secs(6)))
+                .expect("positive timeout is valid"),
+            &first_intent,
+        );
+        first_result_tx
+            .send(report)
+            .expect("send first Doctor result");
+    });
+    first_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first transport started");
+
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
+    let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
+    let second_service = service.clone();
+    let second_selection = selection.clone();
+    let second_intent = intent.clone();
+    let second = std::thread::spawn(move || {
+        let report = second_service.doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &second_selection,
+            Arc::new(BlockingTestTransportProbe {
+                started: second_started_tx,
+                release: Mutex::new(release_second_rx),
+            }),
+            DoctorOptions::new(false, Some(Duration::from_secs(4)))
+                .expect("positive timeout is valid"),
+            &second_intent,
+        );
+        second_result_tx
+            .send(report)
+            .expect("send second Doctor result");
+    });
+
+    assert!(
+        second_result_rx
+            .recv_timeout(Duration::from_millis(1_500))
+            .is_err(),
+        "queue wait must not consume the second probe's own timeout"
+    );
+    release_first_tx
+        .send(())
+        .expect("release the first active transport");
+    first_result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first Doctor completes")
+        .expect("first Doctor succeeds");
+    first.join().expect("join first Doctor");
+    second_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second transport starts after the resource is released");
+    assert!(
+        second_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .is_err(),
+        "the admitted probe must retain its full execution budget"
+    );
+    release_second_tx
+        .send(())
+        .expect("release the second active transport");
+    let second_report = second_result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second Doctor completes")
+        .expect("second Doctor succeeds");
+    second.join().expect("join second Doctor");
+    assert_eq!(
+        second_report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "transport")
+            .expect("second transport result")
+            .status,
+        "passed"
+    );
+}
+
+#[test]
+fn cleanup_only_probe_bounds_later_admission_with_a_typed_failure() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+    let selection = doctor_selection(&["transport"]);
+    let intent = ProviderComputerUseIntent::host_default();
+    let options = DoctorOptions::new(false, Some(Duration::from_millis(100)))
+        .expect("positive timeout is valid");
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+    let first = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &selection,
+            Arc::new(BlockingTestTransportProbe {
+                started: first_started_tx,
+                release: Mutex::new(release_first_rx),
+            }),
+            options,
+            &intent,
+        )
+        .expect("the first Doctor call publishes its typed probe timeout");
+    first_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first transport started");
+    assert_eq!(
+        first
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "transport")
+            .expect("first transport result")
+            .status,
+        "timed_out"
+    );
+
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
+    let second_service = service.clone();
+    let second_selection = doctor_selection(&["config", "transport"]);
+    let second_intent = intent.clone();
+    let second = std::thread::spawn(move || {
+        let report = second_service.doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &second_selection,
+            Arc::new(RecordingTestTransportProbe {
+                started: second_started_tx,
+            }),
+            options,
+            &second_intent,
+        );
+        second_result_tx
+            .send(report)
+            .expect("send blocked Doctor result");
+    });
+    let error = second_result_rx
+        .recv_timeout(Duration::from_millis(250))
+        .expect("cleanup-only ownership must bound later admission")
+        .expect_err("cleanup-only ownership must bound later admission");
+    assert_eq!(error.error.code, ErrorCode::StateConflict);
+    assert!(
+        error
+            .partial_probe_results
+            .iter()
+            .any(|probe| probe.scope == "config" && probe.status == "passed"),
+        "admission failure must preserve completed independent probe rows"
+    );
+    assert!(
+        error
+            .partial_probe_results
+            .iter()
+            .all(|probe| probe.scope != "transport"),
+        "a probe that never started must not appear as completed evidence"
+    );
+    assert!(
+        second_started_rx.try_recv().is_err(),
+        "the blocked probe must not start before cleanup releases its lock"
+    );
+    release_first_tx
+        .send(())
+        .expect("release the cleanup-only transport");
+    second.join().expect("join blocked Doctor");
+}
+
+#[test]
+fn expired_admission_remains_authoritative_when_capacity_becomes_ready() {
+    let now = Instant::now();
+    let admission_deadlines = BTreeMap::from([
+        ("transport".to_string(), now - Duration::from_millis(1)),
+        ("provider".to_string(), now + Duration::from_secs(1)),
+    ]);
+
+    assert_eq!(
+        expired_doctor_admission(&admission_deadlines, now).as_deref(),
+        Some("transport"),
+        "an expired wait must fail before a newly available slot can admit the probe"
+    );
+}
+
+#[test]
+fn same_batch_spawn_failure_preserves_already_published_rows() {
+    let selection = doctor_selection(&["config"]);
+    let mut scheduler = production_doctor_scheduler(
+        production_doctor_probes(
+            selection.scopes(),
+            None,
+            true,
+            (
+                DEFAULT_NATIVE_READINESS_TIMEOUT,
+                DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
+            ),
+            false,
+        ),
+        DoctorOptions::default(),
+    )
+    .expect("valid config scheduler");
+    let started = scheduler.start_ready();
+    assert_eq!(started.len(), 1);
+    let snapshot_slot = RwLock::new(capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    ));
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let mut request_guard = DoctorRequestGuard::new(registry.clone(), request_id);
+    let mut execution = ProductionDoctorExecution::new();
+    let mut records = Vec::new();
+    apply_production_doctor_registry_events(
+        &registry,
+        vec![DoctorRegistryEvent::Completed {
+            completion_order: (Instant::now(), 1),
+            probe_id: "config".to_string(),
+            completion: DoctorProbeCompletion::new(
+                DoctorProbeStatus::Passed,
+                DoctorDependentEvidence::Useful,
+            ),
+            effect: Box::new(ProductionDoctorTaskEffect::None),
+        }],
+        DoctorOptions::default(),
+        &snapshot_slot,
+        &mut execution,
+        &mut scheduler,
+        &mut records,
+    )
+    .expect("same-batch completion reduction");
+
+    let failure = fail_production_doctor_request(
+        runtime::integrity_error("Doctor worker could not start"),
+        &mut request_guard,
+        &mut execution,
+        LOCAL_DEMO_HOST,
+        &selection,
+        DoctorOptions::default(),
+        ProductionDoctorProjection {
+            scheduler: &scheduler,
+            records: &records,
+            snapshot_slot: &snapshot_slot,
+            fatal_context: true,
+        },
+    )
+    .expect_err("post-start infrastructure failure");
+
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| probe.scope == "config" && probe.status == "passed")
+    );
+}
+
+#[test]
+fn retiring_failed_doctor_request_cancels_and_reaps_remaining_tasks() {
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let probe = DoctorProbe {
+        probe_id: "retired-request-probe".to_string(),
+        scope: "transport".to_string(),
+        dependencies: Vec::new(),
+        resource_locks: Default::default(),
+        timeout: Duration::from_secs(2),
+        cache_policy: DoctorProbeCachePolicy::Reuse,
+    };
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+    registry
+        .spawn(request_id, &probe, move |context| {
+            started_tx.send(()).expect("signal probe start");
+            while !context.is_cancelled() {
+                std::thread::yield_now();
+            }
+            ProductionDoctorTaskResult {
+                completion: DoctorProbeCompletion::new(
+                    DoctorProbeStatus::TimedOut,
+                    DoctorDependentEvidence::NotUseful,
+                ),
+                effect: ProductionDoctorTaskEffect::None,
+            }
+        })
+        .expect("spawn cancellable Doctor task");
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("probe starts before request retirement");
+    let completed_probe = DoctorProbe {
+        probe_id: "retired-request-completed-probe".to_string(),
+        ..probe
+    };
+    registry
+        .spawn(request_id, &completed_probe, move |_context| {
+            ProductionDoctorTaskResult {
+                completion: DoctorProbeCompletion::new(
+                    DoctorProbeStatus::Passed,
+                    DoctorDependentEvidence::Useful,
+                ),
+                effect: ProductionDoctorTaskEffect::None,
+            }
+        })
+        .expect("spawn completing Doctor task");
+    let completion_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        registry.advance(Instant::now());
+        if registry.request_state_counts(request_id) == (1, 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < completion_deadline,
+            "completed sibling must publish its buffered event"
+        );
+        std::thread::yield_now();
+    }
+
+    registry.retire_request(request_id);
+
+    assert_eq!(registry.request_state_counts(request_id), (0, 0));
 }
 
 #[test]
@@ -1833,15 +2494,35 @@ fn production_doctor_filters_requested_scopes_without_relabeling_blockers() {
     );
 
     let transport = production_doctor_report(LOCAL_DEMO_HOST, Some("transport"), &snapshot);
-    assert!(!transport.ready);
+    assert!(transport.ready);
     assert_eq!(transport.scopes, ["transport"]);
-    assert_eq!(transport.findings.len(), 1);
-    assert_eq!(transport.findings[0].scope, "transport");
-    assert_eq!(
-        transport.findings[0].evidence,
-        ["reason=transport_unavailable"]
-    );
+    assert!(transport.findings.is_empty());
+    assert_eq!(transport.probe_results[0].status, "passed");
     assert_eq!(transport.probe_results[0].duration_ms, 0);
+    let blocked_transport = DoctorTransportObservation::blocked(DoctorFinding {
+        finding_id: "transport.selected.failed".to_string(),
+        scope: "transport".to_string(),
+        severity: "error".to_string(),
+        fixability: DoctorFixability::ManualActionRequired,
+        readiness_impact: "blocked".to_string(),
+        summary: "the selected transport failed its live observation".to_string(),
+        evidence: vec!["reason=selected_transport_failed".to_string()],
+        recovery_command: None,
+    });
+    let transport_selection = doctor_selection(&["transport"]);
+    let blocked_transport_report = production_doctor_report_with_selection(
+        LOCAL_DEMO_HOST,
+        &transport_selection,
+        &blocked_transport,
+        DoctorOptions::default(),
+        &snapshot,
+    );
+    assert!(!blocked_transport_report.ready);
+    assert_eq!(blocked_transport_report.probe_results[0].status, "blocked");
+    assert_eq!(
+        blocked_transport_report.findings[0].finding_id,
+        "transport.selected.failed"
+    );
 
     let provider = production_doctor_report(LOCAL_DEMO_HOST, Some("provider"), &snapshot);
     assert!(!provider.ready);
@@ -1901,6 +2582,7 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     service
         .runtime
@@ -1934,15 +2616,21 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
     let report = service
         .doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
-            Some("provider"),
-            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5))),
+            &doctor_selection(&["provider"]),
+            Arc::new(ready_transport()),
+            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5)))
+                .expect("positive timeout"),
             &intent,
         )
         .expect("provider doctor refresh should complete");
 
     assert!(report.ready);
     assert!(report.changed);
-    assert_eq!(report.cache_updates, ["provider_smoke"]);
+    assert_eq!(
+        report.cache_updates,
+        ["native_readiness", "provider_smoke"],
+        "the hidden native prerequisite must report its cache mutation"
+    );
     assert_eq!(report.probe_results.len(), 1);
     assert_eq!(report.probe_results[0].probe_id, "provider.smoke.refresh");
     assert_eq!(report.probe_results[0].cache_status, "refreshed");
@@ -1954,8 +2642,10 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
     let default_report = service
         .doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
-            None,
-            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5))),
+            &doctor_selection(&[]),
+            Arc::new(ready_transport()),
+            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5)))
+                .expect("positive timeout"),
             &intent,
         )
         .expect("default all-scope doctor refresh should include provider refresh");
@@ -1969,6 +2659,80 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
         probe.probe_id == "provider.smoke.refresh" && probe.cache_status == "refreshed"
     }));
     assert_eq!(service.host_status().unwrap().sessions, 0);
+}
+
+#[test]
+fn refresh_projection_preserves_worker_finish_timestamps() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    );
+
+    let mut native_report =
+        production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
+    let native_refresh: Result<ReadinessEvidence, SatelleError> =
+        Err(SatelleError::computer_use_not_ready());
+    apply_native_refresh(
+        &mut native_report,
+        &native_refresh,
+        "2026-07-29T21:00:00Z".to_string(),
+        "2026-07-29T21:00:01Z".to_string(),
+        Duration::from_secs(1),
+        true,
+    );
+    assert_eq!(
+        native_report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "computer-use")
+            .expect("native refresh row")
+            .finished_at,
+        "2026-07-29T21:00:01Z"
+    );
+
+    let mut provider_report =
+        production_doctor_report(LOCAL_DEMO_HOST, Some("provider"), &snapshot);
+    let provider_refresh: Result<AdapterReadiness, SatelleError> =
+        Err(SatelleError::computer_use_not_ready());
+    apply_provider_refresh(
+        &mut provider_report,
+        &provider_refresh,
+        "2026-07-29T21:00:02Z".to_string(),
+        "2026-07-29T21:00:03Z".to_string(),
+        Duration::from_secs(1),
+    );
+    assert_eq!(
+        provider_report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "provider")
+            .expect("provider refresh row")
+            .finished_at,
+        "2026-07-29T21:00:03Z"
+    );
+
+    let mut provider_not_required_report =
+        production_doctor_report(LOCAL_DEMO_HOST, Some("provider"), &snapshot);
+    apply_provider_not_required(
+        &mut provider_not_required_report,
+        "2026-07-29T21:00:04Z".to_string(),
+        "2026-07-29T21:00:05Z".to_string(),
+        Duration::from_secs(1),
+    );
+    let provider_not_required = provider_not_required_report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "provider")
+        .expect("no-smoke provider row");
+    assert_eq!(provider_not_required.started_at, "2026-07-29T21:00:04Z");
+    assert_eq!(provider_not_required.finished_at, "2026-07-29T21:00:05Z");
+    assert_eq!(provider_not_required.duration_ms, 1_000);
 }
 
 #[test]
@@ -2160,6 +2924,7 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     service
         .runtime
@@ -2332,6 +3097,7 @@ fn failed_upstream_validation_returns_only_the_closed_smoke_failed_outcome() {
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
     };
     service
         .runtime
@@ -2478,11 +3244,13 @@ fn doctor_provider_and_default_scopes_report_closed_descriptor_status_without_se
     );
 
     for scope in [None, Some("provider"), Some("all")] {
+        let scopes = scope.map_or_else(Vec::new, |scope| vec![scope]);
         let report = service
             .doctor_with_provider_intent(
                 LOCAL_DEMO_HOST,
-                scope,
-                DoctorOptions::new(false, None),
+                &doctor_selection(&scopes),
+                Arc::new(ready_transport()),
+                DoctorOptions::new(false, None).expect("default timeout is valid"),
                 &intent,
             )
             .expect("read-only doctor should classify its provider descriptor");
@@ -2628,8 +3396,9 @@ fn doctor_reports_a_named_missing_provider_descriptor_without_resolving_it() {
     let report = service
         .doctor_with_provider_intent(
             LOCAL_DEMO_HOST,
-            Some("provider"),
-            DoctorOptions::new(false, None),
+            &doctor_selection(&["provider"]),
+            Arc::new(ready_transport()),
+            DoctorOptions::new(false, None).expect("default timeout is valid"),
             &provider_intent_with_missing_descriptor(),
         )
         .expect("doctor must preserve the missing descriptor as diagnostic evidence");
@@ -2803,6 +3572,7 @@ fn capability_snapshot(
         evidence,
         verdict: evaluate_phase0_support(evidence),
         control_plane_admission: codex_capabilities::ControlPlaneAdmission::not_applicable(),
+        budget_failure: None,
         started_at: "2026-07-09T00:00:00Z".to_string(),
         finished_at: "2026-07-09T00:00:01Z".to_string(),
         duration_ms,
