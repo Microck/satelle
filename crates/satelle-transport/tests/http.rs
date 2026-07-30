@@ -2012,9 +2012,7 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
         address,
         &bootstrap_token,
         &host_identity,
-        &format!(
-            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/unknown-action/start"
-        ),
+        &format!("/v1/maintenance/bootstrap/{operation_id}/action/unknown-action/start"),
         operation_id,
     )
     .send()
@@ -2038,9 +2036,7 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
         address,
         &bootstrap_token,
         &host_identity,
-        &format!(
-            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/service-config/start"
-        ),
+        &format!("/v1/maintenance/bootstrap/{operation_id}/action/service-config/start"),
         operation_id,
     )
     .send()
@@ -2065,9 +2061,7 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
             address,
             &bootstrap_token,
             &host_identity,
-            &format!(
-                "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/{action_id}/start"
-            ),
+            &format!("/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/start"),
             operation_id,
         )
         .send()
@@ -2089,9 +2083,7 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
             address,
             &bootstrap_token,
             &host_identity,
-            &format!(
-                "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/{action_id}/complete"
-            ),
+            &format!("/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/complete"),
             operation_id,
         )
         .send()
@@ -2124,7 +2116,7 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
         address,
         &bootstrap_token,
         &host_identity,
-        &format!("/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/finish"),
+        &format!("/v1/maintenance/bootstrap/{operation_id}/finish"),
         operation_id,
     )
     .send()
@@ -2167,9 +2159,7 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
         address,
         &bootstrap_token,
         &host_identity,
-        &format!(
-            "/v1/maintenance/bootstrap/{failed_operation_id}/persistent-host-service/bootstrap-handoff/start"
-        ),
+        &format!("/v1/maintenance/bootstrap/{failed_operation_id}/action/bootstrap-handoff/start"),
         failed_operation_id,
     )
     .send()
@@ -2182,7 +2172,7 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
         &bootstrap_token,
         &host_identity,
         &format!(
-            "/v1/maintenance/bootstrap/{failed_operation_id}/persistent-host-service/bootstrap-handoff/complete"
+            "/v1/maintenance/bootstrap/{failed_operation_id}/action/bootstrap-handoff/complete"
         ),
         failed_operation_id,
     )
@@ -2196,7 +2186,7 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
         &bootstrap_token,
         &host_identity,
         &format!(
-            "/v1/maintenance/bootstrap/{failed_operation_id}/persistent-host-service/path-set-directories/start"
+            "/v1/maintenance/bootstrap/{failed_operation_id}/action/path-set-directories/start"
         ),
         failed_operation_id,
     )
@@ -2210,7 +2200,7 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
         &bootstrap_token,
         &host_identity,
         &format!(
-            "/v1/maintenance/bootstrap/{failed_operation_id}/persistent-host-service/path-set-directories/fail/remote_command_failed"
+            "/v1/maintenance/bootstrap/{failed_operation_id}/action/path-set-directories/fail/remote_command_failed"
         ),
         failed_operation_id,
     )
@@ -2223,7 +2213,7 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
         address,
         &bootstrap_token,
         &host_identity,
-        &format!("/v1/maintenance/bootstrap/{failed_operation_id}/persistent-host-service/finish"),
+        &format!("/v1/maintenance/bootstrap/{failed_operation_id}/finish"),
         failed_operation_id,
     )
     .send()
@@ -2248,6 +2238,69 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
     );
     assert!(
         failed.actions()[2..]
+            .iter()
+            .all(|action| action.status() == satelle_host::SetupActionStatus::Skipped)
+    );
+
+    let update_operation_id = "host-update-route-proof";
+    let begin_update = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!(
+            "/v1/maintenance/bootstrap/{update_operation_id}/host_binary_replacement/host_update/begin"
+        ),
+        update_operation_id,
+    )
+    .send()
+    .await
+    .expect("begin Host update maintenance");
+    assert_eq!(begin_update.status(), StatusCode::OK);
+    for action_id in [
+        "install-host-artifact",
+        "publish-host-service",
+        "restart-host-daemon",
+        "invalidate-readiness-caches",
+        "host-update-postcheck",
+    ] {
+        let skip = setup_mutation_request(
+            &client,
+            address,
+            &bootstrap_token,
+            &host_identity,
+            &format!("/v1/maintenance/bootstrap/{update_operation_id}/action/{action_id}/skip"),
+            update_operation_id,
+        )
+        .send()
+        .await
+        .expect("skip Host update action");
+        assert_eq!(skip.status(), StatusCode::OK, "skip {action_id}");
+    }
+    let finish_update = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{update_operation_id}/finish"),
+        update_operation_id,
+    )
+    .send()
+    .await
+    .expect("finish Host update maintenance");
+    assert_eq!(finish_update.status(), StatusCode::OK);
+    let update = service
+        .load_setup_run(update_operation_id)
+        .expect("load Host update ledger")
+        .expect("Host update ledger exists");
+    assert_eq!(
+        update.operation_kind(),
+        satelle_host::SetupOperationKind::HostUpdate
+    );
+    assert_eq!(update.status(), satelle_host::SetupRunStatus::Completed);
+    assert!(
+        update
+            .actions()
             .iter()
             .all(|action| action.status() == satelle_host::SetupActionStatus::Skipped)
     );
@@ -2330,16 +2383,16 @@ async fn persistent_host_lifecycle_maintenance_uses_exact_single_action_plans() 
             .begin_persistent_host_stop_maintenance(stop_operation)
             .expect("active durable control token begins Host stop");
         durable_client
-            .start_persistent_service_action(stop_operation, "service-restart")
+            .start_maintenance_action(stop_operation, "service-restart")
             .expect_err("Host stop rejects the restart action");
         durable_client
-            .start_persistent_service_action(stop_operation, "service-stop")
+            .start_maintenance_action(stop_operation, "service-stop")
             .expect("start Host stop action");
         durable_client
-            .complete_persistent_service_action(stop_operation, "service-stop")
+            .complete_maintenance_action(stop_operation, "service-stop")
             .expect("complete Host stop action");
         durable_client
-            .finish_persistent_service_maintenance(stop_operation)
+            .finish_maintenance_plan(stop_operation)
             .expect("finish Host stop maintenance");
 
         let restart_operation = "persistent-host-restart-lifecycle";
@@ -2347,16 +2400,16 @@ async fn persistent_host_lifecycle_maintenance_uses_exact_single_action_plans() 
             .begin_persistent_host_restart_maintenance(restart_operation)
             .expect("admin bootstrap begins Host restart");
         bootstrap_client
-            .start_persistent_service_action(restart_operation, "service-stop")
+            .start_maintenance_action(restart_operation, "service-stop")
             .expect_err("Host restart rejects the stop action");
         bootstrap_client
-            .start_persistent_service_action(restart_operation, "service-restart")
+            .start_maintenance_action(restart_operation, "service-restart")
             .expect("start Host restart action");
         bootstrap_client
-            .complete_persistent_service_action(restart_operation, "service-restart")
+            .complete_maintenance_action(restart_operation, "service-restart")
             .expect("complete Host restart action");
         bootstrap_client
-            .finish_persistent_service_maintenance(restart_operation)
+            .finish_maintenance_plan(restart_operation)
             .expect("finish Host restart maintenance");
     })
     .await

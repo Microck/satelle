@@ -2485,6 +2485,24 @@ impl RuntimeHandle {
         })
     }
 
+    pub(crate) fn run_default_maintenance_postcheck(
+        &self,
+        operation: &mut MaintenanceOperationHandle,
+        postcheck_action_id: &str,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        let engine = self.engine()?;
+        let key = engine
+            .adapter
+            .readiness_cache_key(
+                crate::LOCAL_DEMO_HOST,
+                &crate::ProviderComputerUseIntent::host_default(),
+            )?
+            .ok_or_else(|| {
+                model::integrity_failure("the native readiness postcheck key is unavailable")
+            })?;
+        self.run_maintenance_postcheck(operation, &key, postcheck_action_id)
+    }
+
     pub(crate) fn finish_setup_run(
         &self,
         operation: &mut MaintenanceOperationHandle,

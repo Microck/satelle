@@ -586,11 +586,20 @@ impl Storage {
             ];
         let persistent_host_stop = action_ids == ["service-stop"];
         let persistent_host_restart = action_ids == ["service-restart"];
+        let host_update = action_ids
+            == [
+                "install-host-artifact",
+                "publish-host-service",
+                "restart-host-daemon",
+                "invalidate-readiness-caches",
+                "host-update-postcheck",
+            ];
         if plan.run_id != owner.operation_id
             || (!on_demand_handoff
                 && !persistent_host_service
                 && !persistent_host_stop
-                && !persistent_host_restart)
+                && !persistent_host_restart
+                && !host_update)
         {
             return Err(StorageError::new(StorageErrorKind::InvalidInput));
         }
@@ -1809,21 +1818,30 @@ fn require_run_and_predecessor_times(
     let mut statement = transaction
         .prepare(
             "SELECT predecessor.status, predecessor.finished_at
-             FROM setup_actions AS predecessor
-             JOIN setup_actions AS current
-               ON current.run_id = predecessor.run_id
+             FROM setup_actions AS current
+             LEFT JOIN setup_actions AS predecessor
+               ON predecessor.run_id = current.run_id
+              AND predecessor.action_order < current.action_order
              WHERE current.run_id = ?1 AND current.action_id = ?2
-               AND predecessor.action_order < current.action_order",
+             ORDER BY predecessor.action_order",
         )
         .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
     let rows = statement
         .query_map(params![run_id, action_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
         })
         .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+    let mut action_exists = false;
     for row in rows {
         let (status, finished_at) =
             row.map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+        action_exists = true;
+        let Some(status) = status else {
+            continue;
+        };
         if matches!(
             SetupActionStatus::parse(&status)?,
             SetupActionStatus::Completed
@@ -1835,6 +1853,9 @@ fn require_run_and_predecessor_times(
                 .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
             require_not_before(transition_at, &finished_at)?;
         }
+    }
+    if !action_exists {
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
     }
     Ok(())
 }
@@ -1855,7 +1876,7 @@ fn require_started_action_time(
         .optional()
         .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
     let Some((status, started_at)) = action else {
-        return Err(StorageError::new(StorageErrorKind::StateConflict));
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
     };
     if SetupActionStatus::parse(&status)? != SetupActionStatus::Started {
         return Err(StorageError::new(StorageErrorKind::StateConflict));

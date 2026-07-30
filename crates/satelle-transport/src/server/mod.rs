@@ -852,20 +852,28 @@ fn router(state: Arc<DaemonState>) -> Router {
             post(setup::begin_bootstrap_maintenance),
         )
         .route(
-            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/{action_id}/start",
-            post(setup::start_persistent_service_action),
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/start",
+            post(setup::start_maintenance_action),
         )
         .route(
-            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/{action_id}/complete",
-            post(setup::complete_persistent_service_action),
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/complete",
+            post(setup::complete_maintenance_action),
         )
         .route(
-            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/{action_id}/fail/{failure_kind}",
-            post(setup::fail_persistent_service_action),
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/skip",
+            post(setup::skip_maintenance_action),
         )
         .route(
-            "/v1/maintenance/bootstrap/{operation_id}/persistent-host-service/finish",
-            post(setup::finish_persistent_service_maintenance),
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/fail/{failure_kind}",
+            post(setup::fail_maintenance_action),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/postcheck",
+            post(setup::run_maintenance_postcheck),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/finish",
+            post(setup::finish_maintenance_plan),
         )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),

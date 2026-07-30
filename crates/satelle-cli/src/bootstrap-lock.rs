@@ -15,6 +15,7 @@ const COMMIT_REQUIRED_MUTATION_PHASES: &[&str] = &[
     "persistent_maintenance_begin",
     "persistent_action_start",
     "persistent_action_complete",
+    "persistent_action_skip",
     "persistent_action_fail",
     "persistent_maintenance_finish",
 ];
@@ -33,6 +34,7 @@ const SUCCESS_MUTATION_PHASES: &[&str] = &[
 const RECOVERABLE_OPERATION_KINDS: &[&str] = &[
     "initial_setup",
     "missing_daemon_repair",
+    "host_binary_replacement",
     "service_stop",
     "service_restart",
 ];
@@ -53,6 +55,7 @@ fn posix_pattern(values: &[&str]) -> String {
 pub(super) enum OperationKind {
     InitialSetup,
     MissingDaemonRepair,
+    HostBinaryReplacement,
     ServiceStop,
     ServiceRestart,
 }
@@ -62,6 +65,7 @@ impl OperationKind {
         match self {
             Self::InitialSetup => "initial_setup",
             Self::MissingDaemonRepair => "missing_daemon_repair",
+            Self::HostBinaryReplacement => "host_binary_replacement",
             Self::ServiceStop => "service_stop",
             Self::ServiceRestart => "service_restart",
         }
@@ -1377,7 +1381,7 @@ mod tests {
         let script = request().windows_script();
         assert!(
             script.contains(
-                "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'service_stop', 'service_restart')"
+                "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement', 'service_stop', 'service_restart')"
             )
         );
     }
@@ -2715,6 +2719,7 @@ mod tests {
                 "persistent_maintenance_begin",
                 "persistent_action_start",
                 "persistent_action_complete",
+                "persistent_action_skip",
                 "persistent_action_fail",
                 "persistent_maintenance_finish",
             ]
@@ -2739,6 +2744,7 @@ mod tests {
             &[
                 "initial_setup",
                 "missing_daemon_repair",
+                "host_binary_replacement",
                 "service_stop",
                 "service_restart",
             ]
@@ -2755,10 +2761,10 @@ mod tests {
             assert_eq!(windows.matches(phase).count(), 2, "Windows {phase}");
         }
         assert!(posix.contains(
-            "case \"$claim_operation_kind\" in initial_setup|missing_daemon_repair|service_stop|service_restart)"
+            "case \"$claim_operation_kind\" in initial_setup|missing_daemon_repair|host_binary_replacement|service_stop|service_restart)"
         ));
         assert!(windows.contains(
-            "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'service_stop', 'service_restart')"
+            "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement', 'service_stop', 'service_restart')"
         ));
     }
 
@@ -2838,6 +2844,10 @@ mod tests {
         assert_eq!(
             OperationKind::MissingDaemonRepair.as_str(),
             "missing_daemon_repair"
+        );
+        assert_eq!(
+            OperationKind::HostBinaryReplacement.as_str(),
+            "host_binary_replacement"
         );
         assert_eq!(OperationKind::ServiceStop.as_str(), "service_stop");
         assert_eq!(OperationKind::ServiceRestart.as_str(), "service_restart");

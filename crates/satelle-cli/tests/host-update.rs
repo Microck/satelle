@@ -29,6 +29,10 @@ fn host_update_dry_run_emits_the_v1_plan_before_any_apply_boundary() {
     let report: Value = serde_json::from_slice(&output.stdout).expect("parse update report");
     assert_eq!(report["schema_version"], "satelle.host.update.v1");
     assert_eq!(report["host"], "local-demo");
+    assert_eq!(report["status"], "up_to_date");
+    assert_eq!(report["reusable_plan"], false);
+    assert_eq!(report["changed"], false);
+    assert_eq!(report["applied_actions"], serde_json::json!([]));
     assert_eq!(report["checked_components"], serde_json::json!(["host"]));
     assert!(report["targets"].as_array().is_some_and(|targets| {
         !targets.is_empty()
@@ -39,6 +43,57 @@ fn host_update_dry_run_emits_the_v1_plan_before_any_apply_boundary() {
                     && target["remote_mutations"].is_array()
             })
     }));
+}
+
+#[test]
+fn current_host_update_exits_without_confirmation_or_mutation() {
+    let state = tempfile::tempdir().expect("temporary update state");
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "host",
+            "update",
+            "--host",
+            "local-demo",
+            "--component",
+            "host",
+            "--json",
+        ])
+        .output()
+        .expect("run current Host update");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).expect("parse update report");
+    assert_eq!(report["status"], "up_to_date");
+    assert_eq!(report["changed"], false);
+    assert_eq!(report["confirmation_required"], false);
+}
+
+#[test]
+fn quiet_current_host_update_has_no_output() {
+    let state = tempfile::tempdir().expect("temporary update state");
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "host",
+            "update",
+            "--host",
+            "local-demo",
+            "--component",
+            "host",
+            "--quiet",
+        ])
+        .output()
+        .expect("run quiet current Host update");
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }
 
 #[test]

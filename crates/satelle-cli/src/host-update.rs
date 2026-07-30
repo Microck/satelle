@@ -54,6 +54,7 @@ pub struct CodexUpdateInspection {
     pub current_version: Option<String>,
     pub target_version: String,
     pub update_required: bool,
+    pub automation_is_safe: bool,
     pub restart_impact: HostUpdateRestartImpact,
     pub remote_mutations: Vec<HostUpdateMutation>,
 }
@@ -195,7 +196,7 @@ fn plan_host_targets(
     };
     let daemon_mutations = mutation_for(
         disposition,
-        "replace_host_daemon",
+        "install-host-artifact",
         artifact.daemon_destination,
     );
     let mut targets = vec![HostUpdateTargetPlan {
@@ -236,7 +237,7 @@ fn plan_host_targets(
             restart_impact: HostUpdateRestartImpact::HostDaemon,
             remote_mutations: mutation_for(
                 disposition,
-                "replace_host_daemon_service",
+                "publish-host-service",
                 Some(service.destination.clone()),
             ),
         });
@@ -284,7 +285,9 @@ fn plan_codex_targets(
                 current_version: inspection.current_version.clone(),
                 target_version: inspection.target_version.clone(),
                 version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
-                disposition: if inspection.update_required {
+                disposition: if inspection.update_required && !inspection.automation_is_safe {
+                    HostUpdateDisposition::SkippedUnsupported
+                } else if inspection.update_required {
                     if inspection.current_version.is_some() {
                         HostUpdateDisposition::Update
                     } else {
@@ -314,9 +317,12 @@ pub fn codex_inspections_from_evidence(
             current_version: evidence.runtime_current_version.clone(),
             target_version: evidence.required_version.clone(),
             update_required: evidence.runtime_update_required,
+            // Codex installation ownership is known, but no current transport
+            // owns a safe replacement executor.
+            automation_is_safe: false,
             restart_impact: HostUpdateRestartImpact::CodexRuntime,
             remote_mutations: vec![HostUpdateMutation {
-                operation: "replace_codex_runtime".to_string(),
+                operation: "replace-codex-runtime".to_string(),
                 remote_path: None,
             }],
         },
@@ -326,9 +332,10 @@ pub fn codex_inspections_from_evidence(
             current_version: evidence.native_component_current_version.clone(),
             target_version: evidence.required_version.clone(),
             update_required: evidence.native_update_required,
+            automation_is_safe: false,
             restart_impact: HostUpdateRestartImpact::NativeComputerUse,
             remote_mutations: vec![HostUpdateMutation {
-                operation: "replace_codex_native_computer_use".to_string(),
+                operation: "replace-codex-native-computer-use".to_string(),
                 remote_path: None,
             }],
         },
@@ -400,6 +407,27 @@ pub fn render_host_update_plan(report: &HostUpdateReport) -> String {
         for mutation in &target.remote_mutations {
             let _ = writeln!(output, "  planned remote mutation: {}", mutation.operation);
         }
+    }
+    output
+}
+
+pub fn render_host_update_result(report: &HostUpdateReport) -> String {
+    let mut output = format!(
+        "Host update status for {}: {:?}\n",
+        report.host, report.status
+    );
+    for action in &report.applied_actions {
+        let _ = writeln!(output, "- applied: {action}");
+    }
+    for action in &report.skipped_actions {
+        let _ = writeln!(output, "- skipped: {action}");
+    }
+    for postcheck in &report.postcheck_results {
+        let _ = writeln!(
+            output,
+            "- postcheck {}: {:?} ({})",
+            postcheck.check_id, postcheck.status, postcheck.summary
+        );
     }
     output
 }
@@ -483,9 +511,10 @@ mod tests {
                 current_version: Some("0.9.0".to_string()),
                 target_version: "1.0.0".to_string(),
                 update_required: true,
+                automation_is_safe: true,
                 restart_impact: HostUpdateRestartImpact::CodexRuntime,
                 remote_mutations: vec![HostUpdateMutation {
-                    operation: "replace_codex_runtime".to_string(),
+                    operation: "replace-codex-runtime".to_string(),
                     remote_path: None,
                 }],
             },
@@ -495,9 +524,10 @@ mod tests {
                 current_version: None,
                 target_version: "1.0.0".to_string(),
                 update_required: true,
+                automation_is_safe: true,
                 restart_impact: HostUpdateRestartImpact::NativeComputerUse,
                 remote_mutations: vec![HostUpdateMutation {
-                    operation: "install_codex_native_computer_use".to_string(),
+                    operation: "install-codex-native-computer-use".to_string(),
                     remote_path: None,
                 }],
             },
@@ -678,6 +708,7 @@ mod tests {
             current_version: None,
             target_version: "1.0.0".to_string(),
             update_required: true,
+            automation_is_safe: false,
             restart_impact: HostUpdateRestartImpact::NativeComputerUse,
             remote_mutations: Vec::new(),
         }];
@@ -699,6 +730,46 @@ mod tests {
             error,
             HostUpdatePlanError::AmbiguousCodexComponentOwnership { .. }
         ));
+    }
+
+    #[test]
+    fn unsafe_owned_codex_update_is_a_skipped_manual_action() {
+        let host = host_inspection(HostVersionRelation::MatchesCli);
+        let codex = [CodexUpdateInspection {
+            target: HostUpdateTarget::CodexRuntime,
+            ownership: CodexComponentOwnership::CodexOwned,
+            current_version: Some("0.9.0".to_string()),
+            target_version: "1.0.0".to_string(),
+            update_required: true,
+            automation_is_safe: false,
+            restart_impact: HostUpdateRestartImpact::CodexRuntime,
+            remote_mutations: vec![HostUpdateMutation {
+                operation: "replace-codex-runtime".to_string(),
+                remote_path: None,
+            }],
+        }];
+        let report = build_host_update_plan(
+            HostUpdatePlanRequest {
+                host: "office",
+                cli_version: "1.2.3",
+                components: &[HostUpdateComponent::Codex],
+                includes_all: false,
+                host_inspection: &host,
+                service_inspection: None,
+                codex_inspections: &codex,
+            },
+            &artifact(),
+        )
+        .expect("build manual Codex update report");
+
+        assert_eq!(
+            report.status,
+            satelle_core::host_update::HostUpdateStatus::ManualActionRequired
+        );
+        assert!(!report.confirmation_required);
+        assert_eq!(report.skipped_actions, ["replace-codex-runtime"]);
+        assert!(report.planned_actions.is_empty());
+        assert!(report.postcheck_results.is_empty());
     }
 
     #[test]

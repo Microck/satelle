@@ -783,7 +783,8 @@ pub(super) async fn begin_bootstrap_maintenance(
         }
         satelle_host::BootstrapMaintenancePlanKind::PersistentHostService
         | satelle_host::BootstrapMaintenancePlanKind::PersistentHostStop
-        | satelle_host::BootstrapMaintenancePlanKind::PersistentHostRestart => {
+        | satelle_host::BootstrapMaintenancePlanKind::PersistentHostRestart
+        | satelle_host::BootstrapMaintenancePlanKind::HostUpdate => {
             persistent_service_maintenance_principal_is_authorized(&authorized)
         }
     };
@@ -812,62 +813,96 @@ pub(super) async fn begin_bootstrap_maintenance(
     }
 }
 
-pub(super) async fn start_persistent_service_action(
+pub(super) async fn start_maintenance_action(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
     Path((operation_id, action_id)): Path<(String, String)>,
 ) -> Response {
-    run_persistent_service_transition(
+    run_maintenance_transition(
         state,
         authorized,
         operation_id,
-        move |service, operation| service.start_bootstrap_service_action(operation, &action_id),
+        move |service, operation| service.start_bootstrap_maintenance_action(operation, &action_id),
     )
     .await
 }
 
-pub(super) async fn complete_persistent_service_action(
+pub(super) async fn complete_maintenance_action(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
     Path((operation_id, action_id)): Path<(String, String)>,
 ) -> Response {
-    run_persistent_service_transition(
-        state,
-        authorized,
-        operation_id,
-        move |service, operation| service.complete_bootstrap_service_action(operation, &action_id),
-    )
-    .await
-}
-
-pub(super) async fn fail_persistent_service_action(
-    State(state): State<Arc<DaemonState>>,
-    Extension(authorized): Extension<AuthorizedRequest>,
-    Path((operation_id, action_id, failure_kind)): Path<(String, String, String)>,
-) -> Response {
-    run_persistent_service_transition(
+    run_maintenance_transition(
         state,
         authorized,
         operation_id,
         move |service, operation| {
-            service.fail_bootstrap_service_action(operation, &action_id, &failure_kind)
+            service.complete_bootstrap_maintenance_action(operation, &action_id)
         },
     )
     .await
 }
 
-pub(super) async fn finish_persistent_service_maintenance(
+pub(super) async fn skip_maintenance_action(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path((operation_id, action_id)): Path<(String, String)>,
+) -> Response {
+    run_maintenance_transition(
+        state,
+        authorized,
+        operation_id,
+        move |service, operation| service.skip_bootstrap_maintenance_action(operation, &action_id),
+    )
+    .await
+}
+
+pub(super) async fn fail_maintenance_action(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path((operation_id, action_id, failure_kind)): Path<(String, String, String)>,
+) -> Response {
+    run_maintenance_transition(
+        state,
+        authorized,
+        operation_id,
+        move |service, operation| {
+            service.fail_bootstrap_maintenance_action(operation, &action_id, &failure_kind)
+        },
+    )
+    .await
+}
+
+pub(super) async fn finish_maintenance_plan(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
     Path(operation_id): Path<String>,
 ) -> Response {
-    run_persistent_service_transition(state, authorized, operation_id, |service, operation| {
-        service.finish_bootstrap_service_maintenance(operation)
+    run_maintenance_transition(state, authorized, operation_id, |service, operation| {
+        service.finish_bootstrap_maintenance_plan(operation)
     })
     .await
 }
 
-async fn run_persistent_service_transition(
+pub(super) async fn run_maintenance_postcheck(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path((operation_id, action_id)): Path<(String, String)>,
+) -> Response {
+    run_maintenance_transition(
+        state,
+        authorized,
+        operation_id,
+        move |service, operation| {
+            service
+                .run_bootstrap_maintenance_postcheck(operation, &action_id)
+                .map(|_| ())
+        },
+    )
+    .await
+}
+
+async fn run_maintenance_transition(
     state: Arc<DaemonState>,
     authorized: AuthorizedRequest,
     operation_id: String,
