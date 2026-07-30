@@ -2557,6 +2557,57 @@ websocket_inbound_messages_per_minute = 67
 }
 
 #[cfg(test)]
+mod ssh_bootstrap_config_tests {
+    use super::*;
+
+    #[test]
+    fn user_config_accepts_ssh_bootstrap_and_rejects_unknown_nested_keys() {
+        let parsed = parse_user_config(
+            Path::new("/test/config.toml"),
+            r#"
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://remote.example.test"
+
+[hosts.remote.ssh_bootstrap]
+address = "operator@remote.example.test"
+"#,
+        )
+        .expect("parse operator-owned SSH bootstrap config");
+        assert_eq!(
+            parsed.config.hosts["remote"]
+                .ssh_bootstrap
+                .as_ref()
+                .expect("retain SSH bootstrap config")
+                .address,
+            "operator@remote.example.test"
+        );
+
+        let error = parse_user_config(
+            Path::new("/test/config.toml"),
+            r#"
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://remote.example.test"
+
+[hosts.remote.ssh_bootstrap]
+address = "operator@remote.example.test"
+port = 22
+"#,
+        )
+        .expect_err("reject unknown SSH bootstrap keys");
+        assert_eq!(error.code, ErrorCode::UnknownConfigKey);
+        assert_eq!(
+            error.details["unknown_keys"][0]["path"],
+            "hosts.remote.ssh_bootstrap.port"
+        );
+        assert_eq!(error.details["unknown_keys"][0]["key"], "port");
+    }
+}
+
+#[cfg(test)]
 mod trusted_profile_config_tests {
     use super::*;
 
@@ -3576,6 +3627,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "adapter",
                     "address",
                     "network",
+                    "ssh_bootstrap",
                     "timeouts",
                     "native_readiness_cache_ttl",
                     "provider_smoke_success_cache_ttl",
@@ -3608,6 +3660,18 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     &format!("{host_path}.network"),
                     network_table,
                     &["provider", "tailnet_name", "hostname"],
+                    &mut unknown_keys,
+                );
+            }
+
+            if let Some(ssh_bootstrap_table) = host_table
+                .get("ssh_bootstrap")
+                .and_then(toml::Value::as_table)
+            {
+                collect_unknown_keys_for_table(
+                    &format!("{host_path}.ssh_bootstrap"),
+                    ssh_bootstrap_table,
+                    &["address"],
                     &mut unknown_keys,
                 );
             }

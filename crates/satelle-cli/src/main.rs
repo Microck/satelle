@@ -5666,38 +5666,25 @@ fn show_paths(
         print_json(&output).map_err(failure)
     } else {
         println!("Host: {}", output["host"].as_str().unwrap_or_default());
-        println!(
-            "Config: {}",
-            output["config_file"].as_str().unwrap_or_default()
-        );
-        println!(
-            "Cache: {}",
-            output["cache_root"].as_str().unwrap_or_default()
-        );
-        println!(
-            "State: {}",
-            output["state_root"].as_str().unwrap_or_default()
-        );
-        println!(
-            "SQLite: {}",
-            output["sqlite_store"].as_str().unwrap_or_default()
-        );
-        println!(
-            "Operator logs: {}",
-            output["operator_log_root"].as_str().unwrap_or_default()
-        );
-        println!(
-            "Recordings: {}",
-            output["recording_root"].as_str().unwrap_or_default()
-        );
-        println!(
-            "Project config: {}",
-            output["project_config_file"].as_str().unwrap_or_default()
-        );
-        println!(
-            "Install receipt: {}",
-            output["install_receipt"].as_str().unwrap_or_default()
-        );
+        if let Some(observation_source) = output["observation_source"].as_str() {
+            println!("Observation source: {observation_source}");
+        }
+        for (label, field) in [
+            ("Config", "config_file"),
+            ("Cache", "cache_root"),
+            ("State", "state_root"),
+            ("SQLite", "sqlite_store"),
+            ("Operator logs", "operator_log_root"),
+            ("Recordings", "recording_root"),
+            ("Project config", "project_config_file"),
+            ("Install receipt", "install_receipt"),
+        ] {
+            println!(
+                "{label} [{}]: {}",
+                output["sources"][field].as_str().unwrap_or_default(),
+                output[field].as_str().unwrap_or_default()
+            );
+        }
         Ok(())
     }
 }

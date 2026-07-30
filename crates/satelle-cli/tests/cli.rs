@@ -5211,6 +5211,34 @@ fn paths_json_uses_satelle_home_and_explicit_overrides() {
     );
 }
 
+#[test]
+fn paths_human_output_identifies_each_path_source() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["paths"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let output = String::from_utf8(output.stdout).expect("paths output is UTF-8");
+
+    assert!(output.contains("State [explicit_environment]:"));
+    assert!(output.contains("SQLite [explicit_environment]:"));
+    assert!(output.contains("Recordings [explicit_environment]:"));
+    assert!(output.contains("Config [os_default]:"));
+
+    let host_output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["paths", "--host", "local-demo"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let host_output = String::from_utf8(host_output.stdout).expect("Host paths output is UTF-8");
+    assert!(host_output.contains("Observation source: host_reported"));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn paths_json_uses_the_native_macos_operator_log_root() {
