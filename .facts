@@ -1116,21 +1116,21 @@
 - satelle MVP does not support ambiguous path override names such as SATELLE_CONFIG, SATELLE_STATE, SATELLE_CACHE, or SATELLE_LOG @spec @mvp @implemented
 - satelle path override environment variables apply only to the Satelle process that receives the environment variable @implemented @mvp
 - satelle local CLI path override environment variables do not change daemon storage paths unless host setup or service configuration sets matching daemon path overrides @implemented @mvp
-- satelle paths output identifies each resolved path source as os_default, satelle_home, explicit_environment, service_config, project_discovery, or host_reported @spec @mvp
+- satelle paths output identifies each resolved path source as os_default, satelle_home, explicit_environment, service_config, project_discovery, or host_reported @spec @mvp @implemented
 - satelle exposes a read-only satelle paths command that prints the resolved Satelle Path Set for the local CLI user by default @implemented @mvp
-- satelle paths supports --host <alias> to request the resolved Satelle Path Set from a configured remote Host Daemon @spec @mvp
+- satelle paths supports --host <alias> to request the resolved Satelle Path Set from a configured remote Host Daemon @spec @mvp @implemented
 - satelle paths supports --json with stable keys for config_file, cache_root, state_root, sqlite_store, operator_log_root, recording_root, project_config_file, and install_receipt @implemented @mvp
 - satelle exposes a read-only satelle host sessions command that lists active compatible Satelle Desktop Sessions for a configured host alias @implemented @mvp
-- satelle host sessions first attempts the configured direct Host Daemon connection before using SSH bootstrap @spec @mvp
-- satelle host sessions may use SSH bootstrap to start an on-demand Host Daemon inspection process when the direct Host Daemon connection is unavailable and the host alias has SSH bootstrap configuration @spec @mvp
-- satelle host sessions SSH bootstrap mode does not install, register, update, or configure a persistent Host Daemon service @spec @mvp
-- satelle host sessions SSH bootstrap mode may upload or verify the invoking local CLI release's matching host artifact only when that artifact is needed to run the on-demand inspection process @spec @mvp
-- satelle host sessions SSH bootstrap mode stops or disconnects from its on-demand inspection process after the session listing unless another active Satelle command has claimed the same process @spec @mvp
+- satelle host sessions first attempts the configured direct Host Daemon connection before using SSH bootstrap @spec @mvp @implemented
+- satelle host sessions may use SSH bootstrap to start an on-demand Host Daemon inspection process when the direct Host Daemon connection is unavailable and the host alias has SSH bootstrap configuration @spec @mvp @implemented
+- satelle host sessions SSH bootstrap mode does not install, register, update, or configure a persistent Host Daemon service @spec @mvp @implemented
+- satelle host sessions SSH bootstrap mode may upload or verify the invoking local CLI release's matching host artifact only when that artifact is needed to run the on-demand inspection process @spec @mvp @implemented
+- satelle host sessions SSH bootstrap mode stops or disconnects from its on-demand inspection process after the session listing unless another active Satelle command has claimed the same process @spec @mvp @implemented
 - satelle host sessions non-quiet human output states whether results came from direct Host Daemon connection or SSH bootstrap @implemented @mvp
 - satelle host sessions --json includes connection_mode, bootstrapped, bootstrap_actions, and host_daemon_version fields @implemented @mvp
-- satelle host sessions supports --no-bootstrap to require an already reachable Host Daemon connection and fail instead of starting an SSH-bootstrap inspection process @spec @mvp
-- satelle host sessions reports a typed host-daemon-unreachable diagnostic when --no-bootstrap is set and no configured direct Host Daemon connection is reachable @spec @mvp
-- satelle host sessions reports a typed ssh-bootstrap-unavailable diagnostic when no direct Host Daemon is reachable and the host alias lacks SSH bootstrap configuration @spec @mvp
+- satelle host sessions supports --no-bootstrap to require an already reachable Host Daemon connection and fail instead of starting an SSH-bootstrap inspection process @spec @mvp @implemented
+- satelle host sessions reports a typed host-daemon-unreachable diagnostic when --no-bootstrap is set and no configured direct Host Daemon connection is reachable @spec @mvp @implemented
+- satelle host sessions reports a typed ssh-bootstrap-unavailable diagnostic when no direct Host Daemon is reachable and the host alias lacks SSH bootstrap configuration @spec @mvp @implemented
 - satelle host sessions MVP returns session metadata only and does not include screenshots, thumbnails, window previews, or captured frame data @implemented @mvp
 - satelle host sessions does not request OS screen-recording or screen-capture permissions, launch capture pickers, or create recording artifacts @implemented @mvp
 - satelle host sessions display_summary intentionally avoids window titles, app names, page titles, clipboard contents, and other visible desktop content @implemented @mvp
@@ -1145,7 +1145,7 @@
 - satelle treats a Git repository root as a helpful boundary for project discovery when present but does not require Git for project configuration @spec @mvp @implemented
 - satelle project-level configuration discovery stops at the nearest .satelle/config.toml and does not merge parent project configuration files in MVP @implemented @mvp
 - satelle treats project-level configuration as untrusted repository input @spec @mvp @implemented
-- satelle project-level configuration is limited to non-secret shared Host Aliases, model and provider intent, output defaults, timeout defaults, and non-authoritative transport preferences @spec @mvp
+- satelle project-level configuration is limited to non-secret shared Host Aliases, model and provider intent, output defaults, timeout defaults, and non-authoritative transport preferences @spec @mvp @implemented
 - every project-declared Host Alias resolves through a user-level Satelle Host Binding before remote communication or mutation begins @spec @mvp @implemented
 - a user-level Host Binding is selectable by project configuration only when that exact binding sets allow_project_selection = true @spec @mvp @implemented
 - project Host selection permission is scoped to one exact Host Alias and does not grant mutation consent, YOLO, provider-secret consent, Trusted Profile consent, or sensitive-export consent @spec @mvp @implemented
@@ -1154,8 +1154,8 @@
 - satelle project-level configuration cannot define or override a concrete network address, SSH destination, direct API URL, TLS trust material, bearer-token descriptor, Tailscale node identity, Desktop Binding, daemon path, provider endpoint binding, or provider credential binding @spec @mvp @implemented
 - a project transport preference is accepted only when its transport kind exactly matches the user-level Host Binding, while the concrete destination and authentication details remain exclusively user-owned @spec @mvp @implemented
 - satelle configuration merging never allows a project object to replace a user-owned Host Binding as a whole object @spec @mvp @implemented
-- satelle preflight reports when Host, model, provider, profile, timeout, or transport intent came from project-level configuration @spec @mvp
-- project-level output defaults cannot suppress Host identity, desktop target, YOLO, authority, consent, or sensitive-export warnings required by the selected command @spec @mvp
+- satelle preflight reports when Host, model, provider, profile, timeout, or transport intent came from project-level configuration @spec @mvp @implemented
+- project-level output defaults cannot suppress Host identity, desktop target, YOLO, authority, consent, or sensitive-export warnings required by the selected command @spec @mvp @implemented
 - satelle project-level configuration cannot define --yes equivalents, assume-yes behavior, trusted profile declarations, or any setting that grants noninteractive mutation consent for setup, repair, host update, self update remote-update flows, or doctor fix flows @implemented @mvp
 - satelle reports a typed project-mutation-consent-not-allowed configuration error when project-level configuration attempts to grant noninteractive mutation consent @implemented @mvp
 - satelle applies configuration precedence as built-in defaults, then user-level configuration, then project-level configuration, then explicit Satelle process environment variables, then CLI flags for non-secret overlapping settings @implemented @mvp
@@ -1225,7 +1225,7 @@
 - satelle project-level configuration may reference host aliases that users bind to concrete personal host access details in user-level configuration @spec @mvp @implemented
 - satelle project-level configuration cannot define or override a concrete Host Binding @spec @mvp @implemented
 - satelle reports a missing host binding with separate project reference and required user binding paths when the effective configuration context references a project-level host alias that the user has not configured @spec @mvp @implemented
-- satelle config check --all reports missing host binding for every locally selectable project-level host alias context that lacks a user-level binding @spec @mvp
+- satelle config check --all reports missing host binding for every locally selectable project-level host alias context that lacks a user-level binding @spec @mvp @implemented
 - satelle user-level host configuration may define desktop_user as the Satelle Desktop Binding account for that concrete host alias @implemented @mvp
 - satelle user-level host configuration may define desktop_session_preference for that concrete host alias @implemented @mvp
 - satelle user-level host configuration may define desktop_session_native_selector as a Satelle Native Desktop Session Selector object with platform, kind, and value fields for that concrete host alias @implemented @mvp
@@ -1304,7 +1304,7 @@
 - satelle post-MVP config explain output reports included configuration files in checked_files and sources, shows each included file's parent file and normalized include path, and attributes every effective value to the exact included or including file that won precedence @spec @later
 - satelle post-MVP config composition never reads, resolves, dereferences, prints, or includes raw secret material from Satelle Secret Sources while loading includes, running config check, or running config explain @spec @later
 - satelle post-MVP config composition treats included files as ordinary Satelle configuration files, so included project-level files cannot define Satelle Secret Sources, Satelle Trusted Profiles, YOLO enablement, concrete daemon paths, provider credentials, credential helpers, or noninteractive mutation consent @spec @later
-- satelle MVP does not include a mutating satelle config repair command @spec @mvp
+- satelle MVP does not include a mutating satelle config repair command @spec @mvp @implemented
 - satelle later config repair is an explicit user-invoked command and never runs as an implicit side effect of config check, config explain, setup, repair, doctor, preflight, run, or steer @spec @later
 - satelle later config repair changes only local CLI-visible Satelle configuration files and does not mutate remote-Host-owned configuration unless a separate remote-Host config repair command is specified @spec @later
 - satelle later config repair edits project-level configuration only when the project config file is explicitly selected on the command line @spec @later
@@ -1695,11 +1695,11 @@
 - retention deletion does not claim cryptographic erasure from SQLite pages, filesystem snapshots, backups, or upstream services @spec @mvp
 - Satelle documents that Codex and model providers may retain data independently from Satelle-owned retention @spec @mvp
 - satelle local CLI cache stores only convenience data such as redacted command history, aggregate stats, AI client installer state, downloaded release metadata, and non-authoritative recent host summaries @spec @mvp @implemented
-- satelle local CLI cache root is configurable through SATELLE_CACHE_DIR @spec @mvp
+- satelle local CLI cache root is configurable through SATELLE_CACHE_DIR @spec @mvp @implemented
 - satelle local CLI cache entries have explicit time-to-live or retention policies instead of persisting indefinitely by default @spec @mvp
 - satelle local CLI cache never stores provider credentials, raw prompts, screenshots, desktop recordings, full transcripts, raw Codex protocol payloads, or raw provider request and response bodies by default @spec @mvp
-- satelle Host Daemon stores its SQLite database under the resolved Satelle local mutable state root @spec @mvp
-- satelle Host Daemon stores recording artifacts under a recordings directory inside the resolved Satelle local mutable state root by default @spec @mvp
+- satelle Host Daemon stores its SQLite database under the resolved Satelle local mutable state root @spec @mvp @implemented
+- satelle Host Daemon stores recording artifacts under a recordings directory inside the resolved Satelle local mutable state root by default @spec @mvp @implemented
 - satelle Host Daemon writes Satelle Operator Log Files by default when the resolved OS-native Satelle log directory is writable @spec @mvp
 - satelle Satelle Operator Log Files are a best-effort local inspection mirror and are never authoritative for satelle logs, satelle status, recovery, retention, or support bundle collection @spec @mvp @implemented
 - satelle logs command reads Satelle Log Entries from SQLite through the Host Daemon API instead of parsing Satelle Operator Log Files @spec @mvp @implemented
@@ -1707,9 +1707,9 @@
 - satelle Satelle Operator Log Files do not include provider request bodies, provider response bodies, full prompts, screenshots, desktop recordings, full transcripts, raw setup stdout, raw setup stderr, raw repair stdout, or raw repair stderr by default @spec @mvp @implemented
 - satelle Satelle Operator Log Files rotate at 10 MiB and retain at most 5 files total per Host Daemon instance by default @spec @mvp @implemented
 - satelle Satelle Operator Log File retention can be configured per host or profile without changing SQLite log retention @spec @mvp
-- satelle Satelle Operator Log Files are stored under an OS-native Satelle log directory on the remote host instead of project directories @spec @mvp
-- satelle default Linux Satelle Operator Log File root is ${XDG_STATE_HOME:-$HOME/.local/state}/satelle/logs @spec @mvp
-- satelle default Windows Satelle Operator Log File root is the Local AppData Known Folder joined with Microck\Satelle\data\state\logs @spec @mvp
+- satelle Satelle Operator Log Files are stored under an OS-native Satelle log directory on the remote host instead of project directories @spec @mvp @implemented
+- satelle default Linux Satelle Operator Log File root is ${XDG_STATE_HOME:-$HOME/.local/state}/satelle/logs @spec @mvp @implemented
+- satelle default Windows Satelle Operator Log File root is the Local AppData Known Folder joined with Microck\Satelle\data\state\logs @spec @mvp @implemented
 - satelle default macOS Satelle Operator Log File root is $HOME/Library/Logs/dev.Microck.Satelle @spec @mvp @implemented
 - satelle Host Daemon continues running when Satelle Operator Log File writes fail while SQLite remains writable, and records the degraded log-file sink as a typed diagnostic finding @spec @mvp
 - satelle Host Daemon writes startup, shutdown, and fatal-error notices to stdout or stderr so service managers and containers can capture minimal process diagnostics @spec @mvp
