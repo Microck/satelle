@@ -282,7 +282,7 @@ impl OutputArgs {
         Ok(if self.json {
             OutputFormat::Json
         } else {
-            self.format.unwrap_or_else(|| match default {
+            self.format.unwrap_or(match default {
                 Some(satelle_core::PresentationOutputFormat::Json) => OutputFormat::Json,
                 Some(satelle_core::PresentationOutputFormat::Human) | None => OutputFormat::Human,
             })

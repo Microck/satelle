@@ -9008,6 +9008,9 @@ impl TurnEventOutput {
         }
     }
 
+    // Keep the complete event payload explicit at each call site. A wrapper used only
+    // to satisfy this lint would hide required preflight fields without reducing them.
+    #[allow(clippy::too_many_arguments)]
     fn emit_preflight(
         &mut self,
         host: &str,
