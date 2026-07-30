@@ -185,37 +185,7 @@ fn plan_host_targets(
         HostVersionRelation::MatchesCli => HostUpdateDisposition::Current,
         HostVersionRelation::NewerThanCli | HostVersionRelation::RequiresNewerCli => unreachable!(),
     };
-    let mut service_disposition = request
-        .service_inspection
-        .map(|service| match service.relation_to_cli {
-            HostVersionRelation::Missing => Ok(HostUpdateDisposition::Install),
-            HostVersionRelation::OlderThanCli => Ok(HostUpdateDisposition::Update),
-            HostVersionRelation::MatchesCli => Ok(HostUpdateDisposition::Current),
-            HostVersionRelation::NewerThanCli => Err(HostUpdatePlanError::HostBinaryNewerThanCli {
-                host_version: service
-                    .current_version
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                cli_version: request.cli_version.to_string(),
-            }),
-            HostVersionRelation::RequiresNewerCli => {
-                Err(HostUpdatePlanError::HostUpdateRequiresCliUpgrade {
-                    cli_version: request.cli_version.to_string(),
-                })
-            }
-        })
-        .transpose()?;
-    if disposition != HostUpdateDisposition::Current
-        && service_disposition == Some(HostUpdateDisposition::Current)
-    {
-        // Persistent service definitions execute the digest-pinned artifact
-        // path. Replacing that artifact therefore changes the service asset
-        // even when the service and target daemon versions already match.
-        service_disposition = Some(HostUpdateDisposition::Update);
-    }
-    let artifact_required = disposition != HostUpdateDisposition::Current
-        || service_disposition.is_some_and(|service| service != HostUpdateDisposition::Current);
-    let artifact = if !artifact_required {
+    let artifact = if disposition == HostUpdateDisposition::Current {
         None
     } else {
         let artifact = artifacts
@@ -242,13 +212,12 @@ fn plan_host_targets(
         }
         Some(artifact)
     };
-    let daemon_destination = artifact
-        .as_ref()
-        .and_then(|artifact| artifact.daemon_destination.clone());
     let daemon_mutations = mutation_for(
         disposition,
         "install-host-artifact",
-        daemon_destination.clone(),
+        artifact
+            .as_ref()
+            .and_then(|artifact| artifact.daemon_destination.clone()),
     );
     let daemon_restart_impact = if daemon_mutations.is_empty() {
         HostUpdateRestartImpact::None
@@ -260,11 +229,7 @@ fn plan_host_targets(
         current_version: request.host_inspection.current_version.clone(),
         target_version: request.cli_version.to_string(),
         version_source: HostUpdateVersionSource::InvokingCliRelease,
-        artifact_digest: if daemon_mutations.is_empty() {
-            None
-        } else {
-            artifact.as_ref().map(|artifact| artifact.digest.clone())
-        },
+        artifact_digest: artifact.map(|artifact| artifact.digest),
         disposition,
         restart_impact: daemon_restart_impact,
         remote_mutations: daemon_mutations,
@@ -300,7 +265,7 @@ fn plan_host_targets(
             current_version: service.current_version.clone(),
             target_version: request.cli_version.to_string(),
             version_source: HostUpdateVersionSource::InvokingCliRelease,
-            artifact_digest,
+            artifact_digest: None,
             disposition,
             restart_impact: if remote_mutations.is_empty() {
                 HostUpdateRestartImpact::None
@@ -653,7 +618,7 @@ mod tests {
         Artifact(Some(VerifiedHostArtifact {
             version: "1.2.3".to_string(),
             remote_platform: "linux-x64".to_string(),
-            digest: "ab".repeat(32),
+            digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             daemon_destination: Some("/opt/satelle/bin/satelle".to_string()),
         }))
     }
@@ -769,6 +734,34 @@ mod tests {
                 && target.version_source == HostUpdateVersionSource::InvokingCliRelease
         }));
         assert_eq!(report.targets[1].current_version, None);
+    }
+
+    #[test]
+    fn current_host_does_not_require_an_unused_release_artifact() {
+        let host = HostUpdateInspection {
+            current_version: Some("1.2.3".to_string()),
+            relation_to_cli: HostVersionRelation::MatchesCli,
+            remote_platform: "linux-x64".to_string(),
+        };
+        let report = build_host_update_plan(
+            HostUpdatePlanRequest {
+                host: "office",
+                cli_version: "1.2.3",
+                components: &[HostUpdateComponent::Host],
+                includes_all: false,
+                host_inspection: &host,
+                service_inspection: None,
+                codex_inspections: &[],
+            },
+            &Artifact(None),
+        )
+        .expect("a current Host does not consume release metadata");
+
+        assert_eq!(
+            report.status,
+            satelle_core::host_update::HostUpdateStatus::UpToDate
+        );
+        assert_eq!(report.targets[0].artifact_digest, None);
     }
 
     #[test]
