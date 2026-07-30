@@ -131,7 +131,21 @@ impl SatelleMcp {
             "paths" => {
                 let input: HostInput = decode(arguments)?;
                 validate_host(input.host.as_deref())?;
-                self.operation(read::paths_report(input.host))
+                let Some(alias) = input.host.as_deref() else {
+                    return self.operation(read::paths_report(None));
+                };
+                let host = match self.config().resolve_host(Some(alias)) {
+                    Ok(host) => host,
+                    Err(failure) => return Ok(operational_error(failure.error)),
+                };
+                let paths = match self
+                    .host_read(host, &context, |host| read::paths_report(Some(host)))
+                    .await?
+                {
+                    Ok(paths) => paths,
+                    Err(failure) => return Ok(operational_error(failure.error)),
+                };
+                Ok(structured(paths, false))
             }
             "status" => {
                 let input: StatusInput = decode(arguments)?;

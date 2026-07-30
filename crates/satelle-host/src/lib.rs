@@ -59,13 +59,13 @@ use runtime::{
     ProductionComputerUseAdapter, RequestIdentity, RunCommand, RuntimeHandle, SteerCommand,
     StopCommand,
 };
+use satelle_core::daemon_service::DaemonResolvedPathSet;
 use satelle_core::doctor::{
     DoctorDependentEvidence, DoctorProbe, DoctorProbeCachePolicy, DoctorProbeCompletion,
     DoctorProbeExecutionContext, DoctorProbeExecutionRecord, DoctorProbeLifecycle,
     DoctorProbeLifecycleEvent, DoctorProbeResource, DoctorProbeScheduleEvent, DoctorProbeScheduler,
     DoctorProbeState, DoctorProbeStatus, DoctorScope, DoctorScopeSelection,
 };
-use satelle_core::daemon_service::DaemonResolvedPathSet;
 use satelle_core::session::{PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     DaemonPathOverrides, DoctorFinding, DoctorFixability, DoctorOptions, DoctorProbeResult,

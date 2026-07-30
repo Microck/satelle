@@ -5129,9 +5129,11 @@ pub(crate) fn host_sessions_for_inspection(
             ssh_transport(host, launch_policy)
                 .and_then(|transport| transport.host_sessions(no_bootstrap))
         }
-        TransportKind::Local => local_host_service(&host.config).and_then(|service| {
-            LocalTransport::new(host.alias.clone(), service).host_sessions(no_bootstrap)
-        }),
+        TransportKind::Local => local_host_service(&host.config)
+            .map_err(|failure| failure.error)
+            .and_then(|service| {
+                LocalTransport::new(host.alias.clone(), service).host_sessions(no_bootstrap)
+            }),
     };
     result
         .map_err(|error| {
@@ -5163,6 +5165,7 @@ pub(crate) fn host_paths_for_inspection(
         )
         .and_then(|transport| transport.host_paths()),
         TransportKind::Local => local_host_service(&host.config)
+            .map_err(|failure| failure.error)
             .and_then(|service| LocalTransport::new(host.alias.clone(), service).host_paths()),
     };
     result.map_err(failure)

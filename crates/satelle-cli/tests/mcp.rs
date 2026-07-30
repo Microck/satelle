@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 mod test_file;
 
 const SESSION_ID: &str = "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11";
-const DIRECT_READ_CONNECTIONS: usize = 4;
+const DIRECT_READ_CONNECTIONS: usize = 5;
 const TEST_INFRASTRUCTURE_DEADLOCK_LIMIT: Duration = Duration::from_secs(30);
 
 struct ImmediateCloseEndpoint {
@@ -35,9 +35,10 @@ impl ImmediateCloseEndpoint {
         let (shutdown, shutdown_requested) = mpsc::channel();
         let server = thread::spawn(move || {
             let mut accepted = 0;
+            let mut shutdown = false;
             loop {
-                if shutdown_requested.try_recv().is_ok() {
-                    return accepted;
+                if !shutdown && shutdown_requested.try_recv().is_ok() {
+                    shutdown = true;
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
@@ -47,6 +48,9 @@ impl ImmediateCloseEndpoint {
                             accepted <= max_connections,
                             "immediate-close endpoint exceeded {max_connections} connections"
                         );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && shutdown => {
+                        return accepted;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(1));
@@ -767,6 +771,7 @@ api_token = {{ kind = "file", path = {token_path} }}
             tool_call(4, "doctor", json!({"scope": "transport"})),
             tool_call(5, "host_status", json!({})),
             tool_call(6, "host_sessions", json!({})),
+            tool_call(7, "paths", json!({"host": "remote"})),
         ],
     );
     let accepted_connections = endpoint.shutdown();
@@ -776,17 +781,14 @@ api_token = {{ kind = "file", path = {token_path} }}
         "direct Host MCP reads must not panic while dropping their transport: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        accepted_connections, DIRECT_READ_CONNECTIONS,
-        "each network-backed direct Host read must reach the owned endpoint exactly once"
-    );
     let responses = responses(&output);
     for (id, expected_code) in [
         (2, "host-unreachable"),
         (3, "host-unreachable"),
         (4, "not-implemented"),
         (5, "host-unreachable"),
-        (6, "host-unreachable"),
+        (6, "host-daemon-unreachable"),
+        (7, "ssh-bootstrap-unavailable"),
     ] {
         let result = &response(&responses, id)["result"];
         assert_eq!(result["isError"], true, "tool result {id}: {result}");
@@ -796,6 +798,12 @@ api_token = {{ kind = "file", path = {token_path} }}
         );
         assert_eq!(result["structuredContent"]["code"], expected_code);
     }
+    assert_eq!(
+        accepted_connections,
+        DIRECT_READ_CONNECTIONS,
+        "each network-backed direct Host read must reach the owned endpoint exactly once; paths result: {}",
+        response(&responses, 7)["result"]
+    );
 }
 
 #[test]

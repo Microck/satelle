@@ -495,7 +495,7 @@ output_format = "json"
     let report = parse_json(&output.stdout);
 
     assert_eq!(report["effective"]["output_format"], "json");
-    assert_eq!(report["project_intent"]["output_format"], true);
+    assert_eq!(report["sources"]["project_intent"]["output_format"], true);
 }
 
 #[test]
@@ -518,7 +518,7 @@ default_host = "alpha"
         .clone();
     let error = parse_json(&output.stderr);
 
-    assert_eq!(error["code"], "project-host-bindings-not-found");
+    assert_eq!(error["code"], "host-not-found");
     assert_eq!(
         error["details"]["hosts"],
         serde_json::json!(["alpha", "beta"])
