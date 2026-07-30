@@ -604,7 +604,7 @@
 - satelle host update --component host selects only Satelle-owned host binaries and Host Daemon service assets, not Codex runtime components @mvp @spec @implemented
 - satelle host update --component host targets the Satelle host binary version that exactly matches the invoking local CLI release for the remote host platform @spec @mvp @implemented
 - satelle MVP does not support selecting an arbitrary Satelle host binary version, update channel, or latest remote release independently from the invoking local CLI version @spec @mvp @implemented
-- satelle host update does not intentionally leave the Satelle Host Daemon on a Satelle version different from the invoking local CLI version after a successful host component update @spec @mvp
+- satelle host update does not intentionally leave the Satelle Host Daemon on a Satelle version different from the invoking local CLI version after a successful host component update @spec @mvp @implemented
 - satelle host update may use SSH bootstrap or a narrow versioned update handshake only to replace an older or missing Satelle host binary with the invoking CLI's matching host artifact @spec @mvp @implemented
 - satelle host update reports a typed host-binary-newer-than-cli error instead of downgrading automatically when the reachable Satelle Host Daemon version is newer than the invoking local CLI version @spec @mvp @implemented
 - satelle host update reports a typed host-update-requires-cli-upgrade error when the selected host update requires a Satelle host binary version newer than the invoking local CLI can provide @spec @mvp @implemented
@@ -624,7 +624,7 @@
 - satelle host update has no short alias for --component in MVP because component selection is a clarity-sensitive maintenance contract @implemented @mvp
 - satelle host update never mutates the remote host during its update check; mutation starts only after the planned update actions pass the command's consent rules @spec @mvp @implemented
 - satelle host update presents current versions, target versions, update targets, restart impact, and planned remote mutations before mutating the remote host @spec @mvp @implemented
-- satelle host update --yes skips only the final interactive confirmation prompt and does not skip update checks, plan presentation, safety blockers, action ledger recording, or post-update readiness checks @spec @mvp
+- satelle host update --yes skips only the final interactive confirmation prompt and does not skip update checks, plan presentation, safety blockers, action ledger recording, or post-update readiness checks @spec @mvp @implemented
 - satelle host update --yes prints planned remote mutations in human output before applying when --quiet is not active and JSON output mode is not active @spec @mvp @implemented
 - satelle host update --no-input --yes follows the same human plan-output rule as --yes when human output mode is active @spec @mvp @implemented
 - satelle host update --quiet --yes suppresses non-error human plan and progress output but does not suppress final failure summaries or required recovery guidance @spec @mvp @implemented
@@ -2151,11 +2151,11 @@
 - satelle setup and repair JSON output reports status cancelled, changed false, applied_actions as an empty list, and cancellation_reason user_declined_confirmation after a user chooses No at the final mutation confirmation @spec @mvp @implemented
 - satelle setup and repair treat Ctrl-C or an interrupted cliclack prompt as an interrupt distinct from a user choosing No at the final mutation confirmation @spec @mvp @implemented
 - satelle setup and repair exit 130 for Ctrl-C or an interrupted cliclack prompt when the platform reports an interrupt signal to the process @spec @mvp @implemented
-- satelle setup may install or update the standalone Codex runtime and Satelle host binary when the target operating system and transport support the required actions @spec @mvp
+- satelle setup may install or update the standalone Codex runtime and Satelle host binary when the target operating system and transport support the required actions @spec @mvp @implemented
 - satelle repair may update the standalone Codex runtime or Satelle host binary only when live probes show the installed component is missing, corrupted, unsupported, below the required minimum version, incompatible with the required control-plane protocol, or blocking native Computer Use readiness @spec @mvp @implemented
 - satelle repair does not perform opportunistic upgrades to the latest Codex runtime or Satelle host binary when the installed components are compatible and current readiness checks can pass @spec @mvp @implemented
 - satelle repair action plans identify the current version, target version, compatibility reason, and source of the version requirement before proposing a Codex runtime or Satelle host binary upgrade @spec @mvp @implemented
-- satelle repair upgrade actions follow the same plan presentation, final confirmation, --dry-run, --yes, --no-input --yes, setup action ledger, and partial-failure rules as other setup and repair mutations @spec @mvp
+- satelle repair upgrade actions follow the same plan presentation, final confirmation, --dry-run, --yes, --no-input --yes, setup action ledger, and partial-failure rules as other setup and repair mutations @spec @mvp @implemented
 - satelle repair reports manual-action-required when a required compatibility or readiness upgrade cannot be automated safely on the target operating system or transport @spec @mvp @implemented
 - satelle ordinary non-repair upgrades are explicit setup or host maintenance actions instead of side effects of repair @spec @mvp @implemented
 - satelle repair may recommend satelle host update as a follow-up when a newer compatible component is available but not required for current readiness or control-plane compatibility @spec @mvp @implemented
