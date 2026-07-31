@@ -237,7 +237,9 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The Host state could not be read safely.",
             default_recovery: "run satelle doctor and repair the reported storage problem",
         },
-        ErrorCode::HostUnreachable | ErrorCode::DirectDaemonUnreachable => ErrorContract {
+        ErrorCode::HostUnreachable
+        | ErrorCode::HostDaemonUnreachable
+        | ErrorCode::DirectDaemonUnreachable => ErrorContract {
             category: ErrorCategory::RemoteExecution,
             retryable: true,
             outcome: "The Host could not be reached.",
@@ -342,7 +344,8 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::SecretFilePathNotAbsolute
         | ErrorCode::DesktopSessionSelectorConflict
         | ErrorCode::PathOverrideNotAbsolute
-        | ErrorCode::DaemonPathOverrideNotAbsolute => ErrorContract {
+        | ErrorCode::DaemonPathOverrideNotAbsolute
+        | ErrorCode::SshBootstrapUnavailable => ErrorContract {
             category: ErrorCategory::InvalidRequest,
             retryable: false,
             outcome: "The Satelle configuration was not accepted.",
@@ -585,5 +588,13 @@ mod tests {
             assert_eq!(contract.category.as_str(), "remote_execution");
             assert!(!contract.retryable);
         }
+    }
+
+    #[test]
+    fn missing_ssh_bootstrap_configuration_is_non_retryable() {
+        let contract = error_contract(ErrorCode::SshBootstrapUnavailable);
+
+        assert_eq!(contract.category.as_str(), "invalid_request");
+        assert!(!contract.retryable);
     }
 }

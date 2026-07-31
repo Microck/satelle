@@ -59,7 +59,7 @@ pub(super) fn config_explain() -> Value {
 
 pub(super) fn paths() -> Value {
     versioned(
-        "satelle.paths.v1",
+        "satelle.paths.v2",
         json!({
             "host": {"type": "string"},
             "config_file": {"type": "string"},
@@ -68,9 +68,10 @@ pub(super) fn paths() -> Value {
             "sqlite_store": {"type": "string"},
             "operator_log_root": {"type": "string"},
             "recording_root": {"type": "string"},
-            "project_config_file": {"type": "string"},
+            "project_config_file": {"type": ["string", "null"]},
             "install_receipt": {"type": "string"},
-            "sources": {"type": "object"}
+            "sources": path_sources(),
+            "observation_source": {"enum": ["host_reported", null]}
         }),
         &[
             "host",
@@ -83,8 +84,50 @@ pub(super) fn paths() -> Value {
             "project_config_file",
             "install_receipt",
             "sources",
+            "observation_source",
         ],
     )
+}
+
+fn path_sources() -> Value {
+    let properties = json!({
+        "config_file": path_source(),
+        "cache_root": path_source(),
+        "state_root": path_source(),
+        "sqlite_store": path_source(),
+        "operator_log_root": path_source(),
+        "recording_root": path_source(),
+        "project_config_file": path_source(),
+        "install_receipt": path_source(),
+    });
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": [
+            "config_file",
+            "cache_root",
+            "state_root",
+            "sqlite_store",
+            "operator_log_root",
+            "recording_root",
+            "project_config_file",
+            "install_receipt",
+        ],
+        "additionalProperties": false,
+    })
+}
+
+fn path_source() -> Value {
+    json!({
+        "enum": [
+            "os_default",
+            "satelle_home",
+            "explicit_environment",
+            "service_config",
+            "project_discovery",
+            "host_reported",
+        ]
+    })
 }
 
 pub(super) fn status() -> Value {

@@ -79,7 +79,7 @@ use transport::{
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v2";
-const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v1";
+const PATHS_SCHEMA_VERSION: &str = "satelle.paths.v2";
 const DEFAULT_HOST_BIND: &str = "127.0.0.1:3001";
 const DEFAULT_ON_DEMAND_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSH_STATE_RELEASE_REQUEST: &str = "ssh-state-release.request";
@@ -137,11 +137,26 @@ struct ConfigContext<'a> {
 struct SelectedHost {
     alias: String,
     config: HostConfig,
+    from_project: bool,
+}
+
+impl From<(String, HostConfig, bool)> for SelectedHost {
+    fn from((alias, config, from_project): (String, HostConfig, bool)) -> Self {
+        Self {
+            alias,
+            config,
+            from_project,
+        }
+    }
 }
 
 impl From<(String, HostConfig)> for SelectedHost {
     fn from((alias, config): (String, HostConfig)) -> Self {
-        Self { alias, config }
+        Self {
+            alias,
+            config,
+            from_project: false,
+        }
     }
 }
 
@@ -199,7 +214,7 @@ impl<'a> ConfigContext<'a> {
 
     fn resolve_host(&self, flag_host: Option<&str>) -> Result<SelectedHost, CliFailure> {
         self.load()?
-            .resolve_host(flag_host)
+            .resolve_host_with_project_source(flag_host)
             .map(SelectedHost::from)
             .map_err(failure)
     }
@@ -438,6 +453,27 @@ struct HostStartCommand {
     tls_key: Option<PathBuf>,
     #[arg(long)]
     foreground: bool,
+    /// Internal launchd service boundary. Path overrides in this process came
+    /// from the Satelle-owned launchd plist.
+    #[arg(
+        long,
+        hide = true,
+        requires = "foreground",
+        conflicts_with_all = [
+            "service_config",
+            "tls_cert",
+            "tls_key",
+            "bootstrap_token_stdin",
+            "initial_host_identity",
+            "initial_identity_operation_id",
+            "initial_identity_record",
+            "bootstrap_scope",
+            "bootstrap_native_readiness_timeout_ms",
+            "bootstrap_provider_smoke_timeout_ms",
+            "on_demand_idle_timeout_ms"
+        ]
+    )]
+    launchd_service: bool,
     /// Internal SSH bootstrap boundary. The token is read once from stdin and
     /// retained only by this daemon process.
     #[arg(long, hide = true)]
@@ -501,7 +537,8 @@ struct HostStartCommand {
             "bootstrap_scope",
             "bootstrap_native_readiness_timeout_ms",
             "bootstrap_provider_smoke_timeout_ms",
-            "on_demand_idle_timeout_ms"
+            "on_demand_idle_timeout_ms",
+            "launchd_service"
         ]
     )]
     service_config: Option<PathBuf>,
@@ -854,11 +891,11 @@ fn main() -> ExitCode {
             return process_exit_code(&error);
         }
     };
-    let error_format =
+    let mut error_format =
         ErrorFormat::resolve(cli.error_format, cli.command.requests_machine_errors());
     install_diagnostics(&cli.command, error_format);
 
-    match try_main(cli, error_format) {
+    match try_main(cli, &mut error_format) {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             if !failure.error_reported {
@@ -918,7 +955,8 @@ fn parser_error_format(args: &[std::ffi::OsString]) -> ErrorFormat {
     ErrorFormat::resolve(configured, machine_selector)
 }
 
-fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
+fn try_main(cli: Cli, error_format: &mut ErrorFormat) -> Result<(), CliFailure> {
+    let error_format_configured = cli.error_format.is_some();
     let Cli {
         no_color,
         profile,
@@ -928,7 +966,14 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
     let config = ConfigContext::new(profile.as_deref());
     preflight_setup_before_history(&command, &config)?;
     let history = start_command_history(&command, &config);
-    let outcome = execute_command(command, no_color, profile.as_deref(), config);
+    let outcome = execute_command(
+        command,
+        no_color,
+        profile.as_deref(),
+        config,
+        error_format,
+        error_format_configured,
+    );
 
     if let Some(history) = history {
         let session_id = match &outcome {
@@ -937,7 +982,7 @@ fn try_main(cli: Cli, error_format: ErrorFormat) -> Result<(), CliFailure> {
         };
         let error_code = outcome.as_ref().err().map(|failure| failure.error.code);
         if let Err(error) = history.finish(session_id, error_code)
-            && error_format == ErrorFormat::Human
+            && *error_format == ErrorFormat::Human
         {
             // History is non-authoritative and cannot replace the command's
             // outcome, but operators still need to know when a row was lost.
@@ -1062,10 +1107,30 @@ fn execute_command(
     no_color: bool,
     profile: Option<&str>,
     config: ConfigContext<'_>,
+    error_format: &mut ErrorFormat,
+    error_format_configured: bool,
 ) -> Result<Option<SessionId>, CliFailure> {
     let early_lifecycle_host = explicit_lifecycle_json_host(&command).map(str::to_owned);
     let (output_args, event_output) = command.output_request();
-    let output = match output_args.resolve(event_output) {
+    let presentation_default_applies = matches!(
+        &command,
+        Command::Config { .. }
+            | Command::Paths(_)
+            | Command::Status(_)
+            | Command::Logs(_)
+            | Command::Host {
+                command: HostCommand::Status(_) | HostCommand::Sessions(_),
+            }
+    );
+    let presentation_default = presentation_default_applies
+        .then(|| {
+            config
+                .load()
+                .ok()
+                .and_then(|resolved| resolved.config.output_format)
+        })
+        .flatten();
+    let output = match output_args.resolve_with_default(event_output, presentation_default) {
         Ok(output) => output,
         Err(error) => {
             if let Some(host_alias) = early_lifecycle_host.as_deref() {
@@ -1077,6 +1142,16 @@ fn execute_command(
             return Err(failure(error));
         }
     };
+    if !error_format_configured && presentation_default.is_some() {
+        *error_format = if output.is_json() {
+            ErrorFormat::Json
+        } else {
+            ErrorFormat::Human
+        };
+        // The configured presentation default is now known, so diagnostics and the terminal
+        // command error must use the same resolved format as successful output.
+        install_diagnostics(&command, *error_format);
+    }
     let human_style = HumanStyle::detect(no_color);
 
     match command {
@@ -1085,7 +1160,7 @@ fn execute_command(
         Command::Repair(command) => run_repair(command).map(|_| None),
         Command::Doctor(command) => run_doctor(command, config, output).map(|_| None),
         Command::Config { command } => run_config(command, config, output).map(|_| None),
-        Command::Paths(command) => show_paths(command, output).map(|_| None),
+        Command::Paths(command) => show_paths(command, config, output).map(|_| None),
         Command::Host { command } => run_host(command, config, output).map(|_| None),
         Command::SelfCtl { command } => run_self(command).map(|_| None),
         Command::Run(command) => run_prompt(command, config, output).map(Some),
@@ -1700,6 +1775,7 @@ mod history_target_tests {
                 tls_cert: None,
                 tls_key: None,
                 foreground,
+                launchd_service: false,
                 bootstrap_token_stdin,
                 initial_host_identity: None,
                 initial_identity_operation_id: None,
@@ -1827,6 +1903,31 @@ mod history_target_tests {
         };
         assert!(command.service_config.is_some());
         validate_host_start_mode(&command).expect("service config is a valid closed start mode");
+    }
+
+    #[test]
+    fn launchd_service_is_an_internal_non_host_selecting_start_mode() {
+        let cli = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "start",
+            "--foreground",
+            "--launchd-service",
+        ])
+        .expect("parse internal launchd service start command");
+        assert!(
+            !history_target(&cli.command)
+                .expect("Host start history target")
+                .selects_host
+        );
+        let Command::Host {
+            command: HostCommand::Start(command),
+        } = cli.command
+        else {
+            panic!("expected Host start command");
+        };
+        assert!(command.launchd_service);
+        validate_host_start_mode(&command).expect("launchd service is a valid closed start mode");
     }
 
     #[test]
@@ -5568,46 +5669,42 @@ fn config_file_has_root_key(path: &std::path::Path, key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn show_paths(command: PathsCommand, format: OutputFormat) -> Result<(), CliFailure> {
+fn show_paths(
+    command: PathsCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     let json = format.is_json();
-    let output = read::paths_report(command.host)?;
+    let selected_host = command
+        .host
+        .as_deref()
+        .map(|alias| config.resolve_host(Some(alias)))
+        .transpose()?;
+    let output = read::paths_report(selected_host.as_ref())?;
 
     if json {
         print_json(&output).map_err(failure)
     } else {
         println!("Host: {}", output["host"].as_str().unwrap_or_default());
-        println!(
-            "Config: {}",
-            output["config_file"].as_str().unwrap_or_default()
-        );
-        println!(
-            "Cache: {}",
-            output["cache_root"].as_str().unwrap_or_default()
-        );
-        println!(
-            "State: {}",
-            output["state_root"].as_str().unwrap_or_default()
-        );
-        println!(
-            "SQLite: {}",
-            output["sqlite_store"].as_str().unwrap_or_default()
-        );
-        println!(
-            "Operator logs: {}",
-            output["operator_log_root"].as_str().unwrap_or_default()
-        );
-        println!(
-            "Recordings: {}",
-            output["recording_root"].as_str().unwrap_or_default()
-        );
-        println!(
-            "Project config: {}",
-            output["project_config_file"].as_str().unwrap_or_default()
-        );
-        println!(
-            "Install receipt: {}",
-            output["install_receipt"].as_str().unwrap_or_default()
-        );
+        if let Some(observation_source) = output["observation_source"].as_str() {
+            println!("Observation source: {observation_source}");
+        }
+        for (label, field) in [
+            ("Config", "config_file"),
+            ("Cache", "cache_root"),
+            ("State", "state_root"),
+            ("SQLite", "sqlite_store"),
+            ("Operator logs", "operator_log_root"),
+            ("Recordings", "recording_root"),
+            ("Project config", "project_config_file"),
+            ("Install receipt", "install_receipt"),
+        ] {
+            println!(
+                "{label} [{}]: {}",
+                output["sources"][field].as_str().unwrap_or_default(),
+                output[field].as_str().unwrap_or_default()
+            );
+        }
         Ok(())
     }
 }
@@ -6042,6 +6139,21 @@ fn trust_host(
 }
 
 fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleError> {
+    if command.launchd_service
+        && (!command.foreground
+            || command.service_config.is_some()
+            || command.tls_cert.is_some()
+            || command.tls_key.is_some()
+            || command.bootstrap_token_stdin
+            || command.bootstrap_scope.is_some()
+            || command.bootstrap_native_readiness_timeout_ms.is_some()
+            || command.bootstrap_provider_smoke_timeout_ms.is_some()
+            || command.on_demand_idle_timeout_ms.is_some())
+    {
+        return Err(SatelleError::invalid_usage(
+            "--launchd-service is an internal launchd input and cannot be combined with other internal or TLS Host start options",
+        ));
+    }
     if command.service_config.is_some()
         && (command.bind != DEFAULT_HOST_BIND
             || command.foreground
@@ -6137,24 +6249,27 @@ fn start_host_daemon_with(
     ) -> HostService,
 ) -> Result<(), CliFailure> {
     validate_host_start_mode(&command).map_err(failure)?;
-    if command.service_config.is_some() {
-        #[cfg(not(windows))]
-        return Err(failure(SatelleError::invalid_usage(
-            "--service-config is supported only for the per-user Windows Host service",
-        )));
+    let service_path_overrides =
+        if let Some(_service_config_path) = command.service_config.as_deref() {
+            #[cfg(not(windows))]
+            return Err(failure(SatelleError::invalid_usage(
+                "--service-config is supported only for the per-user Windows Host service",
+            )));
 
-        #[cfg(windows)]
-        {
-            let service_config_path = command
-                .service_config
-                .as_deref()
-                .expect("service config presence was checked");
-            let service_config = read_windows_service_config(service_config_path)?;
-            apply_windows_service_environment(&service_config);
-            command.bind = service_config.bind().to_string();
-            command.foreground = true;
-        }
-    }
+            #[cfg(windows)]
+            {
+                let service_config = read_windows_service_config(_service_config_path)?;
+                let path_overrides = service_config.path_overrides();
+                apply_windows_service_environment(&service_config);
+                command.bind = service_config.bind().to_string();
+                command.foreground = true;
+                Some(path_overrides)
+            }
+        } else if command.launchd_service {
+            Some(daemon_path_overrides_from_process_environment())
+        } else {
+            None
+        };
     let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
         (true, Some(scope)) => Some(scope.api_scopes()),
         (true, None) => {
@@ -6269,6 +6384,11 @@ fn start_host_daemon_with(
         )));
     }
     let service = match (on_demand_host.as_ref(), bootstrap_token.as_ref()) {
+        (_, None) if service_path_overrides.is_some() => HostService::production_for_service(
+            service_path_overrides
+                .as_ref()
+                .expect("persistent service path overrides were checked"),
+        ),
         (_, Some(token)) => {
             let mut host_config = satelle_core::SatelleConfig::defaults()
                 .hosts
@@ -6506,6 +6626,17 @@ fn apply_windows_service_environment(config: &WindowsServiceConfigV1) {
         for (key, value) in config.environment() {
             std::env::set_var(key, value);
         }
+    }
+}
+
+fn daemon_path_overrides_from_process_environment() -> DaemonPathOverrides {
+    DaemonPathOverrides {
+        home: std::env::var_os("SATELLE_HOME").map(PathBuf::from),
+        config_file: std::env::var_os("SATELLE_CONFIG_FILE").map(PathBuf::from),
+        state_dir: std::env::var_os("SATELLE_STATE_DIR").map(PathBuf::from),
+        cache_dir: std::env::var_os("SATELLE_CACHE_DIR").map(PathBuf::from),
+        log_dir: std::env::var_os("SATELLE_LOG_DIR").map(PathBuf::from),
+        sources: BTreeMap::new(),
     }
 }
 
@@ -7002,6 +7133,7 @@ mod daemon_tls_watcher_tests {
             tls_cert: tls_cert.map(PathBuf::from),
             tls_key: tls_key.map(PathBuf::from),
             foreground: true,
+            launchd_service: false,
             bootstrap_token_stdin: false,
             initial_host_identity: None,
             initial_identity_operation_id: None,
@@ -7524,6 +7656,7 @@ mod bootstrap_startup_tests {
             tls_cert: None,
             tls_key: None,
             foreground: false,
+            launchd_service: false,
             bootstrap_token_stdin: true,
             initial_host_identity: None,
             initial_identity_operation_id: None,
@@ -8212,7 +8345,7 @@ fn run_prompt(
         &mut event_output,
         explicit_host_alias,
         config
-            .resolve_host(explicit_host_alias)
+            .resolve_host_with_project_source(explicit_host_alias)
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
@@ -8234,9 +8367,9 @@ fn run_prompt(
             if !command.detach {
                 event_output
                     .emit_preflight(
-                        &host.alias,
+                        &host,
                         "run",
-                        &host.config.transport,
+                        config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8281,9 +8414,9 @@ fn run_prompt(
             if !command.detach {
                 event_output
                     .emit_preflight(
-                        &host.alias,
+                        &host,
                         "run",
-                        &host.config.transport,
+                        config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8364,9 +8497,9 @@ fn run_prompt(
 
     event_output
         .emit_preflight(
-            &host.alias,
+            &host,
             "run",
-            &host.config.transport,
+            config,
             &provider_selection,
             Some(&provider_validation),
             command.refresh_provider_smoke_test,
@@ -8445,7 +8578,7 @@ fn steer_prompt(
         &mut event_output,
         explicit_host_alias,
         config
-            .resolve_host(explicit_host_alias)
+            .resolve_host_with_project_source(explicit_host_alias)
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
@@ -8467,9 +8600,9 @@ fn steer_prompt(
             if !command.detach {
                 event_output
                     .emit_preflight(
-                        &host.alias,
+                        &host,
                         "steer",
-                        &host.config.transport,
+                        config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8514,9 +8647,9 @@ fn steer_prompt(
             if !command.detach {
                 event_output
                     .emit_preflight(
-                        &host.alias,
+                        &host,
                         "steer",
-                        &host.config.transport,
+                        config,
                         &provider_selection,
                         None,
                         command.refresh_provider_smoke_test,
@@ -8599,9 +8732,9 @@ fn steer_prompt(
 
     event_output
         .emit_preflight(
-            &host.alias,
+            &host,
             "steer",
-            &host.config.transport,
+            config,
             &provider_selection,
             Some(&provider_validation),
             command.refresh_provider_smoke_test,
@@ -8971,9 +9104,9 @@ impl TurnEventOutput {
 
     fn emit_preflight(
         &mut self,
-        host: &str,
+        host: &SelectedHost,
         operation: &str,
-        transport: &satelle_core::TransportKind,
+        config: &ResolvedConfig,
         provider_selection: &ProviderSelection,
         provider_validation: Option<&transport::ProviderDescriptorValidationReport>,
         refresh_provider_smoke_test: bool,
@@ -8985,12 +9118,28 @@ impl TurnEventOutput {
             EventType::Preflight,
             EventSource::Cli,
             OffsetDateTime::now_utc(),
-            host,
+            &host.alias,
             None,
             "resolved configuration and selected Host transport",
             json!({
                 "operation": operation,
-                "transport": transport,
+                "transport": host.config.transport,
+                "selected_profile": config.selected_profile.as_ref().map(|profile| &profile.name),
+                "effective_timeouts": effective_timeouts_json(
+                    &host.config,
+                    configured_turn_execution_timeout_ms(&host.config),
+                ),
+                "project_config_intent": {
+                    "host": host.from_project,
+                    "model": config.model_alias_from_project(),
+                    "provider": config.provider_alias_from_project(),
+                    "profile": config.selected_profile.as_ref().is_some_and(
+                        |profile| profile.source.as_str() == "project_config"
+                    ),
+                    "timeouts": config.timeout_intent_from_project(&host.alias),
+                    "transport": config.transport_intent_from_project(&host.alias),
+                    "output_format": config.output_format_from_project(),
+                },
                 "requested_model_alias": provider_selection.requested_model_alias,
                 "requested_provider_alias": provider_selection.requested_provider_alias,
                 "model_alias_from_project": provider_selection.model_alias_from_project,

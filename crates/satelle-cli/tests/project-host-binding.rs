@@ -475,3 +475,139 @@ allow_project_selection = true
         "hosts.remote.allow_project_selection"
     );
 }
+
+#[test]
+fn project_output_format_is_a_presentation_only_default() {
+    let fixture = ConfigFixture::new(
+        "",
+        r#"
+output_format = "json"
+"#,
+    );
+
+    let output = fixture
+        .command()
+        .args(["config", "explain"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&output.stdout);
+
+    assert_eq!(report["effective"]["output_format"], "json");
+    assert_eq!(report["sources"]["project_intent"]["output_format"], true);
+}
+
+#[test]
+fn configured_json_output_format_applies_to_command_errors() {
+    let fixture = ConfigFixture::new(
+        r#"
+output_format = "json"
+"#,
+        "",
+    );
+
+    let output = fixture
+        .command()
+        .args(["host", "status", "--host", "missing"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+
+    assert_eq!(error["schema_version"], "satelle.error.v1");
+    assert_eq!(error["code"], "host-not-found");
+}
+
+#[test]
+fn project_preflight_provenance_tracks_the_selected_host_and_each_host_field() {
+    let fixture = ConfigFixture::new(
+        r#"
+[hosts.alpha]
+transport = "local"
+adapter = "fake"
+allow_project_selection = true
+
+[hosts.timeout-only]
+transport = "local"
+adapter = "fake"
+
+[hosts.transport-only]
+transport = "local"
+adapter = "fake"
+"#,
+        r#"
+default_host = "alpha"
+
+[hosts.timeout-only.timeouts]
+native_readiness = "3s"
+
+[hosts.transport-only]
+transport = "local"
+"#,
+    );
+
+    let timeout_only = fixture
+        .command()
+        .args(["config", "explain", "--host", "timeout-only", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let timeout_report = parse_json(&timeout_only.stdout);
+    assert_eq!(timeout_report["sources"]["project_intent"]["host"], false);
+    assert_eq!(
+        timeout_report["sources"]["project_intent"]["timeouts"],
+        true
+    );
+    assert_eq!(
+        timeout_report["sources"]["project_intent"]["transport"],
+        false
+    );
+
+    let transport_only = fixture
+        .command()
+        .args(["config", "explain", "--host", "transport-only", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let transport_report = parse_json(&transport_only.stdout);
+    assert_eq!(transport_report["sources"]["project_intent"]["host"], false);
+    assert_eq!(
+        transport_report["sources"]["project_intent"]["timeouts"],
+        false
+    );
+    assert_eq!(
+        transport_report["sources"]["project_intent"]["transport"],
+        true
+    );
+}
+
+#[test]
+fn config_check_all_reports_every_missing_project_host_binding() {
+    let fixture = ConfigFixture::new(
+        "",
+        r#"
+default_host = "alpha"
+
+[hosts.beta]
+"#,
+    );
+
+    let output = fixture
+        .command()
+        .args(["config", "check", "--all", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+
+    assert_eq!(error["code"], "host-not-found");
+    assert_eq!(
+        error["details"]["hosts"],
+        serde_json::json!(["alpha", "beta"])
+    );
+}

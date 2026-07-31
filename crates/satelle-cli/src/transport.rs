@@ -310,6 +310,9 @@ pub(crate) trait TransportClient {
         experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError>;
     fn host_status(&self) -> Result<HostStatus, SatelleError>;
+    fn host_paths(
+        &self,
+    ) -> Result<satelle_core::daemon_service::DaemonResolvedPathSet, SatelleError>;
     fn host_sessions(&self, no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError>;
     fn run(
         &self,
@@ -735,6 +738,12 @@ impl TransportClient for LocalTransport {
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
         self.service.host_status()
+    }
+
+    fn host_paths(
+        &self,
+    ) -> Result<satelle_core::daemon_service::DaemonResolvedPathSet, SatelleError> {
+        self.service.daemon_resolved_paths()
     }
 
     fn host_sessions(&self, no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError> {
@@ -3443,6 +3452,12 @@ impl TransportClient for SshSetupTransport {
         Err(self.unsupported("host status"))
     }
 
+    fn host_paths(
+        &self,
+    ) -> Result<satelle_core::daemon_service::DaemonResolvedPathSet, SatelleError> {
+        Err(self.unsupported("host paths"))
+    }
+
     fn host_sessions(&self, _no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError> {
         Err(self.unsupported("host sessions"))
     }
@@ -3632,9 +3647,19 @@ impl TransportClient for DirectTransport {
         })
     }
 
+    fn host_paths(
+        &self,
+    ) -> Result<satelle_core::daemon_service::DaemonResolvedPathSet, SatelleError> {
+        self.client
+            .host_paths()
+            .map(|response| response.paths().clone())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
     fn host_sessions(&self, _no_bootstrap: bool) -> Result<HostSessionsReport, SatelleError> {
         // The desktop-session envelope intentionally excludes the daemon version.
         // Read the canonical capabilities envelope instead of reporting the CLI version.
+        let bootstrapped = self._bootstrap.is_some();
         let capabilities = self
             .client
             .capabilities()
@@ -3648,8 +3673,12 @@ impl TransportClient for DirectTransport {
             host: self.alias.clone(),
             detected_platform: capabilities.platform().to_string(),
             connection_mode: self.mode.to_string(),
-            bootstrapped: false,
-            bootstrap_actions: Vec::new(),
+            bootstrapped,
+            bootstrap_actions: if bootstrapped {
+                vec!["start_on_demand".to_string()]
+            } else {
+                Vec::new()
+            },
             host_daemon_version: capabilities.daemon_version().to_string(),
             sessions: desktop_sessions.sessions().to_vec(),
         })
@@ -3844,6 +3873,9 @@ fn ssh_transport(
             }
         }
         None => {
+            let Some(bootstrap_scope) = bootstrap_scope else {
+                return Err(SatelleError::host_daemon_unreachable(&host.alias));
+            };
             let (client, event_client, bootstrap) = bootstrap_ssh_clients(
                 &host.alias,
                 binding.destination(),
@@ -3851,7 +3883,7 @@ fn ssh_transport(
                 &expected_host_identity,
                 admission_timeout,
                 &host.config,
-                bootstrap_scope.expect("tokenless SSH transport requires bootstrap scope"),
+                bootstrap_scope,
             )?;
             (client, event_client, Some(bootstrap))
         }
@@ -5034,6 +5066,119 @@ pub(crate) fn transport_for_with_ssh_bootstrap(
     transport_for_with_ssh_launch_policy(host, launch_policy)
 }
 
+fn is_daemon_reachability_failure(error: &SatelleError) -> bool {
+    matches!(
+        error.code,
+        ErrorCode::HostUnreachable | ErrorCode::DirectDaemonUnreachable
+    )
+}
+
+fn ssh_bootstrap_host(host: &SelectedHost) -> Result<SelectedHost, SatelleError> {
+    let settings = host
+        .config
+        .ssh_bootstrap
+        .as_ref()
+        .ok_or_else(|| SatelleError::ssh_bootstrap_unavailable(&host.alias))?;
+    let mut config = host.config.clone();
+    config.transport = TransportKind::Ssh;
+    config.address = Some(settings.address.clone());
+    config.network = None;
+    config.ca_bundle = None;
+    // The direct daemon already proved this durable credential unreachable. The SSH leg must
+    // select the tokenless read-bootstrap branch instead of retrying the same credential.
+    config.api_token = None;
+    config.ssh_bootstrap = None;
+    Ok(SelectedHost {
+        alias: host.alias.clone(),
+        config,
+        from_project: host.from_project,
+    })
+}
+
+fn direct_inspection_fallback(
+    host: &SelectedHost,
+    no_bootstrap: bool,
+) -> Result<DirectTransport, SatelleError> {
+    if no_bootstrap {
+        return Err(SatelleError::host_daemon_unreachable(&host.alias));
+    }
+    let bootstrap_host = ssh_bootstrap_host(host)?;
+    ssh_transport(
+        &bootstrap_host,
+        SshDaemonLaunchPolicy::Bootstrap(SshBootstrapScope::Read),
+    )
+}
+
+pub(crate) fn host_sessions_for_inspection(
+    host: &SelectedHost,
+    no_bootstrap: bool,
+) -> Result<HostSessionsReport, CliFailure> {
+    let result = match host.config.transport {
+        TransportKind::Direct => match direct_transport(host)
+            .and_then(|transport| transport.host_sessions(no_bootstrap))
+        {
+            Ok(report) => Ok(report),
+            Err(error) if is_daemon_reachability_failure(&error) => {
+                direct_inspection_fallback(host, no_bootstrap)
+                    .and_then(|transport| transport.host_sessions(no_bootstrap))
+            }
+            Err(error) => Err(error),
+        },
+        TransportKind::Ssh => {
+            if no_bootstrap && host.config.api_token.is_none() {
+                Err(SatelleError::host_daemon_unreachable(&host.alias))
+            } else {
+                let bootstrap_scope = (!no_bootstrap).then_some(SshBootstrapScope::Read);
+                let launch_policy = bootstrap_scope.map_or(
+                    SshDaemonLaunchPolicy::Never,
+                    SshDaemonLaunchPolicy::Bootstrap,
+                );
+                ssh_transport(host, launch_policy)
+                    .and_then(|transport| transport.host_sessions(no_bootstrap))
+            }
+        }
+        TransportKind::Local => local_host_service(&host.config)
+            .map_err(|failure| failure.error)
+            .and_then(|service| {
+                LocalTransport::new(host.alias.clone(), service).host_sessions(no_bootstrap)
+            }),
+    };
+    result
+        .map_err(|error| {
+            if no_bootstrap && is_daemon_reachability_failure(&error) {
+                SatelleError::host_daemon_unreachable(&host.alias)
+            } else {
+                error
+            }
+        })
+        .map_err(failure)
+}
+
+pub(crate) fn host_paths_for_inspection(
+    host: &SelectedHost,
+) -> Result<satelle_core::daemon_service::DaemonResolvedPathSet, CliFailure> {
+    let result = match host.config.transport {
+        TransportKind::Direct => match direct_transport(host)
+            .and_then(|transport| transport.host_paths())
+        {
+            Ok(paths) => Ok(paths),
+            Err(error) if is_daemon_reachability_failure(&error) => {
+                direct_inspection_fallback(host, false).and_then(|transport| transport.host_paths())
+            }
+            Err(error) => Err(error),
+        },
+        TransportKind::Ssh => ssh_transport(
+            host,
+            SshDaemonLaunchPolicy::Bootstrap(SshBootstrapScope::Read),
+        )
+        .and_then(|transport| transport.host_paths()),
+        TransportKind::Local => local_host_service(&host.config)
+            .map_err(|failure| failure.error)
+            .and_then(|service| LocalTransport::new(host.alias.clone(), service).host_paths()),
+    };
+    result.map_err(failure)
+}
+
 fn transport_for_with_ssh_launch_policy(
     host: &SelectedHost,
     launch_policy: SshDaemonLaunchPolicy,
@@ -5579,6 +5724,7 @@ mod bootstrap_ordering_tests {
         SshSetupTransport::new(&SelectedHost {
             alias: "remote".to_string(),
             config,
+            from_project: false,
         })
         .expect("construct setup transport")
         .with_remote_target_for_tests(ssh_bootstrap::RemoteTarget::WindowsX64Msvc)

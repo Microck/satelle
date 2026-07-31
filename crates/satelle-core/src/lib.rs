@@ -80,6 +80,7 @@ pub struct SatelleConfig {
     pub default_host: Option<String>,
     pub model_alias: Option<String>,
     pub provider_alias: Option<String>,
+    pub output_format: Option<PresentationOutputFormat>,
     pub experimental_provider_computer_use: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
@@ -103,6 +104,7 @@ impl SatelleConfig {
                 adapter: AdapterKind::Codex,
                 address: None,
                 network: None,
+                ssh_bootstrap: None,
                 timeouts: None,
                 native_readiness_cache_ttl: None,
                 provider_smoke_success_cache_ttl: None,
@@ -133,6 +135,7 @@ impl SatelleConfig {
             default_host: Some(LOCAL_DEMO_HOST.to_string()),
             model_alias: None,
             provider_alias: None,
+            output_format: None,
             experimental_provider_computer_use: None,
             experimental_provider_computer_use_by_provider: BTreeMap::new(),
             yolo: None,
@@ -152,6 +155,9 @@ impl SatelleConfig {
         }
         if higher.provider_alias.is_some() {
             self.provider_alias = higher.provider_alias;
+        }
+        if higher.output_format.is_some() {
+            self.output_format = higher.output_format;
         }
         if higher.experimental_provider_computer_use.is_some() {
             self.experimental_provider_computer_use = higher.experimental_provider_computer_use;
@@ -279,6 +285,9 @@ pub struct HostConfig {
     pub adapter: AdapterKind,
     pub address: Option<String>,
     pub network: Option<NetworkConfig>,
+    /// Operator-owned SSH settings used only when a direct daemon is unreachable during
+    /// read-scoped inspection.
+    pub ssh_bootstrap: Option<SshBootstrapConfig>,
     pub timeouts: Option<TimeoutConfig>,
     pub native_readiness_cache_ttl: Option<ExplicitDuration>,
     pub provider_smoke_success_cache_ttl: Option<ExplicitDuration>,
@@ -1734,6 +1743,19 @@ pub enum NetworkConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SshBootstrapConfig {
+    pub address: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentationOutputFormat {
+    Human,
+    Json,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SatellePathSet {
     pub config_file: PathBuf,
     pub cache_root: PathBuf,
@@ -1747,6 +1769,7 @@ pub struct SatellePathSet {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SatellePathSources {
     pub config_file: PathSource,
     pub cache_root: PathSource,
@@ -1764,7 +1787,9 @@ pub enum PathSource {
     OsDefault,
     SatelleHome,
     ExplicitEnvironment,
+    ServiceConfig,
     ProjectDiscovery,
+    HostReported,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1787,6 +1812,12 @@ pub struct ResolvedConfig {
     model_alias_from_project: bool,
     #[serde(skip)]
     provider_alias_from_project: bool,
+    #[serde(skip)]
+    output_format_from_project: bool,
+    #[serde(skip)]
+    project_timeout_intents: BTreeSet<String>,
+    #[serde(skip)]
+    project_transport_intents: BTreeSet<String>,
     // Config-check enumeration retains only selectors discovered from already validated files.
     // Effective HostConfig values continue to have a single owner in `config`.
     #[serde(skip)]
@@ -1800,6 +1831,18 @@ impl ResolvedConfig {
 
     pub const fn provider_alias_from_project(&self) -> bool {
         self.provider_alias_from_project
+    }
+
+    pub const fn output_format_from_project(&self) -> bool {
+        self.output_format_from_project
+    }
+
+    pub fn timeout_intent_from_project(&self, alias: &str) -> bool {
+        self.project_timeout_intents.contains(alias)
+    }
+
+    pub fn transport_intent_from_project(&self, alias: &str) -> bool {
+        self.project_transport_intents.contains(alias)
     }
 }
 
@@ -1825,7 +1868,18 @@ impl ResolvedConfig {
         &self,
         flag_host: Option<&str>,
     ) -> Result<(String, HostConfig), SatelleError> {
+        self.resolve_host_with_project_source(flag_host)
+            .map(|(alias, host, _)| (alias, host))
+    }
+
+    pub fn resolve_host_with_project_source(
+        &self,
+        flag_host: Option<&str>,
+    ) -> Result<(String, HostConfig, bool), SatelleError> {
         let environment_host = optional_non_empty_env("SATELLE_HOST");
+        let host_from_project = flag_host.is_none()
+            && environment_host.is_none()
+            && self.default_host_requires_project_permission;
         let alias = flag_host
             .map(str::to_string)
             .or_else(|| environment_host.clone())
@@ -1839,11 +1893,7 @@ impl ResolvedConfig {
             .cloned()
             .ok_or_else(|| SatelleError::host_not_found(alias.clone()))?;
 
-        if flag_host.is_none()
-            && environment_host.is_none()
-            && self.default_host_requires_project_permission
-            && !self.project_selectable_hosts.contains(&alias)
-        {
+        if host_from_project && !self.project_selectable_hosts.contains(&alias) {
             return Err(SatelleError::project_host_selection_not_allowed(alias));
         }
 
@@ -1851,7 +1901,7 @@ impl ResolvedConfig {
             profile.apply_to_host(&alias, &mut host, selected.source);
         }
 
-        Ok((alias, host))
+        Ok((alias, host, host_from_project))
     }
 
     pub fn profile_overrides_for_host(&self, field: ProfileField, host: &str) -> bool {
@@ -2051,6 +2101,17 @@ fn load_config_with_profile_selection(
     let mut provider_alias_from_project = project_config
         .as_ref()
         .is_some_and(project_config::ParsedProjectConfig::defines_provider_alias);
+    let output_format_from_project = project_config
+        .as_ref()
+        .is_some_and(project_config::ParsedProjectConfig::defines_output_format);
+    let project_timeout_intents = project_config
+        .as_ref()
+        .map(project_config::ParsedProjectConfig::timeout_intent_aliases)
+        .unwrap_or_default();
+    let project_transport_intents = project_config
+        .as_ref()
+        .map(project_config::ParsedProjectConfig::transport_intent_aliases)
+        .unwrap_or_default();
 
     if let Some(user_config) = &user_config {
         config = config.merge(user_config.config.clone());
@@ -2141,6 +2202,9 @@ fn load_config_with_profile_selection(
         project_selectable_hosts,
         model_alias_from_project,
         provider_alias_from_project,
+        output_format_from_project,
+        project_timeout_intents,
+        project_transport_intents,
         config_check_metadata: ConfigCheckMetadata {
             configured_hosts,
             configured_profiles,
@@ -2380,6 +2444,23 @@ struct ParsedUserConfig {
 }
 
 #[cfg(test)]
+mod presentation_output_config_tests {
+    use super::*;
+
+    #[test]
+    fn user_config_accepts_output_format() {
+        let parsed =
+            parse_user_config(Path::new("/test/config.toml"), "output_format = \"json\"\n")
+                .expect("parse the user-owned presentation default");
+
+        assert_eq!(
+            parsed.config.output_format,
+            Some(PresentationOutputFormat::Json)
+        );
+    }
+}
+
+#[cfg(test)]
 mod api_rate_limit_config_tests {
     use super::*;
 
@@ -2490,6 +2571,57 @@ websocket_inbound_messages_per_minute = 67
         assert_eq!(merged.authenticated_requests_per_minute(), 600);
         assert_eq!(merged.control_requests_per_minute(), 25);
         assert_eq!(merged.websocket_inbound_messages_per_minute(), 120);
+    }
+}
+
+#[cfg(test)]
+mod ssh_bootstrap_config_tests {
+    use super::*;
+
+    #[test]
+    fn user_config_accepts_ssh_bootstrap_and_rejects_unknown_nested_keys() {
+        let parsed = parse_user_config(
+            Path::new("/test/config.toml"),
+            r#"
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://remote.example.test"
+
+[hosts.remote.ssh_bootstrap]
+address = "operator@remote.example.test"
+"#,
+        )
+        .expect("parse operator-owned SSH bootstrap config");
+        assert_eq!(
+            parsed.config.hosts["remote"]
+                .ssh_bootstrap
+                .as_ref()
+                .expect("retain SSH bootstrap config")
+                .address,
+            "operator@remote.example.test"
+        );
+
+        let error = parse_user_config(
+            Path::new("/test/config.toml"),
+            r#"
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://remote.example.test"
+
+[hosts.remote.ssh_bootstrap]
+address = "operator@remote.example.test"
+port = 22
+"#,
+        )
+        .expect_err("reject unknown SSH bootstrap keys");
+        assert_eq!(error.code, ErrorCode::UnknownConfigKey);
+        assert_eq!(
+            error.details["unknown_keys"][0]["path"],
+            "hosts.remote.ssh_bootstrap.port"
+        );
+        assert_eq!(error.details["unknown_keys"][0]["key"], "port");
     }
 }
 
@@ -3454,6 +3586,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             "default_host",
             "model_alias",
             "provider_alias",
+            "output_format",
             "experimental_provider_computer_use",
             "experimental_provider_computer_use_by_provider",
             "yolo",
@@ -3513,6 +3646,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "adapter",
                     "address",
                     "network",
+                    "ssh_bootstrap",
                     "timeouts",
                     "native_readiness_cache_ttl",
                     "provider_smoke_success_cache_ttl",
@@ -3545,6 +3679,18 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     &format!("{host_path}.network"),
                     network_table,
                     &["provider", "tailnet_name", "hostname"],
+                    &mut unknown_keys,
+                );
+            }
+
+            if let Some(ssh_bootstrap_table) = host_table
+                .get("ssh_bootstrap")
+                .and_then(toml::Value::as_table)
+            {
+                collect_unknown_keys_for_table(
+                    &format!("{host_path}.ssh_bootstrap"),
+                    ssh_bootstrap_table,
+                    &["address"],
                     &mut unknown_keys,
                 );
             }
@@ -3816,8 +3962,10 @@ pub enum ErrorCode {
     DaemonPathOverrideNotAbsolute,
     HostNotFound,
     HostUnreachable,
+    HostDaemonUnreachable,
     BootstrapBusy,
     DirectDaemonUnreachable,
+    SshBootstrapUnavailable,
     SshHostKeyVerificationRequired,
     CertificateUntrusted,
     CertificateHostnameMismatch,
@@ -3919,8 +4067,10 @@ impl ErrorCode {
             Self::DaemonPathOverrideNotAbsolute => "daemon-path-override-not-absolute",
             Self::HostNotFound => "host-not-found",
             Self::HostUnreachable => "host-unreachable",
+            Self::HostDaemonUnreachable => "host-daemon-unreachable",
             Self::BootstrapBusy => "bootstrap-busy",
             Self::DirectDaemonUnreachable => "direct-daemon-unreachable",
+            Self::SshBootstrapUnavailable => "ssh-bootstrap-unavailable",
             Self::SshHostKeyVerificationRequired => "ssh-host-key-verification-required",
             Self::CertificateUntrusted => "certificate-untrusted",
             Self::CertificateHostnameMismatch => "certificate-hostname-mismatch",
@@ -4029,7 +4179,10 @@ impl ErrorCode {
             | Self::HostNotFound
             | Self::SessionNotFound
             | Self::LogsCursorExpired => 66,
-            Self::HostUnreachable | Self::DirectDaemonUnreachable => 69,
+            Self::HostUnreachable
+            | Self::HostDaemonUnreachable
+            | Self::DirectDaemonUnreachable
+            | Self::SshBootstrapUnavailable => 69,
             Self::CertificateUntrusted
             | Self::CertificateHostnameMismatch
             | Self::CertificateExpired
@@ -4863,6 +5016,34 @@ impl SatelleError {
             message: format!("direct Host Daemon for host '{alias}' is not reachable"),
             recovery_command: Some(format!(
                 "start the configured Host Daemon, then retry satelle run --host {alias}"
+            )),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn host_daemon_unreachable(alias: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(alias.to_string()));
+        Self {
+            code: ErrorCode::HostDaemonUnreachable,
+            message: format!("Host Daemon for host '{alias}' is not reachable"),
+            recovery_command: Some(format!(
+                "start the configured Host Daemon, then retry with --host {alias}"
+            )),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn ssh_bootstrap_unavailable(alias: &str) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(alias.to_string()));
+        Self {
+            code: ErrorCode::SshBootstrapUnavailable,
+            message: format!("host '{alias}' has no operator-configured SSH bootstrap settings"),
+            recovery_command: Some(format!(
+                "configure hosts.{alias}.ssh_bootstrap.address in the user-level config"
             )),
             source_detail: None,
             details,

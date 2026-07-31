@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v1";
@@ -154,6 +154,7 @@ impl PersistentServiceDecision {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonResolvedPathSet {
     pub config_file: String,
     pub cache_root: String,
@@ -161,6 +162,12 @@ pub struct DaemonResolvedPathSet {
     pub sqlite_store: String,
     pub operator_log_root: String,
     pub recording_root: String,
+    pub sources: crate::SatellePathSources,
+    /// The project config discovered by the daemon, if the daemon resolved one.
+    ///
+    /// A controller-side project path is not authoritative for a remote Host and must never be
+    /// substituted here.
+    pub project_config_file: Option<String>,
     pub install_receipt: String,
 }
 
@@ -173,22 +180,33 @@ impl DaemonResolvedPathSet {
             planned.cache_root = join_remote_path(&home, "cache");
             planned.state_root = join_remote_path(&home, "state");
             planned.operator_log_root = join_remote_path(&home, "logs");
+            planned.sources.config_file = crate::PathSource::ServiceConfig;
+            planned.sources.cache_root = crate::PathSource::ServiceConfig;
+            planned.sources.state_root = crate::PathSource::ServiceConfig;
+            planned.sources.operator_log_root = crate::PathSource::ServiceConfig;
         }
         if let Some(path) = overrides.config_file.as_ref() {
             planned.config_file = path.display().to_string();
+            planned.sources.config_file = crate::PathSource::ServiceConfig;
         }
         if let Some(path) = overrides.cache_dir.as_ref() {
             planned.cache_root = path.display().to_string();
+            planned.sources.cache_root = crate::PathSource::ServiceConfig;
         }
         if let Some(path) = overrides.state_dir.as_ref() {
             planned.state_root = path.display().to_string();
+            planned.sources.state_root = crate::PathSource::ServiceConfig;
         }
         if let Some(path) = overrides.log_dir.as_ref() {
             planned.operator_log_root = path.display().to_string();
+            planned.sources.operator_log_root = crate::PathSource::ServiceConfig;
         }
         planned.sqlite_store = join_remote_path(&planned.state_root, "satelle.sqlite3");
         planned.recording_root = join_remote_path(&planned.state_root, "recordings");
         planned.install_receipt = join_remote_path(&planned.state_root, "install-receipt.json");
+        planned.sources.sqlite_store = planned.sources.state_root;
+        planned.sources.recording_root = planned.sources.state_root;
+        planned.sources.install_receipt = planned.sources.state_root;
         planned
     }
 
@@ -215,6 +233,11 @@ impl From<&crate::SatellePathSet> for DaemonResolvedPathSet {
             sqlite_store: paths.sqlite_store.display().to_string(),
             operator_log_root: paths.operator_log_root.display().to_string(),
             recording_root: paths.recording_root.display().to_string(),
+            sources: paths.sources.clone(),
+            project_config_file: paths
+                .project_config_file
+                .is_file()
+                .then(|| paths.project_config_file.display().to_string()),
             install_receipt: paths.install_receipt.display().to_string(),
         }
     }
@@ -422,7 +445,8 @@ pub fn render_launchd_user_plist(
             "<key>Label</key><string>dev.microck.satelle.host</string>",
             "<key>ProgramArguments</key><array>",
             "<string>{}</string><string>host</string><string>start</string>",
-            "<string>--foreground</string><string>--bind</string><string>{}</string>",
+            "<string>--foreground</string><string>--launchd-service</string>",
+            "<string>--bind</string><string>{}</string>",
             "</array><key>EnvironmentVariables</key><dict>{}</dict>",
             "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
             "</dict></plist>"
@@ -532,6 +556,20 @@ impl WindowsServiceConfigV1 {
 
     pub fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
+    }
+
+    pub fn path_overrides(&self) -> DaemonPathOverrides {
+        DaemonPathOverrides {
+            home: self.environment.get("SATELLE_HOME").map(PathBuf::from),
+            config_file: self
+                .environment
+                .get("SATELLE_CONFIG_FILE")
+                .map(PathBuf::from),
+            state_dir: self.environment.get("SATELLE_STATE_DIR").map(PathBuf::from),
+            cache_dir: self.environment.get("SATELLE_CACHE_DIR").map(PathBuf::from),
+            log_dir: self.environment.get("SATELLE_LOG_DIR").map(PathBuf::from),
+            sources: BTreeMap::new(),
+        }
     }
 
     fn validate(&self) -> Result<(), &'static str> {
@@ -1113,6 +1151,17 @@ mod tests {
             sqlite_store: "/old/state/satelle.sqlite3".to_string(),
             operator_log_root: "/old/logs".to_string(),
             recording_root: "/old/state/recordings".to_string(),
+            sources: crate::SatellePathSources {
+                config_file: crate::PathSource::OsDefault,
+                cache_root: crate::PathSource::OsDefault,
+                state_root: crate::PathSource::OsDefault,
+                sqlite_store: crate::PathSource::OsDefault,
+                operator_log_root: crate::PathSource::OsDefault,
+                recording_root: crate::PathSource::OsDefault,
+                project_config_file: crate::PathSource::ProjectDiscovery,
+                install_receipt: crate::PathSource::OsDefault,
+            },
+            project_config_file: None,
             install_receipt: "/old/state/install-receipt.json".to_string(),
         };
         let planned = current.with_service_overrides(&DaemonPathOverrides {
@@ -1124,6 +1173,7 @@ mod tests {
         assert_eq!(planned.sqlite_store, "/new/home/state/satelle.sqlite3");
         assert_eq!(planned.recording_root, "/new/home/state/recordings");
         assert_eq!(planned.operator_log_root, "/new/operator-logs");
+        assert_eq!(planned.project_config_file, None);
         assert!(planned.required_directories().contains(&planned.state_root));
     }
 
@@ -1142,7 +1192,21 @@ mod tests {
         assert!(plist.contains("<key>SATELLE_HOME</key>"));
         assert!(plist.contains("Satelle &amp; Host"));
         assert!(plist.contains("127.0.0.1:3001"));
+        assert!(plist.contains("<string>--launchd-service</string>"));
         assert!(!plist.contains("0.0.0.0"));
         assert!(!plist.contains("UserName"));
+    }
+
+    #[test]
+    fn windows_service_config_recovers_persistent_path_overrides() {
+        let overrides = DaemonPathOverrides {
+            home: Some(PathBuf::from(r"C:\Users\operator\Satelle")),
+            state_dir: Some(PathBuf::from(r"C:\Users\operator\Satelle\state")),
+            ..DaemonPathOverrides::default()
+        };
+        let config = WindowsServiceConfigV1::new("127.0.0.1:3001", &overrides)
+            .expect("valid Windows service config");
+
+        assert_eq!(config.path_overrides(), overrides);
     }
 }

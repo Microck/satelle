@@ -249,6 +249,14 @@ impl SupportCommand {
 
 impl OutputArgs {
     pub(crate) fn resolve(self, events: EventOutput) -> Result<OutputFormat, SatelleError> {
+        self.resolve_with_default(events, None)
+    }
+
+    pub(crate) fn resolve_with_default(
+        self,
+        events: EventOutput,
+        default: Option<satelle_core::PresentationOutputFormat>,
+    ) -> Result<OutputFormat, SatelleError> {
         if self.json && self.format.is_some() {
             return Err(SatelleError::output_mode_conflict(
                 "--json cannot be combined with --format",
@@ -274,7 +282,10 @@ impl OutputArgs {
         Ok(if self.json {
             OutputFormat::Json
         } else {
-            self.format.unwrap_or(OutputFormat::Human)
+            self.format.unwrap_or(match default {
+                Some(satelle_core::PresentationOutputFormat::Json) => OutputFormat::Json,
+                Some(satelle_core::PresentationOutputFormat::Human) | None => OutputFormat::Human,
+            })
         })
     }
 

@@ -84,6 +84,6 @@ fn release_binary_satisfies_offline_contract() {
     assert!(paths.stdout.ends_with(b"\n"));
     let report = serde_json::from_slice::<Value>(&paths.stdout)
         .expect("release paths output should be one JSON value");
-    assert_eq!(report["schema_version"], "satelle.paths.v1");
+    assert_eq!(report["schema_version"], "satelle.paths.v2");
     assert!(!home.exists());
 }

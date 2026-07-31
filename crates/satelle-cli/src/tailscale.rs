@@ -804,6 +804,7 @@ mod tests {
                 tailnet_name: Some("example.test".to_string()),
                 hostname: Some("studio".to_string()),
             }),
+            ssh_bootstrap: None,
             timeouts: None,
             native_readiness_cache_ttl: None,
             provider_smoke_success_cache_ttl: None,

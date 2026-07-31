@@ -73,7 +73,6 @@ function Assert-SatellePathsPayload {
     "sqlite_store",
     "operator_log_root",
     "recording_root",
-    "project_config_file",
     "install_receipt"
   )
   $SourceFields = @(
@@ -86,17 +85,36 @@ function Assert-SatellePathsPayload {
     "project_config_file",
     "install_receipt"
   )
-  $AllowedPathSources = @("os_default", "satelle_home", "explicit_environment", "project_discovery")
-  if ($Paths.schema_version -ne "satelle.paths.v1") {
-    throw "release binary failed the satelle.paths.v1 smoke test"
+  $AllowedPathSources = @(
+    "os_default",
+    "satelle_home",
+    "explicit_environment",
+    "service_config",
+    "project_discovery",
+    "host_reported"
+  )
+  if ($Paths.schema_version -ne "satelle.paths.v2") {
+    throw "release binary failed the satelle.paths.v2 smoke test"
   }
   foreach ($Field in $StringFields) {
     if ($Paths.PSObject.Properties.Name -notcontains $Field -or $Paths.$Field -isnot [string]) {
-      throw "release binary failed the satelle.paths.v1 smoke test"
+      throw "release binary failed the satelle.paths.v2 smoke test"
     }
   }
+  if (
+    $Paths.PSObject.Properties.Name -notcontains "project_config_file" -or
+    ($null -ne $Paths.project_config_file -and $Paths.project_config_file -isnot [string])
+  ) {
+    throw "release binary failed the satelle.paths.v2 smoke test"
+  }
+  if (
+    $Paths.PSObject.Properties.Name -notcontains "observation_source" -or
+    $null -ne $Paths.observation_source
+  ) {
+    throw "release binary failed the satelle.paths.v2 smoke test"
+  }
   if ($Paths.PSObject.Properties.Name -notcontains "sources" -or $Paths.sources -isnot [PSCustomObject]) {
-    throw "release binary failed the satelle.paths.v1 smoke test"
+    throw "release binary failed the satelle.paths.v2 smoke test"
   }
   foreach ($Field in $SourceFields) {
     if (
@@ -104,7 +122,7 @@ function Assert-SatellePathsPayload {
       $Paths.sources.$Field -isnot [string] -or
       $AllowedPathSources -notcontains $Paths.sources.$Field
     ) {
-      throw "release binary failed the satelle.paths.v1 smoke test"
+      throw "release binary failed the satelle.paths.v2 smoke test"
     }
   }
 }
@@ -255,7 +273,7 @@ try {
   }
   $PathsOutput = & $Members[0].FullName paths --json
   if ($LASTEXITCODE -ne 0) {
-    throw "release binary failed the satelle.paths.v1 smoke test"
+    throw "release binary failed the satelle.paths.v2 smoke test"
   }
   $Paths = $PathsOutput | ConvertFrom-Json
   Assert-SatellePathsPayload $Paths

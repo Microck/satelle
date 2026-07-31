@@ -345,13 +345,14 @@ fn local_inspection_reports_keep_their_closed_v1_shapes() {
     for (args, schema_version, expected_fields) in [
         (
             vec!["paths", "--json"],
-            "satelle.paths.v1",
+            "satelle.paths.v2",
             &[
                 "cache_root",
                 "config_file",
                 "host",
                 "install_receipt",
                 "operator_log_root",
+                "observation_source",
                 "project_config_file",
                 "recording_root",
                 "schema_version",

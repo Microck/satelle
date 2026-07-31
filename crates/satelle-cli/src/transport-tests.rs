@@ -9,7 +9,7 @@ use satelle_core::session::{
     StopObservation, TimeoutPolicy, TurnAdmissionPhase, TurnState, TurnTransition,
 };
 use satelle_core::{
-    ApiTokenSource, ErrorCode, EventSource, EventSubject, EventType, SatelleConfig,
+    ApiTokenSource, ErrorCode, EventSource, EventSubject, EventType, HostConfig, SatelleConfig,
     SatelleEventBody, TransportKind,
 };
 use satelle_host::{
@@ -329,6 +329,7 @@ fn ssh_setup_host(api_token: Option<ApiTokenSource>) -> SelectedHost {
     SelectedHost {
         alias: "remote".to_string(),
         config,
+        from_project: false,
     }
 }
 
@@ -398,6 +399,14 @@ fn ordinary_ssh_commands_require_a_durable_token_descriptor() {
 
     assert_eq!(error.error.code, ErrorCode::ConfigError);
     assert!(error.error.message.contains("api_token"));
+}
+
+#[test]
+fn tokenless_ssh_sessions_without_bootstrap_report_daemon_unreachable() {
+    let failure = transport::host_sessions_for_inspection(&ssh_setup_host(None), true)
+        .expect_err("tokenless no-bootstrap inspection cannot authenticate the daemon");
+
+    assert_eq!(failure.error.code, ErrorCode::HostDaemonUnreachable);
 }
 
 #[test]
@@ -4617,4 +4626,70 @@ fn failed_local_status_preserves_interrupt_exit_and_session_recovery_command() {
     );
     assert_eq!(error.details["session_id"], session_id.as_str());
     assert_eq!(error.details["status_error_code"], "host-unreachable");
+}
+
+fn direct_inspection_host_config() -> HostConfig {
+    let mut config = SatelleConfig::defaults()
+        .hosts
+        .remove("local-demo")
+        .expect("default local Host config");
+    config.transport = TransportKind::Direct;
+    config.address = Some("https://daemon.example.test:9443".to_string());
+    config
+}
+
+#[test]
+fn direct_inspection_fallback_uses_bootstrap_settings_without_durable_authentication() {
+    let mut config = direct_inspection_host_config();
+    config.network = Some(satelle_core::NetworkConfig::Tailscale {
+        tailnet_name: Some("corp".to_string()),
+        hostname: None,
+    });
+    config.expected_host_id = Some("host-123".to_string());
+    config.api_token = Some(ApiTokenSource::File {
+        path: PathBuf::from("/operator/daemon.token"),
+    });
+    config.ca_bundle = Some(PathBuf::from("/operator/daemon-ca.pem"));
+    config.ssh_bootstrap = Some(satelle_core::SshBootstrapConfig {
+        address: "operator@bootstrap.example.test:22".to_string(),
+    });
+    let selected = SelectedHost {
+        alias: "workstation".to_string(),
+        config,
+        from_project: false,
+    };
+
+    let fallback = ssh_bootstrap_host(&selected).expect("operator bootstrap settings should work");
+
+    assert_eq!(fallback.alias, "workstation");
+    assert_eq!(fallback.config.transport, TransportKind::Ssh);
+    assert_eq!(
+        fallback.config.address.as_deref(),
+        Some("operator@bootstrap.example.test:22")
+    );
+    assert_eq!(
+        fallback.config.expected_host_id.as_deref(),
+        Some("host-123")
+    );
+    // The direct daemon already proved this durable credential unreachable. Carrying it into
+    // ssh_transport would select the durable retry branch and skip the read-scoped bootstrap.
+    assert_eq!(fallback.config.api_token, None);
+    assert_eq!(fallback.config.network, None);
+    assert_eq!(fallback.config.ca_bundle, None);
+    assert_eq!(fallback.config.ssh_bootstrap, None);
+}
+
+#[test]
+fn direct_inspection_fallback_requires_operator_ssh_bootstrap_settings() {
+    let selected = SelectedHost {
+        alias: "workstation".to_string(),
+        config: direct_inspection_host_config(),
+        from_project: false,
+    };
+
+    let error = ssh_bootstrap_host(&selected).expect_err("fallback must be explicitly configured");
+
+    assert_eq!(error.code, ErrorCode::SshBootstrapUnavailable);
+    assert_eq!(error.code.as_str(), "ssh-bootstrap-unavailable");
+    assert_eq!(error.exit_code(), 69);
 }

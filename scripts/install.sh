@@ -186,9 +186,11 @@ validate_paths_output() {
       (. == "os_default" or
        . == "satelle_home" or
        . == "explicit_environment" or
-       . == "project_discovery");
+       . == "service_config" or
+       . == "project_discovery" or
+       . == "host_reported");
     type == "object" and
-    .schema_version == "satelle.paths.v1" and
+    .schema_version == "satelle.paths.v2" and
     (.host | type == "string") and
     (.config_file | type == "string") and
     (.cache_root | type == "string") and
@@ -196,8 +198,11 @@ validate_paths_output() {
     (.sqlite_store | type == "string") and
     (.operator_log_root | type == "string") and
     (.recording_root | type == "string") and
-    (.project_config_file | type == "string") and
+    has("project_config_file") and
+    ((.project_config_file == null) or (.project_config_file | type == "string")) and
     (.install_receipt | type == "string") and
+    has("observation_source") and
+    .observation_source == null and
     (.sources | type == "object") and
     (.sources.config_file | valid_path_source) and
     (.sources.cache_root | valid_path_source) and
@@ -356,11 +361,11 @@ fi
   exit 1
 }
 if ! paths_output=$("$extract_root/satelle" paths --json); then
-  printf '%s\n' "release binary failed the satelle.paths.v1 smoke test" >&2
+  printf '%s\n' "release binary failed the satelle.paths.v2 smoke test" >&2
   exit 1
 fi
 printf '%s' "$paths_output" | validate_paths_output || {
-  printf '%s\n' "release binary failed the satelle.paths.v1 smoke test" >&2
+  printf '%s\n' "release binary failed the satelle.paths.v2 smoke test" >&2
   exit 1
 }
 

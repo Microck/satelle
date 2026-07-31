@@ -1417,6 +1417,15 @@ fn events_json_emits_newline_delimited_satelle_events() {
     assert_eq!(events.len(), 7);
     assert_eq!(events[0]["type"], "preflight");
     assert_eq!(events[0]["source"], "cli");
+    assert_eq!(events[0]["data"]["project_config_intent"]["host"], false);
+    assert_eq!(
+        events[0]["data"]["project_config_intent"]["timeouts"],
+        false
+    );
+    assert_eq!(
+        events[0]["data"]["project_config_intent"]["transport"],
+        false
+    );
     assert!(events[0]["session_id"].is_null());
     assert!(events[0]["turn_id"].is_null());
     assert!(events.iter().any(|event| event["type"] == "provider_smoke"));
@@ -5073,7 +5082,7 @@ fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
         .clone();
     assert!(paths_output.stderr.is_empty());
     let paths_report = parse_json_output(&paths_output.stdout);
-    assert_eq!(paths_report["schema_version"], "satelle.paths.v1");
+    assert_eq!(paths_report["schema_version"], "satelle.paths.v2");
     for field in [
         "config_file",
         "cache_root",
@@ -5089,6 +5098,23 @@ fn config_check_explain_and_paths_use_versioned_read_only_json_contracts() {
             "paths JSON should include {field}"
         );
     }
+    assert_eq!(paths_report["observation_source"], serde_json::Value::Null);
+    assert_eq!(
+        paths_report["sources"]["state_root"],
+        "explicit_environment"
+    );
+    assert_eq!(
+        paths_report["sources"]["sqlite_store"],
+        "explicit_environment"
+    );
+    assert_eq!(
+        paths_report["sources"]["recording_root"],
+        "explicit_environment"
+    );
+    assert_eq!(
+        paths_report["sources"]["project_config_file"],
+        "project_discovery"
+    );
 
     assert!(!state.path().join("local-demo-state.json").exists());
 }
@@ -5183,6 +5209,34 @@ fn paths_json_uses_satelle_home_and_explicit_overrides() {
         paths["sources"]["operator_log_root"],
         "explicit_environment"
     );
+}
+
+#[test]
+fn paths_human_output_identifies_each_path_source() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["paths"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let output = String::from_utf8(output.stdout).expect("paths output is UTF-8");
+
+    assert!(output.contains("State [explicit_environment]:"));
+    assert!(output.contains("SQLite [explicit_environment]:"));
+    assert!(output.contains("Recordings [explicit_environment]:"));
+    assert!(output.contains("Config [os_default]:"));
+
+    let host_output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["paths", "--host", "local-demo"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let host_output = String::from_utf8(host_output.stdout).expect("Host paths output is UTF-8");
+    assert!(host_output.contains("Observation source: host_reported"));
 }
 
 #[cfg(target_os = "macos")]
@@ -5326,6 +5380,7 @@ transpor = "direct"
             "default_host",
             "model_alias",
             "provider_alias",
+            "output_format",
             "profile",
             "hosts"
         ])

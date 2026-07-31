@@ -2,9 +2,9 @@ use crate::contract::{
     AdmissionCancellationResponse, ApiError, ApiErrorCode, AuthenticatedResponseContract,
     BootstrapMaintenanceResponse, CapabilitiesResponse, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostDesktopSessionsResponse,
-    HostStatusResponse, LiveResponse, LogsPageResponse, NativeReadinessInvalidationRequest,
-    NativeReadinessInvalidationResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
-    PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
+    HostPathsResponse, HostStatusResponse, LiveResponse, LogsPageResponse,
+    NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse, PROTOCOL_VERSION,
+    PROTOCOL_VERSION_HEADER, PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
@@ -274,6 +274,11 @@ impl DaemonClient {
 
     pub fn host_status(&self) -> Result<HostStatusResponse, DaemonClientError> {
         let (request, request_id) = self.protected_request(Method::GET, "/v1/host/status")?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn host_paths(&self) -> Result<HostPathsResponse, DaemonClientError> {
+        let (request, request_id) = self.protected_request(Method::GET, "/v1/host/paths")?;
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 

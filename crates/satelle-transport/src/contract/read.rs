@@ -1,11 +1,11 @@
 use super::{AuthenticatedResponseContract, RequestId, define_schema_token};
+use satelle_core::daemon_service::DaemonResolvedPathSet;
 use satelle_core::{ApiRateLimits, DesktopSessionRecord};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 define_schema_token!(LiveSchema, "satelle.live.v1");
-define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v5");
-
+define_schema_token!(CapabilitiesSchema, "satelle.capabilities.v6");
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSecretUploadCapability {
@@ -42,6 +42,7 @@ impl ProviderSecretUploadCapability {
     }
 }
 define_schema_token!(HostStatusSchema, "satelle.host.status.v1");
+define_schema_token!(HostPathsSchema, "satelle.host.paths.v1");
 define_schema_token!(
     HostDesktopSessionsSchema,
     "satelle.host.desktop-sessions.v1"
@@ -73,6 +74,7 @@ enum Operation {
     Live,
     Capabilities,
     HostStatus,
+    HostPaths,
     HostDesktopSessions,
     SessionCreate,
     TurnCreate,
@@ -93,6 +95,7 @@ impl Operation {
             Self::Live => "live",
             Self::Capabilities => "capabilities",
             Self::HostStatus => "host_status",
+            Self::HostPaths => "host_paths",
             Self::HostDesktopSessions => "host_desktop_sessions",
             Self::SessionCreate => "session_create",
             Self::TurnCreate => "turn_create",
@@ -293,6 +296,7 @@ impl CapabilitiesResponse {
                 Operation::Live,
                 Operation::Capabilities,
                 Operation::HostStatus,
+                Operation::HostPaths,
                 Operation::HostDesktopSessions,
                 Operation::SessionCreate,
                 Operation::TurnCreate,
@@ -440,6 +444,52 @@ impl AuthenticatedResponseContract for HostStatusResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct HostPathsResponse {
+    schema_version: HostPathsSchema,
+    request_id: RequestId,
+    host_identity: String,
+    paths: DaemonResolvedPathSet,
+}
+
+impl HostPathsResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        paths: DaemonResolvedPathSet,
+    ) -> Self {
+        Self {
+            schema_version: HostPathsSchema,
+            request_id,
+            host_identity,
+            paths,
+        }
+    }
+
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+
+    pub const fn paths(&self) -> &DaemonResolvedPathSet {
+        &self.paths
+    }
+}
+
+impl AuthenticatedResponseContract for HostPathsResponse {
+    fn request_id(&self) -> &RequestId {
+        self.request_id()
+    }
+
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostDesktopSessionsResponse {
     schema_version: HostDesktopSessionsSchema,
     request_id: RequestId,
@@ -526,6 +576,93 @@ mod tests {
                 r#"{"schema_version":"satelle.live.v1","alive":true,"extra":1}"#
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn host_paths_exposes_only_daemon_authoritative_paths() {
+        let request_id = RequestId::new();
+        let paths = DaemonResolvedPathSet {
+            config_file: "/daemon/config/config.toml".to_string(),
+            cache_root: "/daemon/cache".to_string(),
+            state_root: "/daemon/state".to_string(),
+            sqlite_store: "/daemon/state/satelle.sqlite3".to_string(),
+            operator_log_root: "/daemon/state/logs".to_string(),
+            recording_root: "/daemon/state/recordings".to_string(),
+            sources: satelle_core::SatellePathSources {
+                config_file: satelle_core::PathSource::ServiceConfig,
+                cache_root: satelle_core::PathSource::ServiceConfig,
+                state_root: satelle_core::PathSource::ServiceConfig,
+                sqlite_store: satelle_core::PathSource::ServiceConfig,
+                operator_log_root: satelle_core::PathSource::ServiceConfig,
+                recording_root: satelle_core::PathSource::ServiceConfig,
+                project_config_file: satelle_core::PathSource::ProjectDiscovery,
+                install_receipt: satelle_core::PathSource::ServiceConfig,
+            },
+            project_config_file: Some("/daemon/project/satelle.toml".to_string()),
+            install_receipt: "/daemon/state/install-receipt.json".to_string(),
+        };
+        let response =
+            HostPathsResponse::new(request_id.clone(), "host-daemon".to_string(), paths.clone());
+
+        assert_eq!(response.paths(), &paths);
+        assert_eq!(
+            serde_json::to_value(&response).expect("serialize Host Path Set response"),
+            serde_json::json!({
+                "schema_version": "satelle.host.paths.v1",
+                "request_id": request_id,
+                "host_identity": "host-daemon",
+                "paths": {
+                    "config_file": "/daemon/config/config.toml",
+                    "cache_root": "/daemon/cache",
+                    "state_root": "/daemon/state",
+                    "sqlite_store": "/daemon/state/satelle.sqlite3",
+                    "operator_log_root": "/daemon/state/logs",
+                    "recording_root": "/daemon/state/recordings",
+                    "sources": {
+                        "config_file": "service_config",
+                        "cache_root": "service_config",
+                        "state_root": "service_config",
+                        "sqlite_store": "service_config",
+                        "operator_log_root": "service_config",
+                        "recording_root": "service_config",
+                        "project_config_file": "project_discovery",
+                        "install_receipt": "service_config"
+                    },
+                    "project_config_file": "/daemon/project/satelle.toml",
+                    "install_receipt": "/daemon/state/install-receipt.json"
+                }
+            })
+        );
+
+        let mut response_with_nested_path_field =
+            serde_json::to_value(&response).expect("serialize Host Path Set response");
+        response_with_nested_path_field["paths"]["daemon_private_path"] =
+            serde_json::json!("/daemon/private");
+        assert!(
+            serde_json::from_value::<HostPathsResponse>(response_with_nested_path_field).is_err(),
+            "the remote response must reject unknown nested path fields"
+        );
+
+        let mut response_with_nested_source_field =
+            serde_json::to_value(&response).expect("serialize Host Path Set response");
+        response_with_nested_source_field["paths"]["sources"]["daemon_private_path"] =
+            serde_json::json!("service_config");
+        assert!(
+            serde_json::from_value::<HostPathsResponse>(response_with_nested_source_field).is_err(),
+            "the remote response must reject unknown nested source fields"
+        );
+
+        let response_with_controller_path = serde_json::json!({
+            "schema_version": "satelle.host.paths.v1",
+            "request_id": RequestId::new(),
+            "host_identity": "host-daemon",
+            "paths": paths,
+            "controller_project_config_file": "/controller/project/satelle.toml"
+        });
+        assert!(
+            serde_json::from_value::<HostPathsResponse>(response_with_controller_path).is_err(),
+            "the remote response must reject controller-owned path provenance"
         );
     }
 }

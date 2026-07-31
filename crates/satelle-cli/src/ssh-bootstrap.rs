@@ -3347,12 +3347,13 @@ fn parse_launchd_path_overrides(output: &[u8]) -> Result<DaemonPathOverrides, Ss
         "<key>Label</key><string>dev.microck.satelle.host</string>",
         "<key>ProgramArguments</key><array><string>",
     );
-    const ARGUMENTS: &str = concat!(
+    const ARGUMENTS_PREFIX: &str = concat!(
         "</string><string>host</string><string>start</string>",
-        "<string>--foreground</string><string>--bind</string>",
-        "<string>127.0.0.1:3001</string></array>",
-        "<key>EnvironmentVariables</key><dict>",
+        "<string>--foreground</string><string>--launchd-service</string>",
+        "<string>--bind</string><string>",
     );
+    const ENVIRONMENT_PREFIX: &str =
+        concat!("</string></array>", "<key>EnvironmentVariables</key><dict>",);
     const SUFFIX: &str = concat!(
         "</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
         "</dict></plist>",
@@ -3363,10 +3364,19 @@ fn parse_launchd_path_overrides(output: &[u8]) -> Result<DaemonPathOverrides, Ss
         .strip_prefix(PREFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
     let (binary, body) = body
-        .split_once(ARGUMENTS)
+        .split_once(ARGUMENTS_PREFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
     let binary = decode_plist_text(binary)?;
     if !target_path_is_absolute(RemoteTarget::DarwinArm64, &binary) {
+        return Err(SshBootstrapError::InvalidServiceObservation);
+    }
+    let (bind, body) = body
+        .split_once(ENVIRONMENT_PREFIX)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let bind = decode_plist_text(bind)?
+        .parse::<SocketAddr>()
+        .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+    if !bind.ip().is_loopback() {
         return Err(SshBootstrapError::InvalidServiceObservation);
     }
     let environment = body
@@ -3683,6 +3693,18 @@ impl RemoteUserDirectories {
             cache_root,
             state_root,
             operator_log_root,
+            sources: satelle_core::SatellePathSources {
+                config_file: satelle_core::PathSource::OsDefault,
+                cache_root: satelle_core::PathSource::OsDefault,
+                state_root: satelle_core::PathSource::OsDefault,
+                sqlite_store: satelle_core::PathSource::OsDefault,
+                operator_log_root: satelle_core::PathSource::OsDefault,
+                recording_root: satelle_core::PathSource::OsDefault,
+                project_config_file: satelle_core::PathSource::ProjectDiscovery,
+                install_receipt: satelle_core::PathSource::OsDefault,
+            },
+            // On-demand SSH inspection has no authoritative daemon-side project discovery.
+            project_config_file: None,
         }
     }
 
@@ -3762,6 +3784,70 @@ mod remote_user_directories_tests {
                 Err(SshBootstrapError::InvalidProbe)
             ));
         }
+    }
+
+    #[test]
+    fn linux_path_set_uses_xdg_state_for_logs_sqlite_and_recordings() {
+        let directories = RemoteUserDirectories::parse(
+            RemoteTarget::LinuxX64Gnu,
+            b"satelle-user-dirs-v2\nUSER=operator\nHOME=/home/operator\nXDG_CONFIG_HOME=\nXDG_CACHE_HOME=\nXDG_STATE_HOME=\n",
+        )
+        .expect("authenticated Linux directory probe should parse");
+
+        let paths = directories.resolved_path_set();
+
+        assert_eq!(
+            paths.config_file,
+            "/home/operator/.config/satelle/config.toml"
+        );
+        assert_eq!(paths.cache_root, "/home/operator/.cache/satelle");
+        assert_eq!(paths.state_root, "/home/operator/.local/state/satelle");
+        assert_eq!(
+            paths.sqlite_store,
+            "/home/operator/.local/state/satelle/satelle.sqlite3"
+        );
+        assert_eq!(
+            paths.recording_root,
+            "/home/operator/.local/state/satelle/recordings"
+        );
+        assert_eq!(
+            paths.operator_log_root,
+            "/home/operator/.local/state/satelle/logs"
+        );
+        assert_eq!(paths.project_config_file, None);
+    }
+
+    #[test]
+    fn windows_path_set_uses_local_app_data_for_logs_sqlite_and_recordings() {
+        let directories = RemoteUserDirectories::parse(
+            RemoteTarget::WindowsX64Msvc,
+            b"satelle-user-dirs-v2\nUSER=operator\nHOME=C:\\Users\\operator\nLOCALAPPDATA=C:\\Users\\operator\\AppData\\Local\nAPPDATA=C:\\Users\\operator\\AppData\\Roaming\n",
+        )
+        .expect("authenticated Windows directory probe should parse");
+
+        let paths = directories.resolved_path_set();
+
+        assert_eq!(
+            paths.config_file,
+            r"C:\Users\operator\AppData\Roaming\Microck\Satelle\config\config.toml"
+        );
+        assert_eq!(
+            paths.state_root,
+            r"C:\Users\operator\AppData\Local\Microck\Satelle\data\state"
+        );
+        assert_eq!(
+            paths.sqlite_store,
+            r"C:\Users\operator\AppData\Local\Microck\Satelle\data\state\satelle.sqlite3"
+        );
+        assert_eq!(
+            paths.recording_root,
+            r"C:\Users\operator\AppData\Local\Microck\Satelle\data\state\recordings"
+        );
+        assert_eq!(
+            paths.operator_log_root,
+            r"C:\Users\operator\AppData\Local\Microck\Satelle\data\state\logs"
+        );
+        assert_eq!(paths.project_config_file, None);
     }
 }
 
@@ -5308,7 +5394,7 @@ mod tests {
         };
         let plist = satelle_core::daemon_service::render_launchd_user_plist(
             Path::new("/Users/operator/Applications/Satelle & Host/satelle"),
-            "127.0.0.1:3001",
+            "127.0.0.1:4001",
             &overrides,
         )
         .expect("valid launchd plist");
@@ -5325,7 +5411,7 @@ mod tests {
             parse_service_path_overrides(RemoteTarget::DarwinArm64, unknown_key.as_bytes())
                 .is_err()
         );
-        let wrong_bind = plist.replace("127.0.0.1:3001", "127.0.0.1:3002");
+        let wrong_bind = plist.replace("127.0.0.1:4001", "0.0.0.0:4001");
         assert!(
             parse_service_path_overrides(RemoteTarget::DarwinArm64, wrong_bind.as_bytes()).is_err()
         );
@@ -6575,6 +6661,7 @@ mod tests {
             adapter: satelle_core::AdapterKind::Codex,
             address: Some("operator@host".to_string()),
             network: None,
+            ssh_bootstrap: None,
             timeouts: None,
             native_readiness_cache_ttl: None,
             provider_smoke_success_cache_ttl: None,

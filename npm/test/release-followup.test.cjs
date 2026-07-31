@@ -245,7 +245,7 @@ test("Unix installer performs verified install, upgrade, smoke, receipt, and uni
     : `linux-${process.arch === "arm64" ? "arm64" : "x64"}-gnu`;
 
   const completePathsPayload = {
-    schema_version: "satelle.paths.v1",
+    schema_version: "satelle.paths.v2",
     host: "local-demo",
     config_file: "/fixture/config.toml",
     cache_root: "/fixture/cache",
@@ -253,8 +253,9 @@ test("Unix installer performs verified install, upgrade, smoke, receipt, and uni
     sqlite_store: "/fixture/state/satelle.sqlite3",
     operator_log_root: "/fixture/state/logs",
     recording_root: "/fixture/state/recordings",
-    project_config_file: "/fixture/project/satelle.toml",
+    project_config_file: null,
     install_receipt: "/fixture/state/install-receipt.json",
+    observation_source: null,
     sources: {
       config_file: "satelle_home",
       cache_root: "satelle_home",
@@ -283,7 +284,7 @@ test("Unix installer performs verified install, upgrade, smoke, receipt, and uni
   makeRelease("0.1.0");
   makeRelease("0.2.0");
   makeRelease("0.3.0", { versionExit: 1 });
-  makeRelease("0.4.0", { pathsPayload: { schema_version: "satelle.paths.v1" } });
+  makeRelease("0.4.0", { pathsPayload: { schema_version: "satelle.paths.v2" } });
   makeRelease("0.5.0", { pathsExit: 1 });
   makeRelease("0.6.0", {
     pathsPayload: {
@@ -302,6 +303,12 @@ test("Unix installer performs verified install, upgrade, smoke, receipt, and uni
       ...completePathsPayload,
       sources: { ...completePathsPayload.sources, state_root: "legacy_default" },
     },
+  });
+  makeRelease("0.9.0", {
+    pathsPayload: { ...completePathsPayload, project_config_file: undefined },
+  });
+  makeRelease("0.10.0", {
+    pathsPayload: { ...completePathsPayload, observation_source: undefined },
   });
 
   writeExecutable(path.join(commands, "curl"), `#!/bin/sh\nout=''\nurl=''\nwhile [ "$#" -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; http*) url="$1"; shift;; *) shift;; esac; done\nname=\${url##*/}\ncase "$name" in SHA256SUMS) version=\$(printf '%s' "$url" | sed -n 's#.*releases/download/v\\([^/]*\\)/.*#\\1#p'); cp "$SATELLE_FIXTURES/SHA256SUMS-$version" "$out";; *) cp "$SATELLE_FIXTURES/$name" "$out";; esac\n`);
@@ -375,11 +382,13 @@ test("Unix installer performs verified install, upgrade, smoke, receipt, and uni
     ["0.6.0", "incomplete paths sources"],
     ["0.7.0", "wrongly typed paths source"],
     ["0.8.0", "invalid paths source enum"],
+    ["0.9.0", "missing nullable project config field"],
+    ["0.10.0", "missing nullable observation source field"],
   ]) {
     const failedPathsBin = path.join(root, `failed-paths-smoke-${version}`);
     const failedPathsResult = runInstaller("--version", version, "--bin-dir", failedPathsBin);
     assert.notEqual(failedPathsResult.status, 0, `${smokeFailure} unexpectedly passed`);
-    assert.match(failedPathsResult.stderr, /failed the satelle\.paths\.v1 smoke test/);
+    assert.match(failedPathsResult.stderr, /failed the satelle\.paths\.v2 smoke test/);
     assert.equal(existsSync(path.join(failedPathsBin, "satelle")), false);
   }
 
@@ -429,7 +438,7 @@ test("PowerShell installer exposes the same fail-closed lifecycle contract", () 
     "SHA256SUMS",
     "Invoke-BoundedGh",
     "--deny-self-hosted-runners",
-    "satelle.paths.v1",
+    "satelle.paths.v2",
     ".satelle-install.json",
     ".satelle-install.lock",
     "[System.IO.File]::ReadAllText",
@@ -462,15 +471,19 @@ test("PowerShell installer exposes the same fail-closed lifecycle contract", () 
     "project_config_file",
     "install_receipt",
     "sources",
+    "observation_source",
   ]) assert.ok(installer.includes(`"${field}"`), `PowerShell paths verifier is missing ${field}`);
   assert.match(
     installer,
     /\$SourceFields\s*=\s*@\([\s\S]*?"config_file"[\s\S]*?"cache_root"[\s\S]*?"state_root"[\s\S]*?"sqlite_store"[\s\S]*?"operator_log_root"[\s\S]*?"recording_root"[\s\S]*?"project_config_file"[\s\S]*?"install_receipt"[\s\S]*?\)/,
   );
-  assert.match(installer, /\$AllowedPathSources\s*=\s*@\("os_default", "satelle_home", "explicit_environment", "project_discovery"\)/);
+  assert.match(
+    installer,
+    /\$AllowedPathSources\s*=\s*@\(\s*"os_default",\s*"satelle_home",\s*"explicit_environment",\s*"service_config",\s*"project_discovery",\s*"host_reported"\s*\)/,
+  );
 });
 
-test("PowerShell installer rejects nonzero and malformed nested paths payloads", {
+test("PowerShell installer validates the complete paths v2 payload", {
   skip: process.platform === "win32",
 }, (context) => {
   const root = mkdtempSync(path.join(tmpdir(), "satelle-pwsh-paths-"));
@@ -504,7 +517,7 @@ echo '[{}]'
     "install_receipt",
   ];
   const completePathsPayload = {
-    schema_version: "satelle.paths.v1",
+    schema_version: "satelle.paths.v2",
     host: "local-demo",
     config_file: "C:\\fixture\\config.toml",
     cache_root: "C:\\fixture\\cache",
@@ -512,15 +525,37 @@ echo '[{}]'
     sqlite_store: "C:\\fixture\\state\\satelle.sqlite3",
     operator_log_root: "C:\\fixture\\state\\logs",
     recording_root: "C:\\fixture\\state\\recordings",
-    project_config_file: "C:\\fixture\\project\\satelle.toml",
+    project_config_file: null,
     install_receipt: "C:\\fixture\\state\\install-receipt.json",
+    observation_source: null,
     sources: Object.fromEntries(sourceFields.map((field) => [field, "satelle_home"])),
   };
   completePathsPayload.sources.project_config_file = "project_discovery";
 
   const cases = [
+    { name: "complete-v2", payload: completePathsPayload, succeeds: true },
     { name: "nonzero-exit-before-json", pathsOutput: "not-json", pathsExit: 23 },
     { name: "malformed-json", pathsOutput: "{" },
+    {
+      name: "legacy-schema",
+      payload: { ...completePathsPayload, schema_version: "satelle.paths.v1" },
+    },
+    {
+      name: "missing-project-config",
+      payload: { ...completePathsPayload, project_config_file: undefined },
+    },
+    {
+      name: "wrong-type-project-config",
+      payload: { ...completePathsPayload, project_config_file: 42 },
+    },
+    {
+      name: "missing-observation-source",
+      payload: { ...completePathsPayload, observation_source: undefined },
+    },
+    {
+      name: "remote-observation-source",
+      payload: { ...completePathsPayload, observation_source: "host_reported" },
+    },
     { name: "missing-sources", payload: { ...completePathsPayload, sources: undefined } },
     { name: "wrong-type-sources", payload: { ...completePathsPayload, sources: [] } },
   ];
@@ -582,6 +617,15 @@ function global:Invoke-WebRequest {
 `;
     writeFileSync(harnessPath, harness);
     const result = spawnSync("pwsh", ["-NoProfile", "-File", harnessPath], { encoding: "utf8" });
+    if (fixture.succeeds) {
+      assert.equal(
+        result.status,
+        0,
+        `${fixture.name} unexpectedly failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
+      );
+      assert.equal(existsSync(path.join(bin, "satelle.exe")), true, fixture.name);
+      continue;
+    }
     assert.notEqual(
       result.status,
       0,
@@ -589,7 +633,7 @@ function global:Invoke-WebRequest {
     );
     assert.equal(existsSync(path.join(bin, "satelle.exe")), false, fixture.name);
     if (fixture.name === "nonzero-exit-before-json") {
-      assert.match(result.stderr, /failed the satelle\.paths\.v1 smoke test/);
+      assert.match(result.stderr, /failed the satelle\.paths\.v2 smoke test/);
       assert.doesNotMatch(result.stderr, /ConvertFrom-Json/);
     }
   }

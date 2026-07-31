@@ -1,5 +1,5 @@
 use super::output::StatusReport;
-use super::transport::{SshBootstrapScope, transport_for, transport_for_with_ssh_bootstrap};
+use super::transport::transport_for;
 use super::{
     CONFIG_CHECK_SCHEMA_VERSION, CONFIG_EXPLAIN_SCHEMA_VERSION, CliFailure, ConfigContext,
     HostSessionsReport, LOCAL_DEMO_HOST, PATHS_SCHEMA_VERSION, PublicSession, SessionId,
@@ -116,8 +116,9 @@ pub(super) fn config_explain_report(
         .selected_profile
         .as_ref()
         .map(|profile| profile.source.as_str());
-    let (selected_host, selected_host_config) =
-        config.resolve_host(host.as_deref()).map_err(failure)?;
+    let (selected_host, selected_host_config, host_from_project) = config
+        .resolve_host_with_project_source(host.as_deref())
+        .map_err(failure)?;
     let mut effective_config = config.config.clone();
     effective_config
         .hosts
@@ -145,12 +146,22 @@ pub(super) fn config_explain_report(
             "user_config": config.user_config_path,
             "project_config": config.project_config_path,
             "profile": selected_profile_source,
+            "project_intent": {
+                "host": host_from_project,
+                "model": config.model_alias_from_project(),
+                "provider": config.provider_alias_from_project(),
+                "profile": selected_profile_source == Some("project_config"),
+                "timeouts": config.timeout_intent_from_project(&selected_host),
+                "transport": config.transport_intent_from_project(&selected_host),
+                "output_format": config.output_format_from_project(),
+            },
             "environment": environment_sources,
             "flags": ["--host", "--profile"],
         },
         "effective": redacted_config_json(&effective_config, show_secret_references),
         "values": {
             "default_host": config.config.default_host,
+            "output_format": config.config.output_format,
             "host_count": config.config.hosts.len(),
             "effective_timeouts": super::effective_timeouts_json(
                 &selected_host_config,
@@ -174,10 +185,22 @@ pub(super) fn config_explain_report(
     }))
 }
 
-pub(super) fn paths_report(host: Option<String>) -> Result<Value, CliFailure> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let selected_host = host.unwrap_or_else(|| LOCAL_DEMO_HOST.to_string());
-    let paths = resolve_path_set(&cwd).map_err(failure)?;
+pub(super) fn paths_report(host: Option<&super::SelectedHost>) -> Result<Value, CliFailure> {
+    let (selected_host, paths, observation_source) = if let Some(host) = host {
+        (
+            host.alias.clone(),
+            super::transport::host_paths_for_inspection(host)?,
+            Some(satelle_core::PathSource::HostReported),
+        )
+    } else {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let paths = resolve_path_set(&cwd).map_err(failure)?;
+        (
+            LOCAL_DEMO_HOST.to_string(),
+            satelle_core::daemon_service::DaemonResolvedPathSet::from(&paths),
+            None,
+        )
+    };
     Ok(json!({
         "schema_version": PATHS_SCHEMA_VERSION,
         "host": selected_host,
@@ -190,6 +213,7 @@ pub(super) fn paths_report(host: Option<String>) -> Result<Value, CliFailure> {
         "project_config_file": paths.project_config_file,
         "install_receipt": paths.install_receipt,
         "sources": paths.sources,
+        "observation_source": observation_source,
     }))
 }
 
@@ -251,10 +275,7 @@ pub(super) fn host_sessions_for_host(
     host: &super::SelectedHost,
     no_bootstrap: bool,
 ) -> Result<HostSessionsReport, CliFailure> {
-    let bootstrap_scope = (!no_bootstrap).then_some(SshBootstrapScope::Read);
-    let mut report = transport_for_with_ssh_bootstrap(host, bootstrap_scope)?
-        .host_sessions(no_bootstrap)
-        .map_err(failure)?;
+    let mut report = super::transport::host_sessions_for_inspection(host, no_bootstrap)?;
     apply_current_desktop_selection(&mut report, &host.config);
     Ok(report)
 }

@@ -15,8 +15,8 @@ pub use events::{
 pub use logs::LogsPageResponse;
 pub(crate) use read::effective_limits;
 pub use read::{
-    CapabilitiesResponse, EffectiveLimits, HostDesktopSessionsResponse, HostStatusResponse,
-    LiveResponse,
+    CapabilitiesResponse, EffectiveLimits, HostDesktopSessionsResponse, HostPathsResponse,
+    HostStatusResponse, LiveResponse,
 };
 pub use satelle_core::{
     ProviderAuthObservationSource, ProviderAuthValidationMode, ProviderAuthValidationOutcome,
@@ -45,11 +45,12 @@ pub(crate) use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v11 hard-cuts the plaintext provider-secret upload in favor of the
-// Host-bound HPKE preview/envelope v2 contract. It also carries setup
-// verification, native-readiness invalidation, and capabilities v5. Exact
-// negotiation rejects v10 peers rather than preserving the old carrier.
-pub(crate) const PROTOCOL_VERSION: &str = "11";
+// Protocol v12 adds authenticated Host Path Set inspection to the v11 hard cut
+// that replaced plaintext provider-secret upload with the Host-bound HPKE
+// preview/envelope v2 contract. It also carries setup verification,
+// native-readiness invalidation, and capabilities v6. Exact negotiation rejects
+// v11 peers that cannot serve or consume the complete Host Path Set contract.
+pub(crate) const PROTOCOL_VERSION: &str = "12";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -187,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v11_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "11");
+    fn protocol_version_is_the_v12_host_paths_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "12");
     }
 }
