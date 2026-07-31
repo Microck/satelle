@@ -1283,6 +1283,61 @@ fn uncertain_first_host_update_action_start_closes_the_unmodified_operation() {
 
 #[cfg(unix)]
 #[test]
+fn rejected_first_host_update_action_start_closes_the_unmodified_operation() {
+    with_bootstrap_handoff_test_context_with_scope(
+        ApiScopes::ADMIN,
+        |client, fake_ssh, _, _, _| {
+            let operation_id = "host-update-rejected-first-start";
+            client
+                .begin_host_update_maintenance(operation_id)
+                .expect("begin Host update maintenance");
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "host-update-clean-rejection-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::HostBinaryReplacement,
+                fake_ssh,
+            )
+            .expect("acquire Host replacement Bootstrap Lock");
+            bootstrap_lock
+                .confirm_ownership()
+                .expect("confirm Bootstrap Lock ownership");
+
+            // Starting an out-of-order action returns a pre-mutation conflict.
+            // Response reconciliation commits that exact nonmutation attempt.
+            start_persistent_action(
+                "host-update-clean-rejection-host",
+                client,
+                &mut bootstrap_lock,
+                "publish-host-service",
+            )
+            .expect_err("out-of-order action start is rejected");
+
+            finish_unmodified_after_uncertain_first_action_start(
+                "host-update-clean-rejection-host",
+                client,
+                &mut bootstrap_lock,
+            )
+            .expect("close the unmodified Host update after the rejected start");
+
+            let next_operation = "host-update-after-clean-first-start-rejection";
+            client
+                .begin_host_update_maintenance(next_operation)
+                .expect("clean rejection releases Maintenance ownership");
+            for action_id in HOST_UPDATE_ACTIONS {
+                client
+                    .skip_maintenance_action(next_operation, action_id)
+                    .expect("skip the next operation action");
+            }
+            client
+                .finish_maintenance_plan(next_operation)
+                .expect("finish the next maintenance operation");
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn final_host_update_revalidation_holds_and_releases_maintenance_on_drift() {
     with_bootstrap_handoff_test_context_with_scope(ApiScopes::ADMIN, |client, _, _, _, _| {
         let operation_id = "host-update-final-revalidation";

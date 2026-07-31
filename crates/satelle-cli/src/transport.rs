@@ -4035,9 +4035,9 @@ fn finish_unmodified_after_uncertain_first_action_start(
         }
         Err(error) if maintenance_action_is_still_planned(&error) => {
             // The exact state conflict proves the lost start request did not
-            // leave the first action started. It is now safe to close the
-            // original Bootstrap Lock attempt and skip that planned action.
-            commit_verified_bootstrap_mutation(host, bootstrap_lock)?;
+            // leave the first action started. Response reconciliation already
+            // committed that nonmutation attempt, so cleanup can start a new
+            // attempt and skip the still-planned action.
             skip_maintenance_action(host, client, bootstrap_lock, "install-host-artifact")?;
             false
         }
