@@ -3929,26 +3929,41 @@ pub(crate) fn apply_host_update(
             source.to_string(),
         ));
     }
-    if bootstrap_lock.release_committed_handoff().is_err() {
-        let source = SatelleError::host_unreachable(&transport.alias);
-        return Err(host_update_recovery_pending(
-            &mut report,
-            "host-update-postcheck",
-            &operation_id,
-            source,
-        ));
-    }
+    report = finish_successful_host_update_postcheck(report, &operation_id, || {
+        bootstrap_lock
+            .release_committed_handoff()
+            .map_err(|_| SatelleError::host_unreachable(&transport.alias))
+    })?;
     drop(new_client);
     drop(new_tunnel);
 
+    Ok(report.finish_postchecks())
+}
+
+fn finish_successful_host_update_postcheck(
+    mut report: satelle_core::host_update::HostUpdateReport,
+    operation_id: &str,
+    release_bootstrap_lock: impl FnOnce() -> Result<(), SatelleError>,
+) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
+    // The Host has already persisted the successful postcheck and released
+    // its leases. Preserve that authoritative outcome even if the later
+    // Bootstrap Lock release cannot be confirmed.
     report
         .applied_actions
         .push("host-update-postcheck".to_string());
-    report = report.with_postcheck(HostUpdatePostcheck::passed(
+    report = report.with_postcheck(satelle_core::host_update::HostUpdatePostcheck::passed(
         "native-computer-use-ready",
         "Native Computer Use readiness smoke test passed",
     ));
-    Ok(report.finish_postchecks())
+    if let Err(source) = release_bootstrap_lock() {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "release-bootstrap-lock",
+            operation_id,
+            source,
+        ));
+    }
+    Ok(report)
 }
 
 fn maintenance_postcheck_is_terminal(details: Option<&serde_json::Value>) -> bool {

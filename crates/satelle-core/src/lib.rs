@@ -5637,6 +5637,10 @@ impl SatelleError {
             serde_json::to_value(&report.invalidated_caches).unwrap_or(Value::Null),
         );
         details.insert(
+            "postcheck_results".to_string(),
+            serde_json::to_value(&report.postcheck_results).unwrap_or(Value::Null),
+        );
+        details.insert(
             "preserved_state".to_string(),
             Value::String("completed Host update actions were preserved".to_string()),
         );
@@ -5893,6 +5897,14 @@ mod error_contract_tests {
         assert_eq!(
             partial.details["invalidated_caches"],
             serde_json::json!(["native_computer_use"])
+        );
+        assert_eq!(
+            partial.details["postcheck_results"],
+            serde_json::json!([{
+                "check_id": "native-computer-use-ready",
+                "status": "failed",
+                "summary": "Native Computer Use readiness failed",
+            }])
         );
 
         report.status = HostUpdateStatus::PostcheckFailed;

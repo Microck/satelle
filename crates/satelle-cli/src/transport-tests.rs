@@ -1834,6 +1834,40 @@ fn confirmed_action_failure_records_dependency_skips() {
     );
 }
 
+#[test]
+fn successful_postcheck_is_preserved_when_bootstrap_release_is_uncertain() {
+    let mut report = satelle_core::host_update::HostUpdateReport::new(
+        "office",
+        vec![satelle_core::host_update::HostUpdateComponent::Host],
+        Vec::new(),
+    );
+    report.changed = true;
+
+    let error =
+        finish_successful_host_update_postcheck(report, "host-update-postcheck-release", || {
+            Err(SatelleError::host_unreachable("office"))
+        })
+        .expect_err("an uncertain Bootstrap Lock release must require recovery");
+
+    assert_eq!(error.code, ErrorCode::HostUpdatePartiallyApplied);
+    assert_eq!(
+        error.details.get("failed_action"),
+        Some(&serde_json::json!("release-bootstrap-lock"))
+    );
+    assert_eq!(
+        error.details.get("completed_actions"),
+        Some(&serde_json::json!(["host-update-postcheck"]))
+    );
+    assert_eq!(
+        error.details.get("postcheck_results"),
+        Some(&serde_json::json!([{
+            "check_id": "native-computer-use-ready",
+            "status": "passed",
+            "summary": "Native Computer Use readiness smoke test passed",
+        }]))
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn rejected_later_action_start_retains_the_partial_operation_identity() {
