@@ -746,6 +746,44 @@ mod tests {
     }
 
     #[test]
+    fn daemon_only_update_keeps_the_current_service_out_of_the_mutation_plan() {
+        let host = host_inspection(HostVersionRelation::OlderThanCli);
+        let service = HostUpdateServiceInspection {
+            current_version: Some("1.2.3".to_string()),
+            relation_to_cli: HostVersionRelation::MatchesCli,
+            destination: "/home/operator/.config/systemd/user/satelle.service".to_string(),
+        };
+        let report = build_host_update_plan(
+            HostUpdatePlanRequest {
+                host: "office",
+                cli_version: "1.2.3",
+                components: &[HostUpdateComponent::Host],
+                includes_all: false,
+                host_inspection: &host,
+                service_inspection: Some(&service),
+                codex_inspections: &[],
+            },
+            &artifact(),
+        )
+        .expect("build a daemon-only update plan");
+
+        assert_eq!(
+            report.planned_actions,
+            [
+                "install-host-artifact",
+                "restart-host-daemon",
+                "invalidate-readiness-caches",
+                "host-update-postcheck",
+            ]
+        );
+        assert_eq!(
+            report.targets[1].disposition,
+            HostUpdateDisposition::Current
+        );
+        assert!(report.targets[1].remote_mutations.is_empty());
+    }
+
+    #[test]
     fn missing_service_asset_renders_as_not_installed() {
         let mut host = host_inspection(HostVersionRelation::MatchesCli);
         host.current_version = Some("1.2.3".to_string());
@@ -920,16 +958,21 @@ mod tests {
             report.targets[1].remote_mutations,
             [
                 HostUpdateMutation {
-                    operation: "replace_host_daemon".to_string(),
+                    operation: "install-host-artifact".to_string(),
                     remote_path: Some("/opt/satelle/bin/satelle".to_string()),
                 },
                 HostUpdateMutation {
-                    operation: "replace_host_daemon_service".to_string(),
+                    operation: "publish-host-service".to_string(),
                     remote_path: Some(
                         "/home/operator/.config/systemd/user/satelle.service".to_string(),
                     ),
                 },
             ]
+        );
+        let artifact_digest = "ab".repeat(32);
+        assert_eq!(
+            report.targets[1].artifact_digest.as_deref(),
+            Some(artifact_digest.as_str())
         );
     }
 

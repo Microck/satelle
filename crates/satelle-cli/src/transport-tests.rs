@@ -594,8 +594,9 @@ fn default_missing_ssh_host_plan_skips_unavailable_codex_targets() {
     );
     assert_eq!(
         report.targets[0].disposition,
-        satelle_core::host_update::HostUpdateDisposition::Install
+        satelle_core::host_update::HostUpdateDisposition::Skipped
     );
+    assert!(!report.targets[0].remote_mutations.is_empty());
     assert!(report.targets[1..].iter().all(|target| {
         target.disposition == satelle_core::host_update::HostUpdateDisposition::Skipped
             && target.remote_mutations.is_empty()

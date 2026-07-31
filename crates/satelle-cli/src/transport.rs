@@ -3308,11 +3308,6 @@ pub(crate) fn apply_host_update(
     let publish_service = report.targets.iter().any(|target| {
         target.target == HostUpdateTarget::HostDaemonService && target.requires_mutation()
     });
-    if !publish_service {
-        return Err(SatelleError::invalid_usage(
-            "the persistent Host update plan lacks a managed service asset",
-        ));
-    }
 
     let transport = SshSetupTransport::new(host)?;
     if transport.requires_first_trust {
@@ -3375,21 +3370,43 @@ pub(crate) fn apply_host_update(
     })() {
         Ok(overrides) => overrides,
         Err(error) => {
-            finish_locked_unmodified_host_update(
+            let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+            if finish_locked_unmodified_host_update(
                 &transport.alias,
                 &old_client,
                 &mut bootstrap_lock,
-            );
-            return Err(map_ssh_daemon_bootstrap_error(&transport.alias, error));
+            )
+            .is_err()
+            {
+                report.changed = true;
+                return Err(host_update_recovery_pending(
+                    &mut report,
+                    "install-host-artifact",
+                    source,
+                ));
+            }
+            return Err(source);
         }
     };
 
-    start_persistent_action(
+    if let Err(source) = start_persistent_action(
         &transport.alias,
         &old_client,
         &mut bootstrap_lock,
         "install-host-artifact",
-    )?;
+    ) {
+        if finish_locked_unmodified_host_update(&transport.alias, &old_client, &mut bootstrap_lock)
+            .is_err()
+        {
+            report.changed = true;
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "install-host-artifact",
+                source,
+            ));
+        }
+        return Err(source);
+    }
     let artifact = {
         let remote = ssh_bootstrap::PersistentServiceRemote::new(
             transport.binding.destination(),
@@ -3501,7 +3518,135 @@ pub(crate) fn apply_host_update(
         .applied_actions
         .push("install-host-artifact".to_string());
 
-    if let Err(source) = start_persistent_action(
+    if publish_service {
+        if let Err(source) = start_persistent_action(
+            &transport.alias,
+            &old_client,
+            &mut bootstrap_lock,
+            "publish-host-service",
+        ) {
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "publish-host-service",
+                source,
+            ));
+        }
+        let publish_result = {
+            let remote = ssh_bootstrap::PersistentServiceRemote::new(
+                transport.binding.destination(),
+                target,
+                &directories,
+                &mut bootstrap_lock,
+            );
+            let mut remote = match remote {
+                Ok(remote) => remote,
+                Err(error) => {
+                    let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+                    return Err(fail_host_update_action(
+                        &transport.alias,
+                        &old_client,
+                        &mut bootstrap_lock,
+                        &mut report,
+                        "publish-host-service",
+                        source,
+                    ));
+                }
+            };
+            match &service {
+                PreparedPersistentService::Windows { task, config } => {
+                    remote.publish_windows_service_config(task, config)
+                }
+                PreparedPersistentService::Launchd(definition) => {
+                    remote.publish_launchd_definition(definition)
+                }
+            }
+        };
+        if let Err(error) = publish_result {
+            let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+            return Err(fail_host_update_action(
+                &transport.alias,
+                &old_client,
+                &mut bootstrap_lock,
+                &mut report,
+                "publish-host-service",
+                source,
+            ));
+        }
+        if let Err(source) =
+            commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock)
+        {
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "publish-host-service",
+                source,
+            ));
+        }
+        let register_result = {
+            let remote = ssh_bootstrap::PersistentServiceRemote::new(
+                transport.binding.destination(),
+                target,
+                &directories,
+                &mut bootstrap_lock,
+            );
+            let mut remote = match remote {
+                Ok(remote) => remote,
+                Err(error) => {
+                    let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+                    return Err(fail_host_update_action(
+                        &transport.alias,
+                        &old_client,
+                        &mut bootstrap_lock,
+                        &mut report,
+                        "publish-host-service",
+                        source,
+                    ));
+                }
+            };
+            match &service {
+                PreparedPersistentService::Windows { task, .. } => {
+                    remote.register_windows_task(task)
+                }
+                PreparedPersistentService::Launchd(definition) => {
+                    remote.register_launchd(definition)
+                }
+            }
+        };
+        if let Err(error) = register_result {
+            let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+            return Err(fail_host_update_action(
+                &transport.alias,
+                &old_client,
+                &mut bootstrap_lock,
+                &mut report,
+                "publish-host-service",
+                source,
+            ));
+        }
+        if let Err(source) =
+            commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock)
+        {
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "publish-host-service",
+                source,
+            ));
+        }
+        if let Err(source) = complete_persistent_action(
+            &transport.alias,
+            &old_client,
+            &mut bootstrap_lock,
+            "publish-host-service",
+        ) {
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "publish-host-service",
+                source,
+            ));
+        }
+        report
+            .applied_actions
+            .push("publish-host-service".to_string());
+    } else if let Err(source) = skip_maintenance_action(
         &transport.alias,
         &old_client,
         &mut bootstrap_lock,
@@ -3513,113 +3658,6 @@ pub(crate) fn apply_host_update(
             source,
         ));
     }
-    let publish_result = {
-        let remote = ssh_bootstrap::PersistentServiceRemote::new(
-            transport.binding.destination(),
-            target,
-            &directories,
-            &mut bootstrap_lock,
-        );
-        let mut remote = match remote {
-            Ok(remote) => remote,
-            Err(error) => {
-                let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-                return Err(fail_host_update_action(
-                    &transport.alias,
-                    &old_client,
-                    &mut bootstrap_lock,
-                    &mut report,
-                    "publish-host-service",
-                    source,
-                ));
-            }
-        };
-        match &service {
-            PreparedPersistentService::Windows { task, config } => {
-                remote.publish_windows_service_config(task, config)
-            }
-            PreparedPersistentService::Launchd(definition) => {
-                remote.publish_launchd_definition(definition)
-            }
-        }
-    };
-    if let Err(error) = publish_result {
-        let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-        return Err(fail_host_update_action(
-            &transport.alias,
-            &old_client,
-            &mut bootstrap_lock,
-            &mut report,
-            "publish-host-service",
-            source,
-        ));
-    }
-    if let Err(source) = commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock) {
-        return Err(host_update_recovery_pending(
-            &mut report,
-            "publish-host-service",
-            source,
-        ));
-    }
-    let register_result = {
-        let remote = ssh_bootstrap::PersistentServiceRemote::new(
-            transport.binding.destination(),
-            target,
-            &directories,
-            &mut bootstrap_lock,
-        );
-        let mut remote = match remote {
-            Ok(remote) => remote,
-            Err(error) => {
-                let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-                return Err(fail_host_update_action(
-                    &transport.alias,
-                    &old_client,
-                    &mut bootstrap_lock,
-                    &mut report,
-                    "publish-host-service",
-                    source,
-                ));
-            }
-        };
-        match &service {
-            PreparedPersistentService::Windows { task, .. } => remote.register_windows_task(task),
-            PreparedPersistentService::Launchd(definition) => remote.register_launchd(definition),
-        }
-    };
-    if let Err(error) = register_result {
-        let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-        return Err(fail_host_update_action(
-            &transport.alias,
-            &old_client,
-            &mut bootstrap_lock,
-            &mut report,
-            "publish-host-service",
-            source,
-        ));
-    }
-    if let Err(source) = commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock) {
-        return Err(host_update_recovery_pending(
-            &mut report,
-            "publish-host-service",
-            source,
-        ));
-    }
-    if let Err(source) = complete_persistent_action(
-        &transport.alias,
-        &old_client,
-        &mut bootstrap_lock,
-        "publish-host-service",
-    ) {
-        return Err(host_update_recovery_pending(
-            &mut report,
-            "publish-host-service",
-            source,
-        ));
-    }
-    report
-        .applied_actions
-        .push("publish-host-service".to_string());
 
     if let Err(source) = start_persistent_action(
         &transport.alias,
@@ -3918,16 +3956,14 @@ fn finish_locked_unmodified_host_update(
     host: &str,
     client: &DaemonClient,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
-) {
+) -> Result<(), SatelleError> {
     for action_id in HOST_UPDATE_ACTIONS {
-        if skip_maintenance_action(host, client, bootstrap_lock, action_id).is_err() {
-            return;
-        }
+        skip_maintenance_action(host, client, bootstrap_lock, action_id)?;
     }
-    if finish_persistent_maintenance(host, client, bootstrap_lock).is_err() {
-        return;
-    }
-    let _ = bootstrap_lock.release_committed_handoff();
+    finish_persistent_maintenance(host, client, bootstrap_lock)?;
+    bootstrap_lock
+        .release_committed_handoff()
+        .map_err(|_| SatelleError::host_unreachable(host))
 }
 
 fn fail_host_update_action(
