@@ -229,13 +229,13 @@
 - satelle self update never runs automatically during ordinary run, steer, setup, repair, host update, or doctor commands @implemented @mvp
 - satelle self update refuses to cross downgrade or prerelease boundaries unless the user explicitly requests a specific version and the release artifact passes integrity checks @spec @mvp @implemented
 - satelle self update never mutates configured remote hosts as an implicit side effect of replacing the local CLI binary @spec @mvp @implemented
-- satelle self update after a successful local binary replacement in an interactive terminal offers to check and update configured remote hosts to the updated local CLI version @spec @mvp
-- satelle self update does not show the configured-remote update offer when --no-input is set, stdin is not a TTY, JSON output mode is active, or --dry-run is active @spec @mvp
+- satelle self update after a successful local binary replacement in an interactive terminal offers to check and update configured remote hosts to the updated local CLI version @spec @mvp @implemented
+- satelle self update does not show the configured-remote update offer when --no-input is set, stdin is not a TTY, JSON output mode is active, or --dry-run is active @spec @mvp @implemented
 - satelle self update noninteractive success output includes the follow-up host update command for configured remotes when remote Host Daemon versions may need alignment @spec @mvp @implemented
-- satelle self update supports --update-remotes as an explicit request to run the configured-remote Host Daemon update flow after the local update succeeds @spec @mvp
-- satelle self update interactive configured-remote update offer preselects only the current command target host when one is resolved, otherwise the configured default host when exactly one resolves unambiguously @spec @mvp
-- satelle self update interactive configured-remote update offer lists other configured remote hosts as unselected choices that the user may opt into before the remote update plan is built @spec @mvp
-- satelle self update --update-remotes without an explicit host selector targets the same current or default host selection used by the interactive offer instead of every configured remote host @spec @mvp
+- satelle self update supports --update-remotes as an explicit request to run the configured-remote Host Daemon update flow after the local update succeeds @spec @mvp @implemented
+- satelle self update interactive configured-remote update offer preselects only the current command target host when one is resolved, otherwise the configured default host when exactly one resolves unambiguously @spec @mvp @implemented
+- satelle self update interactive configured-remote update offer lists other configured remote hosts as unselected choices that the user may opt into before the remote update plan is built @spec @mvp @implemented
+- satelle self update --update-remotes without an explicit host selector targets the same current or default host selection used by the interactive offer instead of every configured remote host @spec @mvp @implemented
 - satelle self update supports repeatable --host <alias> with --update-remotes for explicitly selected configured remote hosts @spec @mvp
 - satelle self update supports --all-remotes with --update-remotes as the explicit request to check and update every configured remote host @spec @mvp
 - satelle self update reports a typed no-remote-host-selected error when --update-remotes cannot resolve a current or default host and no --host or --all-remotes selector is provided in noninteractive mode @spec @mvp

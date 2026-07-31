@@ -593,6 +593,44 @@ struct HostUpdateCommand {
     output_args: OutputArgs,
 }
 
+struct HostUpdateInvocation {
+    host: Vec<String>,
+    component: Vec<String>,
+    all_remotes: bool,
+    dry_run: bool,
+    yes: bool,
+    no_input: bool,
+    quiet: bool,
+}
+
+impl From<HostUpdateCommand> for HostUpdateInvocation {
+    fn from(command: HostUpdateCommand) -> Self {
+        Self {
+            host: command.host,
+            component: command.component,
+            all_remotes: command.all_remotes,
+            dry_run: command.dry_run,
+            yes: command.yes,
+            no_input: command.no_input,
+            quiet: command.quiet,
+        }
+    }
+}
+
+impl HostUpdateInvocation {
+    fn from_self_update(host: String, no_input: bool) -> Self {
+        Self {
+            host: vec![host],
+            component: Vec::new(),
+            all_remotes: false,
+            dry_run: false,
+            yes: false,
+            no_input,
+            quiet: false,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 struct HostCleanupCommand {
     #[arg(long)]
@@ -8060,6 +8098,14 @@ fn run_host_update(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
+    run_host_update_invocation(command.into(), config, format)
+}
+
+fn run_host_update_invocation(
+    command: HostUpdateInvocation,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     validate_host_update_components(&command.component).map_err(failure)?;
     if command.all_remotes || command.host.len() > 1 {
         return Err(failure(SatelleError::not_implemented(
@@ -8216,6 +8262,19 @@ mod host_update_consent_tests {
             "satelle host update --host 'remote host'\"'\"'; touch /tmp/pwn' --component host --no-input --yes --json"
         );
     }
+
+    #[test]
+    fn self_update_delegates_one_host_through_the_canonical_default_update() {
+        let invocation = HostUpdateInvocation::from_self_update("office".to_string(), true);
+
+        assert_eq!(invocation.host, ["office"]);
+        assert!(invocation.component.is_empty());
+        assert!(!invocation.all_remotes);
+        assert!(!invocation.dry_run);
+        assert!(!invocation.yes);
+        assert!(invocation.no_input);
+        assert!(!invocation.quiet);
+    }
 }
 
 fn run_host_storage(command: HostStorageCommand) -> Result<(), CliFailure> {
@@ -8252,6 +8311,17 @@ fn run_self(
                         "--host and --all-remotes require --update-remotes",
                     )));
                 }
+            } else {
+                if command.all_remotes || !command.host.is_empty() || command.concurrency != 4 {
+                    return Err(failure(SatelleError::not_implemented(
+                        "explicit remote selectors and concurrency belong to the packet 26 update train",
+                    )));
+                }
+                if command.dry_run || output.is_json() {
+                    return Err(failure(SatelleError::not_implemented(
+                        "configured-remote dry-run and JSON summaries belong to the packet 26 update train",
+                    )));
+                }
             }
 
             let resolved = config.load()?;
@@ -8268,38 +8338,98 @@ fn run_self(
                     .filter(|(_, host)| host.transport != satelle_core::TransportKind::Local)
                     .map(|(alias, _)| alias.clone()),
             );
-            let follow_up_host = self_update::selected_remote_host(&remote_choices);
-
-            // Packet 25 owns selection and delegation, but the canonical Host
-            // updater belongs to packets 14 and 15. Fail before replacing the
-            // local binary until that one implementation is available.
-            if command.update_remotes {
-                let recovery = follow_up_host
-                    .map(self_update::host_update_command)
-                    .unwrap_or_else(|| "satelle host update --host <alias>".to_string());
-                return Err(failure(SatelleError::not_implemented(format!(
-                    "--update-remotes requires the canonical Host update flow; run `{recovery}` after updating the local CLI"
-                ))));
+            let follow_up_host =
+                self_update::selected_remote_host(&remote_choices).map(str::to_owned);
+            if command.update_remotes && follow_up_host.is_none() {
+                return Err(failure(SatelleError::not_implemented(
+                    "--update-remotes could not resolve a current or configured default Host; explicit selectors belong to the packet 26 update train",
+                )));
             }
 
+            let stdin_is_terminal = io::stdin().is_terminal();
+            let interactive_offer_candidate = !command.update_remotes
+                && !command.no_input
+                && stdin_is_terminal
+                && !output.is_json()
+                && !command.dry_run;
             let request = self_update::SelfUpdateRequest::current(
                 command.version,
                 command.dry_run,
-                follow_up_host.map(str::to_owned),
+                if interactive_offer_candidate || command.update_remotes {
+                    None
+                } else {
+                    follow_up_host.clone()
+                },
             )
             .map_err(|error| failure(error.into_satelle_error()))?;
             let report =
                 self_update::run(request).map_err(|error| failure(error.into_satelle_error()))?;
             if output.is_json() {
-                print_json(&report).map_err(failure)
+                print_json(&report).map_err(failure)?;
             } else {
                 for line in report.human_lines() {
                     println!("{line}");
                 }
-                Ok(())
             }
+
+            let selected_host = if command.update_remotes {
+                follow_up_host
+            } else if report.should_offer_remote_update(
+                command.no_input,
+                stdin_is_terminal,
+                output.is_json(),
+                command.dry_run,
+            ) {
+                prompt_remote_host_update(&remote_choices)?
+            } else {
+                None
+            };
+
+            let Some(host) = selected_host else {
+                return Ok(());
+            };
+            run_host_update_invocation(
+                HostUpdateInvocation::from_self_update(host, command.no_input),
+                config,
+                output,
+            )
         }
     }
+}
+
+fn prompt_remote_host_update(
+    choices: &[self_update::RemoteHostChoice],
+) -> Result<Option<String>, CliFailure> {
+    if choices.is_empty() {
+        return Ok(None);
+    }
+
+    let mut items = choices
+        .iter()
+        .map(|choice| {
+            (
+                Some(choice.alias.clone()),
+                choice.alias.clone(),
+                if choice.selected { "preselected" } else { "" }.to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    items.push((
+        None,
+        "Not now".to_string(),
+        "leave remote Hosts unchanged".to_string(),
+    ));
+    let initial = self_update::selected_remote_host(choices).map(str::to_owned);
+    cliclack::select("Check and update a configured remote Host?")
+        .items(&items)
+        .initial_value(initial)
+        .interact()
+        .map_err(|source| {
+            failure(setup_interaction_error(
+                "could not read configured remote Host selection",
+                source,
+            ))
+        })
 }
 
 fn run_support(command: SupportCommand) -> Result<(), CliFailure> {

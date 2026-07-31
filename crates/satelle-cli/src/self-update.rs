@@ -76,6 +76,16 @@ pub(crate) struct SelfUpdateReport {
 }
 
 impl SelfUpdateReport {
+    pub(crate) const fn should_offer_remote_update(
+        &self,
+        no_input: bool,
+        stdin_is_terminal: bool,
+        output_is_json: bool,
+        dry_run: bool,
+    ) -> bool {
+        self.changed && !no_input && stdin_is_terminal && !output_is_json && !dry_run
+    }
+
     pub(crate) fn human_lines(&self) -> Vec<String> {
         let mut lines = match self.outcome {
             SelfUpdateOutcome::UpToDate => vec![format!(
@@ -1923,6 +1933,39 @@ mod tests {
             host_update_command("remote; touch /tmp/not-run"),
             "satelle host update --host 'remote; touch /tmp/not-run'"
         );
+    }
+
+    #[test]
+    fn remote_update_offer_requires_a_changed_interactive_human_update() {
+        let mut report = SelfUpdateReport {
+            schema_version: "satelle.self.update.v1",
+            outcome: SelfUpdateOutcome::Updated,
+            current_version: "1.0.0".to_string(),
+            latest_compatible_version: "1.1.0".to_string(),
+            install_owner: "direct-github-release-archive".to_string(),
+            target_artifact: "satelle-v1.1.0-linux-x64-gnu.tar.gz".to_string(),
+            planned_replacement: PathBuf::from("/usr/local/bin/satelle"),
+            changed: true,
+            follow_up_host_update_command: None,
+        };
+
+        assert!(report.should_offer_remote_update(false, true, false, false));
+        for (no_input, stdin_is_terminal, output_is_json, dry_run) in [
+            (true, true, false, false),
+            (false, false, false, false),
+            (false, true, true, false),
+            (false, true, false, true),
+        ] {
+            assert!(!report.should_offer_remote_update(
+                no_input,
+                stdin_is_terminal,
+                output_is_json,
+                dry_run,
+            ));
+        }
+
+        report.changed = false;
+        assert!(!report.should_offer_remote_update(false, true, false, false));
     }
 
     #[test]
