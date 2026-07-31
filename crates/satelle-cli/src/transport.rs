@@ -3395,8 +3395,12 @@ pub(crate) fn apply_host_update(
         &mut bootstrap_lock,
         "install-host-artifact",
     ) {
-        if finish_locked_unmodified_host_update(&transport.alias, &old_client, &mut bootstrap_lock)
-            .is_err()
+        if finish_unmodified_after_uncertain_first_action_start(
+            &transport.alias,
+            &old_client,
+            &mut bootstrap_lock,
+        )
+        .is_err()
         {
             report.changed = true;
             return Err(host_update_recovery_pending(
@@ -3970,6 +3974,59 @@ fn finish_locked_unmodified_host_update(
     bootstrap_lock
         .release_committed_handoff()
         .map_err(|_| SatelleError::host_unreachable(host))
+}
+
+fn finish_unmodified_after_uncertain_first_action_start(
+    host: &str,
+    client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+) -> Result<(), SatelleError> {
+    let operation_id = bootstrap_lock.operation_id().to_string();
+    let first_action_was_failed = match client.fail_maintenance_action(
+        &operation_id,
+        "install-host-artifact",
+        "remote_command_failed",
+    ) {
+        Ok(response) => {
+            validate_persistent_maintenance_response(
+                host,
+                &operation_id,
+                response.reconciled(),
+                response.operation_id(),
+            )?;
+            // A successful failure transition proves the Host received the
+            // start and atomically skips its dependent planned actions.
+            commit_verified_bootstrap_mutation(host, bootstrap_lock)?;
+            true
+        }
+        Err(error) if maintenance_action_is_still_planned(&error) => {
+            // The exact state conflict proves the lost start request did not
+            // leave the first action started. It is now safe to close the
+            // original Bootstrap Lock attempt and skip that planned action.
+            commit_verified_bootstrap_mutation(host, bootstrap_lock)?;
+            skip_maintenance_action(host, client, bootstrap_lock, "install-host-artifact")?;
+            false
+        }
+        Err(error) => return Err(direct_transport_error(host, error)),
+    };
+
+    if !first_action_was_failed {
+        for action_id in HOST_UPDATE_ACTIONS.iter().skip(1) {
+            skip_maintenance_action(host, client, bootstrap_lock, action_id)?;
+        }
+    }
+    finish_persistent_maintenance(host, client, bootstrap_lock)?;
+    bootstrap_lock
+        .release_committed_handoff()
+        .map_err(|_| SatelleError::host_unreachable(host))
+}
+
+fn maintenance_action_is_still_planned(error: &DaemonClientError) -> bool {
+    matches!(
+        error,
+        DaemonClientError::Api { status, error }
+            if status.as_u16() == 409 && error.code() == ApiErrorCode::StateConflict
+    )
 }
 
 fn fail_host_update_action(

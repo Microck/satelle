@@ -185,7 +185,7 @@ fn plan_host_targets(
         HostVersionRelation::MatchesCli => HostUpdateDisposition::Current,
         HostVersionRelation::NewerThanCli | HostVersionRelation::RequiresNewerCli => unreachable!(),
     };
-    let service_disposition = request
+    let mut service_disposition = request
         .service_inspection
         .map(|service| match service.relation_to_cli {
             HostVersionRelation::Missing => Ok(HostUpdateDisposition::Install),
@@ -205,6 +205,14 @@ fn plan_host_targets(
             }
         })
         .transpose()?;
+    if disposition != HostUpdateDisposition::Current
+        && service_disposition == Some(HostUpdateDisposition::Current)
+    {
+        // Persistent service definitions execute the digest-pinned artifact
+        // path. Replacing that artifact therefore changes the service asset
+        // even when the service and target daemon versions already match.
+        service_disposition = Some(HostUpdateDisposition::Update);
+    }
     let artifact_required = disposition != HostUpdateDisposition::Current
         || service_disposition.is_some_and(|service| service != HostUpdateDisposition::Current);
     let artifact = if !artifact_required {
@@ -746,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_only_update_keeps_the_current_service_out_of_the_mutation_plan() {
+    fn daemon_update_republishes_the_current_service_for_the_new_artifact_path() {
         let host = host_inspection(HostVersionRelation::OlderThanCli);
         let service = HostUpdateServiceInspection {
             current_version: Some("1.2.3".to_string()),
@@ -765,22 +773,28 @@ mod tests {
             },
             &artifact(),
         )
-        .expect("build a daemon-only update plan");
+        .expect("build a daemon update plan");
 
         assert_eq!(
             report.planned_actions,
             [
                 "install-host-artifact",
+                "publish-host-service",
                 "restart-host-daemon",
                 "invalidate-readiness-caches",
                 "host-update-postcheck",
             ]
         );
+        assert_eq!(report.targets[1].disposition, HostUpdateDisposition::Update);
         assert_eq!(
-            report.targets[1].disposition,
-            HostUpdateDisposition::Current
+            report.targets[1].remote_mutations,
+            [HostUpdateMutation {
+                operation: "publish-host-service".to_string(),
+                remote_path: Some(
+                    "/home/operator/.config/systemd/user/satelle.service".to_string()
+                ),
+            }]
         );
-        assert!(report.targets[1].remote_mutations.is_empty());
     }
 
     #[test]

@@ -1121,6 +1121,14 @@ fn acquire_bootstrap_lock_for_operation_with_ssh(
 fn with_bootstrap_handoff_test_context(
     test: impl FnOnce(&DaemonClient, &std::path::Path, SocketAddr, &str, &HostService),
 ) {
+    with_bootstrap_handoff_test_context_with_scope(ApiScopes::READ, test);
+}
+
+#[cfg(unix)]
+fn with_bootstrap_handoff_test_context_with_scope(
+    bootstrap_scope: ApiScopes,
+    test: impl FnOnce(&DaemonClient, &std::path::Path, SocketAddr, &str, &HostService),
+) {
     use std::os::unix::fs::PermissionsExt as _;
 
     let state = TestStateDir::new().expect("temporary state directory");
@@ -1129,7 +1137,7 @@ fn with_bootstrap_handoff_test_context(
         .expect("construct Host service")
         .with_ssh_bootstrap_auth_for_tests(
             &bootstrap_token,
-            ApiScopes::READ,
+            bootstrap_scope,
             time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
         );
     let initialized = service.initialize_daemon().expect("initialize Host state");
@@ -1183,6 +1191,94 @@ esac
     );
 
     drop(server);
+}
+
+#[cfg(unix)]
+#[test]
+fn uncertain_first_host_update_action_start_closes_the_unmodified_operation() {
+    with_bootstrap_handoff_test_context_with_scope(
+        ApiScopes::ADMIN,
+        |client, fake_ssh, _, _, ledger| {
+            let operation_id = "host-update-lost-first-start-response";
+            client
+                .begin_host_update_maintenance(operation_id)
+                .expect("begin Host update maintenance");
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "host-update-clean-failure-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::HostBinaryReplacement,
+                fake_ssh,
+            )
+            .expect("acquire Host replacement Bootstrap Lock");
+            bootstrap_lock
+                .confirm_ownership()
+                .expect("confirm Bootstrap Lock ownership");
+
+            // The Host commits the start, but the Controller loses that response.
+            // No artifact or managed process mutation has begun.
+            bootstrap_lock
+                .mark_mutation_started("persistent_action_start")
+                .expect("record the uncertain action-start attempt");
+            client
+                .start_maintenance_action(operation_id, "install-host-artifact")
+                .expect("Host durably starts the first action");
+
+            finish_unmodified_after_uncertain_first_action_start(
+                "host-update-clean-failure-host",
+                client,
+                &mut bootstrap_lock,
+            )
+            .expect("close the unmodified Host update");
+
+            let run = ledger
+                .load_setup_run(operation_id)
+                .expect("read Host update ledger")
+                .expect("Host update run exists");
+            assert_eq!(run.status(), satelle_host::SetupRunStatus::Failed);
+            assert_eq!(
+                run.actions()
+                    .iter()
+                    .map(|action| (action.action_id(), action.status()))
+                    .collect::<Vec<_>>(),
+                [
+                    (
+                        "install-host-artifact",
+                        satelle_host::SetupActionStatus::Failed,
+                    ),
+                    (
+                        "publish-host-service",
+                        satelle_host::SetupActionStatus::Skipped,
+                    ),
+                    (
+                        "restart-host-daemon",
+                        satelle_host::SetupActionStatus::Skipped,
+                    ),
+                    (
+                        "invalidate-readiness-caches",
+                        satelle_host::SetupActionStatus::Skipped,
+                    ),
+                    (
+                        "host-update-postcheck",
+                        satelle_host::SetupActionStatus::Skipped,
+                    ),
+                ]
+            );
+
+            let next_operation = "host-update-after-clean-first-start-failure";
+            client
+                .begin_host_update_maintenance(next_operation)
+                .expect("clean failure releases Maintenance ownership");
+            for action_id in HOST_UPDATE_ACTIONS {
+                client
+                    .skip_maintenance_action(next_operation, action_id)
+                    .expect("skip the next operation action");
+            }
+            client
+                .finish_maintenance_plan(next_operation)
+                .expect("finish the next maintenance operation");
+        },
+    );
 }
 
 #[cfg(unix)]
