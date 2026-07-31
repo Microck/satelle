@@ -810,8 +810,17 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::reject_public_bearer_carriers,
         ));
-    let protocol_read_routes = Router::new()
+    let capabilities_route = Router::new()
         .route("/v1/capabilities", get(capabilities))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_protocol_read,
+        ));
+    let maintenance_read_route = Router::new()
         .route(
             "/v1/maintenance/update-evidence",
             get(maintenance_update_evidence),
@@ -823,6 +832,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_protocol_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_read,
         ));
     let bodyless_read_routes = Router::new()
         .route("/v1/setup/api-token/current", get(setup::confirm_api_token))
@@ -842,7 +855,8 @@ fn router(state: Arc<DaemonState>) -> Router {
             auth::require_query_read,
         ));
     let read_routes = bodyless_read_routes
-        .merge(protocol_read_routes)
+        .merge(capabilities_route)
+        .merge(maintenance_read_route)
         .merge(logs_route)
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),

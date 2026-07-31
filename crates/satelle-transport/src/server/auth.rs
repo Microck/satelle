@@ -538,6 +538,20 @@ pub(super) async fn require_read(
     next.run(request).await
 }
 
+pub(super) async fn require_admin_read(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>() else {
+        return missing_authorization_context();
+    };
+    if !authorized.principal().scopes().allows(ApiScopes::ADMIN) {
+        return insufficient_scope(&state, authorized, "admin");
+    }
+    next.run(request).await
+}
+
 pub(super) async fn require_empty_read(
     State(state): State<Arc<DaemonState>>,
     request: Request,

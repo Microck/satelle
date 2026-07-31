@@ -1377,6 +1377,25 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
 }
 
 #[tokio::test]
+async fn live_maintenance_update_evidence_requires_admin_scope() {
+    for (scope_name, scopes) in [("read", ApiScopes::READ), ("control", ApiScopes::CONTROL)] {
+        let running = RunningServer::start(scopes).await;
+        let response = running
+            .request("/v1/maintenance/update-evidence")
+            .send()
+            .await
+            .expect("request live maintenance evidence");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{scope_name}");
+        let error: ApiError = response.json().await.expect("decode scope rejection");
+        assert_eq!(
+            error.code().as_str(),
+            ErrorCode::AuthorizationInsufficientScope.as_str(),
+            "{scope_name}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn custom_api_rate_limits_are_advertised_and_enforced() {
     let limit = |value| NonZeroUsize::new(value).expect("test rate limit is nonzero");
     let advertised = ApiRateLimits::new(limit(2), limit(3), limit(4), limit(5));

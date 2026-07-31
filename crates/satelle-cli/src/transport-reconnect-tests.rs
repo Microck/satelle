@@ -48,7 +48,8 @@ impl DirectFixture {
     }
 
     fn replace_http_client(&mut self, address: SocketAddr, principal: &str) {
-        let (http_token, _event_token) = register_client_tokens(&self.service, principal);
+        let (http_token, _event_token) =
+            register_client_tokens(&self.service, principal, ApiScopes::CONTROL);
         let client = DaemonClient::loopback(address, http_token, &self.host_identity)
             .expect("construct replacement HTTP client");
         self.transport
@@ -58,7 +59,8 @@ impl DirectFixture {
     }
 
     fn replace_event_client(&mut self, address: SocketAddr, principal: &str) {
-        let (_http_token, event_token) = register_client_tokens(&self.service, principal);
+        let (_http_token, event_token) =
+            register_client_tokens(&self.service, principal, ApiScopes::CONTROL);
         let event_client = DaemonEventClient::loopback(address, event_token, &self.host_identity)
             .expect("construct replacement event client");
         self.transport

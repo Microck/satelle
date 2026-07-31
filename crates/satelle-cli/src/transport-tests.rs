@@ -2827,6 +2827,7 @@ mod reconnect;
 fn register_client_tokens(
     service: &HostService,
     principal: &str,
+    scopes: ApiScopes,
 ) -> (ApiBearerToken, ApiBearerToken) {
     let generated = ApiBearerToken::generate().expect("generate API token");
     let exposed = generated.expose();
@@ -2834,7 +2835,7 @@ fn register_client_tokens(
     let http_token = ApiBearerToken::parse(exposed.as_str()).expect("parse HTTP token");
     let event_token = ApiBearerToken::parse(exposed.as_str()).expect("parse event token");
     service
-        .register_api_token(&registry_token, principal, ApiScopes::CONTROL, None)
+        .register_api_token(&registry_token, principal, scopes, None)
         .expect("register API token");
     (http_token, event_token)
 }
@@ -2876,21 +2877,28 @@ impl DirectFixture {
         let state = TestStateDir::new().expect("temporary state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct deterministic Host service");
-        Self::bind(state, service)
+        Self::bind(state, service, ApiScopes::CONTROL)
+    }
+
+    fn start_with_scopes(scopes: ApiScopes) -> Self {
+        let state = TestStateDir::new().expect("temporary state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic Host service");
+        Self::bind(state, service, scopes)
     }
 
     fn start_with_adapter(adapter: impl ComputerUseAdapter) -> Self {
         let state = TestStateDir::new().expect("temporary state directory");
         let service = HostService::with_adapter_for_tests_at(state.path(), adapter)
             .expect("construct adapter-backed Host service");
-        Self::bind(state, service)
+        Self::bind(state, service, ApiScopes::CONTROL)
     }
 
-    fn bind(state: TestStateDir, service: HostService) -> Self {
+    fn bind(state: TestStateDir, service: HostService, scopes: ApiScopes) -> Self {
         let initialized = service.initialize_daemon().expect("initialize Host state");
         let host_identity = initialized.host_identity().to_string();
         let (http_token, event_token) =
-            register_client_tokens(&service, "principal-cli-direct-test");
+            register_client_tokens(&service, "principal-cli-direct-test", scopes);
         let server_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -3718,7 +3726,7 @@ fn direct_host_sessions_read_daemon_metadata_without_bootstrap() {
 
 #[test]
 fn direct_host_maintenance_probe_does_not_mutate_daemon_state() {
-    let fixture = DirectFixture::start();
+    let fixture = DirectFixture::start_with_scopes(ApiScopes::ADMIN);
     let before = fixture
         .service
         .daemon_runtime_status()
