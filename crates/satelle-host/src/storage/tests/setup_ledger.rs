@@ -1666,3 +1666,82 @@ fn bootstrap_completion_finalizes_an_already_completed_recovery() {
     assert_eq!(SetupActionStatus::Completed, run.actions()[0].status());
     assert!(storage.maintenance_lease_state().unwrap().is_none());
 }
+
+#[test]
+fn host_update_recovery_adopts_the_interrupted_ordered_action() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let plan = SetupRunPlan::new(
+        "host-update-recovery",
+        SetupOperationKind::HostUpdate,
+        None,
+        at(1),
+        vec![
+            SetupActionPlan::new(
+                "install-host-artifact",
+                "Install the verified Host artifact",
+                true,
+            )
+            .unwrap(),
+            SetupActionPlan::new(
+                "publish-host-service",
+                "Publish the Host service definition",
+                true,
+            )
+            .unwrap(),
+            SetupActionPlan::new("restart-host-daemon", "Restart the Host daemon", true).unwrap(),
+            SetupActionPlan::new(
+                "invalidate-readiness-caches",
+                "Invalidate readiness caches",
+                true,
+            )
+            .unwrap(),
+            SetupActionPlan::new("host-update-postcheck", "Run Host postchecks", true).unwrap(),
+        ],
+    )
+    .unwrap();
+    let capability = storage
+        .begin_bootstrap_maintenance(&plan, maintenance_owner(plan.run_id(), plan.started_at()))
+        .expect("begin Host update maintenance");
+    for (action_id, started_at, finished_at) in [
+        ("install-host-artifact", at(2), at(3)),
+        ("publish-host-service", at(4), at(5)),
+    ] {
+        storage
+            .start_setup_action(&capability, action_id, started_at)
+            .expect("start completed Host update action");
+        storage
+            .complete_setup_action_after_verified_postcondition(&capability, action_id, finished_at)
+            .expect("complete Host update action");
+    }
+    storage
+        .start_setup_action(&capability, "restart-host-daemon", at(6))
+        .expect("start daemon restart before replacement");
+    storage
+        .retain_lease_recovery(capability.lease_owner())
+        .expect("retain interrupted Host update ownership");
+
+    storage
+        .adopt_recovery_maintenance(plan.run_id(), maintenance_owner(plan.run_id(), at(7)))
+        .expect("replacement daemon adopts the interrupted Host update action");
+
+    let run = storage
+        .load_setup_run(plan.run_id())
+        .unwrap()
+        .expect("Host update run exists");
+    assert_eq!(SetupRunStatus::Running, run.status());
+    assert_eq!(
+        [
+            SetupActionStatus::Completed,
+            SetupActionStatus::Completed,
+            SetupActionStatus::Started,
+            SetupActionStatus::Planned,
+            SetupActionStatus::Planned,
+        ],
+        run.actions()
+            .iter()
+            .map(|action| action.status())
+            .collect::<Vec<_>>()
+            .as_slice()
+    );
+}

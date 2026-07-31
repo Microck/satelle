@@ -59,6 +59,31 @@ fn direct_host_update_uses_release_target_ids_for_every_supported_platform() {
 }
 
 #[test]
+fn maintenance_postcheck_terminal_detail_distinguishes_released_from_recovery_leases() {
+    for (details, expected) in [
+        (
+            Some(serde_json::json!({
+                "maintenance_postcheck_terminal": true
+            })),
+            true,
+        ),
+        (
+            Some(serde_json::json!({
+                "maintenance_postcheck_terminal": false
+            })),
+            false,
+        ),
+        (Some(serde_json::json!({})), false),
+        (None, false),
+    ] {
+        assert_eq!(
+            maintenance_postcheck_is_terminal(details.as_ref()),
+            expected
+        );
+    }
+}
+
+#[test]
 fn authenticated_minimum_host_version_can_require_a_cli_upgrade() {
     assert_eq!(
         host_version_relation(Some("1.2.0"), true, Some("2.0.0"), "1.5.0")

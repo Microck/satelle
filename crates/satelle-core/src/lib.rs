@@ -5521,7 +5521,7 @@ impl SatelleError {
             "status".to_string(),
             Value::String("postcheck_failed".to_string()),
         );
-        details.insert("changed".to_string(), Value::Bool(report.changed));
+        details.insert("changed".to_string(), Value::Bool(true));
         for (key, value) in [
             (
                 "applied_actions",
@@ -5537,7 +5537,12 @@ impl SatelleError {
             ),
             (
                 "preserved_state",
-                serde_json::to_value(&report.preserved_state),
+                serde_json::to_value(
+                    report
+                        .preserved_state
+                        .as_deref()
+                        .unwrap_or("completed Host update actions were preserved"),
+                ),
             ),
             ("recovery_command", serde_json::to_value(&recovery_command)),
         ] {
@@ -5847,6 +5852,16 @@ mod error_contract_tests {
         );
         assert_eq!(
             postcheck.details["preserved_state"],
+            "completed Host update actions were preserved"
+        );
+
+        report.changed = false;
+        report.preserved_state = None;
+        let canonical_postcheck =
+            SatelleError::host_update_postcheck_failed(&report, "readiness failed");
+        assert_eq!(canonical_postcheck.details["changed"], true);
+        assert_eq!(
+            canonical_postcheck.details["preserved_state"],
             "completed Host update actions were preserved"
         );
     }

@@ -8103,10 +8103,7 @@ fn run_host_update(
     if noninteractive && !command.yes {
         return Err(failure(SatelleError::setup_consent_required(
             &report.planned_actions,
-            format!(
-                "satelle host update --host {} --no-input --yes --json",
-                host.alias
-            ),
+            host_update_consent_command(&host.alias, &command.component),
         )));
     }
     if !command.yes {
@@ -8151,6 +8148,14 @@ fn run_host_update(
     }
 }
 
+fn host_update_consent_command(host: &str, components: &[String]) -> String {
+    let component_selection = components
+        .iter()
+        .map(|component| format!(" --component {component}"))
+        .collect::<String>();
+    format!("satelle host update --host {host}{component_selection} --no-input --yes --json")
+}
+
 fn validate_host_update_components(raw_components: &[String]) -> Result<(), SatelleError> {
     let has_all = raw_components.iter().any(|component| component == "all");
     if has_all && raw_components.len() > 1 {
@@ -8167,6 +8172,23 @@ fn validate_host_update_components(raw_components: &[String]) -> Result<(), Sate
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod host_update_consent_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_command_preserves_the_exact_component_selection() {
+        assert_eq!(
+            host_update_consent_command("office", &["host".to_string(), "codex".to_string()]),
+            "satelle host update --host office --component host --component codex --no-input --yes --json"
+        );
+        assert_eq!(
+            host_update_consent_command("office", &[]),
+            "satelle host update --host office --no-input --yes --json"
+        );
+    }
 }
 
 fn run_host_storage(command: HostStorageCommand) -> Result<(), CliFailure> {

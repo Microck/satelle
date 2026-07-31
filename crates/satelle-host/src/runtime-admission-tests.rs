@@ -337,16 +337,20 @@ fn assert_host_postcheck_outcome(suffix: &str, fixture: MaintenanceProbeFixture)
             assert_eq!(crate::storage::SetupRunStatus::Completed, stored.status());
         }
         "failed" => {
+            let error = observed.unwrap_err();
+            assert_eq!(satelle_core::ErrorCode::ComputerUseNotReady, error.code);
             assert_eq!(
-                satelle_core::ErrorCode::ComputerUseNotReady,
-                observed.unwrap_err().code
+                error.details["maintenance_postcheck_terminal"],
+                serde_json::json!(true)
             );
             assert_eq!(crate::storage::SetupRunStatus::Failed, stored.status());
         }
         "unknown" => {
+            let error = observed.unwrap_err();
+            assert_eq!(satelle_core::ErrorCode::ComputerUseNotReady, error.code);
             assert_eq!(
-                satelle_core::ErrorCode::ComputerUseNotReady,
-                observed.unwrap_err().code
+                error.details["maintenance_postcheck_terminal"],
+                serde_json::json!(false)
             );
             assert_eq!(
                 crate::storage::SetupRunStatus::OutcomeUnknown,

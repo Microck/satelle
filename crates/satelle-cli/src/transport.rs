@@ -3878,16 +3878,14 @@ pub(crate) fn apply_host_update(
     }
     let postcheck = new_client.run_maintenance_postcheck(&operation_id, "host-update-postcheck");
     if let Err(error) = postcheck {
-        if let Err(source) = record_persistent_action_failure(
-            &transport.alias,
-            &new_client,
-            &mut bootstrap_lock,
-            "host-update-postcheck",
-            "host_update_postcheck_failed",
-        )
-        .and_then(|()| {
-            finish_persistent_maintenance(&transport.alias, &new_client, &mut bootstrap_lock)
-        }) {
+        let terminal = match &error {
+            DaemonClientError::Api { error, .. } => {
+                maintenance_postcheck_is_terminal(error.details())
+            }
+            _ => false,
+        };
+        let source = direct_transport_error(&transport.alias, error);
+        if !terminal {
             return Err(host_update_recovery_pending(
                 &mut report,
                 "host-update-postcheck",
@@ -3916,7 +3914,7 @@ pub(crate) fn apply_host_update(
         report.status = satelle_core::host_update::HostUpdateStatus::PostcheckFailed;
         return Err(SatelleError::host_update_postcheck_failed(
             &report,
-            error.to_string(),
+            source.to_string(),
         ));
     }
     if bootstrap_lock.release_committed_handoff().is_err() {
@@ -3938,6 +3936,14 @@ pub(crate) fn apply_host_update(
         "Native Computer Use readiness smoke test passed",
     ));
     Ok(report.finish_postchecks())
+}
+
+fn maintenance_postcheck_is_terminal(details: Option<&serde_json::Value>) -> bool {
+    details
+        .and_then(serde_json::Value::as_object)
+        .and_then(|details| details.get("maintenance_postcheck_terminal"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
 }
 
 fn finish_unmodified_host_update(client: &DaemonClient, operation_id: &str) {

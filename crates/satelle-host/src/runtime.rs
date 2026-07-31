@@ -2477,7 +2477,14 @@ impl RuntimeHandle {
             )
             .map_err(model::storage_failure)?;
         operation.disarm();
-        if let Some(error) = terminal_error {
+        if let Some(mut error) = terminal_error {
+            // The CLI must distinguish a known terminal readiness failure,
+            // whose ledger and leases were finalized above, from an unknown
+            // outcome whose leases remain recovery-pending.
+            error.details.insert(
+                "maintenance_postcheck_terminal".to_string(),
+                serde_json::Value::Bool(status.is_some()),
+            );
             return Err(error);
         }
         status.ok_or_else(|| {

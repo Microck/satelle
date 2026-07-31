@@ -380,7 +380,7 @@ fn plan_codex_targets(
                 } else {
                     HostUpdateDisposition::Current
                 },
-                restart_impact: if inspection.update_required {
+                restart_impact: if inspection.update_required && inspection.automation_is_safe {
                     inspection.restart_impact
                 } else {
                     HostUpdateRestartImpact::None
@@ -1188,6 +1188,10 @@ mod tests {
         assert_eq!(report.skipped_actions, ["replace-codex-runtime"]);
         assert!(report.planned_actions.is_empty());
         assert!(report.postcheck_results.is_empty());
+        assert_eq!(
+            report.targets[0].restart_impact,
+            HostUpdateRestartImpact::None
+        );
     }
 
     #[test]

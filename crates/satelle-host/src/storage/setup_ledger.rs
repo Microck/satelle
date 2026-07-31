@@ -721,30 +721,46 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        let action_status = transaction
+        let (recovery_action_id, recovery_action_count) = transaction
             .query_row(
-                "SELECT setup_actions.status
+                "SELECT min(setup_actions.action_id), count(*)
                  FROM setup_actions
                  JOIN setup_runs USING (run_id)
                  WHERE setup_runs.run_id = ?1
                    AND setup_runs.status = 'outcome_unknown'
-                   AND setup_actions.action_id = 'bootstrap-handoff'",
+                   AND setup_actions.status = 'outcome_unknown'",
                 [operation_id.as_str()],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
             )
-            .optional()
-            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
-            .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
-        let parsed_action_status = SetupActionStatus::parse(&action_status)?;
-        if !matches!(
-            parsed_action_status,
-            SetupActionStatus::Planned
-                | SetupActionStatus::Started
-                | SetupActionStatus::OutcomeUnknown
-                | SetupActionStatus::Completed
-        ) {
-            return Err(StorageError::new(StorageErrorKind::StateConflict));
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if recovery_action_count > 1 {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
+        let recovery_action = if let Some(action_id) = recovery_action_id {
+            Some((
+                validated_stored_private_reference(action_id)?,
+                "outcome_unknown",
+            ))
+        } else {
+            transaction
+                .query_row(
+                    "SELECT setup_actions.action_id
+                     FROM setup_actions
+                     JOIN setup_runs USING (run_id)
+                     WHERE setup_runs.run_id = ?1
+                       AND setup_runs.status = 'outcome_unknown'
+                       AND setup_actions.status = 'planned'
+                     ORDER BY setup_actions.action_order
+                     LIMIT 1",
+                    [operation_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
+                .map(validated_stored_private_reference)
+                .transpose()?
+                .map(|action_id| (action_id, "planned"))
+        };
         require_one_transition(
             transaction
                 .execute(
@@ -755,7 +771,7 @@ impl Storage {
                 )
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
         )?;
-        if parsed_action_status != SetupActionStatus::Completed {
+        if let Some((recovery_action_id, recovery_action_status)) = recovery_action {
             require_one_transition(
                 transaction
                     .execute(
@@ -765,9 +781,14 @@ impl Storage {
                              finished_at = NULL,
                              recovery_hint = NULL
                          WHERE run_id = ?1
-                           AND action_id = 'bootstrap-handoff'
-                           AND status = ?3",
-                        params![operation_id.as_str(), acquired_at, action_status],
+                           AND action_id = ?3
+                           AND status = ?4",
+                        params![
+                            operation_id.as_str(),
+                            acquired_at,
+                            recovery_action_id.as_str(),
+                            recovery_action_status,
+                        ],
                     )
                     .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
             )?;

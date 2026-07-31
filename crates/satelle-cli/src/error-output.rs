@@ -155,7 +155,9 @@ fn human_error(error: &SatelleError) -> String {
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
-            lines.push(format!("applied: {actions}"));
+            if !actions.is_empty() {
+                lines.push(format!("applied: {actions}"));
+            }
         }
         if let Some(postchecks) = error
             .details
@@ -186,7 +188,9 @@ fn human_error(error: &SatelleError) -> String {
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
-            lines.push(format!("invalidated caches: {caches}"));
+            if !caches.is_empty() {
+                lines.push(format!("invalidated caches: {caches}"));
+            }
         }
         if let Some(preserved) = error.details.get("preserved_state").and_then(Value::as_str) {
             lines.push(format!("state: {preserved}"));
@@ -567,6 +571,29 @@ mod tests {
             ]
             .join("\n")
         );
+    }
+
+    #[test]
+    fn host_update_failure_omits_empty_action_and_cache_evidence_lines() {
+        let error = SatelleError {
+            code: ErrorCode::HostUpdatePartiallyApplied,
+            message: "Host update stopped before any action completed".to_string(),
+            recovery_command: Some("satelle repair --host remote --no-input --yes".to_string()),
+            source_detail: None,
+            details: BTreeMap::from([
+                ("completed_actions".to_string(), json!([])),
+                ("invalidated_caches".to_string(), json!([])),
+                (
+                    "preserved_state".to_string(),
+                    json!("maintenance ownership was preserved for recovery"),
+                ),
+            ]),
+        };
+
+        let rendered = human_error(&error);
+        assert!(!rendered.contains("\napplied: "));
+        assert!(!rendered.contains("\ninvalidated caches: "));
+        assert!(rendered.contains("\nstate: maintenance ownership was preserved for recovery"));
     }
 
     #[test]
