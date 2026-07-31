@@ -3759,11 +3759,11 @@ impl RemoteUserDirectories {
                     "if [ ! -e \"$path\" ]; then printf absent; exit 0; fi; ",
                     "[ -f \"$path\" ] && [ ! -L \"$path\" ] || exit 75; ",
                     "[ \"$(wc -c < \"$path\")\" -le 65536 ] || exit 75; ",
-                    "grep -Fq '<string>dev.microck.satelle.host</string>' \"$path\" && ",
-                    "grep -Fq '<string>--foreground</string>' \"$path\" && ",
-                    "{{ printf 'managed\\n'; ",
-                    "/usr/bin/plutil -extract ProgramArguments.0 raw -o - \"$path\"; }} || ",
-                    "printf absent"
+                    "label=$(/usr/bin/plutil -extract Label raw -o - \"$path\") || exit 75; ",
+                    "if [ \"$label\" != 'dev.microck.satelle.host' ]; then ",
+                    "printf absent; exit 0; fi; ",
+                    "printf 'managed\\n'; ",
+                    "/usr/bin/plutil -extract ProgramArguments json -o - \"$path\""
                 ),
                 path = posix_quote(path),
             );
@@ -3776,13 +3776,32 @@ impl RemoteUserDirectories {
         let observation = std::str::from_utf8(&output.stdout)
             .map_err(|_| SshBootstrapError::InvalidServiceObservation)?
             .trim();
-        let mut lines = observation.lines();
-        match (lines.next(), lines.next(), lines.next()) {
-            (Some("absent"), None, None) => Ok(None),
-            (Some("managed"), Some(executable), None) if !executable.is_empty() => {
-                Ok(Some(executable.to_string()))
+        if observation == "absent" {
+            return Ok(None);
+        }
+        let payload = observation
+            .strip_prefix("managed\n")
+            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        if self.target.is_windows() {
+            if payload.is_empty() || payload.contains('\n') {
+                return Err(SshBootstrapError::InvalidServiceObservation);
             }
-            _ => Err(SshBootstrapError::InvalidServiceObservation),
+            return Ok(Some(payload.to_string()));
+        }
+        let arguments: Vec<String> = serde_json::from_str(payload)
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+        match arguments.as_slice() {
+            [executable, host, start, foreground, bind, address]
+                if !executable.is_empty()
+                    && host == "host"
+                    && start == "start"
+                    && foreground == "--foreground"
+                    && bind == "--bind"
+                    && address == "127.0.0.1:3001" =>
+            {
+                Ok(Some(executable.clone()))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -5232,8 +5251,9 @@ mod tests {
             format!(
                 concat!(
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                    "printf 'managed\\n/Users/operator/Library/Caches/Satelle/",
-                    "host/v0.1.0/darwin-arm64/satelle\\n'\n"
+                    "printf 'managed\\n[\"/Users/operator/Library/Caches/Satelle/",
+                    "host/v0.1.0/darwin-arm64/satelle\",\"host\",\"start\",",
+                    "\"--foreground\",\"--bind\",\"127.0.0.1:3001\"]\\n'\n"
                 ),
                 posix_quote(audit_log.to_str().expect("UTF-8 audit path")),
             ),
@@ -5264,7 +5284,7 @@ mod tests {
         );
 
         let invocation = fs::read_to_string(&audit_log).expect("read fake SSH audit");
-        assert!(invocation.contains("grep -Fq"));
+        assert!(invocation.contains("/usr/bin/plutil"));
         for mutation in [
             "Set-Content",
             "Register-ScheduledTask",
@@ -5279,6 +5299,23 @@ mod tests {
                 "service probe attempted mutation command {mutation}: {invocation}"
             );
         }
+
+        fs::write(
+            &fake_ssh,
+            "#!/bin/sh\nprintf 'managed\\n[\"/current/satelle\",\"host\",\"start\",\"--foreground\",\"--bind\",\"127.0.0.1:3002\"]\\n'\n",
+        )
+        .expect("replace fake SSH response with a drifted launchd invocation");
+        assert!(
+            directories
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &service_path,
+                    "host-123",
+                )
+                .expect("a well-formed drifted launchd invocation is observable")
+                .is_none()
+        );
 
         fs::write(
             &fake_ssh,
