@@ -539,7 +539,12 @@ pub fn render_host_update_plan(report: &HostUpdateReport) -> String {
             target.restart_impact
         );
         for mutation in &target.remote_mutations {
-            let _ = writeln!(output, "  planned remote mutation: {}", mutation.operation);
+            let label = if target.disposition == HostUpdateDisposition::Skipped {
+                "skipped manual action"
+            } else {
+                "planned remote mutation"
+            };
+            let _ = writeln!(output, "  {label}: {}", mutation.operation);
         }
     }
     for postcheck in &report.postcheck_results {
@@ -1225,6 +1230,9 @@ mod tests {
             report.targets[0].restart_impact,
             HostUpdateRestartImpact::None
         );
+        let rendered = render_host_update_plan(&report);
+        assert!(rendered.contains("skipped manual action: replace-codex-runtime"));
+        assert!(!rendered.contains("planned remote mutation: replace-codex-runtime"));
     }
 
     #[test]
