@@ -318,7 +318,23 @@ function packageInstallContext({
 }
 
 function isSelfUpdate(argumentsToForward) {
-  return argumentsToForward[0] === "self" && argumentsToForward[1] === "update";
+  const commandArguments = [];
+  for (let index = 0; index < argumentsToForward.length; index += 1) {
+    const argument = argumentsToForward[index];
+    if (
+      argument === "--no-color" ||
+      argument.startsWith("--profile=") ||
+      argument.startsWith("--error-format=")
+    ) {
+      continue;
+    }
+    if (argument === "--profile" || argument === "--error-format") {
+      index += 1;
+      continue;
+    }
+    commandArguments.push(argument);
+  }
+  return commandArguments[0] === "self" && commandArguments[1] === "update";
 }
 
 function packageInstallContextForCommand(argumentsToForward, options) {

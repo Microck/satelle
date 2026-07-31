@@ -481,6 +481,12 @@ test("self-update package context preserves global unscoped ownership", (context
 
 test("package install context is reserved for self update", () => {
   assert.equal(launcher.isSelfUpdate(["self", "update"]), true);
+  assert.equal(
+    launcher.isSelfUpdate(["--error-format", "json", "self", "update"]),
+    true,
+  );
+  assert.equal(launcher.isSelfUpdate(["--profile=prod", "self", "update"]), true);
+  assert.equal(launcher.isSelfUpdate(["self", "--no-color", "update"]), true);
   assert.equal(launcher.isSelfUpdate(["run", "--agent", "codex"]), false);
   assert.equal(launcher.isSelfUpdate(["self", "version"]), false);
   const options = {
