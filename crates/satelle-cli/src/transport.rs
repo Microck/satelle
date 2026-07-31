@@ -3996,13 +3996,22 @@ fn begin_host_update_maintenance_with_revalidation(
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
     let begin = client
         .begin_host_update_maintenance(operation_id)
-        .map_err(|error| direct_transport_error(host, error))?;
-    validate_persistent_maintenance_response(
+        .map_err(|error| host_update_maintenance_begin_error(host, operation_id, error))?;
+    if let Err(source) = validate_persistent_maintenance_response(
         host,
         operation_id,
         begin.reconciled(),
         begin.operation_id(),
-    )?;
+    ) {
+        // A success response proves the request reached the Host. If that
+        // response cannot be authenticated against the requested operation,
+        // the caller cannot safely assume that Maintenance was not acquired.
+        return Err(SatelleError::host_update_recovery_pending(
+            host,
+            operation_id,
+            source.to_string(),
+        ));
+    }
 
     // The accepted plan is rebuilt only after Maintenance excludes every
     // competing Host mutation. Drift invalidates consent and closes the
@@ -4027,6 +4036,29 @@ fn begin_host_update_maintenance_with_revalidation(
         ));
     }
     Ok(current)
+}
+
+fn host_update_maintenance_begin_error(
+    host: &str,
+    operation_id: &str,
+    error: DaemonClientError,
+) -> SatelleError {
+    let outcome_is_uncertain = matches!(
+        &error,
+        DaemonClientError::Transport(_)
+            | DaemonClientError::InvalidResponse(_)
+            | DaemonClientError::UnexpectedSuccessStatus { .. }
+            | DaemonClientError::ResponseRequestIdMismatch
+            | DaemonClientError::ResponseHostIdentityMismatch
+            | DaemonClientError::ResponseContractViolation
+    );
+    if outcome_is_uncertain {
+        SatelleError::host_update_recovery_pending(host, operation_id, error.to_string())
+    } else {
+        // Local request construction, TLS negotiation, protocol rejection, and
+        // typed API rejection all prove that this mutation did not succeed.
+        direct_transport_error(host, error)
+    }
 }
 
 fn finish_locked_unmodified_host_update(
@@ -4105,7 +4137,8 @@ fn fail_host_update_action(
     action_id: &str,
     source: SatelleError,
 ) -> SatelleError {
-    let _ = record_persistent_action_failure(
+    let operation_id = bootstrap_lock.operation_id().to_string();
+    let cleanup = record_persistent_action_failure(
         host,
         client,
         bootstrap_lock,
@@ -4118,7 +4151,25 @@ fn fail_host_update_action(
             .release_committed_handoff()
             .map_err(|_| SatelleError::host_unreachable(host))
     });
-    host_update_recovery_pending(report, action_id, source)
+    match cleanup {
+        Ok(()) => host_update_recovery_pending(report, action_id, source),
+        Err(cleanup) if !report.changed => SatelleError::host_update_recovery_pending(
+            host,
+            &operation_id,
+            format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}"),
+        ),
+        Err(cleanup) => {
+            let failure_detail =
+                format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}");
+            let mut error = host_update_recovery_pending(report, action_id, source);
+            error.details.insert(
+                "operation_id".to_string(),
+                serde_json::Value::String(operation_id),
+            );
+            error.source_detail = Some(failure_detail);
+            error
+        }
+    }
 }
 
 fn host_update_recovery_pending(

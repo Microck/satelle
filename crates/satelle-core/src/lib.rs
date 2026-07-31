@@ -5531,9 +5531,8 @@ impl SatelleError {
         );
         Self {
             code: ErrorCode::HostUpdateRecoveryPending,
-            message:
-                "Host update stopped before remote mutation and its maintenance operation could not be closed"
-                    .to_string(),
+            message: "Host update maintenance has an uncertain outcome and requires recovery"
+                .to_string(),
             recovery_command,
             source_detail: Some(source.into()),
             details,

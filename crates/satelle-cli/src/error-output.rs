@@ -319,7 +319,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         ErrorCode::HostUpdateRecoveryPending => ErrorContract {
             category: ErrorCategory::RemoteExecution,
             retryable: false,
-            outcome: "The Host update stopped before changing remote state, but cleanup failed.",
+            outcome: "The Host update maintenance outcome is uncertain and requires recovery.",
             default_recovery: "run satelle repair for the selected Host",
         },
         ErrorCode::HostUpdatePartiallyApplied => ErrorContract {
