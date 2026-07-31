@@ -4582,7 +4582,11 @@ impl ReleaseArtifactMetadata {
     pub(super) fn from_digest_hex(digest: &str) -> Result<Self, SshBootstrapError> {
         parse_digest_hex(digest)
             .map(Self::from_digest)
-            .map_err(|_| SshBootstrapError::InvalidManifest)
+            .map_err(|_| {
+                SshBootstrapError::VerifiedRelease(Box::new(
+                    self_update::SelfUpdateError::ManifestInvalid,
+                ))
+            })
     }
 
     pub(super) const fn digest(self) -> [u8; 32] {
