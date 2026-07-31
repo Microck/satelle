@@ -54,9 +54,10 @@ use tracing::metadata::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-const EXPECTED_OPERATIONS: [&str; 16] = [
+const EXPECTED_OPERATIONS: [&str; 17] = [
     "live",
     "capabilities",
+    "maintenance_update_evidence",
     "host_status",
     "host_paths",
     "host_desktop_sessions",
@@ -1244,6 +1245,10 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         panic!("the release gate runs on one of the six Controller targets");
     };
     assert_eq!(capabilities_json["platform"]["target"], expected_target);
+    assert!(
+        capabilities_json.get("codex_update_evidence").is_none(),
+        "ordinary capabilities must not launch live maintenance probes"
+    );
     let mut missing_target = capabilities_json.clone();
     missing_target["platform"]
         .as_object_mut()
@@ -1302,6 +1307,26 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         capabilities.limits().attachment_bytes_each(),
         5 * 1024 * 1024
     );
+
+    let maintenance_response = running
+        .request("/v1/maintenance/update-evidence")
+        .send()
+        .await
+        .expect("request fresh maintenance evidence");
+    assert_eq!(maintenance_response.status(), StatusCode::OK);
+    let maintenance_json: serde_json::Value = maintenance_response
+        .json()
+        .await
+        .expect("decode maintenance evidence JSON");
+    assert_eq!(
+        maintenance_json["schema_version"],
+        "satelle.maintenance.update-evidence.v1"
+    );
+    assert_eq!(
+        maintenance_json["host_identity"],
+        capabilities.host_identity()
+    );
+    assert!(maintenance_json.get("codex_update_evidence").is_some());
     assert_eq!(
         capabilities.limits().attachment_bytes_total(),
         10 * 1024 * 1024

@@ -4214,11 +4214,7 @@ fn run_repair(
 
 fn repair_plan_requires_consent(report: &satelle_core::host_update::RepairUpgradeReport) -> bool {
     report.actions.iter().any(|action| {
-        !matches!(
-            action.disposition,
-            satelle_core::host_update::RepairUpgradeDisposition::NotNeeded
-                | satelle_core::host_update::RepairUpgradeDisposition::RecommendHostUpdate
-        )
+        action.disposition == satelle_core::host_update::RepairUpgradeDisposition::Required
     })
 }
 
@@ -4252,13 +4248,17 @@ mod repair_consent_tests {
         );
         assert!(!repair_plan_requires_consent(&read_only));
 
-        for disposition in [
-            RepairUpgradeDisposition::Required,
-            RepairUpgradeDisposition::ManualActionRequired,
-        ] {
-            let mutating = RepairUpgradeReport::new("local-demo", vec![action(disposition)]);
-            assert!(repair_plan_requires_consent(&mutating));
-        }
+        let manual_only = RepairUpgradeReport::new(
+            "local-demo",
+            vec![action(RepairUpgradeDisposition::ManualActionRequired)],
+        );
+        assert!(!repair_plan_requires_consent(&manual_only));
+
+        let mutating = RepairUpgradeReport::new(
+            "local-demo",
+            vec![action(RepairUpgradeDisposition::Required)],
+        );
+        assert!(repair_plan_requires_consent(&mutating));
     }
 }
 

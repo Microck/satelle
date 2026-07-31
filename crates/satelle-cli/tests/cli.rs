@@ -3654,26 +3654,26 @@ fn current_host_update_succeeds_without_an_apply_executor() {
 }
 
 #[test]
-fn unavailable_json_repair_apply_emits_only_the_terminal_error() {
+fn manual_only_json_repair_reports_the_plan_without_apply_failure() {
     let state = state_dir();
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args(["repair", "--host", "local-demo", "--yes", "--json"])
         .assert()
-        .code(70)
+        .success()
         .get_output()
         .clone();
 
+    assert!(output.stderr.is_empty());
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(report["schema_version"], "satelle.repair.v1");
     assert!(
-        output.stdout.is_empty(),
-        "an unavailable JSON apply must not emit a success-shaped plan"
-    );
-    let error = parse_json_output(&output.stderr);
-    assert_eq!(error["schema_version"], "satelle.error.v1");
-    assert_eq!(error["code"], "not-implemented");
-    assert_eq!(
-        error["suggested_commands"],
-        serde_json::json!(["satelle repair --host local-demo --dry-run --json"])
+        report["actions"]
+            .as_array()
+            .expect("repair actions are an array")
+            .iter()
+            .all(|action| action["disposition"] != "required"),
+        "a successful repair plan must not contain an unapplied mutation"
     );
 }
 

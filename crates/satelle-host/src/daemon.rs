@@ -641,16 +641,17 @@ impl HostService {
     pub fn maintenance_codex_update_evidence(
         &self,
     ) -> Result<satelle_core::host_update::CodexUpdateEvidence, SatelleError> {
-        match &self.mode {
-            HostMode::Production { .. } => Ok(production_codex_update_evidence(
-                &ProductionCapabilitySnapshot::collect(None),
-            )),
-            #[cfg(any(test, feature = "test-support"))]
-            HostMode::TestFake { .. } => Ok(self
-                .daemon_runtime_capabilities()?
-                .codex_update_evidence()
-                .clone()),
-        }
+        self.operation_capacity
+            .execute_exclusive(|| match &self.mode {
+                HostMode::Production { .. } => Ok(production_codex_update_evidence(
+                    &ProductionCapabilitySnapshot::collect(None),
+                )),
+                #[cfg(any(test, feature = "test-support"))]
+                HostMode::TestFake { .. } => Ok(self
+                    .daemon_runtime_capabilities()?
+                    .codex_update_evidence()
+                    .clone()),
+            })
     }
 
     /// Reads only Host-observed desktop state. Controller transport and
@@ -2165,6 +2166,35 @@ mod tests {
             evidence.availability,
             satelle_core::host_update::CodexUpdateAvailability::UnsupportedHostPlatform
         );
+    }
+
+    #[test]
+    fn maintenance_update_evidence_shares_the_host_operation_capacity() {
+        let state = crate::TestStateDir::new().expect("temporary Host state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic Host service");
+        let capacity = Arc::clone(&service.operation_capacity);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let active_operation = std::thread::spawn(move || {
+            capacity.execute_exclusive(|| {
+                entered_tx.send(()).expect("signal occupied capacity");
+                release_rx.recv().expect("release occupied capacity");
+                Ok(())
+            })
+        });
+        entered_rx.recv().expect("wait for occupied capacity");
+
+        let observation = service.maintenance_codex_update_evidence();
+        release_tx.send(()).expect("release occupied capacity");
+        active_operation
+            .join()
+            .expect("join capacity holder")
+            .expect("capacity holder succeeds");
+
+        let error =
+            observation.expect_err("maintenance evidence must respect the occupied Host capacity");
+        assert_eq!(error.code, satelle_core::ErrorCode::CapacityExceeded);
     }
 
     #[cfg(target_os = "linux")]

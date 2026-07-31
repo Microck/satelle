@@ -10,7 +10,8 @@ mod setup;
 use crate::contract::{
     ApiError, ApiErrorCategory, ApiErrorCode, CapabilitiesResponse, EffectiveLimits,
     HostDesktopSessionsResponse, HostPathsResponse, HostStatusResponse, LiveResponse,
-    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, effective_limits,
+    MaintenanceUpdateEvidenceResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId,
+    effective_limits,
 };
 use auth::{AuthorizedRequest, REQUEST_ID_HEADER};
 use axum::Router;
@@ -809,8 +810,12 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::reject_public_bearer_carriers,
         ));
-    let capabilities_route = Router::new()
+    let protocol_read_routes = Router::new()
         .route("/v1/capabilities", get(capabilities))
+        .route(
+            "/v1/maintenance/update-evidence",
+            get(maintenance_update_evidence),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_empty_read,
@@ -837,7 +842,7 @@ fn router(state: Arc<DaemonState>) -> Router {
             auth::require_query_read,
         ));
     let read_routes = bodyless_read_routes
-        .merge(capabilities_route)
+        .merge(protocol_read_routes)
         .merge(logs_route)
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -1020,6 +1025,33 @@ async fn capabilities(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
 ) -> Response {
+    let response = CapabilitiesResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        env!("CARGO_PKG_VERSION").to_string(),
+        state.capabilities.codex_runtime(),
+        state.capabilities.native_computer_use(),
+        state.capabilities.provider_computer_use(),
+        state.capabilities.image_attachments(),
+        state.limits,
+    );
+    let mut response = authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    );
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(PROTOCOL_VERSION_HEADER),
+        HeaderValue::from_static(PROTOCOL_VERSION),
+    );
+    response
+}
+
+async fn maintenance_update_evidence(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
     let service = Arc::clone(&state.service);
     let codex_update_evidence = match tokio::task::spawn_blocking(move || {
         service.maintenance_codex_update_evidence()
@@ -1030,16 +1062,10 @@ async fn capabilities(
         Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
         Err(_) => return host_error::task_failure(&state, &authorized),
     };
-    let response = CapabilitiesResponse::new(
+    let response = MaintenanceUpdateEvidenceResponse::new(
         authorized.request_id().clone(),
         state.host_identity.clone(),
-        env!("CARGO_PKG_VERSION").to_string(),
-        state.capabilities.codex_runtime(),
-        state.capabilities.native_computer_use(),
-        state.capabilities.provider_computer_use(),
         codex_update_evidence,
-        state.capabilities.image_attachments(),
-        state.limits,
     );
     let mut response = authenticated_json_response(
         StatusCode::OK,

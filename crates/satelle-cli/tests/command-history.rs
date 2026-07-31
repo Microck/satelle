@@ -424,18 +424,22 @@ adapter = "fake"
     )
     .expect("write remote-default config");
 
-    for arguments in [
-        vec!["repair", "--yes", "--json"],
-        vec!["host", "stop", "--json"],
-        vec!["host", "restart", "--json"],
-        vec!["host", "storage", "migrate", "--json"],
+    for (arguments, succeeds) in [
+        (vec!["repair", "--yes", "--json"], true),
+        (vec!["host", "stop", "--json"], false),
+        (vec!["host", "restart", "--json"], false),
+        (vec!["host", "storage", "migrate", "--json"], false),
     ] {
-        fixture
+        let assertion = fixture
             .command()
             .env("SATELLE_CONFIG_FILE", &config_path)
             .args(arguments)
-            .assert()
-            .failure();
+            .assert();
+        if succeeds {
+            assertion.success();
+        } else {
+            assertion.failure();
+        }
     }
 
     let connection = fixture.connection();

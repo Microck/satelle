@@ -6,6 +6,10 @@ use time::OffsetDateTime;
 
 define_schema_token!(LiveSchema, "satelle.live.v1");
 define_schema_token!(CapabilitiesSchemaV6, "satelle.capabilities.v6");
+define_schema_token!(
+    MaintenanceUpdateEvidenceSchema,
+    "satelle.maintenance.update-evidence.v1"
+);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +78,7 @@ impl LiveResponse {
 enum Operation {
     Live,
     Capabilities,
+    MaintenanceUpdateEvidence,
     HostStatus,
     HostPaths,
     HostDesktopSessions,
@@ -95,6 +100,7 @@ impl Operation {
         match self {
             Self::Live => "live",
             Self::Capabilities => "capabilities",
+            Self::MaintenanceUpdateEvidence => "maintenance_update_evidence",
             Self::HostStatus => "host_status",
             Self::HostPaths => "host_paths",
             Self::HostDesktopSessions => "host_desktop_sessions",
@@ -258,7 +264,6 @@ pub struct CapabilitiesResponse {
     platform: Platform,
     operations: Vec<Operation>,
     runtime_capabilities: RuntimeCapabilities,
-    codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence,
     minimum_host_version: String,
     limits: EffectiveLimits,
     supported_attachment_media_types: Vec<String>,
@@ -274,7 +279,6 @@ impl CapabilitiesResponse {
         codex_runtime: bool,
         native_computer_use: bool,
         provider_computer_use: bool,
-        codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence,
         image_attachments: bool,
         limits: EffectiveLimits,
     ) -> Self {
@@ -301,6 +305,7 @@ impl CapabilitiesResponse {
             operations: vec![
                 Operation::Live,
                 Operation::Capabilities,
+                Operation::MaintenanceUpdateEvidence,
                 Operation::HostStatus,
                 Operation::HostPaths,
                 Operation::HostDesktopSessions,
@@ -321,7 +326,6 @@ impl CapabilitiesResponse {
                 native_computer_use,
                 provider_computer_use,
             },
-            codex_update_evidence,
             minimum_host_version: env!("CARGO_PKG_VERSION").to_string(),
             limits,
             supported_attachment_media_types: if image_attachments {
@@ -356,10 +360,6 @@ impl CapabilitiesResponse {
         &self.platform.target
     }
 
-    pub const fn codex_update_evidence(&self) -> &satelle_core::host_update::CodexUpdateEvidence {
-        &self.codex_update_evidence
-    }
-
     pub fn minimum_host_version(&self) -> &str {
         &self.minimum_host_version
     }
@@ -389,6 +389,74 @@ impl CapabilitiesResponse {
 }
 
 impl AuthenticatedResponseContract for CapabilitiesResponse {
+    fn request_id(&self) -> &RequestId {
+        self.request_id()
+    }
+
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaintenanceUpdateEvidenceResponse {
+    schema_version: MaintenanceUpdateEvidenceSchema,
+    request_id: RequestId,
+    host_identity: String,
+    daemon_version: String,
+    platform: Platform,
+    minimum_host_version: String,
+    codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence,
+}
+
+impl MaintenanceUpdateEvidenceResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence,
+    ) -> Self {
+        Self {
+            schema_version: MaintenanceUpdateEvidenceSchema,
+            request_id,
+            host_identity,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: Platform {
+                os: PlatformOs::current(),
+                arch: std::env::consts::ARCH.to_string(),
+                target: satelle_core::host_update::current_host_artifact_platform(),
+            },
+            minimum_host_version: env!("CARGO_PKG_VERSION").to_string(),
+            codex_update_evidence,
+        }
+    }
+
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+
+    pub fn daemon_version(&self) -> &str {
+        &self.daemon_version
+    }
+
+    pub fn platform_target(&self) -> &str {
+        &self.platform.target
+    }
+
+    pub fn minimum_host_version(&self) -> &str {
+        &self.minimum_host_version
+    }
+
+    pub const fn codex_update_evidence(&self) -> &satelle_core::host_update::CodexUpdateEvidence {
+        &self.codex_update_evidence
+    }
+}
+
+impl AuthenticatedResponseContract for MaintenanceUpdateEvidenceResponse {
     fn request_id(&self) -> &RequestId {
         self.request_id()
     }

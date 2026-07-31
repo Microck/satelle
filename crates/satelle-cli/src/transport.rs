@@ -1242,6 +1242,52 @@ struct CurrentDaemonArtifactObservation {
     validated_host_identity: Option<String>,
 }
 
+trait CurrentDaemonObservationContract {
+    fn daemon_version(&self) -> &str;
+    fn minimum_host_version(&self) -> &str;
+    #[cfg(test)]
+    fn host_identity(&self) -> &str;
+    fn codex_update_evidence(&self) -> Option<&satelle_core::host_update::CodexUpdateEvidence>;
+}
+
+impl CurrentDaemonObservationContract for satelle_transport::CapabilitiesResponse {
+    fn daemon_version(&self) -> &str {
+        self.daemon_version()
+    }
+
+    fn minimum_host_version(&self) -> &str {
+        self.minimum_host_version()
+    }
+
+    #[cfg(test)]
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
+
+    fn codex_update_evidence(&self) -> Option<&satelle_core::host_update::CodexUpdateEvidence> {
+        None
+    }
+}
+
+impl CurrentDaemonObservationContract for satelle_transport::MaintenanceUpdateEvidenceResponse {
+    fn daemon_version(&self) -> &str {
+        self.daemon_version()
+    }
+
+    fn minimum_host_version(&self) -> &str {
+        self.minimum_host_version()
+    }
+
+    #[cfg(test)]
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
+
+    fn codex_update_evidence(&self) -> Option<&satelle_core::host_update::CodexUpdateEvidence> {
+        Some(self.codex_update_evidence())
+    }
+}
+
 impl SshSetupTransport {
     fn new(host: &SelectedHost) -> Result<Self, SatelleError> {
         let requires_first_trust = host.config.expected_host_id.is_none();
@@ -1360,6 +1406,34 @@ impl SshSetupTransport {
         self.observe_current_daemon_at(tunnel.local_addr(), token)
     }
 
+    fn observe_maintenance_daemon_artifact(
+        &self,
+        existing_token_file: bool,
+    ) -> Result<CurrentDaemonArtifactObservation, SatelleError> {
+        if let Some(observation) = self.current_daemon_artifact.as_ref() {
+            return Ok(observation.clone());
+        }
+        let tunnel = SshTunnel::open(self.binding.destination()).map_err(|error| match error {
+            ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
+                SatelleError::ssh_host_key_verification_required(&self.alias)
+            }
+            _ => SatelleError::host_unreachable(&self.alias),
+        })?;
+        let token = if existing_token_file {
+            self.read_configured_durable_token()?
+        } else {
+            ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(&self.alias))?
+        };
+        let client = DaemonClient::loopback_with_timeout(
+            tunnel.local_addr(),
+            token,
+            self.binding.expected_host_identity().to_string(),
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(&self.alias, error))?;
+        self.current_daemon_observation(client.maintenance_update_evidence())
+    }
+
     fn observe_current_daemon_at(
         &self,
         address: std::net::SocketAddr,
@@ -1402,25 +1476,25 @@ impl SshSetupTransport {
                 SSH_DAEMON_REQUEST_TIMEOUT,
             )
             .map_err(|error| direct_transport_error(&self.alias, error))?;
-            return self.current_daemon_observation_from_capabilities(client.capabilities());
+            return self.current_daemon_observation(client.capabilities());
         }
-        self.current_daemon_observation_from_capabilities(client.capabilities())
+        self.current_daemon_observation(client.capabilities())
     }
 
-    fn current_daemon_observation_from_capabilities(
+    fn current_daemon_observation<T: CurrentDaemonObservationContract>(
         &self,
-        capabilities: Result<satelle_transport::CapabilitiesResponse, DaemonClientError>,
+        response: Result<T, DaemonClientError>,
     ) -> Result<CurrentDaemonArtifactObservation, SatelleError> {
-        match capabilities {
-            Ok(capabilities) => Ok(CurrentDaemonArtifactObservation {
-                current_version: Some(capabilities.daemon_version().to_string()),
-                minimum_host_version: Some(capabilities.minimum_host_version().to_string()),
+        match response {
+            Ok(response) => Ok(CurrentDaemonArtifactObservation {
+                current_version: Some(response.daemon_version().to_string()),
+                minimum_host_version: Some(response.minimum_host_version().to_string()),
                 protocol_compatible: true,
-                codex_update_evidence: Some(capabilities.codex_update_evidence().clone()),
+                codex_update_evidence: response.codex_update_evidence().cloned(),
                 #[cfg(test)]
-                validated_host_identity: Some(capabilities.host_identity().to_string()),
+                validated_host_identity: Some(response.host_identity().to_string()),
             }),
-            Err(DaemonClientError::CapabilitiesProtocolMismatch) => {
+            Err(DaemonClientError::ProtocolResponseMismatch) => {
                 Ok(CurrentDaemonArtifactObservation {
                     current_version: None,
                     minimum_host_version: None,
@@ -2893,15 +2967,14 @@ fn inspect_host_maintenance(
         }
         TransportKind::Direct => {
             let transport = direct_transport(host)?;
-            let capabilities = read_direct_maintenance_capabilities(&host.alias, &transport)?;
-            match capabilities {
-                DirectMaintenanceCapabilities::Compatible(capabilities) => {
-                    let (target, platform) =
-                        canonical_remote_platform(capabilities.platform_target());
+            let observation = read_direct_maintenance_evidence(&host.alias, &transport)?;
+            match observation {
+                DirectMaintenanceEvidence::Compatible(evidence) => {
+                    let (target, platform) = canonical_remote_platform(evidence.platform_target());
                     let relation_to_cli = host_version_relation(
-                        Some(capabilities.daemon_version()),
+                        Some(evidence.daemon_version()),
                         true,
-                        Some(capabilities.minimum_host_version()),
+                        Some(evidence.minimum_host_version()),
                         cli_version,
                     )?;
                     let artifact = if kind == HostMaintenancePlanKind::HostUpdate {
@@ -2924,19 +2997,19 @@ fn inspect_host_maintenance(
                         None
                     };
                     Ok(HostMaintenanceInspection {
-                        current_version: Some(capabilities.daemon_version().to_string()),
-                        minimum_host_version: Some(capabilities.minimum_host_version().to_string()),
+                        current_version: Some(evidence.daemon_version().to_string()),
+                        minimum_host_version: Some(evidence.minimum_host_version().to_string()),
                         protocol_compatible: true,
                         relation_to_cli,
                         remote_platform: platform,
                         artifact,
                         service_inspection: None,
-                        codex_evidence: Some(capabilities.codex_update_evidence().clone()),
+                        codex_evidence: Some(evidence.codex_update_evidence().clone()),
                         // Direct maintenance mutation is not implemented in the current transport.
                         host_automation_is_safe: false,
                     })
                 }
-                DirectMaintenanceCapabilities::ProtocolIncompatible { current_version } => {
+                DirectMaintenanceEvidence::ProtocolIncompatible { current_version } => {
                     let relation_to_cli = host_version_relation(
                         current_version.as_deref(),
                         false,
@@ -2964,7 +3037,7 @@ fn inspect_host_maintenance(
             let transport = SshSetupTransport::new_for_maintenance(host)?;
             let target = transport.remote_target()?;
             let current =
-                transport.observe_current_daemon_artifact(transport.token_file_exists()?)?;
+                transport.observe_maintenance_daemon_artifact(transport.token_file_exists()?)?;
             let relation_to_cli = host_version_relation(
                 current.current_version.as_deref(),
                 current.protocol_compatible,
@@ -3079,19 +3152,17 @@ fn inspect_host_maintenance(
     }
 }
 
-enum DirectMaintenanceCapabilities {
-    Compatible(Box<satelle_transport::CapabilitiesResponse>),
+enum DirectMaintenanceEvidence {
+    Compatible(Box<satelle_transport::MaintenanceUpdateEvidenceResponse>),
     ProtocolIncompatible { current_version: Option<String> },
 }
 
-fn classify_direct_maintenance_capabilities(
+fn classify_direct_maintenance_evidence(
     host: &str,
-    capabilities: Result<satelle_transport::CapabilitiesResponse, DaemonClientError>,
-) -> Result<DirectMaintenanceCapabilities, SatelleError> {
-    match capabilities {
-        Ok(capabilities) => Ok(DirectMaintenanceCapabilities::Compatible(Box::new(
-            capabilities,
-        ))),
+    evidence: Result<satelle_transport::MaintenanceUpdateEvidenceResponse, DaemonClientError>,
+) -> Result<DirectMaintenanceEvidence, SatelleError> {
+    match evidence {
+        Ok(evidence) => Ok(DirectMaintenanceEvidence::Compatible(Box::new(evidence))),
         Err(DaemonClientError::Api { error, .. })
             if error.code() == ApiErrorCode::IncompatibleProtocol =>
         {
@@ -3106,12 +3177,12 @@ fn classify_direct_maintenance_capabilities(
                         None,
                     )
                 })?;
-            Ok(DirectMaintenanceCapabilities::ProtocolIncompatible {
+            Ok(DirectMaintenanceEvidence::ProtocolIncompatible {
                 current_version: Some(current_version),
             })
         }
-        Err(DaemonClientError::CapabilitiesProtocolMismatch) => {
-            Ok(DirectMaintenanceCapabilities::ProtocolIncompatible {
+        Err(DaemonClientError::ProtocolResponseMismatch) => {
+            Ok(DirectMaintenanceEvidence::ProtocolIncompatible {
                 current_version: None,
             })
         }
@@ -3119,11 +3190,11 @@ fn classify_direct_maintenance_capabilities(
     }
 }
 
-fn read_direct_maintenance_capabilities(
+fn read_direct_maintenance_evidence(
     host: &str,
     transport: &DirectTransport,
-) -> Result<DirectMaintenanceCapabilities, SatelleError> {
-    classify_direct_maintenance_capabilities(host, transport.client.capabilities())
+) -> Result<DirectMaintenanceEvidence, SatelleError> {
+    classify_direct_maintenance_evidence(host, transport.client.maintenance_update_evidence())
 }
 
 pub(crate) fn plan_host_update(
@@ -5294,7 +5365,7 @@ fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError 
         DaemonClientError::CertificateExpired(_) => SatelleError::certificate_expired(host),
         DaemonClientError::TlsVersionUnsupported(_) => SatelleError::tls_version_unsupported(host),
         DaemonClientError::TlsHandshake(_) => SatelleError::tls_handshake_failed(host),
-        DaemonClientError::CapabilitiesProtocolMismatch => {
+        DaemonClientError::ProtocolResponseMismatch => {
             api_code_error(host, ApiErrorCode::IncompatibleProtocol)
         }
         DaemonClientError::Transport(_) => SatelleError::host_unreachable(host),
@@ -6805,8 +6876,8 @@ mod bootstrap_ordering_tests {
     fn setup_report_uses_protocol_incompatible_pre_mutation_daemon_observation() {
         let transport = setup_transport_for_report();
         let observation = transport
-            .current_daemon_observation_from_capabilities(Err(
-                DaemonClientError::CapabilitiesProtocolMismatch,
+            .current_daemon_observation::<satelle_transport::CapabilitiesResponse>(Err(
+                DaemonClientError::ProtocolResponseMismatch,
             ))
             .expect("map an authenticated protocol mismatch to the planning observation");
 

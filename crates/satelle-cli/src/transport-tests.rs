@@ -3724,11 +3724,11 @@ fn direct_host_maintenance_probe_does_not_mutate_daemon_state() {
         .daemon_runtime_status()
         .expect("read pre-probe daemon state");
 
-    let DirectMaintenanceCapabilities::Compatible(capabilities) =
-        read_direct_maintenance_capabilities("direct-test", fixture.transport())
-            .expect("read authenticated maintenance capabilities")
+    let DirectMaintenanceEvidence::Compatible(evidence) =
+        read_direct_maintenance_evidence("direct-test", fixture.transport())
+            .expect("read authenticated maintenance evidence")
     else {
-        panic!("current Direct Host must return compatible capabilities");
+        panic!("current Direct Host must return compatible maintenance evidence");
     };
 
     let after = fixture
@@ -3736,8 +3736,8 @@ fn direct_host_maintenance_probe_does_not_mutate_daemon_state() {
         .daemon_runtime_status()
         .expect("read post-probe daemon state");
     assert_eq!(before, after);
-    assert_eq!(capabilities.host_identity(), fixture.host_identity);
-    assert_eq!(capabilities.daemon_version(), env!("CARGO_PKG_VERSION"));
+    assert_eq!(evidence.host_identity(), fixture.host_identity);
+    assert_eq!(evidence.daemon_version(), env!("CARGO_PKG_VERSION"));
 }
 
 #[test]
@@ -3761,7 +3761,7 @@ fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance
     }))
     .expect("deserialize an authenticated protocol mismatch");
 
-    let observation = classify_direct_maintenance_capabilities(
+    let observation = classify_direct_maintenance_evidence(
         "direct-test",
         Err(DaemonClientError::Api {
             status: reqwest::StatusCode::UPGRADE_REQUIRED,
@@ -3770,8 +3770,7 @@ fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance
     )
     .expect("retain protocol mismatch evidence for maintenance planning");
 
-    let DirectMaintenanceCapabilities::ProtocolIncompatible { current_version } = observation
-    else {
+    let DirectMaintenanceEvidence::ProtocolIncompatible { current_version } = observation else {
         panic!("expected retained protocol mismatch evidence");
     };
     assert_eq!(current_version.as_deref(), Some("0.0.9"));
@@ -3779,14 +3778,13 @@ fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance
 
 #[test]
 fn header_direct_protocol_mismatch_remains_a_maintenance_observation() {
-    let observation = classify_direct_maintenance_capabilities(
+    let observation = classify_direct_maintenance_evidence(
         "direct-test",
-        Err(DaemonClientError::CapabilitiesProtocolMismatch),
+        Err(DaemonClientError::ProtocolResponseMismatch),
     )
     .expect("classify the authenticated header protocol mismatch");
 
-    let DirectMaintenanceCapabilities::ProtocolIncompatible { current_version } = observation
-    else {
+    let DirectMaintenanceEvidence::ProtocolIncompatible { current_version } = observation else {
         panic!("expected protocol-incompatible maintenance evidence");
     };
     assert_eq!(current_version, None);
