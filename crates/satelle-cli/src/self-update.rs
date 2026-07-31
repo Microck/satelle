@@ -78,10 +78,6 @@ pub(crate) struct SelfUpdateReport {
 }
 
 impl SelfUpdateReport {
-    pub(crate) fn latest_compatible_version(&self) -> &str {
-        &self.latest_compatible_version
-    }
-
     pub(crate) const fn should_offer_remote_update(
         &self,
         no_input: bool,
@@ -697,28 +693,33 @@ fn detect_managed_install(executable: &Path) -> Result<Option<ManagedInstall>, S
     let joined = components.join("/");
 
     if contains("cellar") || joined.contains("/homebrew/") {
-        return Ok(Some(ManagedInstall {
-            install_method: "homebrew".to_string(),
-            install_scope: Some("global".to_string()),
-            package_name: "satelle".to_string(),
-            install_root: None,
-            upgrade_program: "brew".to_string(),
-            upgrade_arguments: vec!["upgrade".to_string(), "satelle".to_string()],
-            upgrade_working_directory: None,
-            upgrade_command: "brew upgrade satelle".to_string(),
-        }));
+        let prefix = manager_command_line("brew", &["--prefix"]).map(PathBuf::from);
+        let owned_files = manager_command_lines("brew", &["list", "--formula", "satelle"])
+            .into_iter()
+            .filter_map(|path| {
+                let path = PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    prefix.as_ref()?.join(path)
+                };
+                path.canonicalize().ok()
+            })
+            .collect::<Vec<_>>();
+        return Ok(system_package_managed_install(
+            executable,
+            &owned_files,
+            None,
+        ));
     }
     if joined.contains("/scoop/apps/") {
-        return Ok(Some(ManagedInstall {
-            install_method: "scoop".to_string(),
-            install_scope: Some("global".to_string()),
-            package_name: "satelle".to_string(),
-            install_root: None,
-            upgrade_program: "scoop".to_string(),
-            upgrade_arguments: vec!["update".to_string(), "satelle".to_string()],
-            upgrade_working_directory: None,
-            upgrade_command: "scoop update satelle".to_string(),
-        }));
+        let install_root = manager_command_line("scoop", &["prefix", "satelle"])
+            .and_then(|path| PathBuf::from(path).canonicalize().ok());
+        return Ok(system_package_managed_install(
+            executable,
+            &[],
+            install_root.as_deref(),
+        ));
     }
 
     // Only the JavaScript launcher can establish package ownership, and its
@@ -732,6 +733,38 @@ fn detect_managed_install(executable: &Path) -> Result<Option<ManagedInstall>, S
         .and_then(|value| value.into_string().ok())
         .ok_or(SelfUpdateError::InstallOwnerUnknown)?;
     package_managed_install(executable, &raw_context).map(Some)
+}
+
+fn system_package_managed_install(
+    executable: &Path,
+    homebrew_owned_files: &[PathBuf],
+    scoop_install_root: Option<&Path>,
+) -> Option<ManagedInstall> {
+    if homebrew_owned_files.iter().any(|owned| owned == executable) {
+        return Some(ManagedInstall {
+            install_method: "homebrew".to_string(),
+            install_scope: Some("global".to_string()),
+            package_name: "satelle".to_string(),
+            install_root: None,
+            upgrade_program: "brew".to_string(),
+            upgrade_arguments: vec!["upgrade".to_string(), "satelle".to_string()],
+            upgrade_working_directory: None,
+            upgrade_command: "brew upgrade satelle".to_string(),
+        });
+    }
+    if scoop_install_root.is_some_and(|root| executable.starts_with(root)) {
+        return Some(ManagedInstall {
+            install_method: "scoop".to_string(),
+            install_scope: Some("global".to_string()),
+            package_name: "satelle".to_string(),
+            install_root: None,
+            upgrade_program: "scoop".to_string(),
+            upgrade_arguments: vec!["update".to_string(), "satelle".to_string()],
+            upgrade_working_directory: None,
+            upgrade_command: "scoop update satelle".to_string(),
+        });
+    }
+    None
 }
 
 fn package_managed_install(
@@ -1040,6 +1073,16 @@ fn manager_command_line(program: &str, arguments: &[&str]) -> Option<String> {
     .ok()
 }
 
+fn manager_command_lines(program: &str, arguments: &[&str]) -> Vec<String> {
+    manager_command_lines_bounded(
+        manager_executable(program, cfg!(windows)),
+        arguments,
+        Duration::from_secs(10),
+        64 * 1024,
+    )
+    .unwrap_or_default()
+}
+
 fn manager_executable(program: &str, windows: bool) -> &str {
     if windows {
         match program {
@@ -1067,6 +1110,19 @@ fn manager_command_line_bounded(
     timeout: Duration,
     output_limit: usize,
 ) -> Result<String, ManagerProbeError> {
+    let mut lines = manager_command_lines_bounded(program, arguments, timeout, output_limit)?;
+    if lines.len() != 1 {
+        return Err(ManagerProbeError::InvalidOutput);
+    }
+    Ok(lines.pop().expect("one bounded manager output line"))
+}
+
+fn manager_command_lines_bounded(
+    program: &str,
+    arguments: &[&str],
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<Vec<String>, ManagerProbeError> {
     let mut stdout = tempfile::tempfile().map_err(|_| ManagerProbeError::OutputRead)?;
     let child_stdout = stdout
         .try_clone()
@@ -1100,15 +1156,16 @@ fn manager_command_line_bounded(
         return Err(ManagerProbeError::OutputLimit);
     }
     let output = String::from_utf8(output).map_err(|_| ManagerProbeError::InvalidOutput)?;
-    let mut lines = output
+    let lines = output
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty());
-    let line = lines.next().ok_or(ManagerProbeError::InvalidOutput)?;
-    if lines.next().is_some() {
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
         return Err(ManagerProbeError::InvalidOutput);
     }
-    Ok(line.to_string())
+    Ok(lines)
 }
 
 fn receipt_path(executable: &Path) -> Result<PathBuf, SelfUpdateError> {
@@ -1140,8 +1197,15 @@ fn validate_receipt(
     ) {
         return Err(SelfUpdateError::ReceiptInvalid("install_method_invalid"));
     }
-    let receipt_binary = receipt
-        .binary_path
+    let receipt_binary_path = if receipt.binary_path.is_absolute() {
+        receipt.binary_path.clone()
+    } else {
+        executable
+            .parent()
+            .ok_or(SelfUpdateError::ReceiptInvalid("binary_parent_missing"))?
+            .join(&receipt.binary_path)
+    };
+    let receipt_binary = receipt_binary_path
         .canonicalize()
         .map_err(|_| SelfUpdateError::ReceiptInvalid("binary_path_invalid"))?;
     if receipt_binary != executable {
@@ -1223,6 +1287,7 @@ fn replace_installation_locked(
     receipt: &InstallReceipt,
     replacer: &impl ExecutableReplacer,
 ) -> Result<(), SelfUpdateError> {
+    preserve_executable_access_mode(executable, staged_binary)?;
     let parent = executable
         .parent()
         .ok_or(SelfUpdateError::ReceiptInvalid("binary_parent_missing"))?;
@@ -1263,6 +1328,30 @@ fn replace_installation_locked(
     // The binary and new receipt are already committed. A stale private backup
     // must not turn a successful update into a false failure.
     let _ = fs::remove_file(&previous_receipt);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn preserve_executable_access_mode(
+    executable: &Path,
+    staged_binary: &Path,
+) -> Result<(), SelfUpdateError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(executable)
+        .map_err(SelfUpdateError::BinaryCommit)?
+        .permissions()
+        .mode()
+        & 0o777;
+    fs::set_permissions(staged_binary, fs::Permissions::from_mode(mode))
+        .map_err(SelfUpdateError::BinaryCommit)
+}
+
+#[cfg(not(unix))]
+fn preserve_executable_access_mode(
+    _executable: &Path,
+    _staged_binary: &Path,
+) -> Result<(), SelfUpdateError> {
     Ok(())
 }
 
@@ -2551,7 +2640,7 @@ mod tests {
     }
 
     #[test]
-    fn homebrew_and_scoop_layouts_keep_typed_upgrade_guidance() {
+    fn homebrew_and_scoop_require_manager_owned_paths_for_upgrade_guidance() {
         for (path, manager, command) in [
             (
                 "/opt/homebrew/Cellar/satelle/0.1.0/bin/satelle",
@@ -2564,9 +2653,26 @@ mod tests {
                 "scoop update satelle",
             ),
         ] {
-            let managed = detect_managed_install(Path::new(path))
-                .unwrap()
-                .expect("managed install");
+            assert!(
+                system_package_managed_install(Path::new(path), &[], None).is_none(),
+                "path shape alone must not establish package-manager ownership"
+            );
+            let homebrew_files = (manager == "homebrew").then(|| [PathBuf::from(path)]);
+            let scoop_prefix = (manager == "scoop").then(|| {
+                PathBuf::from(path)
+                    .parent()
+                    .expect("Scoop fixture has an install root")
+                    .to_path_buf()
+            });
+            let homebrew_files: &[PathBuf] = homebrew_files
+                .as_ref()
+                .map_or(&[], |paths| paths.as_slice());
+            let managed = system_package_managed_install(
+                Path::new(path),
+                homebrew_files,
+                scoop_prefix.as_deref(),
+            )
+            .expect("manager inventory owns the exact executable");
             assert_eq!(managed.install_method, manager);
             assert_eq!(managed.upgrade_command, command);
         }
@@ -3021,6 +3127,63 @@ mod tests {
             "1.2.3",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn relative_receipt_binary_paths_resolve_from_the_receipt_directory() {
+        let fixture = install_fixture("1.2.3");
+        let mut receipt: InstallReceipt =
+            serde_json::from_slice(&fs::read(&fixture.receipt).unwrap()).unwrap();
+        receipt.binary_path = fixture
+            .current_binary
+            .file_name()
+            .map(PathBuf::from)
+            .expect("fixture executable has a file name");
+
+        validate_receipt(
+            &receipt,
+            &fixture.current_binary.canonicalize().unwrap(),
+            "1.2.3",
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_update_preserves_the_existing_executable_access_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = install_fixture("1.0.0");
+        fs::set_permissions(&fixture.current_binary, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fixture.updated_binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = FixtureReleaseSource {
+            latest: "1.1.0".to_string(),
+            executable: fixture.updated_binary.clone(),
+            digest: [9; 32],
+        };
+
+        run_with(
+            SelfUpdateRequest {
+                requested_version: Some("1.1.0".to_string()),
+                dry_run: false,
+                current_executable: fixture.current_binary.clone(),
+                current_version: "1.0.0".to_string(),
+                follow_up_host: None,
+            },
+            &source,
+            &FixtureReplacer,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::metadata(&fixture.current_binary)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
     }
 
     struct InstallFixture {

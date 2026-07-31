@@ -68,7 +68,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -615,21 +615,6 @@ impl From<HostUpdateCommand> for HostUpdateInvocation {
             yes: command.yes,
             no_input: command.no_input,
             quiet: command.quiet,
-        }
-    }
-}
-
-impl HostUpdateInvocation {
-    fn from_self_update(host: String, no_input: bool, host_version: String) -> Self {
-        Self {
-            host: vec![host],
-            host_version,
-            component: Vec::new(),
-            all_remotes: false,
-            dry_run: false,
-            yes: false,
-            no_input,
-            quiet: false,
         }
     }
 }
@@ -8274,18 +8259,23 @@ mod host_update_consent_tests {
     }
 
     #[test]
-    fn self_update_delegates_one_host_through_the_canonical_default_update() {
-        let invocation =
-            HostUpdateInvocation::from_self_update("office".to_string(), true, "1.2.3".to_string());
-
-        assert_eq!(invocation.host, ["office"]);
-        assert_eq!(invocation.host_version, "1.2.3");
-        assert!(invocation.component.is_empty());
-        assert!(!invocation.all_remotes);
-        assert!(!invocation.dry_run);
-        assert!(!invocation.yes);
-        assert!(invocation.no_input);
-        assert!(!invocation.quiet);
+    fn self_update_remote_handoff_reexecutes_the_canonical_host_update_command() {
+        assert_eq!(
+            self_update_remote_handoff_arguments(Some("work"), "office", true),
+            [
+                "--profile",
+                "work",
+                "host",
+                "update",
+                "--host",
+                "office",
+                "--no-input",
+            ]
+        );
+        assert_eq!(
+            self_update_remote_handoff_arguments(None, "office", false),
+            ["host", "update", "--host", "office"]
+        );
     }
 }
 
@@ -8406,17 +8396,86 @@ fn run_self(
             let Some(host) = selected_host else {
                 return Ok(());
             };
-            run_host_update_invocation(
-                HostUpdateInvocation::from_self_update(
-                    host,
-                    command.no_input,
-                    report.latest_compatible_version().to_string(),
-                ),
-                config,
-                output,
-            )
+            run_self_update_remote_handoff(config.flag_profile, &host, command.no_input)
         }
     }
+}
+
+fn self_update_remote_handoff_arguments(
+    profile: Option<&str>,
+    host: &str,
+    no_input: bool,
+) -> Vec<String> {
+    let mut arguments = Vec::new();
+    if let Some(profile) = profile {
+        arguments.extend(["--profile".to_string(), profile.to_string()]);
+    }
+    arguments.extend([
+        "host".to_string(),
+        "update".to_string(),
+        "--host".to_string(),
+        host.to_string(),
+    ]);
+    if no_input {
+        arguments.push("--no-input".to_string());
+    }
+    arguments
+}
+
+fn run_self_update_remote_handoff(
+    profile: Option<&str>,
+    host: &str,
+    no_input: bool,
+) -> Result<(), CliFailure> {
+    io::stdout().flush().map_err(|error| {
+        failure(SatelleError {
+            code: ErrorCode::SelfUpdateFailed,
+            message: "could not flush self-update output before remote handoff".to_string(),
+            recovery_command: Some(self_update::host_update_command(host)),
+            source_detail: Some(error.to_string()),
+            details: BTreeMap::from([("host".to_string(), json!(host))]),
+        })
+    })?;
+    let executable = std::env::current_exe().map_err(|error| {
+        failure(SatelleError {
+            code: ErrorCode::SelfUpdateFailed,
+            message: "could not resolve the updated Satelle executable".to_string(),
+            recovery_command: Some(self_update::host_update_command(host)),
+            source_detail: Some(error.to_string()),
+            details: BTreeMap::from([("host".to_string(), json!(host))]),
+        })
+    })?;
+    let status = ProcessCommand::new(executable)
+        .args(self_update_remote_handoff_arguments(
+            profile, host, no_input,
+        ))
+        .status()
+        .map_err(|error| {
+            failure(SatelleError {
+                code: ErrorCode::SelfUpdateFailed,
+                message: "could not start the updated Satelle executable".to_string(),
+                recovery_command: Some(self_update::host_update_command(host)),
+                source_detail: Some(error.to_string()),
+                details: BTreeMap::from([("host".to_string(), json!(host))]),
+            })
+        })?;
+    if status.success() {
+        return Ok(());
+    }
+
+    // The re-executed binary already emitted its typed Host update failure.
+    // Preserve that single diagnostic while returning the remote execution class.
+    Err(reported_failure(SatelleError {
+        code: ErrorCode::RemoteExecution,
+        message: "the updated Satelle executable could not complete the remote Host update"
+            .to_string(),
+        recovery_command: Some(self_update::host_update_command(host)),
+        source_detail: None,
+        details: BTreeMap::from([
+            ("host".to_string(), json!(host)),
+            ("child_exit_code".to_string(), json!(status.code())),
+        ]),
+    }))
 }
 
 fn prompt_remote_host_update(
