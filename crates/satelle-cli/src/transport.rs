@@ -3395,21 +3395,12 @@ pub(crate) fn apply_host_update(
         &mut bootstrap_lock,
         "install-host-artifact",
     ) {
-        if finish_unmodified_after_uncertain_first_action_start(
+        return Err(recover_failed_first_host_update_action_start(
             &transport.alias,
             &old_client,
             &mut bootstrap_lock,
-        )
-        .is_err()
-        {
-            report.changed = true;
-            return Err(host_update_recovery_pending(
-                &mut report,
-                "install-host-artifact",
-                source,
-            ));
-        }
-        return Err(source);
+            source,
+        ));
     }
     let artifact = {
         let remote = ssh_bootstrap::PersistentServiceRemote::new(
@@ -3454,6 +3445,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "install-host-artifact",
+            &operation_id,
             source,
         ));
     }
@@ -3515,6 +3507,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "install-host-artifact",
+            &operation_id,
             source,
         ));
     }
@@ -3585,6 +3578,7 @@ pub(crate) fn apply_host_update(
             return Err(host_update_recovery_pending(
                 &mut report,
                 "publish-host-service",
+                &operation_id,
                 source,
             ));
         }
@@ -3635,6 +3629,7 @@ pub(crate) fn apply_host_update(
             return Err(host_update_recovery_pending(
                 &mut report,
                 "publish-host-service",
+                &operation_id,
                 source,
             ));
         }
@@ -3647,6 +3642,7 @@ pub(crate) fn apply_host_update(
             return Err(host_update_recovery_pending(
                 &mut report,
                 "publish-host-service",
+                &operation_id,
                 source,
             ));
         }
@@ -3662,6 +3658,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "publish-host-service",
+            &operation_id,
             source,
         ));
     }
@@ -3722,6 +3719,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "restart-host-daemon",
+            &operation_id,
             source,
         ));
     }
@@ -3734,6 +3732,7 @@ pub(crate) fn apply_host_update(
             return Err(host_update_recovery_pending(
                 &mut report,
                 "restart-host-daemon",
+                &operation_id,
                 source,
             ));
         }
@@ -3745,6 +3744,7 @@ pub(crate) fn apply_host_update(
                 return Err(host_update_recovery_pending(
                     &mut report,
                     "restart-host-daemon",
+                    &operation_id,
                     source,
                 ));
             }
@@ -3754,6 +3754,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "restart-host-daemon",
+            &operation_id,
             source,
         ));
     }
@@ -3761,6 +3762,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "restart-host-daemon",
+            &operation_id,
             SatelleError::state_conflict(),
         ));
     }
@@ -3784,6 +3786,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "restart-host-daemon",
+            &operation_id,
             source,
         ));
     }
@@ -3796,6 +3799,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "restart-host-daemon",
+            &operation_id,
             source,
         ));
     }
@@ -3824,6 +3828,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "invalidate-readiness-caches",
+            &operation_id,
             source,
         ));
     }
@@ -3836,6 +3841,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "invalidate-readiness-caches",
+            &operation_id,
             source,
         ));
     }
@@ -3890,6 +3896,7 @@ pub(crate) fn apply_host_update(
             return Err(host_update_recovery_pending(
                 &mut report,
                 "host-update-postcheck",
+                &operation_id,
                 source,
             ));
         }
@@ -3897,6 +3904,7 @@ pub(crate) fn apply_host_update(
             return Err(host_update_recovery_pending(
                 &mut report,
                 "host-update-postcheck",
+                &operation_id,
                 SatelleError::host_unreachable(&transport.alias),
             ));
         }
@@ -3923,6 +3931,7 @@ pub(crate) fn apply_host_update(
         return Err(host_update_recovery_pending(
             &mut report,
             "host-update-postcheck",
+            &operation_id,
             source,
         ));
     }
@@ -3982,12 +3991,23 @@ fn close_unmodified_host_update_or_recovery_pending(
 ) -> SatelleError {
     match finish_unmodified_host_update(host, client, operation_id) {
         Ok(()) => source,
-        Err(cleanup) => SatelleError::host_update_recovery_pending(
-            host,
-            operation_id,
-            format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}"),
-        ),
+        Err(cleanup) => {
+            unmodified_host_update_recovery_pending(host, operation_id, source, cleanup)
+        }
     }
+}
+
+fn unmodified_host_update_recovery_pending(
+    host: &str,
+    operation_id: &str,
+    source: SatelleError,
+    cleanup: SatelleError,
+) -> SatelleError {
+    SatelleError::host_update_recovery_pending(
+        host,
+        operation_id,
+        format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}"),
+    )
 }
 
 fn begin_host_update_maintenance_with_revalidation(
@@ -4087,11 +4107,9 @@ fn close_locked_unmodified_host_update_or_recovery_pending(
     let operation_id = bootstrap_lock.operation_id().to_string();
     match finish_locked_unmodified_host_update(host, client, bootstrap_lock) {
         Ok(()) => source,
-        Err(cleanup) => SatelleError::host_update_recovery_pending(
-            host,
-            &operation_id,
-            format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}"),
-        ),
+        Err(cleanup) => {
+            unmodified_host_update_recovery_pending(host, &operation_id, source, cleanup)
+        }
     }
 }
 
@@ -4141,6 +4159,21 @@ fn finish_unmodified_after_uncertain_first_action_start(
         .map_err(|_| SatelleError::host_unreachable(host))
 }
 
+fn recover_failed_first_host_update_action_start(
+    host: &str,
+    client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    source: SatelleError,
+) -> SatelleError {
+    let operation_id = bootstrap_lock.operation_id().to_string();
+    match finish_unmodified_after_uncertain_first_action_start(host, client, bootstrap_lock) {
+        Ok(()) => source,
+        Err(cleanup) => {
+            unmodified_host_update_recovery_pending(host, &operation_id, source, cleanup)
+        }
+    }
+}
+
 fn maintenance_action_is_still_planned(error: &DaemonClientError) -> bool {
     matches!(
         error,
@@ -4172,20 +4205,14 @@ fn fail_host_update_action(
             .map_err(|_| SatelleError::host_unreachable(host))
     });
     match cleanup {
-        Ok(()) => host_update_recovery_pending(report, action_id, source),
-        Err(cleanup) if !report.changed => SatelleError::host_update_recovery_pending(
-            host,
-            &operation_id,
-            format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}"),
-        ),
+        Ok(()) => host_update_recovery_pending(report, action_id, &operation_id, source),
+        Err(cleanup) if !report.changed => {
+            unmodified_host_update_recovery_pending(host, &operation_id, source, cleanup)
+        }
         Err(cleanup) => {
             let failure_detail =
                 format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}");
-            let mut error = host_update_recovery_pending(report, action_id, source);
-            error.details.insert(
-                "operation_id".to_string(),
-                serde_json::Value::String(operation_id),
-            );
+            let mut error = host_update_recovery_pending(report, action_id, &operation_id, source);
             error.source_detail = Some(failure_detail);
             error
         }
@@ -4218,7 +4245,7 @@ fn recover_later_host_update_action_start(
                     .map_err(|_| SatelleError::host_unreachable(host))
             });
         if cleanup.is_ok() {
-            return host_update_recovery_pending(report, action_id, source);
+            return host_update_recovery_pending(report, action_id, &operation_id, source);
         }
         return operation_scoped_partial_host_update(
             report,
@@ -4242,11 +4269,7 @@ fn operation_scoped_partial_host_update(
     let failure_detail = cleanup.as_ref().map(|cleanup| {
         format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}")
     });
-    let mut error = host_update_recovery_pending(report, action_id, source);
-    error.details.insert(
-        "operation_id".to_string(),
-        serde_json::Value::String(operation_id.to_string()),
-    );
+    let mut error = host_update_recovery_pending(report, action_id, operation_id, source);
     if let Some(failure_detail) = failure_detail {
         error.source_detail = Some(failure_detail);
     }
@@ -4264,6 +4287,7 @@ fn host_update_daemon_adoption_error(
 fn host_update_recovery_pending(
     report: &mut satelle_core::host_update::HostUpdateReport,
     action_id: &str,
+    operation_id: &str,
     source: SatelleError,
 ) -> SatelleError {
     if !report.changed {
@@ -4275,7 +4299,13 @@ fn host_update_recovery_pending(
         "satelle repair --host {} --no-input --yes",
         crate::shell_argument(&report.host)
     ));
-    SatelleError::host_update_partially_applied(report, action_id, source.to_string())
+    let mut error =
+        SatelleError::host_update_partially_applied(report, action_id, source.to_string());
+    error.details.insert(
+        "operation_id".to_string(),
+        serde_json::Value::String(operation_id.to_string()),
+    );
+    error
 }
 
 pub(crate) fn plan_repair_upgrades(

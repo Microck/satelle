@@ -1588,6 +1588,61 @@ fn failed_prechange_action_cleanup_reports_the_recovery_pending_operation() {
 
 #[cfg(unix)]
 #[test]
+fn failed_first_action_start_cleanup_keeps_the_operation_unmodified() {
+    with_bootstrap_handoff_test_context_with_scope(
+        ApiScopes::ADMIN,
+        |client, fake_ssh, _, _, service, bootstrap_token_id| {
+            let operation_id = "host-update-first-start-cleanup-failure";
+            client
+                .begin_host_update_maintenance(operation_id)
+                .expect("begin Host update maintenance");
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "host-update-first-start-cleanup-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::HostBinaryReplacement,
+                fake_ssh,
+            )
+            .expect("acquire Host replacement Bootstrap Lock");
+            bootstrap_lock
+                .confirm_ownership()
+                .expect("confirm Bootstrap Lock ownership");
+            service
+                .revoke_api_token(bootstrap_token_id)
+                .expect("revoke authority before the first action starts");
+            let source = start_persistent_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                "install-host-artifact",
+            )
+            .expect_err("reject the first action start");
+
+            let error = recover_failed_first_host_update_action_start(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                source,
+            );
+
+            assert_eq!(error.code, ErrorCode::HostUpdateRecoveryPending);
+            assert_eq!(
+                error.details.get("operation_id"),
+                Some(&serde_json::json!(operation_id))
+            );
+            assert_eq!(error.details.get("changed"), None);
+            assert!(
+                error
+                    .source_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("maintenance cleanup failed"))
+            );
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn failed_read_only_preflight_cleanup_reports_the_unchanged_operation() {
     with_bootstrap_handoff_test_context_with_scope(
         ApiScopes::ADMIN,
@@ -1862,6 +1917,30 @@ fn lost_daemon_adoption_response_retains_the_partial_operation_identity() {
 
     let error = host_update_daemon_adoption_error(
         &mut report,
+        operation_id,
+        SatelleError::host_unreachable("office"),
+    );
+
+    assert_eq!(error.code, ErrorCode::HostUpdatePartiallyApplied);
+    assert_eq!(
+        error.details.get("operation_id"),
+        Some(&serde_json::json!(operation_id))
+    );
+}
+
+#[test]
+fn common_partial_failure_retains_the_operation_identity() {
+    let operation_id = "host-update-common-partial-failure";
+    let mut report = satelle_core::host_update::HostUpdateReport::new(
+        "office",
+        vec![satelle_core::host_update::HostUpdateComponent::Host],
+        Vec::new(),
+    );
+    report.changed = true;
+
+    let error = host_update_recovery_pending(
+        &mut report,
+        "invalidate-readiness-caches",
         operation_id,
         SatelleError::host_unreachable("office"),
     );
