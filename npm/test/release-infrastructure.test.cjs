@@ -1234,6 +1234,17 @@ test("native release archives use canonical names and match native npm executabl
     assert.equal(sha256(readFileSync(archive.archivePath)), archive.archiveSha256);
     assert.equal(sha256(readFileSync(archive.npmArtifactPath)), archive.npmArtifactSha256);
   }
+  if (process.platform !== "win32") {
+    assert.equal(statSync(validation.stagingDirectory).mode & 0o777, 0o700);
+    assert.equal(
+      statSync(path.join(validation.stagingDirectory, "npm")).mode & 0o777,
+      0o700,
+    );
+    assert.equal(
+      statSync(path.join(validation.stagingDirectory, "github")).mode & 0o777,
+      0o500,
+    );
+  }
 
   const [first] = plan.artifacts;
   const canonicalPath = path.join(destination, first.archive);

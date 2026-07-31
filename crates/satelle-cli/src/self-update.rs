@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -26,6 +26,8 @@ const ARCHIVE_LIMIT: u64 = 256 * 1024 * 1024;
 const BINARY_LIMIT: u64 = 256 * 1024 * 1024;
 const RECEIPT_FILE_NAME: &str = ".satelle-install.json";
 const LOCK_FILE_NAME: &str = ".satelle-install.lock";
+const STAGED_RECEIPT_FILE_NAME: &str = ".satelle-receipt.updating";
+const PREVIOUS_RECEIPT_FILE_NAME: &str = ".satelle-receipt.previous";
 const PACKAGE_INSTALL_CONTEXT_ENV: &str = "SATELLE_PACKAGE_INSTALL_CONTEXT";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -273,6 +275,13 @@ fn run_with(
         return Err(SelfUpdateError::ManagedInstall(Box::new(managed)));
     }
     let receipt_path = receipt_path(&executable)?;
+    let parent = executable
+        .parent()
+        .ok_or(SelfUpdateError::ReceiptInvalid("binary_parent_missing"))?;
+    if !request.dry_run {
+        let _recovery_lock = InstallLock::acquire(parent)?;
+        recover_interrupted_installation(&executable, &receipt_path, &request.current_version)?;
+    }
     let receipt = read_receipt(&receipt_path)?;
     validate_receipt(&receipt, &executable, &request.current_version)?;
 
@@ -328,10 +337,8 @@ fn run_with(
     // The first receipt read builds a mutation-free plan. Revalidate under the
     // install lock before downloading so a waiting updater cannot commit from
     // stale installation state after another updater finishes.
-    let parent = executable
-        .parent()
-        .ok_or(SelfUpdateError::ReceiptInvalid("binary_parent_missing"))?;
     let _lock = InstallLock::acquire(parent)?;
+    recover_interrupted_installation(&executable, &receipt_path, &request.current_version)?;
     let locked_receipt = read_receipt(&receipt_path)?;
     validate_receipt(&locked_receipt, &executable, &request.current_version)?;
     if locked_receipt.target != target.id() {
@@ -1049,6 +1056,60 @@ fn validate_receipt(
     Ok(())
 }
 
+fn recover_interrupted_installation(
+    executable: &Path,
+    receipt_path: &Path,
+    current_version: &str,
+) -> Result<(), SelfUpdateError> {
+    let parent = executable
+        .parent()
+        .ok_or(SelfUpdateError::ReceiptInvalid("binary_parent_missing"))?;
+    let staged_receipt = parent.join(STAGED_RECEIPT_FILE_NAME);
+    let previous_receipt_path = parent.join(PREVIOUS_RECEIPT_FILE_NAME);
+    let previous_receipt = match read_receipt(&previous_receipt_path) {
+        Ok(receipt) => Some(receipt),
+        Err(SelfUpdateError::InstallOwnerUnknown) => None,
+        Err(error) => return Err(error),
+    };
+
+    let Some(previous_receipt) = previous_receipt else {
+        remove_transaction_file(&staged_receipt)?;
+        return Ok(());
+    };
+
+    let current_receipt_matches = match read_receipt(receipt_path) {
+        Ok(receipt) => validate_receipt(&receipt, executable, current_version).is_ok(),
+        Err(SelfUpdateError::InstallOwnerUnknown | SelfUpdateError::ReceiptInvalid(_)) => false,
+        Err(error) => return Err(error),
+    };
+    if current_receipt_matches {
+        remove_transaction_file(&previous_receipt_path)?;
+    } else {
+        validate_receipt(&previous_receipt, executable, current_version)?;
+        remove_transaction_file(receipt_path)?;
+        fs::rename(&previous_receipt_path, receipt_path).map_err(|source| {
+            SelfUpdateError::ReceiptRollback {
+                backup_path: previous_receipt_path.clone(),
+                receipt_path: receipt_path.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    remove_transaction_file(&staged_receipt)
+}
+
+fn remove_transaction_file(path: &Path) -> Result<(), SelfUpdateError> {
+    fs::remove_file(path)
+        .or_else(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(SelfUpdateError::ReceiptCommit)
+}
+
 fn replace_installation_locked(
     executable: &Path,
     receipt_path: &Path,
@@ -1059,9 +1120,8 @@ fn replace_installation_locked(
     let parent = executable
         .parent()
         .ok_or(SelfUpdateError::ReceiptInvalid("binary_parent_missing"))?;
-    let pid = std::process::id();
-    let staged_receipt = parent.join(format!(".satelle-receipt.updating.{pid}"));
-    let previous_receipt = parent.join(format!(".satelle-receipt.previous.{pid}"));
+    let staged_receipt = parent.join(STAGED_RECEIPT_FILE_NAME);
+    let previous_receipt = parent.join(PREVIOUS_RECEIPT_FILE_NAME);
     let receipt_bytes =
         serde_json::to_vec_pretty(receipt).map_err(|_| SelfUpdateError::ReceiptSerialize)?;
     write_private_file(&staged_receipt, &receipt_bytes)?;
@@ -1101,23 +1161,19 @@ fn replace_installation_locked(
 }
 
 struct InstallLock {
-    path: PathBuf,
+    _file: File,
 }
 
 impl InstallLock {
     fn acquire(parent: &Path) -> Result<Self, SelfUpdateError> {
         let path = parent.join(LOCK_FILE_NAME);
-        fs::create_dir(&path).map_err(|error| match error.kind() {
-            io::ErrorKind::AlreadyExists => SelfUpdateError::InstallLocked(path.clone()),
-            _ => SelfUpdateError::InstallLock(error),
-        })?;
-        Ok(Self { path })
-    }
-}
-
-impl Drop for InstallLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+        let file = satelle_core::open_or_create_owner_only_file(&path)
+            .map_err(|error| SelfUpdateError::InstallLock(io::Error::other(error)))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(TryLockError::WouldBlock) => Err(SelfUpdateError::InstallLocked(path)),
+            Err(TryLockError::Error(error)) => Err(SelfUpdateError::InstallLock(error)),
+        }
     }
 }
 
@@ -1659,10 +1715,9 @@ impl SelfUpdateError {
                 Some(format!("satelle self update --version {candidate}"))
             }
             Self::GhUnavailable => Some("install and authenticate gh, then retry".to_string()),
-            Self::InstallLocked(path) => Some(format!(
-                "remove {} only after confirming no Satelle install operation is running",
-                path.display()
-            )),
+            Self::InstallLocked(_) => Some(
+                "wait for the running Satelle install operation to finish, then retry".to_string(),
+            ),
             Self::ReceiptRollback {
                 backup_path,
                 receipt_path,
@@ -2594,6 +2649,75 @@ mod tests {
                 SelfUpdateOutcome::Updated
             );
         });
+    }
+
+    #[test]
+    fn interrupted_receipt_commit_recovers_the_version_matching_the_running_binary() {
+        let fixture = install_fixture("1.0.0");
+        let previous_receipt = fixture
+            .receipt
+            .parent()
+            .unwrap()
+            .join(PREVIOUS_RECEIPT_FILE_NAME);
+        let staged_receipt = fixture
+            .receipt
+            .parent()
+            .unwrap()
+            .join(STAGED_RECEIPT_FILE_NAME);
+        fs::rename(&fixture.receipt, &previous_receipt).unwrap();
+        let mut interrupted_receipt: InstallReceipt =
+            serde_json::from_slice(&fs::read(&previous_receipt).unwrap()).unwrap();
+        interrupted_receipt.version = "1.1.0".to_string();
+        fs::write(
+            &fixture.receipt,
+            serde_json::to_vec_pretty(&interrupted_receipt).unwrap(),
+        )
+        .unwrap();
+        fs::write(&staged_receipt, b"incomplete receipt").unwrap();
+
+        recover_interrupted_installation(
+            &fixture.current_binary.canonicalize().unwrap(),
+            &fixture.receipt,
+            "1.0.0",
+        )
+        .unwrap();
+
+        let recovered: InstallReceipt =
+            serde_json::from_slice(&fs::read(&fixture.receipt).unwrap()).unwrap();
+        assert_eq!(recovered.version, "1.0.0");
+        assert!(!previous_receipt.exists());
+        assert!(!staged_receipt.exists());
+    }
+
+    #[test]
+    fn completed_binary_commit_discards_the_stale_previous_receipt() {
+        let fixture = install_fixture("1.0.0");
+        let previous_receipt = fixture
+            .receipt
+            .parent()
+            .unwrap()
+            .join(PREVIOUS_RECEIPT_FILE_NAME);
+        fs::rename(&fixture.receipt, &previous_receipt).unwrap();
+        let mut committed_receipt: InstallReceipt =
+            serde_json::from_slice(&fs::read(&previous_receipt).unwrap()).unwrap();
+        committed_receipt.version = "1.1.0".to_string();
+        fs::write(
+            &fixture.receipt,
+            serde_json::to_vec_pretty(&committed_receipt).unwrap(),
+        )
+        .unwrap();
+
+        recover_interrupted_installation(
+            &fixture.current_binary.canonicalize().unwrap(),
+            &fixture.receipt,
+            "1.1.0",
+        )
+        .unwrap();
+
+        let preserved: InstallReceipt =
+            serde_json::from_slice(&fs::read(&fixture.receipt).unwrap()).unwrap();
+        assert_eq!(preserved.version, "1.1.0");
+        assert!(!previous_receipt.exists());
     }
 
     #[test]

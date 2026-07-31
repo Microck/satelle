@@ -2072,8 +2072,6 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         chmodSync(snapshot.snapshotPath, 0o400);
       }
       chmodSync(githubRoot, 0o500);
-      chmodSync(npmArtifactRoot, 0o500);
-      chmodSync(stagingRoot, 0o500);
       complete = true;
       return { version, stagingDirectory: stagingRoot, checksums, archives };
     } finally {

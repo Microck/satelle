@@ -166,6 +166,8 @@ jobs:
             ./dist/npm-satelle-unscoped.tgz \
             ./dist/npm-artifacts.json \
             validated/npm/
+          chmod 400 validated/npm/*
+          chmod 500 validated/npm validated
 
       - name: Run npm publication dry-runs sequentially
         shell: bash

@@ -221,6 +221,19 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.match(workflow, /shasum -a 256 -c/);
   assert.match(workflow, /validate-native-release-archives/);
   assert.match(workflow, /SHA256SUMS/);
+  const completePublicationSet = workflow.indexOf(
+    "- name: Complete validated npm publication set",
+  );
+  const sealPublicationFiles = workflow.indexOf("chmod 400 validated/npm/*");
+  const sealPublicationDirectories = workflow.indexOf("chmod 500 validated/npm validated");
+  const publicationDryRuns = workflow.indexOf("- name: Run npm publication dry-runs sequentially");
+  assert.ok(completePublicationSet >= 0, "validated npm publication set is not completed");
+  assert.ok(
+    completePublicationSet < sealPublicationFiles &&
+      sealPublicationFiles < sealPublicationDirectories &&
+      sealPublicationDirectories < publicationDryRuns,
+    "the complete npm publication set must be sealed before dry-run validation",
+  );
   const checkoutUses = workflow.match(/uses: actions\/checkout@[^\n]+/g) ?? [];
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
