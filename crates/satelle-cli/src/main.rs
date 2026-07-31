@@ -8146,7 +8146,10 @@ fn host_update_consent_command(host: &str, components: &[String]) -> String {
         .iter()
         .map(|component| format!(" --component {component}"))
         .collect::<String>();
-    format!("satelle host update --host {host}{component_selection} --no-input --yes --json")
+    format!(
+        "satelle host update --host {}{component_selection} --no-input --yes --json",
+        shell_argument(host)
+    )
 }
 
 fn validate_host_update_components(raw_components: &[String]) -> Result<(), SatelleError> {
@@ -8180,6 +8183,10 @@ mod host_update_consent_tests {
         assert_eq!(
             host_update_consent_command("office", &[]),
             "satelle host update --host office --no-input --yes --json"
+        );
+        assert_eq!(
+            host_update_consent_command("remote host'; touch /tmp/pwn", &["host".to_string()]),
+            "satelle host update --host 'remote host'\"'\"'; touch /tmp/pwn' --component host --no-input --yes --json"
         );
     }
 }

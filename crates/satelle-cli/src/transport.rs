@@ -3768,9 +3768,9 @@ pub(crate) fn apply_host_update(
         Ok(adopted) => adopted,
         Err(error) => {
             let source = direct_transport_error(&transport.alias, error);
-            return Err(host_update_recovery_pending(
+            return Err(host_update_daemon_adoption_error(
                 &mut report,
-                "restart-host-daemon",
+                &operation_id,
                 source,
             ));
         }
@@ -3910,7 +3910,7 @@ pub(crate) fn apply_host_update(
             Some("completed Host update actions and the replacement daemon were preserved".into());
         report.recovery_command = Some(format!(
             "satelle doctor --host {} --scope computer-use --refresh --json",
-            report.host
+            crate::shell_argument(&report.host)
         ));
         report.status = satelle_core::host_update::HostUpdateStatus::PostcheckFailed;
         return Err(SatelleError::host_update_postcheck_failed(
@@ -4253,6 +4253,14 @@ fn operation_scoped_partial_host_update(
     error
 }
 
+fn host_update_daemon_adoption_error(
+    report: &mut satelle_core::host_update::HostUpdateReport,
+    operation_id: &str,
+    source: SatelleError,
+) -> SatelleError {
+    operation_scoped_partial_host_update(report, "restart-host-daemon", operation_id, source, None)
+}
+
 fn host_update_recovery_pending(
     report: &mut satelle_core::host_update::HostUpdateReport,
     action_id: &str,
@@ -4265,7 +4273,7 @@ fn host_update_recovery_pending(
     report.preserved_state = Some("completed Host update actions were preserved".to_string());
     report.recovery_command = Some(format!(
         "satelle repair --host {} --no-input --yes",
-        report.host
+        crate::shell_argument(&report.host)
     ));
     SatelleError::host_update_partially_applied(report, action_id, source.to_string())
 }

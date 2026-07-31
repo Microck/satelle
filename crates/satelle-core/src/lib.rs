@@ -4265,6 +4265,17 @@ pub struct SatelleError {
     pub details: BTreeMap<String, Value>,
 }
 
+fn shell_argument(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_./:".contains(character))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 impl SatelleError {
     pub fn invalid_usage(message: impl Into<String>) -> Self {
         Self {
@@ -5514,7 +5525,10 @@ impl SatelleError {
         operation_id: &str,
         source: impl Into<String>,
     ) -> Self {
-        let recovery_command = Some(format!("satelle repair --host {host} --no-input --yes"));
+        let recovery_command = Some(format!(
+            "satelle repair --host {} --no-input --yes",
+            shell_argument(host)
+        ));
         let mut details = BTreeMap::new();
         details.insert("host".to_string(), Value::String(host.to_string()));
         details.insert(
@@ -5546,7 +5560,7 @@ impl SatelleError {
         let recovery_command = report.recovery_command.clone().or_else(|| {
             Some(format!(
                 "satelle doctor --host {} --scope computer-use --refresh --json",
-                report.host
+                shell_argument(&report.host)
             ))
         });
         let mut details = BTreeMap::new();
@@ -5598,7 +5612,7 @@ impl SatelleError {
     ) -> Self {
         let recovery_command = Some(format!(
             "satelle repair --host {} --no-input --yes",
-            report.host
+            shell_argument(&report.host)
         ));
         let mut details = BTreeMap::new();
         details.insert(
@@ -5928,6 +5942,30 @@ mod error_contract_tests {
             error.source_detail.as_deref(),
             Some("maintenance finish failed")
         );
+    }
+
+    #[test]
+    fn host_update_recovery_commands_quote_host_aliases() {
+        let host = "remote host'; touch /tmp/pwn";
+        let repair_command =
+            "satelle repair --host 'remote host'\"'\"'; touch /tmp/pwn' --no-input --yes";
+        let doctor_command = "satelle doctor --host 'remote host'\"'\"'; touch /tmp/pwn' --scope computer-use --refresh --json";
+        let pending =
+            SatelleError::host_update_recovery_pending(host, "operation-id", "response lost");
+        assert_eq!(pending.recovery_command.as_deref(), Some(repair_command));
+
+        let mut report = crate::host_update::HostUpdateReport::new(
+            host,
+            vec![crate::host_update::HostUpdateComponent::Host],
+            Vec::new(),
+        );
+        report.changed = true;
+        let partial =
+            SatelleError::host_update_partially_applied(&report, "restart-host-daemon", "timeout");
+        assert_eq!(partial.recovery_command.as_deref(), Some(repair_command));
+
+        let postcheck = SatelleError::host_update_postcheck_failed(&report, "readiness failed");
+        assert_eq!(postcheck.recovery_command.as_deref(), Some(doctor_command));
     }
 
     #[test]

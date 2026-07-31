@@ -1847,6 +1847,32 @@ fn lost_later_action_start_response_retains_the_partial_operation_identity() {
     );
 }
 
+#[test]
+fn lost_daemon_adoption_response_retains_the_partial_operation_identity() {
+    let operation_id = "host-update-lost-daemon-adoption";
+    let mut report = satelle_core::host_update::HostUpdateReport::new(
+        "office",
+        vec![satelle_core::host_update::HostUpdateComponent::Host],
+        Vec::new(),
+    );
+    report.changed = true;
+    report
+        .applied_actions
+        .push("restart-host-daemon".to_string());
+
+    let error = host_update_daemon_adoption_error(
+        &mut report,
+        operation_id,
+        SatelleError::host_unreachable("office"),
+    );
+
+    assert_eq!(error.code, ErrorCode::HostUpdatePartiallyApplied);
+    assert_eq!(
+        error.details.get("operation_id"),
+        Some(&serde_json::json!(operation_id))
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn lost_next_mutation_start_response_cannot_reuse_the_previous_commit_fence() {
