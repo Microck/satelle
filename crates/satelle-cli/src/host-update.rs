@@ -542,6 +542,13 @@ pub fn render_host_update_plan(report: &HostUpdateReport) -> String {
             let _ = writeln!(output, "  planned remote mutation: {}", mutation.operation);
         }
     }
+    for postcheck in &report.postcheck_results {
+        let _ = writeln!(
+            output,
+            "- planned postcheck {}: {}",
+            postcheck.check_id, postcheck.summary
+        );
+    }
     output
 }
 
@@ -795,6 +802,18 @@ mod tests {
                 ),
             }]
         );
+        let rendered = render_host_update_plan(&report);
+        for expected in [
+            "- planned postcheck host-api-reachable: Verify authenticated Host API reachability",
+            "- planned postcheck host-version-aligned: Verify the Host version matches the invoking CLI",
+            "- planned postcheck storage-migrations-current: Verify required Host storage migrations are current",
+            "- planned postcheck native-computer-use-ready: Run the native Computer Use readiness smoke test",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing `{expected}` in:\n{rendered}"
+            );
+        }
     }
 
     #[test]
