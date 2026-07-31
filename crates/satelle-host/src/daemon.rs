@@ -614,6 +614,7 @@ impl HostService {
                 provider_computer_use: false,
                 image_attachments: *image_attachments,
                 codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence {
+                    availability: satelle_core::host_update::CodexUpdateAvailability::Available,
                     runtime_ownership:
                         satelle_core::host_update::CodexComponentOwnership::CodexOwned,
                     native_component_ownership:
@@ -1858,6 +1859,11 @@ fn production_codex_update_evidence(
         .flatten();
 
     satelle_core::host_update::CodexUpdateEvidence {
+        availability: if unsupported_host_platform {
+            satelle_core::host_update::CodexUpdateAvailability::UnsupportedHostPlatform
+        } else {
+            satelle_core::host_update::CodexUpdateAvailability::Available
+        },
         runtime_ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
         native_component_ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
         runtime_current_version: runtime_current_version.clone(),
@@ -2091,6 +2097,10 @@ mod tests {
 
         assert!(!evidence.runtime_update_required);
         assert!(!evidence.native_update_required);
+        assert_eq!(
+            evidence.availability,
+            satelle_core::host_update::CodexUpdateAvailability::UnsupportedHostPlatform
+        );
         assert_eq!(evidence.runtime_compatibility_reason, None);
         assert_eq!(evidence.native_component_compatibility_reason, None);
     }

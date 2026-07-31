@@ -40,18 +40,22 @@ fn setup_selection(mode: satelle_core::SetupMode) -> SetupModeSelection {
 
 #[test]
 fn direct_host_update_uses_release_target_ids_for_every_supported_platform() {
-    for (os, arch, expected) in [
-        ("linux", "aarch64", "linux-arm64-gnu"),
-        ("linux", "x86_64", "linux-x64-gnu"),
-        ("macos", "aarch64", "darwin-arm64"),
-        ("macos", "x86_64", "darwin-x64"),
-        ("windows", "aarch64", "win32-arm64-msvc"),
-        ("windows", "x86_64", "win32-x64-msvc"),
+    for expected in [
+        "linux-arm64-gnu",
+        "linux-x64-gnu",
+        "darwin-arm64",
+        "darwin-x64",
+        "win32-arm64-msvc",
+        "win32-x64-msvc",
     ] {
-        let (target, platform) = canonical_remote_platform(os, arch);
+        let (target, platform) = canonical_remote_platform(expected);
         assert_eq!(target.expect("supported remote target").id(), expected);
         assert_eq!(platform, expected);
     }
+
+    let (target, platform) = canonical_remote_platform("linux-x64-musl");
+    assert_eq!(target, None);
+    assert_eq!(platform, "linux-x64-musl");
 }
 
 #[test]

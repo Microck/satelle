@@ -1220,6 +1220,39 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         capabilities_json["schema_version"],
         "satelle.capabilities.v6"
     );
+    let expected_target = if cfg!(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_env = "gnu"
+    )) {
+        "linux-arm64-gnu"
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu"
+    )) {
+        "linux-x64-gnu"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "darwin-arm64"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "darwin-x64"
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        "win32-arm64-msvc"
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "win32-x64-msvc"
+    } else {
+        panic!("the release gate runs on one of the six Controller targets");
+    };
+    assert_eq!(capabilities_json["platform"]["target"], expected_target);
+    let mut missing_target = capabilities_json.clone();
+    missing_target["platform"]
+        .as_object_mut()
+        .expect("platform is an object")
+        .remove("target");
+    assert!(
+        serde_json::from_value::<CapabilitiesResponse>(missing_target).is_err(),
+        "capabilities v6 requires authenticated release-target identity"
+    );
     assert_eq!(
         capabilities_json["provider_secret_upload"],
         serde_json::json!({
@@ -1231,48 +1264,12 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
     );
     let mut legacy_v5 = capabilities_json.clone();
     legacy_v5["schema_version"] = serde_json::json!("satelle.capabilities.v5");
-    legacy_v5
-        .as_object_mut()
-        .expect("capabilities are an object")
-        .remove("codex_update_evidence");
-    legacy_v5
-        .as_object_mut()
-        .expect("capabilities are an object")
-        .remove("minimum_host_version");
-    let legacy_keys = legacy_v5
-        .as_object()
-        .expect("legacy capabilities are an object")
-        .keys()
-        .map(String::as_str)
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(
-        legacy_keys,
-        std::collections::BTreeSet::from([
-            "daemon_version",
-            "host_identity",
-            "limits",
-            "operations",
-            "platform",
-            "provider_secret_upload",
-            "request_id",
-            "runtime_capabilities",
-            "schema_version",
-            "supported_attachment_media_types",
-        ])
-    );
-    let legacy: CapabilitiesResponse =
-        serde_json::from_value(legacy_v5.clone()).expect("decode exact legacy v5 capabilities");
-    assert_eq!(legacy.codex_update_evidence(), None);
-    assert_eq!(legacy.minimum_host_version(), None);
-    let mut invalid_extended_v5 = legacy_v5.clone();
-    invalid_extended_v5["codex_update_evidence"] =
-        capabilities_json["codex_update_evidence"].clone();
     assert!(
-        serde_json::from_value::<CapabilitiesResponse>(invalid_extended_v5).is_err(),
-        "v5 must remain exact instead of accepting v6 fields under the old schema token"
+        serde_json::from_value::<CapabilitiesResponse>(legacy_v5).is_err(),
+        "the protocol-v12 hard cut rejects capabilities v5"
     );
 
-    let mut obsolete_v4 = legacy_v5;
+    let mut obsolete_v4 = capabilities_json.clone();
     obsolete_v4["schema_version"] = serde_json::json!("satelle.capabilities.v4");
     assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v4).is_err());
     let capabilities: CapabilitiesResponse =

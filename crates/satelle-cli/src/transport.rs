@@ -1414,9 +1414,9 @@ impl SshSetupTransport {
         match capabilities {
             Ok(capabilities) => Ok(CurrentDaemonArtifactObservation {
                 current_version: Some(capabilities.daemon_version().to_string()),
-                minimum_host_version: capabilities.minimum_host_version().map(str::to_string),
+                minimum_host_version: Some(capabilities.minimum_host_version().to_string()),
                 protocol_compatible: true,
-                codex_update_evidence: capabilities.codex_update_evidence().cloned(),
+                codex_update_evidence: Some(capabilities.codex_update_evidence().clone()),
                 #[cfg(test)]
                 validated_host_identity: Some(capabilities.host_identity().to_string()),
             }),
@@ -2870,8 +2870,9 @@ fn inspect_host_maintenance(
         TransportKind::Local => {
             let service = local_host_service(&host.config).map_err(|failure| failure.error)?;
             let codex_evidence = service.maintenance_codex_update_evidence()?;
-            let (_, platform) =
-                canonical_remote_platform(std::env::consts::OS, std::env::consts::ARCH);
+            let (_, platform) = canonical_remote_platform(
+                &satelle_core::host_update::current_host_artifact_platform(),
+            );
             Ok(HostMaintenanceInspection {
                 current_version: Some(cli_version.to_string()),
                 minimum_host_version: Some(cli_version.to_string()),
@@ -2890,14 +2891,12 @@ fn inspect_host_maintenance(
             let capabilities = read_direct_maintenance_capabilities(&host.alias, &transport)?;
             match capabilities {
                 DirectMaintenanceCapabilities::Compatible(capabilities) => {
-                    let (target, platform) = canonical_remote_platform(
-                        capabilities.platform(),
-                        capabilities.platform_arch(),
-                    );
+                    let (target, platform) =
+                        canonical_remote_platform(capabilities.platform_target());
                     let relation_to_cli = host_version_relation(
                         Some(capabilities.daemon_version()),
                         true,
-                        capabilities.minimum_host_version(),
+                        Some(capabilities.minimum_host_version()),
                         cli_version,
                     )?;
                     let artifact = if kind == HostMaintenancePlanKind::HostUpdate {
@@ -2921,15 +2920,13 @@ fn inspect_host_maintenance(
                     };
                     Ok(HostMaintenanceInspection {
                         current_version: Some(capabilities.daemon_version().to_string()),
-                        minimum_host_version: capabilities
-                            .minimum_host_version()
-                            .map(str::to_string),
+                        minimum_host_version: Some(capabilities.minimum_host_version().to_string()),
                         protocol_compatible: true,
                         relation_to_cli,
                         remote_platform: platform,
                         artifact,
                         service_inspection: None,
-                        codex_evidence: capabilities.codex_update_evidence().cloned(),
+                        codex_evidence: Some(capabilities.codex_update_evidence().clone()),
                         // Direct maintenance mutation is not implemented in the current transport.
                         host_automation_is_safe: false,
                     })
@@ -3247,6 +3244,11 @@ fn append_codex_repair_inspections(
     let Some(codex) = codex else {
         return Ok(());
     };
+    if codex.availability
+        == satelle_core::host_update::CodexUpdateAvailability::UnsupportedHostPlatform
+    {
+        return Ok(());
+    }
     let codex_inspections = [
         (
             HostUpdateTarget::CodexRuntime,
@@ -3296,13 +3298,11 @@ fn map_release_artifact_error(
     }
 }
 
-fn canonical_remote_platform(
-    os: &str,
-    arch: &str,
-) -> (Option<ssh_bootstrap::RemoteTarget>, String) {
-    let target = ssh_bootstrap::RemoteTarget::from_platform(os, arch);
-    let platform = target.map_or_else(|| format!("{os}-{arch}"), |target| target.id().to_string());
-    (target, platform)
+fn canonical_remote_platform(platform: &str) -> (Option<ssh_bootstrap::RemoteTarget>, String) {
+    (
+        ssh_bootstrap::RemoteTarget::from_id(platform),
+        platform.to_string(),
+    )
 }
 
 fn verified_host_update_artifact(
@@ -3400,6 +3400,9 @@ fn map_host_update_plan_error(error: crate::host_update::HostUpdatePlanError) ->
         }
         HostUpdatePlanError::AmbiguousCodexComponentOwnership { target } => {
             SatelleError::ambiguous_codex_component_ownership(&format!("{target:?}"))
+        }
+        HostUpdatePlanError::UnsupportedCodexTarget { .. } => {
+            SatelleError::unsupported_update_component("codex")
         }
         HostUpdatePlanError::InvalidArtifact { .. }
         | HostUpdatePlanError::InvalidCodexTarget { .. } => {

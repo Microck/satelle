@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 define_schema_token!(LiveSchema, "satelle.live.v1");
-define_schema_token!(CapabilitiesSchemaV5, "satelle.capabilities.v5");
 define_schema_token!(CapabilitiesSchemaV6, "satelle.capabilities.v6");
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -151,6 +150,7 @@ impl PlatformOs {
 struct Platform {
     os: PlatformOs,
     arch: String,
+    target: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -248,57 +248,9 @@ impl EffectiveLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(untagged)]
-enum CapabilitiesSchemaVersion {
-    V5(CapabilitiesSchemaV5),
-    V6(CapabilitiesSchemaV6),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilitiesResponse {
-    schema_version: CapabilitiesSchemaVersion,
-    request_id: RequestId,
-    host_identity: String,
-    daemon_version: String,
-    platform: Platform,
-    operations: Vec<Operation>,
-    runtime_capabilities: RuntimeCapabilities,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    codex_update_evidence: Option<satelle_core::host_update::CodexUpdateEvidence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    minimum_host_version: Option<String>,
-    limits: EffectiveLimits,
-    supported_attachment_media_types: Vec<String>,
-    provider_secret_upload: ProviderSecretUploadCapability,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum CapabilitiesResponseWire {
-    V6(CapabilitiesResponseV6),
-    V5(CapabilitiesResponseV5),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CapabilitiesResponseV5 {
-    schema_version: CapabilitiesSchemaV5,
-    request_id: RequestId,
-    host_identity: String,
-    daemon_version: String,
-    platform: Platform,
-    operations: Vec<Operation>,
-    runtime_capabilities: RuntimeCapabilities,
-    limits: EffectiveLimits,
-    supported_attachment_media_types: Vec<String>,
-    provider_secret_upload: ProviderSecretUploadCapability,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CapabilitiesResponseV6 {
     schema_version: CapabilitiesSchemaV6,
     request_id: RequestId,
     host_identity: String,
@@ -311,44 +263,6 @@ struct CapabilitiesResponseV6 {
     limits: EffectiveLimits,
     supported_attachment_media_types: Vec<String>,
     provider_secret_upload: ProviderSecretUploadCapability,
-}
-
-impl<'de> Deserialize<'de> for CapabilitiesResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(match CapabilitiesResponseWire::deserialize(deserializer)? {
-            CapabilitiesResponseWire::V6(response) => Self {
-                schema_version: CapabilitiesSchemaVersion::V6(response.schema_version),
-                request_id: response.request_id,
-                host_identity: response.host_identity,
-                daemon_version: response.daemon_version,
-                platform: response.platform,
-                operations: response.operations,
-                runtime_capabilities: response.runtime_capabilities,
-                codex_update_evidence: Some(response.codex_update_evidence),
-                minimum_host_version: Some(response.minimum_host_version),
-                limits: response.limits,
-                supported_attachment_media_types: response.supported_attachment_media_types,
-                provider_secret_upload: response.provider_secret_upload,
-            },
-            CapabilitiesResponseWire::V5(response) => Self {
-                schema_version: CapabilitiesSchemaVersion::V5(response.schema_version),
-                request_id: response.request_id,
-                host_identity: response.host_identity,
-                daemon_version: response.daemon_version,
-                platform: response.platform,
-                operations: response.operations,
-                runtime_capabilities: response.runtime_capabilities,
-                codex_update_evidence: None,
-                minimum_host_version: None,
-                limits: response.limits,
-                supported_attachment_media_types: response.supported_attachment_media_types,
-                provider_secret_upload: response.provider_secret_upload,
-            },
-        })
-    }
 }
 
 impl CapabilitiesResponse {
@@ -375,13 +289,14 @@ impl CapabilitiesResponse {
             }
         };
         Self {
-            schema_version: CapabilitiesSchemaVersion::V6(CapabilitiesSchemaV6),
+            schema_version: CapabilitiesSchemaV6,
             request_id,
             host_identity,
             daemon_version,
             platform: Platform {
                 os: PlatformOs::current(),
                 arch: std::env::consts::ARCH.to_string(),
+                target: satelle_core::host_update::current_host_artifact_platform(),
             },
             operations: vec![
                 Operation::Live,
@@ -406,8 +321,8 @@ impl CapabilitiesResponse {
                 native_computer_use,
                 provider_computer_use,
             },
-            codex_update_evidence: Some(codex_update_evidence),
-            minimum_host_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            codex_update_evidence,
+            minimum_host_version: env!("CARGO_PKG_VERSION").to_string(),
             limits,
             supported_attachment_media_types: if image_attachments {
                 super::SUPPORTED_IMAGE_MEDIA_TYPES
@@ -437,14 +352,16 @@ impl CapabilitiesResponse {
         &self.platform.arch
     }
 
-    pub const fn codex_update_evidence(
-        &self,
-    ) -> Option<&satelle_core::host_update::CodexUpdateEvidence> {
-        self.codex_update_evidence.as_ref()
+    pub fn platform_target(&self) -> &str {
+        &self.platform.target
     }
 
-    pub fn minimum_host_version(&self) -> Option<&str> {
-        self.minimum_host_version.as_deref()
+    pub const fn codex_update_evidence(&self) -> &satelle_core::host_update::CodexUpdateEvidence {
+        &self.codex_update_evidence
+    }
+
+    pub fn minimum_host_version(&self) -> &str {
+        &self.minimum_host_version
     }
 
     pub const fn request_id(&self) -> &RequestId {

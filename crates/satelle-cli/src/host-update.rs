@@ -1,8 +1,8 @@
 use satelle_core::host_update::{
-    CodexComponentOwnership, CodexUpdateEvidence, HostUpdateComponent, HostUpdateDisposition,
-    HostUpdateMutation, HostUpdateReport, HostUpdateRestartImpact, HostUpdateTarget,
-    HostUpdateTargetPlan, HostUpdateVersionSource, RepairCompatibilityReason, RepairUpgradeAction,
-    RepairUpgradeDisposition, RepairUpgradeReport,
+    CodexComponentOwnership, CodexUpdateAvailability, CodexUpdateEvidence, HostUpdateComponent,
+    HostUpdateDisposition, HostUpdateMutation, HostUpdateReport, HostUpdateRestartImpact,
+    HostUpdateTarget, HostUpdateTargetPlan, HostUpdateVersionSource, RepairCompatibilityReason,
+    RepairUpgradeAction, RepairUpgradeDisposition, RepairUpgradeReport,
 };
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -85,6 +85,9 @@ pub enum HostUpdatePlanError {
         cli_version: String,
     },
     AmbiguousCodexComponentOwnership {
+        target: HostUpdateTarget,
+    },
+    UnsupportedCodexTarget {
         target: HostUpdateTarget,
     },
     InvalidArtifact {
@@ -303,6 +306,13 @@ fn plan_codex_targets(
                     remote_mutations: Vec::new(),
                 });
             }
+            if !inspection.evidence_available
+                && inspection.ownership == CodexComponentOwnership::CodexOwned
+            {
+                return Err(HostUpdatePlanError::UnsupportedCodexTarget {
+                    target: inspection.target,
+                });
+            }
             if inspection.ownership == CodexComponentOwnership::Ambiguous {
                 return Err(HostUpdatePlanError::AmbiguousCodexComponentOwnership {
                     target: inspection.target,
@@ -351,7 +361,7 @@ pub fn codex_inspections_from_evidence(
     [
         CodexUpdateInspection {
             target: HostUpdateTarget::CodexRuntime,
-            evidence_available: true,
+            evidence_available: evidence.availability == CodexUpdateAvailability::Available,
             ownership: evidence.runtime_ownership,
             current_version: evidence.runtime_current_version.clone(),
             target_version: evidence.required_version.clone(),
@@ -364,7 +374,7 @@ pub fn codex_inspections_from_evidence(
         },
         CodexUpdateInspection {
             target: HostUpdateTarget::CodexNativeComputerUse,
-            evidence_available: true,
+            evidence_available: evidence.availability == CodexUpdateAvailability::Available,
             ownership: evidence.native_component_ownership,
             current_version: evidence.native_component_current_version.clone(),
             target_version: evidence.required_version.clone(),
@@ -862,6 +872,38 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_codex_platform_is_skipped_by_default_and_rejected_when_explicit() {
+        let evidence = CodexUpdateEvidence {
+            availability: CodexUpdateAvailability::UnsupportedHostPlatform,
+            runtime_ownership: CodexComponentOwnership::CodexOwned,
+            native_component_ownership: CodexComponentOwnership::CodexOwned,
+            runtime_current_version: None,
+            native_component_current_version: None,
+            required_version: "1.0.0".to_string(),
+            runtime_update_required: false,
+            native_update_required: false,
+            runtime_compatibility_reason: None,
+            native_component_compatibility_reason: None,
+        };
+        let inspections = codex_inspections_from_evidence(&evidence);
+
+        assert!(inspections.iter().all(|inspection| {
+            !inspection.evidence_available
+                && inspection.ownership == CodexComponentOwnership::CodexOwned
+        }));
+        assert!(
+            plan_codex_targets(&inspections, true)
+                .expect("default selection skips unsupported Codex targets")
+                .iter()
+                .all(|target| target.disposition == HostUpdateDisposition::Skipped)
+        );
+        assert!(matches!(
+            plan_codex_targets(&inspections, false),
+            Err(HostUpdatePlanError::UnsupportedCodexTarget { .. })
+        ));
+    }
+
+    #[test]
     fn newer_host_and_missing_artifact_fail_before_a_plan_exists() {
         let newer = host_inspection(HostVersionRelation::NewerThanCli);
         let newer_error = build_host_update_plan(
@@ -882,7 +924,8 @@ mod tests {
             HostUpdatePlanError::HostBinaryNewerThanCli { .. }
         ));
 
-        let older = host_inspection(HostVersionRelation::OlderThanCli);
+        let mut older = host_inspection(HostVersionRelation::OlderThanCli);
+        older.remote_platform = "linux-x64-musl".to_string();
         let unavailable_error = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
@@ -896,10 +939,13 @@ mod tests {
             &Artifact(None),
         )
         .expect_err("missing verified artifact must block");
-        assert!(matches!(
+        assert_eq!(
             unavailable_error,
-            HostUpdatePlanError::HostArtifactUnavailable { .. }
-        ));
+            HostUpdatePlanError::HostArtifactUnavailable {
+                cli_version: "1.2.3".to_string(),
+                remote_platform: "linux-x64-musl".to_string(),
+            }
+        );
     }
 
     #[test]

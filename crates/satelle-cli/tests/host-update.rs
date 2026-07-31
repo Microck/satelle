@@ -120,7 +120,6 @@ fn repair_dry_run_uses_live_typed_upgrade_evidence() {
     let actions = report["actions"]
         .as_array()
         .expect("repair report has typed actions");
-    assert_eq!(actions.len(), 3);
     assert!(actions.iter().all(|action| {
         action["target"].is_string()
             && (action["current_version"].is_string() || action["current_version"].is_null())
@@ -128,16 +127,24 @@ fn repair_dry_run_uses_live_typed_upgrade_evidence() {
             && action["version_source"].is_string()
             && action["disposition"].is_string()
     }));
-    let runtime = actions
-        .iter()
-        .find(|action| action["target"] == "codex_runtime")
-        .expect("repair report includes the Codex runtime");
-    assert_eq!(runtime["version_source"], "codex_compatibility_requirement");
-    assert!(
-        matches!(
-            runtime["disposition"].as_str(),
-            Some("not_needed" | "required" | "manual_action_required" | "recommend_host_update")
-        ),
-        "repair disposition must stay inside the typed contract: {runtime}"
-    );
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        assert_eq!(actions.len(), 3);
+        let runtime = actions
+            .iter()
+            .find(|action| action["target"] == "codex_runtime")
+            .expect("repair report includes the supported Codex runtime");
+        assert_eq!(runtime["version_source"], "codex_compatibility_requirement");
+        assert!(
+            matches!(
+                runtime["disposition"].as_str(),
+                Some(
+                    "not_needed" | "required" | "manual_action_required" | "recommend_host_update"
+                )
+            ),
+            "repair disposition must stay inside the typed contract: {runtime}"
+        );
+    } else {
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["target"], "host_daemon");
+    }
 }

@@ -761,14 +761,14 @@ impl PreparedIdentityOperation {
 }
 
 impl RemoteTarget {
-    pub(super) fn from_platform(os: &str, arch: &str) -> Option<Self> {
-        match (os, arch) {
-            ("linux", "aarch64" | "arm64") => Some(Self::LinuxArm64Gnu),
-            ("linux", "x86_64" | "x64") => Some(Self::LinuxX64Gnu),
-            ("macos", "aarch64" | "arm64") => Some(Self::DarwinArm64),
-            ("macos", "x86_64" | "x64") => Some(Self::DarwinX64),
-            ("windows", "aarch64" | "arm64") => Some(Self::WindowsArm64Msvc),
-            ("windows", "x86_64" | "x64") => Some(Self::WindowsX64Msvc),
+    pub(super) fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "linux-arm64-gnu" => Some(Self::LinuxArm64Gnu),
+            "linux-x64-gnu" => Some(Self::LinuxX64Gnu),
+            "darwin-arm64" => Some(Self::DarwinArm64),
+            "darwin-x64" => Some(Self::DarwinX64),
+            "win32-arm64-msvc" => Some(Self::WindowsArm64Msvc),
+            "win32-x64-msvc" => Some(Self::WindowsX64Msvc),
             _ => None,
         }
     }

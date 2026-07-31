@@ -55,11 +55,19 @@ pub enum CodexComponentOwnership {
     Ambiguous,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexUpdateAvailability {
+    Available,
+    UnsupportedHostPlatform,
+}
+
 /// Typed Host evidence used to plan Codex-owned updates. Raw probe output does
 /// not cross this boundary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexUpdateEvidence {
+    pub availability: CodexUpdateAvailability,
     pub runtime_ownership: CodexComponentOwnership,
     pub native_component_ownership: CodexComponentOwnership,
     pub runtime_current_version: Option<String>,
@@ -69,6 +77,33 @@ pub struct CodexUpdateEvidence {
     pub native_update_required: bool,
     pub runtime_compatibility_reason: Option<RepairCompatibilityReason>,
     pub native_component_compatibility_reason: Option<RepairCompatibilityReason>,
+}
+
+pub fn current_host_artifact_platform() -> String {
+    let environment = if cfg!(target_env = "gnu") {
+        "gnu"
+    } else if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "msvc") {
+        "msvc"
+    } else {
+        "unknown"
+    };
+    host_artifact_platform(std::env::consts::OS, std::env::consts::ARCH, environment)
+}
+
+fn host_artifact_platform(os: &str, arch: &str, environment: &str) -> String {
+    let arch = match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        arch => arch,
+    };
+    match os {
+        "linux" => format!("linux-{arch}-{environment}"),
+        "macos" => format!("darwin-{arch}"),
+        "windows" => format!("win32-{arch}-{environment}"),
+        os => format!("{os}-{arch}"),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -196,6 +231,7 @@ mod tests {
     #[test]
     fn codex_update_evidence_rejects_unknown_contract_fields() {
         let evidence = serde_json::json!({
+            "availability": "available",
             "runtime_ownership": "codex_owned",
             "native_component_ownership": "codex_owned",
             "runtime_current_version": "1.0.0",
@@ -209,5 +245,42 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<CodexUpdateEvidence>(evidence).is_err());
+    }
+
+    #[test]
+    fn codex_update_evidence_requires_explicit_availability() {
+        let evidence = serde_json::json!({
+            "runtime_ownership": "codex_owned",
+            "native_component_ownership": "codex_owned",
+            "runtime_current_version": null,
+            "native_component_current_version": null,
+            "required_version": "1.0.0",
+            "runtime_update_required": false,
+            "native_update_required": false,
+            "runtime_compatibility_reason": null,
+            "native_component_compatibility_reason": null
+        });
+
+        assert!(serde_json::from_value::<CodexUpdateEvidence>(evidence).is_err());
+    }
+
+    #[test]
+    fn host_artifact_platform_preserves_runtime_family() {
+        assert_eq!(
+            host_artifact_platform("linux", "x86_64", "gnu"),
+            "linux-x64-gnu"
+        );
+        assert_eq!(
+            host_artifact_platform("linux", "x86_64", "musl"),
+            "linux-x64-musl"
+        );
+        assert_eq!(
+            host_artifact_platform("windows", "aarch64", "msvc"),
+            "win32-arm64-msvc"
+        );
+        assert_eq!(
+            host_artifact_platform("freebsd", "riscv64", "unknown"),
+            "freebsd-riscv64"
+        );
     }
 }
