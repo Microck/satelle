@@ -3275,6 +3275,8 @@ pub(crate) fn plan_host_update(
 pub(crate) fn apply_host_update(
     host: &SelectedHost,
     mut report: satelle_core::host_update::HostUpdateReport,
+    components: &[satelle_core::host_update::HostUpdateComponent],
+    includes_all: bool,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
     use satelle_core::host_update::{HostUpdatePostcheck, HostUpdateTarget};
 
@@ -3326,14 +3328,12 @@ pub(crate) fn apply_host_update(
     }
 
     let operation_id = format!("host-update-{}", Uuid::now_v7());
-    let begin = old_client
-        .begin_host_update_maintenance(&operation_id)
-        .map_err(|error| direct_transport_error(&transport.alias, error))?;
-    validate_persistent_maintenance_response(
+    report = begin_host_update_maintenance_with_revalidation(
         &transport.alias,
+        &old_client,
         &operation_id,
-        begin.reconciled(),
-        begin.operation_id(),
+        &report,
+        || plan_host_update(host, components, includes_all),
     )?;
 
     let mut bootstrap_lock = match acquire_bootstrap_lock_for_operation(
@@ -3960,6 +3960,40 @@ fn finish_unmodified_host_update(client: &DaemonClient, operation_id: &str) {
         }
     }
     let _ = client.finish_maintenance_plan(operation_id);
+}
+
+fn begin_host_update_maintenance_with_revalidation(
+    host: &str,
+    client: &DaemonClient,
+    operation_id: &str,
+    accepted: &satelle_core::host_update::HostUpdateReport,
+    revalidate: impl FnOnce() -> Result<satelle_core::host_update::HostUpdateReport, SatelleError>,
+) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
+    let begin = client
+        .begin_host_update_maintenance(operation_id)
+        .map_err(|error| direct_transport_error(host, error))?;
+    validate_persistent_maintenance_response(
+        host,
+        operation_id,
+        begin.reconciled(),
+        begin.operation_id(),
+    )?;
+
+    // The accepted plan is rebuilt only after Maintenance excludes every
+    // competing Host mutation. Drift invalidates consent and closes the
+    // still-unmodified action plan before Bootstrap Lock acquisition.
+    let current = match revalidate() {
+        Ok(current) => current,
+        Err(source) => {
+            finish_unmodified_host_update(client, operation_id);
+            return Err(source);
+        }
+    };
+    if &current != accepted {
+        finish_unmodified_host_update(client, operation_id);
+        return Err(SatelleError::state_conflict());
+    }
+    Ok(current)
 }
 
 fn finish_locked_unmodified_host_update(

@@ -8124,15 +8124,8 @@ fn run_host_update(
         }
     }
 
-    // Rebuild the same in-memory contract immediately before the first
-    // mutation. Any identity, version, target, artifact, or restart drift
-    // invalidates consent instead of silently changing the accepted plan.
-    let revalidated =
-        transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
-    if revalidated != report {
-        return Err(failure(SatelleError::state_conflict()));
-    }
-    report = transport::apply_host_update(&host, revalidated).map_err(failure)?;
+    report =
+        transport::apply_host_update(&host, report, &components, includes_all).map_err(failure)?;
     if format.is_json() {
         print_json(&report).map_err(failure)
     } else if command.quiet {

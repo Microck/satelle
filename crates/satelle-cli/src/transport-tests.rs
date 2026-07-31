@@ -1283,6 +1283,55 @@ fn uncertain_first_host_update_action_start_closes_the_unmodified_operation() {
 
 #[cfg(unix)]
 #[test]
+fn final_host_update_revalidation_holds_and_releases_maintenance_on_drift() {
+    with_bootstrap_handoff_test_context_with_scope(ApiScopes::ADMIN, |client, _, _, _, _| {
+        let operation_id = "host-update-final-revalidation";
+        let accepted = satelle_core::host_update::HostUpdateReport::new(
+            "office",
+            vec![satelle_core::host_update::HostUpdateComponent::Host],
+            Vec::new(),
+        );
+
+        let error = begin_host_update_maintenance_with_revalidation(
+            "office",
+            client,
+            operation_id,
+            &accepted,
+            || {
+                let competing = client
+                    .begin_host_update_maintenance("competing-host-update")
+                    .expect_err("Maintenance is held before final revalidation");
+                assert!(matches!(
+                    competing,
+                    DaemonClientError::Api { ref error, .. }
+                        if error.code() == ApiErrorCode::StateConflict
+                ));
+
+                let mut drifted = accepted.clone();
+                drifted.host = "changed-office".to_string();
+                Ok(drifted)
+            },
+        )
+        .expect_err("drift invalidates the accepted update plan");
+        assert_eq!(error.code, ErrorCode::StateConflict);
+
+        let next_operation = "host-update-after-revalidation-drift";
+        client
+            .begin_host_update_maintenance(next_operation)
+            .expect("drift cleanup releases Maintenance ownership");
+        for action_id in HOST_UPDATE_ACTIONS {
+            client
+                .skip_maintenance_action(next_operation, action_id)
+                .expect("skip the next operation action");
+        }
+        client
+            .finish_maintenance_plan(next_operation)
+            .expect("finish the next maintenance operation");
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn rejected_durable_token_is_reported_after_launched_daemon_handoff_is_terminal() {
     with_bootstrap_handoff_test_context(
         |bootstrap_client, fake_ssh, daemon_address, host_identity, _| {
