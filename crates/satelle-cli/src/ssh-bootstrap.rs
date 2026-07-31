@@ -3611,10 +3611,26 @@ fn same_windows_path_text(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ManagedServiceExecutableObservation {
+    path: String,
+    sha256: [u8; 32],
+}
+
+impl ManagedServiceExecutableObservation {
+    #[cfg(test)]
+    pub(super) fn for_tests(path: impl Into<String>, sha256: [u8; 32]) -> Self {
+        Self {
+            path: path.into(),
+            sha256,
+        }
+    }
+}
+
 pub(super) fn managed_service_executable_version(
     target: RemoteTarget,
     directories: &RemoteUserDirectories,
-    executable: &str,
+    executable: &ManagedServiceExecutableObservation,
     expected_current_release_digest: Option<[u8; 32]>,
 ) -> Option<String> {
     let normalize = |path: &str| {
@@ -3630,8 +3646,8 @@ pub(super) fn managed_service_executable_version(
         }
     };
     let root = normalize(&target.artifact_root(directories).ok()?);
-    let executable = normalize(executable);
-    let relative = executable.strip_prefix(&format!("{root}/"))?;
+    let executable_path = normalize(&executable.path);
+    let relative = executable_path.strip_prefix(&format!("{root}/"))?;
     let mut components = relative.split('/');
     let version = components
         .next()?
@@ -3665,15 +3681,17 @@ pub(super) fn managed_service_executable_version(
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return None;
         }
-        // The invoking release manifest can authenticate only its own
-        // digest-addressed executable. Older version paths remain observable
-        // so planning can report and replace them.
-        if version == env!("CARGO_PKG_VERSION")
-            && parse_digest_hex(digest).ok()? != expected_current_release_digest?
-        {
+        if parse_digest_hex(digest).ok()? != executable.sha256 {
             return None;
         }
     } else if filename != target.executable_name() {
+        return None;
+    }
+    // The invoking release manifest can authenticate only its own release.
+    // Older version paths remain observable so planning can report and
+    // replace them.
+    if version == env!("CARGO_PKG_VERSION") && executable.sha256 != expected_current_release_digest?
+    {
         return None;
     }
 
@@ -3772,7 +3790,7 @@ impl RemoteUserDirectories {
         path: &str,
         host_id: &str,
         expected_path_overrides: &DaemonPathOverrides,
-    ) -> Result<Option<String>, SshBootstrapError> {
+    ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         self.probe_managed_service_executable_with_program(
             OsStr::new("ssh"),
             destination,
@@ -3790,7 +3808,7 @@ impl RemoteUserDirectories {
         path: &str,
         host_id: &str,
         expected_path_overrides: &DaemonPathOverrides,
-    ) -> Result<Option<String>, SshBootstrapError> {
+    ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         self.probe_managed_service_executable_with_program(
             ssh_program.as_os_str(),
             destination,
@@ -3807,7 +3825,7 @@ impl RemoteUserDirectories {
         path: &str,
         host_id: &str,
         expected_path_overrides: &DaemonPathOverrides,
-    ) -> Result<Option<String>, SshBootstrapError> {
+    ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         if host_id.is_empty()
             || !host_id
                 .bytes()
@@ -3863,7 +3881,10 @@ impl RemoteUserDirectories {
                     "if (-not [String]::Equals($normalizedExecutable, $resolvedExecutable, ",
                     "[StringComparison]::OrdinalIgnoreCase)) {{ ",
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "$digest=(Get-FileHash -Algorithm SHA256 -LiteralPath ",
+                    "$resolvedExecutable).Hash.ToLowerInvariant(); ",
                     "[Console]::Out.WriteLine('managed'); ",
+                    "[Console]::Out.WriteLine($digest); ",
                     "[Console]::Out.WriteLine(($config | ConvertTo-Json -Compress -Depth 4)); ",
                     "[Console]::Out.Write($resolvedExecutable)"
                 ),
@@ -3893,7 +3914,8 @@ impl RemoteUserDirectories {
                     "{{ printf absent; exit 0; }}; ",
                     "if [ \"$executable\" != \"$canonical_directory/$basename\" ]; then ",
                     "printf absent; exit 0; fi; ",
-                    "printf 'managed\\n'; ",
+                    "digest=$(shasum -a 256 -- \"$executable\" | awk '{{print $1}}') || exit 75; ",
+                    "printf 'managed\\n%s\\n' \"$digest\"; ",
                     "cat \"$path\""
                 ),
                 path = posix_quote(path),
@@ -3915,6 +3937,12 @@ impl RemoteUserDirectories {
         if marker.strip_suffix('\r').unwrap_or(marker) != "managed" {
             return Err(SshBootstrapError::InvalidServiceObservation);
         }
+        let (digest, payload) = payload
+            .split_once('\n')
+            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        let digest = digest.strip_suffix('\r').unwrap_or(digest);
+        let sha256 =
+            parse_digest_hex(digest).map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
         if self.target.is_windows() {
             let (config, executable) = payload
                 .split_once('\n')
@@ -3936,7 +3964,10 @@ impl RemoteUserDirectories {
             if executable.is_empty() || executable.contains(['\r', '\n']) {
                 return Err(SshBootstrapError::InvalidServiceObservation);
             }
-            return Ok(Some(executable.to_string()));
+            return Ok(Some(ManagedServiceExecutableObservation {
+                path: executable.to_string(),
+                sha256,
+            }));
         }
         let Ok(definition) = parse_launchd_service_definition(payload.as_bytes()) else {
             return Ok(None);
@@ -3946,7 +3977,10 @@ impl RemoteUserDirectories {
         {
             return Ok(None);
         }
-        Ok(Some(definition.executable))
+        Ok(Some(ManagedServiceExecutableObservation {
+            path: definition.executable,
+            sha256,
+        }))
     }
 
     pub(super) fn resolved_path_set(&self) -> satelle_core::daemon_service::DaemonResolvedPathSet {
@@ -5448,6 +5482,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary fake SSH directory");
         let fake_ssh = directory.path().join("ssh");
         let audit_log = directory.path().join("arguments");
+        let observed_digest = "aa".repeat(32);
         let macos_plist = satelle_core::daemon_service::render_launchd_user_plist(
             Path::new("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle"),
             "127.0.0.1:3001",
@@ -5459,9 +5494,10 @@ mod tests {
             format!(
                 concat!(
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                    "printf 'managed\\n%s' {}\n"
+                    "printf 'managed\\n%s\\n%s' {} {}\n"
                 ),
                 posix_quote(audit_log.to_str().expect("UTF-8 audit path")),
+                posix_quote(&observed_digest),
                 posix_quote(&macos_plist),
             ),
         )
@@ -5487,7 +5523,8 @@ mod tests {
                     &DaemonPathOverrides::default(),
                 )
                 .expect("run audited read-only service probe")
-                .as_deref(),
+                .as_ref()
+                .map(|observation| observation.path.as_str()),
             Some("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle")
         );
 
@@ -5514,6 +5551,7 @@ mod tests {
             "[ ! -x \"$executable\" ]",
             "canonical_directory=$(cd -P \"$directory\"",
             "[ \"$executable\" != \"$canonical_directory/$basename\" ]",
+            "shasum -a 256 -- \"$executable\"",
         ] {
             assert!(
                 invocation.contains(executable_integrity_check),
@@ -5533,7 +5571,8 @@ mod tests {
         fs::write(
             &fake_ssh,
             format!(
-                "#!/bin/sh\nprintf 'managed\\n%s' {}\n",
+                "#!/bin/sh\nprintf 'managed\\n%s\\n%s' {} {}\n",
+                posix_quote(&observed_digest),
                 posix_quote(&drifted_macos_plist),
             ),
         )
@@ -5556,7 +5595,9 @@ mod tests {
             format!(
                 concat!(
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                    "printf 'managed\\r\\n{{\"schema\":\"satelle.host-service.v1\",",
+                    "printf 'managed\\r\\n",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
+                    "{{\"schema\":\"satelle.host-service.v1\",",
                     "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                     "\"127.0.0.1:3001\"],\"environment\":{{}}}}\\r\\n",
                     "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
@@ -5581,7 +5622,8 @@ mod tests {
                     &DaemonPathOverrides::default(),
                 )
                 .expect("run audited Windows service probe")
-                .as_deref(),
+                .as_ref()
+                .map(|observation| observation.path.as_str()),
             Some(
                 r"C:\Users\operator\AppData\Local\Satelle\host\v0.1.0\win32-x64-msvc\satelle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe"
             )
@@ -5617,6 +5659,7 @@ mod tests {
             "[IO.FileAttributes]::ReparsePoint",
             "[IO.Path]::IsPathFullyQualified($executable)",
             "$executableItem.FullName",
+            "Get-FileHash -Algorithm SHA256",
         ] {
             assert!(
                 script.contains(executable_integrity_check),
@@ -5638,6 +5681,7 @@ mod tests {
             &fake_ssh,
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
                 "{\"schema\":\"satelle.host-service.v1\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                 "\"127.0.0.1:3002\"],\"environment\":{}}\\r\\n",
@@ -5664,6 +5708,7 @@ mod tests {
             &fake_ssh,
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
                 "{\"schema\":\"satelle.host-service.v1\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                 "\"127.0.0.1:3001\"],",
@@ -5692,20 +5737,23 @@ mod tests {
     fn managed_service_version_comes_from_its_executable_target() {
         let macos = RemoteUserDirectories::for_tests(RemoteTarget::DarwinArm64);
         let windows = RemoteUserDirectories::for_tests(RemoteTarget::WindowsX64Msvc);
+        let old_macos = ManagedServiceExecutableObservation::for_tests(
+            "/Users/operator/Library/Caches/Satelle/host/v0.0.9/darwin-arm64/satelle",
+            [0x11; 32],
+        );
         assert_eq!(
-            managed_service_executable_version(
-                RemoteTarget::DarwinArm64,
-                &macos,
-                "/Users/operator/Library/Caches/Satelle/host/v0.0.9/darwin-arm64/satelle",
-                None,
-            ),
+            managed_service_executable_version(RemoteTarget::DarwinArm64, &macos, &old_macos, None,),
             Some("0.0.9".to_string())
+        );
+        let old_windows = ManagedServiceExecutableObservation::for_tests(
+            r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe",
+            [0xaa; 32],
         );
         assert_eq!(
             managed_service_executable_version(
                 RemoteTarget::WindowsX64Msvc,
                 &windows,
-                r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe",
+                &old_windows,
                 Some([0xbb; 32]),
             ),
             Some("0.0.8".to_string())
@@ -5715,11 +5763,13 @@ mod tests {
             env!("CARGO_PKG_VERSION"),
             "aa".repeat(32),
         );
+        let current_windows =
+            ManagedServiceExecutableObservation::for_tests(&current_windows_path, [0xaa; 32]);
         assert_eq!(
             managed_service_executable_version(
                 RemoteTarget::WindowsX64Msvc,
                 &windows,
-                &current_windows_path,
+                &current_windows,
                 Some([0xaa; 32]),
             ),
             Some(env!("CARGO_PKG_VERSION").to_string())
@@ -5728,27 +5778,49 @@ mod tests {
             managed_service_executable_version(
                 RemoteTarget::WindowsX64Msvc,
                 &windows,
-                &current_windows_path,
+                &current_windows,
                 Some([0xbb; 32]),
             ),
             None
         );
+        let current_macos_path = format!(
+            "/Users/operator/Library/Caches/Satelle/host/v{}/darwin-arm64/satelle",
+            env!("CARGO_PKG_VERSION"),
+        );
+        let current_macos =
+            ManagedServiceExecutableObservation::for_tests(&current_macos_path, [0xaa; 32]);
         assert_eq!(
             managed_service_executable_version(
                 RemoteTarget::DarwinArm64,
                 &macos,
-                "/tmp/lookalike/v0.0.9/darwin-arm64/satelle",
-                None,
+                &current_macos,
+                Some([0xaa; 32]),
             ),
-            None
+            Some(env!("CARGO_PKG_VERSION").to_string())
         );
         assert_eq!(
             managed_service_executable_version(
                 RemoteTarget::DarwinArm64,
                 &macos,
-                "/Users/operator/Library/Caches/Satelle/host/vbroken/darwin-arm64/satelle",
-                None,
+                &current_macos,
+                Some([0xbb; 32]),
             ),
+            None
+        );
+        let lookalike = ManagedServiceExecutableObservation::for_tests(
+            "/tmp/lookalike/v0.0.9/darwin-arm64/satelle",
+            [0x11; 32],
+        );
+        assert_eq!(
+            managed_service_executable_version(RemoteTarget::DarwinArm64, &macos, &lookalike, None,),
+            None
+        );
+        let malformed = ManagedServiceExecutableObservation::for_tests(
+            "/Users/operator/Library/Caches/Satelle/host/vbroken/darwin-arm64/satelle",
+            [0x11; 32],
+        );
+        assert_eq!(
+            managed_service_executable_version(RemoteTarget::DarwinArm64, &macos, &malformed, None,),
             None
         );
         let mut current_version_parts = env!("CARGO_PKG_VERSION").split('.');
@@ -5762,20 +5834,28 @@ mod tests {
             r"C:\Users\operator\AppData\Local\Satelle\host\v{aliased_current_version}\win32-x64-msvc\satelle-{}.exe",
             "bb".repeat(32),
         );
-        assert_eq!(
-            managed_service_executable_version(
-                RemoteTarget::WindowsX64Msvc,
-                &windows,
-                &aliased_current_windows_path,
-                Some([0xaa; 32]),
-            ),
-            None
+        let aliased_current_windows = ManagedServiceExecutableObservation::for_tests(
+            &aliased_current_windows_path,
+            [0xbb; 32],
         );
         assert_eq!(
             managed_service_executable_version(
                 RemoteTarget::WindowsX64Msvc,
                 &windows,
-                r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle.exe",
+                &aliased_current_windows,
+                Some([0xaa; 32]),
+            ),
+            None
+        );
+        let unaddressed_windows = ManagedServiceExecutableObservation::for_tests(
+            r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle.exe",
+            [0xbb; 32],
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                &windows,
+                &unaddressed_windows,
                 Some([0xbb; 32]),
             ),
             None

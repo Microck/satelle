@@ -2833,7 +2833,7 @@ fn host_service_inspection_from_executable(
     target: ssh_bootstrap::RemoteTarget,
     directories: &ssh_bootstrap::RemoteUserDirectories,
     destination: &str,
-    executable: Option<String>,
+    executable: Option<ssh_bootstrap::ManagedServiceExecutableObservation>,
     cli_version: &str,
     expected_current_release_digest: Option<[u8; 32]>,
 ) -> Result<crate::host_update::HostUpdateServiceInspection, SatelleError> {
@@ -3009,9 +3009,9 @@ fn inspect_host_maintenance(
                             .map_err(|error| {
                                 map_ssh_daemon_bootstrap_error(&transport.alias, error)
                             })?;
-                        if target.is_windows() && executable.is_some() {
-                            // A current Windows task is trustworthy only when
-                            // its digest-addressed executable matches the
+                        if executable.is_some() {
+                            // Current service state is trustworthy only when
+                            // the observed executable content matches the
                             // invoking release manifest.
                             service_release_artifact = Some(transport.release_artifact(target)?);
                         }
@@ -6769,7 +6769,12 @@ mod bootstrap_ordering_tests {
             ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
             &directories,
             r"C:\Users\operator\AppData\Local\Satelle\service\host-office.json",
-            Some(r"C:\Program Files\Satelle\satelle.exe".to_string()),
+            Some(
+                ssh_bootstrap::ManagedServiceExecutableObservation::for_tests(
+                    r"C:\Program Files\Satelle\satelle.exe",
+                    [0xaa; 32],
+                ),
+            ),
             env!("CARGO_PKG_VERSION"),
             Some([0xaa; 32]),
         )

@@ -227,10 +227,13 @@ fn plan_host_targets(
         }
         Some(artifact)
     };
+    let daemon_destination = artifact
+        .as_ref()
+        .and_then(|artifact| artifact.daemon_destination.clone());
     let daemon_mutations = mutation_for(
         disposition,
         "replace_host_daemon",
-        artifact.and_then(|artifact| artifact.daemon_destination),
+        daemon_destination.clone(),
     );
     let daemon_restart_impact = if daemon_mutations.is_empty() {
         HostUpdateRestartImpact::None
@@ -247,11 +250,23 @@ fn plan_host_targets(
         remote_mutations: daemon_mutations,
     }];
     if let Some((service, disposition)) = request.service_inspection.zip(service_disposition) {
-        let remote_mutations = mutation_for(
+        let mut remote_mutations = Vec::new();
+        if disposition != HostUpdateDisposition::Current
+            && request.host_inspection.relation_to_cli == HostVersionRelation::MatchesCli
+        {
+            // A service-only repair still needs the authenticated daemon
+            // artifact that the repaired definition will execute.
+            remote_mutations.extend(mutation_for(
+                disposition,
+                "replace_host_daemon",
+                daemon_destination,
+            ));
+        }
+        remote_mutations.extend(mutation_for(
             disposition,
             "replace_host_daemon_service",
             Some(service.destination.clone()),
-        );
+        ));
         targets.push(HostUpdateTargetPlan {
             target: HostUpdateTarget::HostDaemonService,
             current_version: service.current_version.clone(),
@@ -807,6 +822,21 @@ mod tests {
             HostUpdateTarget::HostDaemonService
         );
         assert_eq!(report.targets[1].disposition, HostUpdateDisposition::Update);
+        assert_eq!(
+            report.targets[1].remote_mutations,
+            [
+                HostUpdateMutation {
+                    operation: "replace_host_daemon".to_string(),
+                    remote_path: Some("/opt/satelle/bin/satelle".to_string()),
+                },
+                HostUpdateMutation {
+                    operation: "replace_host_daemon_service".to_string(),
+                    remote_path: Some(
+                        "/home/operator/.config/systemd/user/satelle.service".to_string(),
+                    ),
+                },
+            ]
+        );
     }
 
     #[test]
