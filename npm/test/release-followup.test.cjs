@@ -218,6 +218,8 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.match(workflow, /scripts\/install\.sh" --version/);
   assert.match(workflow, /: > "\$policy_log"/);
   assert.match(workflow, /installer upgrade failed/);
+  assert.equal((workflow.match(/satelle\.paths\.v2/g) ?? []).length, 2);
+  assert.doesNotMatch(workflow, /satelle\.paths\.v1/);
   assert.match(workflow, /shasum -a 256 -c/);
   assert.match(workflow, /validate-native-release-archives/);
   assert.match(workflow, /SHA256SUMS/);
