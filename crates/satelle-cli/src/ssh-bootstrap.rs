@@ -3819,16 +3819,18 @@ impl RemoteUserDirectories {
             return Err(SshBootstrapError::InvalidServiceObservation);
         }
         let observation = std::str::from_utf8(&output.stdout)
-            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?
-            .trim();
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
         if observation == "absent" {
             return Ok(None);
         }
-        let payload = observation
-            .strip_prefix("managed\n")
+        let (marker, payload) = observation
+            .split_once('\n')
             .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        if marker.strip_suffix('\r').unwrap_or(marker) != "managed" {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
         if self.target.is_windows() {
-            if payload.is_empty() || payload.contains('\n') {
+            if payload.is_empty() || payload.contains(['\r', '\n']) {
                 return Err(SshBootstrapError::InvalidServiceObservation);
             }
             return Ok(Some(payload.to_string()));
@@ -5380,8 +5382,8 @@ mod tests {
             format!(
                 concat!(
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                    "printf 'managed\\nC:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\",
-                    "host\\\\v0.1.0\\\\win32-x64-msvc\\\\satelle.exe\\n'\n"
+                    "printf 'managed\\r\\nC:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\",
+                    "host\\\\v0.1.0\\\\win32-x64-msvc\\\\satelle.exe'\n"
                 ),
                 posix_quote(audit_log.to_str().expect("UTF-8 audit path")),
             ),

@@ -50,6 +50,7 @@ pub trait VerifiedHostArtifactResolver {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexUpdateInspection {
     pub target: HostUpdateTarget,
+    pub evidence_available: bool,
     pub ownership: CodexComponentOwnership,
     pub current_version: Option<String>,
     pub target_version: String,
@@ -112,13 +113,17 @@ pub fn build_host_update_plan(
     artifacts: &dyn VerifiedHostArtifactResolver,
 ) -> Result<HostUpdateReport, HostUpdatePlanError> {
     let components = selected_components(request.components, request.includes_all)?;
+    let default_selection = request.components.is_empty() && !request.includes_all;
     let mut targets = Vec::new();
 
     if components.contains(&HostUpdateComponent::Host) {
         targets.extend(plan_host_targets(&request, artifacts)?);
     }
     if components.contains(&HostUpdateComponent::Codex) {
-        targets.extend(plan_codex_targets(request.codex_inspections)?);
+        targets.extend(plan_codex_targets(
+            request.codex_inspections,
+            default_selection,
+        )?);
     }
 
     Ok(HostUpdateReport::new(
@@ -257,7 +262,10 @@ fn mutation_for(
     operation: &str,
     destination: Option<String>,
 ) -> Vec<HostUpdateMutation> {
-    if disposition == HostUpdateDisposition::Current {
+    if matches!(
+        disposition,
+        HostUpdateDisposition::Current | HostUpdateDisposition::Skipped
+    ) {
         Vec::new()
     } else {
         vec![HostUpdateMutation {
@@ -269,10 +277,22 @@ fn mutation_for(
 
 fn plan_codex_targets(
     inspections: &[CodexUpdateInspection],
+    skip_unavailable: bool,
 ) -> Result<Vec<HostUpdateTargetPlan>, HostUpdatePlanError> {
     inspections
         .iter()
         .map(|inspection| {
+            if !inspection.evidence_available && skip_unavailable {
+                return Ok(HostUpdateTargetPlan {
+                    target: inspection.target,
+                    current_version: None,
+                    target_version: inspection.target_version.clone(),
+                    version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
+                    disposition: HostUpdateDisposition::Skipped,
+                    restart_impact: HostUpdateRestartImpact::None,
+                    remote_mutations: Vec::new(),
+                });
+            }
             if inspection.ownership == CodexComponentOwnership::Ambiguous {
                 return Err(HostUpdatePlanError::AmbiguousCodexComponentOwnership {
                     target: inspection.target,
@@ -317,6 +337,7 @@ pub fn codex_inspections_from_evidence(
     [
         CodexUpdateInspection {
             target: HostUpdateTarget::CodexRuntime,
+            evidence_available: true,
             ownership: evidence.runtime_ownership,
             current_version: evidence.runtime_current_version.clone(),
             target_version: evidence.required_version.clone(),
@@ -329,6 +350,7 @@ pub fn codex_inspections_from_evidence(
         },
         CodexUpdateInspection {
             target: HostUpdateTarget::CodexNativeComputerUse,
+            evidence_available: true,
             ownership: evidence.native_component_ownership,
             current_version: evidence.native_component_current_version.clone(),
             target_version: evidence.required_version.clone(),
@@ -338,6 +360,31 @@ pub fn codex_inspections_from_evidence(
                 operation: "replace_codex_native_computer_use".to_string(),
                 remote_path: None,
             }],
+        },
+    ]
+}
+
+pub fn unavailable_codex_inspections(required_version: &str) -> [CodexUpdateInspection; 2] {
+    [
+        CodexUpdateInspection {
+            target: HostUpdateTarget::CodexRuntime,
+            evidence_available: false,
+            ownership: CodexComponentOwnership::Ambiguous,
+            current_version: None,
+            target_version: required_version.to_string(),
+            update_required: false,
+            restart_impact: HostUpdateRestartImpact::None,
+            remote_mutations: Vec::new(),
+        },
+        CodexUpdateInspection {
+            target: HostUpdateTarget::CodexNativeComputerUse,
+            evidence_available: false,
+            ownership: CodexComponentOwnership::Ambiguous,
+            current_version: None,
+            target_version: required_version.to_string(),
+            update_required: false,
+            restart_impact: HostUpdateRestartImpact::None,
+            remote_mutations: Vec::new(),
         },
     ]
 }
@@ -390,14 +437,19 @@ pub fn build_repair_upgrade_plan(
 pub fn render_host_update_plan(report: &HostUpdateReport) -> String {
     let mut output = format!("Host update plan for {}\n", report.host);
     for target in &report.targets {
-        let current = match (target.target, target.current_version.as_deref()) {
-            (HostUpdateTarget::HostDaemonService, None)
+        let current = match (
+            target.target,
+            target.current_version.as_deref(),
+            target.disposition,
+        ) {
+            (_, _, HostUpdateDisposition::Skipped) => "unavailable",
+            (HostUpdateTarget::HostDaemonService, None, _)
                 if target.disposition != HostUpdateDisposition::Install =>
             {
                 "managed asset; version unavailable"
             }
-            (_, Some(version)) => version,
-            (_, None) => "not installed",
+            (_, Some(version), _) => version,
+            (_, None, _) => "not installed",
         };
         let _ = writeln!(
             output,
@@ -490,6 +542,7 @@ mod tests {
         let codex = [
             CodexUpdateInspection {
                 target: HostUpdateTarget::CodexRuntime,
+                evidence_available: true,
                 ownership: CodexComponentOwnership::CodexOwned,
                 current_version: Some("0.9.0".to_string()),
                 target_version: "1.0.0".to_string(),
@@ -502,6 +555,7 @@ mod tests {
             },
             CodexUpdateInspection {
                 target: HostUpdateTarget::CodexNativeComputerUse,
+                evidence_available: true,
                 ownership: CodexComponentOwnership::CodexOwned,
                 current_version: None,
                 target_version: "1.0.0".to_string(),
@@ -702,19 +756,9 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_codex_evidence_blocks_default_but_not_host_only_planning() {
+    fn unavailable_codex_evidence_is_skipped_by_default_but_blocks_explicit_selection() {
         let host = host_inspection(HostVersionRelation::OlderThanCli);
-        let unavailable = codex_inspections_from_evidence(&CodexUpdateEvidence {
-            runtime_ownership: CodexComponentOwnership::Ambiguous,
-            native_component_ownership: CodexComponentOwnership::Ambiguous,
-            runtime_current_version: None,
-            native_component_current_version: None,
-            required_version: "1.0.0".to_string(),
-            runtime_update_required: true,
-            native_update_required: true,
-            runtime_compatibility_reason: None,
-            native_component_compatibility_reason: None,
-        });
+        let unavailable = unavailable_codex_inspections("1.0.0");
 
         build_host_update_plan(
             HostUpdatePlanRequest {
@@ -730,7 +774,7 @@ mod tests {
         )
         .expect("legacy Host evidence still supports a host-only update plan");
 
-        let error = build_host_update_plan(
+        let report = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
@@ -742,7 +786,31 @@ mod tests {
             },
             &artifact(),
         )
-        .expect_err("default planning must fail closed without Codex ownership evidence");
+        .expect("default planning keeps an unavailable Codex check from blocking Host recovery");
+        assert_eq!(report.targets.len(), 3);
+        assert!(report.targets[1..].iter().all(|target| {
+            target.disposition == HostUpdateDisposition::Skipped
+                && target.current_version.is_none()
+                && target.remote_mutations.is_empty()
+        }));
+        assert!(
+            render_host_update_plan(&report)
+                .contains("CodexRuntime: unavailable -> 1.0.0 (Skipped, restart: None)")
+        );
+
+        let error = build_host_update_plan(
+            HostUpdatePlanRequest {
+                host: "office",
+                cli_version: "1.2.3",
+                components: &[],
+                includes_all: true,
+                host_inspection: &host,
+                service_inspection: None,
+                codex_inspections: &unavailable,
+            },
+            &artifact(),
+        )
+        .expect_err("explicit all still requires exact Codex ownership evidence");
         assert!(matches!(
             error,
             HostUpdatePlanError::AmbiguousCodexComponentOwnership { .. }
@@ -795,6 +863,7 @@ mod tests {
         let host = host_inspection(HostVersionRelation::MatchesCli);
         let ambiguous = [CodexUpdateInspection {
             target: HostUpdateTarget::CodexNativeComputerUse,
+            evidence_available: true,
             ownership: CodexComponentOwnership::Ambiguous,
             current_version: None,
             target_version: "1.0.0".to_string(),

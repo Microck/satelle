@@ -561,6 +561,44 @@ fn unpinned_and_unauthenticated_bindings_cannot_open_ordinary_transports() {
 }
 
 #[test]
+fn maintenance_inspection_rejects_an_unpinned_ssh_host() {
+    let mut host = ssh_setup_host(Some(ApiTokenSource::File {
+        path: PathBuf::from("/tmp/unread-token"),
+    }));
+    host.config.expected_host_id = None;
+
+    let error = match SshSetupTransport::new_for_maintenance(&host) {
+        Ok(_) => panic!("maintenance must not enter setup's first-trust identity discovery"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code, ErrorCode::ConfigError);
+}
+
+#[test]
+fn default_missing_ssh_host_plan_skips_unavailable_codex_targets() {
+    let host = ssh_setup_host(Some(ApiTokenSource::File {
+        path: PathBuf::from("/tmp/unread-token"),
+    }));
+
+    let report = plan_host_update(&host, &[], false)
+        .expect("default planning must preserve the missing Host recovery target");
+
+    assert_eq!(
+        report.targets[0].target,
+        satelle_core::host_update::HostUpdateTarget::HostDaemon
+    );
+    assert_eq!(
+        report.targets[0].disposition,
+        satelle_core::host_update::HostUpdateDisposition::Install
+    );
+    assert!(report.targets[1..].iter().all(|target| {
+        target.disposition == satelle_core::host_update::HostUpdateDisposition::Skipped
+            && target.remote_mutations.is_empty()
+    }));
+}
+
+#[test]
 fn setup_token_lock_serializes_processes_targeting_the_same_credential() {
     let state = TestStateDir::new().expect("temporary state directory");
     #[cfg(unix)]

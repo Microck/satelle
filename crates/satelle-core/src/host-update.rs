@@ -28,6 +28,7 @@ pub enum HostUpdateDisposition {
     Current,
     Install,
     Update,
+    Skipped,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

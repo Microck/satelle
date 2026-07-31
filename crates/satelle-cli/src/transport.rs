@@ -1270,6 +1270,14 @@ impl SshSetupTransport {
         })
     }
 
+    fn new_for_maintenance(host: &SelectedHost) -> Result<Self, SatelleError> {
+        // Maintenance can reuse bootstrap transport mechanics only after the
+        // Host identity has already crossed the explicit setup trust boundary.
+        SshHostBinding::from_host_config_for_bootstrap(&host.config)
+            .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+        Self::new(host)
+    }
+
     fn unsupported(&self, operation: &str) -> SatelleError {
         SatelleError::not_implemented(format!(
             "SSH setup transport for host '{}' does not support {operation}",
@@ -2814,7 +2822,6 @@ fn maintenance_release_artifact_required(
 
 fn host_service_inspection_from_executable(
     target: ssh_bootstrap::RemoteTarget,
-    host: &str,
     destination: &str,
     executable: Option<String>,
     cli_version: &str,
@@ -2826,16 +2833,18 @@ fn host_service_inspection_from_executable(
             destination: destination.to_string(),
         });
     };
-    let current_version = ssh_bootstrap::managed_service_executable_version(target, &executable)
-        .ok_or_else(|| {
-            map_ssh_daemon_bootstrap_error(
-                host,
-                ssh_bootstrap::SshBootstrapError::InvalidServiceObservation,
-            )
-        })?;
-    let relation_to_cli = host_version_relation(Some(&current_version), true, None, cli_version)?;
+    let current_version = ssh_bootstrap::managed_service_executable_version(target, &executable);
+    let relation_to_cli = match current_version.as_deref() {
+        Some(current_version) => {
+            host_version_relation(Some(current_version), true, None, cli_version)?
+        }
+        // A canonical managed executable exists, but its path does not expose
+        // a version. Keep it distinct from an absent service and plan a safe
+        // replacement with the exact invoking CLI artifact.
+        None => crate::host_update::HostVersionRelation::OlderThanCli,
+    };
     Ok(crate::host_update::HostUpdateServiceInspection {
-        current_version: Some(current_version),
+        current_version,
         relation_to_cli,
         destination: destination.to_string(),
     })
@@ -2939,7 +2948,7 @@ fn inspect_host_maintenance(
             }
         }
         TransportKind::Ssh => {
-            let transport = SshSetupTransport::new(host)?;
+            let transport = SshSetupTransport::new_for_maintenance(host)?;
             let target = transport.remote_target()?;
             let current =
                 transport.observe_current_daemon_artifact(transport.token_file_exists()?)?;
@@ -2979,7 +2988,6 @@ fn inspect_host_maintenance(
                             })?;
                         Some(host_service_inspection_from_executable(
                             target,
-                            &transport.alias,
                             &destination,
                             executable,
                             cli_version,
@@ -3104,10 +3112,14 @@ pub(crate) fn plan_host_update(
         current_version: inspection.current_version,
         remote_platform: inspection.remote_platform,
     };
-    let codex_evidence = inspection
-        .codex_evidence
-        .unwrap_or_else(unavailable_codex_update_evidence);
-    let codex_inspections = crate::host_update::codex_inspections_from_evidence(&codex_evidence);
+    let codex_inspections = match inspection.codex_evidence {
+        Some(codex_evidence) => {
+            crate::host_update::codex_inspections_from_evidence(&codex_evidence)
+        }
+        None => {
+            crate::host_update::unavailable_codex_inspections(&HostService::required_codex_version())
+        }
+    };
     crate::host_update::build_host_update_plan(
         crate::host_update::HostUpdatePlanRequest {
             host: &host.alias,
@@ -3299,20 +3311,6 @@ fn verified_host_update_artifact_from_metadata(
         remote_platform: target.id().to_string(),
         daemon_destination: install_path,
     })
-}
-
-fn unavailable_codex_update_evidence() -> satelle_core::host_update::CodexUpdateEvidence {
-    satelle_core::host_update::CodexUpdateEvidence {
-        runtime_ownership: satelle_core::host_update::CodexComponentOwnership::Ambiguous,
-        native_component_ownership: satelle_core::host_update::CodexComponentOwnership::Ambiguous,
-        runtime_current_version: None,
-        native_component_current_version: None,
-        required_version: HostService::required_codex_version(),
-        runtime_update_required: true,
-        native_update_required: true,
-        runtime_compatibility_reason: None,
-        native_component_compatibility_reason: None,
-    }
 }
 
 fn host_version_relation(
@@ -6638,7 +6636,6 @@ mod bootstrap_ordering_tests {
     fn absent_persistent_service_is_a_missing_service_target() {
         let inspection = host_service_inspection_from_executable(
             ssh_bootstrap::RemoteTarget::DarwinArm64,
-            "office",
             "/Users/operator/Library/LaunchAgents/dev.microck.satelle.host.plist",
             None,
             env!("CARGO_PKG_VERSION"),
@@ -6653,6 +6650,23 @@ mod bootstrap_ordering_tests {
         assert_eq!(
             inspection.destination,
             "/Users/operator/Library/LaunchAgents/dev.microck.satelle.host.plist"
+        );
+    }
+
+    #[test]
+    fn managed_service_with_an_unparseable_version_remains_an_update_target() {
+        let inspection = host_service_inspection_from_executable(
+            ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
+            r"C:\Users\operator\AppData\Local\Satelle\service\host-office.json",
+            Some(r"C:\Program Files\Satelle\satelle.exe".to_string()),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .expect("a verified managed executable remains observable without a versioned cache path");
+
+        assert_eq!(inspection.current_version, None);
+        assert_eq!(
+            inspection.relation_to_cli,
+            crate::host_update::HostVersionRelation::OlderThanCli
         );
     }
 
