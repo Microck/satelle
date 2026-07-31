@@ -176,6 +176,13 @@ function commandLine(command, argumentsToForward) {
   return lines.length === 1 ? lines[0] : undefined;
 }
 
+function packageManagerCommand(manager, platform) {
+  if (platform !== "win32") {
+    return manager;
+  }
+  return manager === "bun" ? "bun.exe" : `${manager}.cmd`;
+}
+
 function outerNodeModulesRoot(filePath) {
   let current = path.resolve(filePath);
   let selected;
@@ -202,7 +209,10 @@ function discoverGlobalOwnership({
     ["npm", "npm", ["root", "--global"]],
     ["pnpm", "pnpm", ["root", "--global"]],
   ]) {
-    const globalRoot = runCommand(command, argumentsToForward);
+    const globalRoot = runCommand(
+      packageManagerCommand(command, platform),
+      argumentsToForward,
+    );
     if (
       globalRoot &&
       globalRootOwnsLauncher({ globalRoot, packageName, launcherPath })
@@ -211,7 +221,10 @@ function discoverGlobalOwnership({
     }
   }
 
-  const bunBin = runCommand("bun", ["pm", "bin", "--global"]);
+  const bunBin = runCommand(
+    packageManagerCommand("bun", platform),
+    ["pm", "bin", "--global"],
+  );
   if (bunBin) {
     const shimNames =
       platform === "win32"
@@ -318,7 +331,28 @@ function packageInstallContext({
 }
 
 function isSelfUpdate(argumentsToForward) {
-  return argumentsToForward[0] === "self" && argumentsToForward[1] === "update";
+  const command = [];
+  for (let index = 0; index < argumentsToForward.length; index += 1) {
+    const argument = argumentsToForward[index];
+    if (argument === "--no-color") {
+      continue;
+    }
+    if (argument === "--profile" || argument === "--error-format") {
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--profile=") || argument.startsWith("--error-format=")) {
+      continue;
+    }
+    if (argument.startsWith("-")) {
+      return false;
+    }
+    command.push(argument);
+    if (command.length === 2) {
+      return command[0] === "self" && command[1] === "update";
+    }
+  }
+  return false;
 }
 
 function packageInstallContextForCommand(argumentsToForward, options) {

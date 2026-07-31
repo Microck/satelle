@@ -4221,13 +4221,13 @@ impl ErrorCode {
             | Self::SessionNotFound
             | Self::LogsCursorExpired
             | Self::SelfUpdateInstallOwnerUnknown
-            | Self::SelfUpdateReceiptInvalid => 66,
+            | Self::SelfUpdateReceiptInvalid
+            | Self::UnsupportedLocalPlatform
+            | Self::UnsupportedReleaseTarget => 66,
             Self::HostUnreachable
             | Self::HostDaemonUnreachable
             | Self::DirectDaemonUnreachable
-            | Self::SshBootstrapUnavailable
-            | Self::UnsupportedLocalPlatform
-            | Self::UnsupportedReleaseTarget => 69,
+            | Self::SshBootstrapUnavailable => 69,
             Self::CertificateUntrusted
             | Self::CertificateHostnameMismatch
             | Self::CertificateExpired
@@ -6084,12 +6084,12 @@ mod error_contract_tests {
             (
                 ErrorCode::UnsupportedLocalPlatform,
                 "unsupported-local-platform",
-                69,
+                66,
             ),
             (
                 ErrorCode::UnsupportedReleaseTarget,
                 "unsupported-release-target",
-                69,
+                66,
             ),
             (ErrorCode::SelfUpdateLocked, "self-update-locked", 75),
             (

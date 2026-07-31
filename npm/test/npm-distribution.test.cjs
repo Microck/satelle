@@ -481,6 +481,17 @@ test("self-update package context preserves global unscoped ownership", (context
 
 test("package install context is reserved for self update", () => {
   assert.equal(launcher.isSelfUpdate(["self", "update"]), true);
+  assert.equal(
+    launcher.isSelfUpdate([
+      "--profile",
+      "ci",
+      "self",
+      "--error-format=json",
+      "update",
+      "--no-color",
+    ]),
+    true,
+  );
   assert.equal(launcher.isSelfUpdate(["run", "--agent", "codex"]), false);
   assert.equal(launcher.isSelfUpdate(["self", "version"]), false);
   const options = {
@@ -489,6 +500,24 @@ test("package install context is reserved for self update", () => {
     },
   };
   assert.equal(launcher.packageInstallContextForCommand(["run"], options), undefined);
+});
+
+test("Windows global discovery invokes package-manager launcher files", () => {
+  const probes = [];
+  launcher.discoverGlobalOwnership({
+    packageName: "@microck/satelle",
+    launcherPath: "C:\\fixture\\node_modules\\@microck\\satelle\\bin\\satelle.cjs",
+    platform: "win32",
+    runCommand(command, argumentsToForward) {
+      probes.push([command, argumentsToForward]);
+      return undefined;
+    },
+  });
+
+  assert.deepEqual(
+    probes.map(([command]) => command),
+    ["npm.cmd", "pnpm.cmd", "bun.exe"],
+  );
 });
 
 test("self-update context rejects cross-lane ownership ambiguity", (context) => {
@@ -611,7 +640,7 @@ test("canonical launches detect an installed unscoped forwarding package", (cont
       packageName: "@microck/satelle",
       launcherPath: canonicalLauncher,
     }),
-    { packageName: "satelle", launcherPath: unscopedLauncher },
+    { packageName: "satelle", launcherPath: realpathSync(unscopedLauncher) },
   );
 
   writeFileSync(

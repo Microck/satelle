@@ -444,7 +444,6 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          cache: npm
           registry-url: https://registry.npmjs.org
 
       - name: Install npm workspace
@@ -543,7 +542,11 @@ jobs:
             npm publish "$package" --provenance --access public --tag "rc-v$RELEASE_VERSION"
           done
 
-      - name: Publish the GitHub release after npm succeeds
+      # T9 owns the durable, recoverable npm latest-tag transaction. Until
+      # that train lands, publishing version-exact candidates is safe but a
+      # public GitHub release would advertise packages that default installs
+      # cannot resolve.
+      - name: Keep the GitHub release draft until recoverable npm promotion is available
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+        run: test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true

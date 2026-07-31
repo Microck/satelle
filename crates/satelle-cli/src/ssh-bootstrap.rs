@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -2434,10 +2434,11 @@ impl<'a> PersistentServiceRemote<'a> {
 
     pub(super) fn install_verified_host_artifact(
         &mut self,
+        version: &str,
         expected_digest: &str,
     ) -> Result<UploadedHostArtifact, SshBootstrapError> {
         let metadata = ReleaseArtifactMetadata::from_digest_hex(expected_digest)?;
-        let artifact = DownloadedArtifact::fetch_with_metadata(self.target, metadata)?;
+        let artifact = DownloadedArtifact::fetch_with_metadata(self.target, version, metadata)?;
         self.install_host_artifact(artifact)
     }
 
@@ -4566,13 +4567,10 @@ pub(super) struct ReleaseArtifactMetadata {
 }
 
 impl ReleaseArtifactMetadata {
-    pub(super) fn fetch(target: RemoteTarget) -> Result<Self, SshBootstrapError> {
-        let artifact =
-            self_update::fetch_verified_host_artifact(env!("CARGO_PKG_VERSION"), target.id())
-                .map_err(|error| SshBootstrapError::VerifiedRelease(Box::new(error)))?;
-        Ok(Self {
-            digest: artifact.artifact_digest_bytes(),
-        })
+    pub(super) fn fetch(target: RemoteTarget, version: &str) -> Result<Self, SshBootstrapError> {
+        self_update::fetch_host_artifact_digest(version, target.id())
+            .map(|digest| Self { digest })
+            .map_err(|error| SshBootstrapError::VerifiedRelease(Box::new(error)))
     }
 
     pub(super) const fn from_digest(digest: [u8; 32]) -> Self {
@@ -4611,11 +4609,11 @@ impl DownloadedArtifact {
 
     fn fetch_with_metadata(
         target: RemoteTarget,
+        version: &str,
         metadata: ReleaseArtifactMetadata,
     ) -> Result<Self, SshBootstrapError> {
-        let artifact =
-            self_update::fetch_verified_host_artifact(env!("CARGO_PKG_VERSION"), target.id())
-                .map_err(|error| SshBootstrapError::VerifiedRelease(Box::new(error)))?;
+        let artifact = self_update::fetch_verified_host_artifact(version, target.id())
+            .map_err(|error| SshBootstrapError::VerifiedRelease(Box::new(error)))?;
         if artifact.artifact_digest_bytes() != metadata.digest() {
             return Err(SshBootstrapError::VerifiedRelease(Box::new(
                 self_update::SelfUpdateError::ArchiveDigestMismatch,

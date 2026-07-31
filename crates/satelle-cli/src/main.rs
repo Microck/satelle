@@ -595,6 +595,7 @@ struct HostUpdateCommand {
 
 struct HostUpdateInvocation {
     host: Vec<String>,
+    host_version: String,
     component: Vec<String>,
     all_remotes: bool,
     dry_run: bool,
@@ -607,6 +608,7 @@ impl From<HostUpdateCommand> for HostUpdateInvocation {
     fn from(command: HostUpdateCommand) -> Self {
         Self {
             host: command.host,
+            host_version: env!("CARGO_PKG_VERSION").to_string(),
             component: command.component,
             all_remotes: command.all_remotes,
             dry_run: command.dry_run,
@@ -618,9 +620,10 @@ impl From<HostUpdateCommand> for HostUpdateInvocation {
 }
 
 impl HostUpdateInvocation {
-    fn from_self_update(host: String, no_input: bool) -> Self {
+    fn from_self_update(host: String, no_input: bool, host_version: String) -> Self {
         Self {
             host: vec![host],
+            host_version,
             component: Vec::new(),
             all_remotes: false,
             dry_run: false,
@@ -8130,7 +8133,8 @@ fn run_host_update_invocation(
         })
         .collect::<Vec<_>>();
     let mut report =
-        transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
+        transport::plan_host_update(&host, &command.host_version, &components, includes_all)
+            .map_err(failure)?;
     if command.dry_run {
         report = report.into_dry_run();
         if format.is_json() {
@@ -8186,8 +8190,14 @@ fn run_host_update_invocation(
         }
     }
 
-    report =
-        transport::apply_host_update(&host, report, &components, includes_all).map_err(failure)?;
+    report = transport::apply_host_update(
+        &host,
+        &command.host_version,
+        report,
+        &components,
+        includes_all,
+    )
+    .map_err(failure)?;
     if format.is_json() {
         print_json(&report).map_err(failure)
     } else if command.quiet {
@@ -8265,9 +8275,11 @@ mod host_update_consent_tests {
 
     #[test]
     fn self_update_delegates_one_host_through_the_canonical_default_update() {
-        let invocation = HostUpdateInvocation::from_self_update("office".to_string(), true);
+        let invocation =
+            HostUpdateInvocation::from_self_update("office".to_string(), true, "1.2.3".to_string());
 
         assert_eq!(invocation.host, ["office"]);
+        assert_eq!(invocation.host_version, "1.2.3");
         assert!(invocation.component.is_empty());
         assert!(!invocation.all_remotes);
         assert!(!invocation.dry_run);
@@ -8389,7 +8401,11 @@ fn run_self(
                 return Ok(());
             };
             run_host_update_invocation(
-                HostUpdateInvocation::from_self_update(host, command.no_input),
+                HostUpdateInvocation::from_self_update(
+                    host,
+                    command.no_input,
+                    report.latest_compatible_version().to_string(),
+                ),
                 config,
                 output,
             )

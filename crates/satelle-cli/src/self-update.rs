@@ -78,6 +78,10 @@ pub(crate) struct SelfUpdateReport {
 }
 
 impl SelfUpdateReport {
+    pub(crate) fn latest_compatible_version(&self) -> &str {
+        &self.latest_compatible_version
+    }
+
     pub(crate) const fn should_offer_remote_update(
         &self,
         no_input: bool,
@@ -241,7 +245,11 @@ fn fetch_verified_host_artifact_with(
         return Err(SelfUpdateError::VersionInvalid(exact_version.to_string()));
     }
     let target = LocalTarget::from_id(canonical_target_id)?;
-    let staged = source.fetch_verified_release(exact_version, target)?;
+    let staged = source.fetch_verified_release(
+        exact_version,
+        target,
+        ExecutableVerification::CrossTarget,
+    )?;
     Ok(VerifiedHostArtifact {
         #[cfg(test)]
         artifact_identity: target.archive_name(exact_version),
@@ -249,6 +257,35 @@ fn fetch_verified_host_artifact_with(
         verified_version: exact_version.to_string(),
         staged,
     })
+}
+
+/// Reads the release manifest identity used to bind a Host update plan.
+///
+/// Planning needs the expected digest, not a staged executable. The apply
+/// phase downloads and verifies the archive once, then compares its digest
+/// with this planned identity before upload.
+pub(crate) fn fetch_host_artifact_digest(
+    exact_version: &str,
+    canonical_target_id: &str,
+) -> Result<[u8; 32], SelfUpdateError> {
+    fetch_host_artifact_digest_with(
+        &GithubReleaseSource::new()?,
+        exact_version,
+        canonical_target_id,
+    )
+}
+
+fn fetch_host_artifact_digest_with(
+    source: &impl ReleaseSource,
+    exact_version: &str,
+    canonical_target_id: &str,
+) -> Result<[u8; 32], SelfUpdateError> {
+    let version = Version::parse(exact_version)?;
+    if version.to_string() != exact_version {
+        return Err(SelfUpdateError::VersionInvalid(exact_version.to_string()));
+    }
+    let target = LocalTarget::from_id(canonical_target_id)?;
+    source.fetch_release_digest(exact_version, target)
 }
 
 pub(crate) fn run(request: SelfUpdateRequest) -> Result<SelfUpdateReport, SelfUpdateError> {
@@ -345,7 +382,11 @@ fn run_with(
         return Err(SelfUpdateError::ReceiptInvalid("target_mismatch"));
     }
 
-    let verified = source.fetch_verified_release(&target_version.to_string(), target)?;
+    let verified = source.fetch_verified_release(
+        &target_version.to_string(),
+        target,
+        ExecutableVerification::Local,
+    )?;
     let new_receipt = InstallReceipt {
         install_method: locked_receipt.install_method,
         binary_path: executable.clone(),
@@ -367,6 +408,12 @@ fn run_with(
     Ok(report)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutableVerification {
+    Local,
+    CrossTarget,
+}
+
 trait ReleaseSource {
     fn latest_stable_version(&self) -> Result<String, SelfUpdateError>;
 
@@ -374,7 +421,17 @@ trait ReleaseSource {
         &self,
         version: &str,
         target: LocalTarget,
+        executable_verification: ExecutableVerification,
     ) -> Result<VerifiedRelease, SelfUpdateError>;
+
+    fn fetch_release_digest(
+        &self,
+        version: &str,
+        target: LocalTarget,
+    ) -> Result<[u8; 32], SelfUpdateError> {
+        self.fetch_verified_release(version, target, ExecutableVerification::CrossTarget)
+            .map(|release| release.archive_digest)
+    }
 }
 
 trait ExecutableReplacer {
@@ -438,6 +495,7 @@ impl ReleaseSource for GithubReleaseSource {
         &self,
         version: &str,
         target: LocalTarget,
+        executable_verification: ExecutableVerification,
     ) -> Result<VerifiedRelease, SelfUpdateError> {
         let archive_name = target.archive_name(version);
         let release_url = format!("{RELEASE_BASE_URL}/v{version}");
@@ -455,12 +513,25 @@ impl ReleaseSource for GithubReleaseSource {
         write_private_file(&archive_path, &archive_bytes)?;
         verify_release_attestation(&archive_path, version)?;
         let executable = extract_executable(&archive_path, target, directory.path())?;
-        verify_binary_version(&executable, version)?;
+        if executable_verification == ExecutableVerification::Local {
+            verify_binary_version(&executable, version)?;
+        }
         Ok(VerifiedRelease {
             _directory: directory,
             executable,
             archive_digest: actual_digest,
         })
+    }
+
+    fn fetch_release_digest(
+        &self,
+        version: &str,
+        target: LocalTarget,
+    ) -> Result<[u8; 32], SelfUpdateError> {
+        let archive_name = target.archive_name(version);
+        let release_url = format!("{RELEASE_BASE_URL}/v{version}");
+        let manifest = self.download(&format!("{release_url}/SHA256SUMS"), MANIFEST_LIMIT)?;
+        manifest_digest(&manifest, &archive_name)
     }
 }
 
@@ -924,12 +995,10 @@ fn verified_global_manager(context: &PackageInstallContext) -> Option<String> {
         }
     }
     if let Some(bin) = manager_command_line("bun", &["pm", "bin", "--global"]) {
-        let shim = Path::new(&bin).join(if cfg!(windows) {
-            "satelle.exe"
-        } else {
-            "satelle"
-        });
-        if shim.canonicalize().ok().as_ref() == Some(&launcher_path) {
+        let shim_names = manager_shim_names(cfg!(windows));
+        if shim_names.iter().any(|shim_name| {
+            Path::new(&bin).join(shim_name).canonicalize().ok().as_ref() == Some(&launcher_path)
+        }) {
             owners.push("bun".to_string());
         }
     }
@@ -952,7 +1021,34 @@ enum ManagerProbeError {
 }
 
 fn manager_command_line(program: &str, arguments: &[&str]) -> Option<String> {
-    manager_command_line_bounded(program, arguments, Duration::from_secs(10), 64 * 1024).ok()
+    manager_command_line_bounded(
+        manager_executable(program, cfg!(windows)),
+        arguments,
+        Duration::from_secs(10),
+        64 * 1024,
+    )
+    .ok()
+}
+
+fn manager_executable(program: &str, windows: bool) -> &str {
+    if windows {
+        match program {
+            "npm" => "npm.cmd",
+            "pnpm" => "pnpm.cmd",
+            "bun" => "bun.exe",
+            _ => program,
+        }
+    } else {
+        program
+    }
+}
+
+fn manager_shim_names(windows: bool) -> &'static [&'static str] {
+    if windows {
+        &["satelle.exe", "satelle.cmd", "satelle"]
+    } else {
+        &["satelle"]
+    }
 }
 
 fn manager_command_line_bounded(
@@ -1774,6 +1870,7 @@ mod tests {
             &self,
             _version: &str,
             _target: LocalTarget,
+            _executable_verification: ExecutableVerification,
         ) -> Result<VerifiedRelease, SelfUpdateError> {
             let directory = tempdir().map_err(SelfUpdateError::TemporaryDirectory)?;
             let executable = directory.path().join("verified-satelle");
@@ -1787,7 +1884,53 @@ mod tests {
     }
 
     struct RecordingHostArtifactSource {
+        requests: RefCell<Vec<(String, String, ExecutableVerification)>>,
+    }
+
+    struct DigestOnlyHostArtifactSource {
         requests: RefCell<Vec<(String, String)>>,
+    }
+
+    impl ReleaseSource for DigestOnlyHostArtifactSource {
+        fn latest_stable_version(&self) -> Result<String, SelfUpdateError> {
+            panic!("Host artifact planning uses an exact version")
+        }
+
+        fn fetch_verified_release(
+            &self,
+            _version: &str,
+            _target: LocalTarget,
+            _executable_verification: ExecutableVerification,
+        ) -> Result<VerifiedRelease, SelfUpdateError> {
+            panic!("Host artifact planning must not stage an executable")
+        }
+
+        fn fetch_release_digest(
+            &self,
+            version: &str,
+            target: LocalTarget,
+        ) -> Result<[u8; 32], SelfUpdateError> {
+            self.requests
+                .borrow_mut()
+                .push((version.to_string(), target.id().to_string()));
+            Ok([0x6b; 32])
+        }
+    }
+
+    #[test]
+    fn host_artifact_planning_reads_only_version_exact_digest_metadata() {
+        let source = DigestOnlyHostArtifactSource {
+            requests: RefCell::new(Vec::new()),
+        };
+
+        assert_eq!(
+            fetch_host_artifact_digest_with(&source, "1.2.3", "darwin-arm64").unwrap(),
+            [0x6b; 32]
+        );
+        assert_eq!(
+            source.requests.into_inner(),
+            [("1.2.3".to_string(), "darwin-arm64".to_string())]
+        );
     }
 
     impl ReleaseSource for RecordingHostArtifactSource {
@@ -1799,10 +1942,13 @@ mod tests {
             &self,
             version: &str,
             target: LocalTarget,
+            executable_verification: ExecutableVerification,
         ) -> Result<VerifiedRelease, SelfUpdateError> {
-            self.requests
-                .borrow_mut()
-                .push((version.to_string(), target.id().to_string()));
+            self.requests.borrow_mut().push((
+                version.to_string(),
+                target.id().to_string(),
+                executable_verification,
+            ));
             let directory = tempdir().map_err(SelfUpdateError::TemporaryDirectory)?;
             let executable = directory.path().join(target.executable_name());
             fs::write(&executable, b"verified host artifact")
@@ -1858,7 +2004,13 @@ mod tests {
                 "win32-arm64-msvc",
                 "win32-x64-msvc",
             ]
-            .map(|target| ("1.2.3".to_string(), target.to_string()))
+            .map(|target| {
+                (
+                    "1.2.3".to_string(),
+                    target.to_string(),
+                    ExecutableVerification::CrossTarget,
+                )
+            })
         );
     }
 
@@ -1901,6 +2053,7 @@ mod tests {
             &self,
             _version: &str,
             _target: LocalTarget,
+            _executable_verification: ExecutableVerification,
         ) -> Result<VerifiedRelease, SelfUpdateError> {
             Err((self.failure)())
         }
@@ -1922,6 +2075,7 @@ mod tests {
             &self,
             _version: &str,
             _target: LocalTarget,
+            _executable_verification: ExecutableVerification,
         ) -> Result<VerifiedRelease, SelfUpdateError> {
             self.started
                 .send(())
@@ -2128,6 +2282,7 @@ mod tests {
                 |_| (scope == "global").then(|| manager.to_string()),
             )
             .expect("managed install");
+            let canonical_install_root = install_root.canonicalize().unwrap();
             let command = match (manager, scope) {
                 ("npm", "local") => "npm update @microck/satelle --include=optional".to_string(),
                 ("npm", "global") => {
@@ -2145,7 +2300,7 @@ mod tests {
             assert_eq!(managed.upgrade_command, command);
             assert_eq!(
                 managed.upgrade_working_directory.as_deref(),
-                (scope == "local").then_some(install_root.as_path())
+                (scope == "local").then_some(canonical_install_root.as_path())
             );
             let managed_error = SelfUpdateError::ManagedInstall(Box::new(managed.clone()));
             assert_eq!(
@@ -2270,6 +2425,21 @@ mod tests {
             assert_eq!(error.details()["working_directory"], json!(install_root));
             assert!(error.to_string().contains(" from `"));
         }
+    }
+
+    #[test]
+    fn package_manager_probes_and_shims_use_platform_launcher_names() {
+        assert_eq!(manager_executable("npm", false), "npm");
+        assert_eq!(manager_executable("pnpm", false), "pnpm");
+        assert_eq!(manager_executable("bun", false), "bun");
+        assert_eq!(manager_executable("npm", true), "npm.cmd");
+        assert_eq!(manager_executable("pnpm", true), "pnpm.cmd");
+        assert_eq!(manager_executable("bun", true), "bun.exe");
+        assert_eq!(manager_shim_names(false), ["satelle"]);
+        assert_eq!(
+            manager_shim_names(true),
+            ["satelle.exe", "satelle.cmd", "satelle"]
+        );
     }
 
     #[cfg(unix)]
@@ -2528,7 +2698,10 @@ mod tests {
         assert_eq!(report.latest_compatible_version, "1.1.0");
         assert_eq!(report.install_owner, "satelle-install-script");
         assert!(report.target_artifact.contains("satelle-v1.1.0-"));
-        assert_eq!(report.planned_replacement, fixture.current_binary);
+        assert_eq!(
+            report.planned_replacement,
+            fixture.current_binary.canonicalize().unwrap()
+        );
         assert_eq!(
             report.follow_up_host_update_command.as_deref(),
             Some("satelle host update --host workstation")

@@ -195,13 +195,19 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.match(workflow, /gh release create "\$GITHUB_REF_NAME" --draft/);
   assert.match(workflow, /gh release upload "\$GITHUB_REF_NAME"/);
   assert.match(workflow, /release asset set does not match the validated artifact set/);
-  assert.match(workflow, /gh release edit "\$GITHUB_REF_NAME" --draft=false --latest/);
+  assert.doesNotMatch(workflow, /gh release edit "\$GITHUB_REF_NAME" --draft=false --latest/);
+  assert.match(
+    workflow,
+    /Keep the GitHub release draft until recoverable npm promotion is available/,
+  );
   assert.ok(
     workflow.indexOf(
       'npm publish "$package" --provenance --access public --tag "rc-v$RELEASE_VERSION"',
     ) <
-      workflow.indexOf('gh release edit "$GITHUB_REF_NAME" --draft=false --latest'),
-    "the release must remain a draft until every package is published",
+      workflow.indexOf(
+        "- name: Keep the GitHub release draft until recoverable npm promotion is available",
+      ),
+    "the release must remain a draft after every candidate package is published",
   );
   assert.doesNotMatch(workflow, /^\s+(?:validated|dist)\/npm-.*\.tgz \\?$/m);
   assert.match(workflow, /\.\/dist\/npm-satelle-scoped\.tgz/);
