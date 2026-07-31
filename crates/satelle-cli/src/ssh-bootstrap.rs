@@ -1347,6 +1347,18 @@ sync"#,
         self,
         directories: &RemoteUserDirectories,
     ) -> Result<String, SshBootstrapError> {
+        let cache_root = self.artifact_root(directories)?;
+        Ok(join_target_path(
+            self,
+            &cache_root,
+            &format!("v{}/{}", env!("CARGO_PKG_VERSION"), self.id()),
+        ))
+    }
+
+    fn artifact_root(
+        self,
+        directories: &RemoteUserDirectories,
+    ) -> Result<String, SshBootstrapError> {
         if directories.target != self {
             return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
         }
@@ -1369,11 +1381,7 @@ sync"#,
                 .unwrap_or_else(|| join_target_path(self, &directories.home, ".cache"));
             join_target_path(self, &cache, "satelle/host")
         };
-        Ok(join_target_path(
-            self,
-            &cache_root,
-            &format!("v{}/{}", env!("CARGO_PKG_VERSION"), self.id()),
-        ))
+        Ok(cache_root)
     }
 
     fn artifact_upload_directory(
@@ -3585,19 +3593,47 @@ fn same_windows_path_text(left: &str, right: &str) -> bool {
 
 pub(super) fn managed_service_executable_version(
     target: RemoteTarget,
+    directories: &RemoteUserDirectories,
     executable: &str,
 ) -> Option<String> {
-    let components = executable
-        .split(['/', '\\'])
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>();
-    components.windows(2).find_map(|pair| {
-        (pair[1] == target.id())
-            .then(|| pair[0].strip_prefix('v'))
-            .flatten()
-            .filter(|version| !version.is_empty())
-            .map(str::to_string)
-    })
+    let normalize = |path: &str| {
+        let path = path.replace('\\', "/");
+        let path = path
+            .strip_prefix("//?/")
+            .unwrap_or(&path)
+            .trim_end_matches('/');
+        if target.is_windows() {
+            path.to_ascii_lowercase()
+        } else {
+            path.to_string()
+        }
+    };
+    let root = normalize(&target.artifact_root(directories).ok()?);
+    let executable = normalize(executable);
+    let relative = executable.strip_prefix(&format!("{root}/"))?;
+    let mut components = relative.split('/');
+    let version = components
+        .next()?
+        .strip_prefix('v')
+        .filter(|version| !version.is_empty())?;
+    if components.next()? != target.id() {
+        return None;
+    }
+    let filename = components.next()?;
+    if components.next().is_some() {
+        return None;
+    }
+
+    if target.is_windows() {
+        let digest = filename.strip_prefix("satelle-")?.strip_suffix(".exe")?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+    } else if filename != target.executable_name() {
+        return None;
+    }
+
+    Some(version.to_string())
 }
 
 impl RemoteUserDirectories {
@@ -3691,12 +3727,14 @@ impl RemoteUserDirectories {
         destination: &str,
         path: &str,
         host_id: &str,
+        expected_path_overrides: &DaemonPathOverrides,
     ) -> Result<Option<String>, SshBootstrapError> {
         self.probe_managed_service_executable_with_program(
             OsStr::new("ssh"),
             destination,
             path,
             host_id,
+            expected_path_overrides,
         )
     }
 
@@ -3707,12 +3745,14 @@ impl RemoteUserDirectories {
         destination: &str,
         path: &str,
         host_id: &str,
+        expected_path_overrides: &DaemonPathOverrides,
     ) -> Result<Option<String>, SshBootstrapError> {
         self.probe_managed_service_executable_with_program(
             ssh_program.as_os_str(),
             destination,
             path,
             host_id,
+            expected_path_overrides,
         )
     }
 
@@ -3722,6 +3762,7 @@ impl RemoteUserDirectories {
         destination: &str,
         path: &str,
         host_id: &str,
+        expected_path_overrides: &DaemonPathOverrides,
     ) -> Result<Option<String>, SshBootstrapError> {
         if host_id.is_empty()
             || !host_id
@@ -3779,6 +3820,7 @@ impl RemoteUserDirectories {
                     "[StringComparison]::OrdinalIgnoreCase)) {{ ",
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "[Console]::Out.WriteLine('managed'); ",
+                    "[Console]::Out.WriteLine(($config | ConvertTo-Json -Compress -Depth 4)); ",
                     "[Console]::Out.Write($resolvedExecutable)"
                 ),
                 path = powershell_quote(path),
@@ -3830,10 +3872,27 @@ impl RemoteUserDirectories {
             return Err(SshBootstrapError::InvalidServiceObservation);
         }
         if self.target.is_windows() {
-            if payload.is_empty() || payload.contains(['\r', '\n']) {
+            let (config, executable) = payload
+                .split_once('\n')
+                .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+            let config = config.strip_suffix('\r').unwrap_or(config);
+            let Ok(config) = serde_json::from_str::<
+                satelle_core::daemon_service::WindowsServiceConfigV1,
+            >(config) else {
+                return Ok(None);
+            };
+            let expected = satelle_core::daemon_service::WindowsServiceConfigV1::new(
+                "127.0.0.1:3001",
+                expected_path_overrides,
+            )
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+            if config != expected {
+                return Ok(None);
+            }
+            if executable.is_empty() || executable.contains(['\r', '\n']) {
                 return Err(SshBootstrapError::InvalidServiceObservation);
             }
-            return Ok(Some(payload.to_string()));
+            return Ok(Some(executable.to_string()));
         }
         let arguments: Vec<String> = serde_json::from_str(payload)
             .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
@@ -5324,6 +5383,7 @@ mod tests {
                     "operator@example",
                     &service_path,
                     "host-123",
+                    &DaemonPathOverrides::default(),
                 )
                 .expect("run audited read-only service probe")
                 .as_deref(),
@@ -5372,6 +5432,7 @@ mod tests {
                     "operator@example",
                     &service_path,
                     "host-123",
+                    &DaemonPathOverrides::default(),
                 )
                 .expect("a well-formed drifted launchd invocation is observable")
                 .is_none()
@@ -5382,8 +5443,12 @@ mod tests {
             format!(
                 concat!(
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                    "printf 'managed\\r\\nC:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\",
-                    "host\\\\v0.1.0\\\\win32-x64-msvc\\\\satelle.exe'\n"
+                    "printf 'managed\\r\\n{{\"schema\":\"satelle.host-service.v1\",",
+                    "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
+                    "\"127.0.0.1:3001\"],\"environment\":{{}}}}\\r\\n",
+                    "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
+                    "win32-x64-msvc\\\\satelle-",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n"
                 ),
                 posix_quote(audit_log.to_str().expect("UTF-8 audit path")),
             ),
@@ -5400,10 +5465,13 @@ mod tests {
                     "operator@example",
                     &windows_service_path,
                     "host-123",
+                    &DaemonPathOverrides::default(),
                 )
                 .expect("run audited Windows service probe")
                 .as_deref(),
-            Some(r"C:\Users\operator\AppData\Local\Satelle\host\v0.1.0\win32-x64-msvc\satelle.exe")
+            Some(
+                r"C:\Users\operator\AppData\Local\Satelle\host\v0.1.0\win32-x64-msvc\satelle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe"
+            )
         );
         let invocation = fs::read_to_string(audit_log).expect("read Windows fake SSH audit");
         let command = invocation
@@ -5452,13 +5520,69 @@ mod tests {
                 "Windows service probe attempted mutation command {mutation}: {script}"
             );
         }
+
+        fs::write(
+            &fake_ssh,
+            concat!(
+                "#!/bin/sh\nprintf 'managed\\r\\n",
+                "{\"schema\":\"satelle.host-service.v1\",",
+                "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
+                "\"127.0.0.1:3002\"],\"environment\":{}}\\r\\n",
+                "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
+                "win32-x64-msvc\\\\satelle-",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n",
+            ),
+        )
+        .expect("replace fake SSH response with a drifted Windows service config");
+        assert!(
+            windows
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &windows_service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                )
+                .expect("a well-formed drifted Windows service config is observable")
+                .is_none()
+        );
+
+        fs::write(
+            &fake_ssh,
+            concat!(
+                "#!/bin/sh\nprintf 'managed\\r\\n",
+                "{\"schema\":\"satelle.host-service.v1\",",
+                "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
+                "\"127.0.0.1:3001\"],",
+                "\"environment\":{\"SATELLE_HOME\":\"C:\\\\\\\\Drifted\"}}\\r\\n",
+                "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
+                "win32-x64-msvc\\\\satelle-",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n",
+            ),
+        )
+        .expect("replace fake SSH response with a drifted Windows service environment");
+        assert!(
+            windows
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &windows_service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                )
+                .expect("a well-formed drifted Windows service environment is observable")
+                .is_none()
+        );
     }
 
     #[test]
     fn managed_service_version_comes_from_its_executable_target() {
+        let macos = RemoteUserDirectories::for_tests(RemoteTarget::DarwinArm64);
+        let windows = RemoteUserDirectories::for_tests(RemoteTarget::WindowsX64Msvc);
         assert_eq!(
             managed_service_executable_version(
                 RemoteTarget::DarwinArm64,
+                &macos,
                 "/Users/operator/Library/Caches/Satelle/host/v0.0.9/darwin-arm64/satelle",
             ),
             Some("0.0.9".to_string())
@@ -5466,9 +5590,26 @@ mod tests {
         assert_eq!(
             managed_service_executable_version(
                 RemoteTarget::WindowsX64Msvc,
-                r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle.exe",
+                &windows,
+                r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe",
             ),
             Some("0.0.8".to_string())
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::DarwinArm64,
+                &macos,
+                "/tmp/lookalike/v0.0.9/darwin-arm64/satelle",
+            ),
+            None
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                &windows,
+                r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle.exe",
+            ),
+            None
         );
     }
 

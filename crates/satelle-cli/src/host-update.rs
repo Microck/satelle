@@ -229,28 +229,38 @@ fn plan_host_targets(
         "replace_host_daemon",
         artifact.and_then(|artifact| artifact.daemon_destination),
     );
+    let daemon_restart_impact = if daemon_mutations.is_empty() {
+        HostUpdateRestartImpact::None
+    } else {
+        HostUpdateRestartImpact::HostDaemon
+    };
     let mut targets = vec![HostUpdateTargetPlan {
         target: HostUpdateTarget::HostDaemon,
         current_version: request.host_inspection.current_version.clone(),
         target_version: request.cli_version.to_string(),
         version_source: HostUpdateVersionSource::InvokingCliRelease,
         disposition,
-        restart_impact: HostUpdateRestartImpact::HostDaemon,
+        restart_impact: daemon_restart_impact,
         remote_mutations: daemon_mutations,
     }];
     if let Some((service, disposition)) = request.service_inspection.zip(service_disposition) {
+        let remote_mutations = mutation_for(
+            disposition,
+            "replace_host_daemon_service",
+            Some(service.destination.clone()),
+        );
         targets.push(HostUpdateTargetPlan {
             target: HostUpdateTarget::HostDaemonService,
             current_version: service.current_version.clone(),
             target_version: request.cli_version.to_string(),
             version_source: HostUpdateVersionSource::InvokingCliRelease,
             disposition,
-            restart_impact: HostUpdateRestartImpact::HostDaemon,
-            remote_mutations: mutation_for(
-                disposition,
-                "replace_host_daemon_service",
-                Some(service.destination.clone()),
-            ),
+            restart_impact: if remote_mutations.is_empty() {
+                HostUpdateRestartImpact::None
+            } else {
+                HostUpdateRestartImpact::HostDaemon
+            },
+            remote_mutations,
         });
     }
 
@@ -320,7 +330,11 @@ fn plan_codex_targets(
                 } else {
                     HostUpdateDisposition::Current
                 },
-                restart_impact: inspection.restart_impact,
+                restart_impact: if inspection.update_required {
+                    inspection.restart_impact
+                } else {
+                    HostUpdateRestartImpact::None
+                },
                 remote_mutations: if inspection.update_required {
                     inspection.remote_mutations.clone()
                 } else {
@@ -681,6 +695,11 @@ mod tests {
     fn current_host_does_not_resolve_an_update_artifact() {
         let mut host = host_inspection(HostVersionRelation::MatchesCli);
         host.current_version = Some("1.2.3".to_string());
+        let service = HostUpdateServiceInspection {
+            current_version: Some("1.2.3".to_string()),
+            relation_to_cli: HostVersionRelation::MatchesCli,
+            destination: "/home/operator/.config/systemd/user/satelle.service".to_string(),
+        };
         let report = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
@@ -688,19 +707,44 @@ mod tests {
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
-                service_inspection: None,
+                service_inspection: Some(&service),
                 codex_inspections: &[],
             },
             &Artifact(None),
         )
         .expect("a current Host does not need an update artifact");
 
-        assert_eq!(report.targets.len(), 1);
-        assert_eq!(
-            report.targets[0].disposition,
-            HostUpdateDisposition::Current
-        );
+        assert_eq!(report.targets.len(), 2);
+        assert!(report.targets.iter().all(|target| {
+            target.disposition == HostUpdateDisposition::Current
+                && target.restart_impact == HostUpdateRestartImpact::None
+                && target.remote_mutations.is_empty()
+        }));
         assert!(!report.confirmation_required);
+    }
+
+    #[test]
+    fn current_codex_target_has_no_restart_impact() {
+        let target = plan_codex_targets(
+            &[CodexUpdateInspection {
+                target: HostUpdateTarget::CodexRuntime,
+                evidence_available: true,
+                ownership: CodexComponentOwnership::CodexOwned,
+                current_version: Some("1.0.0".to_string()),
+                target_version: "1.0.0".to_string(),
+                update_required: false,
+                restart_impact: HostUpdateRestartImpact::CodexRuntime,
+                remote_mutations: Vec::new(),
+            }],
+            false,
+        )
+        .expect("plan a current Codex target")
+        .pop()
+        .expect("Codex target");
+
+        assert_eq!(target.disposition, HostUpdateDisposition::Current);
+        assert_eq!(target.restart_impact, HostUpdateRestartImpact::None);
+        assert!(target.remote_mutations.is_empty());
     }
 
     #[test]

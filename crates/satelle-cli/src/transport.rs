@@ -2822,6 +2822,7 @@ fn maintenance_release_artifact_required(
 
 fn host_service_inspection_from_executable(
     target: ssh_bootstrap::RemoteTarget,
+    directories: &ssh_bootstrap::RemoteUserDirectories,
     destination: &str,
     executable: Option<String>,
     cli_version: &str,
@@ -2833,7 +2834,8 @@ fn host_service_inspection_from_executable(
             destination: destination.to_string(),
         });
     };
-    let current_version = ssh_bootstrap::managed_service_executable_version(target, &executable);
+    let current_version =
+        ssh_bootstrap::managed_service_executable_version(target, directories, &executable);
     let relation_to_cli = match current_version.as_deref() {
         Some(current_version) => {
             host_version_relation(Some(current_version), true, None, cli_version)?
@@ -2973,6 +2975,14 @@ fn inspect_host_maintenance(
                 let directories = remote_directories
                     .as_ref()
                     .expect("persistent Host inspection requests remote directories");
+                let expected_path_overrides = DaemonPathOverrides {
+                    home: host.config.daemon_home.clone(),
+                    config_file: host.config.daemon_config_file.clone(),
+                    state_dir: host.config.daemon_state_dir.clone(),
+                    cache_dir: host.config.daemon_cache_dir.clone(),
+                    log_dir: host.config.daemon_log_dir.clone(),
+                    ..DaemonPathOverrides::default()
+                };
                 let host_id = transport.binding.expected_host_identity().as_str();
                 let service_path = directories.persistent_service_asset_path(host_id);
                 match service_path {
@@ -2982,12 +2992,14 @@ fn inspect_host_maintenance(
                                 transport.binding.destination(),
                                 &destination,
                                 host_id,
+                                &expected_path_overrides,
                             )
                             .map_err(|error| {
                                 map_ssh_daemon_bootstrap_error(&transport.alias, error)
                             })?;
                         Some(host_service_inspection_from_executable(
                             target,
+                            directories,
                             &destination,
                             executable,
                             cli_version,
@@ -6634,8 +6646,12 @@ mod bootstrap_ordering_tests {
 
     #[test]
     fn absent_persistent_service_is_a_missing_service_target() {
+        let directories = ssh_bootstrap::RemoteUserDirectories::for_tests(
+            ssh_bootstrap::RemoteTarget::DarwinArm64,
+        );
         let inspection = host_service_inspection_from_executable(
             ssh_bootstrap::RemoteTarget::DarwinArm64,
+            &directories,
             "/Users/operator/Library/LaunchAgents/dev.microck.satelle.host.plist",
             None,
             env!("CARGO_PKG_VERSION"),
@@ -6655,8 +6671,12 @@ mod bootstrap_ordering_tests {
 
     #[test]
     fn managed_service_with_an_unparseable_version_remains_an_update_target() {
+        let directories = ssh_bootstrap::RemoteUserDirectories::for_tests(
+            ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
+        );
         let inspection = host_service_inspection_from_executable(
             ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
+            &directories,
             r"C:\Users\operator\AppData\Local\Satelle\service\host-office.json",
             Some(r"C:\Program Files\Satelle\satelle.exe".to_string()),
             env!("CARGO_PKG_VERSION"),
