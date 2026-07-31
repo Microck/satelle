@@ -1938,9 +1938,6 @@ fn lost_daemon_adoption_response_retains_the_partial_operation_identity() {
         Vec::new(),
     );
     report.changed = true;
-    report
-        .applied_actions
-        .push("restart-host-daemon".to_string());
 
     let error = host_update_daemon_adoption_error(
         &mut report,
@@ -1952,6 +1949,11 @@ fn lost_daemon_adoption_response_retains_the_partial_operation_identity() {
     assert_eq!(
         error.details.get("operation_id"),
         Some(&serde_json::json!(operation_id))
+    );
+    assert_eq!(report.applied_actions, ["restart-host-daemon"]);
+    assert_eq!(
+        error.details.get("completed_actions"),
+        Some(&serde_json::json!(["restart-host-daemon"]))
     );
 }
 

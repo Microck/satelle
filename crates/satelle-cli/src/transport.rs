@@ -4294,6 +4294,10 @@ fn host_update_daemon_adoption_error(
     operation_id: &str,
     source: SatelleError,
 ) -> SatelleError {
+    report.changed = true;
+    report
+        .applied_actions
+        .push("restart-host-daemon".to_string());
     operation_scoped_partial_host_update(report, "restart-host-daemon", operation_id, source, None)
 }
 

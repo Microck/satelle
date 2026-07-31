@@ -212,9 +212,15 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Codex control plane cannot admit this operation",
             details: validated_control_plane_details(error),
         },
-        ErrorCode::ComputerUseNotReady
-        | ErrorCode::DoctorReadinessBlockersFound
-        | ErrorCode::SetupVerificationFailed => ApiFailure {
+        ErrorCode::ComputerUseNotReady => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::ComputerUseNotReady,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "native Computer Use is not ready on this Host",
+            details: validated_maintenance_postcheck_details(error),
+        },
+        ErrorCode::DoctorReadinessBlockersFound | ErrorCode::SetupVerificationFailed => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::ComputerUseNotReady,
             category: ApiErrorCategory::Readiness,
@@ -301,7 +307,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
             category: ApiErrorCategory::Readiness,
             retryable: true,
             message: "the native Computer Use readiness smoke test timed out",
-            details: None,
+            details: validated_maintenance_postcheck_details(error),
         },
         ErrorCode::ProviderSmokeTestTimeout => ApiFailure {
             status: StatusCode::GATEWAY_TIMEOUT,
@@ -413,6 +419,16 @@ fn validated_control_plane_details(error: &SatelleError) -> Option<serde_json::V
     let value = serde_json::Value::Object(error.details.clone().into_iter().collect());
     let details = serde_json::from_value::<IncompatibleControlPlaneDetails>(value).ok()?;
     serde_json::to_value(details).ok()
+}
+
+fn validated_maintenance_postcheck_details(error: &SatelleError) -> Option<serde_json::Value> {
+    let terminal = error
+        .details
+        .get("maintenance_postcheck_terminal")?
+        .as_bool()?;
+    Some(serde_json::json!({
+        "maintenance_postcheck_terminal": terminal
+    }))
 }
 
 fn validated_stop_not_confirmed_details(error: &SatelleError) -> Option<serde_json::Value> {
@@ -556,6 +572,33 @@ mod tests {
         assert_eq!(timeout.code, ApiErrorCode::NativeReadinessTimeout);
         assert_eq!(timeout.category, ApiErrorCategory::Readiness);
         assert!(timeout.retryable);
+    }
+
+    #[test]
+    fn maintenance_postcheck_terminal_detail_crosses_the_authenticated_boundary() {
+        for mut error in [
+            SatelleError::computer_use_not_ready(),
+            SatelleError::native_readiness_timeout(),
+        ] {
+            error
+                .details
+                .insert("maintenance_postcheck_terminal".to_string(), json!(true));
+            error.details.insert(
+                "private_canary".to_string(),
+                json!("PRIVATE_DETAILS_CANARY"),
+            );
+
+            assert_eq!(
+                failure(&error).details,
+                Some(json!({ "maintenance_postcheck_terminal": true }))
+            );
+
+            error.details.insert(
+                "maintenance_postcheck_terminal".to_string(),
+                json!("PRIVATE_INVALID_TERMINAL"),
+            );
+            assert_eq!(failure(&error).details, None);
+        }
     }
 
     #[test]
