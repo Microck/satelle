@@ -170,6 +170,11 @@ test("release workflow validates six targets and publishes only a fully verified
     declaredTargets.length,
     "every workflow target needs one Rust target",
   );
+  assert.doesNotMatch(
+    buildMatrix,
+    /runner:.*self-hosted/,
+    "pull-request release builds must not run untrusted code on persistent runners",
+  );
 
   const expectedTargets = Object.entries(platformMatrix)
     .map(([target, { rustTarget }]) => ({ target, rustTarget }))
