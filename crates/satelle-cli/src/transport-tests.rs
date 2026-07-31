@@ -1588,6 +1588,52 @@ fn failed_prechange_action_cleanup_reports_the_recovery_pending_operation() {
 
 #[cfg(unix)]
 #[test]
+fn failed_read_only_preflight_cleanup_reports_the_unchanged_operation() {
+    with_bootstrap_handoff_test_context_with_scope(
+        ApiScopes::ADMIN,
+        |client, fake_ssh, _, _, service, bootstrap_token_id| {
+            let operation_id = "host-update-read-only-preflight-cleanup-failure";
+            client
+                .begin_host_update_maintenance(operation_id)
+                .expect("begin Host update maintenance");
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "host-update-read-only-cleanup-failure-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::HostBinaryReplacement,
+                fake_ssh,
+            )
+            .expect("acquire Host replacement Bootstrap Lock");
+            bootstrap_lock
+                .confirm_ownership()
+                .expect("confirm Bootstrap Lock ownership");
+            service
+                .revoke_api_token(bootstrap_token_id)
+                .expect("revoke cleanup authority after the read-only preflight");
+
+            let error = close_locked_unmodified_host_update_or_recovery_pending(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                SatelleError::host_artifact_unavailable(env!("CARGO_PKG_VERSION"), "darwin-arm64"),
+            );
+
+            assert_eq!(error.code, ErrorCode::HostUpdateRecoveryPending);
+            assert_eq!(
+                error.details.get("operation_id"),
+                Some(&serde_json::json!(operation_id))
+            );
+            assert_eq!(error.details.get("changed"), None);
+            assert_eq!(
+                error.recovery_command.as_deref(),
+                Some("satelle repair --host office --no-input --yes")
+            );
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn failed_postchange_action_cleanup_retains_the_partial_operation_identity() {
     with_bootstrap_handoff_test_context_with_scope(
         ApiScopes::ADMIN,

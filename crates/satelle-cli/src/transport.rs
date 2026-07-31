@@ -3380,21 +3380,12 @@ pub(crate) fn apply_host_update(
         Ok(overrides) => overrides,
         Err(error) => {
             let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-            if finish_locked_unmodified_host_update(
+            return Err(close_locked_unmodified_host_update_or_recovery_pending(
                 &transport.alias,
                 &old_client,
                 &mut bootstrap_lock,
-            )
-            .is_err()
-            {
-                report.changed = true;
-                return Err(host_update_recovery_pending(
-                    &mut report,
-                    "install-host-artifact",
-                    source,
-                ));
-            }
-            return Err(source);
+                source,
+            ));
         }
     };
 
@@ -4073,6 +4064,23 @@ fn finish_locked_unmodified_host_update(
     bootstrap_lock
         .release_committed_handoff()
         .map_err(|_| SatelleError::host_unreachable(host))
+}
+
+fn close_locked_unmodified_host_update_or_recovery_pending(
+    host: &str,
+    client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    source: SatelleError,
+) -> SatelleError {
+    let operation_id = bootstrap_lock.operation_id().to_string();
+    match finish_locked_unmodified_host_update(host, client, bootstrap_lock) {
+        Ok(()) => source,
+        Err(cleanup) => SatelleError::host_update_recovery_pending(
+            host,
+            &operation_id,
+            format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}"),
+        ),
+    }
 }
 
 fn finish_unmodified_after_uncertain_first_action_start(
