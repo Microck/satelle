@@ -153,7 +153,7 @@
 - satelle config check JSON v1 uses schema_version satelle.config.check.v1 @contract @mvp @implemented
 - satelle config explain JSON v2 uses schema_version satelle.config.explain.v2 @contract @mvp @implemented
 - satelle self update JSON v1 uses schema_version satelle.self.update.v1 @spec @contract @mvp
-- satelle host update JSON v1 uses schema_version satelle.host.update.v1 @spec @contract @mvp
+- satelle host update JSON v1 uses schema_version satelle.host.update.v1 @spec @contract @mvp @implemented
 - satelle paths JSON v2 uses schema_version satelle.paths.v2 @contract @mvp @implemented
 - satelle host sessions JSON v1 uses schema_version satelle.host.sessions.v1 @contract @mvp @implemented
 - satelle JSON error v1 uses schema_version satelle.error.v1 @contract @mvp @implemented
@@ -594,36 +594,36 @@
 - satelle host storage migrate attempts rollback to the previous Satelle Path Set and service configuration when migration fails after remote mutation begins @spec @later
 - satelle host storage migrate reports a typed storage-migration-rollback-failed error with preserved source paths, destination staging paths, service state, and manual recovery commands when automatic rollback cannot restore the previous ready state @spec @later
 - satelle host storage migrate runs post-migration checks for Host Daemon API reachability, expected Satelle Path Set, SQLite integrity, operator log writability, recording artifact path writability when recordings are enabled, and native Computer Use readiness-cache invalidation @spec @later
-- satelle setup reports a typed host-binary-newer-than-cli error instead of downgrading automatically when the reachable Satelle Host Daemon version is newer than the invoking local CLI version @spec @mvp
-- satelle setup reports a typed host-artifact-unavailable error when the invoking local CLI release artifact set lacks a verified Host Daemon binary for the detected remote platform @spec @mvp
+- satelle setup reports a typed host-binary-newer-than-cli error instead of downgrading automatically when the reachable Satelle Host Daemon version is newer than the invoking local CLI version @spec @mvp @implemented
+- satelle setup reports a typed host-artifact-unavailable error when the invoking local CLI release artifact set lacks a verified Host Daemon binary for the detected remote platform @spec @mvp @implemented
 - satelle exposes satelle host update as the explicit maintenance command for ordinary updates to Satelle host binaries and supported standalone Codex runtime components @implemented @mvp
-- satelle host update is distinct from setup and repair: setup onboards prerequisites, repair restores broken readiness or compatibility, and host update performs user-requested maintenance updates @spec @mvp
-- satelle host update does not start prompt execution or modify Satelle sessions as a side effect @spec @mvp
-- satelle host update checks all supported update targets by default when no component filter is provided @mvp @spec
-- satelle host update supports a repeatable --component <host|codex|all> filter for selecting update targets @mvp @spec
-- satelle host update --component host selects only Satelle-owned host binaries and Host Daemon service assets, not Codex runtime components @mvp @spec
-- satelle host update --component host targets the Satelle host binary version that exactly matches the invoking local CLI release for the remote host platform @spec @mvp
-- satelle MVP does not support selecting an arbitrary Satelle host binary version, update channel, or latest remote release independently from the invoking local CLI version @spec @mvp
+- satelle host update is distinct from setup and repair: setup onboards prerequisites, repair restores broken readiness or compatibility, and host update performs user-requested maintenance updates @spec @mvp @implemented
+- satelle host update does not start prompt execution or modify Satelle sessions as a side effect @spec @mvp @implemented
+- satelle host update checks all supported update targets by default when no component filter is provided @mvp @spec @implemented
+- satelle host update supports a repeatable --component <host|codex|all> filter for selecting update targets @mvp @spec @implemented
+- satelle host update --component host selects only Satelle-owned host binaries and Host Daemon service assets, not Codex runtime components @mvp @spec @implemented
+- satelle host update --component host targets the Satelle host binary version that exactly matches the invoking local CLI release for the remote host platform @spec @mvp @implemented
+- satelle MVP does not support selecting an arbitrary Satelle host binary version, update channel, or latest remote release independently from the invoking local CLI version @spec @mvp @implemented
 - satelle host update does not intentionally leave the Satelle Host Daemon on a Satelle version different from the invoking local CLI version after a successful host component update @spec @mvp
-- satelle host update may use SSH bootstrap or a narrow versioned update handshake only to replace an older or missing Satelle host binary with the invoking CLI's matching host artifact @spec @mvp
-- satelle host update reports a typed host-binary-newer-than-cli error instead of downgrading automatically when the reachable Satelle Host Daemon version is newer than the invoking local CLI version @spec @mvp
-- satelle host update reports a typed host-update-requires-cli-upgrade error when the selected host update requires a Satelle host binary version newer than the invoking local CLI can provide @spec @mvp
+- satelle host update may use SSH bootstrap or a narrow versioned update handshake only to replace an older or missing Satelle host binary with the invoking CLI's matching host artifact @spec @mvp @implemented
+- satelle host update reports a typed host-binary-newer-than-cli error instead of downgrading automatically when the reachable Satelle Host Daemon version is newer than the invoking local CLI version @spec @mvp @implemented
+- satelle host update reports a typed host-update-requires-cli-upgrade error when the selected host update requires a Satelle host binary version newer than the invoking local CLI can provide @spec @mvp @implemented
 - satelle later host update --component host --version <version> is the sole explicit Host binary version selector @spec @later
 - satelle post-MVP CLI-host compatibility matrix defines supported version skew, protocol version negotiation, feature gating, upgrade order, downgrade policy, artifact verification policy, and recovery path @spec @later
 - satelle exact Satelle CLI and Host Daemon version matching remains the default host update target when --version is absent @spec @later
 - satelle later Host binary version selection never downgrades a reachable Host Daemon unless the user explicitly selects a lower version and the compatibility matrix permits that downgrade @spec @later
 - satelle later Host binary version selection verifies the selected version's release artifact integrity metadata for the detected remote platform before upload or execution @spec @later
 - Satelle does not add Host update channels in current committed scope @spec @later
-- satelle host update --component codex selects the standalone Codex runtime and Codex-owned native Computer Use components required by that runtime for native Computer Use readiness @mvp @spec
-- satelle host update --component codex does not select the Satelle host binary or Host Daemon service assets @mvp @spec
-- satelle host update --component codex does not update unrelated browser extensions, operating-system packages, third-party tools, user browser profiles, provider credentials, or non-Codex automation software @mvp @spec
-- satelle host update shows Codex runtime updates and Codex-owned native Computer Use component updates as separate planned actions even when they are selected by the same --component codex filter @mvp @spec
-- satelle host update reports a typed ambiguous-codex-component-ownership error when a candidate update target cannot be confidently classified as Codex-owned @spec @mvp
-- satelle host update treats --component all as an explicit request to check every supported update target on the selected host @mvp @spec
+- satelle host update --component codex selects the standalone Codex runtime and Codex-owned native Computer Use components required by that runtime for native Computer Use readiness @mvp @spec @implemented
+- satelle host update --component codex does not select the Satelle host binary or Host Daemon service assets @mvp @spec @implemented
+- satelle host update --component codex does not update unrelated browser extensions, operating-system packages, third-party tools, user browser profiles, provider credentials, or non-Codex automation software @mvp @spec @implemented
+- satelle host update shows Codex runtime updates and Codex-owned native Computer Use component updates as separate planned actions even when they are selected by the same --component codex filter @mvp @spec @implemented
+- satelle host update reports a typed ambiguous-codex-component-ownership error when a candidate update target cannot be confidently classified as Codex-owned @spec @mvp @implemented
+- satelle host update treats --component all as an explicit request to check every supported update target on the selected host @mvp @spec @implemented
 - satelle host update reports a typed component-selection-conflict usage error when --component all is combined with any other --component value @implemented @mvp
 - satelle host update has no short alias for --component in MVP because component selection is a clarity-sensitive maintenance contract @implemented @mvp
-- satelle host update never mutates the remote host during its update check; mutation starts only after the planned update actions pass the command's consent rules @spec @mvp
-- satelle host update presents current versions, target versions, update targets, restart impact, and planned remote mutations before mutating the remote host @spec @mvp
+- satelle host update never mutates the remote host during its update check; mutation starts only after the planned update actions pass the command's consent rules @spec @mvp @implemented
+- satelle host update presents current versions, target versions, update targets, restart impact, and planned remote mutations before mutating the remote host @spec @mvp @implemented
 - satelle host update --yes skips only the final interactive confirmation prompt and does not skip update checks, plan presentation, safety blockers, action ledger recording, or post-update readiness checks @spec @mvp
 - satelle host update --yes prints planned remote mutations in human output before applying when --quiet is not active and JSON output mode is not active @spec @mvp
 - satelle host update --no-input --yes follows the same human plan-output rule as --yes when human output mode is active @spec @mvp
@@ -2152,13 +2152,13 @@
 - satelle setup and repair treat Ctrl-C or an interrupted cliclack prompt as an interrupt distinct from a user choosing No at the final mutation confirmation @spec @mvp
 - satelle setup and repair exit 130 for Ctrl-C or an interrupted cliclack prompt when the platform reports an interrupt signal to the process @spec @mvp
 - satelle setup may install or update the standalone Codex runtime and Satelle host binary when the target operating system and transport support the required actions @spec @mvp
-- satelle repair may update the standalone Codex runtime or Satelle host binary only when live probes show the installed component is missing, corrupted, unsupported, below the required minimum version, incompatible with the required control-plane protocol, or blocking native Computer Use readiness @spec @mvp
-- satelle repair does not perform opportunistic upgrades to the latest Codex runtime or Satelle host binary when the installed components are compatible and current readiness checks can pass @spec @mvp
-- satelle repair action plans identify the current version, target version, compatibility reason, and source of the version requirement before proposing a Codex runtime or Satelle host binary upgrade @spec @mvp
+- satelle repair may update the standalone Codex runtime or Satelle host binary only when live probes show the installed component is missing, corrupted, unsupported, below the required minimum version, incompatible with the required control-plane protocol, or blocking native Computer Use readiness @spec @mvp @implemented
+- satelle repair does not perform opportunistic upgrades to the latest Codex runtime or Satelle host binary when the installed components are compatible and current readiness checks can pass @spec @mvp @implemented
+- satelle repair action plans identify the current version, target version, compatibility reason, and source of the version requirement before proposing a Codex runtime or Satelle host binary upgrade @spec @mvp @implemented
 - satelle repair upgrade actions follow the same plan presentation, final confirmation, --dry-run, --yes, --no-input --yes, setup action ledger, and partial-failure rules as other setup and repair mutations @spec @mvp
-- satelle repair reports manual-action-required when a required compatibility or readiness upgrade cannot be automated safely on the target operating system or transport @spec @mvp
-- satelle ordinary non-repair upgrades are explicit setup or host maintenance actions instead of side effects of repair @spec @mvp
-- satelle repair may recommend satelle host update as a follow-up when a newer compatible component is available but not required for current readiness or control-plane compatibility @spec @mvp
+- satelle repair reports manual-action-required when a required compatibility or readiness upgrade cannot be automated safely on the target operating system or transport @spec @mvp @implemented
+- satelle ordinary non-repair upgrades are explicit setup or host maintenance actions instead of side effects of repair @spec @mvp @implemented
+- satelle repair may recommend satelle host update as a follow-up when a newer compatible component is available but not required for current readiness or control-plane compatibility @spec @mvp @implemented
 - satelle setup and repair execute remote mutations as an ordered idempotent action plan with stable action identifiers @spec @mvp
 - satelle setup and repair record each started, completed, failed, and skipped setup action in a host-side setup action ledger before reporting final status @spec @mvp
 - satelle setup and repair stop executing remaining remote mutations after the first failed required setup action @spec @mvp

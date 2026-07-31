@@ -38,6 +38,67 @@ fn setup_selection(mode: satelle_core::SetupMode) -> SetupModeSelection {
     )
 }
 
+#[test]
+fn direct_host_update_uses_release_target_ids_for_every_supported_platform() {
+    for expected in [
+        "linux-arm64-gnu",
+        "linux-x64-gnu",
+        "darwin-arm64",
+        "darwin-x64",
+        "win32-arm64-msvc",
+        "win32-x64-msvc",
+    ] {
+        let (target, platform) = canonical_remote_platform(expected);
+        assert_eq!(target.expect("supported remote target").id(), expected);
+        assert_eq!(platform, expected);
+    }
+
+    let (target, platform) = canonical_remote_platform("linux-x64-musl");
+    assert_eq!(target, None);
+    assert_eq!(platform, "linux-x64-musl");
+}
+
+#[test]
+fn authenticated_minimum_host_version_can_require_a_cli_upgrade() {
+    assert_eq!(
+        host_version_relation(Some("1.2.0"), true, Some("2.0.0"), "1.5.0")
+            .expect("classify authenticated Host version evidence"),
+        crate::host_update::HostVersionRelation::RequiresNewerCli
+    );
+}
+
+#[test]
+fn newer_reachable_host_is_not_hidden_by_its_minimum_version() {
+    assert_eq!(
+        host_version_relation(Some("2.0.0"), true, Some("2.0.0"), "1.5.0")
+            .expect("classify newer authenticated Host version"),
+        crate::host_update::HostVersionRelation::NewerThanCli
+    );
+}
+
+#[test]
+fn missing_codex_evidence_does_not_block_host_repair_planning() {
+    use satelle_core::host_update::{
+        HostUpdateTarget, HostUpdateVersionSource, RepairCompatibilityReason,
+    };
+
+    let mut inspections = vec![crate::host_update::RepairUpgradeInspection {
+        target: HostUpdateTarget::HostDaemon,
+        current_version: None,
+        target_version: "1.0.0".to_string(),
+        compatibility_reason: Some(RepairCompatibilityReason::Missing),
+        version_source: HostUpdateVersionSource::InvokingCliRelease,
+        automation_is_safe: true,
+        newer_compatible_version_available: false,
+    }];
+
+    append_codex_repair_inspections(&mut inspections, None)
+        .expect("missing Codex evidence must not block Host repair planning");
+
+    assert_eq!(inspections.len(), 1);
+    assert_eq!(inspections[0].target, HostUpdateTarget::HostDaemon);
+}
+
 #[derive(Clone)]
 struct RecordingProviderIntentAdapter {
     observed: Arc<Mutex<Option<ProviderComputerUseIntent>>>,
@@ -501,6 +562,44 @@ fn unpinned_and_unauthenticated_bindings_cannot_open_ordinary_transports() {
         Err(error) => error,
     };
     assert_eq!(direct_error.error.code, ErrorCode::ConfigError);
+}
+
+#[test]
+fn maintenance_inspection_rejects_an_unpinned_ssh_host() {
+    let mut host = ssh_setup_host(Some(ApiTokenSource::File {
+        path: PathBuf::from("/tmp/unread-token"),
+    }));
+    host.config.expected_host_id = None;
+
+    let error = match SshSetupTransport::new_for_maintenance(&host) {
+        Ok(_) => panic!("maintenance must not enter setup's first-trust identity discovery"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code, ErrorCode::ConfigError);
+}
+
+#[test]
+fn default_missing_ssh_host_plan_skips_unavailable_codex_targets() {
+    let host = ssh_setup_host(Some(ApiTokenSource::File {
+        path: std::env::temp_dir().join("unread-token"),
+    }));
+
+    let report = plan_host_update(&host, &[], false)
+        .expect("default planning must preserve the missing Host recovery target");
+
+    assert_eq!(
+        report.targets[0].target,
+        satelle_core::host_update::HostUpdateTarget::HostDaemon
+    );
+    assert_eq!(
+        report.targets[0].disposition,
+        satelle_core::host_update::HostUpdateDisposition::Install
+    );
+    assert!(report.targets[1..].iter().all(|target| {
+        target.disposition == satelle_core::host_update::HostUpdateDisposition::Skipped
+            && target.remote_mutations.is_empty()
+    }));
 }
 
 #[test]
@@ -2728,6 +2827,7 @@ mod reconnect;
 fn register_client_tokens(
     service: &HostService,
     principal: &str,
+    scopes: ApiScopes,
 ) -> (ApiBearerToken, ApiBearerToken) {
     let generated = ApiBearerToken::generate().expect("generate API token");
     let exposed = generated.expose();
@@ -2735,7 +2835,7 @@ fn register_client_tokens(
     let http_token = ApiBearerToken::parse(exposed.as_str()).expect("parse HTTP token");
     let event_token = ApiBearerToken::parse(exposed.as_str()).expect("parse event token");
     service
-        .register_api_token(&registry_token, principal, ApiScopes::CONTROL, None)
+        .register_api_token(&registry_token, principal, scopes, None)
         .expect("register API token");
     (http_token, event_token)
 }
@@ -2777,21 +2877,28 @@ impl DirectFixture {
         let state = TestStateDir::new().expect("temporary state directory");
         let service = HostService::local_demo_for_tests_at(state.path())
             .expect("construct deterministic Host service");
-        Self::bind(state, service)
+        Self::bind(state, service, ApiScopes::CONTROL)
+    }
+
+    fn start_with_scopes(scopes: ApiScopes) -> Self {
+        let state = TestStateDir::new().expect("temporary state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic Host service");
+        Self::bind(state, service, scopes)
     }
 
     fn start_with_adapter(adapter: impl ComputerUseAdapter) -> Self {
         let state = TestStateDir::new().expect("temporary state directory");
         let service = HostService::with_adapter_for_tests_at(state.path(), adapter)
             .expect("construct adapter-backed Host service");
-        Self::bind(state, service)
+        Self::bind(state, service, ApiScopes::CONTROL)
     }
 
-    fn bind(state: TestStateDir, service: HostService) -> Self {
+    fn bind(state: TestStateDir, service: HostService, scopes: ApiScopes) -> Self {
         let initialized = service.initialize_daemon().expect("initialize Host state");
         let host_identity = initialized.host_identity().to_string();
         let (http_token, event_token) =
-            register_client_tokens(&service, "principal-cli-direct-test");
+            register_client_tokens(&service, "principal-cli-direct-test", scopes);
         let server_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -3615,6 +3722,80 @@ fn direct_host_sessions_read_daemon_metadata_without_bootstrap() {
     assert!(direct.bootstrap_actions.is_empty());
     assert_eq!(direct.host_daemon_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(direct.sessions, local.sessions);
+}
+
+#[test]
+fn direct_host_maintenance_probe_does_not_mutate_daemon_state() {
+    let fixture = DirectFixture::start_with_scopes(ApiScopes::ADMIN);
+    let before = fixture
+        .service
+        .daemon_runtime_status()
+        .expect("read pre-probe daemon state");
+
+    let DirectMaintenanceEvidence::Compatible(evidence) =
+        read_direct_maintenance_evidence("direct-test", fixture.transport())
+            .expect("read authenticated maintenance evidence")
+    else {
+        panic!("current Direct Host must return compatible maintenance evidence");
+    };
+
+    let after = fixture
+        .service
+        .daemon_runtime_status()
+        .expect("read post-probe daemon state");
+    assert_eq!(before, after);
+    assert_eq!(evidence.host_identity(), fixture.host_identity);
+    assert_eq!(evidence.daemon_version(), env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance() {
+    let error = serde_json::from_value(serde_json::json!({
+        "schema_version": "satelle.error.v1",
+        "request_id": satelle_transport::RequestId::new().to_string(),
+        "host_identity": "host-direct-test",
+        "code": "incompatible-protocol",
+        "category": "compatibility",
+        "retryable": false,
+        "message": "the CLI and Host Daemon protocol versions are incompatible",
+        "details": {
+            "daemon_version": "0.0.9",
+            "reason": "unsupported",
+            "supported_versions": ["12"],
+            "received_version": "11",
+        },
+        "docs_url": null,
+        "suggested_commands": [],
+    }))
+    .expect("deserialize an authenticated protocol mismatch");
+
+    let observation = classify_direct_maintenance_evidence(
+        "direct-test",
+        Err(DaemonClientError::Api {
+            status: reqwest::StatusCode::UPGRADE_REQUIRED,
+            error: Box::new(error),
+        }),
+    )
+    .expect("retain protocol mismatch evidence for maintenance planning");
+
+    let DirectMaintenanceEvidence::ProtocolIncompatible { current_version } = observation else {
+        panic!("expected retained protocol mismatch evidence");
+    };
+    assert_eq!(current_version.as_deref(), Some("0.0.9"));
+}
+
+#[test]
+fn header_direct_protocol_mismatch_remains_a_maintenance_observation() {
+    let observation = classify_direct_maintenance_evidence(
+        "direct-test",
+        Err(DaemonClientError::ProtocolResponseMismatch),
+    )
+    .expect("classify the authenticated header protocol mismatch");
+
+    let DirectMaintenanceEvidence::ProtocolIncompatible { current_version } = observation else {
+        panic!("expected protocol-incompatible maintenance evidence");
+    };
+    assert_eq!(current_version, None);
 }
 
 #[test]

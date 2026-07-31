@@ -3,8 +3,9 @@ use crate::contract::{
     BootstrapMaintenanceResponse, CapabilitiesResponse, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostDesktopSessionsResponse,
     HostPathsResponse, HostStatusResponse, LiveResponse, LogsPageResponse,
-    NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse, PROTOCOL_VERSION,
-    PROTOCOL_VERSION_HEADER, PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
+    MaintenanceUpdateEvidenceResponse, NativeReadinessInvalidationRequest,
+    NativeReadinessInvalidationResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
@@ -201,7 +202,20 @@ impl DaemonClient {
     }
 
     pub fn capabilities(&self) -> Result<CapabilitiesResponse, DaemonClientError> {
-        let (request, request_id) = self.protected_request(Method::GET, "/v1/capabilities")?;
+        self.protocol_read("/v1/capabilities")
+    }
+
+    pub fn maintenance_update_evidence(
+        &self,
+    ) -> Result<MaintenanceUpdateEvidenceResponse, DaemonClientError> {
+        self.protocol_read("/v1/maintenance/update-evidence")
+    }
+
+    fn protocol_read<T: DeserializeOwned + AuthenticatedResponseContract>(
+        &self,
+        path: &str,
+    ) -> Result<T, DaemonClientError> {
+        let (request, request_id) = self.protected_request(Method::GET, path)?;
         let response = request
             .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .send()
@@ -220,7 +234,7 @@ impl DaemonClient {
                 == Some(PROTOCOL_VERSION)
                 && protocol_versions.next().is_none();
             if !protocol_matches {
-                return Err(DaemonClientError::CapabilitiesProtocolMismatch);
+                return Err(DaemonClientError::ProtocolResponseMismatch);
             }
         }
         decode_authenticated(
@@ -830,7 +844,7 @@ pub enum DaemonClientError {
     ResponseRequestIdMismatch,
     ResponseHostIdentityMismatch,
     ResponseContractViolation,
-    CapabilitiesProtocolMismatch,
+    ProtocolResponseMismatch,
 }
 
 impl fmt::Display for DaemonClientError {
@@ -871,7 +885,7 @@ impl fmt::Display for DaemonClientError {
             Self::ResponseContractViolation => {
                 "the Host Daemon response violated the requested operation contract"
             }
-            Self::CapabilitiesProtocolMismatch => {
+            Self::ProtocolResponseMismatch => {
                 "the CLI and Host Daemon protocol versions are incompatible"
             }
         })
@@ -1265,10 +1279,7 @@ mod tests {
             let error = client
                 .capabilities()
                 .expect_err("a response without the current protocol header must fail closed");
-            assert!(matches!(
-                error,
-                DaemonClientError::CapabilitiesProtocolMismatch
-            ));
+            assert!(matches!(error, DaemonClientError::ProtocolResponseMismatch));
             server.join().expect("join legacy daemon fixture");
         }
     }

@@ -3550,15 +3550,6 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
             "--host",
             "local-demo",
             "--component",
-            "host",
-            "--json",
-        ],
-        vec![
-            "host",
-            "update",
-            "--host",
-            "local-demo",
-            "--component",
             "codex",
             "--json",
         ],
@@ -3571,16 +3562,6 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
             "host",
             "--component",
             "codex",
-            "--json",
-        ],
-        vec![
-            "host",
-            "update",
-            "--host",
-            "local-demo",
-            "--component",
-            "all",
-            "--dry-run",
             "--json",
         ],
     ] {
@@ -3591,7 +3572,10 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
             .code(70)
             .get_output()
             .clone();
-        assert!(output.stdout.is_empty());
+        assert!(
+            output.stdout.is_empty(),
+            "JSON failures must emit one result object on stderr"
+        );
         let report = parse_json_output(&output.stderr);
         assert_exact_object_keys(
             &report,
@@ -3609,11 +3593,133 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
         assert_eq!(report["schema_version"], "satelle.error.v1");
         assert_eq!(report["code"], "not-implemented");
         let message = report["message"].as_str().unwrap();
-        assert!(message.contains("Host update was not run"));
-        assert!(message.contains("No Host state or Satelle sessions were changed"));
+        assert!(message.contains("Host update apply belongs to the packet 15 train"));
+        assert!(message.contains("no Host state or Satelle sessions were changed"));
         assert!(!state.path().join("satelle.sqlite3").exists());
         assert!(!state.path().join("satelle.sqlite3.lock").exists());
     }
+
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "host",
+            "update",
+            "--host",
+            "local-demo",
+            "--component",
+            "all",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(output.stderr.is_empty());
+    let plan = parse_json_output(&output.stdout);
+    assert_eq!(plan["schema_version"], "satelle.host.update.v1");
+    assert_eq!(
+        plan["checked_components"],
+        serde_json::json!(["host", "codex"])
+    );
+    assert!(!state.path().join("satelle.sqlite3").exists());
+    assert!(!state.path().join("satelle.sqlite3.lock").exists());
+}
+
+#[test]
+fn current_host_update_succeeds_without_an_apply_executor() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "host",
+            "update",
+            "--host",
+            "local-demo",
+            "--component",
+            "host",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert!(output.stderr.is_empty());
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(report["schema_version"], "satelle.host.update.v1");
+    assert_eq!(report["confirmation_required"], false);
+    assert_eq!(report["targets"][0]["disposition"], "current");
+    assert!(!state.path().join("satelle.sqlite3").exists());
+}
+
+#[test]
+fn manual_only_json_repair_reports_the_plan_without_apply_failure() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["repair", "--host", "local-demo", "--yes", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert!(output.stderr.is_empty());
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(report["schema_version"], "satelle.repair.v1");
+    assert!(
+        report["actions"]
+            .as_array()
+            .expect("repair actions are an array")
+            .iter()
+            .all(|action| action["disposition"] != "required"),
+        "a successful repair plan must not contain an unapplied mutation"
+    );
+}
+
+#[test]
+fn repair_without_a_host_uses_the_configured_default_host() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let token_file = state.path().join("satelle.token");
+    let token = ApiBearerToken::generate().expect("generate API token");
+    test_file::write_user_controlled(&token_file, token.expose().as_str())
+        .expect("write owner-only API token");
+    let closed_listener = TcpListener::bind("127.0.0.1:0").expect("bind temporary port");
+    let closed_address = closed_listener
+        .local_addr()
+        .expect("read temporary address");
+    drop(closed_listener);
+    let token_path = toml::Value::String(token_file.to_string_lossy().into_owned()).to_string();
+    write_user_config(
+        &user_config,
+        format!(
+            r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://{closed_address}"
+expected_host_id = "host-remote"
+api_token = {{ kind = "file", path = {token_path} }}
+"#,
+        ),
+    )
+    .expect("write default remote Host config");
+
+    let output = production_satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["repair", "--dry-run", "--json"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "host-unreachable");
 }
 
 #[test]
@@ -6848,7 +6954,6 @@ desktop_user = "another-user"
 fn future_cli_surfaces_parse_and_return_typed_not_implemented() {
     let state = state_dir();
     for args in [
-        vec!["repair", "--host", "local-demo", "--dry-run", "--json"],
         vec![
             "host",
             "storage",

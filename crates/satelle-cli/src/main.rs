@@ -7,6 +7,8 @@ mod completions;
 mod error_output;
 #[path = "host-trust.rs"]
 mod host_trust;
+#[path = "host-update.rs"]
+mod host_update;
 mod logs;
 mod mcp;
 mod output;
@@ -1157,7 +1159,7 @@ fn execute_command(
     match command {
         Command::Completions(command) => run_completions(command).map_err(failure).map(|_| None),
         Command::Setup(command) => run_setup(command, human_style, config, output).map(|_| None),
-        Command::Repair(command) => run_repair(command).map(|_| None),
+        Command::Repair(command) => run_repair(command, config, output).map(|_| None),
         Command::Doctor(command) => run_doctor(command, config, output).map(|_| None),
         Command::Config { command } => run_config(command, config, output).map(|_| None),
         Command::Paths(command) => show_paths(command, config, output).map(|_| None),
@@ -4170,17 +4172,94 @@ fn shell_argument(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn run_repair(command: RepairCommand) -> Result<(), CliFailure> {
-    if command.no_input && !command.dry_run && !command.yes {
+fn run_repair(
+    command: RepairCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    let host = config.resolve_host(command.host.as_deref())?;
+    let report = transport::plan_repair_upgrades(&host).map_err(failure)?;
+    let requires_consent = repair_plan_requires_consent(&report);
+    if command.no_input && !command.dry_run && !command.yes && requires_consent {
         return Err(failure(SatelleError::input_required(
             "repair needs --yes when --no-input is used for mutations",
         )));
     }
 
-    Err(failure(SatelleError::not_implemented(format!(
-        "repair planning is not implemented yet for host {}",
-        command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)
-    ))))
+    let apply_unavailable = !command.dry_run && requires_consent;
+    if apply_unavailable {
+        // Human output can retain the useful read-only plan before the typed
+        // failure. JSON commands must emit exactly one terminal object.
+        if !format.is_json() {
+            print!("{}", host_update::render_repair_upgrade_plan(&report));
+        }
+        let mut error = SatelleError::not_implemented(concat!(
+            "repair upgrade apply belongs to the repair execution train. The plan was read-only; ",
+            "no Host state or Satelle sessions were changed."
+        ));
+        error.recovery_command = Some(format!(
+            "satelle repair --host {} --dry-run --json",
+            host.alias
+        ));
+        return Err(failure(error));
+    }
+
+    if format.is_json() {
+        print_json(&report).map_err(failure)?;
+    } else {
+        print!("{}", host_update::render_repair_upgrade_plan(&report));
+    }
+    Ok(())
+}
+
+fn repair_plan_requires_consent(report: &satelle_core::host_update::RepairUpgradeReport) -> bool {
+    report.actions.iter().any(|action| {
+        action.disposition == satelle_core::host_update::RepairUpgradeDisposition::Required
+    })
+}
+
+#[cfg(test)]
+mod repair_consent_tests {
+    use super::*;
+    use satelle_core::host_update::{
+        HostUpdateTarget, HostUpdateVersionSource, RepairUpgradeAction, RepairUpgradeDisposition,
+        RepairUpgradeReport,
+    };
+
+    fn action(disposition: RepairUpgradeDisposition) -> RepairUpgradeAction {
+        RepairUpgradeAction {
+            target: HostUpdateTarget::HostDaemon,
+            current_version: Some("0.1.0".to_string()),
+            target_version: "0.1.0".to_string(),
+            compatibility_reason: None,
+            version_source: HostUpdateVersionSource::InvokingCliRelease,
+            disposition,
+        }
+    }
+
+    #[test]
+    fn repair_consent_depends_on_the_planned_mutations() {
+        let read_only = RepairUpgradeReport::new(
+            "local-demo",
+            vec![
+                action(RepairUpgradeDisposition::NotNeeded),
+                action(RepairUpgradeDisposition::RecommendHostUpdate),
+            ],
+        );
+        assert!(!repair_plan_requires_consent(&read_only));
+
+        let manual_only = RepairUpgradeReport::new(
+            "local-demo",
+            vec![action(RepairUpgradeDisposition::ManualActionRequired)],
+        );
+        assert!(!repair_plan_requires_consent(&manual_only));
+
+        let mutating = RepairUpgradeReport::new(
+            "local-demo",
+            vec![action(RepairUpgradeDisposition::Required)],
+        );
+        assert!(repair_plan_requires_consent(&mutating));
+    }
 }
 
 fn run_doctor(
@@ -5742,7 +5821,7 @@ fn run_host(
             config,
             format,
         ),
-        HostCommand::Update(command) => run_host_update(command),
+        HostCommand::Update(command) => run_host_update(command, config, format),
         HostCommand::Cleanup(command) => run_host_cleanup(command, config, format),
         HostCommand::Sessions(command) => show_host_sessions(command, config, format),
         HostCommand::Storage { command } => run_host_storage(command),
@@ -7966,11 +8045,59 @@ fn desktop_policy_is_active(policy: &DesktopSelectionPolicy) -> bool {
     policy.desktop_user.is_some() || policy.preference.is_some() || policy.native_selector.is_some()
 }
 
-fn run_host_update(command: HostUpdateCommand) -> Result<(), CliFailure> {
+fn run_host_update(
+    command: HostUpdateCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     validate_host_update_components(&command.component).map_err(failure)?;
+    if command.all_remotes || command.host.len() > 1 {
+        return Err(failure(SatelleError::not_implemented(
+            "multi-Host update planning belongs to the packet 26 update train",
+        )));
+    }
+    let host = config.resolve_host(command.host.first().map(String::as_str))?;
+    let includes_all = command.component.iter().any(|component| component == "all");
+    let components = command
+        .component
+        .iter()
+        .filter_map(|component| match component.as_str() {
+            "host" => Some(satelle_core::host_update::HostUpdateComponent::Host),
+            "codex" => Some(satelle_core::host_update::HostUpdateComponent::Codex),
+            "all" => None,
+            _ => unreachable!("validated update component"),
+        })
+        .collect::<Vec<_>>();
+    let report = transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
+    if command.dry_run {
+        if format.is_json() {
+            print_json(&report).map_err(failure)?;
+        } else {
+            print!("{}", host_update::render_host_update_plan(&report));
+        }
+        return Ok(());
+    }
+
+    // A current plan is already the complete result. The packet-15 executor is
+    // needed only when this plan contains a remote mutation.
+    if !report.confirmation_required {
+        if format.is_json() {
+            print_json(&report).map_err(failure)?;
+        } else {
+            print!("{}", host_update::render_host_update_plan(&report));
+        }
+        return Ok(());
+    }
+
+    // Until packet 15 supplies the mutation executor, JSON mode must return
+    // one typed error object rather than mixing a plan on stdout with an error
+    // on stderr. The read-only plan remains available through --dry-run.
+    if !format.is_json() {
+        print!("{}", host_update::render_host_update_plan(&report));
+    }
     Err(failure(SatelleError::not_implemented(concat!(
-        "Host update was not run because live Host planning and application are not ",
-        "implemented. No Host state or Satelle sessions were changed."
+        "Host update apply belongs to the packet 15 train. The complete plan above was ",
+        "read-only; no Host state or Satelle sessions were changed."
     ))))
 }
 

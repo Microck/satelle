@@ -1,5 +1,8 @@
 use flate2::read::GzDecoder;
-use reqwest::blocking::{Client, Response};
+use reqwest::{
+    StatusCode,
+    blocking::{Client, Response},
+};
 use satelle_core::session::HostIdentityRef;
 use satelle_core::{DaemonPathOverrides, HostConfig, SshIdentityCommitRecord};
 use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
@@ -758,6 +761,18 @@ impl PreparedIdentityOperation {
 }
 
 impl RemoteTarget {
+    pub(super) fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "linux-arm64-gnu" => Some(Self::LinuxArm64Gnu),
+            "linux-x64-gnu" => Some(Self::LinuxX64Gnu),
+            "darwin-arm64" => Some(Self::DarwinArm64),
+            "darwin-x64" => Some(Self::DarwinX64),
+            "win32-arm64-msvc" => Some(Self::WindowsArm64Msvc),
+            "win32-x64-msvc" => Some(Self::WindowsX64Msvc),
+            _ => None,
+        }
+    }
+
     pub(super) fn inspect_initial_host_state(
         self,
         destination: &str,
@@ -1255,7 +1270,9 @@ sync"#,
             ("darwin", Some(Architecture::X64)) => Ok(Self::DarwinX64),
             ("linux", Some(Architecture::Arm64)) if is_glibc(libc) => Ok(Self::LinuxArm64Gnu),
             ("linux", Some(Architecture::X64)) if is_glibc(libc) => Ok(Self::LinuxX64Gnu),
-            _ => Err(SshBootstrapError::UnsupportedPlatform),
+            _ => Err(SshBootstrapError::UnsupportedPlatform {
+                platform: detected_platform_id(system, architecture, libc),
+            }),
         }
     }
 
@@ -1286,7 +1303,7 @@ sync"#,
         }
     }
 
-    const fn is_windows(self) -> bool {
+    pub(super) const fn is_windows(self) -> bool {
         matches!(self, Self::WindowsArm64Msvc | Self::WindowsX64Msvc)
     }
 
@@ -1335,6 +1352,18 @@ sync"#,
         self,
         directories: &RemoteUserDirectories,
     ) -> Result<String, SshBootstrapError> {
+        let cache_root = self.artifact_root(directories)?;
+        Ok(join_target_path(
+            self,
+            &cache_root,
+            &format!("v{}/{}", env!("CARGO_PKG_VERSION"), self.id()),
+        ))
+    }
+
+    fn artifact_root(
+        self,
+        directories: &RemoteUserDirectories,
+    ) -> Result<String, SshBootstrapError> {
         if directories.target != self {
             return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
         }
@@ -1357,11 +1386,7 @@ sync"#,
                 .unwrap_or_else(|| join_target_path(self, &directories.home, ".cache"));
             join_target_path(self, &cache, "satelle/host")
         };
-        Ok(join_target_path(
-            self,
-            &cache_root,
-            &format!("v{}/{}", env!("CARGO_PKG_VERSION"), self.id()),
-        ))
+        Ok(cache_root)
     }
 
     fn artifact_upload_directory(
@@ -2998,6 +3023,20 @@ fn windows_task_register_command(
 fn windows_task_definition_match_expression(
     task: &satelle_core::daemon_service::WindowsTaskDefinition,
 ) -> String {
+    windows_task_definition_match_expression_for_values(
+        &powershell_quote(&task.principal_sid),
+        &powershell_quote(&task.trigger_user_sid),
+        &powershell_quote(&task.executable),
+        &powershell_quote(&windows_task_arguments(task)),
+    )
+}
+
+fn windows_task_definition_match_expression_for_values(
+    principal_sid: &str,
+    trigger_sid: &str,
+    executable: &str,
+    arguments: &str,
+) -> String {
     format!(
         concat!(
             "($xml.DocumentElement.GetAttribute('version') -eq '1.4') -and ",
@@ -3023,10 +3062,10 @@ fn windows_task_definition_match_expression(
             "($root.Actions.Exec.Command -eq {executable}) -and ",
             "($root.Actions.Exec.Arguments -eq {arguments})"
         ),
-        principal_sid = powershell_quote(&task.principal_sid),
-        trigger_sid = powershell_quote(&task.trigger_user_sid),
-        executable = powershell_quote(&task.executable),
-        arguments = powershell_quote(&windows_task_arguments(task)),
+        principal_sid = principal_sid,
+        trigger_sid = trigger_sid,
+        executable = executable,
+        arguments = arguments,
     )
 }
 
@@ -3313,7 +3352,7 @@ fn parse_service_path_overrides(
     if target.service_platform() != satelle_core::daemon_service::DaemonServicePlatform::Macos {
         return Err(SshBootstrapError::PersistentServiceUnsupported);
     }
-    parse_launchd_path_overrides(output)
+    Ok(parse_launchd_service_definition(output)?.path_overrides)
 }
 
 fn daemon_path_overrides_from_environment(
@@ -3338,7 +3377,15 @@ fn daemon_path_overrides_from_environment(
     Ok(overrides)
 }
 
-fn parse_launchd_path_overrides(output: &[u8]) -> Result<DaemonPathOverrides, SshBootstrapError> {
+struct ObservedLaunchdServiceDefinition {
+    executable: String,
+    bind: SocketAddr,
+    path_overrides: DaemonPathOverrides,
+}
+
+fn parse_launchd_service_definition(
+    output: &[u8],
+) -> Result<ObservedLaunchdServiceDefinition, SshBootstrapError> {
     const PREFIX: &str = concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
         "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
@@ -3401,7 +3448,14 @@ fn parse_launchd_path_overrides(output: &[u8]) -> Result<DaemonPathOverrides, Ss
         }
         remaining = rest;
     }
-    daemon_path_overrides_from_environment(RemoteTarget::DarwinArm64, &entries)
+    Ok(ObservedLaunchdServiceDefinition {
+        executable: binary,
+        bind,
+        path_overrides: daemon_path_overrides_from_environment(
+            RemoteTarget::DarwinArm64,
+            &entries,
+        )?,
+    })
 }
 
 fn decode_plist_text(value: &str) -> Result<String, SshBootstrapError> {
@@ -3557,6 +3611,93 @@ fn same_windows_path_text(left: &str, right: &str) -> bool {
     normalize(left) == normalize(right)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ManagedServiceExecutableObservation {
+    path: String,
+    sha256: [u8; 32],
+}
+
+impl ManagedServiceExecutableObservation {
+    #[cfg(test)]
+    pub(super) fn for_tests(path: impl Into<String>, sha256: [u8; 32]) -> Self {
+        Self {
+            path: path.into(),
+            sha256,
+        }
+    }
+}
+
+pub(super) fn managed_service_executable_version(
+    target: RemoteTarget,
+    directories: &RemoteUserDirectories,
+    executable: &ManagedServiceExecutableObservation,
+    expected_current_release_digest: Option<[u8; 32]>,
+) -> Option<String> {
+    let normalize = |path: &str| {
+        let path = path.replace('\\', "/");
+        let path = path
+            .strip_prefix("//?/")
+            .unwrap_or(&path)
+            .trim_end_matches('/');
+        if target.is_windows() {
+            path.to_ascii_lowercase()
+        } else {
+            path.to_string()
+        }
+    };
+    let root = normalize(&target.artifact_root(directories).ok()?);
+    let executable_path = normalize(&executable.path);
+    let relative = executable_path.strip_prefix(&format!("{root}/"))?;
+    let mut components = relative.split('/');
+    let version = components
+        .next()?
+        .strip_prefix('v')
+        .filter(|version| !version.is_empty())?;
+    let mut version_parts = version.split('.');
+    let release_version = (
+        version_parts.next()?.parse::<u64>().ok()?,
+        version_parts.next()?.parse::<u64>().ok()?,
+        version_parts.next()?.parse::<u64>().ok()?,
+    );
+    if version_parts.next().is_some()
+        || version
+            != format!(
+                "{}.{}.{}",
+                release_version.0, release_version.1, release_version.2
+            )
+    {
+        return None;
+    }
+    if components.next()? != target.id() {
+        return None;
+    }
+    let filename = components.next()?;
+    if components.next().is_some() {
+        return None;
+    }
+
+    if target.is_windows() {
+        let digest = filename.strip_prefix("satelle-")?.strip_suffix(".exe")?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        if parse_digest_hex(digest).ok()? != executable.sha256 {
+            return None;
+        }
+    } else if filename != target.executable_name() {
+        return None;
+    }
+    // The invoking release manifest can authenticate only its own release.
+    // Older version paths remain observable so planning can report and
+    // replace them.
+    if version == env!("CARGO_PKG_VERSION") && executable.sha256 != expected_current_release_digest?
+    {
+        return None;
+    }
+
+    Some(version.to_string())
+}
+
 impl RemoteUserDirectories {
     pub(super) fn probe(
         destination: &str,
@@ -3614,6 +3755,232 @@ impl RemoteUserDirectories {
 
     pub(super) fn authenticated_user(&self) -> &str {
         &self.authenticated_user
+    }
+
+    pub(super) fn persistent_service_asset_path(&self, host_id: &str) -> Option<String> {
+        if host_id.is_empty()
+            || !host_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return None;
+        }
+        match self.target.service_platform() {
+            satelle_core::daemon_service::DaemonServicePlatform::Windows => {
+                self.local_app_data.as_deref().map(|local_app_data| {
+                    join_target_path(
+                        self.target,
+                        local_app_data,
+                        &format!("Satelle/service/{host_id}.json"),
+                    )
+                })
+            }
+            satelle_core::daemon_service::DaemonServicePlatform::Macos => Some(join_target_path(
+                self.target,
+                &self.home,
+                "Library/LaunchAgents/dev.microck.satelle.host.plist",
+            )),
+            satelle_core::daemon_service::DaemonServicePlatform::Linux => None,
+        }
+    }
+
+    pub(super) fn probe_managed_service_executable(
+        &self,
+        destination: &str,
+        path: &str,
+        host_id: &str,
+        expected_path_overrides: &DaemonPathOverrides,
+    ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
+        self.probe_managed_service_executable_with_program(
+            OsStr::new("ssh"),
+            destination,
+            path,
+            host_id,
+            expected_path_overrides,
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn probe_managed_service_executable_for_tests(
+        &self,
+        ssh_program: &Path,
+        destination: &str,
+        path: &str,
+        host_id: &str,
+        expected_path_overrides: &DaemonPathOverrides,
+    ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
+        self.probe_managed_service_executable_with_program(
+            ssh_program.as_os_str(),
+            destination,
+            path,
+            host_id,
+            expected_path_overrides,
+        )
+    }
+
+    fn probe_managed_service_executable_with_program(
+        &self,
+        ssh_program: &OsStr,
+        destination: &str,
+        path: &str,
+        host_id: &str,
+        expected_path_overrides: &DaemonPathOverrides,
+    ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
+        if host_id.is_empty()
+            || !host_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
+        let command = if self.target.is_windows() {
+            let task_name = format!("Host-{host_id}");
+            let service_config_argument = if path.contains([' ', '\t', '"']) {
+                format!("\"{}\"", path.replace('"', "\\\""))
+            } else {
+                path.to_string()
+            };
+            let expected_arguments =
+                format!("host start --service-config {service_config_argument}");
+            let definition_matches = windows_task_definition_match_expression_for_values(
+                "$expectedSid",
+                "$expectedSid",
+                "$executable",
+                &powershell_quote(&expected_arguments),
+            );
+            let script = format!(
+                concat!(
+                    "$ErrorActionPreference='Stop'; $path={path}; ",
+                    "if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "$item=Get-Item -LiteralPath $path -Force; ",
+                    "if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or ",
+                    "$item.Length -gt 65536) {{ exit 75 }}; ",
+                    "$config=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json; ",
+                    "$task=Get-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name} ",
+                    "-ErrorAction SilentlyContinue; ",
+                    "if ($config.schema -cne 'satelle.host-service.v1' -or $null -eq $task) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "[xml]$xml=Export-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name}; ",
+                    "$root=$xml.Task; ",
+                    "$executable=[string]$root.Actions.Exec.Command; ",
+                    "if ([String]::IsNullOrWhiteSpace($executable)) {{ exit 75 }}; ",
+                    "$identity=[Security.Principal.WindowsIdentity]::GetCurrent(); ",
+                    "$expectedSid=$identity.User.Value; ",
+                    "if (-not ({definition_matches})) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "$executableItem=Get-Item -LiteralPath $executable -Force; ",
+                    "if (($executableItem.Attributes -band ",
+                    "[IO.FileAttributes]::ReparsePoint) -ne 0 -or ",
+                    "-not [IO.Path]::IsPathFullyQualified($executable)) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "$resolvedExecutable=$executableItem.FullName; ",
+                    "$normalizedExecutable=[IO.Path]::GetFullPath($executable); ",
+                    "if (-not [String]::Equals($normalizedExecutable, $resolvedExecutable, ",
+                    "[StringComparison]::OrdinalIgnoreCase)) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "$digest=(Get-FileHash -Algorithm SHA256 -LiteralPath ",
+                    "$resolvedExecutable).Hash.ToLowerInvariant(); ",
+                    "[Console]::Out.WriteLine('managed'); ",
+                    "[Console]::Out.WriteLine($digest); ",
+                    "[Console]::Out.WriteLine(($config | ConvertTo-Json -Compress -Depth 4)); ",
+                    "[Console]::Out.Write($resolvedExecutable)"
+                ),
+                path = powershell_quote(path),
+                task_name = powershell_quote(&task_name),
+                definition_matches = definition_matches,
+            );
+            powershell_encoded_command(&script)
+        } else {
+            let script = format!(
+                concat!(
+                    "set -eu; path={path}; ",
+                    "if [ ! -e \"$path\" ]; then printf absent; exit 0; fi; ",
+                    "[ -f \"$path\" ] && [ ! -L \"$path\" ] || exit 75; ",
+                    "[ \"$(wc -c < \"$path\")\" -le 65536 ] || exit 75; ",
+                    "label=$(/usr/bin/plutil -extract Label raw -o - \"$path\") || exit 75; ",
+                    "if [ \"$label\" != 'dev.microck.satelle.host' ]; then ",
+                    "printf absent; exit 0; fi; ",
+                    "executable=$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - ",
+                    "\"$path\") || exit 75; ",
+                    "case \"$executable\" in /*) ;; *) printf absent; exit 0;; esac; ",
+                    "if [ ! -f \"$executable\" ] || [ -L \"$executable\" ] || ",
+                    "[ ! -x \"$executable\" ]; then printf absent; exit 0; fi; ",
+                    "directory=$(/usr/bin/dirname \"$executable\") || exit 75; ",
+                    "basename=$(/usr/bin/basename \"$executable\") || exit 75; ",
+                    "canonical_directory=$(cd -P \"$directory\" 2>/dev/null && pwd -P) || ",
+                    "{{ printf absent; exit 0; }}; ",
+                    "if [ \"$executable\" != \"$canonical_directory/$basename\" ]; then ",
+                    "printf absent; exit 0; fi; ",
+                    "digest=$(shasum -a 256 -- \"$executable\" | awk '{{print $1}}') || exit 75; ",
+                    "printf 'managed\\n%s\\n' \"$digest\"; ",
+                    "cat \"$path\""
+                ),
+                path = posix_quote(path),
+            );
+            format!("sh -c {}", posix_quote(&script))
+        };
+        let output = run_ssh_command_with_program(ssh_program, destination, &command)?;
+        if !output.status.success() {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
+        let observation = std::str::from_utf8(&output.stdout)
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+        if observation == "absent" {
+            return Ok(None);
+        }
+        let (marker, payload) = observation
+            .split_once('\n')
+            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        if marker.strip_suffix('\r').unwrap_or(marker) != "managed" {
+            return Err(SshBootstrapError::InvalidServiceObservation);
+        }
+        let (digest, payload) = payload
+            .split_once('\n')
+            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        let digest = digest.strip_suffix('\r').unwrap_or(digest);
+        let sha256 =
+            parse_digest_hex(digest).map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+        if self.target.is_windows() {
+            let (config, executable) = payload
+                .split_once('\n')
+                .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+            let config = config.strip_suffix('\r').unwrap_or(config);
+            let Ok(config) = serde_json::from_str::<
+                satelle_core::daemon_service::WindowsServiceConfigV1,
+            >(config) else {
+                return Ok(None);
+            };
+            let expected = satelle_core::daemon_service::WindowsServiceConfigV1::new(
+                "127.0.0.1:3001",
+                expected_path_overrides,
+            )
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+            if config != expected {
+                return Ok(None);
+            }
+            if executable.is_empty() || executable.contains(['\r', '\n']) {
+                return Err(SshBootstrapError::InvalidServiceObservation);
+            }
+            return Ok(Some(ManagedServiceExecutableObservation {
+                path: executable.to_string(),
+                sha256,
+            }));
+        }
+        let Ok(definition) = parse_launchd_service_definition(payload.as_bytes()) else {
+            return Ok(None);
+        };
+        if definition.bind != "127.0.0.1:3001".parse().expect("static socket address")
+            || definition.path_overrides != *expected_path_overrides
+        {
+            return Ok(None);
+        }
+        Ok(Some(ManagedServiceExecutableObservation {
+            path: definition.executable,
+            sha256,
+        }))
     }
 
     pub(super) fn resolved_path_set(&self) -> satelle_core::daemon_service::DaemonResolvedPathSet {
@@ -4108,6 +4475,52 @@ fn is_glibc(value: Option<&str>) -> bool {
     value.is_some_and(|value| value.to_ascii_lowercase().starts_with("glibc "))
 }
 
+fn detected_platform_id(system: &str, architecture: &str, libc: Option<&str>) -> String {
+    let system = platform_id_component(system);
+    let architecture = normalize_arch(architecture).map_or_else(
+        || platform_id_component(architecture),
+        |architecture| match architecture {
+            Architecture::Arm64 => "arm64".to_string(),
+            Architecture::X64 => "x64".to_string(),
+        },
+    );
+    match system.as_str() {
+        "linux" => {
+            let libc = libc.map(str::to_ascii_lowercase);
+            let libc = if libc
+                .as_deref()
+                .is_some_and(|libc| libc.starts_with("glibc "))
+            {
+                "gnu"
+            } else if libc.as_deref().is_some_and(|libc| libc.contains("musl")) {
+                "musl"
+            } else {
+                "unknown-libc"
+            };
+            format!("linux-{architecture}-{libc}")
+        }
+        "windows" => format!("win32-{architecture}-msvc"),
+        _ => format!("{system}-{architecture}"),
+    }
+}
+
+fn platform_id_component(value: &str) -> String {
+    let mut component = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            component.push(character.to_ascii_lowercase());
+        } else if !component.is_empty() && !component.ends_with('-') {
+            component.push('-');
+        }
+    }
+    component.truncate(component.trim_end_matches('-').len());
+    if component.is_empty() {
+        "unknown".to_string()
+    } else {
+        component
+    }
+}
+
 struct DownloadedArtifact {
     _directory: TempDir,
     binary: PathBuf,
@@ -4137,7 +4550,13 @@ impl ReleaseArtifactMetadata {
             .get(format!("{release_url}/SHA256SUMS"))
             .send()
             .and_then(Response::error_for_status)
-            .map_err(SshBootstrapError::Http)?;
+            .map_err(|error| {
+                if release_manifest_is_unavailable(error.status()) {
+                    SshBootstrapError::MissingReleaseManifest
+                } else {
+                    SshBootstrapError::Http(error)
+                }
+            })?;
         let manifest = read_response_bounded(manifest, MANIFEST_LIMIT)?;
         Ok(Self {
             digest: manifest_digest(&manifest, &filename)?,
@@ -4159,6 +4578,10 @@ impl ReleaseArtifactMetadata {
         }
         digest
     }
+}
+
+fn release_manifest_is_unavailable(status: Option<StatusCode>) -> bool {
+    status == Some(StatusCode::NOT_FOUND)
 }
 
 impl DownloadedArtifact {
@@ -4958,8 +5381,8 @@ pub(super) enum SshBootstrapError {
     PlatformProbeFailed,
     #[error("the remote platform probe returned an invalid response")]
     InvalidProbe,
-    #[error("the remote platform is not supported by an MVP Host artifact")]
-    UnsupportedPlatform,
+    #[error("the remote platform '{platform}' is not supported by an MVP Host artifact")]
+    UnsupportedPlatform { platform: String },
     #[error("{name} is not an absolute path for the detected remote platform")]
     DaemonPathOverrideNotAbsolute { name: &'static str, value: String },
     #[error("the release artifact request failed")]
@@ -4972,6 +5395,8 @@ pub(super) enum SshBootstrapError {
     ArchiveTooLarge,
     #[error("the release integrity manifest is invalid")]
     InvalidManifest,
+    #[error("the invoking CLI release does not publish an integrity manifest")]
+    MissingReleaseManifest,
     #[error("the release integrity manifest does not contain the selected artifact")]
     MissingIntegrityEntry,
     #[error("the selected release artifact failed SHA-256 verification")]
@@ -5049,6 +5474,392 @@ mod tests {
             service_config_path: r"C:\Users\operator\AppData\Local\Satelle\service\host-123.json"
                 .to_string(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_service_probe_uses_only_audited_read_commands() {
+        let directory = tempfile::tempdir().expect("temporary fake SSH directory");
+        let fake_ssh = directory.path().join("ssh");
+        let audit_log = directory.path().join("arguments");
+        let observed_digest = "aa".repeat(32);
+        let macos_plist = satelle_core::daemon_service::render_launchd_user_plist(
+            Path::new("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle"),
+            "127.0.0.1:3001",
+            &DaemonPathOverrides::default(),
+        )
+        .expect("render canonical macOS service definition");
+        fs::write(
+            &fake_ssh,
+            format!(
+                concat!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                    "printf 'managed\\n%s\\n%s' {} {}\n"
+                ),
+                posix_quote(audit_log.to_str().expect("UTF-8 audit path")),
+                posix_quote(&observed_digest),
+                posix_quote(&macos_plist),
+            ),
+        )
+        .expect("write fake SSH");
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o700))
+            .expect("make fake SSH executable");
+
+        let directories = RemoteUserDirectories::for_tests(RemoteTarget::DarwinArm64);
+        let service_path = directories
+            .persistent_service_asset_path("host-123")
+            .expect("macOS has a managed service asset path");
+        assert_eq!(
+            service_path,
+            "/Users/operator/Library/LaunchAgents/dev.microck.satelle.host.plist"
+        );
+        assert_eq!(
+            directories
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                )
+                .expect("run audited read-only service probe")
+                .as_ref()
+                .map(|observation| observation.path.as_str()),
+            Some("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle")
+        );
+
+        let invocation = fs::read_to_string(&audit_log).expect("read fake SSH audit");
+        assert!(invocation.contains("/usr/bin/plutil"));
+        for mutation in [
+            "Set-Content",
+            "Register-ScheduledTask",
+            "launchctl",
+            "chmod ",
+            "mkdir ",
+            "mv ",
+            "rm ",
+        ] {
+            assert!(
+                !invocation.contains(mutation),
+                "service probe attempted mutation command {mutation}: {invocation}"
+            );
+        }
+        for executable_integrity_check in [
+            "/usr/bin/plutil -extract ProgramArguments.0 raw",
+            "[ ! -f \"$executable\" ]",
+            "[ -L \"$executable\" ]",
+            "[ ! -x \"$executable\" ]",
+            "canonical_directory=$(cd -P \"$directory\"",
+            "[ \"$executable\" != \"$canonical_directory/$basename\" ]",
+            "shasum -a 256 -- \"$executable\"",
+        ] {
+            assert!(
+                invocation.contains(executable_integrity_check),
+                "macOS service probe omitted {executable_integrity_check:?}: {invocation}"
+            );
+        }
+
+        let drifted_macos_plist = satelle_core::daemon_service::render_launchd_user_plist(
+            Path::new("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle"),
+            "127.0.0.1:3001",
+            &DaemonPathOverrides {
+                state_dir: Some(PathBuf::from("/Users/operator/drifted-state")),
+                ..DaemonPathOverrides::default()
+            },
+        )
+        .expect("render drifted macOS service definition");
+        fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\nprintf 'managed\\n%s\\n%s' {} {}\n",
+                posix_quote(&observed_digest),
+                posix_quote(&drifted_macos_plist),
+            ),
+        )
+        .expect("replace fake SSH response with a drifted launchd environment");
+        assert!(
+            directories
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                )
+                .expect("a well-formed drifted launchd environment is observable")
+                .is_none()
+        );
+
+        fs::write(
+            &fake_ssh,
+            format!(
+                concat!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                    "printf 'managed\\r\\n",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
+                    "{{\"schema\":\"satelle.host-service.v1\",",
+                    "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
+                    "\"127.0.0.1:3001\"],\"environment\":{{}}}}\\r\\n",
+                    "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
+                    "win32-x64-msvc\\\\satelle-",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n"
+                ),
+                posix_quote(audit_log.to_str().expect("UTF-8 audit path")),
+            ),
+        )
+        .expect("replace fake SSH response");
+        let windows = RemoteUserDirectories::for_tests(RemoteTarget::WindowsX64Msvc);
+        let windows_service_path = windows
+            .persistent_service_asset_path("host-123")
+            .expect("Windows has a managed service asset path");
+        assert_eq!(
+            windows
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &windows_service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                )
+                .expect("run audited Windows service probe")
+                .as_ref()
+                .map(|observation| observation.path.as_str()),
+            Some(
+                r"C:\Users\operator\AppData\Local\Satelle\host\v0.1.0\win32-x64-msvc\satelle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe"
+            )
+        );
+        let invocation = fs::read_to_string(audit_log).expect("read Windows fake SSH audit");
+        let command = invocation
+            .lines()
+            .last()
+            .expect("SSH invocation contains a remote command");
+        let script = decode_powershell_command(command).expect("decode service probe");
+        assert!(script.contains("Get-ScheduledTask"));
+        assert!(script.contains("Export-ScheduledTask"));
+        assert!(script.contains(r"Host-host-123"));
+        assert!(script.contains("host start --service-config"));
+        for canonical_task_check in [
+            "WindowsIdentity]::GetCurrent()",
+            "DocumentElement.GetAttribute('version')",
+            "Principal.LogonType",
+            "Principal.RunLevel",
+            "Triggers.LogonTrigger.Enabled",
+            "Settings.MultipleInstancesPolicy",
+            "Settings.Enabled",
+            "Actions.Context",
+        ] {
+            assert!(
+                script.contains(canonical_task_check),
+                "Windows service probe omitted {canonical_task_check:?}: {script}"
+            );
+        }
+        for executable_integrity_check in [
+            "Test-Path -LiteralPath $executable -PathType Leaf",
+            "Get-Item -LiteralPath $executable -Force",
+            "[IO.FileAttributes]::ReparsePoint",
+            "[IO.Path]::IsPathFullyQualified($executable)",
+            "$executableItem.FullName",
+            "Get-FileHash -Algorithm SHA256",
+        ] {
+            assert!(
+                script.contains(executable_integrity_check),
+                "Windows service probe omitted {executable_integrity_check:?}: {script}"
+            );
+        }
+        for mutation in [
+            "Set-Content",
+            "Register-ScheduledTask",
+            "Start-ScheduledTask",
+        ] {
+            assert!(
+                !script.contains(mutation),
+                "Windows service probe attempted mutation command {mutation}: {script}"
+            );
+        }
+
+        fs::write(
+            &fake_ssh,
+            concat!(
+                "#!/bin/sh\nprintf 'managed\\r\\n",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
+                "{\"schema\":\"satelle.host-service.v1\",",
+                "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
+                "\"127.0.0.1:3002\"],\"environment\":{}}\\r\\n",
+                "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
+                "win32-x64-msvc\\\\satelle-",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n",
+            ),
+        )
+        .expect("replace fake SSH response with a drifted Windows service config");
+        assert!(
+            windows
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &windows_service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                )
+                .expect("a well-formed drifted Windows service config is observable")
+                .is_none()
+        );
+
+        fs::write(
+            &fake_ssh,
+            concat!(
+                "#!/bin/sh\nprintf 'managed\\r\\n",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
+                "{\"schema\":\"satelle.host-service.v1\",",
+                "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
+                "\"127.0.0.1:3001\"],",
+                "\"environment\":{\"SATELLE_HOME\":\"C:\\\\\\\\Drifted\"}}\\r\\n",
+                "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
+                "win32-x64-msvc\\\\satelle-",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n",
+            ),
+        )
+        .expect("replace fake SSH response with a drifted Windows service environment");
+        assert!(
+            windows
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &windows_service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                )
+                .expect("a well-formed drifted Windows service environment is observable")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn managed_service_version_comes_from_its_executable_target() {
+        let macos = RemoteUserDirectories::for_tests(RemoteTarget::DarwinArm64);
+        let windows = RemoteUserDirectories::for_tests(RemoteTarget::WindowsX64Msvc);
+        let old_macos = ManagedServiceExecutableObservation::for_tests(
+            "/Users/operator/Library/Caches/Satelle/host/v0.0.9/darwin-arm64/satelle",
+            [0x11; 32],
+        );
+        assert_eq!(
+            managed_service_executable_version(RemoteTarget::DarwinArm64, &macos, &old_macos, None,),
+            Some("0.0.9".to_string())
+        );
+        let old_windows = ManagedServiceExecutableObservation::for_tests(
+            r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe",
+            [0xaa; 32],
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                &windows,
+                &old_windows,
+                Some([0xbb; 32]),
+            ),
+            Some("0.0.8".to_string())
+        );
+        let current_windows_path = format!(
+            r"C:\Users\operator\AppData\Local\Satelle\host\v{}\win32-x64-msvc\satelle-{}.exe",
+            env!("CARGO_PKG_VERSION"),
+            "aa".repeat(32),
+        );
+        let current_windows =
+            ManagedServiceExecutableObservation::for_tests(&current_windows_path, [0xaa; 32]);
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                &windows,
+                &current_windows,
+                Some([0xaa; 32]),
+            ),
+            Some(env!("CARGO_PKG_VERSION").to_string())
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                &windows,
+                &current_windows,
+                Some([0xbb; 32]),
+            ),
+            None
+        );
+        let current_macos_path = format!(
+            "/Users/operator/Library/Caches/Satelle/host/v{}/darwin-arm64/satelle",
+            env!("CARGO_PKG_VERSION"),
+        );
+        let current_macos =
+            ManagedServiceExecutableObservation::for_tests(&current_macos_path, [0xaa; 32]);
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::DarwinArm64,
+                &macos,
+                &current_macos,
+                Some([0xaa; 32]),
+            ),
+            Some(env!("CARGO_PKG_VERSION").to_string())
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::DarwinArm64,
+                &macos,
+                &current_macos,
+                Some([0xbb; 32]),
+            ),
+            None
+        );
+        let lookalike = ManagedServiceExecutableObservation::for_tests(
+            "/tmp/lookalike/v0.0.9/darwin-arm64/satelle",
+            [0x11; 32],
+        );
+        assert_eq!(
+            managed_service_executable_version(RemoteTarget::DarwinArm64, &macos, &lookalike, None,),
+            None
+        );
+        let malformed = ManagedServiceExecutableObservation::for_tests(
+            "/Users/operator/Library/Caches/Satelle/host/vbroken/darwin-arm64/satelle",
+            [0x11; 32],
+        );
+        assert_eq!(
+            managed_service_executable_version(RemoteTarget::DarwinArm64, &macos, &malformed, None,),
+            None
+        );
+        let mut current_version_parts = env!("CARGO_PKG_VERSION").split('.');
+        let aliased_current_version = format!(
+            "{}.{}.0{}",
+            current_version_parts.next().expect("release major version"),
+            current_version_parts.next().expect("release minor version"),
+            current_version_parts.next().expect("release patch version"),
+        );
+        let aliased_current_windows_path = format!(
+            r"C:\Users\operator\AppData\Local\Satelle\host\v{aliased_current_version}\win32-x64-msvc\satelle-{}.exe",
+            "bb".repeat(32),
+        );
+        let aliased_current_windows = ManagedServiceExecutableObservation::for_tests(
+            &aliased_current_windows_path,
+            [0xbb; 32],
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                &windows,
+                &aliased_current_windows,
+                Some([0xaa; 32]),
+            ),
+            None
+        );
+        let unaddressed_windows = ManagedServiceExecutableObservation::for_tests(
+            r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle.exe",
+            [0xbb; 32],
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                &windows,
+                &unaddressed_windows,
+                Some([0xbb; 32]),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -6306,6 +7117,40 @@ mod tests {
         ] {
             assert_eq!(RemoteTarget::parse_probe(protocol).unwrap(), target);
         }
+    }
+
+    #[test]
+    fn platform_protocol_preserves_unsupported_detected_platforms() {
+        for (protocol, expected_platform) in [
+            (
+                b"satelle-platform-v1\nLinux\nx86_64\nmusl libc 1.2.5\n".as_slice(),
+                "linux-x64-musl",
+            ),
+            (
+                b"satelle-platform-v1\nFreeBSD\nriscv64\n".as_slice(),
+                "freebsd-riscv64",
+            ),
+        ] {
+            let error = RemoteTarget::parse_probe(protocol)
+                .expect_err("the CLI release does not publish this Host artifact");
+
+            assert!(matches!(
+                error,
+                SshBootstrapError::UnsupportedPlatform { platform }
+                    if platform == expected_platform
+            ));
+        }
+    }
+
+    #[test]
+    fn only_a_missing_release_manifest_is_artifact_unavailability() {
+        assert!(release_manifest_is_unavailable(Some(
+            reqwest::StatusCode::NOT_FOUND
+        )));
+        assert!(!release_manifest_is_unavailable(Some(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        )));
+        assert!(!release_manifest_is_unavailable(None));
     }
 
     #[test]

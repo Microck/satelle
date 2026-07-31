@@ -567,8 +567,8 @@ impl OperationCapacity {
         self.registration_changed.notify_all();
     }
 
-    /// Runs a mutation whose durable idempotency is owned by another boundary
-    /// while still sharing the Host-global operation slot.
+    /// Runs exclusive Host work whose durable idempotency, when needed, is
+    /// owned by another boundary while sharing the Host-global operation slot.
     pub(crate) fn execute_exclusive<T>(
         &self,
         operation: impl FnOnce() -> Result<T, SatelleError>,

@@ -1,0 +1,286 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum HostUpdateSchemaVersion {
+    #[serde(rename = "satelle.host.update.v1")]
+    V1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostUpdateComponent {
+    Host,
+    Codex,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostUpdateTarget {
+    HostDaemon,
+    HostDaemonService,
+    CodexRuntime,
+    CodexNativeComputerUse,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostUpdateDisposition {
+    Current,
+    Install,
+    Update,
+    Skipped,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostUpdateRestartImpact {
+    None,
+    HostDaemon,
+    CodexRuntime,
+    NativeComputerUse,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostUpdateVersionSource {
+    InvokingCliRelease,
+    HostCompatibilityRequirement,
+    CodexCompatibilityRequirement,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexComponentOwnership {
+    CodexOwned,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexUpdateAvailability {
+    Available,
+    UnsupportedHostPlatform,
+}
+
+/// Typed Host evidence used to plan Codex-owned updates. Raw probe output does
+/// not cross this boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexUpdateEvidence {
+    pub availability: CodexUpdateAvailability,
+    pub runtime_ownership: CodexComponentOwnership,
+    pub native_component_ownership: CodexComponentOwnership,
+    pub runtime_current_version: Option<String>,
+    pub native_component_current_version: Option<String>,
+    pub required_version: String,
+    pub runtime_update_required: bool,
+    pub native_update_required: bool,
+    pub runtime_compatibility_reason: Option<RepairCompatibilityReason>,
+    pub native_component_compatibility_reason: Option<RepairCompatibilityReason>,
+}
+
+pub fn current_host_artifact_platform() -> String {
+    let environment = if cfg!(target_env = "gnu") {
+        "gnu"
+    } else if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "msvc") {
+        "msvc"
+    } else {
+        "unknown"
+    };
+    host_artifact_platform(std::env::consts::OS, std::env::consts::ARCH, environment)
+}
+
+fn host_artifact_platform(os: &str, arch: &str, environment: &str) -> String {
+    let arch = match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        arch => arch,
+    };
+    match os {
+        "linux" => format!("linux-{arch}-{environment}"),
+        "macos" => format!("darwin-{arch}"),
+        "windows" => format!("win32-{arch}-{environment}"),
+        os => format!("{os}-{arch}"),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HostUpdateMutation {
+    pub operation: String,
+    pub remote_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HostUpdateTargetPlan {
+    pub target: HostUpdateTarget,
+    pub current_version: Option<String>,
+    pub target_version: String,
+    pub version_source: HostUpdateVersionSource,
+    pub disposition: HostUpdateDisposition,
+    pub restart_impact: HostUpdateRestartImpact,
+    pub remote_mutations: Vec<HostUpdateMutation>,
+}
+
+impl HostUpdateTargetPlan {
+    pub fn requires_mutation(&self) -> bool {
+        !self.remote_mutations.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HostUpdateReport {
+    pub schema_version: HostUpdateSchemaVersion,
+    pub host: String,
+    pub checked_components: Vec<HostUpdateComponent>,
+    pub targets: Vec<HostUpdateTargetPlan>,
+    pub confirmation_required: bool,
+}
+
+impl HostUpdateReport {
+    pub fn new(
+        host: impl Into<String>,
+        checked_components: Vec<HostUpdateComponent>,
+        targets: Vec<HostUpdateTargetPlan>,
+    ) -> Self {
+        let confirmation_required = targets.iter().any(HostUpdateTargetPlan::requires_mutation);
+        Self {
+            schema_version: HostUpdateSchemaVersion::V1,
+            host: host.into(),
+            checked_components,
+            targets,
+            confirmation_required,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairCompatibilityReason {
+    Missing,
+    Corrupted,
+    Unsupported,
+    BelowMinimumVersion,
+    ControlPlaneIncompatible,
+    NativeReadinessBlocked,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairUpgradeDisposition {
+    NotNeeded,
+    Required,
+    ManualActionRequired,
+    RecommendHostUpdate,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum RepairUpgradeSchemaVersion {
+    #[serde(rename = "satelle.repair.v1")]
+    V1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairLedgerStatus {
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairPlanSource {
+    LiveProbes,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepairUpgradeAction {
+    pub target: HostUpdateTarget,
+    pub current_version: Option<String>,
+    pub target_version: String,
+    pub compatibility_reason: Option<RepairCompatibilityReason>,
+    pub version_source: HostUpdateVersionSource,
+    pub disposition: RepairUpgradeDisposition,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepairUpgradeReport {
+    pub schema_version: RepairUpgradeSchemaVersion,
+    pub host: String,
+    pub ledger_status: RepairLedgerStatus,
+    pub plan_source: RepairPlanSource,
+    pub actions: Vec<RepairUpgradeAction>,
+}
+
+impl RepairUpgradeReport {
+    pub fn new(host: impl Into<String>, actions: Vec<RepairUpgradeAction>) -> Self {
+        Self {
+            schema_version: RepairUpgradeSchemaVersion::V1,
+            host: host.into(),
+            ledger_status: RepairLedgerStatus::Unavailable,
+            plan_source: RepairPlanSource::LiveProbes,
+            actions,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_update_evidence_rejects_unknown_contract_fields() {
+        let evidence = serde_json::json!({
+            "availability": "available",
+            "runtime_ownership": "codex_owned",
+            "native_component_ownership": "codex_owned",
+            "runtime_current_version": "1.0.0",
+            "native_component_current_version": "1.0.0",
+            "required_version": "1.0.0",
+            "runtime_update_required": false,
+            "native_update_required": false,
+            "runtime_compatibility_reason": null,
+            "native_component_compatibility_reason": null,
+            "unexpected": true
+        });
+
+        assert!(serde_json::from_value::<CodexUpdateEvidence>(evidence).is_err());
+    }
+
+    #[test]
+    fn codex_update_evidence_requires_explicit_availability() {
+        let evidence = serde_json::json!({
+            "runtime_ownership": "codex_owned",
+            "native_component_ownership": "codex_owned",
+            "runtime_current_version": null,
+            "native_component_current_version": null,
+            "required_version": "1.0.0",
+            "runtime_update_required": false,
+            "native_update_required": false,
+            "runtime_compatibility_reason": null,
+            "native_component_compatibility_reason": null
+        });
+
+        assert!(serde_json::from_value::<CodexUpdateEvidence>(evidence).is_err());
+    }
+
+    #[test]
+    fn host_artifact_platform_preserves_runtime_family() {
+        assert_eq!(
+            host_artifact_platform("linux", "x86_64", "gnu"),
+            "linux-x64-gnu"
+        );
+        assert_eq!(
+            host_artifact_platform("linux", "x86_64", "musl"),
+            "linux-x64-musl"
+        );
+        assert_eq!(
+            host_artifact_platform("windows", "aarch64", "msvc"),
+            "win32-arm64-msvc"
+        );
+        assert_eq!(
+            host_artifact_platform("freebsd", "riscv64", "unknown"),
+            "freebsd-riscv64"
+        );
+    }
+}

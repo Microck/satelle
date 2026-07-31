@@ -54,9 +54,10 @@ use tracing::metadata::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-const EXPECTED_OPERATIONS: [&str; 16] = [
+const EXPECTED_OPERATIONS: [&str; 17] = [
     "live",
     "capabilities",
+    "maintenance_update_evidence",
     "host_status",
     "host_paths",
     "host_desktop_sessions",
@@ -1220,6 +1221,43 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         capabilities_json["schema_version"],
         "satelle.capabilities.v6"
     );
+    let expected_target = if cfg!(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_env = "gnu"
+    )) {
+        "linux-arm64-gnu"
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu"
+    )) {
+        "linux-x64-gnu"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "darwin-arm64"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "darwin-x64"
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        "win32-arm64-msvc"
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "win32-x64-msvc"
+    } else {
+        panic!("the release gate runs on one of the six Controller targets");
+    };
+    assert_eq!(capabilities_json["platform"]["target"], expected_target);
+    assert!(
+        capabilities_json.get("codex_update_evidence").is_none(),
+        "ordinary capabilities must not launch live maintenance probes"
+    );
+    let mut missing_target = capabilities_json.clone();
+    missing_target["platform"]
+        .as_object_mut()
+        .expect("platform is an object")
+        .remove("target");
+    assert!(
+        serde_json::from_value::<CapabilitiesResponse>(missing_target).is_err(),
+        "capabilities v6 requires authenticated release-target identity"
+    );
     assert_eq!(
         capabilities_json["provider_secret_upload"],
         serde_json::json!({
@@ -1229,6 +1267,13 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
             "max_plaintext_bytes": 65_536
         })
     );
+    let mut legacy_v5 = capabilities_json.clone();
+    legacy_v5["schema_version"] = serde_json::json!("satelle.capabilities.v5");
+    assert!(
+        serde_json::from_value::<CapabilitiesResponse>(legacy_v5).is_err(),
+        "the protocol-v12 hard cut rejects capabilities v5"
+    );
+
     let mut obsolete_v4 = capabilities_json.clone();
     obsolete_v4["schema_version"] = serde_json::json!("satelle.capabilities.v4");
     assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v4).is_err());
@@ -1262,6 +1307,26 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         capabilities.limits().attachment_bytes_each(),
         5 * 1024 * 1024
     );
+
+    let maintenance_response = running
+        .request("/v1/maintenance/update-evidence")
+        .send()
+        .await
+        .expect("request fresh maintenance evidence");
+    assert_eq!(maintenance_response.status(), StatusCode::OK);
+    let maintenance_json: serde_json::Value = maintenance_response
+        .json()
+        .await
+        .expect("decode maintenance evidence JSON");
+    assert_eq!(
+        maintenance_json["schema_version"],
+        "satelle.maintenance.update-evidence.v1"
+    );
+    assert_eq!(
+        maintenance_json["host_identity"],
+        capabilities.host_identity()
+    );
+    assert!(maintenance_json.get("codex_update_evidence").is_some());
     assert_eq!(
         capabilities.limits().attachment_bytes_total(),
         10 * 1024 * 1024
@@ -1309,6 +1374,25 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
     let error: ApiError = unknown.json().await.expect("decode not-found error");
     assert_eq!(error.code().as_str(), "route-not-found");
     assert_eq!(error.host_identity(), Some(running.host_identity.as_str()));
+}
+
+#[tokio::test]
+async fn live_maintenance_update_evidence_requires_admin_scope() {
+    for (scope_name, scopes) in [("read", ApiScopes::READ), ("control", ApiScopes::CONTROL)] {
+        let running = RunningServer::start(scopes).await;
+        let response = running
+            .request("/v1/maintenance/update-evidence")
+            .send()
+            .await
+            .expect("request live maintenance evidence");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{scope_name}");
+        let error: ApiError = response.json().await.expect("decode scope rejection");
+        assert_eq!(
+            error.code().as_str(),
+            ErrorCode::AuthorizationInsufficientScope.as_str(),
+            "{scope_name}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -88,12 +88,13 @@ impl DaemonRuntimeStatus {
 /// Host-owned capability evidence. Route availability and network limits stay
 /// in the transport crate because they describe the serving process, not the
 /// Computer Use runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonRuntimeCapabilities {
     codex_runtime: bool,
     native_computer_use: bool,
     provider_computer_use: bool,
     image_attachments: bool,
+    codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence,
 }
 
 /// Volatile activity used only to decide whether an on-demand daemon may exit.
@@ -482,24 +483,32 @@ impl SensitiveCanonicalPayload {
 }
 
 impl DaemonRuntimeCapabilities {
-    pub const fn codex_runtime(self) -> bool {
+    pub const fn codex_runtime(&self) -> bool {
         self.codex_runtime
     }
 
-    pub const fn native_computer_use(self) -> bool {
+    pub const fn native_computer_use(&self) -> bool {
         self.native_computer_use
     }
 
-    pub const fn provider_computer_use(self) -> bool {
+    pub const fn provider_computer_use(&self) -> bool {
         self.provider_computer_use
     }
 
-    pub const fn image_attachments(self) -> bool {
+    pub const fn image_attachments(&self) -> bool {
         self.image_attachments
+    }
+
+    pub fn codex_update_evidence(&self) -> satelle_core::host_update::CodexUpdateEvidence {
+        self.codex_update_evidence.clone()
     }
 }
 
 impl HostService {
+    pub fn required_codex_version() -> String {
+        crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string()
+    }
+
     /// Adds a process-local credential for a loopback bootstrap transport.
     /// The raw bearer remains only in the caller and this in-memory
     /// authenticator; it is never registered in durable Host state.
@@ -604,8 +613,45 @@ impl HostService {
                 native_computer_use: false,
                 provider_computer_use: false,
                 image_attachments: *image_attachments,
+                codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence {
+                    availability: satelle_core::host_update::CodexUpdateAvailability::Available,
+                    runtime_ownership:
+                        satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+                    native_component_ownership:
+                        satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+                    runtime_current_version: None,
+                    native_component_current_version: None,
+                    required_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string(),
+                    runtime_update_required: true,
+                    native_update_required: true,
+                    runtime_compatibility_reason: Some(
+                        satelle_core::host_update::RepairCompatibilityReason::Missing,
+                    ),
+                    native_component_compatibility_reason: Some(
+                        satelle_core::host_update::RepairCompatibilityReason::NativeReadinessBlocked,
+                    ),
+                },
             }),
         }
+    }
+
+    /// Collects fresh update evidence without opening Host storage. Maintenance
+    /// planning must observe installs, removals, and upgrades that occurred
+    /// after daemon startup, while remaining independent from readiness caches.
+    pub fn maintenance_codex_update_evidence(
+        &self,
+    ) -> Result<satelle_core::host_update::CodexUpdateEvidence, SatelleError> {
+        self.operation_capacity
+            .execute_exclusive(|| match &self.mode {
+                HostMode::Production { .. } => Ok(production_codex_update_evidence(
+                    &ProductionCapabilitySnapshot::collect(None),
+                )),
+                #[cfg(any(test, feature = "test-support"))]
+                HostMode::TestFake { .. } => Ok(self
+                    .daemon_runtime_capabilities()?
+                    .codex_update_evidence()
+                    .clone()),
+            })
     }
 
     /// Reads only Host-observed desktop state. Controller transport and
@@ -1758,7 +1804,90 @@ fn production_capabilities(
     snapshot: &ProductionCapabilitySnapshot,
     native_computer_use: bool,
 ) -> DaemonRuntimeCapabilities {
-    let codex_runtime = !snapshot.verdict.blockers().iter().any(|blocker| {
+    let codex_runtime = production_codex_runtime(snapshot);
+    DaemonRuntimeCapabilities {
+        codex_runtime,
+        native_computer_use,
+        provider_computer_use: false,
+        image_attachments: snapshot.image_attachments_supported(),
+        codex_update_evidence: production_codex_update_evidence(snapshot),
+    }
+}
+
+fn production_codex_update_evidence(
+    snapshot: &ProductionCapabilitySnapshot,
+) -> satelle_core::host_update::CodexUpdateEvidence {
+    let runtime_current_version = match snapshot.evidence.codex_version {
+        crate::codex_capabilities::CodexVersionEvidence::Detected { version } => {
+            Some(version.to_string())
+        }
+        crate::codex_capabilities::CodexVersionEvidence::Missing
+        | crate::codex_capabilities::CodexVersionEvidence::Malformed
+        | crate::codex_capabilities::CodexVersionEvidence::Unavailable => None,
+    };
+    let unsupported_host_platform = snapshot
+        .verdict
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.reason == BlockerReason::UnsupportedHostPlatform);
+    let runtime_compatibility_reason = (!unsupported_host_platform)
+        .then(|| {
+            runtime_compatibility_reason(
+                snapshot.evidence.codex_version,
+                snapshot
+                    .verdict
+                    .blockers()
+                    .iter()
+                    .map(|blocker| blocker.reason),
+            )
+        })
+        .flatten();
+    let native_execution_path_unavailable = snapshot
+        .verdict
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.reason == BlockerReason::NativeExecutionPathUnavailable);
+    let incomplete_live_proof = snapshot
+        .verdict
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.reason == BlockerReason::IncompleteLiveProof);
+    let native_component_compatibility_reason = if unsupported_host_platform {
+        None
+    } else if native_execution_path_unavailable {
+        Some(satelle_core::host_update::RepairCompatibilityReason::ControlPlaneIncompatible)
+    } else if incomplete_live_proof {
+        Some(satelle_core::host_update::RepairCompatibilityReason::NativeReadinessBlocked)
+    } else {
+        runtime_compatibility_reason
+    };
+    let native_component_current_version = (!native_execution_path_unavailable)
+        .then_some(runtime_current_version.clone())
+        .flatten();
+
+    satelle_core::host_update::CodexUpdateEvidence {
+        availability: if unsupported_host_platform {
+            satelle_core::host_update::CodexUpdateAvailability::UnsupportedHostPlatform
+        } else {
+            satelle_core::host_update::CodexUpdateAvailability::Available
+        },
+        runtime_ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+        native_component_ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
+        runtime_current_version: runtime_current_version.clone(),
+        // Codex version and native-path probes establish the Codex-owned
+        // component state. Readiness-cache state says only whether a prior
+        // smoke-test result can be reused.
+        native_component_current_version,
+        required_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string(),
+        runtime_update_required: runtime_compatibility_reason.is_some(),
+        native_update_required: native_component_compatibility_reason.is_some(),
+        runtime_compatibility_reason,
+        native_component_compatibility_reason,
+    }
+}
+
+fn production_codex_runtime(snapshot: &ProductionCapabilitySnapshot) -> bool {
+    !snapshot.verdict.blockers().iter().any(|blocker| {
         matches!(
             blocker.reason,
             BlockerReason::MissingCodexRuntime
@@ -1766,12 +1895,41 @@ fn production_capabilities(
                 | BlockerReason::CodexVersionUnavailable
                 | BlockerReason::UnsupportedCodexVersion
         )
-    });
-    DaemonRuntimeCapabilities {
-        codex_runtime,
-        native_computer_use,
-        provider_computer_use: false,
-        image_attachments: snapshot.image_attachments_supported(),
+    })
+}
+
+fn runtime_compatibility_reason(
+    codex_version: crate::codex_capabilities::CodexVersionEvidence,
+    blocker_reasons: impl Iterator<Item = BlockerReason>,
+) -> Option<satelle_core::host_update::RepairCompatibilityReason> {
+    use crate::codex_capabilities::CodexVersionEvidence;
+    use satelle_core::host_update::RepairCompatibilityReason;
+
+    match codex_version {
+        CodexVersionEvidence::Detected { .. } => {
+            let mut unsupported = false;
+            let mut control_plane_incompatible = false;
+            for reason in blocker_reasons {
+                unsupported |= matches!(
+                    reason,
+                    BlockerReason::MalformedCodexVersion
+                        | BlockerReason::CodexVersionUnavailable
+                        | BlockerReason::UnsupportedCodexVersion
+                );
+                control_plane_incompatible |= reason == BlockerReason::NonStableSurface;
+            }
+
+            if unsupported {
+                Some(RepairCompatibilityReason::Unsupported)
+            } else if control_plane_incompatible {
+                Some(RepairCompatibilityReason::ControlPlaneIncompatible)
+            } else {
+                None
+            }
+        }
+        CodexVersionEvidence::Missing => Some(RepairCompatibilityReason::Missing),
+        CodexVersionEvidence::Malformed => Some(RepairCompatibilityReason::Corrupted),
+        CodexVersionEvidence::Unavailable => Some(RepairCompatibilityReason::Unsupported),
     }
 }
 
@@ -1908,6 +2066,152 @@ mod tests {
             .unwrap();
 
         assert!(intent.provider_intent.experimental_provider_computer_use());
+    }
+
+    #[test]
+    fn update_evidence_is_independent_from_readiness_cache_state() {
+        let service = HostService::production();
+        let HostMode::Production { snapshot, .. } = &service.mode else {
+            panic!("production service must retain a production snapshot");
+        };
+        let snapshot = crate::read_production_snapshot(snapshot).expect("read production snapshot");
+
+        assert_eq!(
+            production_capabilities(&snapshot, false).codex_update_evidence(),
+            production_capabilities(&snapshot, true).codex_update_evidence()
+        );
+    }
+
+    #[test]
+    fn detected_codex_with_an_unstable_surface_requires_control_plane_repair() {
+        assert_eq!(
+            runtime_compatibility_reason(
+                crate::codex_capabilities::CodexVersionEvidence::Detected {
+                    version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                },
+                [BlockerReason::NonStableSurface].into_iter(),
+            ),
+            Some(satelle_core::host_update::RepairCompatibilityReason::ControlPlaneIncompatible)
+        );
+    }
+
+    #[test]
+    fn incomplete_live_proof_requires_native_readiness_repair() {
+        use crate::codex_capabilities::{
+            CapabilityMatrix, CodexVersionEvidence, ControlPlaneAdmission, EvidenceSurface,
+            HostPlatform, LiveProofStatus, Phase0CapabilityBlocker, Phase0CapabilityEvidence,
+            Phase0SupportVerdict, RequiredCapability,
+        };
+
+        let mut snapshot = ProductionCapabilitySnapshot::collect(None);
+        snapshot.evidence = Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Windows,
+            capabilities: CapabilityMatrix::unproven(),
+        };
+        snapshot.verdict = Phase0SupportVerdict::Blocked {
+            blockers: vec![Phase0CapabilityBlocker {
+                reason: BlockerReason::IncompleteLiveProof,
+                capability: RequiredCapability::NativeReadiness,
+                codex_version: CodexVersionEvidence::Detected {
+                    version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                },
+                host_platform: HostPlatform::Windows,
+                observed_surface: EvidenceSurface::Stable,
+                live_proof: LiveProofStatus::NotObserved,
+            }],
+        };
+        snapshot.control_plane_admission = ControlPlaneAdmission::not_applicable();
+
+        let evidence = production_codex_update_evidence(&snapshot);
+
+        assert!(!evidence.runtime_update_required);
+        assert_eq!(evidence.runtime_compatibility_reason, None);
+        assert!(evidence.native_update_required);
+        assert_eq!(
+            evidence.native_component_compatibility_reason,
+            Some(satelle_core::host_update::RepairCompatibilityReason::NativeReadinessBlocked)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn maintenance_update_evidence_ignores_the_retained_startup_snapshot() {
+        use crate::codex_capabilities::{CodexVersionEvidence, HostPlatform, Phase0SupportVerdict};
+
+        let service = HostService::production();
+        let HostMode::Production { snapshot, .. } = &service.mode else {
+            panic!("production service must retain a production snapshot");
+        };
+        {
+            let mut retained = snapshot
+                .write()
+                .expect("write retained production capability snapshot");
+            retained.evidence.codex_version = CodexVersionEvidence::Detected {
+                version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+            };
+            retained.verdict = Phase0SupportVerdict::Supported {
+                codex_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                host_platform: HostPlatform::Windows,
+            };
+        }
+
+        let evidence = service
+            .maintenance_codex_update_evidence()
+            .expect("collect live maintenance evidence");
+
+        assert_eq!(
+            evidence.availability,
+            satelle_core::host_update::CodexUpdateAvailability::UnsupportedHostPlatform
+        );
+    }
+
+    #[test]
+    fn maintenance_update_evidence_shares_the_host_operation_capacity() {
+        let state = crate::TestStateDir::new().expect("temporary Host state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic Host service");
+        let capacity = Arc::clone(&service.operation_capacity);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let active_operation = std::thread::spawn(move || {
+            capacity.execute_exclusive(|| {
+                entered_tx.send(()).expect("signal occupied capacity");
+                release_rx.recv().expect("release occupied capacity");
+                Ok(())
+            })
+        });
+        entered_rx.recv().expect("wait for occupied capacity");
+
+        let observation = service.maintenance_codex_update_evidence();
+        release_tx.send(()).expect("release occupied capacity");
+        active_operation
+            .join()
+            .expect("join capacity holder")
+            .expect("capacity holder succeeds");
+
+        let error =
+            observation.expect_err("maintenance evidence must respect the occupied Host capacity");
+        assert_eq!(error.code, satelle_core::ErrorCode::CapacityExceeded);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_host_platform_does_not_propose_codex_replacement() {
+        let evidence = HostService::production()
+            .maintenance_codex_update_evidence()
+            .expect("read unsupported-platform maintenance evidence");
+
+        assert!(!evidence.runtime_update_required);
+        assert!(!evidence.native_update_required);
+        assert_eq!(
+            evidence.availability,
+            satelle_core::host_update::CodexUpdateAvailability::UnsupportedHostPlatform
+        );
+        assert_eq!(evidence.runtime_compatibility_reason, None);
+        assert_eq!(evidence.native_component_compatibility_reason, None);
     }
 
     #[test]

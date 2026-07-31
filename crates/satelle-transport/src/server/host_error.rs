@@ -360,6 +360,12 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::HostDaemonUnreachable
         | ErrorCode::DirectDaemonUnreachable
         | ErrorCode::SshBootstrapUnavailable
+        // Host update planning is Controller-owned. These typed CLI errors
+        // must never be reclassified as Host wire failures.
+        | ErrorCode::HostBinaryNewerThanCli
+        | ErrorCode::HostArtifactUnavailable
+        | ErrorCode::HostUpdateRequiresCliUpgrade
+        | ErrorCode::AmbiguousCodexComponentOwnership
         // Process interruption is a Controller-local process-exit contract.
         // If it crosses the Host boundary, expose no extra API surface.
         | ErrorCode::Interrupted

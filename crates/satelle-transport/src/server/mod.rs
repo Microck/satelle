@@ -10,7 +10,8 @@ mod setup;
 use crate::contract::{
     ApiError, ApiErrorCategory, ApiErrorCode, CapabilitiesResponse, EffectiveLimits,
     HostDesktopSessionsResponse, HostPathsResponse, HostStatusResponse, LiveResponse,
-    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, effective_limits,
+    MaintenanceUpdateEvidenceResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId,
+    effective_limits,
 };
 use auth::{AuthorizedRequest, REQUEST_ID_HEADER};
 use axum::Router;
@@ -819,6 +820,23 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_protocol_read,
         ));
+    let maintenance_read_route = Router::new()
+        .route(
+            "/v1/maintenance/update-evidence",
+            get(maintenance_update_evidence),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_protocol_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_read,
+        ));
     let bodyless_read_routes = Router::new()
         .route("/v1/setup/api-token/current", get(setup::confirm_api_token))
         .route("/v1/host/status", get(host_status))
@@ -838,6 +856,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         ));
     let read_routes = bodyless_read_routes
         .merge(capabilities_route)
+        .merge(maintenance_read_route)
         .merge(logs_route)
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -1029,6 +1048,38 @@ async fn capabilities(
         state.capabilities.provider_computer_use(),
         state.capabilities.image_attachments(),
         state.limits,
+    );
+    let mut response = authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    );
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(PROTOCOL_VERSION_HEADER),
+        HeaderValue::from_static(PROTOCOL_VERSION),
+    );
+    response
+}
+
+async fn maintenance_update_evidence(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let codex_update_evidence = match tokio::task::spawn_blocking(move || {
+        service.maintenance_codex_update_evidence()
+    })
+    .await
+    {
+        Ok(Ok(evidence)) => evidence,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = MaintenanceUpdateEvidenceResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        codex_update_evidence,
     );
     let mut response = authenticated_json_response(
         StatusCode::OK,
