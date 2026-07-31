@@ -3347,7 +3347,7 @@ fn parse_service_path_overrides(
     if target.service_platform() != satelle_core::daemon_service::DaemonServicePlatform::Macos {
         return Err(SshBootstrapError::PersistentServiceUnsupported);
     }
-    parse_launchd_path_overrides(output)
+    Ok(parse_launchd_service_definition(output)?.path_overrides)
 }
 
 fn daemon_path_overrides_from_environment(
@@ -3372,7 +3372,15 @@ fn daemon_path_overrides_from_environment(
     Ok(overrides)
 }
 
-fn parse_launchd_path_overrides(output: &[u8]) -> Result<DaemonPathOverrides, SshBootstrapError> {
+struct ObservedLaunchdServiceDefinition {
+    executable: String,
+    bind: SocketAddr,
+    path_overrides: DaemonPathOverrides,
+}
+
+fn parse_launchd_service_definition(
+    output: &[u8],
+) -> Result<ObservedLaunchdServiceDefinition, SshBootstrapError> {
     const PREFIX: &str = concat!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
         "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" ",
@@ -3435,7 +3443,14 @@ fn parse_launchd_path_overrides(output: &[u8]) -> Result<DaemonPathOverrides, Ss
         }
         remaining = rest;
     }
-    daemon_path_overrides_from_environment(RemoteTarget::DarwinArm64, &entries)
+    Ok(ObservedLaunchdServiceDefinition {
+        executable: binary,
+        bind,
+        path_overrides: daemon_path_overrides_from_environment(
+            RemoteTarget::DarwinArm64,
+            &entries,
+        )?,
+    })
 }
 
 fn decode_plist_text(value: &str) -> Result<String, SshBootstrapError> {
@@ -3850,7 +3865,7 @@ impl RemoteUserDirectories {
                     "if [ \"$executable\" != \"$canonical_directory/$basename\" ]; then ",
                     "printf absent; exit 0; fi; ",
                     "printf 'managed\\n'; ",
-                    "/usr/bin/plutil -extract ProgramArguments json -o - \"$path\""
+                    "cat \"$path\""
                 ),
                 path = posix_quote(path),
             );
@@ -3894,21 +3909,15 @@ impl RemoteUserDirectories {
             }
             return Ok(Some(executable.to_string()));
         }
-        let arguments: Vec<String> = serde_json::from_str(payload)
-            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
-        match arguments.as_slice() {
-            [executable, host, start, foreground, bind, address]
-                if !executable.is_empty()
-                    && host == "host"
-                    && start == "start"
-                    && foreground == "--foreground"
-                    && bind == "--bind"
-                    && address == "127.0.0.1:3001" =>
-            {
-                Ok(Some(executable.clone()))
-            }
-            _ => Ok(None),
+        let Ok(definition) = parse_launchd_service_definition(payload.as_bytes()) else {
+            return Ok(None);
+        };
+        if definition.bind != "127.0.0.1:3001".parse().expect("static socket address")
+            || definition.path_overrides != *expected_path_overrides
+        {
+            return Ok(None);
         }
+        Ok(Some(definition.executable))
     }
 
     pub(super) fn resolved_path_set(&self) -> satelle_core::daemon_service::DaemonResolvedPathSet {
@@ -5352,16 +5361,21 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary fake SSH directory");
         let fake_ssh = directory.path().join("ssh");
         let audit_log = directory.path().join("arguments");
+        let macos_plist = satelle_core::daemon_service::render_launchd_user_plist(
+            Path::new("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle"),
+            "127.0.0.1:3001",
+            &DaemonPathOverrides::default(),
+        )
+        .expect("render canonical macOS service definition");
         fs::write(
             &fake_ssh,
             format!(
                 concat!(
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
-                    "printf 'managed\\n[\"/Users/operator/Library/Caches/Satelle/",
-                    "host/v0.1.0/darwin-arm64/satelle\",\"host\",\"start\",",
-                    "\"--foreground\",\"--bind\",\"127.0.0.1:3001\"]\\n'\n"
+                    "printf 'managed\\n%s' {}\n"
                 ),
                 posix_quote(audit_log.to_str().expect("UTF-8 audit path")),
+                posix_quote(&macos_plist),
             ),
         )
         .expect("write fake SSH");
@@ -5420,11 +5434,23 @@ mod tests {
             );
         }
 
+        let drifted_macos_plist = satelle_core::daemon_service::render_launchd_user_plist(
+            Path::new("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle"),
+            "127.0.0.1:3001",
+            &DaemonPathOverrides {
+                state_dir: Some(PathBuf::from("/Users/operator/drifted-state")),
+                ..DaemonPathOverrides::default()
+            },
+        )
+        .expect("render drifted macOS service definition");
         fs::write(
             &fake_ssh,
-            "#!/bin/sh\nprintf 'managed\\n[\"/current/satelle\",\"host\",\"start\",\"--foreground\",\"--bind\",\"127.0.0.1:3002\"]\\n'\n",
+            format!(
+                "#!/bin/sh\nprintf 'managed\\n%s' {}\n",
+                posix_quote(&drifted_macos_plist),
+            ),
         )
-        .expect("replace fake SSH response with a drifted launchd invocation");
+        .expect("replace fake SSH response with a drifted launchd environment");
         assert!(
             directories
                 .probe_managed_service_executable_for_tests(
@@ -5434,7 +5460,7 @@ mod tests {
                     "host-123",
                     &DaemonPathOverrides::default(),
                 )
-                .expect("a well-formed drifted launchd invocation is observable")
+                .expect("a well-formed drifted launchd environment is observable")
                 .is_none()
         );
 

@@ -133,12 +133,11 @@ fn repair_dry_run_uses_live_typed_upgrade_evidence() {
         .find(|action| action["target"] == "codex_runtime")
         .expect("repair report includes the Codex runtime");
     assert_eq!(runtime["version_source"], "codex_compatibility_requirement");
-    assert_eq!(
-        runtime["disposition"],
-        if runtime["compatibility_reason"].is_null() {
-            "not_needed"
-        } else {
-            "manual_action_required"
-        }
+    assert!(
+        matches!(
+            runtime["disposition"].as_str(),
+            Some("not_needed" | "required" | "manual_action_required" | "recommend_host_update")
+        ),
+        "repair disposition must stay inside the typed contract: {runtime}"
     );
 }

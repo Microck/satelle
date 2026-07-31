@@ -58,6 +58,7 @@ pub enum CodexComponentOwnership {
 /// Typed Host evidence used to plan Codex-owned updates. Raw probe output does
 /// not cross this boundary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodexUpdateEvidence {
     pub runtime_ownership: CodexComponentOwnership,
     pub native_component_ownership: CodexComponentOwnership,
@@ -185,5 +186,28 @@ impl RepairUpgradeReport {
             plan_source: RepairPlanSource::LiveProbes,
             actions,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_update_evidence_rejects_unknown_contract_fields() {
+        let evidence = serde_json::json!({
+            "runtime_ownership": "codex_owned",
+            "native_component_ownership": "codex_owned",
+            "runtime_current_version": "1.0.0",
+            "native_component_current_version": "1.0.0",
+            "required_version": "1.0.0",
+            "runtime_update_required": false,
+            "native_update_required": false,
+            "runtime_compatibility_reason": null,
+            "native_component_compatibility_reason": null,
+            "unexpected": true
+        });
+
+        assert!(serde_json::from_value::<CodexUpdateEvidence>(evidence).is_err());
     }
 }

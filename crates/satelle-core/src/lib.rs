@@ -4150,10 +4150,6 @@ impl ErrorCode {
             | Self::ConcurrencyWithoutRemoteUpdate
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
-            | Self::HostBinaryNewerThanCli
-            | Self::HostArtifactUnavailable
-            | Self::HostUpdateRequiresCliUpgrade
-            | Self::AmbiguousCodexComponentOwnership
             | Self::PersistentServiceUnsupported
             | Self::ExperimentalProviderOptInRequired
             | Self::SetupConsentRequired
@@ -4230,6 +4226,10 @@ impl ErrorCode {
             | Self::DesktopSessionNativeSelectorWrongPlatform
             | Self::DesktopSessionNativeSelectorUnmatched
             | Self::DoctorReadinessBlockersFound
+            | Self::HostBinaryNewerThanCli
+            | Self::HostArtifactUnavailable
+            | Self::HostUpdateRequiresCliUpgrade
+            | Self::AmbiguousCodexComponentOwnership
             | Self::SetupVerificationFailed
             | Self::StateConflict
             | Self::StopNotConfirmed => 75,
@@ -5721,6 +5721,10 @@ mod error_contract_tests {
             (ErrorCode::AuthorizationInsufficientScope, 74),
             (ErrorCode::HostIdentityMismatch, 74),
             (ErrorCode::ComputerUseNotReady, 75),
+            (ErrorCode::HostBinaryNewerThanCli, 75),
+            (ErrorCode::HostArtifactUnavailable, 75),
+            (ErrorCode::HostUpdateRequiresCliUpgrade, 75),
+            (ErrorCode::AmbiguousCodexComponentOwnership, 75),
             (ErrorCode::CapacityExceeded, 75),
             (ErrorCode::HostBusy, 75),
             (ErrorCode::StateConflict, 75),
