@@ -3529,7 +3529,10 @@ pub(crate) fn apply_host_update(
             &mut bootstrap_lock,
             "publish-host-service",
         ) {
-            return Err(host_update_recovery_pending(
+            return Err(recover_later_host_update_action_start(
+                &transport.alias,
+                &old_client,
+                &mut bootstrap_lock,
                 &mut report,
                 "publish-host-service",
                 source,
@@ -3669,7 +3672,10 @@ pub(crate) fn apply_host_update(
         &mut bootstrap_lock,
         "restart-host-daemon",
     ) {
-        return Err(host_update_recovery_pending(
+        return Err(recover_later_host_update_action_start(
+            &transport.alias,
+            &old_client,
+            &mut bootstrap_lock,
             &mut report,
             "restart-host-daemon",
             source,
@@ -3803,7 +3809,10 @@ pub(crate) fn apply_host_update(
         &mut bootstrap_lock,
         "invalidate-readiness-caches",
     ) {
-        return Err(host_update_recovery_pending(
+        return Err(recover_later_host_update_action_start(
+            &transport.alias,
+            &new_client,
+            &mut bootstrap_lock,
             &mut report,
             "invalidate-readiness-caches",
             source,
@@ -3859,7 +3868,10 @@ pub(crate) fn apply_host_update(
         &mut bootstrap_lock,
         "host-update-postcheck",
     ) {
-        return Err(host_update_recovery_pending(
+        return Err(recover_later_host_update_action_start(
+            &transport.alias,
+            &new_client,
+            &mut bootstrap_lock,
             &mut report,
             "host-update-postcheck",
             source,
@@ -4178,6 +4190,67 @@ fn fail_host_update_action(
             error
         }
     }
+}
+
+fn recover_later_host_update_action_start(
+    host: &str,
+    client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    report: &mut satelle_core::host_update::HostUpdateReport,
+    action_id: &str,
+    source: SatelleError,
+) -> SatelleError {
+    let operation_id = bootstrap_lock.operation_id().to_string();
+    if bootstrap_lock.current_mutation_is_committed() {
+        let action_index = HOST_UPDATE_ACTIONS
+            .iter()
+            .position(|candidate| *candidate == action_id)
+            .expect("later Host update actions belong to the ordered maintenance plan");
+        let cleanup = HOST_UPDATE_ACTIONS[action_index..]
+            .iter()
+            .try_for_each(|remaining| {
+                skip_maintenance_action(host, client, bootstrap_lock, remaining)
+            })
+            .and_then(|()| finish_persistent_maintenance(host, client, bootstrap_lock))
+            .and_then(|()| {
+                bootstrap_lock
+                    .release_committed_handoff()
+                    .map_err(|_| SatelleError::host_unreachable(host))
+            });
+        if cleanup.is_ok() {
+            return host_update_recovery_pending(report, action_id, source);
+        }
+        return operation_scoped_partial_host_update(
+            report,
+            action_id,
+            &operation_id,
+            source,
+            cleanup.err(),
+        );
+    }
+
+    operation_scoped_partial_host_update(report, action_id, &operation_id, source, None)
+}
+
+fn operation_scoped_partial_host_update(
+    report: &mut satelle_core::host_update::HostUpdateReport,
+    action_id: &str,
+    operation_id: &str,
+    source: SatelleError,
+    cleanup: Option<SatelleError>,
+) -> SatelleError {
+    let failure_detail = cleanup.as_ref().map(|cleanup| {
+        format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}")
+    });
+    let mut error = host_update_recovery_pending(report, action_id, source);
+    error.details.insert(
+        "operation_id".to_string(),
+        serde_json::Value::String(operation_id.to_string()),
+    );
+    if let Some(failure_detail) = failure_detail {
+        error.source_detail = Some(failure_detail);
+    }
+    error
 }
 
 fn host_update_recovery_pending(

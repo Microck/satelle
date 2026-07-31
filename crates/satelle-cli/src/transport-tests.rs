@@ -1699,6 +1699,156 @@ fn failed_postchange_action_cleanup_retains_the_partial_operation_identity() {
 
 #[cfg(unix)]
 #[test]
+fn rejected_later_action_start_retains_the_partial_operation_identity() {
+    with_bootstrap_handoff_test_context_with_scope(
+        ApiScopes::ADMIN,
+        |client, fake_ssh, _, _, service, bootstrap_token_id| {
+            let operation_id = "host-update-rejected-later-action-start";
+            client
+                .begin_host_update_maintenance(operation_id)
+                .expect("begin Host update maintenance");
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "host-update-rejected-later-action-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::HostBinaryReplacement,
+                fake_ssh,
+            )
+            .expect("acquire Host replacement Bootstrap Lock");
+            bootstrap_lock
+                .confirm_ownership()
+                .expect("confirm Bootstrap Lock ownership");
+            start_persistent_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                "install-host-artifact",
+            )
+            .expect("start the first Host update action");
+            complete_persistent_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                "install-host-artifact",
+            )
+            .expect("complete the first Host update action");
+
+            service
+                .revoke_api_token(bootstrap_token_id)
+                .expect("revoke authority before the later action");
+            let source = start_persistent_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                "publish-host-service",
+            )
+            .expect_err("reject the later action before its ledger mutation");
+            let mut report = satelle_core::host_update::HostUpdateReport::new(
+                "office",
+                vec![satelle_core::host_update::HostUpdateComponent::Host],
+                Vec::new(),
+            );
+            report.changed = true;
+            report
+                .applied_actions
+                .push("install-host-artifact".to_string());
+            let error = recover_later_host_update_action_start(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                &mut report,
+                "publish-host-service",
+                source,
+            );
+
+            assert_eq!(error.code, ErrorCode::HostUpdatePartiallyApplied);
+            assert_eq!(
+                error.details.get("operation_id"),
+                Some(&serde_json::json!(operation_id))
+            );
+            assert!(
+                error
+                    .source_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("maintenance cleanup failed"))
+            );
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lost_later_action_start_response_retains_the_partial_operation_identity() {
+    with_bootstrap_handoff_test_context_with_scope(
+        ApiScopes::ADMIN,
+        |client, fake_ssh, _, _, _, _| {
+            let operation_id = "host-update-lost-later-action-start";
+            client
+                .begin_host_update_maintenance(operation_id)
+                .expect("begin Host update maintenance");
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "host-update-lost-later-action-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::HostBinaryReplacement,
+                fake_ssh,
+            )
+            .expect("acquire Host replacement Bootstrap Lock");
+            bootstrap_lock
+                .confirm_ownership()
+                .expect("confirm Bootstrap Lock ownership");
+            start_persistent_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                "install-host-artifact",
+            )
+            .expect("start the first Host update action");
+            complete_persistent_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                "install-host-artifact",
+            )
+            .expect("complete the first Host update action");
+
+            bootstrap_lock.lose_next_mutation_start_response_for_tests();
+            let source = start_persistent_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                "publish-host-service",
+            )
+            .expect_err("lose the later action start response");
+            let mut report = satelle_core::host_update::HostUpdateReport::new(
+                "office",
+                vec![satelle_core::host_update::HostUpdateComponent::Host],
+                Vec::new(),
+            );
+            report.changed = true;
+            report
+                .applied_actions
+                .push("install-host-artifact".to_string());
+            let error = recover_later_host_update_action_start(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                &mut report,
+                "publish-host-service",
+                source,
+            );
+
+            assert_eq!(error.code, ErrorCode::HostUpdatePartiallyApplied);
+            assert_eq!(
+                error.details.get("operation_id"),
+                Some(&serde_json::json!(operation_id))
+            );
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn lost_next_mutation_start_response_cannot_reuse_the_previous_commit_fence() {
     with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
         let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(

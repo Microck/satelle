@@ -417,6 +417,10 @@ impl SshBootstrapLock {
         Ok(())
     }
 
+    pub(super) fn current_mutation_is_committed(&self) -> bool {
+        self.mutation_committed
+    }
+
     #[cfg(all(test, unix))]
     pub(super) fn exchanged_lock_lines(&self) -> &[String] {
         &self.exchanged_lock_lines
