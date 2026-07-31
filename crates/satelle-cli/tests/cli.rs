@@ -7027,8 +7027,11 @@ fn self_update_remote_options_require_update_remotes() {
 #[test]
 fn self_update_without_proven_install_ownership_fails_closed() {
     let state = state_dir();
+    let config_file = state.path().join("invalid-config.toml");
+    fs::write(&config_file, "this is not valid TOML").expect("write invalid config");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CONFIG_FILE", config_file)
         .args(["self", "update", "--dry-run", "--json"])
         .assert()
         .code(66)

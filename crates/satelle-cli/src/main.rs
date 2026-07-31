@@ -8336,20 +8336,26 @@ fn run_self(
                 }
             }
 
-            let resolved = config.load()?;
             let current_host = std::env::var("SATELLE_HOST")
                 .ok()
                 .filter(|host| !host.is_empty());
-            let remote_choices = self_update::remote_host_choices(
-                current_host.as_deref(),
-                resolved.config.default_host.as_deref(),
-                resolved
-                    .config
-                    .hosts
-                    .iter()
-                    .filter(|(_, host)| host.transport != satelle_core::TransportKind::Local)
-                    .map(|(alias, _)| alias.clone()),
-            );
+            let remote_choices = match config.load() {
+                Ok(resolved) => self_update::remote_host_choices(
+                    current_host.as_deref(),
+                    resolved.config.default_host.as_deref(),
+                    resolved
+                        .config
+                        .hosts
+                        .iter()
+                        .filter(|(_, host)| host.transport != satelle_core::TransportKind::Local)
+                        .map(|(alias, _)| alias.clone()),
+                ),
+                Err(error) if command.update_remotes => return Err(error),
+                // Configured-Host discovery is optional for a local update. A
+                // broken Host config must not prevent installing a CLI that can
+                // understand or repair that config.
+                Err(_) => Vec::new(),
+            };
             let follow_up_host =
                 self_update::selected_remote_host(&remote_choices).map(str::to_owned);
             if command.update_remotes && follow_up_host.is_none() {

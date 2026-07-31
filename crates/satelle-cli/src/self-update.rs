@@ -832,11 +832,21 @@ fn package_managed_install_with_global_owners(
 }
 
 fn managed_upgrade(context: PackageInstallContext, install_root: PathBuf) -> ManagedInstall {
-    let mut upgrade_arguments = vec!["update".to_string()];
+    // Local update commands normally honor the dependency's saved range. An
+    // explicit latest request is required because self-update can cross that range.
+    let mut upgrade_arguments = match context.manager.as_str() {
+        "npm" => vec!["install".to_string()],
+        "pnpm" | "bun" => vec!["update".to_string(), "--latest".to_string()],
+        _ => unreachable!("package manager context is validated before upgrade planning"),
+    };
     if context.scope == "global" {
         upgrade_arguments.push("--global".to_string());
     }
-    upgrade_arguments.push(context.package_name.clone());
+    upgrade_arguments.push(if context.manager == "npm" {
+        format!("{}@latest", context.package_name)
+    } else {
+        context.package_name.clone()
+    });
     if context.manager == "npm" {
         upgrade_arguments.push("--include=optional".to_string());
     }
@@ -2284,14 +2294,16 @@ mod tests {
             .expect("managed install");
             let canonical_install_root = install_root.canonicalize().unwrap();
             let command = match (manager, scope) {
-                ("npm", "local") => "npm update @microck/satelle --include=optional".to_string(),
-                ("npm", "global") => {
-                    "npm update --global @microck/satelle --include=optional".to_string()
+                ("npm", "local") => {
+                    "npm install @microck/satelle@latest --include=optional".to_string()
                 }
-                ("pnpm", "local") => "pnpm update @microck/satelle".to_string(),
-                ("pnpm", "global") => "pnpm update --global @microck/satelle".to_string(),
-                ("bun", "local") => "bun update @microck/satelle".to_string(),
-                ("bun", "global") => "bun update --global satelle".to_string(),
+                ("npm", "global") => {
+                    "npm install --global @microck/satelle@latest --include=optional".to_string()
+                }
+                ("pnpm", "local") => "pnpm update --latest @microck/satelle".to_string(),
+                ("pnpm", "global") => "pnpm update --latest --global @microck/satelle".to_string(),
+                ("bun", "local") => "bun update --latest @microck/satelle".to_string(),
+                ("bun", "global") => "bun update --latest --global satelle".to_string(),
                 _ => unreachable!(),
             };
             assert_eq!(managed.install_method, manager);
@@ -2409,7 +2421,7 @@ mod tests {
             let managed = managed_upgrade(context, install_root.clone());
             assert_eq!(
                 managed.upgrade_command,
-                "npm update @microck/satelle --include=optional"
+                "npm install @microck/satelle@latest --include=optional"
             );
             assert!(
                 !managed
