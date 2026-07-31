@@ -3309,7 +3309,9 @@ fn map_release_artifact_error(
 ) -> SatelleError {
     match error {
         ssh_bootstrap::SshBootstrapError::MissingReleaseManifest
-        | ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry => {
+        | ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry
+        | ssh_bootstrap::SshBootstrapError::ManifestTooLarge
+        | ssh_bootstrap::SshBootstrapError::InvalidManifest => {
             SatelleError::host_artifact_unavailable(env!("CARGO_PKG_VERSION"), target.id())
         }
         error => map_ssh_daemon_bootstrap_error(host, error),
@@ -3420,7 +3422,7 @@ fn map_host_update_plan_error(error: crate::host_update::HostUpdatePlanError) ->
             SatelleError::ambiguous_codex_component_ownership(&format!("{target:?}"))
         }
         HostUpdatePlanError::UnsupportedCodexTarget { .. } => {
-            SatelleError::unsupported_update_component("codex")
+            SatelleError::computer_use_not_ready()
         }
         HostUpdatePlanError::InvalidArtifact { .. }
         | HostUpdatePlanError::InvalidCodexTarget { .. } => {
@@ -6619,6 +6621,30 @@ mod bootstrap_ordering_tests {
             missing_manifest_error.details["remote_platform"],
             serde_json::json!("darwin-arm64")
         );
+
+        for malformed in [
+            ssh_bootstrap::SshBootstrapError::ManifestTooLarge,
+            ssh_bootstrap::SshBootstrapError::InvalidManifest,
+        ] {
+            let error = map_release_artifact_error(
+                "remote",
+                ssh_bootstrap::RemoteTarget::DarwinArm64,
+                malformed,
+            );
+            assert_eq!(error.code, satelle_core::ErrorCode::HostArtifactUnavailable);
+        }
+    }
+
+    #[test]
+    fn unsupported_codex_platform_is_a_readiness_error_not_invalid_usage() {
+        let error = map_host_update_plan_error(
+            crate::host_update::HostUpdatePlanError::UnsupportedCodexTarget {
+                target: satelle_core::host_update::HostUpdateTarget::CodexRuntime,
+            },
+        );
+
+        assert_eq!(error.code, satelle_core::ErrorCode::ComputerUseNotReady);
+        assert_eq!(error.code.exit_code(), 75);
     }
 
     #[test]

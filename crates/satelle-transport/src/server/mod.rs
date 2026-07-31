@@ -1020,6 +1020,16 @@ async fn capabilities(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
 ) -> Response {
+    let service = Arc::clone(&state.service);
+    let codex_update_evidence = match tokio::task::spawn_blocking(move || {
+        service.maintenance_codex_update_evidence()
+    })
+    .await
+    {
+        Ok(Ok(evidence)) => evidence,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
     let response = CapabilitiesResponse::new(
         authorized.request_id().clone(),
         state.host_identity.clone(),
@@ -1027,7 +1037,7 @@ async fn capabilities(
         state.capabilities.codex_runtime(),
         state.capabilities.native_computer_use(),
         state.capabilities.provider_computer_use(),
-        state.capabilities.codex_update_evidence(),
+        codex_update_evidence,
         state.capabilities.image_attachments(),
         state.limits,
     );

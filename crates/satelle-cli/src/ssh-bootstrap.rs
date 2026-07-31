@@ -3637,6 +3637,15 @@ pub(super) fn managed_service_executable_version(
         .next()?
         .strip_prefix('v')
         .filter(|version| !version.is_empty())?;
+    let mut version_parts = version.split('.');
+    let _release_version = (
+        version_parts.next()?.parse::<u64>().ok()?,
+        version_parts.next()?.parse::<u64>().ok()?,
+        version_parts.next()?.parse::<u64>().ok()?,
+    );
+    if version_parts.next().is_some() {
+        return None;
+    }
     if components.next()? != target.id() {
         return None;
     }
@@ -5723,6 +5732,15 @@ mod tests {
                 RemoteTarget::DarwinArm64,
                 &macos,
                 "/tmp/lookalike/v0.0.9/darwin-arm64/satelle",
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::DarwinArm64,
+                &macos,
+                "/Users/operator/Library/Caches/Satelle/host/vbroken/darwin-arm64/satelle",
                 None,
             ),
             None

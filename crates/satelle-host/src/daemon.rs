@@ -635,17 +635,16 @@ impl HostService {
         }
     }
 
-    /// Returns update evidence from live compatibility probes without opening
-    /// Host storage. Maintenance planning is read-only, so an absent readiness
-    /// cache cannot be created or treated as evidence that an update is needed.
+    /// Collects fresh update evidence without opening Host storage. Maintenance
+    /// planning must observe installs, removals, and upgrades that occurred
+    /// after daemon startup, while remaining independent from readiness caches.
     pub fn maintenance_codex_update_evidence(
         &self,
     ) -> Result<satelle_core::host_update::CodexUpdateEvidence, SatelleError> {
         match &self.mode {
-            HostMode::Production { snapshot, .. } => {
-                let snapshot = crate::read_production_snapshot(snapshot)?;
-                Ok(production_codex_update_evidence(&snapshot))
-            }
+            HostMode::Production { .. } => Ok(production_codex_update_evidence(
+                &ProductionCapabilitySnapshot::collect(None),
+            )),
             #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake { .. } => Ok(self
                 .daemon_runtime_capabilities()?
@@ -1847,10 +1846,17 @@ fn production_codex_update_evidence(
         .blockers()
         .iter()
         .any(|blocker| blocker.reason == BlockerReason::NativeExecutionPathUnavailable);
+    let incomplete_live_proof = snapshot
+        .verdict
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.reason == BlockerReason::IncompleteLiveProof);
     let native_component_compatibility_reason = if unsupported_host_platform {
         None
     } else if native_execution_path_unavailable {
         Some(satelle_core::host_update::RepairCompatibilityReason::ControlPlaneIncompatible)
+    } else if incomplete_live_proof {
+        Some(satelle_core::host_update::RepairCompatibilityReason::NativeReadinessBlocked)
     } else {
         runtime_compatibility_reason
     };
@@ -2085,6 +2091,79 @@ mod tests {
                 [BlockerReason::NonStableSurface].into_iter(),
             ),
             Some(satelle_core::host_update::RepairCompatibilityReason::ControlPlaneIncompatible)
+        );
+    }
+
+    #[test]
+    fn incomplete_live_proof_requires_native_readiness_repair() {
+        use crate::codex_capabilities::{
+            CapabilityMatrix, CodexVersionEvidence, ControlPlaneAdmission, EvidenceSurface,
+            HostPlatform, LiveProofStatus, Phase0CapabilityBlocker, Phase0CapabilityEvidence,
+            Phase0SupportVerdict, RequiredCapability,
+        };
+
+        let mut snapshot = ProductionCapabilitySnapshot::collect(None);
+        snapshot.evidence = Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Windows,
+            capabilities: CapabilityMatrix::unproven(),
+        };
+        snapshot.verdict = Phase0SupportVerdict::Blocked {
+            blockers: vec![Phase0CapabilityBlocker {
+                reason: BlockerReason::IncompleteLiveProof,
+                capability: RequiredCapability::NativeReadiness,
+                codex_version: CodexVersionEvidence::Detected {
+                    version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                },
+                host_platform: HostPlatform::Windows,
+                observed_surface: EvidenceSurface::Stable,
+                live_proof: LiveProofStatus::NotObserved,
+            }],
+        };
+        snapshot.control_plane_admission = ControlPlaneAdmission::not_applicable();
+
+        let evidence = production_codex_update_evidence(&snapshot);
+
+        assert!(!evidence.runtime_update_required);
+        assert_eq!(evidence.runtime_compatibility_reason, None);
+        assert!(evidence.native_update_required);
+        assert_eq!(
+            evidence.native_component_compatibility_reason,
+            Some(satelle_core::host_update::RepairCompatibilityReason::NativeReadinessBlocked)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn maintenance_update_evidence_ignores_the_retained_startup_snapshot() {
+        use crate::codex_capabilities::{CodexVersionEvidence, HostPlatform, Phase0SupportVerdict};
+
+        let service = HostService::production();
+        let HostMode::Production { snapshot, .. } = &service.mode else {
+            panic!("production service must retain a production snapshot");
+        };
+        {
+            let mut retained = snapshot
+                .write()
+                .expect("write retained production capability snapshot");
+            retained.evidence.codex_version = CodexVersionEvidence::Detected {
+                version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+            };
+            retained.verdict = Phase0SupportVerdict::Supported {
+                codex_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                host_platform: HostPlatform::Windows,
+            };
+        }
+
+        let evidence = service
+            .maintenance_codex_update_evidence()
+            .expect("collect live maintenance evidence");
+
+        assert_eq!(
+            evidence.availability,
+            satelle_core::host_update::CodexUpdateAvailability::UnsupportedHostPlatform
         );
     }
 
