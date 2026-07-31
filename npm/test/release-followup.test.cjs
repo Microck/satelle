@@ -171,7 +171,7 @@ test("release workflow validates six targets and publishes only a fully verified
     "every workflow target needs one Rust target",
   );
   assert.doesNotMatch(
-    buildMatrix,
+    workflow,
     /runner:.*self-hosted/,
     "pull-request release builds must not run untrusted code on persistent runners",
   );
@@ -280,9 +280,13 @@ test("Unix installer bounds network commands and releases its lock on TERM", {
     [installerPath, "--version", "0.1.0", "--bin-dir", bin],
     {
       env: { ...process.env, PATH: `${commands}:${process.env.PATH}` },
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", "pipe"],
     },
   );
+  let installerStderr = "";
+  installerProcess.stderr.on("data", (chunk) => {
+    installerStderr += chunk;
+  });
   context.after(() => {
     if (installerProcess.exitCode === null) installerProcess.kill("SIGKILL");
   });
@@ -292,7 +296,7 @@ test("Unix installer bounds network commands and releases its lock on TERM", {
   installerProcess.kill("SIGTERM");
   const [exitCode, signal] = await once(installerProcess, "exit");
   assert.equal(signal, null);
-  assert.equal(exitCode, 143);
+  assert.equal(exitCode, 143, installerStderr);
   assert.equal(existsSync(lockPath), false);
 });
 
@@ -434,7 +438,7 @@ test("Unix installer performs verified install, upgrade, smoke, receipt, and uni
   assert.equal(existsSync(path.join(bin, "satelle")), false);
 
   const prereleaseResult = runInstaller("--version", "0.1.0-rc.1", "--bin-dir", bin);
-  assert.equal(prereleaseResult.status, 64);
+  assert.equal(prereleaseResult.status, 64, prereleaseResult.stderr);
   assert.match(prereleaseResult.stderr, /invalid Satelle version/);
 
   const failedSmokeBin = path.join(root, "failed-version-smoke");

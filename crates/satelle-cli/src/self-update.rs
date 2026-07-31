@@ -78,6 +78,10 @@ pub(crate) struct SelfUpdateReport {
 }
 
 impl SelfUpdateReport {
+    pub(crate) fn installed_executable(&self) -> &Path {
+        &self.planned_replacement
+    }
+
     pub(crate) const fn should_offer_remote_update(
         &self,
         no_input: bool,
@@ -2818,6 +2822,10 @@ mod tests {
         assert!(report.target_artifact.contains("satelle-v1.1.0-"));
         assert_eq!(
             report.planned_replacement,
+            fixture.current_binary.canonicalize().unwrap()
+        );
+        assert_eq!(
+            report.installed_executable(),
             fixture.current_binary.canonicalize().unwrap()
         );
         assert_eq!(

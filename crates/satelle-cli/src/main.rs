@@ -679,6 +679,8 @@ struct SelfUpdateCommand {
     concurrency: u8,
     #[arg(long)]
     no_input: bool,
+    #[arg(long)]
+    yes: bool,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -8261,7 +8263,7 @@ mod host_update_consent_tests {
     #[test]
     fn self_update_remote_handoff_reexecutes_the_canonical_host_update_command() {
         assert_eq!(
-            self_update_remote_handoff_arguments(Some("work"), "office", true),
+            self_update_remote_handoff_arguments(Some("work"), "office", true, true),
             [
                 "--profile",
                 "work",
@@ -8270,10 +8272,11 @@ mod host_update_consent_tests {
                 "--host",
                 "office",
                 "--no-input",
+                "--yes",
             ]
         );
         assert_eq!(
-            self_update_remote_handoff_arguments(None, "office", false),
+            self_update_remote_handoff_arguments(None, "office", false, false),
             ["host", "update", "--host", "office"]
         );
     }
@@ -8304,6 +8307,11 @@ fn run_self(
             }
 
             if !command.update_remotes {
+                if command.yes {
+                    return Err(failure(SatelleError::invalid_usage(
+                        "--yes requires --update-remotes",
+                    )));
+                }
                 if command.concurrency != 4 {
                     return Err(failure(SatelleError::concurrency_without_remote_update()));
                 }
@@ -8355,6 +8363,12 @@ fn run_self(
             }
 
             let stdin_is_terminal = io::stdin().is_terminal();
+            if command.update_remotes && (command.no_input || !stdin_is_terminal) && !command.yes {
+                return Err(failure(SatelleError::setup_consent_required(
+                    &["update the selected configured remote Host".to_string()],
+                    "satelle self update --update-remotes --no-input --yes".to_string(),
+                )));
+            }
             let interactive_offer_candidate = !command.update_remotes
                 && !command.no_input
                 && stdin_is_terminal
@@ -8396,7 +8410,13 @@ fn run_self(
             let Some(host) = selected_host else {
                 return Ok(());
             };
-            run_self_update_remote_handoff(config.flag_profile, &host, command.no_input)
+            run_self_update_remote_handoff(
+                report.installed_executable(),
+                config.flag_profile,
+                &host,
+                command.no_input,
+                command.yes,
+            )
         }
     }
 }
@@ -8405,6 +8425,7 @@ fn self_update_remote_handoff_arguments(
     profile: Option<&str>,
     host: &str,
     no_input: bool,
+    yes: bool,
 ) -> Vec<String> {
     let mut arguments = Vec::new();
     if let Some(profile) = profile {
@@ -8419,13 +8440,18 @@ fn self_update_remote_handoff_arguments(
     if no_input {
         arguments.push("--no-input".to_string());
     }
+    if yes {
+        arguments.push("--yes".to_string());
+    }
     arguments
 }
 
 fn run_self_update_remote_handoff(
+    installed_executable: &Path,
     profile: Option<&str>,
     host: &str,
     no_input: bool,
+    yes: bool,
 ) -> Result<(), CliFailure> {
     io::stdout().flush().map_err(|error| {
         failure(SatelleError {
@@ -8436,18 +8462,9 @@ fn run_self_update_remote_handoff(
             details: BTreeMap::from([("host".to_string(), json!(host))]),
         })
     })?;
-    let executable = std::env::current_exe().map_err(|error| {
-        failure(SatelleError {
-            code: ErrorCode::SelfUpdateFailed,
-            message: "could not resolve the updated Satelle executable".to_string(),
-            recovery_command: Some(self_update::host_update_command(host)),
-            source_detail: Some(error.to_string()),
-            details: BTreeMap::from([("host".to_string(), json!(host))]),
-        })
-    })?;
-    let status = ProcessCommand::new(executable)
+    let status = ProcessCommand::new(installed_executable)
         .args(self_update_remote_handoff_arguments(
-            profile, host, no_input,
+            profile, host, no_input, yes,
         ))
         .status()
         .map_err(|error| {

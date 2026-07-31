@@ -165,6 +165,7 @@ function commandLine(command, argumentsToForward) {
     timeout: 10_000,
     maxBuffer: 64 * 1024,
     windowsHide: true,
+    shell: path.extname(command).toLowerCase() === ".cmd",
   });
   if (result.status !== 0 || result.error) {
     return undefined;
@@ -183,16 +184,18 @@ function packageManagerCommand(manager, platform) {
   return manager === "bun" ? "bun.exe" : `${manager}.cmd`;
 }
 
-function outerNodeModulesRoot(filePath) {
+function packageNodeModulesRoot(filePath, packageName) {
   let current = path.resolve(filePath);
-  let selected;
   while (true) {
-    if (path.basename(current).toLowerCase() === "node_modules") {
-      selected = current;
+    if (
+      path.basename(current).toLowerCase() === "node_modules" &&
+      globalRootOwnsLauncher({ globalRoot: current, packageName, launcherPath: filePath })
+    ) {
+      return current;
     }
     const parent = path.dirname(current);
     if (parent === current) {
-      return selected;
+      return undefined;
     }
     current = parent;
   }
@@ -237,11 +240,10 @@ function discoverGlobalOwnership({
         return false;
       }
     });
-    const installRoot = bunOwnsLauncher ? outerNodeModulesRoot(launcherPath) : undefined;
-    if (
-      installRoot &&
-      globalRootOwnsLauncher({ globalRoot: installRoot, packageName, launcherPath })
-    ) {
+    const installRoot = bunOwnsLauncher
+      ? packageNodeModulesRoot(launcherPath, packageName)
+      : undefined;
+    if (installRoot) {
       owners.push({ manager: "bun", installRoot });
     }
   }
@@ -310,12 +312,18 @@ function packageInstallContext({
   if (!packageName || !launcherPath) {
     return undefined;
   }
+  let canonicalLauncherPath;
+  try {
+    canonicalLauncherPath = realpathSync(launcherPath);
+  } catch {
+    return undefined;
+  }
   const candidates = globalOwners.map((owner) => ({
     manager: owner.manager,
     scope: "global",
     package_name: packageName,
     install_root: path.resolve(owner.installRoot),
-    launcher_path: realpathSync(launcherPath),
+    launcher_path: canonicalLauncherPath,
   }));
   const localOwner = discoverLocalOwnership({ packageName, launcherPath });
   if (localOwner) {
@@ -324,7 +332,7 @@ function packageInstallContext({
       scope: "local",
       package_name: packageName,
       install_root: path.resolve(localOwner.installRoot),
-      launcher_path: realpathSync(launcherPath),
+      launcher_path: canonicalLauncherPath,
     });
   }
   return candidates.length === 1 ? candidates[0] : undefined;
@@ -483,8 +491,11 @@ function resolveNativeBinary(
 }
 
 function executeNativeBinary(binaryPath, argumentsToForward, installContext) {
-  const environment = { ...process.env };
-  delete environment[packageInstallContextEnvironment];
+  const environment = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => name.toUpperCase() !== packageInstallContextEnvironment,
+    ),
+  );
   if (installContext) {
     environment[packageInstallContextEnvironment] = JSON.stringify(installContext);
   }
@@ -545,6 +556,7 @@ function main({ packageName = "@microck/satelle", launcherPath = __filename } = 
 
 module.exports = {
   LauncherError,
+  commandLine,
   detectForwardingContext,
   detectInstallationScope,
   detectLinuxLibc,

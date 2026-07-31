@@ -7025,6 +7025,63 @@ fn self_update_remote_options_require_update_remotes() {
 }
 
 #[test]
+fn self_update_yes_requires_remote_handoff() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["--error-format", "json", "self", "update", "--yes"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let error = parse_json_output(&output.stderr);
+
+    assert_eq!(error["code"], "invalid-usage");
+    assert_eq!(error["message"], "--yes requires --update-remotes");
+}
+
+#[test]
+fn noninteractive_self_update_remote_handoff_requires_consent_before_mutation() {
+    let state = state_dir();
+    let config_file = state.path().join("config.toml");
+    write_user_config(
+        &config_file,
+        r#"
+default_host = "remote-default"
+
+[hosts.remote-default]
+transport = "ssh"
+adapter = "fake"
+address = "operator@default.example"
+"#,
+    )
+    .expect("write self-update remote config");
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CONFIG_FILE", config_file)
+        .args([
+            "--error-format",
+            "json",
+            "self",
+            "update",
+            "--update-remotes",
+            "--no-input",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let error = parse_json_output(&output.stderr);
+
+    assert_eq!(error["code"], "setup-consent-required");
+    assert_eq!(error["details"]["mutated"], false);
+    assert_eq!(
+        error["suggested_commands"],
+        serde_json::json!(["satelle self update --update-remotes --no-input --yes"])
+    );
+}
+
+#[test]
 fn self_update_without_proven_install_ownership_fails_closed() {
     let state = state_dir();
     let config_file = state.path().join("invalid-config.toml");

@@ -9,6 +9,7 @@ const {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } = require("node:fs");
 const { tmpdir } = require("node:os");
@@ -520,6 +521,19 @@ test("Windows global discovery invokes package-manager launcher files", () => {
   );
 });
 
+test(
+  "Windows package-manager launcher files execute through the command shell",
+  { skip: process.platform !== "win32" },
+  (context) => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-command-line-"));
+    context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+    const command = path.join(fixtureRoot, "probe.cmd");
+    writeFileSync(command, "@echo probe-result\r\n");
+
+    assert.equal(launcher.commandLine(command, []), "probe-result");
+  },
+);
+
 test("self-update context rejects cross-lane ownership ambiguity", (context) => {
   const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-cross-lane-context-"));
   context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
@@ -547,6 +561,51 @@ test("self-update context rejects cross-lane ownership ambiguity", (context) => 
       packageName: "@microck/satelle",
       launcherPath,
       globalOwners: [{ manager: "npm", installRoot: path.join(fixtureRoot, "node_modules") }],
+    }),
+    undefined,
+  );
+});
+
+test("Bun global discovery selects the nearest package-owning node_modules root", (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-bun-root-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const innerRoot = path.join(
+    fixtureRoot,
+    "node_modules",
+    "foreign",
+    "node_modules",
+  );
+  const launcherPath = path.join(
+    innerRoot,
+    "@microck",
+    "satelle",
+    "bin",
+    "satelle.cjs",
+  );
+  const bunBin = path.join(fixtureRoot, "bun-bin");
+  mkdirSync(path.dirname(launcherPath), { recursive: true });
+  mkdirSync(bunBin);
+  writeFileSync(launcherPath, "fixture");
+  symlinkSync(launcherPath, path.join(bunBin, "satelle"));
+
+  const owners = launcher.discoverGlobalOwnership({
+    packageName: "@microck/satelle",
+    launcherPath,
+    platform: "linux",
+    runCommand(command) {
+      return command === "bun" ? bunBin : undefined;
+    },
+  });
+
+  assert.deepEqual(owners, [{ manager: "bun", installRoot: innerRoot }]);
+});
+
+test("package install context fails closed when the launcher path is missing", () => {
+  assert.equal(
+    launcher.packageInstallContext({
+      packageName: "@microck/satelle",
+      launcherPath: "/missing/satelle/bin/satelle.cjs",
+      globalOwners: [],
     }),
     undefined,
   );
@@ -588,10 +647,12 @@ test("native execution clears stale package context and installs a fresh one", (
   const output = path.join(fixtureRoot, "output.json");
   writeFileSync(
     probe,
-    `require("node:fs").writeFileSync(process.argv[2], process.env.SATELLE_PACKAGE_INSTALL_CONTEXT || "missing");\n`,
+    `const context = Object.entries(process.env).find(([name]) => name.toUpperCase() === "SATELLE_PACKAGE_INSTALL_CONTEXT")?.[1];\nrequire("node:fs").writeFileSync(process.argv[2], context || "missing");\n`,
   );
   const previous = process.env.SATELLE_PACKAGE_INSTALL_CONTEXT;
+  const previousMixedCase = process.env.Satelle_Package_Install_Context;
   process.env.SATELLE_PACKAGE_INSTALL_CONTEXT = "stale";
+  process.env.Satelle_Package_Install_Context = "forged";
   try {
     assert.equal(launcher.executeNativeBinary(process.execPath, [probe, output]), 0);
     assert.equal(readFileSync(output, "utf8"), "missing");
@@ -609,6 +670,11 @@ test("native execution clears stale package context and installs a fresh one", (
       delete process.env.SATELLE_PACKAGE_INSTALL_CONTEXT;
     } else {
       process.env.SATELLE_PACKAGE_INSTALL_CONTEXT = previous;
+    }
+    if (previousMixedCase === undefined) {
+      delete process.env.Satelle_Package_Install_Context;
+    } else {
+      process.env.Satelle_Package_Install_Context = previousMixedCase;
     }
   }
 });

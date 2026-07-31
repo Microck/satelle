@@ -4561,7 +4561,6 @@ fn verified_host_update_artifact_from_metadata(
 ) -> Result<crate::host_update::VerifiedHostArtifact, SatelleError> {
     let metadata =
         metadata.map_err(|error| map_release_artifact_error(host, version, target, error))?;
-    let _verified_digest = metadata.digest();
     Ok(crate::host_update::VerifiedHostArtifact {
         version: version.to_string(),
         remote_platform: target.id().to_string(),

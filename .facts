@@ -202,7 +202,7 @@
 - satelle installation documentation lists npm, pnpm, and bun npm-registry installs before non-npm methods because npm-registry distribution is the recommended local CLI install path @spec @mvp @implemented
 - satelle MVP first-party non-npm local install methods are a Unix shell installer, a Windows PowerShell installer, a Homebrew tap, a Scoop bucket, and direct GitHub release archive downloads @spec @mvp @implemented
 - satelle Unix shell installer supports curl and wget entrypoints that pipe a canonical HTTPS installer script into sh @spec @mvp @implemented
-- label: the Unix shell installer requires gh and jq in addition to curl or wget, fails before downloading when either verified prerequisite is unavailable, and uses jq to validate every required satelle.paths.v1 source member against the closed PathSource vocabulary
+- label: the Unix shell installer requires gh and jq in addition to curl or wget, fails before downloading when either verified prerequisite is unavailable, and uses jq to validate every required satelle.paths.v2 source member against the closed PathSource vocabulary
   id: 9ih
   command: node --test npm/test/release-followup.test.cjs
   tags: [mvp, release-gate, verification, implemented]
@@ -311,7 +311,7 @@
 - satelle public npm package publishing runs on cloud-hosted CI runners capable of generating npm provenance attestations @spec @mvp @implemented
 - satelle public release workflow generates GitHub artifact attestations for each native binary artifact before publishing the release @spec @mvp @implemented
 - satelle public release workflow produces checksum and integrity metadata for every native binary artifact before publishing npm packages or GitHub release assets @spec @mvp @implemented
-- satelle public GitHub release workflow creates or updates a draft release, attaches all release assets and metadata, verifies the release artifact set, and publishes the release only after validation passes @spec @mvp @implemented
+- satelle public GitHub release workflow creates or updates a draft release, attaches all release assets and metadata, and verifies the release artifact set @spec @mvp @implemented
 - satelle first MVP public release does not require npm staged publishing because npm staged publishing requires each package to already exist on the npm registry before it can be staged @spec @mvp @implemented
 - when staged publishing is unavailable for brand-new package identities, satelle may publish initial npm package versions through trusted publishing under `rc-vX.Y.Z` only after prepublication validation passes @spec @mvp @implemented
 - satelle post-MVP npm staged publishing is adopted only after all Satelle npm package identities exist, trusted publishing is stable, release automation supports npm CLI 11.15.0 or newer and Node.js 22.14.0 or newer, and maintainers accept the required 2FA approval step @spec @later
@@ -2377,7 +2377,7 @@
 - a partial npm publication or validation failure stops later package publication and leaves every existing default dist-tag unchanged @spec @mvp
 - a partial npm publication or validation failure records which immutable candidate versions exist plus an idempotent recovery procedure before any npm promotion transaction may begin @spec @mvp
 - release recovery never moves the signed version tag or republishes different bytes under an already published package version @spec @mvp
-- label: the release-candidate offline JSON smoke command is satelle paths --json and must emit schema_version satelle.paths.v1 before target-specific online smoke tests run
+- label: the release-candidate offline JSON smoke command is satelle paths --json and must emit schema_version satelle.paths.v2 before target-specific online smoke tests run
   command: cargo build --workspace --release --locked && cargo test --locked -p satelle-cli --test release-binary-contract release_binary_satisfies_offline_contract -- --exact --ignored
   tags: [release-gate, verification, mvp, spec, implemented, ci]
 - release-candidate validation installs, executes the --version contract, runs satelle paths --json, upgrades, and uninstalls Satelle on every Controller target @spec @verification @mvp @implemented

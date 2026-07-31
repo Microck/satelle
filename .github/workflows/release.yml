@@ -317,7 +317,7 @@ jobs:
           cp "$extract_root/satelle" "$install_root/satelle"
           chmod 755 "$install_root/satelle"
           test "$("$install_root/satelle" --version)" = "satelle $RELEASE_VERSION"
-          test "$("$install_root/satelle" paths --json | jq -r .schema_version)" = satelle.paths.v1
+          test "$("$install_root/satelle" paths --json | jq -r .schema_version)" = satelle.paths.v2
           rm "$install_root/satelle"
           test ! -e "$install_root/satelle"
 
@@ -379,7 +379,7 @@ jobs:
           Copy-Item "$ExtractRoot/satelle.exe" "$InstallRoot/satelle.exe" -Force
           if ((& "$InstallRoot/satelle.exe" --version) -ne "satelle $Version") { throw "version smoke failed" }
           $Paths = & "$InstallRoot/satelle.exe" paths --json | ConvertFrom-Json
-          if ($Paths.schema_version -ne "satelle.paths.v1") { throw "paths smoke failed" }
+          if ($Paths.schema_version -ne "satelle.paths.v2") { throw "paths smoke failed" }
           Remove-Item "$InstallRoot/satelle.exe"
           if (Test-Path "$InstallRoot/satelle.exe") { throw "uninstall failed" }
 

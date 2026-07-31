@@ -400,8 +400,6 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::SelfUpdateManagedInstall
         | ErrorCode::SelfUpdateVersionInvalid
         | ErrorCode::SelfUpdateExplicitVersionRequired
-        | ErrorCode::UnsupportedLocalPlatform
-        | ErrorCode::UnsupportedReleaseTarget
         | ErrorCode::PersistentServiceUnsupported
         | ErrorCode::SetupConsentRequired
         | ErrorCode::ProviderSecretSourceRequired
@@ -423,6 +421,14 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             },
             default_recovery: "review satelle --help and retry with valid input",
         },
+        ErrorCode::UnsupportedLocalPlatform | ErrorCode::UnsupportedReleaseTarget => {
+            ErrorContract {
+                category: ErrorCategory::InvalidRequest,
+                retryable: false,
+                outcome: "The selected platform or release target is not in the Controller matrix.",
+                default_recovery: "select a supported Controller target",
+            }
+        }
         ErrorCode::Interrupted => ErrorContract {
             category: ErrorCategory::Interrupted,
             retryable: true,
@@ -773,6 +779,22 @@ mod tests {
         let contract = error_contract(ErrorCode::SetupVerificationFailed);
         assert_eq!(contract.category.as_str(), "readiness");
         assert!(!contract.retryable);
+    }
+
+    #[test]
+    fn unsupported_release_targets_report_the_platform_contract() {
+        for code in [
+            ErrorCode::UnsupportedLocalPlatform,
+            ErrorCode::UnsupportedReleaseTarget,
+        ] {
+            let error = error_with_code(code);
+            let rendered = human_error(&error);
+
+            assert!(rendered.starts_with(
+                "error: The selected platform or release target is not in the Controller matrix."
+            ));
+            assert!(rendered.ends_with("next: select a supported Controller target"));
+        }
     }
 
     #[test]
