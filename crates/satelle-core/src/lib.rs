@@ -5619,6 +5619,10 @@ impl SatelleError {
             serde_json::to_value(&report.skipped_actions).unwrap_or(Value::Null),
         );
         details.insert(
+            "invalidated_caches".to_string(),
+            serde_json::to_value(&report.invalidated_caches).unwrap_or(Value::Null),
+        );
+        details.insert(
             "preserved_state".to_string(),
             Value::String("completed Host update actions were preserved".to_string()),
         );
@@ -5871,6 +5875,10 @@ mod error_contract_tests {
         assert_eq!(
             partial.details["completed_actions"],
             serde_json::json!(["install-host-artifact"])
+        );
+        assert_eq!(
+            partial.details["invalidated_caches"],
+            serde_json::json!(["native_computer_use"])
         );
 
         report.status = HostUpdateStatus::PostcheckFailed;
