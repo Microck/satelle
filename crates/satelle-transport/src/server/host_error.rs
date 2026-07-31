@@ -33,7 +33,7 @@ pub(super) fn task_failure(state: &DaemonState, authorized: &AuthorizedRequest) 
 }
 
 fn failure(error: &SatelleError) -> ApiFailure {
-    match error.code {
+    let mut failure = match error.code {
         ErrorCode::InvalidUsage
         | ErrorCode::ScopeSelectionConflict
         | ErrorCode::PromptSourceConflict
@@ -218,7 +218,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
             category: ApiErrorCategory::Readiness,
             retryable: false,
             message: "native Computer Use is not ready on this Host",
-            details: validated_maintenance_postcheck_details(error),
+            details: None,
         },
         ErrorCode::DoctorReadinessBlockersFound | ErrorCode::SetupVerificationFailed => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -307,7 +307,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
             category: ApiErrorCategory::Readiness,
             retryable: true,
             message: "the native Computer Use readiness smoke test timed out",
-            details: validated_maintenance_postcheck_details(error),
+            details: None,
         },
         ErrorCode::ProviderSmokeTestTimeout => ApiFailure {
             status: StatusCode::GATEWAY_TIMEOUT,
@@ -412,7 +412,22 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Host does not implement the requested operation",
             details: None,
         },
+    };
+
+    // Maintenance postcheck finalization can attach this one authenticated
+    // state bit to any terminal error kind. Merge only that validated bit
+    // after the normal error mapping so future postcheck failures cannot
+    // silently regress to an uncertain outcome, while all private details
+    // remain confined to the Host.
+    if let Some(serde_json::Value::Object(terminal_details)) =
+        validated_maintenance_postcheck_details(error)
+    {
+        match &mut failure.details {
+            Some(serde_json::Value::Object(details)) => details.extend(terminal_details),
+            _ => failure.details = Some(serde_json::Value::Object(terminal_details)),
+        }
     }
+    failure
 }
 
 fn validated_control_plane_details(error: &SatelleError) -> Option<serde_json::Value> {
@@ -575,10 +590,17 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_postcheck_terminal_detail_crosses_the_authenticated_boundary() {
+    fn maintenance_postcheck_terminal_detail_crosses_every_error_mapping() {
         for mut error in [
             SatelleError::computer_use_not_ready(),
             SatelleError::native_readiness_timeout(),
+            SatelleError {
+                code: ErrorCode::StorageIntegrityFailed,
+                message: "PRIVATE_MESSAGE_CANARY".to_string(),
+                recovery_command: None,
+                source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+                details: BTreeMap::new(),
+            },
         ] {
             error
                 .details
