@@ -582,6 +582,11 @@ struct HostUpdateCommand {
     yes: bool,
     #[arg(long)]
     no_input: bool,
+    #[arg(
+        long,
+        help = "Suppress non-error human plan and progress output; use --json for stable automation data"
+    )]
+    quiet: bool,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -1044,7 +1049,8 @@ fn preflight_setup_before_history(
         .mode
         .as_str()
         .to_string();
-    let trusted_consent = trusted_profile_allows_setup(resolved, &host.alias);
+    let trusted_consent =
+        trusted_profile_allows_mutation(resolved, &host.alias, MutationCommandFamily::Setup);
     let verification_checks = if command.verify {
         setup_verification_checks(
             doctor_provider_intent(resolved, &host.config, true, None)
@@ -2265,7 +2271,11 @@ fn ensure_exact_setup_verification_recovery(report: &mut SetupReport, host: &str
     }
 }
 
-fn trusted_profile_allows_setup(resolved: &ResolvedConfig, host_alias: &str) -> bool {
+fn trusted_profile_allows_mutation(
+    resolved: &ResolvedConfig,
+    host_alias: &str,
+    command_family: MutationCommandFamily,
+) -> bool {
     let Some(selected) = resolved.selected_profile.as_ref() else {
         return false;
     };
@@ -2280,10 +2290,7 @@ fn trusted_profile_allows_setup(resolved: &ResolvedConfig, host_alias: &str) -> 
         .trusted_profiles
         .get(&selected.name)
         .is_some_and(|trusted| {
-            trusted.hosts.contains(host_alias)
-                && trusted
-                    .command_families
-                    .contains(&MutationCommandFamily::Setup)
+            trusted.hosts.contains(host_alias) && trusted.command_families.contains(&command_family)
         })
 }
 
@@ -2562,7 +2569,8 @@ fn run_setup(
         && tailscale_serve::applies_to(&host.config);
     let host_setup_required = !host_setup_components.is_empty();
     let interactive_selection = !command.no_input && io::stdin().is_terminal();
-    let trusted_consent = trusted_profile_allows_setup(resolved, &host.alias);
+    let trusted_consent =
+        trusted_profile_allows_mutation(resolved, &host.alias, MutationCommandFamily::Setup);
     let mut provider_selection =
         resolve_provider_selection(resolved, &host, None, None, false, false)?;
     let provider_probe_required = if command.verify {
@@ -8057,6 +8065,11 @@ fn run_host_update(
         )));
     }
     let host = config.resolve_host(command.host.first().map(String::as_str))?;
+    let trusted_consent = trusted_profile_allows_mutation(
+        config.load()?,
+        &host.alias,
+        MutationCommandFamily::HostUpdate,
+    );
     let includes_all = command.component.iter().any(|component| component == "all");
     let components = command
         .component
@@ -8068,37 +8081,93 @@ fn run_host_update(
             _ => unreachable!("validated update component"),
         })
         .collect::<Vec<_>>();
-    let report = transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
+    let mut report =
+        transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
     if command.dry_run {
+        report = report.into_dry_run();
         if format.is_json() {
             print_json(&report).map_err(failure)?;
-        } else {
+        } else if !command.quiet {
             print!("{}", host_update::render_host_update_plan(&report));
         }
         return Ok(());
     }
-
-    // A current plan is already the complete result. The packet-15 executor is
-    // needed only when this plan contains a remote mutation.
     if !report.confirmation_required {
         if format.is_json() {
             print_json(&report).map_err(failure)?;
-        } else {
-            print!("{}", host_update::render_host_update_plan(&report));
+        } else if !command.quiet {
+            let has_skipped_targets = report.targets.iter().any(|target| {
+                target.disposition == satelle_core::host_update::HostUpdateDisposition::Skipped
+            });
+            if report.status == satelle_core::host_update::HostUpdateStatus::UpToDate
+                && !has_skipped_targets
+            {
+                println!("Host update status for {}: up to date", report.host);
+            } else {
+                print!("{}", host_update::render_host_update_plan(&report));
+            }
         }
         return Ok(());
     }
-
-    // Until packet 15 supplies the mutation executor, JSON mode must return
-    // one typed error object rather than mixing a plan on stdout with an error
-    // on stderr. The read-only plan remains available through --dry-run.
-    if !format.is_json() {
+    if !format.is_json() && !command.quiet {
         print!("{}", host_update::render_host_update_plan(&report));
     }
-    Err(failure(SatelleError::not_implemented(concat!(
-        "Host update apply belongs to the packet 15 train. The complete plan above was ",
-        "read-only; no Host state or Satelle sessions were changed."
-    ))))
+    let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
+    let consent_granted = host_update_consent_granted(command.yes, trusted_consent);
+    if noninteractive && !consent_granted {
+        return Err(failure(SatelleError::setup_consent_required(
+            &report.planned_actions,
+            host_update_consent_command(&host.alias, &command.component),
+        )));
+    }
+    if !consent_granted {
+        let confirmed = cliclack::confirm(format!("Apply the Host update to '{}'?", host.alias))
+            .initial_value(false)
+            .interact()
+            .map_err(|source| {
+                failure(setup_interaction_error(
+                    "could not read Host update confirmation",
+                    source,
+                ))
+            })?;
+        if !confirmed {
+            if !command.quiet {
+                println!("No changes applied.");
+            }
+            return Ok(());
+        }
+    }
+
+    report =
+        transport::apply_host_update(&host, report, &components, includes_all).map_err(failure)?;
+    if format.is_json() {
+        print_json(&report).map_err(failure)
+    } else if command.quiet {
+        println!(
+            "Updated Host '{}': {} actions applied.",
+            report.host,
+            report.applied_actions.len()
+        );
+        Ok(())
+    } else {
+        print!("{}", host_update::render_host_update_result(&report));
+        Ok(())
+    }
+}
+
+const fn host_update_consent_granted(command_yes: bool, trusted_profile: bool) -> bool {
+    command_yes || trusted_profile
+}
+
+fn host_update_consent_command(host: &str, components: &[String]) -> String {
+    let component_selection = components
+        .iter()
+        .map(|component| format!(" --component {component}"))
+        .collect::<String>();
+    format!(
+        "satelle host update --host {}{component_selection} --no-input --yes --json",
+        shell_argument(host)
+    )
 }
 
 fn validate_host_update_components(raw_components: &[String]) -> Result<(), SatelleError> {
@@ -8117,6 +8186,34 @@ fn validate_host_update_components(raw_components: &[String]) -> Result<(), Sate
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod host_update_consent_tests {
+    use super::*;
+
+    #[test]
+    fn trusted_profile_consent_satisfies_both_host_update_confirmation_gates() {
+        assert!(host_update_consent_granted(false, true));
+        assert!(host_update_consent_granted(true, false));
+        assert!(!host_update_consent_granted(false, false));
+    }
+
+    #[test]
+    fn recovery_command_preserves_the_exact_component_selection() {
+        assert_eq!(
+            host_update_consent_command("office", &["host".to_string(), "codex".to_string()]),
+            "satelle host update --host office --component host --component codex --no-input --yes --json"
+        );
+        assert_eq!(
+            host_update_consent_command("office", &[]),
+            "satelle host update --host office --no-input --yes --json"
+        );
+        assert_eq!(
+            host_update_consent_command("remote host'; touch /tmp/pwn", &["host".to_string()]),
+            "satelle host update --host 'remote host'\"'\"'; touch /tmp/pwn' --component host --no-input --yes --json"
+        );
+    }
 }
 
 fn run_host_storage(command: HostStorageCommand) -> Result<(), CliFailure> {

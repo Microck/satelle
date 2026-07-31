@@ -2505,6 +2505,79 @@ fn native_readiness_invalidation_removes_only_the_affected_exact_key() {
 }
 
 #[test]
+fn host_native_readiness_invalidation_removes_every_native_key_only() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let first = readiness_key("first-native-readiness");
+    let second = readiness_key("second-native-readiness");
+    let first_evidence = first
+        .evidence("first-native-result", at(1), at(6))
+        .expect("construct first readiness evidence");
+    let second_evidence = second
+        .evidence("second-native-result", at(1), at(6))
+        .expect("construct second readiness evidence");
+    let provider = ProviderSmokeEvidence::new(
+        "preserved-provider-result",
+        first.provider_config_fingerprint(),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        at(1),
+        at(6),
+    )
+    .expect("construct provider evidence");
+    storage
+        .store_preflight_successes(
+            first.adapter(),
+            first.desktop_binding(),
+            first.execution_policy(),
+            &first_evidence,
+            Some(&provider),
+        )
+        .expect("preseed first native and provider evidence");
+    storage
+        .store_preflight_successes(
+            second.adapter(),
+            second.desktop_binding(),
+            second.execution_policy(),
+            &second_evidence,
+            None,
+        )
+        .expect("preseed second native evidence");
+
+    let host_identity = storage
+        .host_identity()
+        .expect("load Host Identity")
+        .as_str()
+        .to_string();
+    assert_eq!(
+        2,
+        super::super::operational::invalidate_native_readiness_for_host(
+            storage.connection_for_test(),
+            &host_identity,
+        )
+        .expect("invalidate every native readiness tuple")
+    );
+    assert!(
+        storage
+            .load_reusable_readiness(&first, at(2))
+            .expect("query first native evidence")
+            .is_none()
+    );
+    assert!(
+        storage
+            .load_reusable_readiness(&second, at(2))
+            .expect("query second native evidence")
+            .is_none()
+    );
+    let provider_count: i64 = storage
+        .connection_for_test()
+        .query_row("SELECT count(*) FROM provider_smoke_results", [], |row| {
+            row.get(0)
+        })
+        .expect("count preserved provider evidence");
+    assert_eq!(1, provider_count);
+}
+
+#[test]
 fn readiness_and_provider_results_round_trip_without_raw_evidence() {
     const PROVIDER_SECRET_CANARY: &str = "PRIVATE_RESOLVED_PROVIDER_SECRET_CANARY";
 

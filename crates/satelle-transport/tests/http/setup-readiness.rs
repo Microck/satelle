@@ -94,7 +94,8 @@ async fn setup_readiness_requests_reject_empty_unknown_and_unpaired_shapes() {
             INVALIDATE_PATH,
             "native-invalidation-unpaired",
             serde_json::json!({
-                "schema_version": "satelle.native-readiness-invalidation.v1",
+                "schema_version": "satelle.native-readiness-invalidation.v2",
+                "scope": "intent",
                 "model_alias": "vision",
                 "model_from_project": false,
                 "provider_from_project": false,
@@ -163,6 +164,14 @@ async fn native_invalidation_replays_and_conflicts_on_intent_fields() {
         .await
         .expect("send conflicting native invalidation");
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let scope_conflict = running
+        .mutation(INVALIDATE_PATH, "native-invalidation-replay")
+        .json(&NativeReadinessInvalidationRequest::host())
+        .send()
+        .await
+        .expect("send conflicting host-wide native invalidation");
+    assert_eq!(scope_conflict.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]

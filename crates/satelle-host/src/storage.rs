@@ -62,7 +62,7 @@ use self::sql::{
     validate_initial_session,
 };
 pub(crate) use self::stop::{BeginStopOutcome, StopCommit, StopCommitOutcome};
-use crate::{ApiBearerToken, ApiPrincipal, ReadinessCacheKey};
+use crate::{ApiBearerToken, ApiPrincipal};
 pub(crate) use crate::{LogEvent, LogSeverity, LogSource};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use satelle_core::session::{
@@ -498,6 +498,11 @@ pub(crate) enum ProviderBindingDeletionReplay {
 pub(crate) enum NativeReadinessInvalidationReplay {
     Completed(u64),
     Failed(SatelleError),
+}
+
+pub(crate) enum NativeReadinessInvalidationTarget<'a> {
+    Intent(Option<&'a crate::ReadinessCacheKey>),
+    Host,
 }
 
 /// Owns a temporary state directory whose path and permissions satisfy the
@@ -1950,7 +1955,7 @@ impl Storage {
     pub(crate) fn invalidate_native_readiness_idempotent<M>(
         &mut self,
         idempotency: &IdempotencyInput,
-        key: Option<&ReadinessCacheKey>,
+        target: NativeReadinessInvalidationTarget<'_>,
         completed_at: OffsetDateTime,
         map_failure: M,
     ) -> Result<NativeReadinessInvalidationReplay, StorageError>
@@ -1989,14 +1994,20 @@ impl Storage {
         let savepoint = transaction
             .savepoint()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        let invalidated = auth::host_identity(&savepoint).and_then(|host_identity| {
-            key.map_or(Ok(0), |key| {
+        let invalidated = auth::host_identity(&savepoint).and_then(|host_identity| match target {
+            NativeReadinessInvalidationTarget::Intent(key) => key.map_or(Ok(0), |key| {
                 operational::invalidate_native_readiness_for_key(
                     &savepoint,
                     host_identity.as_str(),
                     key,
                 )
-            })
+            }),
+            NativeReadinessInvalidationTarget::Host => {
+                operational::invalidate_native_readiness_for_host(
+                    &savepoint,
+                    host_identity.as_str(),
+                )
+            }
         });
         let replay = match invalidated {
             Ok(deleted) => {

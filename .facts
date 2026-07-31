@@ -34,7 +34,7 @@
 - a Satelle Execution Policy is the Host-enforced combination of approval, sandbox, timeout, provider, model, desktop, and experimental-feature choices for one Turn @spec @mvp @implemented
 - a Satelle Control Lease is the Host Daemon-owned exclusive right to operate one Host Identity and Desktop Binding through native Computer Use @spec @mvp @implemented
 - a Satelle Maintenance Lease is the Host Daemon-owned exclusive right to mutate daemon, runtime, service, or storage state for one Host @spec @mvp @implemented
-- a Satelle Bootstrap Lock is a user-scoped remote filesystem lock acquired through authenticated SSH bootstrap or by a reachable Host Daemon already holding the same operation's Maintenance Lease before remote daemon files can be replaced @spec @mvp
+- a Satelle Bootstrap Lock is a user-scoped remote filesystem lock acquired through authenticated SSH bootstrap or by a reachable Host Daemon already holding the same operation's Maintenance Lease before remote daemon files can be replaced @spec @mvp @implemented
 - a Satelle Idempotency Record binds one API Principal, operation, idempotency key, request digest, and durable outcome @mvp @implemented
 - a Satelle Readiness Result is a timestamped capability result whose validity is bounded by its cache key, expiry, and invalidation conditions @spec @mvp @implemented
 - Satelle YOLO Mode is an explicit unsafe execution mode that asks Codex to bypass Codex-controlled approvals and sandboxing where the compatible Codex control plane supports those settings @spec @mvp
@@ -625,12 +625,12 @@
 - satelle host update never mutates the remote host during its update check; mutation starts only after the planned update actions pass the command's consent rules @spec @mvp @implemented
 - satelle host update presents current versions, target versions, update targets, restart impact, and planned remote mutations before mutating the remote host @spec @mvp @implemented
 - satelle host update --yes skips only the final interactive confirmation prompt and does not skip update checks, plan presentation, safety blockers, action ledger recording, or post-update readiness checks @spec @mvp
-- satelle host update --yes prints planned remote mutations in human output before applying when --quiet is not active and JSON output mode is not active @spec @mvp
-- satelle host update --no-input --yes follows the same human plan-output rule as --yes when human output mode is active @spec @mvp
-- satelle host update --quiet --yes suppresses non-error human plan and progress output but does not suppress final failure summaries or required recovery guidance @spec @mvp
-- satelle host update JSON output includes planned_actions before mutation and applied_actions after mutation instead of printing human plan text @mvp @spec
+- satelle host update --yes prints planned remote mutations in human output before applying when --quiet is not active and JSON output mode is not active @spec @mvp @implemented
+- satelle host update --no-input --yes follows the same human plan-output rule as --yes when human output mode is active @spec @mvp @implemented
+- satelle host update --quiet --yes suppresses non-error human plan and progress output but does not suppress final failure summaries or required recovery guidance @spec @mvp @implemented
+- satelle host update JSON output includes planned_actions before mutation and applied_actions after mutation instead of printing human plan text @mvp @spec @implemented
 - satelle host update does not expose a --plain output mode in MVP because --json is the stable automation contract for update plans, results, and typed errors @implemented @mvp
-- satelle host update help text directs scripts and other agents to --json instead of human output or --quiet output for stable automation data @spec @mvp
+- satelle host update help text directs scripts and other agents to --json instead of human output or --quiet output for stable automation data @spec @mvp @implemented
 - satelle later adds satelle host update --plain as a stable line-oriented scripting output mode narrower than --json and not a replacement for the complete JSON automation contract @spec @later
 - satelle host update --plain is mutually exclusive with --json and every explicit --format value and reports a typed output-mode-conflict usage error for either combination @spec @contract @later
 - satelle host update --plain writes only machine-readable plain records to stdout and writes diagnostics, prompts, progress, and errors to stderr @spec @later
@@ -648,34 +648,34 @@
 - satelle host update --plain compatibility policy freezes v1 field order and escaping rules until a new schema token such as satelle.host.update.plain.v2 is introduced @spec @later
 - satelle host update --plain may add new schema versions after v1 but does not change v1 field order, field meanings, escaping, or enum token meanings in a minor release @spec @later
 - satelle host update reports unsupported selected update components as typed unsupported-update-component errors instead of silently ignoring an explicit component selection @implemented @mvp
-- satelle host update reports unsupported default update targets as skipped diagnostics when checking all supported update targets by default @spec @mvp
-- satelle host update exits 0 with status up_to_date and does not ask for mutation confirmation when all selected supported components are already current @mvp @spec
-- satelle host update --quiet exits 0 with no human output when all selected supported components are already current @spec @mvp
-- satelle host update --quiet prints one concise human changed summary when one or more selected components changed and no error occurs @spec @mvp
-- satelle host update --quiet still prints failure summaries and required recovery guidance when the command fails or leaves the host in a partial or postcheck-failed state @spec @mvp
-- satelle host update supports --dry-run to preview update actions without mutating the selected host @mvp @spec
-- satelle host update --dry-run treats the update plan as preview diagnostics and does not persist or emit a reusable apply plan @spec @mvp
-- satelle host update JSON dry-run output includes reusable_plan false so automation does not treat the preview as an apply artifact @mvp @spec
-- satelle host update non-dry-run invocations always re-probe the selected host and rebuild the update plan from live host state and local release metadata before asking for mutation consent @spec @mvp
-- satelle host update may apply the in-memory plan shown immediately before final confirmation within the same CLI process without repeating the full dry-run command @spec @mvp
-- satelle host update revalidates selected host identity, current component versions, selected component set, target artifact digests, and restart impact before mutating the remote host @spec @mvp
-- satelle host update follows the same final interactive confirmation, --yes, --no-input --yes, manual-action-required, action ledger, and partial-failure rules as setup and repair for remote mutations @spec @mvp
-- satelle host update records maintenance update actions in the Host Daemon SQLite action-ledger storage model with an action kind that distinguishes host_update from setup and repair @spec @mvp
-- satelle host update may restart the Host Daemon or Codex app-server only when the planned update requires it and reports that restart impact before applying the update @spec @mvp
-- satelle host update runs relevant post-update readiness checks after applying any update that can affect Host Daemon health, Codex app-server lifecycle, Codex control-plane compatibility, or native Computer Use readiness @spec @mvp
-- satelle host update verifies Host Daemon API reachability, expected Satelle host version, and required storage migration state after updating Satelle host binaries or Host Daemon service assets @spec @mvp
-- satelle host update verifies Codex app-server startup and required control-plane protocol compatibility after updating the standalone Codex runtime @spec @mvp
-- satelle host update runs the native Computer Use readiness smoke test after updating the standalone Codex runtime or Codex-owned native Computer Use components @spec @mvp
-- satelle host update invalidates native Computer Use readiness cache entries affected by applied host, Codex runtime, or native Computer Use component updates before running post-update readiness checks @spec @mvp
-- satelle host update invalidates provider Computer Use smoke-test cache entries whose cache keys are affected by applied Codex runtime, native Computer Use runtime, or native Computer Use component updates @spec @mvp
-- satelle host update does not rerun provider Computer Use smoke tests by default after ordinary maintenance updates because provider smoke tests are provider/model-specific and are already enforced before prompt execution @spec @mvp
-- satelle host update stores successful post-update readiness check results in the Host Daemon readiness cache when the cache key still matches the updated host state @spec @mvp
-- satelle host update treats post-update readiness check failure after successful update mutations as a typed host-update-postcheck-failed error instead of reporting the update as fully successful @spec @mvp
-- satelle host update uses the remote execution failure exit-code class for host-update-postcheck-failed because the command changed remote state but did not leave the host in the requested ready state @spec @mvp
-- satelle host update does not automatically roll back completed update actions when a post-update readiness check fails @spec @mvp
-- satelle host update human postcheck-failure output states the updates that were applied, the failed readiness check, preserved remote state, invalidated caches, and the recommended repair or doctor command @spec @mvp
-- satelle host update JSON postcheck-failure output includes status postcheck_failed, changed true, applied_actions, postcheck_results, invalidated_caches, preserved_state, and recovery_command fields @spec @mvp
-- satelle host update --dry-run reports the post-update readiness checks that would run after applying the plan without running those post-update checks @spec @mvp
+- satelle host update reports unsupported default update targets as skipped diagnostics when checking all supported update targets by default @spec @mvp @implemented
+- satelle host update exits 0 with status up_to_date and does not ask for mutation confirmation when all selected supported components are already current @mvp @spec @implemented
+- satelle host update --quiet exits 0 with no human output when all selected supported components are already current @spec @mvp @implemented
+- satelle host update --quiet prints one concise human changed summary when one or more selected components changed and no error occurs @spec @mvp @implemented
+- satelle host update --quiet still prints failure summaries and required recovery guidance when the command fails or leaves the host in a partial or postcheck-failed state @spec @mvp @implemented
+- satelle host update supports --dry-run to preview update actions without mutating the selected host @mvp @spec @implemented
+- satelle host update --dry-run treats the update plan as preview diagnostics and does not persist or emit a reusable apply plan @spec @mvp @implemented
+- satelle host update JSON dry-run output includes reusable_plan false so automation does not treat the preview as an apply artifact @mvp @spec @implemented
+- satelle host update non-dry-run invocations always re-probe the selected host and rebuild the update plan from live host state and local release metadata before asking for mutation consent @spec @mvp @implemented
+- satelle host update may apply the in-memory plan shown immediately before final confirmation within the same CLI process without repeating the full dry-run command @spec @mvp @implemented
+- satelle host update revalidates selected host identity, current component versions, selected component set, target artifact digests, and restart impact before mutating the remote host @spec @mvp @implemented
+- satelle host update follows the same final interactive confirmation, --yes, --no-input --yes, manual-action-required, action ledger, and partial-failure rules as setup and repair for remote mutations @spec @mvp @implemented
+- satelle host update records maintenance update actions in the Host Daemon SQLite action-ledger storage model with an action kind that distinguishes host_update from setup and repair @spec @mvp @implemented
+- satelle host update may restart the Host Daemon or Codex app-server only when the planned update requires it and reports that restart impact before applying the update @spec @mvp @implemented
+- satelle host update runs relevant post-update readiness checks after applying any update that can affect Host Daemon health, Codex app-server lifecycle, Codex control-plane compatibility, or native Computer Use readiness @spec @mvp @implemented
+- satelle host update verifies Host Daemon API reachability, expected Satelle host version, and required storage migration state after updating Satelle host binaries or Host Daemon service assets @spec @mvp @implemented
+- satelle host update verifies Codex app-server startup and required control-plane protocol compatibility after updating the standalone Codex runtime @spec @mvp @implemented
+- satelle host update runs the native Computer Use readiness smoke test after updating the standalone Codex runtime or Codex-owned native Computer Use components @spec @mvp @implemented
+- satelle host update invalidates native Computer Use readiness cache entries affected by applied host, Codex runtime, or native Computer Use component updates before running post-update readiness checks @spec @mvp @implemented
+- satelle host update invalidates provider Computer Use smoke-test cache entries whose cache keys are affected by applied Codex runtime, native Computer Use runtime, or native Computer Use component updates @spec @mvp @implemented
+- satelle host update does not rerun provider Computer Use smoke tests by default after ordinary maintenance updates because provider smoke tests are provider/model-specific and are already enforced before prompt execution @spec @mvp @implemented
+- satelle host update stores successful post-update readiness check results in the Host Daemon readiness cache when the cache key still matches the updated host state @spec @mvp @implemented
+- satelle host update treats post-update readiness check failure after successful update mutations as a typed host-update-postcheck-failed error instead of reporting the update as fully successful @spec @mvp @implemented
+- satelle host update uses the remote execution failure exit-code class for host-update-postcheck-failed because the command changed remote state but did not leave the host in the requested ready state @spec @mvp @implemented
+- satelle host update does not automatically roll back completed update actions when a post-update readiness check fails @spec @mvp @implemented
+- satelle host update human postcheck-failure output states the updates that were applied, the failed readiness check, preserved remote state, invalidated caches, and the recommended repair or doctor command @spec @mvp @implemented
+- satelle host update JSON postcheck-failure output includes status postcheck_failed, changed true, applied_actions, postcheck_results, invalidated_caches, preserved_state, and recovery_command fields @spec @mvp @implemented
+- satelle host update --dry-run reports the post-update readiness checks that would run after applying the plan without running those post-update checks @spec @mvp @implemented
 - a Windows Host Daemon reports only its own active user WTS session as compatible, using native selector windows:wts-session:<decimal-session-id> and portable active plus console or remote selectors @contract @mvp @implemented
 - a macOS Host Daemon reports a compatible console session only when /dev/console is owned by the daemon OS user, using native selector macos:console-uid:<decimal-user-id> and portable active and console selectors @contract @mvp @implemented
 
@@ -1463,7 +1463,7 @@
 - an orphaned Maintenance Lease operation is classified outcome_unknown and reconciled from its action postconditions before retry or release @spec @mvp @implemented
 - lease expiry alone never proves that an external Computer Use or maintenance side effect stopped @spec @mvp @implemented
 - timeout expiry, a cancellation request, transport loss, adapter failure, or lease expiry never by itself proves that an upstream Computer Use execution stopped and never by itself permits Control Lease release @spec @mvp @implemented
-- initial setup, missing-daemon repair, and Host binary replacement acquire a Bootstrap Lock before mutating remote files or starting a replacement Host Daemon @spec @mvp
+- initial setup, missing-daemon repair, and Host binary replacement acquire a Bootstrap Lock before mutating remote files or starting a replacement Host Daemon @spec @mvp @implemented
 - a Bootstrap Lock uses atomic filesystem creation under the remote OS user's Satelle state boundary @spec @mvp @implemented
 - a Bootstrap Lock records a non-secret operation id, Controller identity when known, acquisition time, and heartbeat time @spec @mvp @implemented
 - a Controller refreshes its owned Bootstrap Lock heartbeat at least every 5 seconds while the bootstrap operation remains live @spec @mvp @implemented
@@ -1472,8 +1472,8 @@
 - stale Bootstrap Lock recovery probes remote process, binary, service, and Host Daemon state before the lock can be removed or replaced @spec @mvp @implemented
 - stale Bootstrap Lock removal or replacement uses compare-and-set against the observed operation id after the required postcondition probes, so a recovered owner cannot delete a newer lock @spec @mvp @implemented
 - initial setup and missing-daemon repair acquire Bootstrap Lock, start the Host Daemon, obtain a Maintenance Lease carrying the same operation id, and release Bootstrap Lock only after that handoff is durable @spec @mvp @implemented
-- Host binary replacement on a reachable daemon first obtains a Maintenance Lease, then obtains Bootstrap Lock with the same operation id before stopping or replacing the daemon @spec @mvp
-- the replacement Host Daemon reconciles and adopts that maintenance operation before Bootstrap Lock release, and no workflow acquires these locks in the opposite order for the same operation class @spec @mvp
+- Host binary replacement on a reachable daemon first obtains a Maintenance Lease, then obtains Bootstrap Lock with the same operation id before stopping or replacing the daemon @spec @mvp @implemented
+- the replacement Host Daemon reconciles and adopts that maintenance operation before Bootstrap Lock release, and no workflow acquires these locks in the opposite order for the same operation class @spec @mvp @implemented
 - a Bootstrap Lock operation that fails before any remote mutation or managed process starts records a clean failure and releases the lock @spec @mvp @implemented
 - a Bootstrap Lock operation that may have mutated remote state or started a managed process preserves the lock and recovery metadata until postcondition reconciliation proves the outcome @spec @mvp @implemented
 

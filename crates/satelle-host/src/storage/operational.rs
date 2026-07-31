@@ -1280,6 +1280,19 @@ pub(super) fn invalidate_native_readiness_for_key(
     u64::try_from(deleted).map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
 }
 
+pub(super) fn invalidate_native_readiness_for_host(
+    connection: &rusqlite::Connection,
+    host_identity_ref: &str,
+) -> Result<u64, StorageError> {
+    let deleted = connection
+        .execute(
+            "DELETE FROM native_readiness_results WHERE host_identity_ref = ?1",
+            [host_identity_ref],
+        )
+        .map_err(operation_failed)?;
+    u64::try_from(deleted).map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+}
+
 fn insert_readiness(
     connection: &rusqlite::Connection,
     host_identity: &str,

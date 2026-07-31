@@ -101,8 +101,11 @@ pub(super) struct SshBootstrapLock {
     claim_basename: String,
     mutation_phase: Option<String>,
     mutation_attempt: Option<String>,
+    mutation_committed: bool,
     #[cfg(all(test, unix))]
     exchanged_lock_lines: Vec<String>,
+    #[cfg(all(test, unix))]
+    lose_next_mutation_start_response: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -314,8 +317,11 @@ impl SshBootstrapLock {
             claim_basename: ready_claim.basename,
             mutation_phase: None,
             mutation_attempt: None,
+            mutation_committed: false,
             #[cfg(all(test, unix))]
             exchanged_lock_lines: Vec::new(),
+            #[cfg(all(test, unix))]
+            lose_next_mutation_start_response: false,
         })
     }
 
@@ -346,9 +352,19 @@ impl SshBootstrapLock {
     ) -> Result<(), SshBootstrapError> {
         let line = bootstrap_lock::mutation_started_line(phase, attempt)
             .map_err(SshBootstrapError::InvalidBootstrapLockRequest)?;
-        self.exchange_lock_line(line)?;
+        // Bind the local fence to the new attempt before sending its start
+        // line. A lost response can otherwise leave the previous attempt's
+        // committed flag active and make recovery skip this attempt's commit.
         self.mutation_phase = Some(phase.to_string());
         self.mutation_attempt = Some(attempt.to_string());
+        self.mutation_committed = false;
+        let exchange = self.exchange_lock_line(line);
+        #[cfg(all(test, unix))]
+        if self.lose_next_mutation_start_response {
+            self.lose_next_mutation_start_response = false;
+            return Err(SshBootstrapError::BootstrapLockLost);
+        }
+        exchange?;
         Ok(())
     }
 
@@ -383,6 +399,9 @@ impl SshBootstrapLock {
     }
 
     pub(super) fn commit_current_mutation(&mut self) -> Result<(), SshBootstrapError> {
+        if self.mutation_committed {
+            return Ok(());
+        }
         let phase = self
             .mutation_phase
             .as_deref()
@@ -393,12 +412,23 @@ impl SshBootstrapLock {
             .ok_or(SshBootstrapError::BootstrapLockLost)?;
         let committed = bootstrap_lock::mutation_committed_line(phase, attempt)
             .map_err(SshBootstrapError::InvalidBootstrapLockRequest)?;
-        self.exchange_lock_line(committed)
+        self.exchange_lock_line(committed)?;
+        self.mutation_committed = true;
+        Ok(())
+    }
+
+    pub(super) fn current_mutation_is_committed(&self) -> bool {
+        self.mutation_committed
     }
 
     #[cfg(all(test, unix))]
     pub(super) fn exchanged_lock_lines(&self) -> &[String] {
         &self.exchanged_lock_lines
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn lose_next_mutation_start_response_for_tests(&mut self) {
+        self.lose_next_mutation_start_response = true;
     }
 
     fn exchange_lock_line(&mut self, challenge: String) -> Result<(), SshBootstrapError> {
@@ -2410,6 +2440,22 @@ impl<'a> PersistentServiceRemote<'a> {
         &mut self,
     ) -> Result<UploadedHostArtifact, SshBootstrapError> {
         let artifact = DownloadedArtifact::fetch(self.target)?;
+        self.install_host_artifact(artifact)
+    }
+
+    pub(super) fn install_verified_host_artifact(
+        &mut self,
+        expected_digest: &str,
+    ) -> Result<UploadedHostArtifact, SshBootstrapError> {
+        let metadata = ReleaseArtifactMetadata::from_digest_hex(expected_digest)?;
+        let artifact = DownloadedArtifact::fetch_with_metadata(self.target, metadata)?;
+        self.install_host_artifact(artifact)
+    }
+
+    fn install_host_artifact(
+        &mut self,
+        artifact: DownloadedArtifact,
+    ) -> Result<UploadedHostArtifact, SshBootstrapError> {
         let directory = self.target.artifact_upload_directory(self.directories)?;
         let mut uploaded = upload_artifact(
             self.destination,
@@ -4567,6 +4613,12 @@ impl ReleaseArtifactMetadata {
         Self { digest }
     }
 
+    pub(super) fn from_digest_hex(digest: &str) -> Result<Self, SshBootstrapError> {
+        parse_digest_hex(digest)
+            .map(Self::from_digest)
+            .map_err(|_| SshBootstrapError::InvalidManifest)
+    }
+
     pub(super) const fn digest(self) -> [u8; 32] {
         self.digest
     }
@@ -4586,6 +4638,13 @@ fn release_manifest_is_unavailable(status: Option<StatusCode>) -> bool {
 
 impl DownloadedArtifact {
     fn fetch(target: RemoteTarget) -> Result<Self, SshBootstrapError> {
+        Self::fetch_with_metadata(target, ReleaseArtifactMetadata::fetch(target)?)
+    }
+
+    fn fetch_with_metadata(
+        target: RemoteTarget,
+        metadata: ReleaseArtifactMetadata,
+    ) -> Result<Self, SshBootstrapError> {
         let version = env!("CARGO_PKG_VERSION");
         let filename = format!(
             "satelle-v{version}-{}.{}",
@@ -4598,7 +4657,7 @@ impl DownloadedArtifact {
             .user_agent(format!("satelle/{version}"))
             .build()
             .map_err(SshBootstrapError::Http)?;
-        let expected_digest = ReleaseArtifactMetadata::fetch(target)?.digest();
+        let expected_digest = metadata.digest();
 
         let mut archive = NamedTempFile::new().map_err(SshBootstrapError::LocalFile)?;
         let mut response = client
@@ -7199,6 +7258,15 @@ mod tests {
             manifest_digest(manifest.as_bytes(), "satelle-v0.1.0-linux-x64-gnu.tar.gz").unwrap(),
             [0x11; 32]
         );
+    }
+
+    #[test]
+    fn accepted_update_digest_round_trips_without_refetching_manifest_state() {
+        let digest = "ab".repeat(32);
+        let metadata =
+            ReleaseArtifactMetadata::from_digest_hex(&digest).expect("parse accepted plan digest");
+
+        assert_eq!(metadata.digest_hex(), digest);
     }
 
     #[test]

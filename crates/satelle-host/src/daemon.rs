@@ -29,7 +29,7 @@ const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 3;
 const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 2;
 const PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION: u16 = 1;
 const SETUP_VERIFICATION_DIGEST_SCHEMA_VERSION: u16 = 1;
-const NATIVE_READINESS_INVALIDATION_DIGEST_SCHEMA_VERSION: u16 = 1;
+const NATIVE_READINESS_INVALIDATION_DIGEST_SCHEMA_VERSION: u16 = 2;
 const DURABLE_SETUP_PRINCIPAL_PREFIX: &str = "controller-setup";
 
 /// A diagnostic-safe snapshot captured from the daemon-owned runtime after
@@ -458,6 +458,7 @@ struct CanonicalSetupVerification<'a> {
 struct CanonicalNativeReadinessInvalidation<'a> {
     operation: &'static str,
     host: &'static str,
+    scope: &'static str,
     model_alias: Option<&'a str>,
     provider_alias: Option<&'a str>,
     model_from_project: bool,
@@ -1168,20 +1169,35 @@ impl HostService {
     pub fn invalidate_native_readiness_idempotent(
         &self,
         authority: &MutationAuthority,
+        host_wide: bool,
         model_alias: Option<&str>,
         provider_alias: Option<&str>,
-        model_from_project: bool,
-        provider_from_project: bool,
+        project_selection_provenance: (bool, bool),
         experimental_provider_computer_use: bool,
     ) -> Result<u64, SatelleError> {
+        let (model_from_project, provider_from_project) = project_selection_provenance;
         if model_alias.is_some() != provider_alias.is_some() {
             return Err(SatelleError::config_error(
                 "native readiness invalidation requires model and provider aliases together",
                 None,
             ));
         }
-        let provider_intent =
-            match (model_alias, provider_alias) {
+        if host_wide
+            && (model_alias.is_some()
+                || provider_alias.is_some()
+                || model_from_project
+                || provider_from_project
+                || experimental_provider_computer_use)
+        {
+            return Err(SatelleError::config_error(
+                "host-wide native readiness invalidation cannot select provider intent",
+                None,
+            ));
+        }
+        let provider_intent = if host_wide {
+            None
+        } else {
+            Some(match (model_alias, provider_alias) {
                 (Some(model_alias), Some(provider_alias)) => crate::ProviderComputerUseIntent::new(
                     Some(EffectiveModelRef::new(model_alias).map_err(|_| {
                         SatelleError::config_error("the model alias is invalid", None)
@@ -1195,11 +1211,13 @@ impl HostService {
                 .with_experimental_provider_computer_use(experimental_provider_computer_use),
                 (None, None) => crate::ProviderComputerUseIntent::host_default(),
                 _ => unreachable!("the paired alias invariant is checked above"),
-            };
+            })
+        };
         let canonical_payload = canonical_payload(
             &CanonicalNativeReadinessInvalidation {
                 operation: "native_readiness_invalidation",
                 host: LOCAL_DEMO_HOST,
+                scope: if host_wide { "host" } else { "intent" },
                 model_alias,
                 provider_alias,
                 model_from_project,
@@ -1220,7 +1238,8 @@ impl HostService {
             self.runtime.invalidate_native_readiness_idempotent(
                 &identity,
                 LOCAL_DEMO_HOST,
-                &provider_intent,
+                provider_intent.as_ref(),
+                host_wide,
             )
         })
     }

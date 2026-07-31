@@ -34,11 +34,12 @@ pub use setup::{
     BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
     NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
-    ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
-    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
-    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, SetupVerificationRequest, SetupVerificationResponse,
+    NativeReadinessInvalidationScope, ProviderBindingAuthorizationRequest,
+    ProviderBindingAuthorizationResponse, ProviderBindingDeletionResponse,
+    ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
+    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
+    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, SetupVerificationRequest,
+    SetupVerificationResponse,
 };
 pub(crate) use setup::{
     PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO, provider_secret_upload_aad,

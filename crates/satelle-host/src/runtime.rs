@@ -42,9 +42,10 @@ use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, BeginProviderSecretProvisioning, IdempotentOperation,
-    LeaseOwner, LogPageStorageError, NativeReadinessInvalidationReplay, ObservedUpstreamRef,
-    OperatorLogMirror, OperatorLogPolicy, ProviderBindingAuthorizationReplay,
-    ProviderBindingDeletionReplay, ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
+    LeaseOwner, LogPageStorageError, NativeReadinessInvalidationReplay,
+    NativeReadinessInvalidationTarget, ObservedUpstreamRef, OperatorLogMirror, OperatorLogPolicy,
+    ProviderBindingAuthorizationReplay, ProviderBindingDeletionReplay,
+    ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
     ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay, ReadinessProbeKind,
     ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan,
     SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
@@ -2477,12 +2478,37 @@ impl RuntimeHandle {
             )
             .map_err(model::storage_failure)?;
         operation.disarm();
-        if let Some(error) = terminal_error {
+        if let Some(mut error) = terminal_error {
+            // The CLI must distinguish a known terminal readiness failure,
+            // whose ledger and leases were finalized above, from an unknown
+            // outcome whose leases remain recovery-pending.
+            error.details.insert(
+                "maintenance_postcheck_terminal".to_string(),
+                serde_json::Value::Bool(status.is_some()),
+            );
             return Err(error);
         }
         status.ok_or_else(|| {
             model::integrity_failure("a passed maintenance postcheck was not terminal")
         })
+    }
+
+    pub(crate) fn run_default_maintenance_postcheck(
+        &self,
+        operation: &mut MaintenanceOperationHandle,
+        postcheck_action_id: &str,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        let engine = self.engine()?;
+        let key = engine
+            .adapter
+            .readiness_cache_key(
+                crate::LOCAL_DEMO_HOST,
+                &crate::ProviderComputerUseIntent::host_default(),
+            )?
+            .ok_or_else(|| {
+                model::integrity_failure("the native readiness postcheck key is unavailable")
+            })?;
+        self.run_maintenance_postcheck(operation, &key, postcheck_action_id)
     }
 
     pub(crate) fn finish_setup_run(
@@ -3608,7 +3634,8 @@ impl RuntimeHandle {
         &self,
         identity: &RequestIdentity,
         host: &str,
-        provider_intent: &ProviderComputerUseIntent,
+        provider_intent: Option<&ProviderComputerUseIntent>,
+        host_wide: bool,
     ) -> Result<u64, SatelleError> {
         let completed_at = time::OffsetDateTime::now_utc();
         let idempotency = model::idempotency(
@@ -3617,12 +3644,20 @@ impl RuntimeHandle {
             completed_at,
         )?;
         let engine = self.engine()?;
-        let key = engine.adapter.readiness_cache_key(host, provider_intent)?;
+        let key = provider_intent
+            .map(|provider_intent| engine.adapter.readiness_cache_key(host, provider_intent))
+            .transpose()?
+            .flatten();
+        let target = if host_wide {
+            NativeReadinessInvalidationTarget::Host
+        } else {
+            NativeReadinessInvalidationTarget::Intent(key.as_ref())
+        };
         let replay = engine
             .lock_storage()?
             .invalidate_native_readiness_idempotent(
                 &idempotency,
-                key.as_ref(),
+                target,
                 completed_at,
                 model::storage_failure_ref,
             )

@@ -4015,6 +4015,9 @@ pub enum ErrorCode {
     HostBinaryNewerThanCli,
     HostArtifactUnavailable,
     HostUpdateRequiresCliUpgrade,
+    HostUpdateRecoveryPending,
+    HostUpdatePartiallyApplied,
+    HostUpdatePostcheckFailed,
     AmbiguousCodexComponentOwnership,
     PersistentServiceUnsupported,
     SetupConsentRequired,
@@ -4124,6 +4127,9 @@ impl ErrorCode {
             Self::HostBinaryNewerThanCli => "host-binary-newer-than-cli",
             Self::HostArtifactUnavailable => "host-artifact-unavailable",
             Self::HostUpdateRequiresCliUpgrade => "host-update-requires-cli-upgrade",
+            Self::HostUpdateRecoveryPending => "host-update-recovery-pending",
+            Self::HostUpdatePartiallyApplied => "host-update-partially-applied",
+            Self::HostUpdatePostcheckFailed => "host-update-postcheck-failed",
             Self::AmbiguousCodexComponentOwnership => "ambiguous-codex-component-ownership",
             Self::PersistentServiceUnsupported => "persistent-service-unsupported",
             Self::SetupConsentRequired => "setup-consent-required",
@@ -4204,6 +4210,9 @@ impl ErrorCode {
             | Self::HostIdentityMismatch
             | Self::StoreInUse
             | Self::RemoteExecution
+            | Self::HostUpdateRecoveryPending
+            | Self::HostUpdatePartiallyApplied
+            | Self::HostUpdatePostcheckFailed
             | Self::StorageBusy
             | Self::StorageIntegrityFailed
             | Self::ProviderSecretResolutionFailed => 74,
@@ -4254,6 +4263,17 @@ pub struct SatelleError {
     pub source_detail: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub details: BTreeMap<String, Value>,
+}
+
+fn shell_argument(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_./:".contains(character))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 impl SatelleError {
@@ -5500,6 +5520,145 @@ impl SatelleError {
         }
     }
 
+    pub fn host_update_recovery_pending(
+        host: &str,
+        operation_id: &str,
+        source: impl Into<String>,
+    ) -> Self {
+        let recovery_command = Some(format!(
+            "satelle repair --host {} --no-input --yes",
+            shell_argument(host)
+        ));
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(host.to_string()));
+        details.insert(
+            "operation_id".to_string(),
+            Value::String(operation_id.to_string()),
+        );
+        details.insert(
+            "preserved_state".to_string(),
+            Value::String("the Host update Maintenance Lease remains recovery-pending".to_string()),
+        );
+        details.insert(
+            "recovery_command".to_string(),
+            serde_json::to_value(&recovery_command).unwrap_or(Value::Null),
+        );
+        Self {
+            code: ErrorCode::HostUpdateRecoveryPending,
+            message: "Host update maintenance has an uncertain outcome and requires recovery"
+                .to_string(),
+            recovery_command,
+            source_detail: Some(source.into()),
+            details,
+        }
+    }
+
+    pub fn host_update_postcheck_failed(
+        report: &crate::host_update::HostUpdateReport,
+        source: impl Into<String>,
+    ) -> Self {
+        let recovery_command = report.recovery_command.clone().or_else(|| {
+            Some(format!(
+                "satelle doctor --host {} --scope computer-use --refresh --json",
+                shell_argument(&report.host)
+            ))
+        });
+        let mut details = BTreeMap::new();
+        details.insert(
+            "status".to_string(),
+            Value::String("postcheck_failed".to_string()),
+        );
+        details.insert("changed".to_string(), Value::Bool(true));
+        for (key, value) in [
+            (
+                "applied_actions",
+                serde_json::to_value(&report.applied_actions),
+            ),
+            (
+                "postcheck_results",
+                serde_json::to_value(&report.postcheck_results),
+            ),
+            (
+                "invalidated_caches",
+                serde_json::to_value(&report.invalidated_caches),
+            ),
+            (
+                "preserved_state",
+                serde_json::to_value(
+                    report
+                        .preserved_state
+                        .as_deref()
+                        .unwrap_or("completed Host update actions were preserved"),
+                ),
+            ),
+            ("recovery_command", serde_json::to_value(&recovery_command)),
+        ] {
+            details.insert(key.to_string(), value.unwrap_or(Value::Null));
+        }
+        Self {
+            code: ErrorCode::HostUpdatePostcheckFailed,
+            message: "Host update mutations completed, but the post-update readiness check failed"
+                .to_string(),
+            recovery_command,
+            source_detail: Some(source.into()),
+            details,
+        }
+    }
+
+    pub fn host_update_partially_applied(
+        report: &crate::host_update::HostUpdateReport,
+        failed_action: &str,
+        source: impl Into<String>,
+    ) -> Self {
+        let recovery_command = Some(format!(
+            "satelle repair --host {} --no-input --yes",
+            shell_argument(&report.host)
+        ));
+        let mut details = BTreeMap::new();
+        details.insert(
+            "status".to_string(),
+            Value::String("partial_failure".to_string()),
+        );
+        details.insert("changed".to_string(), Value::Bool(report.changed));
+        details.insert(
+            "completed_actions".to_string(),
+            serde_json::to_value(&report.applied_actions).unwrap_or(Value::Null),
+        );
+        details.insert(
+            "failed_action".to_string(),
+            Value::String(failed_action.to_string()),
+        );
+        details.insert(
+            "skipped_actions".to_string(),
+            serde_json::to_value(&report.skipped_actions).unwrap_or(Value::Null),
+        );
+        details.insert(
+            "invalidated_caches".to_string(),
+            serde_json::to_value(&report.invalidated_caches).unwrap_or(Value::Null),
+        );
+        details.insert(
+            "postcheck_results".to_string(),
+            serde_json::to_value(&report.postcheck_results).unwrap_or(Value::Null),
+        );
+        details.insert(
+            "preserved_state".to_string(),
+            Value::String("completed Host update actions were preserved".to_string()),
+        );
+        details.insert(
+            "recovery_command".to_string(),
+            serde_json::to_value(&recovery_command).unwrap_or(Value::Null),
+        );
+        Self {
+            code: ErrorCode::HostUpdatePartiallyApplied,
+            message: format!(
+                "Host update action '{failed_action}' failed after one or more remote mutations completed"
+            ),
+            recovery_command,
+            source_detail: Some(source.into()),
+            details,
+        }
+    }
+
     pub fn ambiguous_codex_component_ownership(target: &str) -> Self {
         let mut details = BTreeMap::new();
         details.insert("target".to_string(), Value::from(target));
@@ -5702,6 +5861,126 @@ mod error_contract_tests {
     }
 
     #[test]
+    fn host_update_failures_preserve_remote_mutation_evidence() {
+        use crate::host_update::{
+            HostUpdateComponent, HostUpdatePostcheck, HostUpdateReport, HostUpdateStatus,
+        };
+
+        let mut report =
+            HostUpdateReport::new("remote", vec![HostUpdateComponent::Host], Vec::new());
+        report.changed = true;
+        report.status = HostUpdateStatus::PartialFailure;
+        report
+            .applied_actions
+            .push("install-host-artifact".to_string());
+        report
+            .invalidated_caches
+            .push("native_computer_use".to_string());
+        report.postcheck_results.push(HostUpdatePostcheck::failed(
+            "native-computer-use-ready",
+            "Native Computer Use readiness failed",
+        ));
+        report.preserved_state = Some("completed Host update actions were preserved".to_string());
+        report.recovery_command =
+            Some("satelle doctor --host remote --scope computer-use --refresh --json".to_string());
+
+        let partial =
+            SatelleError::host_update_partially_applied(&report, "restart-host-daemon", "timeout");
+        assert_eq!(partial.code, ErrorCode::HostUpdatePartiallyApplied);
+        assert_eq!(partial.exit_code(), 74);
+        assert_eq!(partial.details["status"], "partial_failure");
+        assert_eq!(partial.details["changed"], true);
+        assert_eq!(
+            partial.details["completed_actions"],
+            serde_json::json!(["install-host-artifact"])
+        );
+        assert_eq!(
+            partial.details["invalidated_caches"],
+            serde_json::json!(["native_computer_use"])
+        );
+        assert_eq!(
+            partial.details["postcheck_results"],
+            serde_json::json!([{
+                "check_id": "native-computer-use-ready",
+                "status": "failed",
+                "summary": "Native Computer Use readiness failed",
+            }])
+        );
+
+        report.status = HostUpdateStatus::PostcheckFailed;
+        let postcheck = SatelleError::host_update_postcheck_failed(&report, "readiness failed");
+        assert_eq!(postcheck.code, ErrorCode::HostUpdatePostcheckFailed);
+        assert_eq!(postcheck.exit_code(), 74);
+        assert_eq!(postcheck.details["status"], "postcheck_failed");
+        assert_eq!(postcheck.details["changed"], true);
+        assert_eq!(
+            postcheck.details["invalidated_caches"],
+            serde_json::json!(["native_computer_use"])
+        );
+        assert_eq!(
+            postcheck.details["preserved_state"],
+            "completed Host update actions were preserved"
+        );
+
+        report.changed = false;
+        report.preserved_state = None;
+        let canonical_postcheck =
+            SatelleError::host_update_postcheck_failed(&report, "readiness failed");
+        assert_eq!(canonical_postcheck.details["changed"], true);
+        assert_eq!(
+            canonical_postcheck.details["preserved_state"],
+            "completed Host update actions were preserved"
+        );
+    }
+
+    #[test]
+    fn host_update_recovery_pending_names_the_operation_and_repair_path() {
+        let error = SatelleError::host_update_recovery_pending(
+            "remote",
+            "host-update-operation",
+            "maintenance finish failed",
+        );
+        assert_eq!(error.code, ErrorCode::HostUpdateRecoveryPending);
+        assert_eq!(error.exit_code(), 74);
+        assert_eq!(
+            error.details.get("operation_id"),
+            Some(&serde_json::json!("host-update-operation"))
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some("satelle repair --host remote --no-input --yes")
+        );
+        assert_eq!(
+            error.source_detail.as_deref(),
+            Some("maintenance finish failed")
+        );
+    }
+
+    #[test]
+    fn host_update_recovery_commands_quote_host_aliases() {
+        let host = "remote host'; touch /tmp/pwn";
+        let repair_command =
+            "satelle repair --host 'remote host'\"'\"'; touch /tmp/pwn' --no-input --yes";
+        let doctor_command = "satelle doctor --host 'remote host'\"'\"'; touch /tmp/pwn' --scope computer-use --refresh --json";
+        let pending =
+            SatelleError::host_update_recovery_pending(host, "operation-id", "response lost");
+        assert_eq!(pending.recovery_command.as_deref(), Some(repair_command));
+
+        let mut report = crate::host_update::HostUpdateReport::new(
+            host,
+            vec![crate::host_update::HostUpdateComponent::Host],
+            Vec::new(),
+        );
+        report.changed = true;
+        let partial =
+            SatelleError::host_update_partially_applied(&report, "restart-host-daemon", "timeout");
+        assert_eq!(partial.recovery_command.as_deref(), Some(repair_command));
+
+        let postcheck = SatelleError::host_update_postcheck_failed(&report, "readiness failed");
+        assert_eq!(postcheck.recovery_command.as_deref(), Some(doctor_command));
+    }
+
+    #[test]
     fn canonical_broad_exit_classes_cover_security_storage_and_internal_errors() {
         for (code, expected) in [
             (ErrorCode::InvalidUsage, 64),
@@ -5710,6 +5989,9 @@ mod error_contract_tests {
             (ErrorCode::NotImplemented, 70),
             (ErrorCode::CompletionInstallFailed, 73),
             (ErrorCode::RemoteExecution, 74),
+            (ErrorCode::HostUpdateRecoveryPending, 74),
+            (ErrorCode::HostUpdatePartiallyApplied, 74),
+            (ErrorCode::HostUpdatePostcheckFailed, 74),
             (ErrorCode::StorageIntegrityFailed, 74),
             (ErrorCode::SshHostKeyVerificationRequired, 74),
             (ErrorCode::CertificateUntrusted, 74),

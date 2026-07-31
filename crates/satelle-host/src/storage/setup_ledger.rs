@@ -586,11 +586,20 @@ impl Storage {
             ];
         let persistent_host_stop = action_ids == ["service-stop"];
         let persistent_host_restart = action_ids == ["service-restart"];
+        let host_update = action_ids
+            == [
+                "install-host-artifact",
+                "publish-host-service",
+                "restart-host-daemon",
+                "invalidate-readiness-caches",
+                "host-update-postcheck",
+            ];
         if plan.run_id != owner.operation_id
             || (!on_demand_handoff
                 && !persistent_host_service
                 && !persistent_host_stop
-                && !persistent_host_restart)
+                && !persistent_host_restart
+                && !host_update)
         {
             return Err(StorageError::new(StorageErrorKind::InvalidInput));
         }
@@ -712,30 +721,46 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        let action_status = transaction
+        let (recovery_action_id, recovery_action_count) = transaction
             .query_row(
-                "SELECT setup_actions.status
+                "SELECT min(setup_actions.action_id), count(*)
                  FROM setup_actions
                  JOIN setup_runs USING (run_id)
                  WHERE setup_runs.run_id = ?1
                    AND setup_runs.status = 'outcome_unknown'
-                   AND setup_actions.action_id = 'bootstrap-handoff'",
+                   AND setup_actions.status = 'outcome_unknown'",
                 [operation_id.as_str()],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
             )
-            .optional()
-            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
-            .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
-        let parsed_action_status = SetupActionStatus::parse(&action_status)?;
-        if !matches!(
-            parsed_action_status,
-            SetupActionStatus::Planned
-                | SetupActionStatus::Started
-                | SetupActionStatus::OutcomeUnknown
-                | SetupActionStatus::Completed
-        ) {
-            return Err(StorageError::new(StorageErrorKind::StateConflict));
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if recovery_action_count > 1 {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
+        let recovery_action = if let Some(action_id) = recovery_action_id {
+            Some((
+                validated_stored_private_reference(action_id)?,
+                "outcome_unknown",
+            ))
+        } else {
+            transaction
+                .query_row(
+                    "SELECT setup_actions.action_id
+                     FROM setup_actions
+                     JOIN setup_runs USING (run_id)
+                     WHERE setup_runs.run_id = ?1
+                       AND setup_runs.status = 'outcome_unknown'
+                       AND setup_actions.status = 'planned'
+                     ORDER BY setup_actions.action_order
+                     LIMIT 1",
+                    [operation_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
+                .map(validated_stored_private_reference)
+                .transpose()?
+                .map(|action_id| (action_id, "planned"))
+        };
         require_one_transition(
             transaction
                 .execute(
@@ -746,7 +771,7 @@ impl Storage {
                 )
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
         )?;
-        if parsed_action_status != SetupActionStatus::Completed {
+        if let Some((recovery_action_id, recovery_action_status)) = recovery_action {
             require_one_transition(
                 transaction
                     .execute(
@@ -756,9 +781,14 @@ impl Storage {
                              finished_at = NULL,
                              recovery_hint = NULL
                          WHERE run_id = ?1
-                           AND action_id = 'bootstrap-handoff'
-                           AND status = ?3",
-                        params![operation_id.as_str(), acquired_at, action_status],
+                           AND action_id = ?3
+                           AND status = ?4",
+                        params![
+                            operation_id.as_str(),
+                            acquired_at,
+                            recovery_action_id.as_str(),
+                            recovery_action_status,
+                        ],
                     )
                     .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
             )?;
@@ -1809,21 +1839,30 @@ fn require_run_and_predecessor_times(
     let mut statement = transaction
         .prepare(
             "SELECT predecessor.status, predecessor.finished_at
-             FROM setup_actions AS predecessor
-             JOIN setup_actions AS current
-               ON current.run_id = predecessor.run_id
+             FROM setup_actions AS current
+             LEFT JOIN setup_actions AS predecessor
+               ON predecessor.run_id = current.run_id
+              AND predecessor.action_order < current.action_order
              WHERE current.run_id = ?1 AND current.action_id = ?2
-               AND predecessor.action_order < current.action_order",
+             ORDER BY predecessor.action_order",
         )
         .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
     let rows = statement
         .query_map(params![run_id, action_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
         })
         .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+    let mut action_exists = false;
     for row in rows {
         let (status, finished_at) =
             row.map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+        action_exists = true;
+        let Some(status) = status else {
+            continue;
+        };
         if matches!(
             SetupActionStatus::parse(&status)?,
             SetupActionStatus::Completed
@@ -1835,6 +1874,9 @@ fn require_run_and_predecessor_times(
                 .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
             require_not_before(transition_at, &finished_at)?;
         }
+    }
+    if !action_exists {
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
     }
     Ok(())
 }
@@ -1855,7 +1897,7 @@ fn require_started_action_time(
         .optional()
         .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
     let Some((status, started_at)) = action else {
-        return Err(StorageError::new(StorageErrorKind::StateConflict));
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
     };
     if SetupActionStatus::parse(&status)? != SetupActionStatus::Started {
         return Err(StorageError::new(StorageErrorKind::StateConflict));

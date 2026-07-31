@@ -33,7 +33,7 @@ pub(super) fn task_failure(state: &DaemonState, authorized: &AuthorizedRequest) 
 }
 
 fn failure(error: &SatelleError) -> ApiFailure {
-    match error.code {
+    let mut failure = match error.code {
         ErrorCode::InvalidUsage
         | ErrorCode::ScopeSelectionConflict
         | ErrorCode::PromptSourceConflict
@@ -212,9 +212,15 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Codex control plane cannot admit this operation",
             details: validated_control_plane_details(error),
         },
-        ErrorCode::ComputerUseNotReady
-        | ErrorCode::DoctorReadinessBlockersFound
-        | ErrorCode::SetupVerificationFailed => ApiFailure {
+        ErrorCode::ComputerUseNotReady => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::ComputerUseNotReady,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "native Computer Use is not ready on this Host",
+            details: None,
+        },
+        ErrorCode::DoctorReadinessBlockersFound | ErrorCode::SetupVerificationFailed => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::ComputerUseNotReady,
             category: ApiErrorCategory::Readiness,
@@ -365,7 +371,10 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::HostBinaryNewerThanCli
         | ErrorCode::HostArtifactUnavailable
         | ErrorCode::HostUpdateRequiresCliUpgrade
+        | ErrorCode::HostUpdateRecoveryPending
         | ErrorCode::AmbiguousCodexComponentOwnership
+        | ErrorCode::HostUpdatePartiallyApplied
+        | ErrorCode::HostUpdatePostcheckFailed
         // Process interruption is a Controller-local process-exit contract.
         // If it crosses the Host boundary, expose no extra API surface.
         | ErrorCode::Interrupted
@@ -403,13 +412,38 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Host does not implement the requested operation",
             details: None,
         },
+    };
+
+    // Maintenance postcheck finalization can attach this one authenticated
+    // state bit to readiness and storage failures. Merge only that validated
+    // bit after normal mapping, while preserving the detail-free InternalError
+    // contract for Controller-local or otherwise unexposed Host errors.
+    if failure.code != ApiErrorCode::InternalError
+        && let Some(serde_json::Value::Object(terminal_details)) =
+            validated_maintenance_postcheck_details(error)
+    {
+        match &mut failure.details {
+            Some(serde_json::Value::Object(details)) => details.extend(terminal_details),
+            _ => failure.details = Some(serde_json::Value::Object(terminal_details)),
+        }
     }
+    failure
 }
 
 fn validated_control_plane_details(error: &SatelleError) -> Option<serde_json::Value> {
     let value = serde_json::Value::Object(error.details.clone().into_iter().collect());
     let details = serde_json::from_value::<IncompatibleControlPlaneDetails>(value).ok()?;
     serde_json::to_value(details).ok()
+}
+
+fn validated_maintenance_postcheck_details(error: &SatelleError) -> Option<serde_json::Value> {
+    let terminal = error
+        .details
+        .get("maintenance_postcheck_terminal")?
+        .as_bool()?;
+    Some(serde_json::json!({
+        "maintenance_postcheck_terminal": terminal
+    }))
 }
 
 fn validated_stop_not_confirmed_details(error: &SatelleError) -> Option<serde_json::Value> {
@@ -553,6 +587,64 @@ mod tests {
         assert_eq!(timeout.code, ApiErrorCode::NativeReadinessTimeout);
         assert_eq!(timeout.category, ApiErrorCategory::Readiness);
         assert!(timeout.retryable);
+    }
+
+    #[test]
+    fn maintenance_postcheck_terminal_detail_crosses_readiness_and_storage_error_mappings() {
+        for mut error in [
+            SatelleError::computer_use_not_ready(),
+            SatelleError::native_readiness_timeout(),
+            SatelleError {
+                code: ErrorCode::StorageIntegrityFailed,
+                message: "PRIVATE_MESSAGE_CANARY".to_string(),
+                recovery_command: None,
+                source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+                details: BTreeMap::new(),
+            },
+        ] {
+            error
+                .details
+                .insert("maintenance_postcheck_terminal".to_string(), json!(true));
+            error.details.insert(
+                "private_canary".to_string(),
+                json!("PRIVATE_DETAILS_CANARY"),
+            );
+
+            assert_eq!(
+                failure(&error).details,
+                Some(json!({ "maintenance_postcheck_terminal": true }))
+            );
+
+            error.details.insert(
+                "maintenance_postcheck_terminal".to_string(),
+                json!("PRIVATE_INVALID_TERMINAL"),
+            );
+            assert_eq!(failure(&error).details, None);
+        }
+    }
+
+    #[test]
+    fn maintenance_postcheck_terminal_detail_does_not_expand_internal_errors() {
+        for code in [ErrorCode::HostUpdatePostcheckFailed, ErrorCode::Interrupted] {
+            let error = SatelleError {
+                code,
+                message: "PRIVATE_MESSAGE_CANARY".to_string(),
+                recovery_command: None,
+                source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+                details: BTreeMap::from([
+                    ("maintenance_postcheck_terminal".to_string(), json!(true)),
+                    (
+                        "private_canary".to_string(),
+                        json!("PRIVATE_DETAILS_CANARY"),
+                    ),
+                ]),
+            };
+
+            let mapped = failure(&error);
+
+            assert_eq!(mapped.code, ApiErrorCode::InternalError);
+            assert_eq!(mapped.details, None);
+        }
     }
 
     #[test]
