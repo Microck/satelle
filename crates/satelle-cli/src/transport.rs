@@ -4510,10 +4510,9 @@ fn map_release_artifact_error(
     error: ssh_bootstrap::SshBootstrapError,
 ) -> SatelleError {
     match error {
-        ssh_bootstrap::SshBootstrapError::MissingReleaseManifest
-        | ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry
-        | ssh_bootstrap::SshBootstrapError::ManifestTooLarge
-        | ssh_bootstrap::SshBootstrapError::InvalidManifest => {
+        ssh_bootstrap::SshBootstrapError::VerifiedRelease(error)
+            if error.release_artifact_is_unavailable() =>
+        {
             SatelleError::host_artifact_unavailable(env!("CARGO_PKG_VERSION"), target.id())
         }
         error => map_ssh_daemon_bootstrap_error(host, error),
@@ -7824,7 +7823,9 @@ mod bootstrap_ordering_tests {
         let missing_error = map_release_artifact_error(
             "remote",
             ssh_bootstrap::RemoteTarget::DarwinArm64,
-            ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry,
+            ssh_bootstrap::SshBootstrapError::VerifiedRelease(Box::new(
+                crate::self_update::SelfUpdateError::ManifestEntryMissing,
+            )),
         );
         assert_eq!(
             missing_error.code,
@@ -7835,31 +7836,33 @@ mod bootstrap_ordering_tests {
             serde_json::json!("darwin-arm64")
         );
 
-        let missing_manifest_error = map_release_artifact_error(
+        let oversized_manifest_error = map_release_artifact_error(
             "remote",
             ssh_bootstrap::RemoteTarget::DarwinArm64,
-            ssh_bootstrap::SshBootstrapError::MissingReleaseManifest,
+            ssh_bootstrap::SshBootstrapError::VerifiedRelease(Box::new(
+                crate::self_update::SelfUpdateError::ResponseTooLarge,
+            )),
         );
         assert_eq!(
-            missing_manifest_error.code,
+            oversized_manifest_error.code,
             satelle_core::ErrorCode::HostArtifactUnavailable
         );
         assert_eq!(
-            missing_manifest_error.details["remote_platform"],
+            oversized_manifest_error.details["remote_platform"],
             serde_json::json!("darwin-arm64")
         );
 
-        for malformed in [
-            ssh_bootstrap::SshBootstrapError::ManifestTooLarge,
-            ssh_bootstrap::SshBootstrapError::InvalidManifest,
-        ] {
-            let error = map_release_artifact_error(
-                "remote",
-                ssh_bootstrap::RemoteTarget::DarwinArm64,
-                malformed,
-            );
-            assert_eq!(error.code, satelle_core::ErrorCode::HostArtifactUnavailable);
-        }
+        let malformed = map_release_artifact_error(
+            "remote",
+            ssh_bootstrap::RemoteTarget::DarwinArm64,
+            ssh_bootstrap::SshBootstrapError::VerifiedRelease(Box::new(
+                crate::self_update::SelfUpdateError::ManifestInvalid,
+            )),
+        );
+        assert_eq!(
+            malformed.code,
+            satelle_core::ErrorCode::HostArtifactUnavailable
+        );
     }
 
     #[test]
@@ -7899,7 +7902,9 @@ mod bootstrap_ordering_tests {
             "office",
             ssh_bootstrap::RemoteTarget::DarwinArm64,
             None,
-            Err(ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry),
+            Err(ssh_bootstrap::SshBootstrapError::VerifiedRelease(Box::new(
+                crate::self_update::SelfUpdateError::ManifestEntryMissing,
+            ))),
         )
         .expect_err("missing integrity metadata must block the update plan");
         assert_eq!(

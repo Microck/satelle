@@ -1569,6 +1569,14 @@ pub(crate) enum SelfUpdateError {
 }
 
 impl SelfUpdateError {
+    pub(crate) fn release_artifact_is_unavailable(&self) -> bool {
+        match self {
+            Self::Http(error) => error.status() == Some(reqwest::StatusCode::NOT_FOUND),
+            Self::ResponseTooLarge | Self::ManifestInvalid | Self::ManifestEntryMissing => true,
+            _ => false,
+        }
+    }
+
     fn error_code(&self) -> ErrorCode {
         match self {
             Self::ManagedInstall(_) => ErrorCode::SelfUpdateManagedInstall,
