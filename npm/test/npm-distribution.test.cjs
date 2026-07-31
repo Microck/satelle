@@ -563,6 +563,9 @@ test("global discovery requires the probed manager root to own the real launcher
   const owners = launcher.discoverGlobalOwnership({
     packageName: "@microck/satelle",
     launcherPath,
+    // The Windows launcher-name contract has its own test above. Keep this
+    // ownership test platform-independent so its probe names stay deterministic.
+    platform: "linux",
     runCommand(command, argumentsToForward) {
       probes.push([command, argumentsToForward]);
       if (command === "npm") {
