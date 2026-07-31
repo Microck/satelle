@@ -1699,6 +1699,48 @@ fn failed_postchange_action_cleanup_retains_the_partial_operation_identity() {
 
 #[cfg(unix)]
 #[test]
+fn lost_next_mutation_start_response_cannot_reuse_the_previous_commit_fence() {
+    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
+        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+            "host-update-commit-fence-host",
+            "fake-ssh-host",
+            "host-update-commit-fence-response-loss".to_string(),
+            bootstrap_lock::OperationKind::HostBinaryReplacement,
+            fake_ssh,
+        )
+        .expect("acquire Host replacement Bootstrap Lock");
+        bootstrap_lock
+            .confirm_ownership()
+            .expect("confirm Bootstrap Lock ownership");
+        bootstrap_lock
+            .mark_mutation_started("install-host-artifact")
+            .expect("start the first mutation");
+        bootstrap_lock
+            .commit_current_mutation()
+            .expect("commit the first mutation");
+
+        bootstrap_lock.lose_next_mutation_start_response_for_tests();
+        assert!(matches!(
+            bootstrap_lock.mark_mutation_started("publish-host-service"),
+            Err(ssh_bootstrap::SshBootstrapError::BootstrapLockLost)
+        ));
+        assert!(matches!(
+            bootstrap_lock.commit_current_mutation(),
+            Err(ssh_bootstrap::SshBootstrapError::BootstrapLockLost)
+        ));
+
+        let committed_lines = bootstrap_lock
+            .exchanged_lock_lines()
+            .iter()
+            .filter(|line| line.starts_with(bootstrap_lock::MUTATION_COMMITTED))
+            .collect::<Vec<_>>();
+        assert_eq!(committed_lines.len(), 1);
+        assert!(committed_lines[0].contains(" install-host-artifact "));
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn rejected_durable_token_is_reported_after_launched_daemon_handoff_is_terminal() {
     with_bootstrap_handoff_test_context(
         |bootstrap_client, fake_ssh, daemon_address, host_identity, _| {

@@ -104,6 +104,8 @@ pub(super) struct SshBootstrapLock {
     mutation_committed: bool,
     #[cfg(all(test, unix))]
     exchanged_lock_lines: Vec<String>,
+    #[cfg(all(test, unix))]
+    lose_next_mutation_start_response: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -318,6 +320,8 @@ impl SshBootstrapLock {
             mutation_committed: false,
             #[cfg(all(test, unix))]
             exchanged_lock_lines: Vec::new(),
+            #[cfg(all(test, unix))]
+            lose_next_mutation_start_response: false,
         })
     }
 
@@ -348,10 +352,19 @@ impl SshBootstrapLock {
     ) -> Result<(), SshBootstrapError> {
         let line = bootstrap_lock::mutation_started_line(phase, attempt)
             .map_err(SshBootstrapError::InvalidBootstrapLockRequest)?;
-        self.exchange_lock_line(line)?;
+        // Bind the local fence to the new attempt before sending its start
+        // line. A lost response can otherwise leave the previous attempt's
+        // committed flag active and make recovery skip this attempt's commit.
         self.mutation_phase = Some(phase.to_string());
         self.mutation_attempt = Some(attempt.to_string());
         self.mutation_committed = false;
+        let exchange = self.exchange_lock_line(line);
+        #[cfg(all(test, unix))]
+        if self.lose_next_mutation_start_response {
+            self.lose_next_mutation_start_response = false;
+            return Err(SshBootstrapError::BootstrapLockLost);
+        }
+        exchange?;
         Ok(())
     }
 
@@ -407,6 +420,11 @@ impl SshBootstrapLock {
     #[cfg(all(test, unix))]
     pub(super) fn exchanged_lock_lines(&self) -> &[String] {
         &self.exchanged_lock_lines
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn lose_next_mutation_start_response_for_tests(&mut self) {
+        self.lose_next_mutation_start_response = true;
     }
 
     fn exchange_lock_line(&mut self, challenge: String) -> Result<(), SshBootstrapError> {
