@@ -5671,7 +5671,7 @@ impl SatelleError {
         let recovery_command = report.recovery_command.clone().or_else(|| {
             Some(format!(
                 "satelle repair --host {} --no-input --yes",
-                report.host
+                shell_argument(&report.host)
             ))
         });
         let mut details = BTreeMap::new();
@@ -5725,7 +5725,10 @@ impl SatelleError {
         skipped_actions: &[String],
         source: impl Into<String>,
     ) -> Self {
-        let recovery_command = Some(format!("satelle repair --host {host} --no-input --yes"));
+        let recovery_command = Some(format!(
+            "satelle repair --host {} --no-input --yes",
+            shell_argument(host)
+        ));
         Self {
             code: ErrorCode::SetupActionFailed,
             message: format!(
@@ -5806,7 +5809,10 @@ impl SatelleError {
         skipped_actions: &[String],
         source: impl Into<String>,
     ) -> Self {
-        let recovery_command = Some(format!("satelle repair --host {host} --no-input --yes"));
+        let recovery_command = Some(format!(
+            "satelle repair --host {} --no-input --yes",
+            shell_argument(host)
+        ));
         Self {
             code: ErrorCode::SetupPartiallyApplied,
             message: format!(
@@ -6170,6 +6176,26 @@ mod error_contract_tests {
 
         let postcheck = SatelleError::host_update_postcheck_failed(&report, "readiness failed");
         assert_eq!(postcheck.recovery_command.as_deref(), Some(doctor_command));
+
+        let setup =
+            SatelleError::setup_action_failed(host, "repair-host-daemon", &[], "install failed");
+        assert_eq!(setup.recovery_command.as_deref(), Some(repair_command));
+
+        let storage = SatelleError::storage_maintenance_partially_applied(
+            host,
+            &["restore-storage-backup".to_string()],
+            "restart-host-api-service",
+            &[],
+            "restart failed",
+        );
+        assert_eq!(storage.recovery_command.as_deref(), Some(repair_command));
+
+        let repair = crate::host_update::RepairUpgradeReport::new(host, Vec::new())
+            .partial_failure(
+                vec!["install-host-artifact".to_string()],
+                "repair-host-daemon",
+            );
+        assert_eq!(repair.recovery_command.as_deref(), Some(repair_command));
     }
 
     #[test]

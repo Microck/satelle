@@ -1436,6 +1436,7 @@ fn final_host_update_revalidation_holds_and_releases_maintenance_on_drift() {
             "office",
             client,
             operation_id,
+            HostUpdateOperation::Update,
             &accepted,
             || {
                 let competing = client
@@ -1496,6 +1497,7 @@ fn uncertain_host_update_maintenance_begin_reports_the_recovery_pending_operatio
         "office",
         &unavailable_client,
         operation_id,
+        HostUpdateOperation::Update,
         &accepted,
         || panic!("revalidation cannot run after uncertain Maintenance acquisition"),
     )
@@ -1529,6 +1531,7 @@ fn failed_final_revalidation_cleanup_reports_the_recovery_pending_operation() {
                 "office",
                 client,
                 operation_id,
+                HostUpdateOperation::Update,
                 &accepted,
                 || {
                     service
@@ -2179,6 +2182,12 @@ fn common_partial_failure_retains_the_operation_identity() {
     assert_eq!(
         error.details.get("invalidated_caches"),
         Some(&serde_json::json!(["native_computer_use"]))
+    );
+    assert_eq!(
+        error.recovery_command.as_deref(),
+        Some(
+            "satelle repair --host office --run host-update-common-partial-failure --no-input --yes"
+        )
     );
 }
 

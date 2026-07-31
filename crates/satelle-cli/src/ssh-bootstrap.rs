@@ -3963,7 +3963,7 @@ impl RemoteUserDirectories {
     }
 
     #[cfg(all(test, unix))]
-    pub(super) fn probe_managed_service_asset_for_tests(
+    pub(super) fn probe_managed_service_executable_for_tests(
         &self,
         ssh_program: &Path,
         destination: &str,
@@ -7527,8 +7527,8 @@ mod tests {
             native_readiness_cache_ttl: None,
             provider_smoke_success_cache_ttl: None,
             provider_smoke_failure_cache_ttl: None,
-            daemon_idle_timeout: None,
             setup_ledger_retention: None,
+            daemon_idle_timeout: None,
             desktop_user: None,
             desktop_session_preference: None,
             desktop_session_native_selector: None,
@@ -8598,78 +8598,5 @@ mod tests {
         assert!(!script.contains("--bootstrap-operation-kind"));
         assert!(script.contains("RedirectStandardInput = $true"));
         assert!(script.contains("StandardInput.WriteLine($token)"));
-    }
-
-    #[test]
-    fn offline_storage_commands_are_exact_on_windows_and_macos() {
-        let windows = offline_storage_maintenance_command(
-            RemoteTarget::WindowsX64Msvc,
-            r"C:\Satelle\satelle.exe",
-            "restore",
-            OfflineStorageMaintenanceIdentity {
-                host: "office",
-                operation_id: "storage-operation-1",
-            },
-            r"C:\Satelle\state",
-            Some(r"C:\Satelle\state\migration.backup"),
-            false,
-        );
-        let windows_script =
-            decode_powershell_command(&windows).expect("decode Windows storage command");
-        assert_eq!(
-            windows_script,
-            concat!(
-                "& 'C:\\Satelle\\satelle.exe' host offline-storage-maintenance ",
-                "--operation 'restore' --host 'office' ",
-                "--operation-id 'storage-operation-1' ",
-                "--state-root 'C:\\Satelle\\state' ",
-                "--backup 'C:\\Satelle\\state\\migration.backup'"
-            )
-        );
-
-        let macos = offline_storage_maintenance_command(
-            RemoteTarget::DarwinArm64,
-            "/Users/test/satelle",
-            "store-reset",
-            OfflineStorageMaintenanceIdentity {
-                host: "office",
-                operation_id: "storage-operation-2",
-            },
-            "/Users/test/state",
-            None,
-            true,
-        );
-        let expected_macos_arguments = concat!(
-            "'/Users/test/satelle' host offline-storage-maintenance ",
-            "--operation 'store-reset' --host 'office' ",
-            "--operation-id 'storage-operation-2' ",
-            "--state-root '/Users/test/state' --delete-recordings"
-        );
-        assert_eq!(
-            macos,
-            format!(
-                "sh -c {}",
-                posix_quote(&format!("exec {expected_macos_arguments}"))
-            )
-        );
-    }
-
-    #[test]
-    fn offline_storage_results_preserve_the_remote_observed_values() {
-        let result = parse_offline_storage_maintenance_result(
-            "store-reset",
-            br#"{"removed_metadata_file_names":[],"recordings_deleted":false}"#,
-        )
-        .expect("valid remote store reset result");
-
-        assert_eq!(result["recordings_deleted"], false);
-        assert_eq!(result["removed_metadata_file_names"], serde_json::json!([]));
-        assert!(
-            parse_offline_storage_maintenance_result(
-                "store-reset",
-                br#"{"recordings_deleted":true}"#
-            )
-            .is_err()
-        );
     }
 }

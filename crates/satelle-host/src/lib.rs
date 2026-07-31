@@ -2155,13 +2155,14 @@ impl HostService {
             .as_ref()
             .map(|paths| std::path::PathBuf::from(&paths.operator_log_root))
             .map_err(Clone::clone);
-        Self::production_for_host_at(config, state_root, operator_log_root)
+        Self::production_for_host_at(config, state_root, operator_log_root, daemon_paths)
     }
 
     fn production_for_host_at(
         config: &HostConfig,
         state_root: Result<std::path::PathBuf, SatelleError>,
         operator_log_root: Result<std::path::PathBuf, SatelleError>,
+        daemon_paths: Result<DaemonResolvedPathSet, SatelleError>,
     ) -> Self {
         let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect(None)));
         let working_directory = state_root
@@ -2219,15 +2220,28 @@ impl HostService {
     }
 
     fn production_for_offline_storage(state_root: &std::path::Path) -> Self {
-        let config = satelle_core::SatelleConfig::defaults()
+        let mut config = satelle_core::SatelleConfig::defaults()
             .hosts
             .remove(LOCAL_DEMO_HOST)
             .expect("the built-in local Host config exists");
-        Self::production_for_host_at(
-            &config,
-            Ok(state_root.to_path_buf()),
-            Ok(state_root.join("logs")),
-        )
+        config.daemon_state_dir = Some(state_root.to_path_buf());
+        config.daemon_log_dir = Some(state_root.join("logs"));
+        Self::production_for_host(&config)
+    }
+
+    /// Builds the persistent Host service with the exact path overrides from
+    /// its Satelle-owned launchd or Windows service configuration.
+    pub fn production_for_service(overrides: &DaemonPathOverrides) -> Self {
+        let mut config = satelle_core::SatelleConfig::defaults()
+            .hosts
+            .remove(LOCAL_DEMO_HOST)
+            .expect("the built-in local Host config exists");
+        config.daemon_home = overrides.home.clone();
+        config.daemon_config_file = overrides.config_file.clone();
+        config.daemon_state_dir = overrides.state_dir.clone();
+        config.daemon_cache_dir = overrides.cache_dir.clone();
+        config.daemon_log_dir = overrides.log_dir.clone();
+        Self::production_for_host(&config)
     }
 
     /// Builds an on-demand Host whose only bootstrap credential is held in

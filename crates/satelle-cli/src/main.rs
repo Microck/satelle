@@ -1492,9 +1492,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         Command::Repair(command) => HistoryTarget {
             family: "repair",
             selects_host: true,
-            // Repair does not consume ConfigContext; its handler defaults
-            // directly to the local demo Host when --host is absent.
-            explicit_host: Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)),
+            explicit_host: command.host.as_deref(),
             session_id: None,
         },
         Command::Doctor(command) => HistoryTarget {
@@ -4419,7 +4417,7 @@ fn run_repair(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let host = config.resolve_host(Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)))?;
+    let host = config.resolve_host(command.host.as_deref())?;
     let mut report =
         transport::plan_repair_upgrades(&host, command.run.as_deref()).map_err(failure)?;
     if command.dry_run {

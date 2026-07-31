@@ -554,7 +554,7 @@ impl RepairUpgradeReport {
         self.preserved_state = Some("completed repair actions were preserved".to_string());
         self.recovery_command = Some(format!(
             "satelle repair --host {} --no-input --yes",
-            self.host
+            crate::shell_argument(&self.host)
         ));
         self
     }

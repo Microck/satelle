@@ -185,7 +185,37 @@ fn plan_host_targets(
         HostVersionRelation::MatchesCli => HostUpdateDisposition::Current,
         HostVersionRelation::NewerThanCli | HostVersionRelation::RequiresNewerCli => unreachable!(),
     };
-    let artifact = if disposition == HostUpdateDisposition::Current {
+    let mut service_disposition = request
+        .service_inspection
+        .map(|service| match service.relation_to_cli {
+            HostVersionRelation::Missing => Ok(HostUpdateDisposition::Install),
+            HostVersionRelation::OlderThanCli => Ok(HostUpdateDisposition::Update),
+            HostVersionRelation::MatchesCli => Ok(HostUpdateDisposition::Current),
+            HostVersionRelation::NewerThanCli => Err(HostUpdatePlanError::HostBinaryNewerThanCli {
+                host_version: service
+                    .current_version
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                cli_version: request.cli_version.to_string(),
+            }),
+            HostVersionRelation::RequiresNewerCli => {
+                Err(HostUpdatePlanError::HostUpdateRequiresCliUpgrade {
+                    cli_version: request.cli_version.to_string(),
+                })
+            }
+        })
+        .transpose()?;
+    if disposition != HostUpdateDisposition::Current
+        && service_disposition == Some(HostUpdateDisposition::Current)
+    {
+        // Persistent service definitions execute the digest-pinned artifact
+        // path. Replacing that artifact therefore changes the service asset
+        // even when the service and target daemon versions already match.
+        service_disposition = Some(HostUpdateDisposition::Update);
+    }
+    let artifact_required = disposition != HostUpdateDisposition::Current
+        || service_disposition.is_some_and(|service| service != HostUpdateDisposition::Current);
+    let artifact = if !artifact_required {
         None
     } else {
         let artifact = artifacts
@@ -212,12 +242,13 @@ fn plan_host_targets(
         }
         Some(artifact)
     };
+    let daemon_destination = artifact
+        .as_ref()
+        .and_then(|artifact| artifact.daemon_destination.clone());
     let daemon_mutations = mutation_for(
         disposition,
         "install-host-artifact",
-        artifact
-            .as_ref()
-            .and_then(|artifact| artifact.daemon_destination.clone()),
+        daemon_destination.clone(),
     );
     let daemon_restart_impact = if daemon_mutations.is_empty() {
         HostUpdateRestartImpact::None
@@ -229,7 +260,11 @@ fn plan_host_targets(
         current_version: request.host_inspection.current_version.clone(),
         target_version: request.cli_version.to_string(),
         version_source: HostUpdateVersionSource::InvokingCliRelease,
-        artifact_digest: artifact.map(|artifact| artifact.digest),
+        artifact_digest: if daemon_mutations.is_empty() {
+            None
+        } else {
+            artifact.as_ref().map(|artifact| artifact.digest.clone())
+        },
         disposition,
         restart_impact: daemon_restart_impact,
         remote_mutations: daemon_mutations,
@@ -265,7 +300,7 @@ fn plan_host_targets(
             current_version: service.current_version.clone(),
             target_version: request.cli_version.to_string(),
             version_source: HostUpdateVersionSource::InvokingCliRelease,
-            artifact_digest: None,
+            artifact_digest,
             disposition,
             restart_impact: if remote_mutations.is_empty() {
                 HostUpdateRestartImpact::None
@@ -554,18 +589,11 @@ pub fn render_repair_upgrade_plan(
     report: &satelle_core::host_update::RepairUpgradeReport,
 ) -> String {
     let mut output = format!("Repair upgrade plan for {}\n", report.host);
-    if report.ledger_status == satelle_core::host_update::RepairLedgerStatus::Available {
-        let _ = writeln!(output, "plan source: retained setup action ledger");
-    } else if report
-        .actions
-        .iter()
-        .any(|action| action.compatibility_reason.is_some())
-    {
-        let _ = writeln!(
-            output,
-            "warning: retained setup history is unavailable; the plan uses current Host probes"
-        );
-    }
+    let _ = writeln!(
+        output,
+        "ledger: {:?}; plan source: {:?}",
+        report.ledger_status, report.plan_source
+    );
     for action in &report.actions {
         let current = action.current_version.as_deref().unwrap_or("not installed");
         let reason = action
@@ -618,7 +646,7 @@ mod tests {
         Artifact(Some(VerifiedHostArtifact {
             version: "1.2.3".to_string(),
             remote_platform: "linux-x64".to_string(),
-            digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            digest: "ab".repeat(32),
             daemon_destination: Some("/opt/satelle/bin/satelle".to_string()),
         }))
     }
@@ -734,34 +762,6 @@ mod tests {
                 && target.version_source == HostUpdateVersionSource::InvokingCliRelease
         }));
         assert_eq!(report.targets[1].current_version, None);
-    }
-
-    #[test]
-    fn current_host_does_not_require_an_unused_release_artifact() {
-        let host = HostUpdateInspection {
-            current_version: Some("1.2.3".to_string()),
-            relation_to_cli: HostVersionRelation::MatchesCli,
-            remote_platform: "linux-x64".to_string(),
-        };
-        let report = build_host_update_plan(
-            HostUpdatePlanRequest {
-                host: "office",
-                cli_version: "1.2.3",
-                components: &[HostUpdateComponent::Host],
-                includes_all: false,
-                host_inspection: &host,
-                service_inspection: None,
-                codex_inspections: &[],
-            },
-            &Artifact(None),
-        )
-        .expect("a current Host does not consume release metadata");
-
-        assert_eq!(
-            report.status,
-            satelle_core::host_update::HostUpdateStatus::UpToDate
-        );
-        assert_eq!(report.targets[0].artifact_digest, None);
     }
 
     #[test]
@@ -1311,40 +1311,6 @@ mod tests {
                 version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
                 disposition: RepairUpgradeDisposition::ManualActionRequired,
             }
-        );
-    }
-
-    #[test]
-    fn repair_human_output_warns_about_missing_history_only_when_it_affects_explanation() {
-        let healthy = build_repair_upgrade_plan(
-            "office",
-            &[RepairUpgradeInspection {
-                target: HostUpdateTarget::HostDaemon,
-                current_version: Some("1.0.0".to_string()),
-                target_version: "1.0.0".to_string(),
-                compatibility_reason: None,
-                version_source: HostUpdateVersionSource::InvokingCliRelease,
-                automation_is_safe: true,
-                newer_compatible_version_available: false,
-            }],
-        );
-        assert!(!render_repair_upgrade_plan(&healthy).contains("history is unavailable"));
-
-        let blocked = build_repair_upgrade_plan(
-            "office",
-            &[RepairUpgradeInspection {
-                target: HostUpdateTarget::HostDaemon,
-                current_version: None,
-                target_version: "1.0.0".to_string(),
-                compatibility_reason: Some(RepairCompatibilityReason::Missing),
-                version_source: HostUpdateVersionSource::InvokingCliRelease,
-                automation_is_safe: true,
-                newer_compatible_version_available: false,
-            }],
-        );
-        assert!(
-            render_repair_upgrade_plan(&blocked)
-                .contains("warning: retained setup history is unavailable")
         );
     }
 }

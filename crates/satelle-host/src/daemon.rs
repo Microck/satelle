@@ -1844,28 +1844,51 @@ fn production_codex_update_evidence(
         | crate::codex_capabilities::CodexVersionEvidence::Malformed
         | crate::codex_capabilities::CodexVersionEvidence::Unavailable => None,
     };
-    DaemonRuntimeCapabilities {
-        codex_runtime,
-        native_computer_use,
-        provider_computer_use: false,
-        image_attachments: snapshot.image_attachments_supported(),
-        codex_update_evidence: satelle_core::host_update::CodexUpdateEvidence {
-            runtime_ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
-            native_component_ownership:
-                satelle_core::host_update::CodexComponentOwnership::CodexOwned,
-            runtime_current_version: runtime_current_version.clone(),
-            // Native Computer Use ships with the managed Codex runtime. Its
-            // installed version is runtime evidence, while
-            // `native_computer_use` remains only the readiness-cache result.
-            native_component_current_version: runtime_current_version,
-            required_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string(),
-            runtime_update_required: !codex_runtime,
-            native_update_required: !codex_runtime,
-            runtime_compatibility_reason: runtime_compatibility_reason(snapshot),
-            native_component_compatibility_reason: native_compatibility_reason(
-                snapshot,
-                codex_runtime,
-            ),
+    let unsupported_host_platform = snapshot
+        .verdict
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.reason == BlockerReason::UnsupportedHostPlatform);
+    let runtime_compatibility_reason = (!unsupported_host_platform)
+        .then(|| {
+            runtime_compatibility_reason(
+                snapshot.evidence.codex_version,
+                snapshot
+                    .verdict
+                    .blockers()
+                    .iter()
+                    .map(|blocker| blocker.reason),
+            )
+        })
+        .flatten();
+    let native_execution_path_unavailable = snapshot
+        .verdict
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.reason == BlockerReason::NativeExecutionPathUnavailable);
+    let incomplete_live_proof = snapshot
+        .verdict
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.reason == BlockerReason::IncompleteLiveProof);
+    let native_component_compatibility_reason = if unsupported_host_platform {
+        None
+    } else if native_execution_path_unavailable {
+        Some(satelle_core::host_update::RepairCompatibilityReason::ControlPlaneIncompatible)
+    } else if incomplete_live_proof {
+        Some(satelle_core::host_update::RepairCompatibilityReason::NativeReadinessBlocked)
+    } else {
+        runtime_compatibility_reason
+    };
+    let native_component_current_version = (!native_execution_path_unavailable)
+        .then_some(runtime_current_version.clone())
+        .flatten();
+
+    satelle_core::host_update::CodexUpdateEvidence {
+        availability: if unsupported_host_platform {
+            satelle_core::host_update::CodexUpdateAvailability::UnsupportedHostPlatform
+        } else {
+            satelle_core::host_update::CodexUpdateAvailability::Available
         },
         runtime_ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
         native_component_ownership: satelle_core::host_update::CodexComponentOwnership::CodexOwned,
@@ -1901,19 +1924,13 @@ fn runtime_compatibility_reason(
     use crate::codex_capabilities::CodexVersionEvidence;
     use satelle_core::host_update::RepairCompatibilityReason;
 
-    if snapshot
-        .verdict
-        .blockers()
-        .iter()
-        .any(|blocker| blocker.reason == BlockerReason::MissingCodexRuntime)
-    {
-        return Some(RepairCompatibilityReason::Missing);
-    }
-    match snapshot.evidence.codex_version {
-        CodexVersionEvidence::Detected { .. }
-            if snapshot.verdict.blockers().iter().any(|blocker| {
-                matches!(
-                    blocker.reason,
+    match codex_version {
+        CodexVersionEvidence::Detected { .. } => {
+            let mut unsupported = false;
+            let mut control_plane_incompatible = false;
+            for reason in blocker_reasons {
+                unsupported |= matches!(
+                    reason,
                     BlockerReason::MalformedCodexVersion
                         | BlockerReason::CodexVersionUnavailable
                         | BlockerReason::UnsupportedCodexVersion
@@ -1932,17 +1949,6 @@ fn runtime_compatibility_reason(
         CodexVersionEvidence::Missing => Some(RepairCompatibilityReason::Missing),
         CodexVersionEvidence::Malformed => Some(RepairCompatibilityReason::Corrupted),
         CodexVersionEvidence::Unavailable => Some(RepairCompatibilityReason::Unsupported),
-    }
-}
-
-fn native_compatibility_reason(
-    snapshot: &ProductionCapabilitySnapshot,
-    codex_runtime: bool,
-) -> Option<satelle_core::host_update::RepairCompatibilityReason> {
-    if codex_runtime {
-        None
-    } else {
-        runtime_compatibility_reason(snapshot)
     }
 }
 

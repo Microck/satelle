@@ -767,31 +767,6 @@ impl Storage {
         } else if parsed_action_status != SetupActionStatus::OutcomeUnknown {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
-        let recovery_action = if let Some(action_id) = recovery_action_id {
-            Some((
-                validated_stored_private_reference(action_id)?,
-                "outcome_unknown",
-            ))
-        } else {
-            transaction
-                .query_row(
-                    "SELECT setup_actions.action_id
-                     FROM setup_actions
-                     JOIN setup_runs USING (run_id)
-                     WHERE setup_runs.run_id = ?1
-                       AND setup_runs.status = 'outcome_unknown'
-                       AND setup_actions.status = 'planned'
-                     ORDER BY setup_actions.action_order
-                     LIMIT 1",
-                    [operation_id.as_str()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
-                .map(validated_stored_private_reference)
-                .transpose()?
-                .map(|action_id| (action_id, "planned"))
-        };
         require_one_transition(
             transaction
                 .execute(
@@ -802,7 +777,7 @@ impl Storage {
                 )
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
         )?;
-        if let Some((recovery_action_id, recovery_action_status)) = recovery_action {
+        if parsed_action_status != SetupActionStatus::Completed {
             require_one_transition(
                 transaction
                     .execute(

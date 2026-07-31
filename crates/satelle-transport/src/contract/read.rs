@@ -254,28 +254,9 @@ impl EffectiveLimits {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilitiesResponse {
-    schema_version: CapabilitiesSchemaV6,
-    request_id: RequestId,
-    host_identity: String,
-    daemon_version: String,
-    platform: Platform,
-    operations: Vec<Operation>,
-    runtime_capabilities: RuntimeCapabilities,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    codex_update_evidence: Option<satelle_core::host_update::CodexUpdateEvidence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    minimum_host_version: Option<String>,
-    limits: EffectiveLimits,
-    supported_attachment_media_types: Vec<String>,
-    provider_secret_upload: ProviderSecretUploadCapability,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CapabilitiesResponseV6 {
     schema_version: CapabilitiesSchemaV6,
     request_id: RequestId,
     host_identity: String,
@@ -287,29 +268,6 @@ struct CapabilitiesResponseV6 {
     limits: EffectiveLimits,
     supported_attachment_media_types: Vec<String>,
     provider_secret_upload: ProviderSecretUploadCapability,
-}
-
-impl<'de> Deserialize<'de> for CapabilitiesResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let response = CapabilitiesResponseV6::deserialize(deserializer)?;
-        Ok(Self {
-            schema_version: response.schema_version,
-            request_id: response.request_id,
-            host_identity: response.host_identity,
-            daemon_version: response.daemon_version,
-            platform: response.platform,
-            operations: response.operations,
-            runtime_capabilities: response.runtime_capabilities,
-            codex_update_evidence: Some(response.codex_update_evidence),
-            minimum_host_version: Some(response.minimum_host_version),
-            limits: response.limits,
-            supported_attachment_media_types: response.supported_attachment_media_types,
-            provider_secret_upload: response.provider_secret_upload,
-        })
-    }
 }
 
 impl CapabilitiesResponse {
