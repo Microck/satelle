@@ -1868,6 +1868,57 @@ fn successful_postcheck_is_preserved_when_bootstrap_release_is_uncertain() {
     );
 }
 
+#[test]
+fn confirmed_remote_actions_are_recorded_before_reconciliation_failure() {
+    for action_id in ["publish-host-service", "restart-host-daemon"] {
+        let mut report = satelle_core::host_update::HostUpdateReport::new(
+            "office",
+            vec![satelle_core::host_update::HostUpdateComponent::Host],
+            Vec::new(),
+        );
+        report.changed = true;
+
+        let error = finish_confirmed_host_update_action(&mut report, action_id, || {
+            Err(SatelleError::host_unreachable("office"))
+        })
+        .expect_err("a later reconciliation failure must remain visible");
+
+        assert_eq!(error.code, ErrorCode::HostUnreachable);
+        assert_eq!(report.applied_actions, [action_id]);
+    }
+}
+
+#[test]
+fn terminal_failed_postcheck_is_preserved_when_bootstrap_release_is_uncertain() {
+    let mut report = satelle_core::host_update::HostUpdateReport::new(
+        "office",
+        vec![satelle_core::host_update::HostUpdateComponent::Host],
+        Vec::new(),
+    );
+    report.changed = true;
+
+    let error = finish_terminal_failed_host_update_postcheck(
+        report,
+        "host-update-terminal-postcheck-release",
+        SatelleError::computer_use_not_ready(),
+        || Err(SatelleError::host_unreachable("office")),
+    );
+
+    assert_eq!(error.code, ErrorCode::HostUpdatePartiallyApplied);
+    assert_eq!(
+        error.details.get("failed_action"),
+        Some(&serde_json::json!("release-bootstrap-lock"))
+    );
+    assert_eq!(
+        error.details.get("postcheck_results"),
+        Some(&serde_json::json!([{
+            "check_id": "native-computer-use-ready",
+            "status": "failed",
+            "summary": "Native Computer Use readiness smoke test failed",
+        }]))
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn rejected_later_action_start_retains_the_partial_operation_identity() {

@@ -3624,7 +3624,15 @@ pub(crate) fn apply_host_update(
             ));
         }
         if let Err(source) =
-            commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock)
+            finish_confirmed_host_update_action(&mut report, "publish-host-service", || {
+                commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock)?;
+                complete_persistent_action(
+                    &transport.alias,
+                    &old_client,
+                    &mut bootstrap_lock,
+                    "publish-host-service",
+                )
+            })
         {
             return Err(host_update_recovery_pending(
                 &mut report,
@@ -3633,22 +3641,6 @@ pub(crate) fn apply_host_update(
                 source,
             ));
         }
-        if let Err(source) = complete_persistent_action(
-            &transport.alias,
-            &old_client,
-            &mut bootstrap_lock,
-            "publish-host-service",
-        ) {
-            return Err(host_update_recovery_pending(
-                &mut report,
-                "publish-host-service",
-                &operation_id,
-                source,
-            ));
-        }
-        report
-            .applied_actions
-            .push("publish-host-service".to_string());
     } else if let Err(source) = skip_maintenance_action(
         &transport.alias,
         &old_client,
@@ -3790,12 +3782,16 @@ pub(crate) fn apply_host_update(
             source,
         ));
     }
-    if let Err(source) = complete_persistent_action(
-        &transport.alias,
-        &new_client,
-        &mut bootstrap_lock,
-        "restart-host-daemon",
-    ) {
+    if let Err(source) =
+        finish_confirmed_host_update_action(&mut report, "restart-host-daemon", || {
+            complete_persistent_action(
+                &transport.alias,
+                &new_client,
+                &mut bootstrap_lock,
+                "restart-host-daemon",
+            )
+        })
+    {
         return Err(host_update_recovery_pending(
             &mut report,
             "restart-host-daemon",
@@ -3803,9 +3799,6 @@ pub(crate) fn apply_host_update(
             source,
         ));
     }
-    report
-        .applied_actions
-        .push("restart-host-daemon".to_string());
 
     if let Err(source) = start_persistent_action(
         &transport.alias,
@@ -3903,31 +3896,15 @@ pub(crate) fn apply_host_update(
                 source,
             ));
         }
-        if bootstrap_lock.release_committed_handoff().is_err() {
-            return Err(host_update_recovery_pending(
-                &mut report,
-                "host-update-postcheck",
-                &operation_id,
-                SatelleError::host_unreachable(&transport.alias),
-            ));
-        }
+        let error =
+            finish_terminal_failed_host_update_postcheck(report, &operation_id, source, || {
+                bootstrap_lock
+                    .release_committed_handoff()
+                    .map_err(|_| SatelleError::host_unreachable(&transport.alias))
+            });
         drop(new_client);
         drop(new_tunnel);
-        report = report.with_postcheck(HostUpdatePostcheck::failed(
-            "native-computer-use-ready",
-            "Native Computer Use readiness smoke test failed",
-        ));
-        report.preserved_state =
-            Some("completed Host update actions and the replacement daemon were preserved".into());
-        report.recovery_command = Some(format!(
-            "satelle doctor --host {} --scope computer-use --refresh --json",
-            crate::shell_argument(&report.host)
-        ));
-        report.status = satelle_core::host_update::HostUpdateStatus::PostcheckFailed;
-        return Err(SatelleError::host_update_postcheck_failed(
-            &report,
-            source.to_string(),
-        ));
+        return Err(error);
     }
     report = finish_successful_host_update_postcheck(report, &operation_id, || {
         bootstrap_lock
@@ -3938,6 +3915,48 @@ pub(crate) fn apply_host_update(
     drop(new_tunnel);
 
     Ok(report.finish_postchecks())
+}
+
+fn finish_confirmed_host_update_action(
+    report: &mut satelle_core::host_update::HostUpdateReport,
+    action_id: &str,
+    reconcile_action: impl FnOnce() -> Result<(), SatelleError>,
+) -> Result<(), SatelleError> {
+    // The remote outcome is already confirmed. Record it before the fence or
+    // ledger reconciliation that follows so an uncertain response cannot
+    // erase a mutation that recovery must preserve.
+    report.applied_actions.push(action_id.to_string());
+    reconcile_action()
+}
+
+fn finish_terminal_failed_host_update_postcheck(
+    mut report: satelle_core::host_update::HostUpdateReport,
+    operation_id: &str,
+    source: SatelleError,
+    release_bootstrap_lock: impl FnOnce() -> Result<(), SatelleError>,
+) -> SatelleError {
+    // The Host finalized the failed postcheck and released its leases. Record
+    // that terminal outcome before the independent Bootstrap Lock release.
+    report = report.with_postcheck(satelle_core::host_update::HostUpdatePostcheck::failed(
+        "native-computer-use-ready",
+        "Native Computer Use readiness smoke test failed",
+    ));
+    report.preserved_state =
+        Some("completed Host update actions and the replacement daemon were preserved".into());
+    report.recovery_command = Some(format!(
+        "satelle doctor --host {} --scope computer-use --refresh --json",
+        crate::shell_argument(&report.host)
+    ));
+    report.status = satelle_core::host_update::HostUpdateStatus::PostcheckFailed;
+    if let Err(release_source) = release_bootstrap_lock() {
+        return host_update_recovery_pending(
+            &mut report,
+            "release-bootstrap-lock",
+            operation_id,
+            release_source,
+        );
+    }
+    SatelleError::host_update_postcheck_failed(&report, source.to_string())
 }
 
 fn finish_successful_host_update_postcheck(
