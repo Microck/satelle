@@ -303,6 +303,8 @@ impl HostUpdateReport {
             .any(|postcheck| postcheck.status != HostUpdatePostcheckStatus::Passed)
         {
             HostUpdateStatus::PostcheckFailed
+        } else if !self.skipped_actions.is_empty() {
+            HostUpdateStatus::ManualActionRequired
         } else if self.changed {
             HostUpdateStatus::Applied
         } else {
@@ -650,5 +652,44 @@ mod tests {
                 .iter()
                 .any(|postcheck| { postcheck.status == HostUpdatePostcheckStatus::Planned })
         );
+    }
+
+    #[test]
+    fn applied_work_preserves_manual_action_required_status() {
+        let mut unsafe_codex =
+            update_target(HostUpdateTarget::CodexRuntime, "update-codex-runtime");
+        unsafe_codex.disposition = HostUpdateDisposition::Skipped;
+
+        let report = HostUpdateReport::new(
+            "office",
+            vec![HostUpdateComponent::Host, HostUpdateComponent::Codex],
+            vec![
+                update_target(HostUpdateTarget::HostDaemon, "install-host-artifact"),
+                unsafe_codex,
+            ],
+        )
+        .with_applied_action("install-host-artifact")
+        .with_postcheck(HostUpdatePostcheck::passed(
+            "host-api-reachable",
+            "Host API is reachable",
+        ))
+        .with_postcheck(HostUpdatePostcheck::passed(
+            "host-version-aligned",
+            "Host version matches the invoking CLI",
+        ))
+        .with_postcheck(HostUpdatePostcheck::passed(
+            "storage-migrations-current",
+            "Storage migrations are current",
+        ))
+        .with_postcheck(HostUpdatePostcheck::passed(
+            "native-computer-use-ready",
+            "Native Computer Use is ready",
+        ))
+        .finish_postchecks();
+
+        assert_eq!(report.status, HostUpdateStatus::ManualActionRequired);
+        assert!(report.changed);
+        assert_eq!(report.applied_actions, ["install-host-artifact"]);
+        assert_eq!(report.skipped_actions, ["update-codex-runtime"]);
     }
 }
