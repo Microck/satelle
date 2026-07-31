@@ -3660,6 +3660,51 @@ fn unavailable_json_repair_apply_emits_only_the_terminal_error() {
 }
 
 #[test]
+fn repair_without_a_host_uses_the_configured_default_host() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    let token_file = state.path().join("satelle.token");
+    let token = ApiBearerToken::generate().expect("generate API token");
+    test_file::write_user_controlled(&token_file, token.expose().as_str())
+        .expect("write owner-only API token");
+    let closed_listener = TcpListener::bind("127.0.0.1:0").expect("bind temporary port");
+    let closed_address = closed_listener
+        .local_addr()
+        .expect("read temporary address");
+    drop(closed_listener);
+    let token_path = toml::Value::String(token_file.to_string_lossy().into_owned()).to_string();
+    write_user_config(
+        &user_config,
+        format!(
+            r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "direct"
+adapter = "codex"
+address = "https://{closed_address}"
+expected_host_id = "host-remote"
+api_token = {{ kind = "file", path = {token_path} }}
+"#,
+        ),
+    )
+    .expect("write default remote Host config");
+
+    let output = production_satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["repair", "--dry-run", "--json"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "host-unreachable");
+}
+
+#[test]
 fn host_update_rejects_conflicting_or_unsupported_components() {
     satelle()
         .args([

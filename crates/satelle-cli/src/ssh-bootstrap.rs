@@ -3010,6 +3010,20 @@ fn windows_task_register_command(
 fn windows_task_definition_match_expression(
     task: &satelle_core::daemon_service::WindowsTaskDefinition,
 ) -> String {
+    windows_task_definition_match_expression_for_values(
+        &powershell_quote(&task.principal_sid),
+        &powershell_quote(&task.trigger_user_sid),
+        &powershell_quote(&task.executable),
+        &powershell_quote(&windows_task_arguments(task)),
+    )
+}
+
+fn windows_task_definition_match_expression_for_values(
+    principal_sid: &str,
+    trigger_sid: &str,
+    executable: &str,
+    arguments: &str,
+) -> String {
     format!(
         concat!(
             "($xml.DocumentElement.GetAttribute('version') -eq '1.4') -and ",
@@ -3035,10 +3049,10 @@ fn windows_task_definition_match_expression(
             "($root.Actions.Exec.Command -eq {executable}) -and ",
             "($root.Actions.Exec.Arguments -eq {arguments})"
         ),
-        principal_sid = powershell_quote(&task.principal_sid),
-        trigger_sid = powershell_quote(&task.trigger_user_sid),
-        executable = powershell_quote(&task.executable),
-        arguments = powershell_quote(&windows_task_arguments(task)),
+        principal_sid = principal_sid,
+        trigger_sid = trigger_sid,
+        executable = executable,
+        arguments = arguments,
     )
 }
 
@@ -3725,6 +3739,12 @@ impl RemoteUserDirectories {
             };
             let expected_arguments =
                 format!("host start --service-config {service_config_argument}");
+            let definition_matches = windows_task_definition_match_expression_for_values(
+                "$expectedSid",
+                "$expectedSid",
+                "$executable",
+                &powershell_quote(&expected_arguments),
+            );
             let script = format!(
                 concat!(
                     "$ErrorActionPreference='Stop'; $path={path}; ",
@@ -3740,11 +3760,12 @@ impl RemoteUserDirectories {
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "[xml]$xml=Export-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name}; ",
                     "$root=$xml.Task; ",
-                    "if (@($root.Actions.Exec).Count -ne 1 -or ",
-                    "$root.Actions.Exec.Arguments -cne {expected_arguments}) {{ ",
-                    "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "$executable=[string]$root.Actions.Exec.Command; ",
                     "if ([String]::IsNullOrWhiteSpace($executable)) {{ exit 75 }}; ",
+                    "$identity=[Security.Principal.WindowsIdentity]::GetCurrent(); ",
+                    "$expectedSid=$identity.User.Value; ",
+                    "if (-not ({definition_matches})) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {{ ",
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "$executableItem=Get-Item -LiteralPath $executable -Force; ",
@@ -3762,7 +3783,7 @@ impl RemoteUserDirectories {
                 ),
                 path = powershell_quote(path),
                 task_name = powershell_quote(&task_name),
-                expected_arguments = powershell_quote(&expected_arguments),
+                definition_matches = definition_matches,
             );
             powershell_encoded_command(&script)
         } else {
@@ -5392,6 +5413,21 @@ mod tests {
         assert!(script.contains("Export-ScheduledTask"));
         assert!(script.contains(r"Host-host-123"));
         assert!(script.contains("host start --service-config"));
+        for canonical_task_check in [
+            "WindowsIdentity]::GetCurrent()",
+            "DocumentElement.GetAttribute('version')",
+            "Principal.LogonType",
+            "Principal.RunLevel",
+            "Triggers.LogonTrigger.Enabled",
+            "Settings.MultipleInstancesPolicy",
+            "Settings.Enabled",
+            "Actions.Context",
+        ] {
+            assert!(
+                script.contains(canonical_task_check),
+                "Windows service probe omitted {canonical_task_check:?}: {script}"
+            );
+        }
         for executable_integrity_check in [
             "Test-Path -LiteralPath $executable -PathType Leaf",
             "Get-Item -LiteralPath $executable -Force",

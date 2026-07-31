@@ -4183,7 +4183,7 @@ fn run_repair(
         )));
     }
 
-    let host = config.resolve_host(Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)))?;
+    let host = config.resolve_host(command.host.as_deref())?;
     let report = transport::plan_repair_upgrades(&host).map_err(failure)?;
     let apply_unavailable = !command.dry_run
         && report.actions.iter().any(|action| {
