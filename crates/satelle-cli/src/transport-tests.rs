@@ -1754,6 +1754,88 @@ fn failed_postchange_action_cleanup_retains_the_partial_operation_identity() {
 
 #[cfg(unix)]
 #[test]
+fn confirmed_action_failure_records_dependency_skips() {
+    with_bootstrap_handoff_test_context_with_scope(
+        ApiScopes::ADMIN,
+        |client, fake_ssh, _, _, _, _| {
+            let operation_id = "host-update-confirmed-action-failure";
+            client
+                .begin_host_update_maintenance(operation_id)
+                .expect("begin Host update maintenance");
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "host-update-confirmed-action-failure-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::HostBinaryReplacement,
+                fake_ssh,
+            )
+            .expect("acquire Host replacement Bootstrap Lock");
+            bootstrap_lock
+                .confirm_ownership()
+                .expect("confirm Bootstrap Lock ownership");
+            start_persistent_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                "install-host-artifact",
+            )
+            .expect("start artifact installation");
+            complete_persistent_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                "install-host-artifact",
+            )
+            .expect("complete artifact installation");
+            start_persistent_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                "publish-host-service",
+            )
+            .expect("start service publication");
+
+            let mut report = satelle_core::host_update::HostUpdateReport::new(
+                "office",
+                vec![satelle_core::host_update::HostUpdateComponent::Host],
+                Vec::new(),
+            );
+            report.changed = true;
+            report
+                .applied_actions
+                .push("install-host-artifact".to_string());
+            let error = fail_host_update_action(
+                "office",
+                client,
+                &mut bootstrap_lock,
+                &mut report,
+                "publish-host-service",
+                SatelleError::host_unreachable("office"),
+            );
+
+            assert_eq!(error.code, ErrorCode::HostUpdatePartiallyApplied);
+            assert_eq!(
+                report.skipped_actions,
+                [
+                    "restart-host-daemon",
+                    "invalidate-readiness-caches",
+                    "host-update-postcheck",
+                ]
+            );
+            assert_eq!(
+                error.details.get("skipped_actions"),
+                Some(&serde_json::json!([
+                    "restart-host-daemon",
+                    "invalidate-readiness-caches",
+                    "host-update-postcheck",
+                ]))
+            );
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn rejected_later_action_start_retains_the_partial_operation_identity() {
     with_bootstrap_handoff_test_context_with_scope(
         ApiScopes::ADMIN,

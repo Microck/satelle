@@ -3441,6 +3441,9 @@ pub(crate) fn apply_host_update(
     // The verified artifact publication changed remote state even if the
     // following fence commit cannot be confirmed.
     report.changed = true;
+    report
+        .applied_actions
+        .push("install-host-artifact".to_string());
     if let Err(source) = commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock) {
         return Err(host_update_recovery_pending(
             &mut report,
@@ -3511,9 +3514,6 @@ pub(crate) fn apply_host_update(
             source,
         ));
     }
-    report
-        .applied_actions
-        .push("install-host-artifact".to_string());
 
     if publish_service {
         if let Err(source) = start_persistent_action(
@@ -4194,19 +4194,32 @@ fn fail_host_update_action(
     source: SatelleError,
 ) -> SatelleError {
     let operation_id = bootstrap_lock.operation_id().to_string();
-    let cleanup = record_persistent_action_failure(
+    let action_index = HOST_UPDATE_ACTIONS
+        .iter()
+        .position(|candidate| *candidate == action_id)
+        .expect("failed Host update actions belong to the ordered maintenance plan");
+    let recorded_failure = record_persistent_action_failure(
         host,
         client,
         bootstrap_lock,
         action_id,
         "remote_command_failed",
-    )
-    .and_then(|()| finish_persistent_maintenance(host, client, bootstrap_lock))
-    .and_then(|()| {
-        bootstrap_lock
-            .release_committed_handoff()
-            .map_err(|_| SatelleError::host_unreachable(host))
-    });
+    );
+    if recorded_failure.is_ok() {
+        report.skipped_actions.extend(
+            HOST_UPDATE_ACTIONS
+                .iter()
+                .skip(action_index + 1)
+                .map(|action| (*action).to_string()),
+        );
+    }
+    let cleanup = recorded_failure
+        .and_then(|()| finish_persistent_maintenance(host, client, bootstrap_lock))
+        .and_then(|()| {
+            bootstrap_lock
+                .release_committed_handoff()
+                .map_err(|_| SatelleError::host_unreachable(host))
+        });
     match cleanup {
         Ok(()) => host_update_recovery_pending(report, action_id, &operation_id, source),
         Err(cleanup) if !report.changed => {
