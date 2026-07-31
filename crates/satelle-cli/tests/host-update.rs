@@ -115,6 +115,28 @@ fn current_host_update_exits_without_confirmation_or_mutation() {
 }
 
 #[test]
+fn default_current_host_update_reports_skipped_targets_in_human_output() {
+    let state = TestStateDir::new().expect("create secure temporary state directory");
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["host", "update", "--host", "local-demo"])
+        .output()
+        .expect("run default current Host update");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("Host update output is UTF-8");
+    assert!(stdout.contains("Host update plan for local-demo"));
+    assert!(stdout.contains("- CodexRuntime: unavailable"));
+    assert!(stdout.contains("- CodexNativeComputerUse: unavailable"));
+    assert!(!stdout.contains("Host update status for local-demo: up to date"));
+}
+
+#[test]
 fn quiet_current_host_update_has_no_output() {
     let state = tempfile::tempdir().expect("temporary update state");
     let output = satelle()

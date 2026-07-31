@@ -8088,7 +8088,12 @@ fn run_host_update(
         if format.is_json() {
             print_json(&report).map_err(failure)?;
         } else if !command.quiet {
-            if report.status == satelle_core::host_update::HostUpdateStatus::UpToDate {
+            let has_skipped_targets = report.targets.iter().any(|target| {
+                target.disposition == satelle_core::host_update::HostUpdateDisposition::Skipped
+            });
+            if report.status == satelle_core::host_update::HostUpdateStatus::UpToDate
+                && !has_skipped_targets
+            {
                 println!("Host update status for {}: up to date", report.host);
             } else {
                 print!("{}", host_update::render_host_update_plan(&report));
