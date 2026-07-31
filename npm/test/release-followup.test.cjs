@@ -304,6 +304,12 @@ test("Unix installer performs verified install, upgrade, smoke, receipt, and uni
       sources: { ...completePathsPayload.sources, state_root: "legacy_default" },
     },
   });
+  makeRelease("0.9.0", {
+    pathsPayload: { ...completePathsPayload, project_config_file: undefined },
+  });
+  makeRelease("0.10.0", {
+    pathsPayload: { ...completePathsPayload, observation_source: undefined },
+  });
 
   writeExecutable(path.join(commands, "curl"), `#!/bin/sh\nout=''\nurl=''\nwhile [ "$#" -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; http*) url="$1"; shift;; *) shift;; esac; done\nname=\${url##*/}\ncase "$name" in SHA256SUMS) version=\$(printf '%s' "$url" | sed -n 's#.*releases/download/v\\([^/]*\\)/.*#\\1#p'); cp "$SATELLE_FIXTURES/SHA256SUMS-$version" "$out";; *) cp "$SATELLE_FIXTURES/$name" "$out";; esac\n`);
   writeExecutable(path.join(commands, "gh"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "$SATELLE_GH_LOG"\nif [ "$1" = api ]; then case "$2" in */git/ref/tags/*) echo 'tag ${"b".repeat(40)}';; */git/tags/*) echo '${"a".repeat(40)}';; *) echo 'v0.1.0';; esac; fi\n`);
@@ -376,6 +382,8 @@ test("Unix installer performs verified install, upgrade, smoke, receipt, and uni
     ["0.6.0", "incomplete paths sources"],
     ["0.7.0", "wrongly typed paths source"],
     ["0.8.0", "invalid paths source enum"],
+    ["0.9.0", "missing nullable project config field"],
+    ["0.10.0", "missing nullable observation source field"],
   ]) {
     const failedPathsBin = path.join(root, `failed-paths-smoke-${version}`);
     const failedPathsResult = runInstaller("--version", version, "--bin-dir", failedPathsBin);

@@ -198,8 +198,10 @@ validate_paths_output() {
     (.sqlite_store | type == "string") and
     (.operator_log_root | type == "string") and
     (.recording_root | type == "string") and
+    has("project_config_file") and
     ((.project_config_file == null) or (.project_config_file | type == "string")) and
     (.install_receipt | type == "string") and
+    has("observation_source") and
     .observation_source == null and
     (.sources | type == "object") and
     (.sources.config_file | valid_path_source) and
