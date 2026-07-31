@@ -3745,7 +3745,20 @@ impl RemoteUserDirectories {
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "$executable=[string]$root.Actions.Exec.Command; ",
                     "if ([String]::IsNullOrWhiteSpace($executable)) {{ exit 75 }}; ",
-                    "[Console]::Out.WriteLine('managed'); [Console]::Out.Write($executable)"
+                    "if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "$executableItem=Get-Item -LiteralPath $executable -Force; ",
+                    "if (($executableItem.Attributes -band ",
+                    "[IO.FileAttributes]::ReparsePoint) -ne 0 -or ",
+                    "-not [IO.Path]::IsPathFullyQualified($executable)) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "$resolvedExecutable=$executableItem.FullName; ",
+                    "$normalizedExecutable=[IO.Path]::GetFullPath($executable); ",
+                    "if (-not [String]::Equals($normalizedExecutable, $resolvedExecutable, ",
+                    "[StringComparison]::OrdinalIgnoreCase)) {{ ",
+                    "[Console]::Out.Write('absent'); exit 0 }}; ",
+                    "[Console]::Out.WriteLine('managed'); ",
+                    "[Console]::Out.Write($resolvedExecutable)"
                 ),
                 path = powershell_quote(path),
                 task_name = powershell_quote(&task_name),
@@ -3761,6 +3774,17 @@ impl RemoteUserDirectories {
                     "[ \"$(wc -c < \"$path\")\" -le 65536 ] || exit 75; ",
                     "label=$(/usr/bin/plutil -extract Label raw -o - \"$path\") || exit 75; ",
                     "if [ \"$label\" != 'dev.microck.satelle.host' ]; then ",
+                    "printf absent; exit 0; fi; ",
+                    "executable=$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - ",
+                    "\"$path\") || exit 75; ",
+                    "case \"$executable\" in /*) ;; *) printf absent; exit 0;; esac; ",
+                    "if [ ! -f \"$executable\" ] || [ -L \"$executable\" ] || ",
+                    "[ ! -x \"$executable\" ]; then printf absent; exit 0; fi; ",
+                    "directory=$(/usr/bin/dirname \"$executable\") || exit 75; ",
+                    "basename=$(/usr/bin/basename \"$executable\") || exit 75; ",
+                    "canonical_directory=$(cd -P \"$directory\" 2>/dev/null && pwd -P) || ",
+                    "{{ printf absent; exit 0; }}; ",
+                    "if [ \"$executable\" != \"$canonical_directory/$basename\" ]; then ",
                     "printf absent; exit 0; fi; ",
                     "printf 'managed\\n'; ",
                     "/usr/bin/plutil -extract ProgramArguments json -o - \"$path\""
@@ -5299,6 +5323,19 @@ mod tests {
                 "service probe attempted mutation command {mutation}: {invocation}"
             );
         }
+        for executable_integrity_check in [
+            "/usr/bin/plutil -extract ProgramArguments.0 raw",
+            "[ ! -f \"$executable\" ]",
+            "[ -L \"$executable\" ]",
+            "[ ! -x \"$executable\" ]",
+            "canonical_directory=$(cd -P \"$directory\"",
+            "[ \"$executable\" != \"$canonical_directory/$basename\" ]",
+        ] {
+            assert!(
+                invocation.contains(executable_integrity_check),
+                "macOS service probe omitted {executable_integrity_check:?}: {invocation}"
+            );
+        }
 
         fs::write(
             &fake_ssh,
@@ -5355,6 +5392,18 @@ mod tests {
         assert!(script.contains("Export-ScheduledTask"));
         assert!(script.contains(r"Host-host-123"));
         assert!(script.contains("host start --service-config"));
+        for executable_integrity_check in [
+            "Test-Path -LiteralPath $executable -PathType Leaf",
+            "Get-Item -LiteralPath $executable -Force",
+            "[IO.FileAttributes]::ReparsePoint",
+            "[IO.Path]::IsPathFullyQualified($executable)",
+            "$executableItem.FullName",
+        ] {
+            assert!(
+                script.contains(executable_integrity_check),
+                "Windows service probe omitted {executable_integrity_check:?}: {script}"
+            );
+        }
         for mutation in [
             "Set-Content",
             "Register-ScheduledTask",

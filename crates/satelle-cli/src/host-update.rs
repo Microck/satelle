@@ -391,7 +391,11 @@ pub fn render_host_update_plan(report: &HostUpdateReport) -> String {
     let mut output = format!("Host update plan for {}\n", report.host);
     for target in &report.targets {
         let current = match (target.target, target.current_version.as_deref()) {
-            (HostUpdateTarget::HostDaemonService, None) => "managed asset; version unavailable",
+            (HostUpdateTarget::HostDaemonService, None)
+                if target.disposition != HostUpdateDisposition::Install =>
+            {
+                "managed asset; version unavailable"
+            }
             (_, Some(version)) => version,
             (_, None) => "not installed",
         };
@@ -585,6 +589,38 @@ mod tests {
 
         assert_eq!(report.targets.len(), 1);
         assert_eq!(report.targets[0].target, HostUpdateTarget::HostDaemon);
+    }
+
+    #[test]
+    fn missing_service_asset_renders_as_not_installed() {
+        let mut host = host_inspection(HostVersionRelation::MatchesCli);
+        host.current_version = Some("1.2.3".to_string());
+        let service = HostUpdateServiceInspection {
+            current_version: None,
+            relation_to_cli: HostVersionRelation::Missing,
+            destination: "/home/operator/.config/systemd/user/satelle.service".to_string(),
+        };
+        let report = build_host_update_plan(
+            HostUpdatePlanRequest {
+                host: "office",
+                cli_version: "1.2.3",
+                components: &[HostUpdateComponent::Host],
+                includes_all: false,
+                host_inspection: &host,
+                service_inspection: Some(&service),
+                codex_inspections: &[],
+            },
+            &artifact(),
+        )
+        .expect("build plan with missing service asset");
+
+        let rendered = render_host_update_plan(&report);
+        assert!(
+            rendered.contains(
+                "HostDaemonService: not installed -> 1.2.3 (Install, restart: HostDaemon)"
+            )
+        );
+        assert!(!rendered.contains("managed asset; version unavailable"));
     }
 
     #[test]
