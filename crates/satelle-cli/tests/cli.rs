@@ -8230,11 +8230,9 @@ fn run_provider_secret_setup_in_pty(
     }
     let preview_end = process.wait_for_after("Provider secret overwrite behavior:", 0);
     let secret_prompt_end = process.wait_for_after("Provider secret", preview_end);
-    if accepted {
-        process
-            .wait_for_echo_disabled()
-            .expect("provider secret prompt disables PTY echo");
-    }
+    process
+        .wait_for_echo_disabled()
+        .expect("provider secret prompt disables PTY echo");
     process.write_input(&format!("{secret}\n"));
     let confirmation_end = process.wait_for_after(
         "Provision or replace the provider secret at this exact destination?",
