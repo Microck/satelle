@@ -3638,12 +3638,18 @@ pub(super) fn managed_service_executable_version(
         .strip_prefix('v')
         .filter(|version| !version.is_empty())?;
     let mut version_parts = version.split('.');
-    let _release_version = (
+    let release_version = (
         version_parts.next()?.parse::<u64>().ok()?,
         version_parts.next()?.parse::<u64>().ok()?,
         version_parts.next()?.parse::<u64>().ok()?,
     );
-    if version_parts.next().is_some() {
+    if version_parts.next().is_some()
+        || version
+            != format!(
+                "{}.{}.{}",
+                release_version.0, release_version.1, release_version.2
+            )
+    {
         return None;
     }
     if components.next()? != target.id() {
@@ -5742,6 +5748,26 @@ mod tests {
                 &macos,
                 "/Users/operator/Library/Caches/Satelle/host/vbroken/darwin-arm64/satelle",
                 None,
+            ),
+            None
+        );
+        let mut current_version_parts = env!("CARGO_PKG_VERSION").split('.');
+        let aliased_current_version = format!(
+            "{}.{}.0{}",
+            current_version_parts.next().expect("release major version"),
+            current_version_parts.next().expect("release minor version"),
+            current_version_parts.next().expect("release patch version"),
+        );
+        let aliased_current_windows_path = format!(
+            r"C:\Users\operator\AppData\Local\Satelle\host\v{aliased_current_version}\win32-x64-msvc\satelle-{}.exe",
+            "bb".repeat(32),
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                &windows,
+                &aliased_current_windows_path,
+                Some([0xaa; 32]),
             ),
             None
         );
