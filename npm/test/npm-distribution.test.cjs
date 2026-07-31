@@ -611,7 +611,7 @@ test("canonical launches detect an installed unscoped forwarding package", (cont
       packageName: "@microck/satelle",
       launcherPath: canonicalLauncher,
     }),
-    { packageName: "satelle", launcherPath: unscopedLauncher },
+    { packageName: "satelle", launcherPath: realpathSync(unscopedLauncher) },
   );
 
   writeFileSync(
