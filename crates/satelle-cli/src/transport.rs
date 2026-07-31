@@ -972,6 +972,15 @@ fn map_ssh_daemon_bootstrap_error(
     }
 }
 
+fn map_remote_target_error(alias: &str, error: ssh_bootstrap::SshBootstrapError) -> SatelleError {
+    match error {
+        ssh_bootstrap::SshBootstrapError::UnsupportedPlatform { platform } => {
+            SatelleError::host_artifact_unavailable(env!("CARGO_PKG_VERSION"), &platform)
+        }
+        error => map_ssh_daemon_bootstrap_error(alias, error),
+    }
+}
+
 fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, SatelleError> {
     let attachments = request
         .attachments()
@@ -1298,7 +1307,7 @@ impl SshSetupTransport {
         self.remote_target.map_or_else(
             || {
                 ssh_bootstrap::RemoteTarget::probe(self.binding.destination())
-                    .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))
+                    .map_err(|error| map_remote_target_error(&self.alias, error))
             },
             Ok,
         )
@@ -3279,7 +3288,8 @@ fn map_release_artifact_error(
     error: ssh_bootstrap::SshBootstrapError,
 ) -> SatelleError {
     match error {
-        ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry => {
+        ssh_bootstrap::SshBootstrapError::MissingReleaseManifest
+        | ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry => {
             SatelleError::host_artifact_unavailable(env!("CARGO_PKG_VERSION"), target.id())
         }
         error => map_ssh_daemon_bootstrap_error(host, error),
@@ -6573,6 +6583,39 @@ mod bootstrap_ordering_tests {
         assert_eq!(
             missing_error.details["remote_platform"],
             serde_json::json!("darwin-arm64")
+        );
+
+        let missing_manifest_error = map_release_artifact_error(
+            "remote",
+            ssh_bootstrap::RemoteTarget::DarwinArm64,
+            ssh_bootstrap::SshBootstrapError::MissingReleaseManifest,
+        );
+        assert_eq!(
+            missing_manifest_error.code,
+            satelle_core::ErrorCode::HostArtifactUnavailable
+        );
+        assert_eq!(
+            missing_manifest_error.details["remote_platform"],
+            serde_json::json!("darwin-arm64")
+        );
+    }
+
+    #[test]
+    fn unsupported_detected_platform_is_typed_artifact_unavailability() {
+        let unsupported = map_remote_target_error(
+            "office",
+            ssh_bootstrap::SshBootstrapError::UnsupportedPlatform {
+                platform: "linux-x64-musl".to_string(),
+            },
+        );
+
+        assert_eq!(
+            unsupported.code,
+            satelle_core::ErrorCode::HostArtifactUnavailable
+        );
+        assert_eq!(
+            unsupported.details["remote_platform"],
+            serde_json::json!("linux-x64-musl")
         );
     }
 

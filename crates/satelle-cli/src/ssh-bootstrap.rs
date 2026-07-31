@@ -1,5 +1,8 @@
 use flate2::read::GzDecoder;
-use reqwest::blocking::{Client, Response};
+use reqwest::{
+    StatusCode,
+    blocking::{Client, Response},
+};
 use satelle_core::session::HostIdentityRef;
 use satelle_core::{DaemonPathOverrides, HostConfig, SshIdentityCommitRecord};
 use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
@@ -1267,7 +1270,9 @@ sync"#,
             ("darwin", Some(Architecture::X64)) => Ok(Self::DarwinX64),
             ("linux", Some(Architecture::Arm64)) if is_glibc(libc) => Ok(Self::LinuxArm64Gnu),
             ("linux", Some(Architecture::X64)) if is_glibc(libc) => Ok(Self::LinuxX64Gnu),
-            _ => Err(SshBootstrapError::UnsupportedPlatform),
+            _ => Err(SshBootstrapError::UnsupportedPlatform {
+                platform: detected_platform_id(system, architecture, libc),
+            }),
         }
     }
 
@@ -4412,6 +4417,52 @@ fn is_glibc(value: Option<&str>) -> bool {
     value.is_some_and(|value| value.to_ascii_lowercase().starts_with("glibc "))
 }
 
+fn detected_platform_id(system: &str, architecture: &str, libc: Option<&str>) -> String {
+    let system = platform_id_component(system);
+    let architecture = normalize_arch(architecture).map_or_else(
+        || platform_id_component(architecture),
+        |architecture| match architecture {
+            Architecture::Arm64 => "arm64".to_string(),
+            Architecture::X64 => "x64".to_string(),
+        },
+    );
+    match system.as_str() {
+        "linux" => {
+            let libc = libc.map(str::to_ascii_lowercase);
+            let libc = if libc
+                .as_deref()
+                .is_some_and(|libc| libc.starts_with("glibc "))
+            {
+                "gnu"
+            } else if libc.as_deref().is_some_and(|libc| libc.contains("musl")) {
+                "musl"
+            } else {
+                "unknown-libc"
+            };
+            format!("linux-{architecture}-{libc}")
+        }
+        "windows" => format!("win32-{architecture}-msvc"),
+        _ => format!("{system}-{architecture}"),
+    }
+}
+
+fn platform_id_component(value: &str) -> String {
+    let mut component = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            component.push(character.to_ascii_lowercase());
+        } else if !component.is_empty() && !component.ends_with('-') {
+            component.push('-');
+        }
+    }
+    component.truncate(component.trim_end_matches('-').len());
+    if component.is_empty() {
+        "unknown".to_string()
+    } else {
+        component
+    }
+}
+
 struct DownloadedArtifact {
     _directory: TempDir,
     binary: PathBuf,
@@ -4441,7 +4492,13 @@ impl ReleaseArtifactMetadata {
             .get(format!("{release_url}/SHA256SUMS"))
             .send()
             .and_then(Response::error_for_status)
-            .map_err(SshBootstrapError::Http)?;
+            .map_err(|error| {
+                if release_manifest_is_unavailable(error.status()) {
+                    SshBootstrapError::MissingReleaseManifest
+                } else {
+                    SshBootstrapError::Http(error)
+                }
+            })?;
         let manifest = read_response_bounded(manifest, MANIFEST_LIMIT)?;
         Ok(Self {
             digest: manifest_digest(&manifest, &filename)?,
@@ -4463,6 +4520,10 @@ impl ReleaseArtifactMetadata {
         }
         digest
     }
+}
+
+fn release_manifest_is_unavailable(status: Option<StatusCode>) -> bool {
+    status == Some(StatusCode::NOT_FOUND)
 }
 
 impl DownloadedArtifact {
@@ -5262,8 +5323,8 @@ pub(super) enum SshBootstrapError {
     PlatformProbeFailed,
     #[error("the remote platform probe returned an invalid response")]
     InvalidProbe,
-    #[error("the remote platform is not supported by an MVP Host artifact")]
-    UnsupportedPlatform,
+    #[error("the remote platform '{platform}' is not supported by an MVP Host artifact")]
+    UnsupportedPlatform { platform: String },
     #[error("{name} is not an absolute path for the detected remote platform")]
     DaemonPathOverrideNotAbsolute { name: &'static str, value: String },
     #[error("the release artifact request failed")]
@@ -5276,6 +5337,8 @@ pub(super) enum SshBootstrapError {
     ArchiveTooLarge,
     #[error("the release integrity manifest is invalid")]
     InvalidManifest,
+    #[error("the invoking CLI release does not publish an integrity manifest")]
+    MissingReleaseManifest,
     #[error("the release integrity manifest does not contain the selected artifact")]
     MissingIntegrityEntry,
     #[error("the selected release artifact failed SHA-256 verification")]
@@ -6894,6 +6957,40 @@ mod tests {
         ] {
             assert_eq!(RemoteTarget::parse_probe(protocol).unwrap(), target);
         }
+    }
+
+    #[test]
+    fn platform_protocol_preserves_unsupported_detected_platforms() {
+        for (protocol, expected_platform) in [
+            (
+                b"satelle-platform-v1\nLinux\nx86_64\nmusl libc 1.2.5\n".as_slice(),
+                "linux-x64-musl",
+            ),
+            (
+                b"satelle-platform-v1\nFreeBSD\nriscv64\n".as_slice(),
+                "freebsd-riscv64",
+            ),
+        ] {
+            let error = RemoteTarget::parse_probe(protocol)
+                .expect_err("the CLI release does not publish this Host artifact");
+
+            assert!(matches!(
+                error,
+                SshBootstrapError::UnsupportedPlatform { platform }
+                    if platform == expected_platform
+            ));
+        }
+    }
+
+    #[test]
+    fn only_a_missing_release_manifest_is_artifact_unavailability() {
+        assert!(release_manifest_is_unavailable(Some(
+            reqwest::StatusCode::NOT_FOUND
+        )));
+        assert!(!release_manifest_is_unavailable(Some(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        )));
+        assert!(!release_manifest_is_unavailable(None));
     }
 
     #[test]
