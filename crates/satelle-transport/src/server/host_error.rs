@@ -415,12 +415,12 @@ fn failure(error: &SatelleError) -> ApiFailure {
     };
 
     // Maintenance postcheck finalization can attach this one authenticated
-    // state bit to any terminal error kind. Merge only that validated bit
-    // after the normal error mapping so future postcheck failures cannot
-    // silently regress to an uncertain outcome, while all private details
-    // remain confined to the Host.
-    if let Some(serde_json::Value::Object(terminal_details)) =
-        validated_maintenance_postcheck_details(error)
+    // state bit to readiness and storage failures. Merge only that validated
+    // bit after normal mapping, while preserving the detail-free InternalError
+    // contract for Controller-local or otherwise unexposed Host errors.
+    if failure.code != ApiErrorCode::InternalError
+        && let Some(serde_json::Value::Object(terminal_details)) =
+            validated_maintenance_postcheck_details(error)
     {
         match &mut failure.details {
             Some(serde_json::Value::Object(details)) => details.extend(terminal_details),
@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_postcheck_terminal_detail_crosses_every_error_mapping() {
+    fn maintenance_postcheck_terminal_detail_crosses_readiness_and_storage_error_mappings() {
         for mut error in [
             SatelleError::computer_use_not_ready(),
             SatelleError::native_readiness_timeout(),
@@ -620,6 +620,30 @@ mod tests {
                 json!("PRIVATE_INVALID_TERMINAL"),
             );
             assert_eq!(failure(&error).details, None);
+        }
+    }
+
+    #[test]
+    fn maintenance_postcheck_terminal_detail_does_not_expand_internal_errors() {
+        for code in [ErrorCode::HostUpdatePostcheckFailed, ErrorCode::Interrupted] {
+            let error = SatelleError {
+                code,
+                message: "PRIVATE_MESSAGE_CANARY".to_string(),
+                recovery_command: None,
+                source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+                details: BTreeMap::from([
+                    ("maintenance_postcheck_terminal".to_string(), json!(true)),
+                    (
+                        "private_canary".to_string(),
+                        json!("PRIVATE_DETAILS_CANARY"),
+                    ),
+                ]),
+            };
+
+            let mapped = failure(&error);
+
+            assert_eq!(mapped.code, ApiErrorCode::InternalError);
+            assert_eq!(mapped.details, None);
         }
     }
 
