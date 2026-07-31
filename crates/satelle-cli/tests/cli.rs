@@ -6948,7 +6948,6 @@ fn future_cli_surfaces_parse_and_return_typed_not_implemented() {
             "--dry-run",
             "--json",
         ],
-        vec!["self", "update", "--dry-run", "--json"],
         vec![
             "support",
             "bundle",
