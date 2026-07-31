@@ -3832,6 +3832,12 @@ pub(crate) fn apply_host_update(
             source,
         ));
     }
+    // Cache deletion is the side effect. Record it before completing the
+    // ledger action so an uncertain completion response cannot hide it from
+    // recovery output.
+    report
+        .invalidated_caches
+        .push("native_computer_use".to_string());
     if let Err(source) = complete_persistent_action(
         &transport.alias,
         &new_client,
@@ -3848,9 +3854,6 @@ pub(crate) fn apply_host_update(
     report
         .applied_actions
         .push("invalidate-readiness-caches".to_string());
-    report
-        .invalidated_caches
-        .push("native_computer_use".to_string());
 
     // A replacement daemon serves authenticated capabilities only after it
     // opens the Host store and completes startup migrations. Those three

@@ -1937,6 +1937,9 @@ fn common_partial_failure_retains_the_operation_identity() {
         Vec::new(),
     );
     report.changed = true;
+    report
+        .invalidated_caches
+        .push("native_computer_use".to_string());
 
     let error = host_update_recovery_pending(
         &mut report,
@@ -1949,6 +1952,10 @@ fn common_partial_failure_retains_the_operation_identity() {
     assert_eq!(
         error.details.get("operation_id"),
         Some(&serde_json::json!(operation_id))
+    );
+    assert_eq!(
+        error.details.get("invalidated_caches"),
+        Some(&serde_json::json!(["native_computer_use"]))
     );
 }
 
