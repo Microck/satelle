@@ -1049,7 +1049,8 @@ fn preflight_setup_before_history(
         .mode
         .as_str()
         .to_string();
-    let trusted_consent = trusted_profile_allows_setup(resolved, &host.alias);
+    let trusted_consent =
+        trusted_profile_allows_mutation(resolved, &host.alias, MutationCommandFamily::Setup);
     let verification_checks = if command.verify {
         setup_verification_checks(
             doctor_provider_intent(resolved, &host.config, true, None)
@@ -2270,7 +2271,11 @@ fn ensure_exact_setup_verification_recovery(report: &mut SetupReport, host: &str
     }
 }
 
-fn trusted_profile_allows_setup(resolved: &ResolvedConfig, host_alias: &str) -> bool {
+fn trusted_profile_allows_mutation(
+    resolved: &ResolvedConfig,
+    host_alias: &str,
+    command_family: MutationCommandFamily,
+) -> bool {
     let Some(selected) = resolved.selected_profile.as_ref() else {
         return false;
     };
@@ -2285,10 +2290,7 @@ fn trusted_profile_allows_setup(resolved: &ResolvedConfig, host_alias: &str) -> 
         .trusted_profiles
         .get(&selected.name)
         .is_some_and(|trusted| {
-            trusted.hosts.contains(host_alias)
-                && trusted
-                    .command_families
-                    .contains(&MutationCommandFamily::Setup)
+            trusted.hosts.contains(host_alias) && trusted.command_families.contains(&command_family)
         })
 }
 
@@ -2567,7 +2569,8 @@ fn run_setup(
         && tailscale_serve::applies_to(&host.config);
     let host_setup_required = !host_setup_components.is_empty();
     let interactive_selection = !command.no_input && io::stdin().is_terminal();
-    let trusted_consent = trusted_profile_allows_setup(resolved, &host.alias);
+    let trusted_consent =
+        trusted_profile_allows_mutation(resolved, &host.alias, MutationCommandFamily::Setup);
     let mut provider_selection =
         resolve_provider_selection(resolved, &host, None, None, false, false)?;
     let provider_probe_required = if command.verify {
@@ -8062,6 +8065,11 @@ fn run_host_update(
         )));
     }
     let host = config.resolve_host(command.host.first().map(String::as_str))?;
+    let trusted_consent = trusted_profile_allows_mutation(
+        config.load()?,
+        &host.alias,
+        MutationCommandFamily::HostUpdate,
+    );
     let includes_all = command.component.iter().any(|component| component == "all");
     let components = command
         .component
@@ -8105,13 +8113,14 @@ fn run_host_update(
         print!("{}", host_update::render_host_update_plan(&report));
     }
     let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
-    if noninteractive && !command.yes {
+    let consent_granted = host_update_consent_granted(command.yes, trusted_consent);
+    if noninteractive && !consent_granted {
         return Err(failure(SatelleError::setup_consent_required(
             &report.planned_actions,
             host_update_consent_command(&host.alias, &command.component),
         )));
     }
-    if !command.yes {
+    if !consent_granted {
         let confirmed = cliclack::confirm(format!("Apply the Host update to '{}'?", host.alias))
             .initial_value(false)
             .interact()
@@ -8146,6 +8155,10 @@ fn run_host_update(
     }
 }
 
+const fn host_update_consent_granted(command_yes: bool, trusted_profile: bool) -> bool {
+    command_yes || trusted_profile
+}
+
 fn host_update_consent_command(host: &str, components: &[String]) -> String {
     let component_selection = components
         .iter()
@@ -8178,6 +8191,13 @@ fn validate_host_update_components(raw_components: &[String]) -> Result<(), Sate
 #[cfg(test)]
 mod host_update_consent_tests {
     use super::*;
+
+    #[test]
+    fn trusted_profile_consent_satisfies_both_host_update_confirmation_gates() {
+        assert!(host_update_consent_granted(false, true));
+        assert!(host_update_consent_granted(true, false));
+        assert!(!host_update_consent_granted(false, false));
+    }
 
     #[test]
     fn recovery_command_preserves_the_exact_component_selection() {
