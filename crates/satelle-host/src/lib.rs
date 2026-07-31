@@ -179,6 +179,7 @@ pub enum BootstrapMaintenancePlanKind {
     PersistentHostService,
     PersistentHostStop,
     PersistentHostRestart,
+    HostUpdate,
 }
 
 impl BootstrapMaintenancePlanKind {
@@ -188,6 +189,7 @@ impl BootstrapMaintenancePlanKind {
             Self::PersistentHostService => "persistent_host_service",
             Self::PersistentHostStop => "persistent_host_stop",
             Self::PersistentHostRestart => "persistent_host_restart",
+            Self::HostUpdate => "host_update",
         }
     }
 
@@ -197,6 +199,7 @@ impl BootstrapMaintenancePlanKind {
             "persistent_host_service" => Ok(Self::PersistentHostService),
             "persistent_host_stop" => Ok(Self::PersistentHostStop),
             "persistent_host_restart" => Ok(Self::PersistentHostRestart),
+            "host_update" => Ok(Self::HostUpdate),
             _ => Err(SatelleError::invalid_usage(
                 "invalid Bootstrap maintenance plan kind",
             )),
@@ -243,6 +246,29 @@ impl BootstrapMaintenancePlanKind {
                 "Restart the registered Host service",
                 true,
             )?],
+            Self::HostUpdate => vec![
+                SetupActionPlan::new(
+                    "install-host-artifact",
+                    "Install the verified Host artifact",
+                    true,
+                )?,
+                SetupActionPlan::new(
+                    "publish-host-service",
+                    "Publish the Host service definition",
+                    true,
+                )?,
+                SetupActionPlan::new("restart-host-daemon", "Restart the Host daemon", true)?,
+                SetupActionPlan::new(
+                    "invalidate-readiness-caches",
+                    "Invalidate readiness evidence affected by the update",
+                    true,
+                )?,
+                SetupActionPlan::new(
+                    "host-update-postcheck",
+                    "Verify Host health after the update",
+                    true,
+                )?,
+            ],
         };
         Ok(actions)
     }
@@ -251,6 +277,7 @@ impl BootstrapMaintenancePlanKind {
         match self {
             Self::PersistentHostStop => operation_kind == SetupOperationKind::ServiceStop,
             Self::PersistentHostRestart => operation_kind == SetupOperationKind::ServiceRestart,
+            Self::HostUpdate => operation_kind == SetupOperationKind::HostUpdate,
             Self::OnDemandHandoff | Self::PersistentHostService => !matches!(
                 operation_kind,
                 SetupOperationKind::ServiceStop | SetupOperationKind::ServiceRestart
@@ -268,18 +295,6 @@ impl BootstrapMaintenancePlanKind {
     }
 }
 
-fn persistent_service_action(action_id: &str) -> bool {
-    matches!(
-        action_id,
-        "bootstrap-handoff"
-            | "path-set-directories"
-            | "service-config"
-            | "service-registration"
-            | "service-start-or-restart"
-            | "service-stop"
-            | "service-restart"
-    )
-}
 #[cfg(any(test, feature = "test-support"))]
 use test_runtime::FakeComputerUseAdapter;
 #[cfg(feature = "test-support")]
@@ -369,18 +384,18 @@ mod bootstrap_maintenance_tests {
             };
             assert!(
                 service
-                    .start_bootstrap_service_action(operation_id, mismatched_action)
+                    .start_bootstrap_maintenance_action(operation_id, mismatched_action)
                     .is_err(),
                 "a lifecycle plan must reject the other lifecycle action"
             );
             service
-                .start_bootstrap_service_action(operation_id, expected_action)
+                .start_bootstrap_maintenance_action(operation_id, expected_action)
                 .expect("start exact lifecycle action");
             service
-                .complete_bootstrap_service_action(operation_id, expected_action)
+                .complete_bootstrap_maintenance_action(operation_id, expected_action)
                 .expect("complete exact lifecycle action");
             service
-                .finish_bootstrap_service_maintenance(operation_id)
+                .finish_bootstrap_maintenance_plan(operation_id)
                 .expect("finish lifecycle plan");
             let completed = service
                 .load_setup_run(operation_id)
@@ -428,6 +443,66 @@ mod bootstrap_maintenance_tests {
                 )
                 .is_err(),
             "service_restart must not admit the multi-action setup plan"
+        );
+    }
+
+    #[test]
+    fn host_update_plan_has_one_ordered_host_update_ledger() {
+        let state = TestStateDir::new().expect("create state directory");
+        let service =
+            HostService::local_demo_for_tests_at(state.path()).expect("create Host service");
+        let operation_id = "host-update-operation";
+
+        service
+            .acquire_bootstrap_maintenance_plan(
+                operation_id,
+                SetupOperationKind::HostUpdate,
+                BootstrapMaintenancePlanKind::HostUpdate,
+            )
+            .expect("acquire Host update maintenance");
+        let run = service
+            .load_setup_run(operation_id)
+            .expect("load Host update run")
+            .expect("Host update run exists");
+        assert_eq!(SetupOperationKind::HostUpdate, run.operation_kind());
+        assert_eq!(
+            run.actions()
+                .iter()
+                .map(SetupActionRecord::action_id)
+                .collect::<Vec<_>>(),
+            [
+                "install-host-artifact",
+                "publish-host-service",
+                "restart-host-daemon",
+                "invalidate-readiness-caches",
+                "host-update-postcheck",
+            ]
+        );
+
+        for action in run.actions() {
+            service
+                .skip_bootstrap_maintenance_action(operation_id, action.action_id())
+                .expect("skip an unneeded Host update action in order");
+        }
+        service
+            .finish_bootstrap_maintenance_plan(operation_id)
+            .expect("finish skipped Host update plan");
+        assert_eq!(
+            SetupRunStatus::Completed,
+            service
+                .load_setup_run(operation_id)
+                .expect("load completed Host update")
+                .expect("completed Host update exists")
+                .status()
+        );
+        assert!(
+            service
+                .acquire_bootstrap_maintenance_plan(
+                    "wrong-host-update-kind",
+                    SetupOperationKind::Repair,
+                    BootstrapMaintenancePlanKind::HostUpdate,
+                )
+                .is_err()
         );
     }
 
@@ -1371,16 +1446,11 @@ impl HostService {
         Ok(())
     }
 
-    pub fn start_bootstrap_service_action(
+    pub fn start_bootstrap_maintenance_action(
         &self,
         operation_id: &str,
         action_id: &str,
     ) -> Result<(), SatelleError> {
-        if !persistent_service_action(action_id) {
-            return Err(SatelleError::invalid_usage(
-                "invalid persistent Host service action",
-            ));
-        }
         let slot = self
             .bootstrap_maintenance
             .lock()
@@ -1393,16 +1463,11 @@ impl HostService {
             .start_setup_action(operation, action_id, time::OffsetDateTime::now_utc())
     }
 
-    pub fn complete_bootstrap_service_action(
+    pub fn complete_bootstrap_maintenance_action(
         &self,
         operation_id: &str,
         action_id: &str,
     ) -> Result<(), SatelleError> {
-        if !persistent_service_action(action_id) {
-            return Err(SatelleError::invalid_usage(
-                "invalid persistent Host service action",
-            ));
-        }
         let slot = self
             .bootstrap_maintenance
             .lock()
@@ -1419,17 +1484,33 @@ impl HostService {
             )
     }
 
-    pub fn fail_bootstrap_service_action(
+    pub fn skip_bootstrap_maintenance_action(
+        &self,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<(), SatelleError> {
+        let slot = self
+            .bootstrap_maintenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let operation = slot.as_ref().ok_or_else(SatelleError::state_conflict)?;
+        if operation.operation_id() != operation_id {
+            return Err(SatelleError::state_conflict());
+        }
+        self.runtime.skip_setup_action(
+            operation,
+            action_id,
+            SetupActionSkipReason::NotRequired,
+            time::OffsetDateTime::now_utc(),
+        )
+    }
+
+    pub fn fail_bootstrap_maintenance_action(
         &self,
         operation_id: &str,
         action_id: &str,
         failure_kind: &str,
     ) -> Result<(), SatelleError> {
-        if !persistent_service_action(action_id) {
-            return Err(SatelleError::invalid_usage(
-                "invalid persistent Host service action",
-            ));
-        }
         let (error_code, recovery_hint) = match failure_kind {
             "remote_command_failed" => (
                 "remote_command_failed",
@@ -1446,6 +1527,10 @@ impl HostService {
             "listener_still_reachable" => (
                 "listener_still_reachable",
                 "inspect the user service and loopback listener, then retry the Host stop",
+            ),
+            "host_update_postcheck_failed" => (
+                "host_update_postcheck_failed",
+                "run satelle doctor, then retry satelle host update",
             ),
             _ => {
                 return Err(SatelleError::invalid_usage(
@@ -1492,7 +1577,7 @@ impl HostService {
         Ok(())
     }
 
-    pub fn finish_bootstrap_service_maintenance(
+    pub fn finish_bootstrap_maintenance_plan(
         &self,
         operation_id: &str,
     ) -> Result<(), SatelleError> {
@@ -1508,6 +1593,26 @@ impl HostService {
             .finish_setup_run(operation, time::OffsetDateTime::now_utc())?;
         *slot = None;
         Ok(())
+    }
+
+    pub fn run_bootstrap_maintenance_postcheck(
+        &self,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        let mut slot = self
+            .bootstrap_maintenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let operation = slot.as_mut().ok_or_else(SatelleError::state_conflict)?;
+        if operation.operation_id() != operation_id {
+            return Err(SatelleError::state_conflict());
+        }
+        let result = self
+            .runtime
+            .run_default_maintenance_postcheck(operation, action_id);
+        *slot = None;
+        result
     }
 
     pub fn complete_bootstrap_maintenance(&self, operation_id: &str) -> Result<(), SatelleError> {

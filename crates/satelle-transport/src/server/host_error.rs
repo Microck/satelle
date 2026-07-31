@@ -366,6 +366,8 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::HostArtifactUnavailable
         | ErrorCode::HostUpdateRequiresCliUpgrade
         | ErrorCode::AmbiguousCodexComponentOwnership
+        | ErrorCode::HostUpdatePartiallyApplied
+        | ErrorCode::HostUpdatePostcheckFailed
         // Process interruption is a Controller-local process-exit contract.
         // If it crosses the Host boundary, expose no extra API surface.
         | ErrorCode::Interrupted

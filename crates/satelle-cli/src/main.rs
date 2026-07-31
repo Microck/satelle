@@ -582,6 +582,11 @@ struct HostUpdateCommand {
     yes: bool,
     #[arg(long)]
     no_input: bool,
+    #[arg(
+        long,
+        help = "Suppress non-error human plan and progress output; use --json for stable automation data"
+    )]
+    quiet: bool,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -8068,37 +8073,82 @@ fn run_host_update(
             _ => unreachable!("validated update component"),
         })
         .collect::<Vec<_>>();
-    let report = transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
+    let mut report =
+        transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
     if command.dry_run {
+        report = report.into_dry_run();
         if format.is_json() {
             print_json(&report).map_err(failure)?;
-        } else {
+        } else if !command.quiet {
             print!("{}", host_update::render_host_update_plan(&report));
         }
         return Ok(());
     }
-
-    // A current plan is already the complete result. The packet-15 executor is
-    // needed only when this plan contains a remote mutation.
     if !report.confirmation_required {
         if format.is_json() {
             print_json(&report).map_err(failure)?;
-        } else {
-            print!("{}", host_update::render_host_update_plan(&report));
+        } else if !command.quiet {
+            if report.status == satelle_core::host_update::HostUpdateStatus::UpToDate {
+                println!("Host update status for {}: up to date", report.host);
+            } else {
+                print!("{}", host_update::render_host_update_plan(&report));
+            }
         }
         return Ok(());
     }
-
-    // Until packet 15 supplies the mutation executor, JSON mode must return
-    // one typed error object rather than mixing a plan on stdout with an error
-    // on stderr. The read-only plan remains available through --dry-run.
-    if !format.is_json() {
+    if !format.is_json() && !command.quiet {
         print!("{}", host_update::render_host_update_plan(&report));
     }
-    Err(failure(SatelleError::not_implemented(concat!(
-        "Host update apply belongs to the packet 15 train. The complete plan above was ",
-        "read-only; no Host state or Satelle sessions were changed."
-    ))))
+    let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
+    if noninteractive && !command.yes {
+        return Err(failure(SatelleError::setup_consent_required(
+            &report.planned_actions,
+            format!(
+                "satelle host update --host {} --no-input --yes --json",
+                host.alias
+            ),
+        )));
+    }
+    if !command.yes {
+        let confirmed = cliclack::confirm(format!("Apply the Host update to '{}'?", host.alias))
+            .initial_value(false)
+            .interact()
+            .map_err(|source| {
+                failure(setup_interaction_error(
+                    "could not read Host update confirmation",
+                    source,
+                ))
+            })?;
+        if !confirmed {
+            if !command.quiet {
+                println!("No changes applied.");
+            }
+            return Ok(());
+        }
+    }
+
+    // Rebuild the same in-memory contract immediately before the first
+    // mutation. Any identity, version, target, artifact, or restart drift
+    // invalidates consent instead of silently changing the accepted plan.
+    let revalidated =
+        transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
+    if revalidated != report {
+        return Err(failure(SatelleError::state_conflict()));
+    }
+    report = transport::apply_host_update(&host, revalidated).map_err(failure)?;
+    if format.is_json() {
+        print_json(&report).map_err(failure)
+    } else if command.quiet {
+        println!(
+            "Updated Host '{}': {} actions applied.",
+            report.host,
+            report.applied_actions.len()
+        );
+        Ok(())
+    } else {
+        print!("{}", host_update::render_host_update_result(&report));
+        Ok(())
+    }
 }
 
 fn validate_host_update_components(raw_components: &[String]) -> Result<(), SatelleError> {

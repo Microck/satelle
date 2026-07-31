@@ -38,6 +38,13 @@ use zeroize::Zeroizing;
 const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const HOST_UPDATE_ACTIONS: [&str; 5] = [
+    "install-host-artifact",
+    "publish-host-service",
+    "restart-host-daemon",
+    "invalidate-readiness-caches",
+    "host-update-postcheck",
+];
 type InterruptFuture<'a> = Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send + 'a>>;
 
 trait InterruptSource: Send + Sync {
@@ -3137,6 +3144,10 @@ fn inspect_host_maintenance(
             } else {
                 None
             };
+            let host_automation_is_safe = host.config.setup_mode
+                == Some(satelle_core::SetupMode::Persistent)
+                && target.service_platform() != DaemonServicePlatform::Linux
+                && service_inspection.is_some();
             Ok(HostMaintenanceInspection {
                 current_version: current.current_version,
                 minimum_host_version: current.minimum_host_version,
@@ -3146,7 +3157,7 @@ fn inspect_host_maintenance(
                 artifact,
                 service_inspection,
                 codex_evidence: current.codex_update_evidence,
-                host_automation_is_safe: true,
+                host_automation_is_safe,
             })
         }
     }
@@ -3212,6 +3223,7 @@ pub(crate) fn plan_host_update(
         HostMaintenancePlanKind::CodexOnly
     };
     let inspection = inspect_host_maintenance(host, kind)?;
+    let host_automation_is_safe = inspection.host_automation_is_safe;
     let service_inspection = inspection.service_inspection;
 
     let host_inspection = crate::host_update::HostUpdateInspection {
@@ -3227,7 +3239,7 @@ pub(crate) fn plan_host_update(
             crate::host_update::unavailable_codex_inspections(&HostService::required_codex_version())
         }
     };
-    crate::host_update::build_host_update_plan(
+    let mut report = crate::host_update::build_host_update_plan(
         crate::host_update::HostUpdatePlanRequest {
             host: &host.alias,
             cli_version,
@@ -3239,7 +3251,724 @@ pub(crate) fn plan_host_update(
         },
         &HostUpdateArtifactResolver(inspection.artifact),
     )
-    .map_err(map_host_update_plan_error)
+    .map_err(map_host_update_plan_error)?;
+    if !host_automation_is_safe {
+        for target in &mut report.targets {
+            if matches!(
+                target.target,
+                satelle_core::host_update::HostUpdateTarget::HostDaemon
+                    | satelle_core::host_update::HostUpdateTarget::HostDaemonService
+            ) && target.requires_mutation()
+            {
+                target.disposition = satelle_core::host_update::HostUpdateDisposition::Skipped;
+            }
+        }
+        report = satelle_core::host_update::HostUpdateReport::new(
+            report.host,
+            report.checked_components,
+            report.targets,
+        );
+    }
+    Ok(report)
+}
+
+pub(crate) fn apply_host_update(
+    host: &SelectedHost,
+    mut report: satelle_core::host_update::HostUpdateReport,
+) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
+    use satelle_core::host_update::{HostUpdatePostcheck, HostUpdateTarget};
+
+    if host.config.transport != TransportKind::Ssh || !report.confirmation_required {
+        return Err(SatelleError::invalid_usage(
+            "the selected Host update has no supported automatic SSH mutation plan",
+        ));
+    }
+
+    let expected_artifact_path = report
+        .targets
+        .iter()
+        .find_map(|target| {
+            target
+                .remote_mutations
+                .iter()
+                .find(|mutation| mutation.operation == "install-host-artifact")
+                .and_then(|mutation| {
+                    mutation
+                        .remote_path
+                        .clone()
+                        .zip(target.artifact_digest.clone())
+                })
+        })
+        .ok_or_else(|| {
+            SatelleError::invalid_usage(
+                "the Host update plan lacks an exact verified artifact destination",
+            )
+        })?;
+    let (expected_artifact_path, expected_artifact_digest) = expected_artifact_path;
+    let publish_service = report.targets.iter().any(|target| {
+        target.target == HostUpdateTarget::HostDaemonService && target.requires_mutation()
+    });
+    if !publish_service {
+        return Err(SatelleError::invalid_usage(
+            "the persistent Host update plan lacks a managed service asset",
+        ));
+    }
+
+    let transport = SshSetupTransport::new(host)?;
+    if transport.requires_first_trust {
+        return Err(SatelleError::ssh_host_key_verification_required(
+            &transport.alias,
+        ));
+    }
+    let target = transport.remote_target()?;
+    let directories = transport.remote_directories(target)?;
+    let (old_tunnel, old_client) = transport.durable_service_client()?;
+    let old_capabilities = old_client
+        .capabilities()
+        .map_err(|error| direct_transport_error(&transport.alias, error))?;
+    if old_capabilities.host_identity() != transport.binding.expected_host_identity().as_str() {
+        return Err(SatelleError::host_identity_mismatch(&transport.alias));
+    }
+
+    let operation_id = format!("host-update-{}", Uuid::now_v7());
+    let begin = old_client
+        .begin_host_update_maintenance(&operation_id)
+        .map_err(|error| direct_transport_error(&transport.alias, error))?;
+    validate_persistent_maintenance_response(
+        &transport.alias,
+        &operation_id,
+        begin.reconciled(),
+        begin.operation_id(),
+    )?;
+
+    let mut bootstrap_lock = match acquire_bootstrap_lock_for_operation(
+        &transport.alias,
+        transport.binding.destination(),
+        operation_id.clone(),
+        bootstrap_lock::OperationKind::HostBinaryReplacement,
+    ) {
+        Ok(lock) => lock,
+        Err(error) => {
+            finish_unmodified_host_update(&old_client, &operation_id);
+            return Err(error);
+        }
+    };
+    if let Err(error) = confirm_bootstrap_lock(&transport.alias, &mut bootstrap_lock) {
+        finish_unmodified_host_update(&old_client, &operation_id);
+        let _ = bootstrap_lock.release_unmodified();
+        return Err(error);
+    }
+
+    // The reachable daemon owns Maintenance before this read-only service
+    // preflight. Bootstrap Lock prevents any other installer from changing
+    // the observed service definition before the first update mutation.
+    let daemon_path_overrides = match (|| {
+        let remote = ssh_bootstrap::PersistentServiceRemote::new(
+            transport.binding.destination(),
+            target,
+            &directories,
+            &mut bootstrap_lock,
+        )?;
+        remote.observe_canonical_daemon_path_overrides(
+            transport.binding.expected_host_identity().as_str(),
+        )
+    })() {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            finish_locked_unmodified_host_update(
+                &transport.alias,
+                &old_client,
+                &mut bootstrap_lock,
+            );
+            return Err(map_ssh_daemon_bootstrap_error(&transport.alias, error));
+        }
+    };
+
+    start_persistent_action(
+        &transport.alias,
+        &old_client,
+        &mut bootstrap_lock,
+        "install-host-artifact",
+    )?;
+    let artifact = {
+        let remote = ssh_bootstrap::PersistentServiceRemote::new(
+            transport.binding.destination(),
+            target,
+            &directories,
+            &mut bootstrap_lock,
+        );
+        let mut remote = match remote {
+            Ok(remote) => remote,
+            Err(error) => {
+                let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+                return Err(fail_host_update_action(
+                    &transport.alias,
+                    &old_client,
+                    &mut bootstrap_lock,
+                    &mut report,
+                    "install-host-artifact",
+                    source,
+                ));
+            }
+        };
+        match remote.install_verified_host_artifact(&expected_artifact_digest) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+                return Err(fail_host_update_action(
+                    &transport.alias,
+                    &old_client,
+                    &mut bootstrap_lock,
+                    &mut report,
+                    "install-host-artifact",
+                    source,
+                ));
+            }
+        }
+    };
+    // The verified artifact publication changed remote state even if the
+    // following fence commit cannot be confirmed.
+    report.changed = true;
+    if let Err(source) = commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "install-host-artifact",
+            source,
+        ));
+    }
+    if artifact.remote_path() != expected_artifact_path {
+        let source = SatelleError::state_conflict();
+        return Err(fail_host_update_action(
+            &transport.alias,
+            &old_client,
+            &mut bootstrap_lock,
+            &mut report,
+            "install-host-artifact",
+            source,
+        ));
+    }
+    let service_remote = ssh_bootstrap::PersistentServiceRemote::new(
+        transport.binding.destination(),
+        target,
+        &directories,
+        &mut bootstrap_lock,
+    );
+    let service_remote = match service_remote {
+        Ok(remote) => remote,
+        Err(error) => {
+            let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+            return Err(fail_host_update_action(
+                &transport.alias,
+                &old_client,
+                &mut bootstrap_lock,
+                &mut report,
+                "install-host-artifact",
+                source,
+            ));
+        }
+    };
+    let service = match transport.prepare_persistent_service(
+        target,
+        &artifact,
+        &daemon_path_overrides,
+        &service_remote,
+    ) {
+        Ok(service) => service,
+        Err(source) => {
+            return Err(fail_host_update_action(
+                &transport.alias,
+                &old_client,
+                &mut bootstrap_lock,
+                &mut report,
+                "install-host-artifact",
+                source,
+            ));
+        }
+    };
+    if let Err(source) = complete_persistent_action(
+        &transport.alias,
+        &old_client,
+        &mut bootstrap_lock,
+        "install-host-artifact",
+    ) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "install-host-artifact",
+            source,
+        ));
+    }
+    report
+        .applied_actions
+        .push("install-host-artifact".to_string());
+
+    if let Err(source) = start_persistent_action(
+        &transport.alias,
+        &old_client,
+        &mut bootstrap_lock,
+        "publish-host-service",
+    ) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "publish-host-service",
+            source,
+        ));
+    }
+    let publish_result = {
+        let remote = ssh_bootstrap::PersistentServiceRemote::new(
+            transport.binding.destination(),
+            target,
+            &directories,
+            &mut bootstrap_lock,
+        );
+        let mut remote = match remote {
+            Ok(remote) => remote,
+            Err(error) => {
+                let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+                return Err(fail_host_update_action(
+                    &transport.alias,
+                    &old_client,
+                    &mut bootstrap_lock,
+                    &mut report,
+                    "publish-host-service",
+                    source,
+                ));
+            }
+        };
+        match &service {
+            PreparedPersistentService::Windows { task, config } => {
+                remote.publish_windows_service_config(task, config)
+            }
+            PreparedPersistentService::Launchd(definition) => {
+                remote.publish_launchd_definition(definition)
+            }
+        }
+    };
+    if let Err(error) = publish_result {
+        let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+        return Err(fail_host_update_action(
+            &transport.alias,
+            &old_client,
+            &mut bootstrap_lock,
+            &mut report,
+            "publish-host-service",
+            source,
+        ));
+    }
+    if let Err(source) = commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "publish-host-service",
+            source,
+        ));
+    }
+    let register_result = {
+        let remote = ssh_bootstrap::PersistentServiceRemote::new(
+            transport.binding.destination(),
+            target,
+            &directories,
+            &mut bootstrap_lock,
+        );
+        let mut remote = match remote {
+            Ok(remote) => remote,
+            Err(error) => {
+                let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+                return Err(fail_host_update_action(
+                    &transport.alias,
+                    &old_client,
+                    &mut bootstrap_lock,
+                    &mut report,
+                    "publish-host-service",
+                    source,
+                ));
+            }
+        };
+        match &service {
+            PreparedPersistentService::Windows { task, .. } => remote.register_windows_task(task),
+            PreparedPersistentService::Launchd(definition) => remote.register_launchd(definition),
+        }
+    };
+    if let Err(error) = register_result {
+        let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+        return Err(fail_host_update_action(
+            &transport.alias,
+            &old_client,
+            &mut bootstrap_lock,
+            &mut report,
+            "publish-host-service",
+            source,
+        ));
+    }
+    if let Err(source) = commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "publish-host-service",
+            source,
+        ));
+    }
+    if let Err(source) = complete_persistent_action(
+        &transport.alias,
+        &old_client,
+        &mut bootstrap_lock,
+        "publish-host-service",
+    ) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "publish-host-service",
+            source,
+        ));
+    }
+    report
+        .applied_actions
+        .push("publish-host-service".to_string());
+
+    if let Err(source) = start_persistent_action(
+        &transport.alias,
+        &old_client,
+        &mut bootstrap_lock,
+        "restart-host-daemon",
+    ) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "restart-host-daemon",
+            source,
+        ));
+    }
+    let restart_result = {
+        let remote = ssh_bootstrap::PersistentServiceRemote::new(
+            transport.binding.destination(),
+            target,
+            &directories,
+            &mut bootstrap_lock,
+        );
+        let mut remote = match remote {
+            Ok(remote) => remote,
+            Err(error) => {
+                let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+                return Err(fail_host_update_action(
+                    &transport.alias,
+                    &old_client,
+                    &mut bootstrap_lock,
+                    &mut report,
+                    "restart-host-daemon",
+                    source,
+                ));
+            }
+        };
+        match &service {
+            PreparedPersistentService::Windows { task, .. } => remote.restart_windows_task(task),
+            PreparedPersistentService::Launchd(_) => remote.restart_launchd(),
+        }
+    };
+    if let Err(error) = restart_result {
+        let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
+        return Err(fail_host_update_action(
+            &transport.alias,
+            &old_client,
+            &mut bootstrap_lock,
+            &mut report,
+            "restart-host-daemon",
+            source,
+        ));
+    }
+    if let Err(source) = commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "restart-host-daemon",
+            source,
+        ));
+    }
+    drop(old_client);
+    drop(old_tunnel);
+
+    let (new_tunnel, new_client) = match transport.durable_service_client() {
+        Ok(connection) => connection,
+        Err(source) => {
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "restart-host-daemon",
+                source,
+            ));
+        }
+    };
+    let new_capabilities =
+        match wait_for_durable_daemon(&transport.alias, || new_client.capabilities()) {
+            Ok(capabilities) => capabilities,
+            Err(source) => {
+                return Err(host_update_recovery_pending(
+                    &mut report,
+                    "restart-host-daemon",
+                    source,
+                ));
+            }
+        };
+    if new_capabilities.host_identity() != transport.binding.expected_host_identity().as_str() {
+        let source = SatelleError::host_identity_mismatch(&transport.alias);
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "restart-host-daemon",
+            source,
+        ));
+    }
+    if new_capabilities.daemon_version() != env!("CARGO_PKG_VERSION") {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "restart-host-daemon",
+            SatelleError::state_conflict(),
+        ));
+    }
+    let adopted = match new_client.begin_host_update_maintenance(&operation_id) {
+        Ok(adopted) => adopted,
+        Err(error) => {
+            let source = direct_transport_error(&transport.alias, error);
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "restart-host-daemon",
+                source,
+            ));
+        }
+    };
+    if let Err(source) = validate_persistent_maintenance_response(
+        &transport.alias,
+        &operation_id,
+        adopted.reconciled(),
+        adopted.operation_id(),
+    ) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "restart-host-daemon",
+            source,
+        ));
+    }
+    if let Err(source) = complete_persistent_action(
+        &transport.alias,
+        &new_client,
+        &mut bootstrap_lock,
+        "restart-host-daemon",
+    ) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "restart-host-daemon",
+            source,
+        ));
+    }
+    report
+        .applied_actions
+        .push("restart-host-daemon".to_string());
+
+    if let Err(source) = start_persistent_action(
+        &transport.alias,
+        &new_client,
+        &mut bootstrap_lock,
+        "invalidate-readiness-caches",
+    ) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "invalidate-readiness-caches",
+            source,
+        ));
+    }
+    let invalidation = match satelle_transport::NativeReadinessInvalidationRequest::new(
+        None, None, false, false, false,
+    ) {
+        Ok(invalidation) => invalidation,
+        Err(error) => {
+            let source = SatelleError::invalid_usage(error);
+            return Err(fail_host_update_action(
+                &transport.alias,
+                &new_client,
+                &mut bootstrap_lock,
+                &mut report,
+                "invalidate-readiness-caches",
+                source,
+            ));
+        }
+    };
+    if let Err(error) = new_client.invalidate_native_readiness(&invalidation, &operation_id) {
+        let source = direct_transport_error(&transport.alias, error);
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "invalidate-readiness-caches",
+            source,
+        ));
+    }
+    if let Err(source) = complete_persistent_action(
+        &transport.alias,
+        &new_client,
+        &mut bootstrap_lock,
+        "invalidate-readiness-caches",
+    ) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "invalidate-readiness-caches",
+            source,
+        ));
+    }
+    report
+        .applied_actions
+        .push("invalidate-readiness-caches".to_string());
+    report
+        .invalidated_caches
+        .push("native_computer_use".to_string());
+
+    // A replacement daemon serves authenticated capabilities only after it
+    // opens the Host store and completes startup migrations. Those three
+    // postconditions are therefore proven before the native readiness probe.
+    for (check_id, summary) in [
+        ("host-api-reachable", "Authenticated Host API is reachable"),
+        (
+            "host-version-aligned",
+            "Host version matches the invoking CLI",
+        ),
+        (
+            "storage-migrations-current",
+            "Host storage opened with current migrations",
+        ),
+    ] {
+        report = report.with_postcheck(HostUpdatePostcheck::passed(check_id, summary));
+    }
+    if let Err(source) = start_persistent_action(
+        &transport.alias,
+        &new_client,
+        &mut bootstrap_lock,
+        "host-update-postcheck",
+    ) {
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "host-update-postcheck",
+            source,
+        ));
+    }
+    let postcheck = new_client.run_maintenance_postcheck(&operation_id, "host-update-postcheck");
+    if let Err(error) = postcheck {
+        if let Err(source) = record_persistent_action_failure(
+            &transport.alias,
+            &new_client,
+            &mut bootstrap_lock,
+            "host-update-postcheck",
+            "host_update_postcheck_failed",
+        )
+        .and_then(|()| {
+            finish_persistent_maintenance(&transport.alias, &new_client, &mut bootstrap_lock)
+        }) {
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "host-update-postcheck",
+                source,
+            ));
+        }
+        if bootstrap_lock.release_committed_handoff().is_err() {
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "host-update-postcheck",
+                SatelleError::host_unreachable(&transport.alias),
+            ));
+        }
+        drop(new_client);
+        drop(new_tunnel);
+        report = report.with_postcheck(HostUpdatePostcheck::failed(
+            "native-computer-use-ready",
+            "Native Computer Use readiness smoke test failed",
+        ));
+        report.preserved_state =
+            Some("completed Host update actions and the replacement daemon were preserved".into());
+        report.recovery_command = Some(format!(
+            "satelle doctor --host {} --scope computer-use --refresh --json",
+            report.host
+        ));
+        report.status = satelle_core::host_update::HostUpdateStatus::PostcheckFailed;
+        return Err(SatelleError::host_update_postcheck_failed(
+            &report,
+            error.to_string(),
+        ));
+    }
+    if bootstrap_lock.release_committed_handoff().is_err() {
+        let source = SatelleError::host_unreachable(&transport.alias);
+        return Err(host_update_recovery_pending(
+            &mut report,
+            "host-update-postcheck",
+            source,
+        ));
+    }
+    drop(new_client);
+    drop(new_tunnel);
+
+    report
+        .applied_actions
+        .push("host-update-postcheck".to_string());
+    report = report.with_postcheck(HostUpdatePostcheck::passed(
+        "native-computer-use-ready",
+        "Native Computer Use readiness smoke test passed",
+    ));
+    Ok(report.finish_postchecks())
+}
+
+fn finish_unmodified_host_update(client: &DaemonClient, operation_id: &str) {
+    for action_id in HOST_UPDATE_ACTIONS {
+        if client
+            .skip_maintenance_action(operation_id, action_id)
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = client.finish_maintenance_plan(operation_id);
+}
+
+fn finish_locked_unmodified_host_update(
+    host: &str,
+    client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+) {
+    for action_id in HOST_UPDATE_ACTIONS {
+        if skip_maintenance_action(host, client, bootstrap_lock, action_id).is_err() {
+            return;
+        }
+    }
+    if finish_persistent_maintenance(host, client, bootstrap_lock).is_err() {
+        return;
+    }
+    let _ = bootstrap_lock.release_committed_handoff();
+}
+
+fn fail_host_update_action(
+    host: &str,
+    client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    report: &mut satelle_core::host_update::HostUpdateReport,
+    action_id: &str,
+    source: SatelleError,
+) -> SatelleError {
+    let _ = record_persistent_action_failure(
+        host,
+        client,
+        bootstrap_lock,
+        action_id,
+        "remote_command_failed",
+    )
+    .and_then(|()| finish_persistent_maintenance(host, client, bootstrap_lock))
+    .and_then(|()| {
+        bootstrap_lock
+            .release_committed_handoff()
+            .map_err(|_| SatelleError::host_unreachable(host))
+    });
+    host_update_recovery_pending(report, action_id, source)
+}
+
+fn host_update_recovery_pending(
+    report: &mut satelle_core::host_update::HostUpdateReport,
+    action_id: &str,
+    source: SatelleError,
+) -> SatelleError {
+    if !report.changed {
+        return source;
+    }
+    report.status = satelle_core::host_update::HostUpdateStatus::PartialFailure;
+    report.preserved_state = Some("completed Host update actions were preserved".to_string());
+    report.recovery_command = Some(format!(
+        "satelle repair --host {} --no-input --yes",
+        report.host
+    ));
+    SatelleError::host_update_partially_applied(report, action_id, source.to_string())
 }
 
 pub(crate) fn plan_repair_upgrades(
@@ -3422,6 +4151,7 @@ fn verified_host_update_artifact_from_metadata(
     Ok(crate::host_update::VerifiedHostArtifact {
         version: env!("CARGO_PKG_VERSION").to_string(),
         remote_platform: target.id().to_string(),
+        digest: metadata.digest_hex(),
         daemon_destination: install_path,
     })
 }
@@ -3775,7 +4505,7 @@ fn start_persistent_action(
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let response = reconcile_bootstrap_maintenance_response(
         host,
-        client.start_persistent_service_action(&operation_id, action_id),
+        client.start_maintenance_action(&operation_id, action_id),
         bootstrap_lock,
     )?;
     validate_persistent_maintenance_response(
@@ -3799,7 +4529,31 @@ fn complete_persistent_action(
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let response = reconcile_bootstrap_maintenance_response(
         host,
-        client.complete_persistent_service_action(&operation_id, action_id),
+        client.complete_maintenance_action(&operation_id, action_id),
+        bootstrap_lock,
+    )?;
+    validate_persistent_maintenance_response(
+        host,
+        &operation_id,
+        response.reconciled(),
+        response.operation_id(),
+    )?;
+    commit_verified_bootstrap_mutation(host, bootstrap_lock)
+}
+
+fn skip_maintenance_action(
+    host: &str,
+    client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    action_id: &str,
+) -> Result<(), SatelleError> {
+    let operation_id = bootstrap_lock.operation_id().to_string();
+    bootstrap_lock
+        .mark_mutation_started("persistent_action_skip")
+        .map_err(|_| SatelleError::host_unreachable(host))?;
+    let response = reconcile_bootstrap_maintenance_response(
+        host,
+        client.skip_maintenance_action(&operation_id, action_id),
         bootstrap_lock,
     )?;
     validate_persistent_maintenance_response(
@@ -3822,7 +4576,7 @@ fn finish_persistent_maintenance(
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let response = reconcile_bootstrap_maintenance_response(
         host,
-        client.finish_persistent_service_maintenance(&operation_id),
+        client.finish_maintenance_plan(&operation_id),
         bootstrap_lock,
     )?;
     validate_persistent_maintenance_response(
@@ -3863,7 +4617,7 @@ fn record_persistent_action_failure(
         .mark_mutation_started("persistent_action_fail")
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let response = client
-        .fail_persistent_service_action(&operation_id, action_id, failure_kind)
+        .fail_maintenance_action(&operation_id, action_id, failure_kind)
         .map_err(|error| direct_transport_error(host, error))?;
     validate_persistent_maintenance_response(
         host,

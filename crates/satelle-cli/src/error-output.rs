@@ -140,6 +140,58 @@ fn human_error(error: &SatelleError) -> String {
     if error.details.get("mutated") == Some(&Value::Bool(false)) {
         lines.push("state: No changes were applied.".to_string());
     }
+    if matches!(
+        error.code,
+        ErrorCode::HostUpdatePartiallyApplied | ErrorCode::HostUpdatePostcheckFailed
+    ) {
+        let actions_key = if error.code == ErrorCode::HostUpdatePostcheckFailed {
+            "applied_actions"
+        } else {
+            "completed_actions"
+        };
+        if let Some(actions) = error.details.get(actions_key).and_then(Value::as_array) {
+            let actions = actions
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("applied: {actions}"));
+        }
+        if let Some(postchecks) = error
+            .details
+            .get("postcheck_results")
+            .and_then(Value::as_array)
+        {
+            for failed in postchecks.iter().filter(|postcheck| {
+                postcheck.get("status").and_then(Value::as_str) == Some("failed")
+            }) {
+                let check_id = failed
+                    .get("check_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let summary = failed
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("readiness failed");
+                lines.push(format!("failed check: {check_id} ({summary})"));
+            }
+        }
+        if let Some(caches) = error
+            .details
+            .get("invalidated_caches")
+            .and_then(Value::as_array)
+        {
+            let caches = caches
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("invalidated caches: {caches}"));
+        }
+        if let Some(preserved) = error.details.get("preserved_state").and_then(Value::as_str) {
+            lines.push(format!("state: {preserved}"));
+        }
+    }
     lines.push(format!("next: {recovery}"));
     lines.join("\n")
 }
@@ -259,6 +311,18 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             retryable: true,
             outcome: "The remote operation did not complete.",
             default_recovery: "check the Host status and retry the command",
+        },
+        ErrorCode::HostUpdatePartiallyApplied => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: false,
+            outcome: "The Host update stopped after changing remote state.",
+            default_recovery: "run satelle repair for the selected Host",
+        },
+        ErrorCode::HostUpdatePostcheckFailed => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: false,
+            outcome: "The Host update changed remote state but readiness failed.",
+            default_recovery: "run satelle doctor for the selected Host",
         },
         ErrorCode::SshHostKeyVerificationRequired => ErrorContract {
             category: ErrorCategory::RemoteExecution,
@@ -455,6 +519,54 @@ mod tests {
         let error = SatelleError::invalid_usage("path 'two  spaces\tand a tab' is invalid");
 
         assert!(human_error(&error).contains("path 'two  spaces\tand a tab' is invalid"));
+    }
+
+    #[test]
+    fn host_update_postcheck_error_lists_preserved_remote_evidence() {
+        let error = SatelleError {
+            code: ErrorCode::HostUpdatePostcheckFailed,
+            message: "post-update readiness failed".to_string(),
+            recovery_command: Some(
+                "satelle doctor --host remote --scope computer-use --refresh --json".to_string(),
+            ),
+            source_detail: Some("private probe diagnostic".to_string()),
+            details: BTreeMap::from([
+                (
+                    "applied_actions".to_string(),
+                    json!(["install-host-artifact"]),
+                ),
+                (
+                    "postcheck_results".to_string(),
+                    json!([{
+                        "check_id": "native-computer-use-ready",
+                        "status": "failed",
+                        "summary": "Native Computer Use readiness failed"
+                    }]),
+                ),
+                (
+                    "invalidated_caches".to_string(),
+                    json!(["native_computer_use"]),
+                ),
+                (
+                    "preserved_state".to_string(),
+                    json!("the replacement Host daemon was preserved"),
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            human_error(&error),
+            [
+                "error: The Host update changed remote state but readiness failed.",
+                "cause: post-update readiness failed [host-update-postcheck-failed]",
+                "applied: install-host-artifact",
+                "failed check: native-computer-use-ready (Native Computer Use readiness failed)",
+                "invalidated caches: native_computer_use",
+                "state: the replacement Host daemon was preserved",
+                "next: satelle doctor --host remote --scope computer-use --refresh --json",
+            ]
+            .join("\n")
+        );
     }
 
     #[test]
