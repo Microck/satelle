@@ -1830,7 +1830,16 @@ fn production_codex_update_evidence(
         .iter()
         .any(|blocker| blocker.reason == BlockerReason::UnsupportedHostPlatform);
     let runtime_compatibility_reason = (!unsupported_host_platform)
-        .then(|| runtime_compatibility_reason(snapshot))
+        .then(|| {
+            runtime_compatibility_reason(
+                snapshot.evidence.codex_version,
+                snapshot
+                    .verdict
+                    .blockers()
+                    .iter()
+                    .map(|blocker| blocker.reason),
+            )
+        })
         .flatten();
     let native_execution_path_unavailable = snapshot
         .verdict
@@ -1877,25 +1886,34 @@ fn production_codex_runtime(snapshot: &ProductionCapabilitySnapshot) -> bool {
 }
 
 fn runtime_compatibility_reason(
-    snapshot: &ProductionCapabilitySnapshot,
+    codex_version: crate::codex_capabilities::CodexVersionEvidence,
+    blocker_reasons: impl Iterator<Item = BlockerReason>,
 ) -> Option<satelle_core::host_update::RepairCompatibilityReason> {
     use crate::codex_capabilities::CodexVersionEvidence;
     use satelle_core::host_update::RepairCompatibilityReason;
 
-    match snapshot.evidence.codex_version {
-        CodexVersionEvidence::Detected { .. }
-            if snapshot.verdict.blockers().iter().any(|blocker| {
-                matches!(
-                    blocker.reason,
+    match codex_version {
+        CodexVersionEvidence::Detected { .. } => {
+            let mut unsupported = false;
+            let mut control_plane_incompatible = false;
+            for reason in blocker_reasons {
+                unsupported |= matches!(
+                    reason,
                     BlockerReason::MalformedCodexVersion
                         | BlockerReason::CodexVersionUnavailable
                         | BlockerReason::UnsupportedCodexVersion
-                )
-            }) =>
-        {
-            Some(RepairCompatibilityReason::Unsupported)
+                );
+                control_plane_incompatible |= reason == BlockerReason::NonStableSurface;
+            }
+
+            if unsupported {
+                Some(RepairCompatibilityReason::Unsupported)
+            } else if control_plane_incompatible {
+                Some(RepairCompatibilityReason::ControlPlaneIncompatible)
+            } else {
+                None
+            }
         }
-        CodexVersionEvidence::Detected { .. } => None,
         CodexVersionEvidence::Missing => Some(RepairCompatibilityReason::Missing),
         CodexVersionEvidence::Malformed => Some(RepairCompatibilityReason::Corrupted),
         CodexVersionEvidence::Unavailable => Some(RepairCompatibilityReason::Unsupported),
@@ -2048,6 +2066,19 @@ mod tests {
         assert_eq!(
             production_capabilities(&snapshot, false).codex_update_evidence(),
             production_capabilities(&snapshot, true).codex_update_evidence()
+        );
+    }
+
+    #[test]
+    fn detected_codex_with_an_unstable_surface_requires_control_plane_repair() {
+        assert_eq!(
+            runtime_compatibility_reason(
+                crate::codex_capabilities::CodexVersionEvidence::Detected {
+                    version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                },
+                [BlockerReason::NonStableSurface].into_iter(),
+            ),
+            Some(satelle_core::host_update::RepairCompatibilityReason::ControlPlaneIncompatible)
         );
     }
 
