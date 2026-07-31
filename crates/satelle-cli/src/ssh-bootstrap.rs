@@ -1303,7 +1303,7 @@ sync"#,
         }
     }
 
-    const fn is_windows(self) -> bool {
+    pub(super) const fn is_windows(self) -> bool {
         matches!(self, Self::WindowsArm64Msvc | Self::WindowsX64Msvc)
     }
 
@@ -3615,6 +3615,7 @@ pub(super) fn managed_service_executable_version(
     target: RemoteTarget,
     directories: &RemoteUserDirectories,
     executable: &str,
+    expected_current_release_digest: Option<[u8; 32]>,
 ) -> Option<String> {
     let normalize = |path: &str| {
         let path = path.replace('\\', "/");
@@ -3647,6 +3648,14 @@ pub(super) fn managed_service_executable_version(
     if target.is_windows() {
         let digest = filename.strip_prefix("satelle-")?.strip_suffix(".exe")?;
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        // The invoking release manifest can authenticate only its own
+        // digest-addressed executable. Older version paths remain observable
+        // so planning can report and replace them.
+        if version == env!("CARGO_PKG_VERSION")
+            && parse_digest_hex(digest).ok()? != expected_current_release_digest?
+        {
             return None;
         }
     } else if filename != target.executable_name() {
@@ -5673,6 +5682,7 @@ mod tests {
                 RemoteTarget::DarwinArm64,
                 &macos,
                 "/Users/operator/Library/Caches/Satelle/host/v0.0.9/darwin-arm64/satelle",
+                None,
             ),
             Some("0.0.9".to_string())
         );
@@ -5681,14 +5691,39 @@ mod tests {
                 RemoteTarget::WindowsX64Msvc,
                 &windows,
                 r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe",
+                Some([0xbb; 32]),
             ),
             Some("0.0.8".to_string())
+        );
+        let current_windows_path = format!(
+            r"C:\Users\operator\AppData\Local\Satelle\host\v{}\win32-x64-msvc\satelle-{}.exe",
+            env!("CARGO_PKG_VERSION"),
+            "aa".repeat(32),
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                &windows,
+                &current_windows_path,
+                Some([0xaa; 32]),
+            ),
+            Some(env!("CARGO_PKG_VERSION").to_string())
+        );
+        assert_eq!(
+            managed_service_executable_version(
+                RemoteTarget::WindowsX64Msvc,
+                &windows,
+                &current_windows_path,
+                Some([0xbb; 32]),
+            ),
+            None
         );
         assert_eq!(
             managed_service_executable_version(
                 RemoteTarget::DarwinArm64,
                 &macos,
                 "/tmp/lookalike/v0.0.9/darwin-arm64/satelle",
+                None,
             ),
             None
         );
@@ -5697,6 +5732,7 @@ mod tests {
                 RemoteTarget::WindowsX64Msvc,
                 &windows,
                 r"C:\Users\operator\AppData\Local\Satelle\host\v0.0.8\win32-x64-msvc\satelle.exe",
+                Some([0xbb; 32]),
             ),
             None
         );

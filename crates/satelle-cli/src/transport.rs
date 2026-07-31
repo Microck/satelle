@@ -2835,6 +2835,7 @@ fn host_service_inspection_from_executable(
     destination: &str,
     executable: Option<String>,
     cli_version: &str,
+    expected_current_release_digest: Option<[u8; 32]>,
 ) -> Result<crate::host_update::HostUpdateServiceInspection, SatelleError> {
     let Some(executable) = executable else {
         return Ok(crate::host_update::HostUpdateServiceInspection {
@@ -2843,8 +2844,12 @@ fn host_service_inspection_from_executable(
             destination: destination.to_string(),
         });
     };
-    let current_version =
-        ssh_bootstrap::managed_service_executable_version(target, directories, &executable);
+    let current_version = ssh_bootstrap::managed_service_executable_version(
+        target,
+        directories,
+        &executable,
+        expected_current_release_digest,
+    );
     let relation_to_cli = match current_version.as_deref() {
         Some(current_version) => {
             host_version_relation(Some(current_version), true, None, cli_version)?
@@ -2977,6 +2982,7 @@ fn inspect_host_maintenance(
             let remote_directories = (inspect_service || initial_artifact_required)
                 .then(|| transport.remote_directories(target))
                 .transpose()?;
+            let mut service_release_artifact = None;
             let service_inspection = if inspect_service {
                 let directories = remote_directories
                     .as_ref()
@@ -3003,12 +3009,19 @@ fn inspect_host_maintenance(
                             .map_err(|error| {
                                 map_ssh_daemon_bootstrap_error(&transport.alias, error)
                             })?;
+                        if target.is_windows() && executable.is_some() {
+                            // A current Windows task is trustworthy only when
+                            // its digest-addressed executable matches the
+                            // invoking release manifest.
+                            service_release_artifact = Some(transport.release_artifact(target)?);
+                        }
                         Some(host_service_inspection_from_executable(
                             target,
                             directories,
                             &destination,
                             executable,
                             cli_version,
+                            service_release_artifact.map(|metadata| metadata.digest()),
                         )?)
                     }
                     None => None,
@@ -3024,9 +3037,14 @@ fn inspect_host_maintenance(
                     .as_ref()
                     .map(|service| service.relation_to_cli),
             );
-            let release_artifact = needs_host_release_artifact
-                .then(|| transport.release_artifact(target))
-                .transpose()?;
+            let release_artifact = if needs_host_release_artifact {
+                Some(match service_release_artifact {
+                    Some(metadata) => metadata,
+                    None => transport.release_artifact(target)?,
+                })
+            } else {
+                None
+            };
             let install_path = match (remote_directories.as_ref(), release_artifact.as_ref()) {
                 (Some(directories), Some(metadata)) => Some(
                     target
@@ -6701,6 +6719,7 @@ mod bootstrap_ordering_tests {
             "/Users/operator/Library/LaunchAgents/dev.microck.satelle.host.plist",
             None,
             env!("CARGO_PKG_VERSION"),
+            None,
         )
         .expect("an absent definition is a known missing service target");
 
@@ -6726,6 +6745,7 @@ mod bootstrap_ordering_tests {
             r"C:\Users\operator\AppData\Local\Satelle\service\host-office.json",
             Some(r"C:\Program Files\Satelle\satelle.exe".to_string()),
             env!("CARGO_PKG_VERSION"),
+            Some([0xaa; 32]),
         )
         .expect("a verified managed executable remains observable without a versioned cache path");
 
