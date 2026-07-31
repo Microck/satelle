@@ -578,7 +578,7 @@ fn maintenance_inspection_rejects_an_unpinned_ssh_host() {
 #[test]
 fn default_missing_ssh_host_plan_skips_unavailable_codex_targets() {
     let host = ssh_setup_host(Some(ApiTokenSource::File {
-        path: PathBuf::from("/tmp/unread-token"),
+        path: std::env::temp_dir().join("unread-token"),
     }));
 
     let report = plan_host_update(&host, &[], false)

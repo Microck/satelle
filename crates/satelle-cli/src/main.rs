@@ -4177,22 +4177,16 @@ fn run_repair(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    if command.no_input && !command.dry_run && !command.yes {
+    let host = config.resolve_host(command.host.as_deref())?;
+    let report = transport::plan_repair_upgrades(&host).map_err(failure)?;
+    let requires_consent = repair_plan_requires_consent(&report);
+    if command.no_input && !command.dry_run && !command.yes && requires_consent {
         return Err(failure(SatelleError::input_required(
             "repair needs --yes when --no-input is used for mutations",
         )));
     }
 
-    let host = config.resolve_host(command.host.as_deref())?;
-    let report = transport::plan_repair_upgrades(&host).map_err(failure)?;
-    let apply_unavailable = !command.dry_run
-        && report.actions.iter().any(|action| {
-            !matches!(
-                action.disposition,
-                satelle_core::host_update::RepairUpgradeDisposition::NotNeeded
-                    | satelle_core::host_update::RepairUpgradeDisposition::RecommendHostUpdate
-            )
-        });
+    let apply_unavailable = !command.dry_run && requires_consent;
     if apply_unavailable {
         // Human output can retain the useful read-only plan before the typed
         // failure. JSON commands must emit exactly one terminal object.
@@ -4216,6 +4210,56 @@ fn run_repair(
         print!("{}", host_update::render_repair_upgrade_plan(&report));
     }
     Ok(())
+}
+
+fn repair_plan_requires_consent(report: &satelle_core::host_update::RepairUpgradeReport) -> bool {
+    report.actions.iter().any(|action| {
+        !matches!(
+            action.disposition,
+            satelle_core::host_update::RepairUpgradeDisposition::NotNeeded
+                | satelle_core::host_update::RepairUpgradeDisposition::RecommendHostUpdate
+        )
+    })
+}
+
+#[cfg(test)]
+mod repair_consent_tests {
+    use super::*;
+    use satelle_core::host_update::{
+        HostUpdateTarget, HostUpdateVersionSource, RepairUpgradeAction, RepairUpgradeDisposition,
+        RepairUpgradeReport,
+    };
+
+    fn action(disposition: RepairUpgradeDisposition) -> RepairUpgradeAction {
+        RepairUpgradeAction {
+            target: HostUpdateTarget::HostDaemon,
+            current_version: Some("0.1.0".to_string()),
+            target_version: "0.1.0".to_string(),
+            compatibility_reason: None,
+            version_source: HostUpdateVersionSource::InvokingCliRelease,
+            disposition,
+        }
+    }
+
+    #[test]
+    fn repair_consent_depends_on_the_planned_mutations() {
+        let read_only = RepairUpgradeReport::new(
+            "local-demo",
+            vec![
+                action(RepairUpgradeDisposition::NotNeeded),
+                action(RepairUpgradeDisposition::RecommendHostUpdate),
+            ],
+        );
+        assert!(!repair_plan_requires_consent(&read_only));
+
+        for disposition in [
+            RepairUpgradeDisposition::Required,
+            RepairUpgradeDisposition::ManualActionRequired,
+        ] {
+            let mutating = RepairUpgradeReport::new("local-demo", vec![action(disposition)]);
+            assert!(repair_plan_requires_consent(&mutating));
+        }
+    }
 }
 
 fn run_doctor(
@@ -8026,6 +8070,17 @@ fn run_host_update(
         .collect::<Vec<_>>();
     let report = transport::plan_host_update(&host, &components, includes_all).map_err(failure)?;
     if command.dry_run {
+        if format.is_json() {
+            print_json(&report).map_err(failure)?;
+        } else {
+            print!("{}", host_update::render_host_update_plan(&report));
+        }
+        return Ok(());
+    }
+
+    // A current plan is already the complete result. The packet-15 executor is
+    // needed only when this plan contains a remote mutation.
+    if !report.confirmation_required {
         if format.is_json() {
             print_json(&report).map_err(failure)?;
         } else {

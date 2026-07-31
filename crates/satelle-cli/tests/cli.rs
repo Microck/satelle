@@ -3550,15 +3550,6 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
             "--host",
             "local-demo",
             "--component",
-            "host",
-            "--json",
-        ],
-        vec![
-            "host",
-            "update",
-            "--host",
-            "local-demo",
-            "--component",
             "codex",
             "--json",
         ],
@@ -3633,6 +3624,33 @@ fn host_update_valid_selections_fail_truthfully_without_mutating_state() {
     );
     assert!(!state.path().join("satelle.sqlite3").exists());
     assert!(!state.path().join("satelle.sqlite3.lock").exists());
+}
+
+#[test]
+fn current_host_update_succeeds_without_an_apply_executor() {
+    let state = state_dir();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "host",
+            "update",
+            "--host",
+            "local-demo",
+            "--component",
+            "host",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    assert!(output.stderr.is_empty());
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(report["schema_version"], "satelle.host.update.v1");
+    assert_eq!(report["confirmation_required"], false);
+    assert_eq!(report["targets"][0]["disposition"], "current");
+    assert!(!state.path().join("satelle.sqlite3").exists());
 }
 
 #[test]

@@ -641,7 +641,7 @@ impl HostService {
         &self,
     ) -> Result<satelle_core::host_update::CodexUpdateEvidence, SatelleError> {
         match &self.mode {
-            HostMode::Production { snapshot } => {
+            HostMode::Production { snapshot, .. } => {
                 let snapshot = crate::read_production_snapshot(snapshot)?;
                 Ok(production_codex_update_evidence(&snapshot))
             }
@@ -2040,7 +2040,7 @@ mod tests {
     #[test]
     fn update_evidence_is_independent_from_readiness_cache_state() {
         let service = HostService::production();
-        let HostMode::Production { snapshot } = &service.mode else {
+        let HostMode::Production { snapshot, .. } = &service.mode else {
             panic!("production service must retain a production snapshot");
         };
         let snapshot = crate::read_production_snapshot(snapshot).expect("read production snapshot");
