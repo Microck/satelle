@@ -3344,12 +3344,21 @@ pub(crate) fn apply_host_update(
     ) {
         Ok(lock) => lock,
         Err(error) => {
-            finish_unmodified_host_update(&old_client, &operation_id);
-            return Err(error);
+            return Err(close_unmodified_host_update_or_recovery_pending(
+                &transport.alias,
+                &old_client,
+                &operation_id,
+                error,
+            ));
         }
     };
     if let Err(error) = confirm_bootstrap_lock(&transport.alias, &mut bootstrap_lock) {
-        finish_unmodified_host_update(&old_client, &operation_id);
+        let error = close_unmodified_host_update_or_recovery_pending(
+            &transport.alias,
+            &old_client,
+            &operation_id,
+            error,
+        );
         let _ = bootstrap_lock.release_unmodified();
         return Err(error);
     }
@@ -3809,22 +3818,7 @@ pub(crate) fn apply_host_update(
             source,
         ));
     }
-    let invalidation = match satelle_transport::NativeReadinessInvalidationRequest::new(
-        None, None, false, false, false,
-    ) {
-        Ok(invalidation) => invalidation,
-        Err(error) => {
-            let source = SatelleError::invalid_usage(error);
-            return Err(fail_host_update_action(
-                &transport.alias,
-                &new_client,
-                &mut bootstrap_lock,
-                &mut report,
-                "invalidate-readiness-caches",
-                source,
-            ));
-        }
-    };
+    let invalidation = satelle_transport::NativeReadinessInvalidationRequest::host();
     if let Err(error) = new_client.invalidate_native_readiness(&invalidation, &operation_id) {
         let source = direct_transport_error(&transport.alias, error);
         return Err(host_update_recovery_pending(
@@ -3950,16 +3944,47 @@ fn maintenance_postcheck_is_terminal(details: Option<&serde_json::Value>) -> boo
         == Some(true)
 }
 
-fn finish_unmodified_host_update(client: &DaemonClient, operation_id: &str) {
+fn finish_unmodified_host_update(
+    host: &str,
+    client: &DaemonClient,
+    operation_id: &str,
+) -> Result<(), SatelleError> {
     for action_id in HOST_UPDATE_ACTIONS {
-        if client
+        let response = client
             .skip_maintenance_action(operation_id, action_id)
-            .is_err()
-        {
-            return;
-        }
+            .map_err(|error| direct_transport_error(host, error))?;
+        validate_persistent_maintenance_response(
+            host,
+            operation_id,
+            response.reconciled(),
+            response.operation_id(),
+        )?;
     }
-    let _ = client.finish_maintenance_plan(operation_id);
+    let response = client
+        .finish_maintenance_plan(operation_id)
+        .map_err(|error| direct_transport_error(host, error))?;
+    validate_persistent_maintenance_response(
+        host,
+        operation_id,
+        response.reconciled(),
+        response.operation_id(),
+    )
+}
+
+fn close_unmodified_host_update_or_recovery_pending(
+    host: &str,
+    client: &DaemonClient,
+    operation_id: &str,
+    source: SatelleError,
+) -> SatelleError {
+    match finish_unmodified_host_update(host, client, operation_id) {
+        Ok(()) => source,
+        Err(cleanup) => SatelleError::host_update_recovery_pending(
+            host,
+            operation_id,
+            format!("Host update stopped: {source}; maintenance cleanup failed: {cleanup}"),
+        ),
+    }
 }
 
 fn begin_host_update_maintenance_with_revalidation(
@@ -3985,13 +4010,21 @@ fn begin_host_update_maintenance_with_revalidation(
     let current = match revalidate() {
         Ok(current) => current,
         Err(source) => {
-            finish_unmodified_host_update(client, operation_id);
-            return Err(source);
+            return Err(close_unmodified_host_update_or_recovery_pending(
+                host,
+                client,
+                operation_id,
+                source,
+            ));
         }
     };
     if &current != accepted {
-        finish_unmodified_host_update(client, operation_id);
-        return Err(SatelleError::state_conflict());
+        return Err(close_unmodified_host_update_or_recovery_pending(
+            host,
+            client,
+            operation_id,
+            SatelleError::state_conflict(),
+        ));
     }
     Ok(current)
 }
@@ -4035,9 +4068,10 @@ fn finish_unmodified_after_uncertain_first_action_start(
         }
         Err(error) if maintenance_action_is_still_planned(&error) => {
             // The exact state conflict proves the lost start request did not
-            // leave the first action started. Response reconciliation already
-            // committed that nonmutation attempt, so cleanup can start a new
-            // attempt and skip the still-planned action.
+            // leave the first action started. Commit an unresolved transport
+            // attempt now; a known pre-mutation rejection already committed
+            // it, and the local fence makes that repeat a no-op.
+            commit_verified_bootstrap_mutation(host, bootstrap_lock)?;
             skip_maintenance_action(host, client, bootstrap_lock, "install-host-artifact")?;
             false
         }

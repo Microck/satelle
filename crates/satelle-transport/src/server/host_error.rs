@@ -365,6 +365,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::HostBinaryNewerThanCli
         | ErrorCode::HostArtifactUnavailable
         | ErrorCode::HostUpdateRequiresCliUpgrade
+        | ErrorCode::HostUpdateRecoveryPending
         | ErrorCode::AmbiguousCodexComponentOwnership
         | ErrorCode::HostUpdatePartiallyApplied
         | ErrorCode::HostUpdatePostcheckFailed

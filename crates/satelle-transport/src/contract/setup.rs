@@ -68,7 +68,7 @@ define_schema_token!(
 );
 define_schema_token!(
     NativeReadinessInvalidationSchema,
-    "satelle.native-readiness-invalidation.v1"
+    "satelle.native-readiness-invalidation.v2"
 );
 define_schema_token!(
     NativeReadinessInvalidationResponseSchema,
@@ -573,9 +573,17 @@ impl ApiRequestContract for SetupVerificationRequest {
     const SCHEMA_VERSION: &'static str = SetupVerificationSchema::TOKEN;
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeReadinessInvalidationScope {
+    Intent,
+    Host,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct NativeReadinessInvalidationRequest {
     schema_version: NativeReadinessInvalidationSchema,
+    scope: NativeReadinessInvalidationScope,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_alias: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -594,6 +602,7 @@ impl<'de> Deserialize<'de> for NativeReadinessInvalidationRequest {
         #[serde(deny_unknown_fields)]
         struct WireRequest {
             schema_version: NativeReadinessInvalidationSchema,
+            scope: NativeReadinessInvalidationScope,
             model_alias: Option<String>,
             provider_alias: Option<String>,
             model_from_project: bool,
@@ -614,9 +623,21 @@ impl<'de> Deserialize<'de> for NativeReadinessInvalidationRequest {
                 "model_alias and provider_alias must be non-empty",
             ));
         }
+        if request.scope == NativeReadinessInvalidationScope::Host
+            && (request.model_alias.is_some()
+                || request.provider_alias.is_some()
+                || request.model_from_project
+                || request.provider_from_project
+                || request.experimental_provider_computer_use)
+        {
+            return Err(serde::de::Error::custom(
+                "host-wide native readiness invalidation cannot select provider intent",
+            ));
+        }
 
         Ok(Self {
             schema_version: request.schema_version,
+            scope: request.scope,
             model_alias: request.model_alias,
             provider_alias: request.provider_alias,
             model_from_project: request.model_from_project,
@@ -644,12 +665,29 @@ impl NativeReadinessInvalidationRequest {
         }
         Ok(Self {
             schema_version: NativeReadinessInvalidationSchema,
+            scope: NativeReadinessInvalidationScope::Intent,
             model_alias,
             provider_alias,
             model_from_project,
             provider_from_project,
             experimental_provider_computer_use,
         })
+    }
+
+    pub fn host() -> Self {
+        Self {
+            schema_version: NativeReadinessInvalidationSchema,
+            scope: NativeReadinessInvalidationScope::Host,
+            model_alias: None,
+            provider_alias: None,
+            model_from_project: false,
+            provider_from_project: false,
+            experimental_provider_computer_use: false,
+        }
+    }
+
+    pub const fn scope(&self) -> NativeReadinessInvalidationScope {
+        self.scope
     }
 
     pub fn model_alias(&self) -> Option<&str> {
@@ -1260,7 +1298,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             serde_json::json!({
-                "schema_version": "satelle.native-readiness-invalidation.v1",
+                "schema_version": "satelle.native-readiness-invalidation.v2",
+                "scope": "intent",
                 "model_alias": "vision",
                 "provider_alias": "open_ai",
                 "model_from_project": true,
@@ -1268,6 +1307,27 @@ mod tests {
                 "experimental_provider_computer_use": true
             })
         );
+    }
+
+    #[test]
+    fn host_native_invalidation_is_explicit_and_carries_no_intent() {
+        let request = NativeReadinessInvalidationRequest::host();
+        assert_eq!(request.scope(), NativeReadinessInvalidationScope::Host);
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "schema_version": "satelle.native-readiness-invalidation.v2",
+                "scope": "host",
+                "model_from_project": false,
+                "provider_from_project": false,
+                "experimental_provider_computer_use": false
+            })
+        );
+
+        let mut invalid = serde_json::to_value(request).unwrap();
+        invalid["model_alias"] = serde_json::json!("vision");
+        invalid["provider_alias"] = serde_json::json!("openai");
+        assert!(serde_json::from_value::<NativeReadinessInvalidationRequest>(invalid).is_err());
     }
 
     #[test]

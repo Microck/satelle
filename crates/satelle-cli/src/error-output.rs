@@ -316,6 +316,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The remote operation did not complete.",
             default_recovery: "check the Host status and retry the command",
         },
+        ErrorCode::HostUpdateRecoveryPending => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: false,
+            outcome: "The Host update stopped before changing remote state, but cleanup failed.",
+            default_recovery: "run satelle repair for the selected Host",
+        },
         ErrorCode::HostUpdatePartiallyApplied => ErrorContract {
             category: ErrorCategory::RemoteExecution,
             retryable: false,

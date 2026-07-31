@@ -101,6 +101,7 @@ pub(super) struct SshBootstrapLock {
     claim_basename: String,
     mutation_phase: Option<String>,
     mutation_attempt: Option<String>,
+    mutation_committed: bool,
     #[cfg(all(test, unix))]
     exchanged_lock_lines: Vec<String>,
 }
@@ -314,6 +315,7 @@ impl SshBootstrapLock {
             claim_basename: ready_claim.basename,
             mutation_phase: None,
             mutation_attempt: None,
+            mutation_committed: false,
             #[cfg(all(test, unix))]
             exchanged_lock_lines: Vec::new(),
         })
@@ -349,6 +351,7 @@ impl SshBootstrapLock {
         self.exchange_lock_line(line)?;
         self.mutation_phase = Some(phase.to_string());
         self.mutation_attempt = Some(attempt.to_string());
+        self.mutation_committed = false;
         Ok(())
     }
 
@@ -383,6 +386,9 @@ impl SshBootstrapLock {
     }
 
     pub(super) fn commit_current_mutation(&mut self) -> Result<(), SshBootstrapError> {
+        if self.mutation_committed {
+            return Ok(());
+        }
         let phase = self
             .mutation_phase
             .as_deref()
@@ -393,7 +399,9 @@ impl SshBootstrapLock {
             .ok_or(SshBootstrapError::BootstrapLockLost)?;
         let committed = bootstrap_lock::mutation_committed_line(phase, attempt)
             .map_err(SshBootstrapError::InvalidBootstrapLockRequest)?;
-        self.exchange_lock_line(committed)
+        self.exchange_lock_line(committed)?;
+        self.mutation_committed = true;
+        Ok(())
     }
 
     #[cfg(all(test, unix))]

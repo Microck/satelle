@@ -1121,18 +1121,24 @@ fn acquire_bootstrap_lock_for_operation_with_ssh(
 fn with_bootstrap_handoff_test_context(
     test: impl FnOnce(&DaemonClient, &std::path::Path, SocketAddr, &str, &HostService),
 ) {
-    with_bootstrap_handoff_test_context_with_scope(ApiScopes::READ, test);
+    with_bootstrap_handoff_test_context_with_scope(
+        ApiScopes::READ,
+        |client, fake_ssh, address, host_identity, service, _| {
+            test(client, fake_ssh, address, host_identity, service);
+        },
+    );
 }
 
 #[cfg(unix)]
 fn with_bootstrap_handoff_test_context_with_scope(
     bootstrap_scope: ApiScopes,
-    test: impl FnOnce(&DaemonClient, &std::path::Path, SocketAddr, &str, &HostService),
+    test: impl FnOnce(&DaemonClient, &std::path::Path, SocketAddr, &str, &HostService, &str),
 ) {
     use std::os::unix::fs::PermissionsExt as _;
 
     let state = TestStateDir::new().expect("temporary state directory");
     let bootstrap_token = ApiBearerToken::generate().expect("generate bootstrap token");
+    let bootstrap_token_id = bootstrap_token.token_id().to_string();
     let service = HostService::local_demo_for_tests_at(state.path())
         .expect("construct Host service")
         .with_ssh_bootstrap_auth_for_tests(
@@ -1188,6 +1194,7 @@ esac
         server.local_addr(),
         &host_identity,
         &ledger,
+        &bootstrap_token_id,
     );
 
     drop(server);
@@ -1198,7 +1205,7 @@ esac
 fn uncertain_first_host_update_action_start_closes_the_unmodified_operation() {
     with_bootstrap_handoff_test_context_with_scope(
         ApiScopes::ADMIN,
-        |client, fake_ssh, _, _, ledger| {
+        |client, fake_ssh, _, _, ledger, _| {
             let operation_id = "host-update-lost-first-start-response";
             client
                 .begin_host_update_maintenance(operation_id)
@@ -1286,7 +1293,7 @@ fn uncertain_first_host_update_action_start_closes_the_unmodified_operation() {
 fn rejected_first_host_update_action_start_closes_the_unmodified_operation() {
     with_bootstrap_handoff_test_context_with_scope(
         ApiScopes::ADMIN,
-        |client, fake_ssh, _, _, _| {
+        |client, fake_ssh, _, _, _, _| {
             let operation_id = "host-update-rejected-first-start";
             client
                 .begin_host_update_maintenance(operation_id)
@@ -1338,8 +1345,59 @@ fn rejected_first_host_update_action_start_closes_the_unmodified_operation() {
 
 #[cfg(unix)]
 #[test]
+fn lost_first_host_update_action_start_closes_the_still_planned_operation() {
+    with_bootstrap_handoff_test_context_with_scope(
+        ApiScopes::ADMIN,
+        |client, fake_ssh, _, _, _, _| {
+            let operation_id = "host-update-lost-unprocessed-first-start";
+            client
+                .begin_host_update_maintenance(operation_id)
+                .expect("begin Host update maintenance");
+            let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                "host-update-lost-start-host",
+                "fake-ssh-host",
+                operation_id.to_string(),
+                bootstrap_lock::OperationKind::HostBinaryReplacement,
+                fake_ssh,
+            )
+            .expect("acquire Host replacement Bootstrap Lock");
+            bootstrap_lock
+                .confirm_ownership()
+                .expect("confirm Bootstrap Lock ownership");
+
+            // Model a transport loss before the Host receives the start. The
+            // attempt is unresolved locally, while the Host action stays planned.
+            bootstrap_lock
+                .mark_mutation_started("persistent_action_start")
+                .expect("record the unresolved action-start attempt");
+
+            finish_unmodified_after_uncertain_first_action_start(
+                "host-update-lost-start-host",
+                client,
+                &mut bootstrap_lock,
+            )
+            .expect("the exact planned conflict closes the unresolved start");
+
+            let next_operation = "host-update-after-lost-first-start";
+            client
+                .begin_host_update_maintenance(next_operation)
+                .expect("reconciled transport loss releases Maintenance ownership");
+            for action_id in HOST_UPDATE_ACTIONS {
+                client
+                    .skip_maintenance_action(next_operation, action_id)
+                    .expect("skip the next operation action");
+            }
+            client
+                .finish_maintenance_plan(next_operation)
+                .expect("finish the next maintenance operation");
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn final_host_update_revalidation_holds_and_releases_maintenance_on_drift() {
-    with_bootstrap_handoff_test_context_with_scope(ApiScopes::ADMIN, |client, _, _, _, _| {
+    with_bootstrap_handoff_test_context_with_scope(ApiScopes::ADMIN, |client, _, _, _, _, _| {
         let operation_id = "host-update-final-revalidation";
         let accepted = satelle_core::host_update::HostUpdateReport::new(
             "office",
@@ -1383,6 +1441,48 @@ fn final_host_update_revalidation_holds_and_releases_maintenance_on_drift() {
             .finish_maintenance_plan(next_operation)
             .expect("finish the next maintenance operation");
     });
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_final_revalidation_cleanup_reports_the_recovery_pending_operation() {
+    with_bootstrap_handoff_test_context_with_scope(
+        ApiScopes::ADMIN,
+        |client, _, _, _, service, bootstrap_token_id| {
+            let operation_id = "host-update-revalidation-cleanup-failure";
+            let accepted = satelle_core::host_update::HostUpdateReport::new(
+                "office",
+                vec![satelle_core::host_update::HostUpdateComponent::Host],
+                Vec::new(),
+            );
+
+            let error = begin_host_update_maintenance_with_revalidation(
+                "office",
+                client,
+                operation_id,
+                &accepted,
+                || {
+                    service
+                        .revoke_api_token(bootstrap_token_id)
+                        .expect("revoke cleanup authority after Maintenance begins");
+                    let mut drifted = accepted.clone();
+                    drifted.host = "changed-office".to_string();
+                    Ok(drifted)
+                },
+            )
+            .expect_err("cleanup failure retains a typed recovery-pending operation");
+
+            assert_eq!(error.code, ErrorCode::HostUpdateRecoveryPending);
+            assert_eq!(
+                error.details.get("operation_id"),
+                Some(&serde_json::json!(operation_id))
+            );
+            assert_eq!(
+                error.recovery_command.as_deref(),
+                Some("satelle repair --host office --no-input --yes")
+            );
+        },
+    );
 }
 
 #[cfg(unix)]

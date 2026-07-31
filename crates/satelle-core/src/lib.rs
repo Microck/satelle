@@ -4015,6 +4015,7 @@ pub enum ErrorCode {
     HostBinaryNewerThanCli,
     HostArtifactUnavailable,
     HostUpdateRequiresCliUpgrade,
+    HostUpdateRecoveryPending,
     HostUpdatePartiallyApplied,
     HostUpdatePostcheckFailed,
     AmbiguousCodexComponentOwnership,
@@ -4126,6 +4127,7 @@ impl ErrorCode {
             Self::HostBinaryNewerThanCli => "host-binary-newer-than-cli",
             Self::HostArtifactUnavailable => "host-artifact-unavailable",
             Self::HostUpdateRequiresCliUpgrade => "host-update-requires-cli-upgrade",
+            Self::HostUpdateRecoveryPending => "host-update-recovery-pending",
             Self::HostUpdatePartiallyApplied => "host-update-partially-applied",
             Self::HostUpdatePostcheckFailed => "host-update-postcheck-failed",
             Self::AmbiguousCodexComponentOwnership => "ambiguous-codex-component-ownership",
@@ -4208,6 +4210,7 @@ impl ErrorCode {
             | Self::HostIdentityMismatch
             | Self::StoreInUse
             | Self::RemoteExecution
+            | Self::HostUpdateRecoveryPending
             | Self::HostUpdatePartiallyApplied
             | Self::HostUpdatePostcheckFailed
             | Self::StorageBusy
@@ -5506,6 +5509,37 @@ impl SatelleError {
         }
     }
 
+    pub fn host_update_recovery_pending(
+        host: &str,
+        operation_id: &str,
+        source: impl Into<String>,
+    ) -> Self {
+        let recovery_command = Some(format!("satelle repair --host {host} --no-input --yes"));
+        let mut details = BTreeMap::new();
+        details.insert("host".to_string(), Value::String(host.to_string()));
+        details.insert(
+            "operation_id".to_string(),
+            Value::String(operation_id.to_string()),
+        );
+        details.insert(
+            "preserved_state".to_string(),
+            Value::String("the Host update Maintenance Lease remains recovery-pending".to_string()),
+        );
+        details.insert(
+            "recovery_command".to_string(),
+            serde_json::to_value(&recovery_command).unwrap_or(Value::Null),
+        );
+        Self {
+            code: ErrorCode::HostUpdateRecoveryPending,
+            message:
+                "Host update stopped before remote mutation and its maintenance operation could not be closed"
+                    .to_string(),
+            recovery_command,
+            source_detail: Some(source.into()),
+            details,
+        }
+    }
+
     pub fn host_update_postcheck_failed(
         report: &crate::host_update::HostUpdateReport,
         source: impl Into<String>,
@@ -5867,6 +5901,29 @@ mod error_contract_tests {
     }
 
     #[test]
+    fn host_update_recovery_pending_names_the_operation_and_repair_path() {
+        let error = SatelleError::host_update_recovery_pending(
+            "remote",
+            "host-update-operation",
+            "maintenance finish failed",
+        );
+        assert_eq!(error.code, ErrorCode::HostUpdateRecoveryPending);
+        assert_eq!(error.exit_code(), 74);
+        assert_eq!(
+            error.details.get("operation_id"),
+            Some(&serde_json::json!("host-update-operation"))
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some("satelle repair --host remote --no-input --yes")
+        );
+        assert_eq!(
+            error.source_detail.as_deref(),
+            Some("maintenance finish failed")
+        );
+    }
+
+    #[test]
     fn canonical_broad_exit_classes_cover_security_storage_and_internal_errors() {
         for (code, expected) in [
             (ErrorCode::InvalidUsage, 64),
@@ -5875,6 +5932,7 @@ mod error_contract_tests {
             (ErrorCode::NotImplemented, 70),
             (ErrorCode::CompletionInstallFailed, 73),
             (ErrorCode::RemoteExecution, 74),
+            (ErrorCode::HostUpdateRecoveryPending, 74),
             (ErrorCode::HostUpdatePartiallyApplied, 74),
             (ErrorCode::HostUpdatePostcheckFailed, 74),
             (ErrorCode::StorageIntegrityFailed, 74),

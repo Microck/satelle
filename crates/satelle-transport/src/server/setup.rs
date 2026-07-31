@@ -5,13 +5,13 @@ use crate::contract::{
     ApiErrorCategory, ApiErrorCode, BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL,
     DurableTokenActivationResponse, DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
     NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
-    PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
-    ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
-    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
-    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, SetupVerificationRequest, SetupVerificationResponse,
-    provider_secret_upload_aad,
+    NativeReadinessInvalidationScope, PROVIDER_SECRET_UPLOAD_CONTENT_TYPE,
+    PROVIDER_SECRET_UPLOAD_INFO, ProviderBindingAuthorizationRequest,
+    ProviderBindingAuthorizationResponse, ProviderBindingDeletionResponse,
+    ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
+    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
+    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, SetupVerificationRequest,
+    SetupVerificationResponse, provider_secret_upload_aad,
 };
 use axum::extract::{Extension, Path, Request, State};
 use axum::http::header::CONTENT_TYPE;
@@ -117,16 +117,17 @@ pub(super) async fn invalidate_native_readiness(
     let service = Arc::clone(&state.service);
     let model_alias = request.model_alias().map(str::to_string);
     let provider_alias = request.provider_alias().map(str::to_string);
+    let host_wide = request.scope() == NativeReadinessInvalidationScope::Host;
     let model_from_project = request.model_from_project();
     let provider_from_project = request.provider_from_project();
     let experimental_provider_computer_use = request.experimental_provider_computer_use();
     let deleted = match tokio::task::spawn_blocking(move || {
         service.invalidate_native_readiness_idempotent(
             &authority,
+            host_wide,
             model_alias.as_deref(),
             provider_alias.as_deref(),
-            model_from_project,
-            provider_from_project,
+            (model_from_project, provider_from_project),
             experimental_provider_computer_use,
         )
     })

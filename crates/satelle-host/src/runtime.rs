@@ -42,9 +42,10 @@ use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, BeginProviderSecretProvisioning, IdempotentOperation,
-    LeaseOwner, LogPageStorageError, NativeReadinessInvalidationReplay, ObservedUpstreamRef,
-    OperatorLogMirror, OperatorLogPolicy, ProviderBindingAuthorizationReplay,
-    ProviderBindingDeletionReplay, ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
+    LeaseOwner, LogPageStorageError, NativeReadinessInvalidationReplay,
+    NativeReadinessInvalidationTarget, ObservedUpstreamRef, OperatorLogMirror, OperatorLogPolicy,
+    ProviderBindingAuthorizationReplay, ProviderBindingDeletionReplay,
+    ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
     ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay, ReadinessProbeKind,
     ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan,
     SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
@@ -3633,7 +3634,8 @@ impl RuntimeHandle {
         &self,
         identity: &RequestIdentity,
         host: &str,
-        provider_intent: &ProviderComputerUseIntent,
+        provider_intent: Option<&ProviderComputerUseIntent>,
+        host_wide: bool,
     ) -> Result<u64, SatelleError> {
         let completed_at = time::OffsetDateTime::now_utc();
         let idempotency = model::idempotency(
@@ -3642,12 +3644,20 @@ impl RuntimeHandle {
             completed_at,
         )?;
         let engine = self.engine()?;
-        let key = engine.adapter.readiness_cache_key(host, provider_intent)?;
+        let key = provider_intent
+            .map(|provider_intent| engine.adapter.readiness_cache_key(host, provider_intent))
+            .transpose()?
+            .flatten();
+        let target = if host_wide {
+            NativeReadinessInvalidationTarget::Host
+        } else {
+            NativeReadinessInvalidationTarget::Intent(key.as_ref())
+        };
         let replay = engine
             .lock_storage()?
             .invalidate_native_readiness_idempotent(
                 &idempotency,
-                key.as_ref(),
+                target,
                 completed_at,
                 model::storage_failure_ref,
             )
