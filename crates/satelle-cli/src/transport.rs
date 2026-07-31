@@ -4236,17 +4236,15 @@ fn recover_later_host_update_action_start(
             .iter()
             .position(|candidate| *candidate == action_id)
             .expect("later Host update actions belong to the ordered maintenance plan");
-        let cleanup = HOST_UPDATE_ACTIONS[action_index..]
-            .iter()
-            .try_for_each(|remaining| {
+        let cleanup = (|| {
+            skip_remaining_host_update_actions(report, action_index, |remaining| {
                 skip_maintenance_action(host, client, bootstrap_lock, remaining)
-            })
-            .and_then(|()| finish_persistent_maintenance(host, client, bootstrap_lock))
-            .and_then(|()| {
-                bootstrap_lock
-                    .release_committed_handoff()
-                    .map_err(|_| SatelleError::host_unreachable(host))
-            });
+            })?;
+            finish_persistent_maintenance(host, client, bootstrap_lock)?;
+            bootstrap_lock
+                .release_committed_handoff()
+                .map_err(|_| SatelleError::host_unreachable(host))
+        })();
         if cleanup.is_ok() {
             return host_update_recovery_pending(report, action_id, &operation_id, source);
         }
@@ -4260,6 +4258,18 @@ fn recover_later_host_update_action_start(
     }
 
     operation_scoped_partial_host_update(report, action_id, &operation_id, source, None)
+}
+
+fn skip_remaining_host_update_actions(
+    report: &mut satelle_core::host_update::HostUpdateReport,
+    action_index: usize,
+    mut skip_action: impl FnMut(&str) -> Result<(), SatelleError>,
+) -> Result<(), SatelleError> {
+    for remaining in &HOST_UPDATE_ACTIONS[action_index..] {
+        skip_action(remaining)?;
+        report.skipped_actions.push((*remaining).to_string());
+    }
+    Ok(())
 }
 
 fn operation_scoped_partial_host_update(

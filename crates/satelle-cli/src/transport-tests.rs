@@ -1903,6 +1903,33 @@ fn lost_later_action_start_response_retains_the_partial_operation_identity() {
 }
 
 #[test]
+fn confirmed_cleanup_skips_are_recorded_in_the_partial_report() {
+    let mut report = satelle_core::host_update::HostUpdateReport::new(
+        "office",
+        vec![satelle_core::host_update::HostUpdateComponent::Host],
+        Vec::new(),
+    );
+    let mut skipped = Vec::new();
+
+    skip_remaining_host_update_actions(&mut report, 1, |action| {
+        skipped.push(action.to_string());
+        Ok(())
+    })
+    .expect("record confirmed cleanup skips");
+
+    assert_eq!(
+        skipped,
+        [
+            "publish-host-service",
+            "restart-host-daemon",
+            "invalidate-readiness-caches",
+            "host-update-postcheck",
+        ]
+    );
+    assert_eq!(report.skipped_actions, skipped);
+}
+
+#[test]
 fn lost_daemon_adoption_response_retains_the_partial_operation_identity() {
     let operation_id = "host-update-lost-daemon-adoption";
     let mut report = satelle_core::host_update::HostUpdateReport::new(
