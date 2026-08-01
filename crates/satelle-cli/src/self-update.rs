@@ -1384,6 +1384,16 @@ struct Version {
     prerelease: Option<String>,
 }
 
+pub(crate) fn remote_host_handoff_supported(
+    requested_version: Option<&str>,
+) -> Result<bool, SelfUpdateError> {
+    let Some(requested_version) = requested_version else {
+        // Implicit selection uses the latest stable release by contract.
+        return Ok(true);
+    };
+    Ok(Version::parse(requested_version)?.prerelease.is_none())
+}
+
 impl Version {
     fn parse(raw: &str) -> Result<Self, SelfUpdateError> {
         let (core, prerelease) = raw
@@ -2723,6 +2733,17 @@ mod tests {
         for invalid in ["", "1", "1.2", "01.2.3", "1.2.3+", "1.2.3-", "1.2.3-01"] {
             assert!(Version::parse(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn remote_host_handoff_accepts_only_stable_release_selections() {
+        assert!(remote_host_handoff_supported(None).unwrap());
+        assert!(remote_host_handoff_supported(Some("1.2.3")).unwrap());
+        assert!(!remote_host_handoff_supported(Some("1.2.3-rc.1")).unwrap());
+        assert!(matches!(
+            remote_host_handoff_supported(Some("invalid")),
+            Err(SelfUpdateError::VersionInvalid(version)) if version == "invalid"
+        ));
     }
 
     #[test]

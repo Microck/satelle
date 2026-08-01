@@ -8362,6 +8362,15 @@ fn run_self(
                 }
             }
 
+            let remote_host_handoff_supported =
+                self_update::remote_host_handoff_supported(command.version.as_deref())
+                    .map_err(|error| failure(error.into_satelle_error()))?;
+            if command.update_remotes && !remote_host_handoff_supported {
+                return Err(failure(SatelleError::invalid_usage(
+                    "prerelease self-updates cannot be combined with --update-remotes; update the local CLI without a Host handoff",
+                )));
+            }
+
             let current_host = std::env::var("SATELLE_HOST")
                 .ok()
                 .filter(|host| !host.is_empty());
@@ -8401,7 +8410,8 @@ fn run_self(
                 && !command.no_input
                 && stdin_is_terminal
                 && !output.is_json()
-                && !command.dry_run;
+                && !command.dry_run
+                && remote_host_handoff_supported;
             let request = self_update::SelfUpdateRequest::current(
                 command.version,
                 command.dry_run,
@@ -8424,12 +8434,14 @@ fn run_self(
 
             let selected_host = if command.update_remotes {
                 follow_up_host
-            } else if report.should_offer_remote_update(
-                command.no_input,
-                stdin_is_terminal,
-                output.is_json(),
-                command.dry_run,
-            ) {
+            } else if remote_host_handoff_supported
+                && report.should_offer_remote_update(
+                    command.no_input,
+                    stdin_is_terminal,
+                    output.is_json(),
+                    command.dry_run,
+                )
+            {
                 prompt_remote_host_update(&remote_choices)?
             } else {
                 None
