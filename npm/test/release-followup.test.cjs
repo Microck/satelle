@@ -192,6 +192,10 @@ test("release workflow validates six targets and publishes only a fully verified
   );
   assert.match(
     workflow,
+    /Install trusted publishing npm[\s\S]*?npm install --global npm@11\.5\.1[\s\S]*?test "\$\(npm --version\)" = "11\.5\.1"/,
+  );
+  assert.match(
+    workflow,
     /npm publish "\$package" --provenance --access public --tag "rc-v\$RELEASE_VERSION"/,
   );
   assert.match(workflow, /npm view "\$package_name@\$RELEASE_VERSION" dist\.integrity --json/);

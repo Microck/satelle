@@ -476,20 +476,31 @@ impl GithubReleaseSource {
             .map_err(SelfUpdateError::Http)?;
         read_response_bounded(response, limit)
     }
-}
 
-impl ReleaseSource for GithubReleaseSource {
-    fn latest_stable_version(&self) -> Result<String, SelfUpdateError> {
-        let tag = run_gh_line(&[
-            "api",
-            "repos/Microck/satelle/releases/latest",
-            "--jq",
-            ".tag_name",
-        ])?;
+    fn latest_stable_version_with(
+        &self,
+        verifier_program: &Path,
+    ) -> Result<String, SelfUpdateError> {
+        require_release_verifier_with(verifier_program)?;
+        let tag = run_gh_line_with(
+            verifier_program,
+            &[
+                "api",
+                "repos/Microck/satelle/releases/latest",
+                "--jq",
+                ".tag_name",
+            ],
+        )?;
         tag.strip_prefix('v')
             .filter(|version| !version.is_empty())
             .map(str::to_string)
             .ok_or(SelfUpdateError::ReleaseMetadataInvalid)
+    }
+}
+
+impl ReleaseSource for GithubReleaseSource {
+    fn latest_stable_version(&self) -> Result<String, SelfUpdateError> {
+        self.latest_stable_version_with(Path::new("gh"))
     }
 
     fn fetch_verified_release(
@@ -1561,11 +1572,15 @@ fn verify_release_attestation(archive: &Path, version: &str) -> Result<(), SelfU
 }
 
 fn run_gh_line(arguments: &[&str]) -> Result<String, SelfUpdateError> {
+    run_gh_line_with(Path::new("gh"), arguments)
+}
+
+fn run_gh_line_with(program: &Path, arguments: &[&str]) -> Result<String, SelfUpdateError> {
     // Write bounded command output to a file instead of a pipe. Waiting for a
     // child before draining a pipe can deadlock if it fills the pipe buffer.
     let mut stdout = tempfile::tempfile().map_err(SelfUpdateError::GhOutput)?;
     let child_stdout = stdout.try_clone().map_err(SelfUpdateError::GhOutput)?;
-    let mut child = Command::new("gh")
+    let mut child = Command::new(program)
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::from(child_stdout))
@@ -2096,6 +2111,23 @@ mod tests {
 
         let error = require_release_verifier_with(&missing_gh)
             .expect_err("missing gh must fail before Host artifact release I/O");
+        assert!(matches!(&error, SelfUpdateError::GhUnavailable));
+        assert_eq!(error.code(), "release-verifier-unavailable");
+        assert_eq!(
+            error.recovery_command().as_deref(),
+            Some("install and authenticate gh, then retry")
+        );
+    }
+
+    #[test]
+    fn latest_release_query_preflights_the_release_verifier() {
+        let directory = tempdir().unwrap();
+        let missing_gh = directory.path().join("gh");
+        let source = GithubReleaseSource::new().unwrap();
+
+        let error = source
+            .latest_stable_version_with(&missing_gh)
+            .expect_err("missing gh must fail before the latest release query");
         assert!(matches!(&error, SelfUpdateError::GhUnavailable));
         assert_eq!(error.code(), "release-verifier-unavailable");
         assert_eq!(
