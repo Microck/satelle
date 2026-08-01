@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -25,7 +25,7 @@ const MANIFEST_LIMIT: u64 = 64 * 1024;
 const ARCHIVE_LIMIT: u64 = 256 * 1024 * 1024;
 const BINARY_LIMIT: u64 = 256 * 1024 * 1024;
 const RECEIPT_FILE_NAME: &str = ".satelle-install.json";
-const LOCK_FILE_NAME: &str = ".satelle-install.lock";
+const INSTALL_LOCK_NAME: &str = ".satelle-install.lock";
 const STAGED_RECEIPT_FILE_NAME: &str = ".satelle-receipt.updating";
 const PREVIOUS_RECEIPT_FILE_NAME: &str = ".satelle-receipt.previous";
 const PACKAGE_INSTALL_CONTEXT_ENV: &str = "SATELLE_PACKAGE_INSTALL_CONTEXT";
@@ -1367,18 +1367,32 @@ fn preserve_executable_access_mode(
 }
 
 struct InstallLock {
-    _file: File,
+    path: PathBuf,
 }
 
 impl InstallLock {
     fn acquire(parent: &Path) -> Result<Self, SelfUpdateError> {
-        let path = parent.join(LOCK_FILE_NAME);
-        let file = satelle_core::open_or_create_owner_only_file(&path)
-            .map_err(|error| SelfUpdateError::InstallLock(io::Error::other(error)))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(TryLockError::WouldBlock) => Err(SelfUpdateError::InstallLocked(path)),
-            Err(TryLockError::Error(error)) => Err(SelfUpdateError::InstallLock(error)),
+        let path = parent.join(INSTALL_LOCK_NAME);
+        match fs::create_dir(&path) {
+            Ok(()) => Ok(Self { path }),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Err(SelfUpdateError::InstallLocked(path))
+            }
+            Err(error) => Err(SelfUpdateError::InstallLock(error)),
+        }
+    }
+}
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "could not release the Satelle installation lock directory"
+            );
         }
     }
 }
@@ -2947,6 +2961,43 @@ mod tests {
         assert_eq!(receipt.version, "1.1.0");
         assert_eq!(receipt.artifact_digest, "09".repeat(32));
         assert_eq!(receipt.install_method, "satelle-install-script");
+        assert!(
+            !fixture
+                .current_binary
+                .parent()
+                .unwrap()
+                .join(INSTALL_LOCK_NAME)
+                .exists(),
+            "a completed CLI update must release the shared installer lock path"
+        );
+    }
+
+    #[test]
+    fn cli_and_installers_share_one_directory_lock_protocol() {
+        let directory = tempdir().unwrap();
+        let lock_path = directory.path().join(INSTALL_LOCK_NAME);
+
+        fs::create_dir(&lock_path).unwrap();
+        let blocked = match InstallLock::acquire(directory.path()) {
+            Ok(_) => panic!("an installer-owned lock directory must block the CLI"),
+            Err(error) => error,
+        };
+        assert!(matches!(blocked, SelfUpdateError::InstallLocked(path) if path == lock_path));
+        fs::remove_dir(&lock_path).unwrap();
+
+        {
+            let _lock = InstallLock::acquire(directory.path()).unwrap();
+            assert!(lock_path.is_dir());
+            assert_eq!(
+                fs::create_dir(&lock_path).unwrap_err().kind(),
+                io::ErrorKind::AlreadyExists,
+                "the CLI lock must block the installers' atomic mkdir"
+            );
+        }
+        assert!(
+            !lock_path.exists(),
+            "releasing the CLI lock must restore the installers' acquisition path"
+        );
     }
 
     #[test]
