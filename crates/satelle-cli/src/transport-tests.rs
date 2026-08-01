@@ -77,6 +77,35 @@ fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
         serde_json::json!("restore-storage-backup")
     );
 
+    let completion_recovery_command = "satelle host offline-storage-maintenance --operation \
+        restore --host 'remote host' --operation-id storage-maintenance-exact --state-root \
+        '/state root' --backup '/state root/backup file' --yes --reconcile-completion";
+    let completion_failure = SatelleError::storage_maintenance_partially_applied(
+        &["restore-storage-backup".to_string()],
+        "record-storage-maintenance-ledger-completion",
+        &[],
+        completion_recovery_command,
+        "completion write failed",
+    );
+    let wrapped_completion_failure = storage_maintenance_partial_error(
+        "remote host",
+        &[
+            "stop-host-api-service".to_string(),
+            "restore-storage-backup".to_string(),
+            "restart-host-api-service".to_string(),
+            "verify-host-api-service".to_string(),
+        ],
+        "restore-storage-backup",
+        &[],
+        &recovery_command,
+        completion_failure,
+    );
+    assert_eq!(
+        wrapped_completion_failure.recovery_command.as_deref(),
+        Some(completion_recovery_command),
+        "the remote operation-bound reconciliation command must survive wrapping"
+    );
+
     let mut remote_partial = SatelleError::storage_maintenance_partially_applied(
         &["cleanup-storage-backups".to_string()],
         "cleanup-storage-backups",

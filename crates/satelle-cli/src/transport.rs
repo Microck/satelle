@@ -3045,6 +3045,23 @@ fn storage_maintenance_partial_error(
     recovery_command: &str,
     source: SatelleError,
 ) -> SatelleError {
+    // A remote completion failure already owns a durable operation and
+    // returns its exact reconciliation command. Other source errors can carry
+    // generic advice, so only this phase overrides the public retry fallback.
+    let recovery_command = if source.code == ErrorCode::SetupPartiallyApplied
+        && source
+            .details
+            .get("failed_action")
+            .and_then(serde_json::Value::as_str)
+            == Some("record-storage-maintenance-ledger-completion")
+    {
+        source
+            .recovery_command
+            .clone()
+            .unwrap_or_else(|| recovery_command.to_string())
+    } else {
+        recovery_command.to_string()
+    };
     let mut error = if completed_actions.is_empty() {
         let mut error = SatelleError::setup_action_failed(
             host,
@@ -3052,10 +3069,10 @@ fn storage_maintenance_partial_error(
             skipped_actions,
             source.to_string(),
         );
-        error.recovery_command = Some(recovery_command.to_string());
+        error.recovery_command = Some(recovery_command.clone());
         error.details.insert(
             "recovery_command".to_string(),
-            serde_json::Value::String(recovery_command.to_string()),
+            serde_json::Value::String(recovery_command),
         );
         error
     } else {
@@ -3063,7 +3080,7 @@ fn storage_maintenance_partial_error(
             completed_actions,
             failed_action,
             skipped_actions,
-            recovery_command,
+            &recovery_command,
             source.to_string(),
         )
     };
