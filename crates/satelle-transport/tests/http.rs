@@ -2444,11 +2444,17 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
         address,
         &bootstrap_token,
         &host_identity,
-        &format!(
-            "/v1/maintenance/bootstrap/{update_operation_id}/host_binary_replacement/host_update/begin"
-        ),
+        &format!("/v1/maintenance/host-update/{update_operation_id}/begin"),
         update_operation_id,
     )
+    .json(&serde_json::json!({
+        "schema_version": "satelle.host-update-maintenance.v1",
+        "recovery_identity": {
+            "target_version": "0.1.0",
+            "artifact_digest":
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+    }))
     .send()
     .await
     .expect("begin Host update maintenance");

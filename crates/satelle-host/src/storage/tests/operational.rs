@@ -370,6 +370,8 @@ fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
 
             DROP TABLE authorized_provider_bindings;
             DROP TABLE provider_smoke_hmac_key;
+            ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
+            ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
             DELETE FROM schema_migrations WHERE version IN (12, 13, 14);
             PRAGMA user_version = 11;",
         )
@@ -577,7 +579,9 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
         .connection_for_test()
         .execute_batch(
             "DROP TABLE authorized_provider_bindings;
-             DROP TABLE provider_smoke_hmac_key;",
+             DROP TABLE provider_smoke_hmac_key;
+             ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
+             ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;",
         )
         .expect("remove version twelve provider bindings table");
     storage
@@ -716,6 +720,17 @@ fn durable_operation_vocabularies_are_closed_over_pr04_mutations() {
             vec![SetupActionPlan::new("mutate", "Mutate host state", false).unwrap()],
         )
         .unwrap();
+        let plan = if kind == SetupOperationKind::HostUpdate {
+            plan.with_host_update_recovery_identity(
+                satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+                    "0.1.0",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            )
+            .unwrap()
+        } else {
+            plan
+        };
         let capability = storage
             .begin_setup_run(&plan, lease_owner(&operation_id, at(1)))
             .expect("acquire Maintenance Lease before mutation");
@@ -763,13 +778,13 @@ fn newer_schema_history_is_rejected_without_downgrade() {
         .connection_for_test()
         .execute(
             "INSERT INTO schema_migrations (version, checksum, applied_at)
-             VALUES (14, ?1, '2026-07-21T00:00:00Z')",
+             VALUES (15, ?1, '2026-07-21T00:00:00Z')",
             ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
         )
         .expect("insert future migration");
     storage
         .connection_for_test()
-        .pragma_update(None, "user_version", 14)
+        .pragma_update(None, "user_version", 15)
         .expect("mark future schema");
     drop(storage);
 
@@ -780,7 +795,7 @@ fn newer_schema_history_is_rejected_without_downgrade() {
     assert_eq!(error.kind(), StorageErrorKind::MigrationIntegrity);
     let connection = Connection::open(state.path().join(DATABASE_FILE_NAME))
         .expect("future database remains readable");
-    assert_eq!(pragma_integer(&connection, "user_version"), 14);
+    assert_eq!(pragma_integer(&connection, "user_version"), 15);
 }
 
 #[test]
@@ -813,6 +828,8 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              ALTER TABLE api_tokens DROP COLUMN token_state;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
+             ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
+             ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
              DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14);
              PRAGMA user_version = 7;",
         )
