@@ -5059,22 +5059,29 @@ fn selected_repair_run(
         .map(Some)
 }
 
-fn resumes_selected_host_update(selected_run: Option<&RepairLedgerPlan>) -> bool {
-    selected_run.is_some_and(|run| {
-        matches!(
-            run.selected_operation_kind,
-            Some(
-                satelle_transport::SetupRepairOperationKind::HostUpdate
-                    | satelle_transport::SetupRepairOperationKind::Repair
-            )
-        ) && matches!(
-            run.selected_run_status,
-            Some(
-                satelle_transport::SetupRepairRunStatus::Running
-                    | satelle_transport::SetupRepairRunStatus::OutcomeUnknown
-            )
-        ) && run.host_update_recovery_identity.is_some()
-    })
+fn selected_host_replacement_operation(
+    selected_run: Option<&RepairLedgerPlan>,
+) -> Option<HostUpdateOperation> {
+    let run = selected_run?;
+    if !matches!(
+        run.selected_run_status,
+        Some(
+            satelle_transport::SetupRepairRunStatus::Running
+                | satelle_transport::SetupRepairRunStatus::OutcomeUnknown
+        )
+    ) || run.host_update_recovery_identity.is_none()
+    {
+        return None;
+    }
+    match run.selected_operation_kind {
+        Some(satelle_transport::SetupRepairOperationKind::HostUpdate) => {
+            Some(HostUpdateOperation::Update)
+        }
+        Some(satelle_transport::SetupRepairOperationKind::Repair) => {
+            Some(HostUpdateOperation::Repair)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn plan_repair_upgrades(
@@ -5086,8 +5093,9 @@ pub(crate) fn plan_repair_upgrades(
     };
 
     let selected_run = selected_repair_run(host, run_id)?;
-    let resumes_host_update = resumes_selected_host_update(selected_run.as_ref());
-    let target_version = if resumes_host_update {
+    let resumes_host_replacement =
+        selected_host_replacement_operation(selected_run.as_ref()).is_some();
+    let target_version = if resumes_host_replacement {
         selected_run
             .as_ref()
             .and_then(|run| run.host_update_recovery_identity.as_ref())
@@ -5098,14 +5106,14 @@ pub(crate) fn plan_repair_upgrades(
     };
     let inspection = inspect_host_maintenance(
         host,
-        if resumes_host_update {
+        if resumes_host_replacement {
             HostMaintenancePlanKind::HostUpdateRecovery
         } else {
             HostMaintenancePlanKind::Repair
         },
         target_version,
     )?;
-    if resumes_host_update {
+    if resumes_host_replacement {
         validate_host_update_recovery_artifact(
             &inspection,
             selected_run
@@ -5135,7 +5143,7 @@ pub(crate) fn plan_repair_upgrades(
         .map(parse_release_version)
         .transpose()?;
     let minimum_exceeds_cli = minimum_host_release.is_some_and(|minimum| minimum > cli_release);
-    let host_reason = if resumes_host_update {
+    let host_reason = if resumes_host_replacement {
         Some(RepairCompatibilityReason::Corrupted)
     } else if inspection.current_version.is_none() {
         Some(RepairCompatibilityReason::Missing)
@@ -5289,8 +5297,9 @@ pub(crate) fn apply_repair_upgrades(
         return Ok(repair);
     }
     let selected_run = selected_repair_run(host, recovery_run_id)?;
-    let resumes_host_update = resumes_selected_host_update(selected_run.as_ref());
-    let recovery_identity = resumes_host_update
+    let resumed_operation = selected_host_replacement_operation(selected_run.as_ref());
+    let recovery_identity = resumed_operation
+        .is_some()
         .then(|| {
             selected_run
                 .as_ref()
@@ -5309,17 +5318,13 @@ pub(crate) fn apply_repair_upgrades(
     } else {
         plan_host_update(host, target_version, &components, false)?
     };
-    let operation = if resumes_host_update {
-        HostUpdateOperation::Update
-    } else {
-        HostUpdateOperation::Repair
-    };
+    let operation = resumed_operation.unwrap_or(HostUpdateOperation::Repair);
     let source = match apply_host_update_with_operation(
         host,
         target_version,
         host_update,
         operation,
-        recovery_run_id.filter(|_| resumes_host_update),
+        recovery_run_id.filter(|_| resumed_operation.is_some()),
         || {
             if let Some(recovery_identity) = recovery_identity.as_ref() {
                 plan_host_update_recovery(host, recovery_identity)

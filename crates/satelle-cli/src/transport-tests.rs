@@ -95,15 +95,18 @@ fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
 }
 
 #[test]
-fn active_or_outcome_unknown_host_updates_resume_the_selected_operation_id() {
+fn active_host_replacements_resume_with_the_selected_operation_kind() {
     let selected = |operation_kind, run_status| RepairLedgerPlan {
         available: true,
         automatic_action_ids: Vec::new(),
         selected_operation_kind: Some(operation_kind),
         selected_run_status: Some(run_status),
-        host_update_recovery_identity: (operation_kind
-            == satelle_transport::SetupRepairOperationKind::HostUpdate)
-            .then(test_host_update_recovery_identity),
+        host_update_recovery_identity: matches!(
+            operation_kind,
+            satelle_transport::SetupRepairOperationKind::HostUpdate
+                | satelle_transport::SetupRepairOperationKind::Repair
+        )
+        .then(test_host_update_recovery_identity),
     };
     let interrupted_host_update = selected(
         satelle_transport::SetupRepairOperationKind::HostUpdate,
@@ -129,14 +132,21 @@ fn active_or_outcome_unknown_host_updates_resume_the_selected_operation_id() {
         host_update_recovery_identity: None,
     };
 
-    assert!(resumes_selected_host_update(Some(&interrupted_host_update)));
-    assert!(resumes_selected_host_update(Some(&running_host_update)));
-    assert!(!resumes_selected_host_update(Some(&completed_host_update)));
-    assert!(!resumes_selected_host_update(Some(&interrupted_repair)));
-    assert!(!resumes_selected_host_update(Some(
-        &interrupted_bootstrap_handoff
-    )));
-    assert!(!resumes_selected_host_update(None));
+    assert!(matches!(
+        selected_host_replacement_operation(Some(&interrupted_host_update)),
+        Some(HostUpdateOperation::Update)
+    ));
+    assert!(matches!(
+        selected_host_replacement_operation(Some(&running_host_update)),
+        Some(HostUpdateOperation::Update)
+    ));
+    assert!(matches!(
+        selected_host_replacement_operation(Some(&interrupted_repair)),
+        Some(HostUpdateOperation::Repair)
+    ));
+    assert!(selected_host_replacement_operation(Some(&completed_host_update)).is_none());
+    assert!(selected_host_replacement_operation(Some(&interrupted_bootstrap_handoff)).is_none());
+    assert!(selected_host_replacement_operation(None).is_none());
 }
 
 #[test]
