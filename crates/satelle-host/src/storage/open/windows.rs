@@ -100,6 +100,44 @@ impl SecureStateDirectory {
         })
     }
 
+    pub(super) fn open_read_only(state_root: &Path) -> Result<Self, StorageError> {
+        if !state_root.is_absolute() || state_root.parent().is_none() {
+            return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
+        }
+
+        let prefixes = directory_prefixes(state_root)?;
+        let drive_root = prefixes
+            .first()
+            .ok_or_else(|| StorageError::new(StorageErrorKind::UnsafeStatePath))?;
+        require_fixed_drive(drive_root)?;
+
+        let process_identity = ProcessIdentity::current()?;
+        let mut pinned_directories = Vec::with_capacity(prefixes.len());
+        for (index, path) in prefixes.iter().enumerate() {
+            let is_state_root = index + 1 == prefixes.len();
+            let desired_access = if is_state_root {
+                FILE_READ_ATTRIBUTES | READ_CONTROL
+            } else {
+                FILE_READ_ATTRIBUTES
+            };
+            let handle = open_directory(path, desired_access)?
+                .ok_or_else(|| StorageError::new(StorageErrorKind::StateDirectoryUnavailable))?;
+            require_directory_handle(&handle)?;
+            if is_state_root {
+                require_persistent_acls(&handle)?;
+                require_owner(&handle, &process_identity.user)?;
+                verify_private_security(&handle, &process_identity.user, ObjectKind::Directory)?;
+            }
+            pinned_directories.push(handle);
+        }
+
+        Ok(Self {
+            root: state_root.to_path_buf(),
+            _pinned_directories: pinned_directories,
+            process_identity,
+        })
+    }
+
     pub(super) fn open_private_leaf(
         &self,
         file_name: &str,

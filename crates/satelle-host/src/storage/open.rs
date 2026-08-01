@@ -18,6 +18,8 @@ use uuid::Uuid;
 use rustix::fs::{FileType, Mode, OFlags};
 #[cfg(unix)]
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -254,7 +256,7 @@ enum ValidationStep {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackupValidationMode {
     DurableStaging,
-    ReadOnlyMemory,
+    ReadOnlyFile,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -713,7 +715,23 @@ pub(super) fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, St
     // Recheck the full ancestor chain after creation. A writable or symlinked
     // parent is rejected before any protected leaf is opened.
     validate_state_root_ancestors(state_root)?;
-    open_and_restrict_state_directory(state_root)
+    open_state_directory(state_root, true)
+}
+
+#[cfg(unix)]
+fn open_state_root_read_only(state_root: &Path) -> Result<StateDirectory, StorageError> {
+    if !state_root.is_absolute() || state_root.parent().is_none() {
+        return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
+    }
+    validate_state_root_ancestors(state_root)?;
+    let metadata = fs::symlink_metadata(state_root).map_err(|source| {
+        StorageError::with_source(StorageErrorKind::StateDirectoryUnavailable, source)
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
+    }
+    validate_state_root_owner(&metadata)?;
+    open_state_directory(state_root, false)
 }
 
 #[cfg(unix)]
@@ -752,7 +770,10 @@ fn validate_state_root_owner(metadata: &fs::Metadata) -> Result<(), StorageError
 }
 
 #[cfg(unix)]
-fn open_and_restrict_state_directory(path: &Path) -> Result<StateDirectory, StorageError> {
+fn open_state_directory(
+    path: &Path,
+    restrict_permissions: bool,
+) -> Result<StateDirectory, StorageError> {
     let descriptor = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -767,9 +788,11 @@ fn open_and_restrict_state_directory(path: &Path) -> Result<StateDirectory, Stor
     {
         return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
     }
-    rustix::fs::fchmod(&descriptor, Mode::RWXU).map_err(|source| {
-        StorageError::with_source(StorageErrorKind::StateDirectoryUnavailable, source)
-    })?;
+    if restrict_permissions {
+        rustix::fs::fchmod(&descriptor, Mode::RWXU).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::StateDirectoryUnavailable, source)
+        })?;
+    }
     let path_metadata = fs::symlink_metadata(path).map_err(|source| {
         StorageError::with_source(StorageErrorKind::StateDirectoryUnavailable, source)
     })?;
@@ -798,6 +821,12 @@ fn open_and_restrict_state_directory(path: &Path) -> Result<StateDirectory, Stor
 #[cfg(windows)]
 pub(super) fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, StorageError> {
     windows::SecureStateDirectory::prepare(state_root).map(|secure| StateDirectory { secure })
+}
+
+#[cfg(windows)]
+fn open_state_root_read_only(state_root: &Path) -> Result<StateDirectory, StorageError> {
+    windows::SecureStateDirectory::open_read_only(state_root)
+        .map(|secure| StateDirectory { secure })
 }
 
 fn acquire_ownership_lock(state_directory: &StateDirectory) -> Result<OwnershipLock, StorageError> {
@@ -1516,27 +1545,37 @@ fn validate_migration_backup_at_with_hook(
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    if mode == BackupValidationMode::ReadOnlyMemory {
-        let database_size = usize::try_from(
-            backup_file
-                .metadata()
-                .map_err(|source| {
-                    StorageError::with_source(StorageErrorKind::IntegrityCheckFailed, source)
-                })?
-                .len(),
+    if mode == BackupValidationMode::ReadOnlyFile {
+        #[cfg(target_os = "linux")]
+        // The guarded descriptor is the authority boundary. Reopening its
+        // process-local descriptor path gives SQLite a file-backed view
+        // without granting a writable state-directory pathname.
+        let validation = Connection::open_with_flags(
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", backup_file.as_raw_fd())),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .map_err(|source| {
-            StorageError::with_source(StorageErrorKind::IntegrityCheckFailed, source)
-        })?;
-        let mut source = &backup_file;
-        source.rewind().map_err(|source| {
-            StorageError::with_source(StorageErrorKind::IntegrityCheckFailed, source)
-        })?;
-        let mut validation = Connection::open_in_memory()
-            .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?;
-        validation
-            .deserialize_read_exact("main", &mut source, database_size, true)
-            .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?;
+        .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?;
+        #[cfg(target_os = "macos")]
+        let validation_registration = unix_vfs::register_validation_file(&backup_file)?;
+        #[cfg(target_os = "macos")]
+        let validation = Connection::open_with_flags_and_vfs(
+            validation_registration.path(),
+            flags,
+            unix_vfs::name()?,
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?;
+        #[cfg(windows)]
+        let validation = {
+            let validation_path =
+                sqlite_leaf_path(state_root, state_directory, physical_backup_file_name);
+            let mut validation_uri = url::Url::from_file_path(validation_path)
+                .map_err(|()| StorageError::new(StorageErrorKind::UnsafeStatePath))?;
+            validation_uri
+                .query_pairs_mut()
+                .append_pair("immutable", "1");
+            Connection::open_with_flags(validation_uri.as_str(), flags | OpenFlags::SQLITE_OPEN_URI)
+                .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?
+        };
         validate_backup_migration_state(&validation, manifest_read.manifest.source_schema_version)?;
         verify_integrity(&validation)?;
     }
@@ -1686,7 +1725,7 @@ pub(super) fn validate_migration_backup_preview(
         backup_file_name,
         backup_file_name,
         &manifest_file_name,
-        BackupValidationMode::ReadOnlyMemory,
+        BackupValidationMode::ReadOnlyFile,
         |_| Ok(()),
     )
 }
@@ -2673,7 +2712,7 @@ pub(super) fn validate_migration_backup_for_preview(
     state_root: &Path,
     backup_file_name: &str,
 ) -> Result<(), StorageError> {
-    let state_directory = prepare_state_root(state_root)?;
+    let state_directory = open_state_root_read_only(state_root)?;
     validate_migration_backup_preview(state_root, &state_directory, backup_file_name).map(|_| ())
 }
 

@@ -3063,8 +3063,13 @@ fn storage_maintenance_partial_error(
             source.to_string(),
         )
     };
+    copy_storage_maintenance_evidence(&mut error, &source);
+    error
+}
+
+fn copy_storage_maintenance_evidence(error: &mut SatelleError, source: &SatelleError) {
     // The remote mutation can fail after deleting only part of the approved
-    // set. Keep those exact identities in the outer service-recovery error.
+    // set. Keep those exact identities in every later service-recovery error.
     for key in [
         "removed_backup_file_names",
         "removed_metadata_file_names",
@@ -3073,6 +3078,15 @@ fn storage_maintenance_partial_error(
         if let Some(value) = source.details.get(key) {
             error.details.insert(key.to_string(), value.clone());
         }
+    }
+}
+
+fn preserve_pending_storage_mutation(
+    mut error: SatelleError,
+    mutation: &Result<serde_json::Value, SatelleError>,
+) -> SatelleError {
+    if let Err(source) = mutation {
+        copy_storage_maintenance_evidence(&mut error, source);
     }
     error
 }
@@ -3317,13 +3331,16 @@ pub(crate) fn apply_ssh_storage_maintenance(
             &mut bootstrap_lock,
         )
         .map_err(|error| {
-            storage_maintenance_partial_error(
-                &transport.alias,
-                &completed_actions,
-                "restart-host-api-service",
-                &["verify-host-api-service".to_string()],
-                &recovery_command,
-                map_ssh_daemon_bootstrap_error(&transport.alias, error),
+            preserve_pending_storage_mutation(
+                storage_maintenance_partial_error(
+                    &transport.alias,
+                    &completed_actions,
+                    "restart-host-api-service",
+                    &["verify-host-api-service".to_string()],
+                    &recovery_command,
+                    map_ssh_daemon_bootstrap_error(&transport.alias, error),
+                ),
+                &mutation,
             )
         })?;
         match target.service_platform() {
@@ -3336,13 +3353,16 @@ pub(crate) fn apply_ssh_storage_maintenance(
             DaemonServicePlatform::Linux => unreachable!("Linux storage maintenance is rejected"),
         }
         .map_err(|error| {
-            storage_maintenance_partial_error(
-                &transport.alias,
-                &completed_actions,
-                "restart-host-api-service",
-                &["verify-host-api-service".to_string()],
-                &recovery_command,
-                map_ssh_daemon_bootstrap_error(&transport.alias, error),
+            preserve_pending_storage_mutation(
+                storage_maintenance_partial_error(
+                    &transport.alias,
+                    &completed_actions,
+                    "restart-host-api-service",
+                    &["verify-host-api-service".to_string()],
+                    &recovery_command,
+                    map_ssh_daemon_bootstrap_error(&transport.alias, error),
+                ),
+                &mutation,
             )
         })?;
         completed_actions.push("restart-host-api-service".to_string());
@@ -3362,62 +3382,76 @@ pub(crate) fn apply_ssh_storage_maintenance(
             ssh_bootstrap::PersistentServiceObservation::Running,
         )
         .map_err(|error| {
-            storage_maintenance_partial_error(
-                &transport.alias,
-                &completed_actions,
-                "verify-host-api-service",
-                &[],
-                &recovery_command,
-                error,
+            preserve_pending_storage_mutation(
+                storage_maintenance_partial_error(
+                    &transport.alias,
+                    &completed_actions,
+                    "verify-host-api-service",
+                    &[],
+                    &recovery_command,
+                    error,
+                ),
+                &mutation,
             )
         })?;
         completed_actions.push("verify-host-api-service".to_string());
     }
     let (verification_tunnel, verification_client) =
         transport.durable_service_client().map_err(|error| {
-            storage_maintenance_partial_error(
-                &transport.alias,
-                &completed_actions,
-                "verify-host-api-service",
-                &[],
-                &recovery_command,
-                error,
+            preserve_pending_storage_mutation(
+                storage_maintenance_partial_error(
+                    &transport.alias,
+                    &completed_actions,
+                    "verify-host-api-service",
+                    &[],
+                    &recovery_command,
+                    error,
+                ),
+                &mutation,
             )
         })?;
     wait_for_durable_daemon(&transport.alias, || verification_client.capabilities()).map_err(
         |error| {
-            storage_maintenance_partial_error(
-                &transport.alias,
-                &completed_actions,
-                "verify-host-api-service",
-                &[],
-                &recovery_command,
-                error,
+            preserve_pending_storage_mutation(
+                storage_maintenance_partial_error(
+                    &transport.alias,
+                    &completed_actions,
+                    "verify-host-api-service",
+                    &[],
+                    &recovery_command,
+                    error,
+                ),
+                &mutation,
             )
         },
     )?;
     commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock).map_err(|error| {
-        storage_maintenance_partial_error(
-            &transport.alias,
-            &completed_actions,
-            "commit-storage-maintenance-fence",
-            &[],
-            &recovery_command,
-            error,
+        preserve_pending_storage_mutation(
+            storage_maintenance_partial_error(
+                &transport.alias,
+                &completed_actions,
+                "commit-storage-maintenance-fence",
+                &[],
+                &recovery_command,
+                error,
+            ),
+            &mutation,
         )
     })?;
     let result = match mutation {
         Ok(result) => result,
         Err(source) => {
             bootstrap_lock.release_committed_handoff().map_err(|_| {
-                storage_maintenance_partial_error(
+                let mut error = storage_maintenance_partial_error(
                     &transport.alias,
                     &completed_actions,
                     "release-storage-maintenance-fence",
                     &[],
                     &recovery_command,
                     SatelleError::host_unreachable(&transport.alias),
-                )
+                );
+                copy_storage_maintenance_evidence(&mut error, &source);
+                error
             })?;
             return Err(storage_maintenance_partial_error(
                 &transport.alias,

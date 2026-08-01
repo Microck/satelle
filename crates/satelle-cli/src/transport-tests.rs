@@ -88,17 +88,34 @@ fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
         "removed_backup_file_names".to_string(),
         serde_json::json!(["satelle.sqlite3.migration-v14-first.backup"]),
     );
-    let preserved = storage_maintenance_partial_error(
+    remote_partial.details.insert(
+        "removed_metadata_file_names".to_string(),
+        serde_json::json!(["satelle.sqlite3.migration-v14-first.backup.json"]),
+    );
+    remote_partial
+        .details
+        .insert("recordings_deleted".to_string(), serde_json::json!(true));
+    let pending_mutation = Err(remote_partial);
+    let restart_failure = storage_maintenance_partial_error(
         "remote host",
         &["stop-host-api-service".to_string()],
-        "cleanup-storage-backups",
-        &["restart-host-api-service".to_string()],
+        "restart-host-api-service",
+        &["verify-host-api-service".to_string()],
         &recovery_command,
-        remote_partial,
+        SatelleError::host_unreachable("remote host"),
     );
+    let preserved = preserve_pending_storage_mutation(restart_failure, &pending_mutation);
     assert_eq!(
         preserved.details["removed_backup_file_names"],
         serde_json::json!(["satelle.sqlite3.migration-v14-first.backup"])
+    );
+    assert_eq!(
+        preserved.details["removed_metadata_file_names"],
+        serde_json::json!(["satelle.sqlite3.migration-v14-first.backup.json"])
+    );
+    assert_eq!(
+        preserved.details["recordings_deleted"],
+        serde_json::json!(true)
     );
 
     assert!(

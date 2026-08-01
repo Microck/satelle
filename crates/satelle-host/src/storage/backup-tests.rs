@@ -86,22 +86,34 @@ impl BackupFixture {
 #[test]
 fn restore_preview_validation_does_not_require_state_directory_writes() {
     let fixture = BackupFixture::new(1);
-    let state_directory = fixture.state_directory();
     let original_permissions = fs::metadata(&fixture.state_root)
         .expect("read state directory metadata")
         .permissions();
     fs::set_permissions(&fixture.state_root, fs::Permissions::from_mode(0o500))
         .expect("make the state directory read-only");
 
-    let validation = validate_migration_backup_preview(
-        &fixture.state_root,
-        &state_directory,
-        fixture.backup_file_name(),
-    );
+    let validation =
+        validate_migration_backup_for_preview(&fixture.state_root, fixture.backup_file_name());
+    let preview_mode = fs::metadata(&fixture.state_root)
+        .expect("read state directory metadata after preview")
+        .permissions()
+        .mode()
+        & 0o777;
 
     fs::set_permissions(&fixture.state_root, original_permissions)
         .expect("restore state directory permissions");
-    validation.expect("preview validates without staging a writable copy");
+    if let Err(error) = validation {
+        panic!(
+            "preview validates without staging a writable copy: {error}; source: {}",
+            error
+                .source()
+                .map_or_else(|| "none".to_string(), ToString::to_string)
+        );
+    }
+    assert_eq!(
+        0o500, preview_mode,
+        "preview must not change directory mode"
+    );
 }
 
 #[test]
