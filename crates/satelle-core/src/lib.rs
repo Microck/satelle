@@ -83,10 +83,10 @@ pub struct SatelleConfig {
     pub model_alias: Option<String>,
     pub provider_alias: Option<String>,
     pub output_format: Option<PresentationOutputFormat>,
+    pub log_verbosity: Option<LogVerbosity>,
     pub experimental_provider_computer_use: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
-    pub yolo: Option<bool>,
     pub command_history: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_rate_limits: Option<ApiRateLimits>,
@@ -139,9 +139,9 @@ impl SatelleConfig {
             model_alias: None,
             provider_alias: None,
             output_format: None,
+            log_verbosity: None,
             experimental_provider_computer_use: None,
             experimental_provider_computer_use_by_provider: BTreeMap::new(),
-            yolo: None,
             command_history: None,
             api_rate_limits: None,
             hosts,
@@ -162,15 +162,15 @@ impl SatelleConfig {
         if higher.output_format.is_some() {
             self.output_format = higher.output_format;
         }
+        if higher.log_verbosity.is_some() {
+            self.log_verbosity = higher.log_verbosity;
+        }
         if higher.experimental_provider_computer_use.is_some() {
             self.experimental_provider_computer_use = higher.experimental_provider_computer_use;
         }
         for (provider_alias, enabled) in higher.experimental_provider_computer_use_by_provider {
             self.experimental_provider_computer_use_by_provider
                 .insert(provider_alias, enabled);
-        }
-        if higher.yolo.is_some() {
-            self.yolo = higher.yolo;
         }
         if higher.command_history.is_some() {
             self.command_history = higher.command_history;
@@ -1762,6 +1762,15 @@ pub enum PresentationOutputFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogVerbosity {
+    Off,
+    Info,
+    Debug,
+    Trace,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SatellePathSet {
     pub config_file: PathBuf,
@@ -1842,6 +1851,19 @@ impl ResolvedConfig {
 
     pub const fn output_format_from_project(&self) -> bool {
         self.output_format_from_project
+    }
+
+    /// Returns the explicit user-owned Trusted Profile reference only when the
+    /// selection source is itself permitted to activate durable consent.
+    pub fn trusted_profile_reference(&self) -> Option<&str> {
+        let selected = self.selected_profile.as_ref()?;
+        matches!(
+            selected.source,
+            profiles::ProfileSelectionSource::UserConfig
+                | profiles::ProfileSelectionSource::CliFlag
+        )
+        .then(|| self.profile_overlay.as_ref()?.trusted_profile_reference())
+        .flatten()
     }
 
     pub fn timeout_intent_from_project(&self, alias: &str) -> bool {
@@ -2147,6 +2169,23 @@ fn load_config_with_profile_selection(
                 .collect()
         })
         .unwrap_or_default();
+    if let Some(user_config) = &user_config {
+        for (name, profile) in &user_config.profiles {
+            if let Some(reference) = profile.trusted_profile_reference()
+                && !config.trusted_profiles.contains_key(reference)
+            {
+                return Err(SatelleError::config_error(
+                    format!(
+                        "config file {} profile '{}' references missing trusted profile '{}'",
+                        user_config_path.display(),
+                        name,
+                        reference
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
     let project_defaults = project_config.as_ref().and_then(|project_config| {
         let host = project_config.default_host()?;
         let profile_name = project_config.default_profile.as_deref()?;
@@ -2465,6 +2504,17 @@ mod presentation_output_config_tests {
             Some(PresentationOutputFormat::Json)
         );
     }
+
+    #[test]
+    fn user_config_accepts_log_verbosity() {
+        let parsed = parse_user_config(
+            Path::new("/test/config.toml"),
+            "log_verbosity = \"trace\"\n",
+        )
+        .expect("parse user-owned log verbosity");
+
+        assert_eq!(parsed.config.log_verbosity, Some(LogVerbosity::Trace));
+    }
 }
 
 #[cfg(test)]
@@ -2678,19 +2728,19 @@ command_families = ["setup", "repair", "host_update", "self_update_remotes", "do
         for (raw, expected_code) in [
             (
                 "[trusted_profiles.maintenance]\ncommand_families = [\"setup\"]\n",
-                ErrorCode::ConfigError,
+                ErrorCode::TrustedProfileHostAllowlistRequired,
             ),
             (
                 "[trusted_profiles.maintenance]\nhosts = []\ncommand_families = [\"setup\"]\n",
-                ErrorCode::ConfigError,
+                ErrorCode::TrustedProfileHostAllowlistRequired,
             ),
             (
                 "[trusted_profiles.maintenance]\nhosts = [\"office-mac\"]\n",
-                ErrorCode::ConfigError,
+                ErrorCode::TrustedProfileCommandAllowlistRequired,
             ),
             (
                 "[trusted_profiles.maintenance]\nhosts = [\"office-mac\"]\ncommand_families = []\n",
-                ErrorCode::ConfigError,
+                ErrorCode::TrustedProfileCommandAllowlistRequired,
             ),
         ] {
             let error = parse_user_config(Path::new("/test/config.toml"), raw)
@@ -2727,7 +2777,7 @@ command_families = ["setup", "repair", "host_update", "self_update_remotes", "do
             );
             let error = parse_user_config(Path::new("/test/config.toml"), &raw)
                 .expect_err("reject unsupported host scope");
-            assert_eq!(error.code, ErrorCode::ConfigError);
+            assert_eq!(error.code, ErrorCode::UnsupportedTrustedProfileHostScope);
             assert_eq!(error.details.get("value"), Some(&serde_json::json!(scope)));
         }
     }
@@ -2740,9 +2790,19 @@ command_families = ["setup", "repair", "host_update", "self_update_remotes", "do
             );
             let error = parse_user_config(Path::new("/test/config.toml"), &raw)
                 .expect_err("reject unsupported command scope");
-            assert_eq!(error.code, ErrorCode::ConfigError);
+            assert_eq!(error.code, ErrorCode::UnsupportedTrustedProfileCommandScope);
             assert_eq!(error.details.get("value"), Some(&serde_json::json!(scope)));
         }
+    }
+
+    #[test]
+    fn process_global_yolo_is_not_a_user_config_key() {
+        let error = parse_user_config(Path::new("/test/config.toml"), "yolo = true\n")
+            .expect_err("reject process-global YOLO policy");
+
+        assert_eq!(error.code, ErrorCode::UnknownConfigKey);
+        assert_eq!(error.details.get("path"), Some(&serde_json::json!("yolo")));
+        assert_eq!(error.details.get("key"), Some(&serde_json::json!("yolo")));
     }
 
     #[test]
@@ -2971,15 +3031,14 @@ fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(),
 
         let hosts = profile.get("hosts").and_then(toml::Value::as_array);
         if hosts.is_none_or(Vec::is_empty) {
-            return Err(SatelleError::trusted_profile_allowlist_required(
+            return Err(SatelleError::trusted_profile_host_allowlist_required(
                 path,
                 &profile_path,
-                "hosts",
             ));
         }
         for host in hosts.into_iter().flatten().filter_map(toml::Value::as_str) {
             if unsupported_host_scope(host) {
-                return Err(SatelleError::unsupported_trusted_profile_scope(
+                return Err(SatelleError::unsupported_trusted_profile_host_scope(
                     path,
                     &format!("{profile_path}.hosts"),
                     host,
@@ -2991,10 +3050,9 @@ fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(),
             .get("command_families")
             .and_then(toml::Value::as_array);
         if commands.is_none_or(Vec::is_empty) {
-            return Err(SatelleError::trusted_profile_allowlist_required(
+            return Err(SatelleError::trusted_profile_command_allowlist_required(
                 path,
                 &profile_path,
-                "command_families",
             ));
         }
         for command in commands
@@ -3006,7 +3064,7 @@ fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(),
                 command,
                 "setup" | "repair" | "host_update" | "self_update_remotes" | "doctor_fix"
             ) {
-                return Err(SatelleError::unsupported_trusted_profile_scope(
+                return Err(SatelleError::unsupported_trusted_profile_command_scope(
                     path,
                     &format!("{profile_path}.command_families"),
                     command,
@@ -3604,9 +3662,9 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             "model_alias",
             "provider_alias",
             "output_format",
+            "log_verbosity",
             "experimental_provider_computer_use",
             "experimental_provider_computer_use_by_provider",
-            "yolo",
             "command_history",
             "api_rate_limits",
             "profile",
@@ -3995,6 +4053,10 @@ pub enum ErrorCode {
     ConfigInterpolationNotSupported,
     UnknownTimeoutKey,
     DurationUnitRequired,
+    TrustedProfileHostAllowlistRequired,
+    UnsupportedTrustedProfileHostScope,
+    TrustedProfileCommandAllowlistRequired,
+    UnsupportedTrustedProfileCommandScope,
     UnsupportedConfigComposition,
     ProjectDaemonPathOverrideNotAllowed,
     ProjectDesktopBindingNotAllowed,
@@ -4045,6 +4107,8 @@ pub enum ErrorCode {
     IncompatibleControlPlane,
     ComputerUseNotReady,
     NativeReadinessTimeout,
+    YoloNotSupported,
+    YoloBlockedByNativeApproval,
     ProviderSmokeTestTimeout,
     UnsupportedProviderComputerUse,
     ExperimentalProviderOptInRequired,
@@ -4117,6 +4181,14 @@ impl ErrorCode {
             Self::ConfigInterpolationNotSupported => "config-interpolation-not-supported",
             Self::UnknownTimeoutKey => "unknown-timeout-key",
             Self::DurationUnitRequired => "duration-unit-required",
+            Self::TrustedProfileHostAllowlistRequired => "trusted-profile-host-allowlist-required",
+            Self::UnsupportedTrustedProfileHostScope => "unsupported-trusted-profile-host-scope",
+            Self::TrustedProfileCommandAllowlistRequired => {
+                "trusted-profile-command-allowlist-required"
+            }
+            Self::UnsupportedTrustedProfileCommandScope => {
+                "unsupported-trusted-profile-command-scope"
+            }
             Self::UnsupportedConfigComposition => "unsupported-config-composition",
             Self::ProjectDaemonPathOverrideNotAllowed => "project-daemon-path-override-not-allowed",
             Self::ProjectDesktopBindingNotAllowed => "project-desktop-binding-not-allowed",
@@ -4173,6 +4245,8 @@ impl ErrorCode {
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
             Self::NativeReadinessTimeout => "native-readiness-timeout",
+            Self::YoloNotSupported => "yolo-not-supported",
+            Self::YoloBlockedByNativeApproval => "yolo-blocked-by-native-approval",
             Self::ProviderSmokeTestTimeout => "provider-smoke-test-timeout",
             Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
             Self::ExperimentalProviderOptInRequired => "experimental-provider-opt-in-required",
@@ -4267,6 +4341,10 @@ impl ErrorCode {
             | Self::ConfigInterpolationNotSupported
             | Self::UnknownTimeoutKey
             | Self::DurationUnitRequired
+            | Self::TrustedProfileHostAllowlistRequired
+            | Self::UnsupportedTrustedProfileHostScope
+            | Self::TrustedProfileCommandAllowlistRequired
+            | Self::UnsupportedTrustedProfileCommandScope
             | Self::UnsupportedConfigComposition
             | Self::ProjectDaemonPathOverrideNotAllowed
             | Self::ProjectDesktopBindingNotAllowed
@@ -4328,6 +4406,8 @@ impl ErrorCode {
             | Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
             | Self::NativeReadinessTimeout
+            | Self::YoloNotSupported
+            | Self::YoloBlockedByNativeApproval
             | Self::ProviderSmokeTestTimeout
             | Self::UnsupportedProviderComputerUse
             | Self::ExperimentalProviderNotValidated
@@ -4487,6 +4567,29 @@ impl SatelleError {
         }
     }
 
+    pub fn yolo_not_supported() -> Self {
+        Self {
+            code: ErrorCode::YoloNotSupported,
+            message: "the remote Codex control plane cannot apply YOLO approval and sandbox policy"
+                .to_string(),
+            recovery_command: Some("update Codex or rerun the command with --no-yolo".to_string()),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn yolo_blocked_by_native_approval() -> Self {
+        Self {
+            code: ErrorCode::YoloBlockedByNativeApproval,
+            message: "YOLO mode cannot bypass a native Computer Use approval".to_string(),
+            recovery_command: Some(
+                "grant the required native approval, then rerun the command".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
     pub fn config_error(message: impl Into<String>, source_detail: Option<String>) -> Self {
         Self {
             code: ErrorCode::ConfigError,
@@ -4497,7 +4600,26 @@ impl SatelleError {
         }
     }
 
+    fn trusted_profile_host_allowlist_required(config_file: &Path, profile_path: &str) -> Self {
+        Self::trusted_profile_allowlist_required(
+            ErrorCode::TrustedProfileHostAllowlistRequired,
+            config_file,
+            profile_path,
+            "hosts",
+        )
+    }
+
+    fn trusted_profile_command_allowlist_required(config_file: &Path, profile_path: &str) -> Self {
+        Self::trusted_profile_allowlist_required(
+            ErrorCode::TrustedProfileCommandAllowlistRequired,
+            config_file,
+            profile_path,
+            "command_families",
+        )
+    }
+
     fn trusted_profile_allowlist_required(
+        code: ErrorCode,
         config_file: &Path,
         profile_path: &str,
         allowlist: &str,
@@ -4513,7 +4635,7 @@ impl SatelleError {
             Value::String(allowlist.to_string()),
         );
         Self {
-            code: ErrorCode::ConfigError,
+            code,
             message: format!(
                 "config file {} Trusted Profile at {profile_path} requires a non-empty {allowlist} allowlist",
                 config_file.display()
@@ -4526,7 +4648,38 @@ impl SatelleError {
         }
     }
 
-    fn unsupported_trusted_profile_scope(config_file: &Path, toml_path: &str, value: &str) -> Self {
+    fn unsupported_trusted_profile_host_scope(
+        config_file: &Path,
+        toml_path: &str,
+        value: &str,
+    ) -> Self {
+        Self::unsupported_trusted_profile_scope(
+            ErrorCode::UnsupportedTrustedProfileHostScope,
+            config_file,
+            toml_path,
+            value,
+        )
+    }
+
+    fn unsupported_trusted_profile_command_scope(
+        config_file: &Path,
+        toml_path: &str,
+        value: &str,
+    ) -> Self {
+        Self::unsupported_trusted_profile_scope(
+            ErrorCode::UnsupportedTrustedProfileCommandScope,
+            config_file,
+            toml_path,
+            value,
+        )
+    }
+
+    fn unsupported_trusted_profile_scope(
+        code: ErrorCode,
+        config_file: &Path,
+        toml_path: &str,
+        value: &str,
+    ) -> Self {
         let mut details = BTreeMap::new();
         details.insert(
             "file".to_string(),
@@ -4535,7 +4688,7 @@ impl SatelleError {
         details.insert("path".to_string(), Value::String(toml_path.to_string()));
         details.insert("value".to_string(), Value::String(value.to_string()));
         Self {
-            code: ErrorCode::ConfigError,
+            code,
             message: format!(
                 "config file {} uses unsupported Trusted Profile scope '{value}' at {toml_path}",
                 config_file.display()

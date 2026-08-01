@@ -1401,6 +1401,7 @@ fn events_json_emits_newline_delimited_satelle_events() {
             "local-demo",
             "--events",
             "json",
+            "--yolo",
             "Open the browser and report the page title",
         ])
         .assert()
@@ -1417,6 +1418,8 @@ fn events_json_emits_newline_delimited_satelle_events() {
     assert_eq!(events.len(), 7);
     assert_eq!(events[0]["type"], "preflight");
     assert_eq!(events[0]["source"], "cli");
+    assert_eq!(events[0]["data"]["yolo"]["active"], true);
+    assert_eq!(events[0]["data"]["yolo"]["source"], "cli_flag");
     assert_eq!(events[0]["data"]["project_config_intent"]["host"], false);
     assert_eq!(
         events[0]["data"]["project_config_intent"]["timeouts"],
@@ -2906,6 +2909,9 @@ transport = "local"
 adapter = "fake"
 
 [profiles.maintenance]
+trusted_profile = "maintenance"
+
+[profiles.unreferenced]
 
 [trusted_profiles.maintenance]
 hosts = ["local-demo"]
@@ -2913,6 +2919,53 @@ command_families = ["setup"]
 "#,
     )
     .expect("trusted profile config should be written");
+
+    let explain = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "--profile",
+            "maintenance",
+            "config",
+            "explain",
+            "--host",
+            "local-demo",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let explain = parse_json_output(&explain.stdout);
+    let consent = &explain["values"]["noninteractive_mutation_consent"];
+    assert_eq!(consent["command_flag"]["source"], "absent");
+    assert_eq!(
+        consent["command_families"]["setup"]["source"],
+        "user_config_trusted_profile"
+    );
+    assert_eq!(consent["command_families"]["repair"]["source"], "absent");
+
+    let unreferenced = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "--profile",
+            "unreferenced",
+            "config",
+            "explain",
+            "--host",
+            "local-demo",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json_output(&unreferenced.stdout)["values"]["noninteractive_mutation_consent"]["command_families"]
+            ["setup"]["source"],
+        "absent"
+    );
 
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &config_file)
@@ -2959,6 +3012,22 @@ command_families = ["setup"]
             .exists()
     );
 
+    let environment_explain = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", environment_state.path())
+        .env("SATELLE_PROFILE", "maintenance")
+        .args(["config", "explain", "--host", "local-demo", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let environment_explain = parse_json_output(&environment_explain.stdout);
+    assert_eq!(
+        environment_explain["values"]["noninteractive_mutation_consent"]["command_families"]["setup"]
+            ["source"],
+        "absent"
+    );
+
     let project_state = state_dir();
     let project_config_file = project_state.path().join("user-config.toml");
     write_user_config(
@@ -2971,6 +3040,7 @@ transport = "local"
 adapter = "fake"
 
 [profiles.maintenance]
+trusted_profile = "maintenance"
 
 [trusted_profiles.maintenance]
 hosts = ["local-demo"]
@@ -4334,12 +4404,11 @@ fn yolo_policy_resolves_from_user_config_and_config_explain_reports_source() {
         &user_config,
         r#"
 default_host = "local-demo"
-yolo = true
 
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
-yolo = false
+yolo = true
 "#,
     )
     .expect("user config should be written");
@@ -4355,9 +4424,9 @@ yolo = false
     let report = parse_json_output(&output.stdout);
     let yolo = &report["values"]["yolo"];
 
-    assert_eq!(report["effective"]["yolo"], true);
-    assert_eq!(report["effective"]["hosts"]["local-demo"]["yolo"], false);
-    assert_eq!(yolo["active"], false);
+    assert_eq!(report["effective"]["yolo"], serde_json::Value::Null);
+    assert_eq!(report["effective"]["hosts"]["local-demo"]["yolo"], true);
+    assert_eq!(yolo["active"], true);
     assert_eq!(yolo["source"], "user_config_host");
     assert_eq!(yolo["target_host"], "local-demo");
     assert_eq!(yolo["winning_source"], "user_config_host");
@@ -4375,11 +4444,11 @@ fn run_and_steer_report_yolo_state_and_flags_override_config() {
         &user_config,
         r#"
 default_host = "local-demo"
-yolo = true
 
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
+yolo = true
 "#,
     )
     .expect("user config should be written");
@@ -8413,6 +8482,7 @@ kind = "file"
 path = '{}'
 
 [profiles.maintenance]
+trusted_profile = "maintenance"
 
 [trusted_profiles.maintenance]
 hosts = ["selected"]

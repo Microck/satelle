@@ -280,6 +280,8 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         },
         ErrorCode::IncompatibleControlPlane
         | ErrorCode::ComputerUseNotReady
+        | ErrorCode::YoloNotSupported
+        | ErrorCode::YoloBlockedByNativeApproval
         | ErrorCode::UnsupportedProviderComputerUse
         | ErrorCode::DesktopSessionUnavailable
         | ErrorCode::DesktopSessionAmbiguous
@@ -474,6 +476,10 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ConfigInterpolationNotSupported
         | ErrorCode::UnknownTimeoutKey
         | ErrorCode::DurationUnitRequired
+        | ErrorCode::TrustedProfileHostAllowlistRequired
+        | ErrorCode::UnsupportedTrustedProfileHostScope
+        | ErrorCode::TrustedProfileCommandAllowlistRequired
+        | ErrorCode::UnsupportedTrustedProfileCommandScope
         | ErrorCode::UnsupportedConfigComposition
         | ErrorCode::ProjectDaemonPathOverrideNotAllowed
         | ErrorCode::ProjectDesktopBindingNotAllowed

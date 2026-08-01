@@ -37,13 +37,13 @@
 - a Satelle Bootstrap Lock is a user-scoped remote filesystem lock acquired through authenticated SSH bootstrap or by a reachable Host Daemon already holding the same operation's Maintenance Lease before remote daemon files can be replaced @spec @mvp @implemented
 - a Satelle Idempotency Record binds one API Principal, operation, idempotency key, request digest, and durable outcome @mvp @implemented
 - a Satelle Readiness Result is a timestamped capability result whose validity is bounded by its cache key, expiry, and invalidation conditions @spec @mvp @implemented
-- Satelle YOLO Mode is an explicit unsafe execution mode that asks Codex to bypass Codex-controlled approvals and sandboxing where the compatible Codex control plane supports those settings @spec @mvp
+- Satelle YOLO Mode is an explicit unsafe execution mode that asks Codex to bypass Codex-controlled approvals and sandboxing where the compatible Codex control plane supports those settings @spec @mvp @implemented
 - a Satelle Provider Probe Surface is an ephemeral local UI served by the Host Daemon to verify that a selected model and provider can observe and act through native Computer Use @spec @mvp @implemented
 - a Satelle Event is a stable JSON lifecycle record emitted by attached run and steer commands or Host Daemon event streams @spec @mvp @implemented
 - a Satelle Setup Action Ledger is the Host Daemon-owned record of setup, repair, update, migration, and other specified maintenance action plans, status changes, partial failures, and recovery metadata for a controlled Host @spec @mvp @implemented
 - a Satelle Setup Component is a named onboarding responsibility that setup can plan, report, and selectively target without changing the default setup contract @mvp @implemented
-- a Satelle Trusted Profile is a user-level profile explicitly allowed by the local OS user to supply noninteractive mutation consent for configured command families and Host Aliases @spec @mvp
-- a Satelle Mutation Command Family is a stable consent scope grouping one mutating command workflow independently from exact CLI subcommand spelling @spec @mvp
+- a Satelle Trusted Profile is a user-level profile explicitly allowed by the local OS user to supply noninteractive mutation consent for configured command families and Host Aliases @spec @mvp @implemented
+- a Satelle Mutation Command Family is a stable consent scope grouping one mutating command workflow independently from exact CLI subcommand spelling @spec @mvp @implemented
 - a Satelle Doctor Finding is a diagnostic result with a scope, severity, fixability, readiness impact, summary, evidence, and optional recovery command @mvp @implemented
 - a Satelle Doctor Probe is an individual diagnostic check with a stable probe id, scope, dependencies, resource locks, timeout, and cache policy @mvp @implemented
 - a Satelle Doctor Event is a diagnostic-stream record with its own versioned schema and is distinct from a lifecycle Satelle Event @mvp @implemented
@@ -1160,20 +1160,20 @@
 - satelle reports a typed project-mutation-consent-not-allowed configuration error when project-level configuration attempts to grant noninteractive mutation consent @implemented @mvp
 - satelle applies configuration precedence as built-in defaults, then user-level configuration, then project-level configuration, then explicit Satelle process environment variables, then CLI flags for non-secret overlapping settings @implemented @mvp
 - satelle applies project-level precedence only to fields that the project-level schema is authorized to define @spec @mvp @implemented
-- satelle user-level configuration may define Satelle Trusted Profiles that grant noninteractive mutation consent only for configured command families and host aliases @spec @mvp
+- satelle user-level configuration may define Satelle Trusted Profiles that grant noninteractive mutation consent only for configured command families and host aliases @spec @mvp @implemented
 - satelle MVP Satelle Trusted Profiles require a non-empty explicit host alias allowlist for noninteractive mutation consent @spec @mvp @implemented
 - satelle MVP Satelle Trusted Profiles do not support all-hosts consent scopes, wildcard host scopes, glob host scopes, regex host scopes, project-host scopes, or default-host scopes @spec @mvp @implemented
-- satelle Satelle Trusted Profile host allowlists match the resolved target host alias selected for the command before remote mutation planning starts @spec @mvp
-- satelle reports a typed trusted-profile-host-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit host alias @spec @mvp
-- satelle reports a typed unsupported-trusted-profile-host-scope configuration error when a Satelle Trusted Profile uses an all-hosts, wildcard, glob, regex, project-host, or default-host scope @spec @mvp
+- satelle Satelle Trusted Profile host allowlists match the resolved target host alias selected for the command before remote mutation planning starts @spec @mvp @implemented
+- satelle reports a typed trusted-profile-host-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit host alias @spec @mvp @implemented
+- satelle reports a typed unsupported-trusted-profile-host-scope configuration error when a Satelle Trusted Profile uses an all-hosts, wildcard, glob, regex, project-host, or default-host scope @spec @mvp @implemented
 - satelle MVP Satelle Trusted Profiles require a non-empty explicit Satelle Mutation Command Family allowlist for noninteractive mutation consent @spec @mvp @implemented
 - satelle MVP Satelle Trusted Profiles do not support all-mutating-command consent scopes, wildcard command scopes, glob command scopes, regex command scopes, or future-command scopes @spec @mvp @implemented
 - satelle MVP Satelle Mutation Command Family values are setup, repair, host_update, self_update_remotes, and doctor_fix @spec @mvp @implemented
 - satelle later adds config_repair and host_storage_migrate Satelle Mutation Command Family values when those commands become available @spec @later
-- satelle Satelle Trusted Profile command-family allowlists match the command family for the selected mutating command before remote mutation planning starts @spec @mvp
-- satelle reports a typed trusted-profile-command-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit Satelle Mutation Command Family @spec @mvp
-- satelle reports a typed unsupported-trusted-profile-command-scope configuration error when a Satelle Trusted Profile uses an all-mutating-command, wildcard, glob, regex, or future-command scope @spec @mvp
-- satelle does not apply Satelle Trusted Profile noninteractive mutation consent when either the resolved target host alias or the command family is outside the trusted profile allowlists @spec @mvp
+- satelle Satelle Trusted Profile command-family allowlists match the command family for the selected mutating command before remote mutation planning starts @spec @mvp @implemented
+- satelle reports a typed trusted-profile-command-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit Satelle Mutation Command Family @spec @mvp @implemented
+- satelle reports a typed unsupported-trusted-profile-command-scope configuration error when a Satelle Trusted Profile uses an all-mutating-command, wildcard, glob, regex, or future-command scope @spec @mvp @implemented
+- satelle does not apply Satelle Trusted Profile noninteractive mutation consent when either the resolved target host alias or the command family is outside the trusted profile allowlists @spec @mvp @implemented
 - satelle Satelle Trusted Profiles are durable user-level configuration records that remain active until the local OS user edits or removes them @spec @mvp @implemented
 - satelle MVP does not automatically expire Satelle Trusted Profiles by age, last use, CLI version, project, calendar date, or host update state @spec @mvp @implemented
 - satelle later supports optional Satelle Trusted Profile expiration through an explicit user-level field named expires_at with an RFC 3339 UTC timestamp @spec @later
@@ -1185,21 +1185,21 @@
 - satelle config explain shows each selected Satelle Trusted Profile expiration state as absent, active, or expired and reports the winning source for expires_at without contacting remote hosts @spec @later
 - satelle does not apply Satelle Trusted Profile noninteractive mutation consent when the profile is expired at command evaluation time @spec @later
 - satelle commands that would otherwise use an expired Satelle Trusted Profile report a typed trusted-profile-expired error and require interactive confirmation or another valid consent source before mutating local or remote state @spec @later
-- satelle accepts Satelle Trusted Profile mutation consent only when the trusted profile comes from user-level configuration and is selected by a user-level default or explicit --profile option, not when project-level configuration or SATELLE_PROFILE selects the profile @spec @mvp
+- satelle accepts Satelle Trusted Profile mutation consent only when the trusted profile comes from user-level configuration and is selected by a user-level default or explicit --profile option, not when project-level configuration or SATELLE_PROFILE selects the profile @spec @mvp @implemented
 - satelle config check treats project-level mutation consent settings as locally decidable configuration errors without contacting remote hosts @implemented @mvp
-- satelle config explain reports the effective noninteractive mutation consent source for the selected context while distinguishing command flags, user-level trusted profiles, and absent consent @spec @mvp
+- satelle config explain reports the effective noninteractive mutation consent source for the selected context while distinguishing command flags, user-level trusted profiles, and absent consent @spec @mvp @implemented
 - satelle project-level configuration cannot enable YOLO mode or be the winning source that makes YOLO mode active @implemented @mvp
 - satelle reports a typed project-yolo-enable-not-allowed configuration error when project-level configuration attempts to enable YOLO mode @implemented @mvp
-- satelle user-level configuration and user-level profiles may enable YOLO mode only for an explicit Host Alias @spec @mvp
-- satelle does not support a process-global or all-host persistent YOLO default @spec @mvp
+- satelle user-level configuration and user-level profiles may enable YOLO mode only for an explicit Host Alias @spec @mvp @implemented
+- satelle does not support a process-global or all-host persistent YOLO default @spec @mvp @implemented
 - satelle resolves YOLO policy per command and per target host instead of treating it as only a process-global switch @implemented @mvp
-- satelle Host-specific YOLO policy is the only persistent base YOLO policy within a user-level configuration source @spec @mvp
+- satelle Host-specific YOLO policy is the only persistent base YOLO policy within a user-level configuration source @spec @mvp @implemented
 - satelle selected user-level profile YOLO policy overlays the merged base configuration according to the same precedence model used for other profile settings @spec @mvp @implemented
 - satelle accepts selected profile YOLO enablement only when that policy comes from user-level configuration, names an explicit Host Alias, and the profile is selected by a user-level default or explicit --profile option; project and SATELLE_PROFILE selection may apply yolo = false but never yolo = true @spec @mvp @implemented
 - satelle does not activate Trusted Profile consent or YOLO policy solely because SATELLE_PROFILE selected a profile @spec @mvp @implemented
 - satelle CLI flags can enable or disable YOLO mode for one command and take precedence over user-level YOLO policy @implemented @mvp
 - satelle config explain output shows the effective YOLO policy, target host, selected_profile field, contributing config files, and winning source @implemented @mvp
-- satelle non-quiet preflight output identifies when YOLO mode is active and whether it came from a CLI flag, user-level Host configuration, or an explicitly selected Host-bound user-level profile @spec @mvp
+- satelle non-quiet preflight output identifies when YOLO mode is active and whether it came from a CLI flag, user-level Host configuration, or an explicitly selected Host-bound user-level profile @spec @mvp @implemented
 - satelle JSON state output includes whether YOLO mode is active and the configuration source that selected it @implemented @mvp
 - satelle supports explicit environment variables for selecting config paths, default host, profile, and logging behavior @spec @mvp @implemented
 - satelle does not use environment variables as a full nested configuration language for host definitions or policy trees @implemented @mvp
@@ -1211,15 +1211,15 @@
 - satelle supports SATELLE_HOST as an optional process environment default Host selector that is lower precedence than --host and higher precedence than config-file Host defaults @spec @mvp @implemented
 - satelle supports SATELLE_PROFILE as an optional process environment profile selector that is lower precedence than --profile and higher precedence than config-file profile defaults @spec @mvp @implemented
 - satelle supports configuration profiles that select default values and policy overlays on top of the merged base configuration @spec @mvp @implemented
-- satelle named profiles can define host selection, model and provider intent, timeout policy, output preferences, log verbosity, YOLO policy, and Trusted Profile references subject to each field's existing source restrictions @spec @mvp
+- satelle named profiles can define host selection, model and provider intent, timeout policy, output preferences, log verbosity, YOLO policy, and Trusted Profile references subject to each field's existing source restrictions @spec @mvp @implemented
 - satelle profile overlays are applied after base user and project configuration and before explicit environment variables and CLI flags @spec @mvp @implemented
 - satelle project-level configuration may request a profile name only as shared intent and cannot define trusted profiles, mutation consent, YOLO enablement, or secret-source locations through that profile @spec @mvp @implemented
 - satelle profiles do not redefine the entire host configuration tree independently from base user and project configuration @spec @mvp @implemented
 - satelle timeout configuration lives under a nested timeouts table at host and profile scopes instead of as direct host or profile keys @spec @mvp @implemented
 - satelle timeout configuration may be set in any configuration source that can define host or profile defaults, subject to normal configuration precedence @spec @mvp @implemented
-- satelle MVP timeout configuration keys are timeouts.native_readiness, timeouts.provider_smoke_test, and timeouts.turn_execution @spec @mvp
-- satelle timeouts.turn_execution configuration values are finite human duration strings with explicit units @spec @mvp
-- satelle rejects bare integer timeouts.turn_execution values with a typed duration-unit-required configuration error @spec @mvp
+- satelle MVP timeout configuration keys are timeouts.native_readiness, timeouts.provider_smoke_test, and timeouts.turn_execution @spec @mvp @implemented
+- satelle timeouts.turn_execution configuration values are finite human duration strings with explicit units @spec @mvp @implemented
+- satelle rejects bare integer timeouts.turn_execution values with a typed duration-unit-required configuration error @spec @mvp @implemented
 - satelle reports a typed unknown-timeout-key configuration error for unrecognized keys under a timeouts table @implemented @mvp
 - satelle MVP does not support direct native_readiness_timeout or provider_smoke_test_timeout configuration keys outside the nested timeouts table @implemented @mvp
 - satelle project-level configuration may reference host aliases that users bind to concrete personal host access details in user-level configuration @spec @mvp @implemented
@@ -1949,13 +1949,13 @@
 - --relay-native-actions is mutually exclusive with YOLO mode, reports a typed native-action-policy-conflict for that combination, and is never implied by --yes @spec @later
 - satelle run and steer support an explicit YOLO option for users who want Codex-controlled approvals to be auto-accepted @implemented @mvp
 - satelle YOLO mode is disabled by default and must be selected by a command option, user-level configuration policy, or user-level profile policy @spec @mvp @implemented
-- satelle YOLO mode does not ask for an additional Satelle confirmation prompt after the user explicitly selects the mode @spec @mvp
+- satelle YOLO mode does not ask for an additional Satelle confirmation prompt after the user explicitly selects the mode @spec @mvp @implemented
 - satelle YOLO mode starts or updates the Codex thread with approval policy never and sandbox danger-full-access when the compatible app-server protocol supports those settings @spec @mvp @implemented
 - satelle YOLO mode auto-accepts documented Codex app-server approval callbacks that Satelle receives and can answer with an accept decision @spec @mvp @implemented
-- satelle YOLO mode does not bypass host authentication, transport security, host readiness, native Computer Use readiness, or unsupported-platform checks @spec @mvp
+- satelle YOLO mode does not bypass host authentication, transport security, host readiness, native Computer Use readiness, or unsupported-platform checks @spec @mvp @implemented
 - satelle YOLO mode does not grant operating-system privacy permissions, approve administrator authentication, approve security prompts, unlock machines, or click through Codex app UI permission prompts that are not exposed as supported app-server approval callbacks @spec @mvp @implemented
-- satelle reports a typed yolo-not-supported error when the remote Codex control plane cannot honor the requested YOLO approval and sandbox behavior @spec @mvp
-- satelle reports a typed yolo-blocked-by-native-approval error when native Computer Use blocks on a non-bypassable OS, app, or sensitive-action approval while YOLO mode is active @spec @mvp
+- satelle reports a typed yolo-not-supported error when the remote Codex control plane cannot honor the requested YOLO approval and sandbox behavior @spec @mvp @implemented
+- satelle reports a typed yolo-blocked-by-native-approval error when native Computer Use blocks on a non-bypassable OS, app, or sensitive-action approval while YOLO mode is active @spec @mvp @implemented
 - id: htr
   label: satelle host trust atomically replaces the user-level configuration without changing its POSIX mode or Windows DACL and revalidates the replacement before reporting success
   command: cargo test --locked -p satelle-cli --features test-support --bin satelle host_trust::tests::host_identity_update_preserves_unrelated_toml_and_is_idempotent -- --exact

@@ -8,7 +8,9 @@ use super::{
     redacted_config_json, resolve_path_set, yolo_config_json,
 };
 use satelle_core::doctor::DoctorScopeSelection;
-use satelle_core::{DoctorOptions, DoctorReport, SatelleError};
+use satelle_core::{
+    DoctorOptions, DoctorReport, MutationCommandFamily, ResolvedConfig, SatelleError,
+};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -102,6 +104,42 @@ const LOCAL_CONFIG_CHECKS: &[&str] = &[
 
 const REMOTE_CONFIG_CHECKS: &[&str] = &["remote_host", "provider_auth", "native_computer_use"];
 
+fn noninteractive_mutation_consent_json(config: &ResolvedConfig, host: &str) -> Value {
+    let trusted_profile = config
+        .trusted_profile_reference()
+        .and_then(|reference| config.config.trusted_profiles.get(reference))
+        .filter(|trusted| trusted.hosts.contains(host));
+    let family = |command_family| {
+        let active = trusted_profile
+            .is_some_and(|trusted| trusted.command_families.contains(&command_family));
+        json!({
+            "active": active,
+            "source": if active {
+                "user_config_trusted_profile"
+            } else {
+                "absent"
+            },
+        })
+    };
+
+    json!({
+        // Config explain has no mutating command flag. Report that source
+        // explicitly so consumers do not mistake Trusted Profile consent for
+        // a command-scoped --yes decision.
+        "command_flag": {
+            "active": false,
+            "source": "absent",
+        },
+        "command_families": {
+            "setup": family(MutationCommandFamily::Setup),
+            "repair": family(MutationCommandFamily::Repair),
+            "host_update": family(MutationCommandFamily::HostUpdate),
+            "self_update_remotes": family(MutationCommandFamily::SelfUpdateRemotes),
+            "doctor_fix": family(MutationCommandFamily::DoctorFix),
+        },
+    })
+}
+
 pub(super) fn config_explain_report(
     host: Option<String>,
     show_secret_references: bool,
@@ -127,6 +165,7 @@ pub(super) fn config_explain_report(
         "host": env_source("SATELLE_HOST"),
         "profile": env_source("SATELLE_PROFILE"),
         "command_history": env_source("SATELLE_COMMAND_HISTORY"),
+        "log_verbosity": env_source("SATELLE_LOG"),
         "paths": {
             "home": env_source("SATELLE_HOME"),
             "config_file": env_source("SATELLE_CONFIG_FILE"),
@@ -156,12 +195,13 @@ pub(super) fn config_explain_report(
                 "output_format": config.output_format_from_project(),
             },
             "environment": environment_sources,
-            "flags": ["--host", "--profile"],
+            "flags": ["--host", "--profile", "--log-verbosity"],
         },
         "effective": redacted_config_json(&effective_config, show_secret_references),
         "values": {
             "default_host": config.config.default_host,
             "output_format": config.config.output_format,
+            "log_verbosity": config.config.log_verbosity,
             "host_count": config.config.hosts.len(),
             "effective_timeouts": super::effective_timeouts_json(
                 &selected_host_config,
@@ -179,6 +219,10 @@ pub(super) fn config_explain_report(
                 &selected_host_config,
             ),
             "yolo": yolo_config_json(config, &selected_host, &selected_host_config),
+            "noninteractive_mutation_consent": noninteractive_mutation_consent_json(
+                config,
+                &selected_host,
+            ),
             "show_secret_references": show_secret_references,
         },
         "not_checked": ["remote_host", "provider_auth", "native_computer_use"],

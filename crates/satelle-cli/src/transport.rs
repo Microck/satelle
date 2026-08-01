@@ -8420,6 +8420,8 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::IncompatibleProtocol
             | ApiErrorCode::IncompatibleControlPlane
             | ApiErrorCode::ComputerUseNotReady
+            | ApiErrorCode::YoloNotSupported
+            | ApiErrorCode::YoloBlockedByNativeApproval
             | ApiErrorCode::DesktopBindingRequired
             | ApiErrorCode::DesktopSessionUnavailable
             | ApiErrorCode::DesktopSessionAmbiguous
@@ -8455,6 +8457,10 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
         ApiErrorCode::HostUnreachable => SatelleError::host_unreachable(host),
         ApiErrorCode::StateConflict => SatelleError::state_conflict(),
         ApiErrorCode::NativeReadinessTimeout => SatelleError::native_readiness_timeout(),
+        ApiErrorCode::YoloNotSupported => SatelleError::yolo_not_supported(),
+        ApiErrorCode::YoloBlockedByNativeApproval => {
+            SatelleError::yolo_blocked_by_native_approval()
+        }
         ApiErrorCode::ProviderSmokeTestTimeout => SatelleError::provider_smoke_test_timeout(),
         ApiErrorCode::UnsupportedProviderComputerUse => {
             SatelleError::unsupported_provider_computer_use()

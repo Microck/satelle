@@ -13,7 +13,6 @@ fn global_profile_overlays_merged_config_and_selected_host() {
 default_host = "base-host"
 model_alias = "base-model"
 provider_alias = "base-provider"
-yolo = false
 
 [hosts.base-host]
 transport = "local"
@@ -41,6 +40,7 @@ provider_smoke_test = "11s"
 host = "work-host"
 model_alias = "work-model"
 provider_alias = "work-provider"
+log_verbosity = "trace"
 experimental_provider_computer_use = true
 yolo = true
 daemon_idle_timeout = "3m"
@@ -68,11 +68,12 @@ native_readiness = "7s"
     assert_eq!(report["sources"]["profile"], "cli_flag");
     assert_eq!(report["effective"]["model_alias"], "work-model");
     assert_eq!(report["effective"]["provider_alias"], "work-provider");
+    assert_eq!(report["effective"]["log_verbosity"], "trace");
     assert_eq!(
         report["effective"]["experimental_provider_computer_use"],
         true
     );
-    assert_eq!(report["effective"]["yolo"], false);
+    assert_eq!(report["effective"]["yolo"], serde_json::Value::Null);
     assert_eq!(report["effective"]["hosts"]["work-host"]["yolo"], true);
     assert_eq!(
         report["effective"]["hosts"]["work-host"]["daemon_idle_timeout"],
@@ -156,6 +157,29 @@ native_readiness = "7s"
         overridden_host["values"]["yolo"]["source"],
         "user_config_profile"
     );
+}
+
+#[test]
+fn profile_output_format_is_an_effective_presentation_default() {
+    let fixture = ConfigFixture::new(
+        r#"
+[profiles.machine]
+output_format = "json"
+"#,
+        "",
+    );
+
+    let output = fixture
+        .command()
+        .args(["--profile", "machine", "config", "explain"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&output.stdout);
+
+    assert_eq!(report["selected_profile"], "machine");
+    assert_eq!(report["effective"]["output_format"], "json");
 }
 
 #[test]
@@ -609,51 +633,6 @@ profile = "review"
 }
 
 #[test]
-fn untrusted_profile_selectors_can_reduce_yolo_policy() {
-    let fixture = ConfigFixture::new(
-        r#"
-default_host = "local-demo"
-yolo = true
-
-[hosts.local-demo]
-transport = "local"
-adapter = "fake"
-allow_project_selection = true
-
-[profiles.safe]
-host = "local-demo"
-yolo = false
-"#,
-        r#"
-profile = "safe"
-"#,
-    );
-
-    for (source, configure) in [
-        ("project_config", None),
-        ("environment", Some(("SATELLE_PROFILE", "safe"))),
-    ] {
-        let mut command = fixture.command();
-        if let Some((name, value)) = configure {
-            command.env(name, value);
-        }
-        let output = command
-            .args(["config", "explain", "--json"])
-            .assert()
-            .success()
-            .get_output()
-            .clone();
-        let report = parse_json(&output.stdout);
-
-        assert_eq!(report["sources"]["profile"], source);
-        assert_eq!(report["effective"]["yolo"], true);
-        assert_eq!(report["effective"]["hosts"]["local-demo"]["yolo"], false);
-        assert_eq!(report["values"]["yolo"]["active"], false);
-        assert_eq!(report["values"]["yolo"]["source"], "user_config_profile");
-    }
-}
-
-#[test]
 fn undefined_profiles_and_project_profile_definitions_are_typed_errors() {
     let fixture = ConfigFixture::new("", "");
 
@@ -689,6 +668,34 @@ host = "attacker-host"
     assert_same_file(
         &project_profile["details"]["file"],
         &fixture.resolved_project_config(),
+    );
+}
+
+#[test]
+fn every_trusted_profile_reference_must_resolve_even_when_unselected() {
+    let fixture = ConfigFixture::new(
+        r#"
+[profiles.active]
+
+[profiles.dangling]
+trusted_profile = "missing"
+"#,
+        "",
+    );
+
+    let output = fixture
+        .command()
+        .args(["--profile", "active", "config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+    assert_eq!(error["code"], "configuration-error");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("references missing trusted profile 'missing'"))
     );
 }
 
