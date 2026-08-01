@@ -432,6 +432,8 @@ enum HostCommand {
     #[command(hide = true)]
     OfflineStorageMaintenance(OfflineStorageMaintenanceCommand),
     #[command(hide = true)]
+    OfflineStorageRestorePreview(OfflineStorageRestorePreviewCommand),
+    #[command(hide = true)]
     OfflineStorageBackupCleanupPlan(OfflineStorageBackupCleanupPlanCommand),
 }
 
@@ -766,6 +768,14 @@ struct OfflineStorageMaintenanceCommand {
 struct OfflineStorageBackupCleanupPlanCommand {
     #[arg(long)]
     state_root: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct OfflineStorageRestorePreviewCommand {
+    #[arg(long)]
+    state_root: PathBuf,
+    #[arg(long)]
+    backup: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1567,6 +1577,9 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             command: HostCommand::OfflineStorageMaintenance(_),
         } => return None,
         Command::Host {
+            command: HostCommand::OfflineStorageRestorePreview(_),
+        } => return None,
+        Command::Host {
             command: HostCommand::OfflineStorageBackupCleanupPlan(_),
         } => return None,
         Command::Host { command } => HistoryTarget {
@@ -1608,6 +1621,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                     command: HostStoreCommand::Reset(command),
                 } => command.host.as_deref(),
                 HostCommand::OfflineStorageMaintenance(_) => None,
+                HostCommand::OfflineStorageRestorePreview(_) => None,
                 HostCommand::OfflineStorageBackupCleanupPlan(_) => None,
             },
             session_id: None,
@@ -2250,6 +2264,23 @@ mod history_target_tests {
         };
         assert_eq!(restore.host.as_deref(), Some("remote"));
         assert!(restore.dry_run);
+
+        let restore_preview = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "offline-storage-restore-preview",
+            "--state-root",
+            "/state",
+            "--backup",
+            "/state/satelle.sqlite3.migration-v13-example.backup",
+        ])
+        .expect("parse internal storage restore preview");
+        assert!(matches!(
+            restore_preview.command,
+            Command::Host {
+                command: HostCommand::OfflineStorageRestorePreview(_)
+            }
+        ));
 
         let cleanup = Cli::try_parse_from([
             "satelle",
@@ -6100,6 +6131,9 @@ fn run_host(
         HostCommand::Storage { command } => run_host_storage(command, config, format),
         HostCommand::Store { command } => run_host_store(command, config, format),
         HostCommand::OfflineStorageMaintenance(command) => run_offline_storage_maintenance(command),
+        HostCommand::OfflineStorageRestorePreview(command) => {
+            run_offline_storage_restore_preview(command)
+        }
         HostCommand::OfflineStorageBackupCleanupPlan(command) => {
             run_offline_storage_backup_cleanup_plan(command)
         }
@@ -8812,6 +8846,8 @@ fn run_host_storage(
                     )
                     .map_err(failure)?;
                 }
+            } else if command.dry_run {
+                transport::preview_ssh_storage_restore(&host, &command.backup).map_err(failure)?;
             } else {
                 transport::preflight_ssh_storage_maintenance(&host).map_err(failure)?;
             }
@@ -9266,6 +9302,14 @@ fn run_offline_storage_backup_cleanup_plan(
     let plan = satelle_host::HostService::plan_storage_backup_cleanup(&command.state_root)
         .map_err(failure)?;
     print_json(&plan).map_err(failure)
+}
+
+fn run_offline_storage_restore_preview(
+    command: OfflineStorageRestorePreviewCommand,
+) -> Result<(), CliFailure> {
+    satelle_host::HostService::preview_storage_restore(&command.state_root, &command.backup)
+        .map_err(failure)?;
+    print_json(&json!({"valid": true})).map_err(failure)
 }
 
 #[cfg(test)]

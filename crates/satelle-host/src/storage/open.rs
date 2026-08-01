@@ -2687,7 +2687,7 @@ fn list_validated_migration_backups(
 pub(super) fn plan_migration_backup_cleanup(
     state_root: &Path,
 ) -> Result<Vec<String>, StorageError> {
-    let state_directory = prepare_state_root(state_root)?;
+    let state_directory = open_state_root_read_only(state_root)?;
     let validated = list_validated_migration_backups(state_root, &state_directory)?;
     let retained_valid_count = validated.len();
     let delete_count = validated.len().saturating_sub(2);

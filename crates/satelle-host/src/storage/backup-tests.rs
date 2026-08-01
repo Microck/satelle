@@ -116,6 +116,32 @@ fn restore_preview_validation_does_not_require_state_directory_writes() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn backup_cleanup_plan_does_not_require_state_directory_writes() {
+    let fixture = BackupFixture::new(3);
+    let original_permissions = fs::metadata(&fixture.state_root)
+        .expect("read state directory metadata")
+        .permissions();
+    fs::set_permissions(&fixture.state_root, fs::Permissions::from_mode(0o500))
+        .expect("make the state directory read-only");
+
+    let plan = plan_migration_backup_cleanup(&fixture.state_root);
+    let preview_mode = fs::metadata(&fixture.state_root)
+        .expect("read state directory metadata after planning")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    fs::set_permissions(&fixture.state_root, original_permissions)
+        .expect("restore state directory permissions");
+    plan.expect("plan cleanup without mutation");
+    assert_eq!(
+        0o500, preview_mode,
+        "cleanup planning must not change directory mode"
+    );
+}
+
 #[test]
 fn migration_backup_restore_preserves_active_and_retired_idempotency_hmac_keys() {
     const PAYLOAD: &[u8] = b"deterministic migration restore HMAC payload";

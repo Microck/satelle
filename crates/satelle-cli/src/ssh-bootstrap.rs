@@ -25,6 +25,7 @@ use super::bootstrap_lock;
 use super::ssh_tunnel::{SshStderrClassification, classify_stderr};
 
 const PROBE_OUTPUT_LIMIT: usize = 4096;
+const OFFLINE_STORAGE_PLAN_LIMIT: usize = 64 * 1024;
 const OFFLINE_STORAGE_RESULT_LIMIT: usize = 64 * 1024;
 const SERVICE_DEFINITION_LIMIT: usize = 64 * 1024;
 const TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -2979,10 +2980,40 @@ fn offline_storage_backup_cleanup_plan_command(
     }
 }
 
+fn offline_storage_restore_preview_command(
+    target: RemoteTarget,
+    binary: &str,
+    state_root: &str,
+    backup: &str,
+) -> String {
+    if target.is_windows() {
+        powershell_encoded_command(&format!(
+            "& {} host offline-storage-restore-preview --state-root {} --backup {}",
+            powershell_quote(binary),
+            powershell_quote(state_root),
+            powershell_quote(backup),
+        ))
+    } else {
+        let arguments = format!(
+            "{} host offline-storage-restore-preview --state-root {} --backup {}",
+            posix_quote(binary),
+            posix_quote(state_root),
+            posix_quote(backup),
+        );
+        format!("sh -c {}", posix_quote(&format!("exec {arguments}")))
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OfflineStorageBackupCleanupPlan {
     eligible_backup_file_names: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfflineStorageRestorePreview {
+    valid: bool,
 }
 
 pub(super) fn plan_offline_storage_backup_cleanup(
@@ -2995,11 +3026,32 @@ pub(super) fn plan_offline_storage_backup_cleanup(
     let output = require_success_output(run_ssh_command_with_output_limit(
         destination,
         &command,
-        PROBE_OUTPUT_LIMIT,
+        OFFLINE_STORAGE_PLAN_LIMIT,
     )?)?;
     serde_json::from_slice::<OfflineStorageBackupCleanupPlan>(&output.stdout)
         .map(|plan| plan.eligible_backup_file_names)
         .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)
+}
+
+pub(super) fn preview_offline_storage_restore(
+    destination: &str,
+    target: RemoteTarget,
+    binary: &str,
+    state_root: &str,
+    backup: &str,
+) -> Result<(), SshBootstrapError> {
+    let command = offline_storage_restore_preview_command(target, binary, state_root, backup);
+    let output = require_success_output(run_ssh_command_with_output_limit(
+        destination,
+        &command,
+        PROBE_OUTPUT_LIMIT,
+    )?)?;
+    let preview = serde_json::from_slice::<OfflineStorageRestorePreview>(&output.stdout)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    if !preview.valid {
+        return Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse);
+    }
+    Ok(())
 }
 
 fn parse_offline_storage_maintenance_result(
@@ -5617,6 +5669,35 @@ mod tests {
         assert!(plan.contains("offline-storage-backup-cleanup-plan"));
         assert!(!plan.contains("--yes"));
         assert!(!plan.contains("--approved-backup"));
+
+        let restore_preview = offline_storage_restore_preview_command(
+            RemoteTarget::WindowsX64Msvc,
+            r"C:\Satelle\satelle.exe",
+            r"C:\Satelle\state",
+            r"C:\Satelle\state\operator's backup",
+        );
+        let restore_preview_script =
+            decode_powershell_command(&restore_preview).expect("decode restore preview command");
+        assert_eq!(
+            restore_preview_script,
+            "& 'C:\\Satelle\\satelle.exe' host offline-storage-restore-preview --state-root 'C:\\Satelle\\state' --backup 'C:\\Satelle\\state\\operator''s backup'"
+        );
+    }
+
+    #[test]
+    fn offline_cleanup_plan_limit_covers_many_exact_backup_identities() {
+        let eligible_backup_file_names = (0..64)
+            .map(|index| {
+                format!("satelle.sqlite3.migration-v14-00000000-0000-0000-0000-{index:012}.backup")
+            })
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "eligible_backup_file_names": eligible_backup_file_names,
+        }))
+        .expect("serialize a large cleanup plan");
+
+        assert!(encoded.len() > PROBE_OUTPUT_LIMIT);
+        assert!(encoded.len() <= OFFLINE_STORAGE_PLAN_LIMIT);
     }
 
     #[test]

@@ -3109,6 +3109,59 @@ pub(crate) fn preflight_ssh_storage_maintenance(host: &SelectedHost) -> Result<(
     Ok(())
 }
 
+pub(crate) fn preview_ssh_storage_restore(
+    host: &SelectedHost,
+    backup: &Path,
+) -> Result<(), SatelleError> {
+    let transport = SshSetupTransport::new(host)?;
+    if transport.requires_first_trust {
+        return Err(SatelleError::invalid_usage(format!(
+            "host '{}' must have a trusted expected Host Identity before storage maintenance can run",
+            transport.alias
+        )));
+    }
+    let target = transport.remote_target()?;
+    if target.service_platform() == DaemonServicePlatform::Linux {
+        return Err(SatelleError::persistent_service_unsupported(
+            target.service_platform().as_str(),
+        ));
+    }
+    let directories = transport.remote_directories(target)?;
+    let path_overrides = DaemonPathOverrides {
+        home: host.config.daemon_home.clone(),
+        config_file: host.config.daemon_config_file.clone(),
+        state_dir: host.config.daemon_state_dir.clone(),
+        cache_dir: host.config.daemon_cache_dir.clone(),
+        log_dir: host.config.daemon_log_dir.clone(),
+        ..DaemonPathOverrides::default()
+    };
+    let host_id = transport.binding.expected_host_identity().as_str();
+    let service_asset_path = directories
+        .persistent_service_asset_path(host_id)
+        .ok_or_else(|| SatelleError::persistent_service_unsupported("unknown"))?;
+    let executable = directories
+        .probe_managed_service_executable(
+            transport.binding.destination(),
+            &service_asset_path,
+            host_id,
+            &path_overrides,
+        )
+        .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
+        .ok_or_else(SatelleError::state_conflict)?;
+    let state_root = directories
+        .resolved_path_set()
+        .with_service_overrides(&path_overrides)
+        .state_root;
+    ssh_bootstrap::preview_offline_storage_restore(
+        transport.binding.destination(),
+        target,
+        executable.path(),
+        &state_root,
+        &backup.display().to_string(),
+    )
+    .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))
+}
+
 pub(crate) fn plan_ssh_storage_backup_cleanup(
     host: &SelectedHost,
 ) -> Result<(satelle_host::StorageBackupCleanupPlan, bool), SatelleError> {
