@@ -8541,6 +8541,17 @@ fn local_storage_state_root(host: &SelectedHost) -> Result<PathBuf, CliFailure> 
         .unwrap_or_else(|| satelle_core::state_dir().map_err(failure))
 }
 
+fn storage_maintenance_mutation_failure(
+    mut source: SatelleError,
+    recovery_command: &str,
+) -> SatelleError {
+    // The operator already consented to one exact storage mutation. Keep the
+    // source classification and evidence, but make its retry guidance point
+    // back to that exact operation instead of a generic storage diagnostic.
+    source.recovery_command = Some(recovery_command.to_string());
+    source
+}
+
 fn apply_local_offline_storage_maintenance<T>(
     state_root: &Path,
     action_id: &str,
@@ -8564,7 +8575,10 @@ fn apply_local_offline_storage_maintenance<T>(
                 &operation_id,
                 action_id,
             );
-            return Err(failure(source));
+            return Err(failure(storage_maintenance_mutation_failure(
+                source,
+                recovery_command,
+            )));
         }
     };
     if let Err(source) = satelle_host::HostService::record_completed_offline_storage_maintenance(
@@ -8584,6 +8598,21 @@ fn apply_local_offline_storage_maintenance<T>(
         ));
     }
     Ok(result)
+}
+
+#[cfg(test)]
+#[test]
+fn local_storage_mutation_failure_keeps_source_evidence_and_exact_retry_command() {
+    let source = SatelleError::host_unreachable("local-demo");
+    let source_code = source.code;
+    let source_details = source.details.clone();
+    let retry = "satelle host storage backup cleanup --host local-demo --no-input --yes";
+
+    let error = storage_maintenance_mutation_failure(source, retry);
+
+    assert_eq!(error.code, source_code);
+    assert_eq!(error.details, source_details);
+    assert_eq!(error.recovery_command.as_deref(), Some(retry));
 }
 
 fn run_host_storage(

@@ -3406,6 +3406,18 @@ enum HostMaintenancePlanKind {
     Repair,
 }
 
+fn inspects_persistent_service(
+    kind: HostMaintenancePlanKind,
+    setup_mode: Option<satelle_core::SetupMode>,
+) -> bool {
+    matches!(
+        kind,
+        HostMaintenancePlanKind::HostUpdate
+            | HostMaintenancePlanKind::HostUpdateRecovery
+            | HostMaintenancePlanKind::Repair
+    ) && setup_mode == Some(satelle_core::SetupMode::Persistent)
+}
+
 fn host_release_artifact_required(relation: crate::host_update::HostVersionRelation) -> bool {
     matches!(
         relation,
@@ -3581,11 +3593,7 @@ fn inspect_host_maintenance(
                 current.minimum_host_version.as_deref(),
                 cli_version,
             )?;
-            let inspect_service = matches!(
-                kind,
-                HostMaintenancePlanKind::HostUpdate | HostMaintenancePlanKind::HostUpdateRecovery
-            ) && host.config.setup_mode
-                == Some(satelle_core::SetupMode::Persistent);
+            let inspect_service = inspects_persistent_service(kind, host.config.setup_mode);
             let initial_artifact_required = maintenance_release_artifact_required(
                 kind,
                 relation_to_cli,
@@ -8893,6 +8901,18 @@ mod bootstrap_ordering_tests {
             HostVersionRelation::Missing,
             false,
             None,
+        ));
+    }
+
+    #[test]
+    fn persistent_repair_inspects_the_service_before_automation() {
+        assert!(inspects_persistent_service(
+            HostMaintenancePlanKind::Repair,
+            Some(satelle_core::SetupMode::Persistent),
+        ));
+        assert!(!inspects_persistent_service(
+            HostMaintenancePlanKind::Repair,
+            Some(satelle_core::SetupMode::OnDemand),
         ));
     }
 
