@@ -4175,15 +4175,22 @@ pub(crate) fn apply_host_update(
         cli_version,
         report,
         HostUpdateOperation::Update,
+        HostReplacementEntry::ReachableDaemon,
         None,
         || plan_host_update(host, cli_version, components, includes_all),
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostUpdateOperation {
     Update,
     Repair,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostReplacementEntry {
+    ReachableDaemon,
+    Bootstrap,
 }
 
 fn apply_host_update_with_operation(
@@ -4191,6 +4198,7 @@ fn apply_host_update_with_operation(
     cli_version: &str,
     mut report: satelle_core::host_update::HostUpdateReport,
     operation: HostUpdateOperation,
+    entry: HostReplacementEntry,
     existing_operation_id: Option<&str>,
     revalidate: impl FnOnce() -> Result<satelle_core::host_update::HostUpdateReport, SatelleError>,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
@@ -4228,22 +4236,6 @@ fn apply_host_update_with_operation(
         target.target == HostUpdateTarget::HostDaemonService && target.requires_mutation()
     });
 
-    let transport = SshSetupTransport::new(host)?;
-    if transport.requires_first_trust {
-        return Err(SatelleError::ssh_host_key_verification_required(
-            &transport.alias,
-        ));
-    }
-    let target = transport.remote_target()?;
-    let directories = transport.remote_directories(target)?;
-    let (old_tunnel, old_client) = transport.durable_service_client()?;
-    let old_capabilities = old_client
-        .capabilities()
-        .map_err(|error| direct_transport_error(&transport.alias, error))?;
-    if old_capabilities.host_identity() != transport.binding.expected_host_identity().as_str() {
-        return Err(SatelleError::host_identity_mismatch(&transport.alias));
-    }
-
     let operation_id = existing_operation_id
         .map(str::to_string)
         .unwrap_or_else(|| {
@@ -4256,50 +4248,110 @@ fn apply_host_update_with_operation(
                 Uuid::now_v7()
             )
         });
-    report.recovery_command = Some(format!(
-        "satelle repair --host {} --run {} --no-input --yes",
-        crate::shell_argument(&report.host),
-        crate::shell_argument(&operation_id)
-    ));
-    report = begin_host_update_maintenance_with_revalidation(
-        &transport.alias,
-        &old_client,
-        &operation_id,
-        operation,
-        &report,
-        revalidate,
-    )?;
+    let transport = SshSetupTransport::new(host)?;
+    if transport.requires_first_trust {
+        return Err(SatelleError::ssh_host_key_verification_required(
+            &transport.alias,
+        ));
+    }
+    let target = transport.remote_target()?;
+    let directories = transport.remote_directories(target)?;
+    let mut revalidate = Some(revalidate);
+    let old_connection = if entry == HostReplacementEntry::ReachableDaemon {
+        let connection = transport.durable_service_client()?;
+        let old_capabilities = connection
+            .1
+            .capabilities()
+            .map_err(|error| direct_transport_error(&transport.alias, error))?;
+        if old_capabilities.host_identity() != transport.binding.expected_host_identity().as_str() {
+            return Err(SatelleError::host_identity_mismatch(&transport.alias));
+        }
+        report = begin_host_update_maintenance_with_revalidation(
+            &transport.alias,
+            &connection.1,
+            &operation_id,
+            operation,
+            &report,
+            revalidate
+                .take()
+                .expect("Host replacement revalidation runs exactly once"),
+        )?;
+        Some(connection)
+    } else {
+        None
+    };
+    let old_client = old_connection.as_ref().map(|(_, client)| client);
 
     let mut bootstrap_lock = match acquire_bootstrap_lock_for_operation(
         &transport.alias,
         transport.binding.destination(),
         operation_id.clone(),
-        bootstrap_lock::OperationKind::HostBinaryReplacement,
+        match entry {
+            HostReplacementEntry::ReachableDaemon => {
+                bootstrap_lock::OperationKind::HostBinaryReplacement
+            }
+            HostReplacementEntry::Bootstrap => bootstrap_lock::OperationKind::MissingDaemonRepair,
+        },
     ) {
         Ok(lock) => lock,
         Err(error) => {
-            return Err(close_unmodified_host_update_or_recovery_pending(
-                &transport.alias,
-                &old_client,
-                &operation_id,
-                error,
-            ));
+            return Err(match old_client {
+                Some(old_client) => close_unmodified_host_update_or_recovery_pending(
+                    &transport.alias,
+                    old_client,
+                    &operation_id,
+                    error,
+                ),
+                None => error,
+            });
         }
     };
     if let Err(error) = confirm_bootstrap_lock(&transport.alias, &mut bootstrap_lock) {
-        let error = close_unmodified_host_update_or_recovery_pending(
-            &transport.alias,
-            &old_client,
-            &operation_id,
-            error,
-        );
+        let error = match old_client {
+            Some(old_client) => close_unmodified_host_update_or_recovery_pending(
+                &transport.alias,
+                old_client,
+                &operation_id,
+                error,
+            ),
+            None => error,
+        };
         let _ = bootstrap_lock.release_unmodified();
         return Err(error);
     }
+    if entry == HostReplacementEntry::Bootstrap {
+        let current = match revalidate
+            .take()
+            .expect("Host replacement revalidation runs exactly once")()
+        {
+            Ok(current) => current,
+            Err(source) => {
+                return Err(release_unmodified_bootstrap_repair(
+                    &transport.alias,
+                    &mut bootstrap_lock,
+                    source,
+                ));
+            }
+        };
+        if current != report {
+            return Err(release_unmodified_bootstrap_repair(
+                &transport.alias,
+                &mut bootstrap_lock,
+                SatelleError::state_conflict(),
+            ));
+        }
+        report = current;
+    }
+    report.recovery_command = Some(format!(
+        "satelle repair --host {} --run {} --no-input --yes",
+        crate::shell_argument(&report.host),
+        crate::shell_argument(&operation_id)
+    ));
 
-    // The reachable daemon owns Maintenance before this read-only service
-    // preflight. Bootstrap Lock prevents any other installer from changing
-    // the observed service definition before the first update mutation.
+    // A compatible daemon owns Maintenance before this read-only preflight.
+    // A missing or protocol-incompatible daemon instead enters under
+    // Bootstrap Lock and hands the completed replacement actions to the new
+    // daemon before releasing that lock.
     let daemon_path_overrides = match (|| {
         let remote = ssh_bootstrap::PersistentServiceRemote::new(
             transport.binding.destination(),
@@ -4314,24 +4366,36 @@ fn apply_host_update_with_operation(
         Ok(overrides) => overrides,
         Err(error) => {
             let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-            return Err(close_locked_unmodified_host_update_or_recovery_pending(
-                &transport.alias,
-                &old_client,
-                &mut bootstrap_lock,
-                source,
-            ));
+            return Err(match old_client {
+                Some(old_client) => close_locked_unmodified_host_update_or_recovery_pending(
+                    &transport.alias,
+                    old_client,
+                    &mut bootstrap_lock,
+                    source,
+                ),
+                None => fail_pre_adoption_host_replacement(
+                    &transport.alias,
+                    None,
+                    &mut bootstrap_lock,
+                    &mut report,
+                    "install-host-artifact",
+                    source,
+                ),
+            });
         }
     };
 
-    if let Err(source) = start_persistent_action(
-        &transport.alias,
-        &old_client,
-        &mut bootstrap_lock,
-        "install-host-artifact",
-    ) {
+    if let Some(old_client) = old_client
+        && let Err(source) = start_persistent_action(
+            &transport.alias,
+            old_client,
+            &mut bootstrap_lock,
+            "install-host-artifact",
+        )
+    {
         return Err(recover_failed_first_host_update_action_start(
             &transport.alias,
-            &old_client,
+            old_client,
             &mut bootstrap_lock,
             source,
         ));
@@ -4347,9 +4411,9 @@ fn apply_host_update_with_operation(
             Ok(remote) => remote,
             Err(error) => {
                 let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-                return Err(fail_host_update_action(
+                return Err(fail_pre_adoption_host_replacement(
                     &transport.alias,
-                    &old_client,
+                    old_client,
                     &mut bootstrap_lock,
                     &mut report,
                     "install-host-artifact",
@@ -4361,9 +4425,9 @@ fn apply_host_update_with_operation(
             Ok(artifact) => artifact,
             Err(error) => {
                 let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-                return Err(fail_host_update_action(
+                return Err(fail_pre_adoption_host_replacement(
                     &transport.alias,
-                    &old_client,
+                    old_client,
                     &mut bootstrap_lock,
                     &mut report,
                     "install-host-artifact",
@@ -4388,9 +4452,9 @@ fn apply_host_update_with_operation(
     }
     if artifact.remote_path() != expected_artifact_path {
         let source = SatelleError::state_conflict();
-        return Err(fail_host_update_action(
+        return Err(fail_pre_adoption_host_replacement(
             &transport.alias,
-            &old_client,
+            old_client,
             &mut bootstrap_lock,
             &mut report,
             "install-host-artifact",
@@ -4407,9 +4471,9 @@ fn apply_host_update_with_operation(
         Ok(remote) => remote,
         Err(error) => {
             let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-            return Err(fail_host_update_action(
+            return Err(fail_pre_adoption_host_replacement(
                 &transport.alias,
-                &old_client,
+                old_client,
                 &mut bootstrap_lock,
                 &mut report,
                 "install-host-artifact",
@@ -4425,9 +4489,9 @@ fn apply_host_update_with_operation(
     ) {
         Ok(service) => service,
         Err(source) => {
-            return Err(fail_host_update_action(
+            return Err(fail_pre_adoption_host_replacement(
                 &transport.alias,
-                &old_client,
+                old_client,
                 &mut bootstrap_lock,
                 &mut report,
                 "install-host-artifact",
@@ -4435,12 +4499,14 @@ fn apply_host_update_with_operation(
             ));
         }
     };
-    if let Err(source) = complete_persistent_action(
-        &transport.alias,
-        &old_client,
-        &mut bootstrap_lock,
-        "install-host-artifact",
-    ) {
+    if let Some(old_client) = old_client
+        && let Err(source) = complete_persistent_action(
+            &transport.alias,
+            old_client,
+            &mut bootstrap_lock,
+            "install-host-artifact",
+        )
+    {
         return Err(host_update_recovery_pending(
             &mut report,
             "install-host-artifact",
@@ -4450,15 +4516,17 @@ fn apply_host_update_with_operation(
     }
 
     if publish_service {
-        if let Err(source) = start_persistent_action(
-            &transport.alias,
-            &old_client,
-            &mut bootstrap_lock,
-            "publish-host-service",
-        ) {
+        if let Some(old_client) = old_client
+            && let Err(source) = start_persistent_action(
+                &transport.alias,
+                old_client,
+                &mut bootstrap_lock,
+                "publish-host-service",
+            )
+        {
             return Err(recover_later_host_update_action_start(
                 &transport.alias,
-                &old_client,
+                old_client,
                 &mut bootstrap_lock,
                 &mut report,
                 "publish-host-service",
@@ -4476,9 +4544,9 @@ fn apply_host_update_with_operation(
                 Ok(remote) => remote,
                 Err(error) => {
                     let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-                    return Err(fail_host_update_action(
+                    return Err(fail_pre_adoption_host_replacement(
                         &transport.alias,
-                        &old_client,
+                        old_client,
                         &mut bootstrap_lock,
                         &mut report,
                         "publish-host-service",
@@ -4497,9 +4565,9 @@ fn apply_host_update_with_operation(
         };
         if let Err(error) = publish_result {
             let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-            return Err(fail_host_update_action(
+            return Err(fail_pre_adoption_host_replacement(
                 &transport.alias,
-                &old_client,
+                old_client,
                 &mut bootstrap_lock,
                 &mut report,
                 "publish-host-service",
@@ -4527,9 +4595,9 @@ fn apply_host_update_with_operation(
                 Ok(remote) => remote,
                 Err(error) => {
                     let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-                    return Err(fail_host_update_action(
+                    return Err(fail_pre_adoption_host_replacement(
                         &transport.alias,
-                        &old_client,
+                        old_client,
                         &mut bootstrap_lock,
                         &mut report,
                         "publish-host-service",
@@ -4548,9 +4616,9 @@ fn apply_host_update_with_operation(
         };
         if let Err(error) = register_result {
             let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-            return Err(fail_host_update_action(
+            return Err(fail_pre_adoption_host_replacement(
                 &transport.alias,
-                &old_client,
+                old_client,
                 &mut bootstrap_lock,
                 &mut report,
                 "publish-host-service",
@@ -4560,12 +4628,14 @@ fn apply_host_update_with_operation(
         if let Err(source) =
             finish_confirmed_host_update_action(&mut report, "publish-host-service", || {
                 commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock)?;
-                complete_persistent_action(
-                    &transport.alias,
-                    &old_client,
-                    &mut bootstrap_lock,
-                    "publish-host-service",
-                )
+                old_client.map_or(Ok(()), |old_client| {
+                    complete_persistent_action(
+                        &transport.alias,
+                        old_client,
+                        &mut bootstrap_lock,
+                        "publish-host-service",
+                    )
+                })
             })
         {
             return Err(host_update_recovery_pending(
@@ -4575,12 +4645,14 @@ fn apply_host_update_with_operation(
                 source,
             ));
         }
-    } else if let Err(source) = skip_maintenance_action(
-        &transport.alias,
-        &old_client,
-        &mut bootstrap_lock,
-        "publish-host-service",
-    ) {
+    } else if let Some(old_client) = old_client
+        && let Err(source) = skip_maintenance_action(
+            &transport.alias,
+            old_client,
+            &mut bootstrap_lock,
+            "publish-host-service",
+        )
+    {
         return Err(host_update_recovery_pending(
             &mut report,
             "publish-host-service",
@@ -4589,15 +4661,17 @@ fn apply_host_update_with_operation(
         ));
     }
 
-    if let Err(source) = start_persistent_action(
-        &transport.alias,
-        &old_client,
-        &mut bootstrap_lock,
-        "restart-host-daemon",
-    ) {
+    if let Some(old_client) = old_client
+        && let Err(source) = start_persistent_action(
+            &transport.alias,
+            old_client,
+            &mut bootstrap_lock,
+            "restart-host-daemon",
+        )
+    {
         return Err(recover_later_host_update_action_start(
             &transport.alias,
-            &old_client,
+            old_client,
             &mut bootstrap_lock,
             &mut report,
             "restart-host-daemon",
@@ -4615,9 +4689,9 @@ fn apply_host_update_with_operation(
             Ok(remote) => remote,
             Err(error) => {
                 let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-                return Err(fail_host_update_action(
+                return Err(fail_pre_adoption_host_replacement(
                     &transport.alias,
-                    &old_client,
+                    old_client,
                     &mut bootstrap_lock,
                     &mut report,
                     "restart-host-daemon",
@@ -4632,9 +4706,9 @@ fn apply_host_update_with_operation(
     };
     if let Err(error) = restart_result {
         let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
-        return Err(fail_host_update_action(
+        return Err(fail_pre_adoption_host_replacement(
             &transport.alias,
-            &old_client,
+            old_client,
             &mut bootstrap_lock,
             &mut report,
             "restart-host-daemon",
@@ -4649,8 +4723,7 @@ fn apply_host_update_with_operation(
             source,
         ));
     }
-    drop(old_client);
-    drop(old_tunnel);
+    drop(old_connection);
 
     let (new_tunnel, new_client) = match transport.durable_service_client() {
         Ok(connection) => connection,
@@ -4692,37 +4765,53 @@ fn apply_host_update_with_operation(
             SatelleError::state_conflict(),
         ));
     }
-    let adopted = match operation {
-        HostUpdateOperation::Update => {
-            new_client.begin_host_update_maintenance(&operation_id, &recovery_identity)
-        }
-        HostUpdateOperation::Repair => {
-            new_client.begin_repair_maintenance(&operation_id, &recovery_identity)
-        }
-    };
-    let adopted = match adopted {
-        Ok(adopted) => adopted,
-        Err(error) => {
-            let source = direct_transport_error(&transport.alias, error);
+    if entry == HostReplacementEntry::Bootstrap {
+        if let Err(source) = adopt_bootstrap_repair_actions(
+            &transport.alias,
+            &new_client,
+            &mut bootstrap_lock,
+            &recovery_identity,
+            publish_service,
+        ) {
             return Err(host_update_daemon_adoption_error(
                 &mut report,
                 &operation_id,
                 source,
             ));
         }
-    };
-    if let Err(source) = validate_persistent_maintenance_response(
-        &transport.alias,
-        &operation_id,
-        adopted.reconciled(),
-        adopted.operation_id(),
-    ) {
-        return Err(host_update_recovery_pending(
-            &mut report,
-            "restart-host-daemon",
+    } else {
+        let adopted = match operation {
+            HostUpdateOperation::Update => {
+                new_client.begin_host_update_maintenance(&operation_id, &recovery_identity)
+            }
+            HostUpdateOperation::Repair => {
+                new_client.begin_repair_maintenance(&operation_id, &recovery_identity)
+            }
+        };
+        let adopted = match adopted {
+            Ok(adopted) => adopted,
+            Err(error) => {
+                let source = direct_transport_error(&transport.alias, error);
+                return Err(host_update_daemon_adoption_error(
+                    &mut report,
+                    &operation_id,
+                    source,
+                ));
+            }
+        };
+        if let Err(source) = validate_persistent_maintenance_response(
+            &transport.alias,
             &operation_id,
-            source,
-        ));
+            adopted.reconciled(),
+            adopted.operation_id(),
+        ) {
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "restart-host-daemon",
+                &operation_id,
+                source,
+            ));
+        }
     }
     if let Err(source) =
         finish_confirmed_host_update_action(&mut report, "restart-host-daemon", || {
@@ -4857,6 +4946,35 @@ fn apply_host_update_with_operation(
     drop(new_tunnel);
 
     Ok(report.finish_postchecks())
+}
+
+fn adopt_bootstrap_repair_actions(
+    host: &str,
+    client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
+    published_service: bool,
+) -> Result<(), SatelleError> {
+    let operation_id = bootstrap_lock.operation_id().to_string();
+    let adopted = client
+        .begin_repair_maintenance(&operation_id, recovery_identity)
+        .map_err(|error| direct_transport_error(host, error))?;
+    validate_persistent_maintenance_response(
+        host,
+        &operation_id,
+        adopted.reconciled(),
+        adopted.operation_id(),
+    )?;
+
+    for action_id in ["install-host-artifact", "publish-host-service"] {
+        if action_id == "publish-host-service" && !published_service {
+            skip_maintenance_action(host, client, bootstrap_lock, action_id)?;
+        } else {
+            start_persistent_action(host, client, bootstrap_lock, action_id)?;
+            complete_persistent_action(host, client, bootstrap_lock, action_id)?;
+        }
+    }
+    start_persistent_action(host, client, bootstrap_lock, "restart-host-daemon")
 }
 
 fn finish_confirmed_host_update_action(
@@ -5239,6 +5357,51 @@ fn fail_host_update_action(
     }
 }
 
+fn fail_pre_adoption_host_replacement(
+    host: &str,
+    client: Option<&DaemonClient>,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    report: &mut satelle_core::host_update::HostUpdateReport,
+    action_id: &str,
+    source: SatelleError,
+) -> SatelleError {
+    if let Some(client) = client {
+        return fail_host_update_action(host, client, bootstrap_lock, report, action_id, source);
+    }
+
+    let operation_id = bootstrap_lock.operation_id().to_string();
+    if report.changed || bootstrap_lock.has_mutation_attempt() {
+        // A lock-first repair has no daemon ledger until the replacement
+        // starts. Preserve the operation claim whenever the remote mutation
+        // outcome is known or uncertain so a later repair can reconcile it.
+        report.changed = true;
+        return operation_scoped_partial_host_update(
+            report,
+            action_id,
+            &operation_id,
+            source,
+            None,
+        );
+    }
+    release_unmodified_bootstrap_repair(host, bootstrap_lock, source)
+}
+
+fn release_unmodified_bootstrap_repair(
+    host: &str,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    source: SatelleError,
+) -> SatelleError {
+    let operation_id = bootstrap_lock.operation_id().to_string();
+    match bootstrap_lock.release_unmodified() {
+        Ok(()) => source,
+        Err(_) => SatelleError::host_update_recovery_pending(
+            host,
+            &operation_id,
+            format!("Host repair stopped: {source}; Bootstrap Lock release failed"),
+        ),
+    }
+}
+
 fn recover_later_host_update_action_start(
     host: &str,
     client: &DaemonClient,
@@ -5516,6 +5679,43 @@ fn selected_host_replacement_operation(
     }
 }
 
+fn repair_host_replacement_entry(
+    repair: &satelle_core::host_update::RepairUpgradeReport,
+    resumes_host_replacement: bool,
+) -> HostReplacementEntry {
+    use satelle_core::host_update::{
+        HostUpdateTarget, RepairCompatibilityReason, RepairUpgradeDisposition,
+    };
+
+    if !resumes_host_replacement
+        && repair.actions.iter().any(|action| {
+            action.target == HostUpdateTarget::HostDaemon
+                && action.disposition == RepairUpgradeDisposition::Required
+                && matches!(
+                    action.compatibility_reason,
+                    Some(
+                        RepairCompatibilityReason::Missing
+                            | RepairCompatibilityReason::ControlPlaneIncompatible
+                    )
+                )
+        })
+    {
+        HostReplacementEntry::Bootstrap
+    } else {
+        HostReplacementEntry::ReachableDaemon
+    }
+}
+
+fn repair_plan_reads_daemon_ledger(
+    repair: &satelle_core::host_update::RepairUpgradeReport,
+    run_id: Option<&str>,
+) -> bool {
+    run_id.is_some()
+        || (repair.requires_mutation()
+            && repair_host_replacement_entry(repair, false)
+                == HostReplacementEntry::ReachableDaemon)
+}
+
 pub(crate) fn plan_repair_upgrades(
     host: &SelectedHost,
     run_id: Option<&str>,
@@ -5621,7 +5821,7 @@ pub(crate) fn plan_repair_upgrades(
 
     let mut report =
         crate::host_update::build_repair_upgrade_plan(&host.alias, &repair_inspections);
-    if report.requires_mutation() || run_id.is_some() {
+    if repair_plan_reads_daemon_ledger(&report, run_id) {
         let probes = report
             .planned_actions
             .iter()
@@ -5752,11 +5952,13 @@ pub(crate) fn apply_repair_upgrades(
         plan_host_update(host, target_version, &components, false)?
     };
     let operation = resumed_operation.unwrap_or(HostUpdateOperation::Repair);
+    let entry = repair_host_replacement_entry(&repair, resumed_operation.is_some());
     let source = match apply_host_update_with_operation(
         host,
         target_version,
         host_update,
         operation,
+        entry,
         recovery_run_id.filter(|_| resumed_operation.is_some()),
         || {
             if let Some(recovery_identity) = recovery_identity.as_ref() {

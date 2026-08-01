@@ -286,6 +286,126 @@ fn active_host_replacements_resume_with_the_selected_operation_kind() {
 }
 
 #[test]
+fn unavailable_daemon_repairs_enter_host_replacement_under_bootstrap_lock() {
+    use satelle_core::host_update::{
+        HostUpdateTarget, HostUpdateVersionSource, RepairCompatibilityReason, RepairUpgradeAction,
+        RepairUpgradeDisposition, RepairUpgradeReport,
+    };
+
+    let report = |compatibility_reason| {
+        RepairUpgradeReport::new(
+            "office",
+            vec![RepairUpgradeAction {
+                action_id: "repair-host-daemon".to_string(),
+                target: HostUpdateTarget::HostDaemon,
+                current_version: (compatibility_reason != RepairCompatibilityReason::Missing)
+                    .then(|| "0.1.0".to_string()),
+                target_version: env!("CARGO_PKG_VERSION").to_string(),
+                compatibility_reason: Some(compatibility_reason),
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
+                disposition: RepairUpgradeDisposition::Required,
+            }],
+        )
+    };
+
+    for reason in [
+        RepairCompatibilityReason::Missing,
+        RepairCompatibilityReason::ControlPlaneIncompatible,
+    ] {
+        let report = report(reason);
+        assert_eq!(
+            repair_host_replacement_entry(&report, false),
+            HostReplacementEntry::Bootstrap
+        );
+        assert!(!repair_plan_reads_daemon_ledger(&report, None));
+    }
+    let compatible_report = report(RepairCompatibilityReason::BelowMinimumVersion);
+    assert_eq!(
+        repair_host_replacement_entry(&compatible_report, false),
+        HostReplacementEntry::ReachableDaemon
+    );
+    assert!(repair_plan_reads_daemon_ledger(&compatible_report, None));
+    assert!(repair_plan_reads_daemon_ledger(
+        &report(RepairCompatibilityReason::Missing),
+        Some("selected-run"),
+    ));
+    assert_eq!(
+        repair_host_replacement_entry(&report(RepairCompatibilityReason::Missing), true),
+        HostReplacementEntry::ReachableDaemon
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn replacement_daemon_adopts_bootstrap_repair_actions_before_postchecks() {
+    for (published_service, expected_publish_status) in [
+        (true, satelle_host::SetupActionStatus::Completed),
+        (false, satelle_host::SetupActionStatus::Skipped),
+    ] {
+        with_bootstrap_handoff_test_context_with_scope(
+            ApiScopes::ADMIN,
+            |client, fake_ssh, _, _, ledger, _| {
+                let operation_id = if published_service {
+                    "bootstrap-repair-adoption-published-service"
+                } else {
+                    "bootstrap-repair-adoption-current-service"
+                };
+                let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
+                    "office",
+                    "fake-ssh-host",
+                    operation_id.to_string(),
+                    bootstrap_lock::OperationKind::MissingDaemonRepair,
+                    fake_ssh,
+                )
+                .expect("acquire missing-daemon repair Bootstrap Lock");
+                bootstrap_lock
+                    .confirm_ownership()
+                    .expect("confirm Bootstrap Lock ownership");
+
+                adopt_bootstrap_repair_actions(
+                    "office",
+                    client,
+                    &mut bootstrap_lock,
+                    &test_host_update_recovery_identity(),
+                    published_service,
+                )
+                .expect("replacement daemon adopts completed bootstrap repair actions");
+
+                let run = ledger
+                    .load_setup_run(operation_id)
+                    .expect("read repair ledger")
+                    .expect("repair run exists");
+                assert_eq!(
+                    run.actions()
+                        .iter()
+                        .map(|action| (action.action_id(), action.status()))
+                        .collect::<Vec<_>>(),
+                    [
+                        (
+                            "install-host-artifact",
+                            satelle_host::SetupActionStatus::Completed,
+                        ),
+                        ("publish-host-service", expected_publish_status),
+                        (
+                            "restart-host-daemon",
+                            satelle_host::SetupActionStatus::Started,
+                        ),
+                        (
+                            "invalidate-readiness-caches",
+                            satelle_host::SetupActionStatus::Planned,
+                        ),
+                        (
+                            "host-update-postcheck",
+                            satelle_host::SetupActionStatus::Planned,
+                        ),
+                    ]
+                );
+            },
+        );
+    }
+}
+
+#[test]
 fn host_update_recovery_requires_and_rechecks_the_persisted_artifact() {
     assert!(maintenance_release_artifact_required(
         HostMaintenancePlanKind::HostUpdateRecovery,
