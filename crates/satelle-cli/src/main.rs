@@ -8843,6 +8843,13 @@ fn storage_backup_cleanup_actions(
     actions
 }
 
+fn preview_local_storage_restore_before_consent(
+    state_root: &Path,
+    backup: &Path,
+) -> Result<(), CliFailure> {
+    satelle_host::HostService::preview_storage_restore(state_root, backup).map_err(failure)
+}
+
 fn run_host_storage(
     command: HostStorageCommand,
     config: ConfigContext<'_>,
@@ -8861,16 +8868,7 @@ fn run_host_storage(
                 .then(|| local_storage_state_root(&host))
                 .transpose()?;
             if let Some(state_root) = &local_state_root {
-                if command.dry_run {
-                    satelle_host::HostService::preview_storage_restore(state_root, &command.backup)
-                        .map_err(failure)?;
-                } else {
-                    satelle_host::HostService::validate_storage_restore(
-                        state_root,
-                        &command.backup,
-                    )
-                    .map_err(failure)?;
-                }
+                preview_local_storage_restore_before_consent(state_root, &command.backup)?;
             } else if command.dry_run {
                 transport::preview_ssh_storage_restore(&host, &command.backup).map_err(failure)?;
             } else {
@@ -9153,6 +9151,42 @@ fn run_host_store(
             )
         }
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn local_restore_preconsent_validation_is_read_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let state = satelle_host::test_support::TestStateDir::new()
+        .expect("create local restore preconsent state");
+    let backup = state
+        .path()
+        .join("satelle.sqlite3.migration-v12-0198a146-5ec2-7dd5-b51c-7d5e241e5890.backup");
+    std::fs::write(&backup, b"invalid sqlite backup").expect("write invalid backup");
+    let original_permissions = std::fs::metadata(state.path())
+        .expect("read original state permissions")
+        .permissions();
+    std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o500))
+        .expect("make state directory read-only");
+
+    let validation = preview_local_storage_restore_before_consent(state.path(), &backup);
+    let mode_after_validation = std::fs::metadata(state.path())
+        .expect("read state permissions after validation")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    std::fs::set_permissions(state.path(), original_permissions)
+        .expect("restore state directory permissions");
+    assert!(
+        validation.is_err(),
+        "the invalid backup must still fail preview validation"
+    );
+    assert_eq!(
+        0o500, mode_after_validation,
+        "preconsent validation must not prepare or stage in the state directory"
+    );
 }
 
 fn run_offline_storage_maintenance(
