@@ -172,6 +172,34 @@ pub struct DaemonResolvedPathSet {
 }
 
 impl DaemonResolvedPathSet {
+    /// Builds the path evidence needed by an offline Host operation from its
+    /// already-authoritative state root. Offline maintenance must not depend
+    /// on project discovery, the process working directory, or OS defaults.
+    pub fn for_offline_state_root(state_root: &Path) -> Self {
+        let state_root = state_root.display().to_string();
+        let source = crate::PathSource::ServiceConfig;
+        Self {
+            config_file: join_remote_path(&state_root, "config.toml"),
+            cache_root: join_remote_path(&state_root, "cache"),
+            sqlite_store: join_remote_path(&state_root, "satelle.sqlite3"),
+            operator_log_root: join_remote_path(&state_root, "logs"),
+            recording_root: join_remote_path(&state_root, "recordings"),
+            project_config_file: None,
+            install_receipt: join_remote_path(&state_root, "install-receipt.json"),
+            state_root,
+            sources: crate::SatellePathSources {
+                config_file: source,
+                cache_root: source,
+                state_root: source,
+                sqlite_store: source,
+                operator_log_root: source,
+                recording_root: source,
+                project_config_file: source,
+                install_receipt: source,
+            },
+        }
+    }
+
     pub fn with_service_overrides(&self, overrides: &DaemonPathOverrides) -> Self {
         let mut planned = self.clone();
         if let Some(home) = overrides.home.as_ref() {

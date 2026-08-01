@@ -867,6 +867,10 @@ fn router(state: Arc<DaemonState>) -> Router {
             "/v1/maintenance/host-update/{operation_id}/begin",
             post(setup::begin_host_update_maintenance),
         )
+        .route(
+            "/v1/maintenance/repair/{operation_id}/begin",
+            post(setup::begin_repair_maintenance),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_setup_mutation,

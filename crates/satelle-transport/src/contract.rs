@@ -38,8 +38,8 @@ pub use setup::{
     ProviderBindingAuthorizationResponse, ProviderBindingDeletionResponse,
     ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
     ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
-    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, SetupRepairDecision,
-    SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
+    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, RepairMaintenanceRequest,
+    SetupRepairDecision, SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
     SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairPreviousStatus, SetupRepairProbe,
     SetupRepairRunStatus, SetupVerificationRequest, SetupVerificationResponse,
 };

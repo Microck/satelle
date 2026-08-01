@@ -310,6 +310,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         },
         ErrorCode::HostBinaryNewerThanCli
         | ErrorCode::HostArtifactUnavailable
+        | ErrorCode::HostUpdateRecoveryIdentityMismatch
         | ErrorCode::HostUpdateRequiresCliUpgrade
         | ErrorCode::AmbiguousCodexComponentOwnership => ErrorContract {
             category: ErrorCategory::Readiness,

@@ -567,7 +567,11 @@ impl RepairUpgradeReport {
     }
 
     pub fn applied(mut self, completed_actions: Vec<String>) -> Self {
-        self.status = RepairStatus::Applied;
+        self.status = if self.skipped_actions.is_empty() {
+            RepairStatus::Applied
+        } else {
+            RepairStatus::ManualActionRequired
+        };
         self.changed = !completed_actions.is_empty();
         self.applied_actions.clone_from(&completed_actions);
         self.completed_actions = completed_actions;
@@ -744,6 +748,44 @@ mod tests {
             partial.recovery_command.as_deref(),
             Some("satelle repair --host remote --no-input --yes")
         );
+    }
+
+    #[test]
+    fn applied_repair_work_preserves_manual_action_required_status() {
+        let report = RepairUpgradeReport::new(
+            "remote",
+            vec![
+                RepairUpgradeAction {
+                    action_id: "repair-host-daemon".to_string(),
+                    target: HostUpdateTarget::HostDaemon,
+                    current_version: None,
+                    target_version: "1.1.0".to_string(),
+                    compatibility_reason: Some(RepairCompatibilityReason::Missing),
+                    version_source: HostUpdateVersionSource::InvokingCliRelease,
+                    disposition: RepairUpgradeDisposition::Required,
+                },
+                RepairUpgradeAction {
+                    action_id: "repair-codex-runtime".to_string(),
+                    target: HostUpdateTarget::CodexRuntime,
+                    current_version: None,
+                    target_version: "1.1.0".to_string(),
+                    compatibility_reason: Some(RepairCompatibilityReason::Missing),
+                    version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
+                    disposition: RepairUpgradeDisposition::ManualActionRequired,
+                },
+            ],
+        )
+        .applied(vec![
+            "install-host-artifact".to_string(),
+            "publish-host-service".to_string(),
+            "restart-host-daemon".to_string(),
+            "invalidate-readiness-caches".to_string(),
+            "host-update-postcheck".to_string(),
+        ]);
+
+        assert_eq!(RepairStatus::ManualActionRequired, report.status);
+        assert!(report.changed);
+        assert_eq!(report.skipped_actions, ["repair-codex-runtime"]);
     }
 
     #[test]

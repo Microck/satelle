@@ -569,11 +569,17 @@ impl DaemonClient {
     pub fn begin_repair_maintenance(
         &self,
         operation_id: &str,
+        recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
     ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
-        let path =
-            format!("/v1/maintenance/bootstrap/{operation_id}/missing_daemon_repair/repair/begin");
+        let path = format!("/v1/maintenance/repair/{operation_id}/begin");
         let (request, request_id) = self.mutation_request(&path, operation_id)?;
-        self.send_authenticated(request, request_id, StatusCode::OK)
+        self.send_authenticated(
+            request.json(&crate::RepairMaintenanceRequest::new(
+                recovery_identity.clone(),
+            )),
+            request_id,
+            StatusCode::OK,
+        )
     }
 
     pub fn start_maintenance_action(

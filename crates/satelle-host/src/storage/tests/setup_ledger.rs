@@ -1600,7 +1600,7 @@ fn repair_uses_each_actions_most_recent_retained_ledger_entry() {
     );
 
     let selected_run = storage
-        .load_setup_run("setup-run-1")
+        .load_setup_run("setup-run-2")
         .unwrap()
         .expect("selected setup run remains retained");
     let selected_repair = storage
@@ -1617,12 +1617,57 @@ fn repair_uses_each_actions_most_recent_retained_ledger_entry() {
         )
         .unwrap();
     assert_eq!(
-        Some("setup-run-1"),
+        SetupRepairDecision::OperatorActionRequired,
+        selected_repair.actions()[0].decision()
+    );
+    assert!(!selected_repair.actions()[0].retry_safe());
+    assert_eq!(
+        Some("setup-run-2"),
         selected_repair.actions()[0].previous_run_id()
     );
     assert_eq!(
-        Some(SetupActionStatus::Failed),
+        Some(SetupActionStatus::Completed),
         selected_repair.actions()[0].previous_status()
+    );
+}
+
+#[test]
+fn repair_adopts_the_first_planned_action_after_a_completed_action() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let plan = SetupRunPlan::new(
+        "planned-action-recovery",
+        SetupOperationKind::Repair,
+        None,
+        at(1),
+        vec![
+            SetupActionPlan::new("replace-host", "Replace Host", true).unwrap(),
+            SetupActionPlan::new("restart-host", "Restart Host", true).unwrap(),
+        ],
+    )
+    .unwrap();
+    let capability = begin_setup_run(&mut storage, &plan);
+    storage
+        .start_setup_action(&capability, "replace-host", at(2))
+        .unwrap();
+    storage
+        .complete_setup_action_after_verified_postcondition(&capability, "replace-host", at(3))
+        .unwrap();
+    storage
+        .retain_lease_recovery(capability.lease_owner())
+        .expect("retain recovery between maintenance actions");
+
+    let adopted = storage
+        .adopt_recovery_maintenance(plan.run_id(), maintenance_owner(plan.run_id(), at(4)))
+        .expect("adopt the first remaining planned action");
+    storage
+        .complete_setup_action_after_verified_postcondition(&adopted, "restart-host", at(5))
+        .expect("complete the action started during adoption");
+    assert_eq!(
+        SetupRunStatus::Completed,
+        storage
+            .finish_setup_run_and_release_maintenance(&adopted, at(6))
+            .expect("finish the adopted operation")
     );
 }
 

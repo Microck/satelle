@@ -2507,6 +2507,75 @@ async fn persistent_host_service_maintenance_routes_enforce_action_order() {
             .all(|action| action.status() == satelle_host::SetupActionStatus::Skipped)
     );
 
+    let repair_operation_id = "repair-host-replacement-route-proof";
+    let begin_repair = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/repair/{repair_operation_id}/begin"),
+        repair_operation_id,
+    )
+    .json(&serde_json::json!({
+        "schema_version": "satelle.repair-maintenance.v1",
+        "recovery_identity": {
+            "target_version": "0.1.0",
+            "artifact_digest":
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+    }))
+    .send()
+    .await
+    .expect("begin repair Host replacement maintenance");
+    assert_eq!(begin_repair.status(), StatusCode::OK);
+    for action_id in [
+        "install-host-artifact",
+        "publish-host-service",
+        "restart-host-daemon",
+        "invalidate-readiness-caches",
+        "host-update-postcheck",
+    ] {
+        let skip = setup_mutation_request(
+            &client,
+            address,
+            &bootstrap_token,
+            &host_identity,
+            &format!("/v1/maintenance/bootstrap/{repair_operation_id}/action/{action_id}/skip"),
+            repair_operation_id,
+        )
+        .send()
+        .await
+        .expect("skip repair Host replacement action");
+        assert_eq!(skip.status(), StatusCode::OK, "skip {action_id}");
+    }
+    let finish_repair = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        &format!("/v1/maintenance/bootstrap/{repair_operation_id}/finish"),
+        repair_operation_id,
+    )
+    .send()
+    .await
+    .expect("finish repair Host replacement maintenance");
+    assert_eq!(finish_repair.status(), StatusCode::OK);
+    let repair = service
+        .load_setup_run(repair_operation_id)
+        .expect("load repair Host replacement ledger")
+        .expect("repair Host replacement ledger exists");
+    assert_eq!(
+        repair.operation_kind(),
+        satelle_host::SetupOperationKind::Repair
+    );
+    assert_eq!(
+        repair
+            .host_update_recovery_identity()
+            .expect("repair retains its exact recovery identity")
+            .artifact_digest(),
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+
     server.shutdown().await.expect("stop bootstrap server");
 }
 

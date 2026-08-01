@@ -1566,7 +1566,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 HostCommand::Trust(command) => Some(command.host.as_str()),
                 HostCommand::Status(command) => command.host.as_deref(),
                 HostCommand::Stop(command) | HostCommand::Restart(command) => {
-                    Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST))
+                    command.host.as_deref()
                 }
                 HostCommand::Update(command) => (command.host.len() == 1 && !command.all_remotes)
                     .then(|| command.host[0].as_str()),
@@ -1574,19 +1574,19 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 HostCommand::Sessions(command) => command.host.as_deref(),
                 HostCommand::Storage {
                     command: HostStorageCommand::Migrate(command),
-                } => Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)),
+                } => command.host.as_deref(),
                 HostCommand::Storage {
                     command: HostStorageCommand::Restore(command),
-                } => Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)),
+                } => command.host.as_deref(),
                 HostCommand::Storage {
                     command:
                         HostStorageCommand::Backup {
                             command: HostStorageBackupCommand::Cleanup(command),
                         },
-                } => Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)),
+                } => command.host.as_deref(),
                 HostCommand::Store {
                     command: HostStoreCommand::Reset(command),
-                } => Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)),
+                } => command.host.as_deref(),
                 HostCommand::OfflineStorageMaintenance(_) => None,
             },
             session_id: None,
@@ -4444,12 +4444,20 @@ fn run_repair(
     }
     let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
     if noninteractive && !command.yes {
+        let recovery_command = match command.run.as_deref() {
+            Some(run_id) => format!(
+                "satelle repair --host {} --run {} --no-input --yes --json",
+                shell_argument(&host.alias),
+                shell_argument(run_id)
+            ),
+            None => format!(
+                "satelle repair --host {} --no-input --yes --json",
+                shell_argument(&host.alias)
+            ),
+        };
         return Err(failure(SatelleError::setup_consent_required(
             &report.planned_actions,
-            format!(
-                "satelle repair --host {} --no-input --yes --json",
-                host.alias
-            ),
+            recovery_command,
         )));
     }
     if !command.yes {
@@ -8655,7 +8663,7 @@ fn run_host_storage(
                     .insert("api_service_restarted".to_string(), json!(true));
                 activation
             };
-            print_storage_result(&host.alias, "restore", activation, format)
+            print_storage_result(&host.alias, "restore", activation, true, format)
         }
         HostStorageCommand::Backup {
             command: HostStorageBackupCommand::Cleanup(command),
@@ -8677,8 +8685,17 @@ fn run_host_storage(
             } else {
                 vec!["delete older eligible validated migration backups".to_string()]
             };
-            if command.dry_run || planned_actions.is_empty() {
+            if command.dry_run {
                 return print_storage_plan(&host.alias, "backup_cleanup", &planned_actions, format);
+            }
+            if planned_actions.is_empty() {
+                return print_storage_result(
+                    &host.alias,
+                    "backup_cleanup",
+                    json!({"removed_backup_file_names": []}),
+                    false,
+                    format,
+                );
             }
             let recovery_command = format!(
                 "satelle host storage backup cleanup --host {} --no-input --yes",
@@ -8711,7 +8728,11 @@ fn run_host_storage(
                 )
                 .map_err(failure)?
             };
-            print_storage_result(&host.alias, "backup_cleanup", cleanup, format)
+            let changed = cleanup
+                .get("removed_backup_file_names")
+                .and_then(Value::as_array)
+                .is_some_and(|removed| !removed.is_empty());
+            print_storage_result(&host.alias, "backup_cleanup", cleanup, changed, format)
         }
     }
 }
@@ -8768,6 +8789,7 @@ fn run_host_store(
                         satelle_host::HostService::reset_store_metadata_offline(
                             state_root,
                             command.delete_recordings,
+                            &recovery_command,
                         )
                     },
                 )?)
@@ -8790,7 +8812,15 @@ fn run_host_store(
                     .insert("api_service_restarted".to_string(), json!(true));
                 reset
             };
-            print_storage_result(&host.alias, "store_reset", reset, format)
+            let changed = reset
+                .get("removed_metadata_file_names")
+                .and_then(Value::as_array)
+                .is_some_and(|removed| !removed.is_empty())
+                || reset
+                    .get("recordings_deleted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            print_storage_result(&host.alias, "store_reset", reset, changed, format)
         }
     }
 }
@@ -8880,6 +8910,7 @@ fn run_offline_storage_maintenance(
             satelle_host::HostService::reset_store_metadata_offline(
                 &command.state_root,
                 command.delete_recordings,
+                &recovery_command,
             )
             .and_then(|result| {
                 serde_json::to_value(result).map_err(|error| {
@@ -8934,7 +8965,9 @@ fn print_storage_plan(
             "status": "planned",
             "changed": false,
             "planned_actions": planned_actions,
-            "applied_actions": []
+            "applied_actions": [],
+            "cancellation_reason": null,
+            "result": null
         }))
         .map_err(failure)
     } else {
@@ -8959,8 +8992,10 @@ fn print_storage_cancelled(
             "operation": operation,
             "status": "cancelled",
             "changed": false,
+            "planned_actions": [],
             "applied_actions": [],
-            "cancellation_reason": "user_declined_confirmation"
+            "cancellation_reason": "user_declined_confirmation",
+            "result": null
         }))
         .map_err(failure)
     } else {
@@ -8973,6 +9008,7 @@ fn print_storage_result(
     host: &str,
     operation: &str,
     result: Value,
+    changed: bool,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     if format.is_json() {
@@ -8981,7 +9017,10 @@ fn print_storage_result(
             "host": host,
             "operation": operation,
             "status": "applied",
-            "changed": true,
+            "changed": changed,
+            "planned_actions": [],
+            "applied_actions": [],
+            "cancellation_reason": null,
             "result": result
         }))
         .map_err(failure)

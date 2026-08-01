@@ -1774,3 +1774,19 @@ fn cleanup_ignores_malformed_lookalikes_without_deleting_them() {
         );
     }
 }
+
+#[test]
+fn offline_store_reset_returns_files_removed_before_a_later_delete_failure() {
+    let state = crate::TestStateDir::new().expect("create state directory");
+    let reset = begin_store_reset_offline(state.path()).expect("acquire offline reset ownership");
+    write_private_file(&state.path().join("satelle.sqlite3-wal"), b"wal");
+    fs::create_dir(state.path().join("satelle.sqlite3-shm")).expect("create invalid later sidecar");
+
+    let (removed, _) = reset
+        .reset_metadata()
+        .expect_err("the invalid later sidecar must fail reset");
+
+    assert_eq!(removed, ["satelle.sqlite3-wal"]);
+    assert!(!state.path().join("satelle.sqlite3-wal").exists());
+    assert!(state.path().join("satelle.sqlite3-shm").is_dir());
+}

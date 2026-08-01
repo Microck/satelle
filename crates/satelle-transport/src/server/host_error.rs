@@ -391,6 +391,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         // must never be reclassified as Host wire failures.
         | ErrorCode::HostBinaryNewerThanCli
         | ErrorCode::HostArtifactUnavailable
+        | ErrorCode::HostUpdateRecoveryIdentityMismatch
         | ErrorCode::ReleaseVerifierUnavailable
         | ErrorCode::HostUpdateRequiresCliUpgrade
         | ErrorCode::HostUpdateRecoveryPending

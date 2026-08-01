@@ -362,6 +362,7 @@ pub(crate) struct RepairLedgerPlan {
 struct LocalTransport {
     alias: String,
     service: HostService,
+    desktop_binding: Option<satelle_core::session::DesktopBindingRef>,
     provider_secret_bridge: Mutex<Option<LocalProviderSecretBridge>>,
 }
 
@@ -370,6 +371,20 @@ impl LocalTransport {
         Self {
             alias,
             service,
+            desktop_binding: None,
+            provider_secret_bridge: Mutex::new(None),
+        }
+    }
+
+    fn for_selected_host(host: &SelectedHost, service: HostService) -> Self {
+        let desktop_binding = host.config.desktop_user.as_deref().map(|desktop_user| {
+            satelle_core::session::DesktopBindingRef::new(desktop_user)
+                .expect("resolved Host configuration contains a validated desktop binding")
+        });
+        Self {
+            alias: host.alias.clone(),
+            service,
+            desktop_binding,
             provider_secret_bridge: Mutex::new(None),
         }
     }
@@ -696,7 +711,9 @@ impl TransportClient for LocalTransport {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let plan = self.service.plan_setup_repair(None, run_id, &probes)?;
+        let plan =
+            self.service
+                .plan_setup_repair(self.desktop_binding.as_ref(), run_id, &probes)?;
         Ok(RepairLedgerPlan {
             available: plan.selected_operation_kind().is_some()
                 || plan
@@ -3111,14 +3128,22 @@ pub(crate) fn apply_ssh_storage_maintenance(
             None
         };
         let artifact = remote.install_current_host_artifact()?;
+        if artifact.cache_changed() {
+            bootstrap_lock.commit_current_mutation()?;
+        }
         Ok::<_, ssh_bootstrap::SshBootstrapError>((overrides, windows_task, artifact))
     })();
     let (persisted_overrides, windows_task, artifact) = match prerequisites {
         Ok(prerequisites) => prerequisites,
         Err(error) => {
-            bootstrap_lock
-                .release_unmodified()
-                .map_err(|_| SatelleError::host_unreachable(&transport.alias))?;
+            // A failed fenced upload retains recovery ownership. Only a
+            // wholly read-only prerequisite failure may release the claim as
+            // unmodified.
+            if !bootstrap_lock.has_mutation_attempt() {
+                bootstrap_lock
+                    .release_unmodified()
+                    .map_err(|_| SatelleError::host_unreachable(&transport.alias))?;
+            }
             return Err(map_ssh_daemon_bootstrap_error(&transport.alias, error));
         }
     };
@@ -3677,14 +3702,25 @@ fn validate_host_update_recovery_artifact(
     inspection: &HostMaintenanceInspection,
     recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
 ) -> Result<(), SatelleError> {
-    let artifact = inspection
-        .artifact
-        .as_ref()
-        .ok_or_else(SatelleError::state_conflict)?;
-    if artifact.version != recovery_identity.target_version()
-        || artifact.digest != recovery_identity.artifact_digest()
-    {
-        return Err(SatelleError::state_conflict());
+    let artifact = inspection.artifact.as_ref().ok_or_else(|| {
+        SatelleError::host_artifact_unavailable(
+            recovery_identity.target_version(),
+            &inspection.remote_platform,
+        )
+    })?;
+    if artifact.version != recovery_identity.target_version() {
+        return Err(SatelleError::host_update_recovery_identity_mismatch(
+            "target_version",
+            recovery_identity.target_version(),
+            &artifact.version,
+        ));
+    }
+    if artifact.digest != recovery_identity.artifact_digest() {
+        return Err(SatelleError::host_update_recovery_identity_mismatch(
+            "artifact_digest",
+            recovery_identity.artifact_digest(),
+            &artifact.digest,
+        ));
     }
     Ok(())
 }
@@ -4363,7 +4399,9 @@ fn apply_host_update_with_operation(
         HostUpdateOperation::Update => {
             new_client.begin_host_update_maintenance(&operation_id, &recovery_identity)
         }
-        HostUpdateOperation::Repair => new_client.begin_repair_maintenance(&operation_id),
+        HostUpdateOperation::Repair => {
+            new_client.begin_repair_maintenance(&operation_id, &recovery_identity)
+        }
     };
     let adopted = match adopted {
         Ok(adopted) => adopted,
@@ -4665,7 +4703,9 @@ fn begin_host_update_maintenance_with_revalidation(
     let begin = match operation {
         HostUpdateOperation::Update => client
             .begin_host_update_maintenance(operation_id, &host_update_recovery_identity(accepted)?),
-        HostUpdateOperation::Repair => client.begin_repair_maintenance(operation_id),
+        HostUpdateOperation::Repair => {
+            client.begin_repair_maintenance(operation_id, &host_update_recovery_identity(accepted)?)
+        }
     }
     .map_err(|error| host_update_maintenance_begin_error(host, operation_id, error))?;
     if let Err(source) = validate_persistent_maintenance_response(
@@ -5021,15 +5061,19 @@ fn selected_repair_run(
 
 fn resumes_selected_host_update(selected_run: Option<&RepairLedgerPlan>) -> bool {
     selected_run.is_some_and(|run| {
-        run.selected_operation_kind == Some(satelle_transport::SetupRepairOperationKind::HostUpdate)
-            && matches!(
-                run.selected_run_status,
-                Some(
-                    satelle_transport::SetupRepairRunStatus::Running
-                        | satelle_transport::SetupRepairRunStatus::OutcomeUnknown
-                )
+        matches!(
+            run.selected_operation_kind,
+            Some(
+                satelle_transport::SetupRepairOperationKind::HostUpdate
+                    | satelle_transport::SetupRepairOperationKind::Repair
             )
-            && run.host_update_recovery_identity.is_some()
+        ) && matches!(
+            run.selected_run_status,
+            Some(
+                satelle_transport::SetupRepairRunStatus::Running
+                    | satelle_transport::SetupRepairRunStatus::OutcomeUnknown
+            )
+        ) && run.host_update_recovery_identity.is_some()
     })
 }
 
@@ -5330,9 +5374,15 @@ pub(crate) fn apply_repair_upgrades(
             source.to_string(),
         ));
     }
-    let partial = repair.partial_failure(completed_actions, failed_action);
+    let mut partial = repair.partial_failure(completed_actions, &failed_action);
+    if source.recovery_command.is_some() {
+        partial
+            .recovery_command
+            .clone_from(&source.recovery_command);
+    }
     Err(SatelleError::setup_partially_applied(
         &partial,
+        &failed_action,
         source.to_string(),
     ))
 }
@@ -7978,7 +8028,7 @@ fn transport_for_with_ssh_launch_policy(
 ) -> Result<Box<dyn TransportClient>, CliFailure> {
     match host.config.transport {
         TransportKind::Local => local_host_service(&host.config)
-            .map(|service| Box::new(LocalTransport::new(host.alias.clone(), service)) as _),
+            .map(|service| Box::new(LocalTransport::for_selected_host(host, service)) as _),
         TransportKind::Direct => direct_transport(host)
             .map(|transport| Box::new(transport) as _)
             .map_err(failure),

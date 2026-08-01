@@ -414,6 +414,10 @@ impl SshBootstrapLock {
         self.mutation_committed
     }
 
+    pub(super) fn has_mutation_attempt(&self) -> bool {
+        self.mutation_phase.is_some() || self.mutation_attempt.is_some()
+    }
+
     #[cfg(all(test, unix))]
     pub(super) fn exchanged_lock_lines(&self) -> &[String] {
         &self.exchanged_lock_lines
@@ -2355,6 +2359,10 @@ impl UploadedHostArtifact {
 
     pub(super) fn binary_sha256(&self) -> &str {
         &self.binary_sha256
+    }
+
+    pub(super) const fn cache_changed(&self) -> bool {
+        self.cache_changed
     }
 }
 

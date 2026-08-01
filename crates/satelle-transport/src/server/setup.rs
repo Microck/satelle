@@ -11,10 +11,11 @@ use crate::contract::{
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, SetupRepairDecision, SetupRepairOperationKind,
-    SetupRepairPlanAction, SetupRepairPlanRequest, SetupRepairPlanResponse,
-    SetupRepairPostcondition, SetupRepairPreviousStatus, SetupRepairRunStatus,
-    SetupVerificationRequest, SetupVerificationResponse, provider_secret_upload_aad,
+    ProviderSecretUploadEnvelope, RepairMaintenanceRequest, SetupRepairDecision,
+    SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
+    SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairPreviousStatus,
+    SetupRepairRunStatus, SetupVerificationRequest, SetupVerificationResponse,
+    provider_secret_upload_aad,
 };
 use axum::extract::{Extension, Path, Request, State};
 use axum::http::header::CONTENT_TYPE;
@@ -942,6 +943,38 @@ pub(super) async fn begin_host_update_maintenance(
     let recovery_identity = request.recovery_identity().clone();
     match tokio::task::spawn_blocking(move || {
         service.acquire_host_update_maintenance(&operation, &recovery_identity)
+    })
+    .await
+    {
+        Ok(Ok(())) => authenticated_json_response(
+            StatusCode::OK,
+            &BootstrapMaintenanceResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                operation_id,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
+}
+
+pub(super) async fn begin_repair_maintenance(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(operation_id): Path<String>,
+    ApiJson(request): ApiJson<RepairMaintenanceRequest>,
+) -> Response {
+    if !persistent_service_maintenance_principal_is_authorized(&authorized) {
+        return bootstrap_maintenance_principal_required(&state, &authorized);
+    }
+    let service = Arc::clone(&state.service);
+    let operation = operation_id.clone();
+    let recovery_identity = request.recovery_identity().clone();
+    match tokio::task::spawn_blocking(move || {
+        service.acquire_repair_maintenance(&operation, &recovery_identity)
     })
     .await
     {

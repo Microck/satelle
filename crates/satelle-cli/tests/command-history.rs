@@ -405,7 +405,7 @@ fn multi_host_updates_are_not_attributed_to_the_default_host() {
 }
 
 #[test]
-fn repair_records_the_configured_default_while_local_lifecycle_commands_keep_their_default() {
+fn commands_without_an_explicit_host_record_the_configured_default() {
     let fixture = Fixture::new();
     let config_path = fixture.cache.path().join("remote-default-config.toml");
     test_file::write_user_controlled(
@@ -454,9 +454,9 @@ adapter = "fake"
         selected_hosts,
         vec![
             Some("remote".to_string()),
-            Some("local-demo".to_string()),
-            Some("local-demo".to_string()),
-            Some("local-demo".to_string()),
+            Some("remote".to_string()),
+            Some("remote".to_string()),
+            Some("remote".to_string()),
         ]
     );
 }

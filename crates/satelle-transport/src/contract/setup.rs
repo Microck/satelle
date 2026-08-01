@@ -30,6 +30,7 @@ define_schema_token!(
     HostUpdateMaintenanceSchema,
     "satelle.host-update-maintenance.v1"
 );
+define_schema_token!(RepairMaintenanceSchema, "satelle.repair-maintenance.v1");
 define_schema_token!(
     ProviderBindingAuthorizationSchema,
     "satelle.provider-binding-authorization.v2"
@@ -124,6 +125,30 @@ impl HostUpdateMaintenanceRequest {
 
 impl ApiRequestContract for HostUpdateMaintenanceRequest {
     const SCHEMA_VERSION: &'static str = HostUpdateMaintenanceSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepairMaintenanceRequest {
+    schema_version: RepairMaintenanceSchema,
+    recovery_identity: HostUpdateRecoveryIdentity,
+}
+
+impl RepairMaintenanceRequest {
+    pub fn new(recovery_identity: HostUpdateRecoveryIdentity) -> Self {
+        Self {
+            schema_version: RepairMaintenanceSchema,
+            recovery_identity,
+        }
+    }
+
+    pub fn recovery_identity(&self) -> &HostUpdateRecoveryIdentity {
+        &self.recovery_identity
+    }
+}
+
+impl ApiRequestContract for RepairMaintenanceRequest {
+    const SCHEMA_VERSION: &'static str = RepairMaintenanceSchema::TOKEN;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

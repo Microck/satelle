@@ -263,9 +263,21 @@ impl SetupRunPlan {
         mut self,
         identity: HostUpdateRecoveryIdentity,
     ) -> Result<Self, satelle_core::SatelleError> {
-        if self.operation_kind != SetupOperationKind::HostUpdate {
+        let repair_replaces_host = self.operation_kind == SetupOperationKind::Repair
+            && self
+                .actions
+                .iter()
+                .map(|action| action.action_id.as_str())
+                .eq([
+                    "install-host-artifact",
+                    "publish-host-service",
+                    "restart-host-daemon",
+                    "invalidate-readiness-caches",
+                    "host-update-postcheck",
+                ]);
+        if self.operation_kind != SetupOperationKind::HostUpdate && !repair_replaces_host {
             return Err(satelle_core::SatelleError::invalid_usage(
-                "Host update recovery identity requires a Host update plan",
+                "Host replacement recovery identity requires a Host update or Host-replacing repair plan",
             ));
         }
         validate_host_update_recovery_identity(&identity).map_err(crate::runtime::storage_error)?;
@@ -765,16 +777,24 @@ impl Storage {
         let recovery_action = transaction
             .query_row(
                 "SELECT setup_actions.action_id, setup_actions.status
-                 FROM setup_actions
+                FROM setup_actions
                  JOIN setup_runs USING (run_id)
                  WHERE setup_runs.run_id = ?1
                    AND setup_runs.status = 'outcome_unknown'
                    AND (
-                       setup_actions.action_id = 'bootstrap-handoff'
-                       OR setup_actions.status = 'outcome_unknown'
+                       setup_actions.status IN ('outcome_unknown', 'planned', 'started')
+                       OR (
+                           setup_actions.action_id = 'bootstrap-handoff'
+                           AND setup_actions.status = 'completed'
+                       )
                    )
                  ORDER BY
-                   CASE WHEN setup_actions.action_id = 'bootstrap-handoff' THEN 0 ELSE 1 END,
+                   CASE setup_actions.status
+                       WHEN 'outcome_unknown' THEN 0
+                       WHEN 'planned' THEN 1
+                       WHEN 'started' THEN 2
+                       ELSE 3
+                   END,
                    setup_actions.action_order
                  LIMIT 1",
                 [operation_id.as_str()],
@@ -795,7 +815,12 @@ impl Storage {
             ) {
                 return Err(StorageError::new(StorageErrorKind::StateConflict));
             }
-        } else if parsed_action_status != SetupActionStatus::OutcomeUnknown {
+        } else if !matches!(
+            parsed_action_status,
+            SetupActionStatus::Planned
+                | SetupActionStatus::Started
+                | SetupActionStatus::OutcomeUnknown
+        ) {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
         require_one_transition(
@@ -876,7 +901,7 @@ impl Storage {
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
         if matches!(
             SetupActionStatus::parse(&existing_status)?,
@@ -1297,21 +1322,26 @@ impl Storage {
         }
 
         let history = match selected_run {
-            Some(run) => run
-                .actions()
-                .iter()
-                .map(|action| {
-                    (
-                        action.action_id().to_string(),
-                        PreviousSetupAction {
-                            run_id: run.run_id().to_string(),
-                            status: action.status(),
-                            retry_safe: action.retry_safe(),
-                            row_id: 0,
-                        },
-                    )
-                })
-                .collect(),
+            Some(run) => {
+                let accumulated = self.latest_setup_actions(desktop_binding)?;
+                run.actions()
+                    .iter()
+                    .map(|action| {
+                        let historical_retry_safe = accumulated
+                            .get(action.action_id())
+                            .is_none_or(|previous| previous.retry_safe);
+                        (
+                            action.action_id().to_string(),
+                            PreviousSetupAction {
+                                run_id: run.run_id().to_string(),
+                                status: action.status(),
+                                retry_safe: action.retry_safe() && historical_retry_safe,
+                                row_id: 0,
+                            },
+                        )
+                    })
+                    .collect()
+            }
             None => self.latest_setup_actions(desktop_binding)?,
         };
         let actions = probes
@@ -1450,7 +1480,7 @@ impl Storage {
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
         if status == "completed"
             && SetupActionStatus::parse(&existing_status)? == SetupActionStatus::Completed
@@ -1687,8 +1717,20 @@ fn begin_setup_run_in_transaction(
 ) -> Result<(), StorageError> {
     let bootstrap_handoff_only =
         plan.actions.len() == 1 && plan.actions[0].action_id == "bootstrap-handoff";
+    let host_replacement_actions = plan
+        .actions
+        .iter()
+        .map(|action| action.action_id.as_str())
+        .eq([
+            "install-host-artifact",
+            "publish-host-service",
+            "restart-host-daemon",
+            "invalidate-readiness-caches",
+            "host-update-postcheck",
+        ]);
     let host_update_artifact_identity_required =
-        plan.operation_kind == SetupOperationKind::HostUpdate && !bootstrap_handoff_only;
+        (plan.operation_kind == SetupOperationKind::HostUpdate && !bootstrap_handoff_only)
+            || (plan.operation_kind == SetupOperationKind::Repair && host_replacement_actions);
     if host_update_artifact_identity_required != plan.host_update_recovery_identity.is_some() {
         return Err(StorageError::new(StorageErrorKind::InvalidInput));
     }
@@ -2102,7 +2144,7 @@ fn load_run_started_at(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
         .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))
 }
 

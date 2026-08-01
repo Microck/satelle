@@ -82,6 +82,16 @@ fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
             .recovery_command("remote", None, true)
             .contains("--delete-recordings")
     );
+
+    assert_eq!(
+        SshStorageMaintenance::Restore.recovery_command(
+            "operator's host",
+            Some(std::path::Path::new("/state/operator's backup.sqlite3")),
+            false,
+        ),
+        "satelle host storage restore --host 'operator'\"'\"'s host' --backup \
+         '/state/operator'\"'\"'s backup.sqlite3' --no-input --yes"
+    );
 }
 
 #[test]
@@ -157,16 +167,38 @@ fn host_update_recovery_requires_and_rechecks_the_persisted_artifact() {
     };
     validate_host_update_recovery_artifact(&inspection, &identity)
         .expect("the persisted release identity matches");
-    assert!(
-        validate_host_update_recovery_artifact(
-            &inspection,
-            &satelle_core::host_update::HostUpdateRecoveryIdentity::new(
-                identity.target_version(),
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            ),
-        )
-        .is_err(),
-        "repair must fail closed when release metadata no longer matches"
+    let mismatch = validate_host_update_recovery_artifact(
+        &inspection,
+        &satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+            identity.target_version(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ),
+    )
+    .expect_err("repair must fail closed when release metadata no longer matches");
+    assert_eq!(
+        mismatch.code,
+        satelle_core::ErrorCode::HostUpdateRecoveryIdentityMismatch
+    );
+    assert_eq!(
+        mismatch
+            .details
+            .get("field")
+            .and_then(serde_json::Value::as_str),
+        Some("artifact_digest")
+    );
+    assert_eq!(
+        mismatch
+            .details
+            .get("expected")
+            .and_then(serde_json::Value::as_str),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    );
+    assert_eq!(
+        mismatch
+            .details
+            .get("actual")
+            .and_then(serde_json::Value::as_str),
+        Some(identity.artifact_digest())
     );
     assert_eq!(
         host_update_recovery_identity(&test_host_update_report()).unwrap(),

@@ -2309,21 +2309,22 @@ pub(crate) struct OfflineStoreReset {
 }
 
 impl OfflineStoreReset {
-    pub(crate) fn reset_metadata(self) -> Result<Vec<String>, StorageError> {
+    pub(crate) fn reset_metadata(self) -> Result<Vec<String>, (Vec<String>, StorageError)> {
         let mut removed = Vec::new();
         for file_name in &PROTECTED_FILE_NAMES[2..] {
-            if self
-                .state_directory
-                .delete_private_leaf_durable(file_name)?
-            {
-                removed.push((*file_name).to_string());
+            match self.state_directory.delete_private_leaf_durable(file_name) {
+                Ok(true) => removed.push((*file_name).to_string()),
+                Ok(false) => {}
+                Err(error) => return Err((removed, error)),
             }
         }
-        if self
+        match self
             .state_directory
-            .delete_private_leaf_durable(DATABASE_FILE_NAME)?
+            .delete_private_leaf_durable(DATABASE_FILE_NAME)
         {
-            removed.push(DATABASE_FILE_NAME.to_string());
+            Ok(true) => removed.push(DATABASE_FILE_NAME.to_string()),
+            Ok(false) => {}
+            Err(error) => return Err((removed, error)),
         }
         Ok(removed)
     }

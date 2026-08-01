@@ -4027,6 +4027,7 @@ pub enum ErrorCode {
     UnsupportedUpdateComponent,
     HostBinaryNewerThanCli,
     HostArtifactUnavailable,
+    HostUpdateRecoveryIdentityMismatch,
     ReleaseVerifierUnavailable,
     HostUpdateRequiresCliUpgrade,
     HostUpdateRecoveryPending,
@@ -4154,6 +4155,7 @@ impl ErrorCode {
             Self::UnsupportedUpdateComponent => "unsupported-update-component",
             Self::HostBinaryNewerThanCli => "host-binary-newer-than-cli",
             Self::HostArtifactUnavailable => "host-artifact-unavailable",
+            Self::HostUpdateRecoveryIdentityMismatch => "host-update-recovery-identity-mismatch",
             Self::ReleaseVerifierUnavailable => "release-verifier-unavailable",
             Self::HostUpdateRequiresCliUpgrade => "host-update-requires-cli-upgrade",
             Self::HostUpdateRecoveryPending => "host-update-recovery-pending",
@@ -4294,6 +4296,7 @@ impl ErrorCode {
             | Self::DoctorReadinessBlockersFound
             | Self::HostBinaryNewerThanCli
             | Self::HostArtifactUnavailable
+            | Self::HostUpdateRecoveryIdentityMismatch
             | Self::HostUpdateRequiresCliUpgrade
             | Self::AmbiguousCodexComponentOwnership
             | Self::SetupVerificationFailed
@@ -5564,6 +5567,29 @@ impl SatelleError {
         }
     }
 
+    pub fn host_update_recovery_identity_mismatch(
+        field: &str,
+        expected: &str,
+        actual: &str,
+    ) -> Self {
+        Self {
+            code: ErrorCode::HostUpdateRecoveryIdentityMismatch,
+            message: format!(
+                "the verified Host artifact {field} does not match the interrupted operation"
+            ),
+            recovery_command: Some(
+                "restore the exact persisted Host artifact identity before resuming repair"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([
+                ("field".to_string(), Value::String(field.to_string())),
+                ("expected".to_string(), Value::String(expected.to_string())),
+                ("actual".to_string(), Value::String(actual.to_string())),
+            ]),
+        }
+    }
+
     pub fn host_update_requires_cli_upgrade(cli_version: &str) -> Self {
         let mut details = BTreeMap::new();
         details.insert("cli_version".to_string(), Value::from(cli_version));
@@ -5762,22 +5788,28 @@ impl SatelleError {
 
     pub fn setup_partially_applied(
         report: &crate::host_update::RepairUpgradeReport,
+        failed_action: &str,
         source: impl Into<String>,
     ) -> Self {
-        let failed_action = report.failed_action.as_deref().unwrap_or("unknown");
+        let recovery_command = report.recovery_command.clone().or_else(|| {
+            Some(format!(
+                "satelle repair --host {} --no-input --yes",
+                shell_argument(&report.host)
+            ))
+        });
         Self {
             code: ErrorCode::SetupPartiallyApplied,
             message: format!(
                 "setup or repair action '{failed_action}' failed after one or more remote mutations completed"
             ),
-            recovery_command: report.recovery_command.clone(),
+            recovery_command: recovery_command.clone(),
             source_detail: Some(source.into()),
             details: BTreeMap::from([
                 (
                     "status".to_string(),
                     Value::String("partial_failure".to_string()),
                 ),
-                ("changed".to_string(), Value::Bool(true)),
+                ("changed".to_string(), Value::Bool(report.changed)),
                 (
                     "completed_actions".to_string(),
                     serde_json::to_value(&report.completed_actions).unwrap_or(Value::Null),
@@ -5796,7 +5828,7 @@ impl SatelleError {
                 ),
                 (
                     "recovery_command".to_string(),
-                    serde_json::to_value(&report.recovery_command).unwrap_or(Value::Null),
+                    serde_json::to_value(&recovery_command).unwrap_or(Value::Null),
                 ),
             ]),
         }
@@ -6238,7 +6270,11 @@ mod error_contract_tests {
             vec!["repair-host-daemon".to_string()],
             "repair-native-computer-use",
         );
-        let partial = SatelleError::setup_partially_applied(&report, "postcheck failed");
+        let partial = SatelleError::setup_partially_applied(
+            &report,
+            "repair-native-computer-use",
+            "postcheck failed",
+        );
         assert_eq!(partial.code, ErrorCode::SetupPartiallyApplied);
         assert_eq!(partial.exit_code(), 74);
         assert_eq!(partial.details["status"], "partial_failure");
@@ -6298,6 +6334,7 @@ mod error_contract_tests {
             (ErrorCode::ComputerUseNotReady, 75),
             (ErrorCode::HostBinaryNewerThanCli, 75),
             (ErrorCode::HostArtifactUnavailable, 75),
+            (ErrorCode::HostUpdateRecoveryIdentityMismatch, 75),
             (ErrorCode::HostUpdateRequiresCliUpgrade, 75),
             (ErrorCode::AmbiguousCodexComponentOwnership, 75),
             (ErrorCode::CapacityExceeded, 75),
