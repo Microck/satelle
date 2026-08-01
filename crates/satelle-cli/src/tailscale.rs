@@ -894,7 +894,7 @@ mod tests {
         let parent_pid_file = fixture.path().join("parent-pid");
         let escaped_pid_file = fixture.path().join("escaped-pid");
         let script = format!(
-            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nsetsid sh -c 'printf \"%s\" \"$$\" > \"{}\"; sleep 10' &\nwhile true; do sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nsetsid sh -c 'sleep 10' &\nprintf '%s' \"$!\" > '{}'\nwhile true; do sleep 1; done\n",
             parent_pid_file.display(),
             escaped_pid_file.display()
         );
