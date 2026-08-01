@@ -8,7 +8,9 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const DEFAULT_SESSION_RETENTION: time::Duration = time::Duration::days(7);
-pub(crate) const DEFAULT_SETUP_LEDGER_RETENTION: time::Duration = time::Duration::days(30);
+pub(crate) const DEFAULT_SETUP_LEDGER_RETENTION: time::Duration = time::Duration::milliseconds(
+    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS as i64,
+);
 
 impl Storage {
     /// Removes only expired Satelle-owned Session and setup-ledger metadata.

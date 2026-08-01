@@ -2538,7 +2538,7 @@ impl<'a> PersistentServiceRemote<'a> {
     pub(super) fn publish_windows_service_config(
         &mut self,
         task: &satelle_core::daemon_service::WindowsTaskDefinition,
-        config: &satelle_core::daemon_service::WindowsServiceConfigV1,
+        config: &satelle_core::daemon_service::WindowsServiceConfigV2,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
         let contents = serde_json::to_vec_pretty(config)
@@ -2616,6 +2616,7 @@ impl<'a> PersistentServiceRemote<'a> {
         &self,
         artifact: &UploadedHostArtifact,
         overrides: &DaemonPathOverrides,
+        setup_ledger_retention_ms: u64,
     ) -> Result<LaunchdServiceDefinition, SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
         let binary = self.absolute_artifact_path(artifact);
@@ -2623,6 +2624,7 @@ impl<'a> PersistentServiceRemote<'a> {
             Path::new(&binary),
             "127.0.0.1:3001",
             overrides,
+            setup_ledger_retention_ms,
         )
         .map_err(|_| SshBootstrapError::InvalidPersistentServiceDefinition)?;
         Ok(LaunchdServiceDefinition {
@@ -3643,7 +3645,7 @@ fn parse_service_path_overrides(
     output: &[u8],
 ) -> Result<DaemonPathOverrides, SshBootstrapError> {
     if target.is_windows() {
-        let config: satelle_core::daemon_service::WindowsServiceConfigV1 =
+        let config: satelle_core::daemon_service::WindowsServiceConfigV2 =
             serde_json::from_slice(output)
                 .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
         if config.bind() != "127.0.0.1:3001" {
@@ -3683,6 +3685,7 @@ struct ObservedLaunchdServiceDefinition {
     executable: String,
     bind: SocketAddr,
     path_overrides: DaemonPathOverrides,
+    setup_ledger_retention_ms: u64,
 }
 
 fn parse_launchd_service_definition(
@@ -3701,6 +3704,7 @@ fn parse_launchd_service_definition(
         "<string>--foreground</string><string>--launchd-service</string>",
         "<string>--bind</string><string>",
     );
+    const RETENTION_PREFIX: &str = "</string><string>--setup-ledger-retention-ms</string><string>";
     const ENVIRONMENT_PREFIX: &str =
         concat!("</string></array>", "<key>EnvironmentVariables</key><dict>",);
     const SUFFIX: &str = concat!(
@@ -3720,7 +3724,7 @@ fn parse_launchd_service_definition(
         return Err(SshBootstrapError::InvalidServiceObservation);
     }
     let (bind, body) = body
-        .split_once(ENVIRONMENT_PREFIX)
+        .split_once(RETENTION_PREFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
     let bind = decode_plist_text(bind)?
         .parse::<SocketAddr>()
@@ -3728,6 +3732,14 @@ fn parse_launchd_service_definition(
     if !bind.ip().is_loopback() {
         return Err(SshBootstrapError::InvalidServiceObservation);
     }
+    let (setup_ledger_retention_ms, body) = body
+        .split_once(ENVIRONMENT_PREFIX)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let setup_ledger_retention_ms = setup_ledger_retention_ms
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0 && *value <= satelle_core::MAX_SETUP_LEDGER_RETENTION_MS)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
     let environment = body
         .strip_suffix(SUFFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
@@ -3753,6 +3765,7 @@ fn parse_launchd_service_definition(
     Ok(ObservedLaunchdServiceDefinition {
         executable: binary,
         bind,
+        setup_ledger_retention_ms,
         path_overrides: daemon_path_overrides_from_environment(
             RemoteTarget::DarwinArm64,
             &entries,
@@ -4096,6 +4109,7 @@ impl RemoteUserDirectories {
         path: &str,
         host_id: &str,
         expected_path_overrides: &DaemonPathOverrides,
+        expected_setup_ledger_retention_ms: u64,
     ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         self.probe_managed_service_executable_with_program(
             OsStr::new("ssh"),
@@ -4103,6 +4117,7 @@ impl RemoteUserDirectories {
             path,
             host_id,
             expected_path_overrides,
+            expected_setup_ledger_retention_ms,
         )
     }
 
@@ -4114,6 +4129,7 @@ impl RemoteUserDirectories {
         path: &str,
         host_id: &str,
         expected_path_overrides: &DaemonPathOverrides,
+        expected_setup_ledger_retention_ms: u64,
     ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         self.probe_managed_service_executable_with_program(
             ssh_program.as_os_str(),
@@ -4121,6 +4137,7 @@ impl RemoteUserDirectories {
             path,
             host_id,
             expected_path_overrides,
+            expected_setup_ledger_retention_ms,
         )
     }
 
@@ -4131,6 +4148,7 @@ impl RemoteUserDirectories {
         path: &str,
         host_id: &str,
         expected_path_overrides: &DaemonPathOverrides,
+        expected_setup_ledger_retention_ms: u64,
     ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         if host_id.is_empty()
             || !host_id
@@ -4165,7 +4183,7 @@ impl RemoteUserDirectories {
                     "$config=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json; ",
                     "$task=Get-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name} ",
                     "-ErrorAction SilentlyContinue; ",
-                    "if ($config.schema -cne 'satelle.host-service.v1' -or $null -eq $task) {{ ",
+                    "if ($config.schema -cne 'satelle.host-service.v2' -or $null -eq $task) {{ ",
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "[xml]$xml=Export-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name}; ",
                     "$root=$xml.Task; ",
@@ -4255,13 +4273,14 @@ impl RemoteUserDirectories {
                 .ok_or(SshBootstrapError::InvalidServiceObservation)?;
             let config = config.strip_suffix('\r').unwrap_or(config);
             let Ok(config) = serde_json::from_str::<
-                satelle_core::daemon_service::WindowsServiceConfigV1,
+                satelle_core::daemon_service::WindowsServiceConfigV2,
             >(config) else {
                 return Ok(None);
             };
-            let expected = satelle_core::daemon_service::WindowsServiceConfigV1::new(
+            let expected = satelle_core::daemon_service::WindowsServiceConfigV2::new(
                 "127.0.0.1:3001",
                 expected_path_overrides,
+                expected_setup_ledger_retention_ms,
             )
             .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
             if config != expected {
@@ -4280,6 +4299,7 @@ impl RemoteUserDirectories {
         };
         if definition.bind != "127.0.0.1:3001".parse().expect("static socket address")
             || definition.path_overrides != *expected_path_overrides
+            || definition.setup_ledger_retention_ms != expected_setup_ledger_retention_ms
         {
             return Ok(None);
         }
@@ -5766,6 +5786,7 @@ mod tests {
             Path::new("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle"),
             "127.0.0.1:3001",
             &DaemonPathOverrides::default(),
+            satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
         )
         .expect("render canonical macOS service definition");
         fs::write(
@@ -5800,11 +5821,25 @@ mod tests {
                     &service_path,
                     "host-123",
                     &DaemonPathOverrides::default(),
+                    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
                 )
                 .expect("run audited read-only service probe")
                 .as_ref()
                 .map(|observation| observation.path.as_str()),
             Some("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle")
+        );
+        assert!(
+            directories
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                    3_600_000,
+                )
+                .expect("a drifted macOS retention is observable")
+                .is_none()
         );
 
         let invocation = fs::read_to_string(&audit_log).expect("read fake SSH audit");
@@ -5845,6 +5880,7 @@ mod tests {
                 state_dir: Some(PathBuf::from("/Users/operator/drifted-state")),
                 ..DaemonPathOverrides::default()
             },
+            satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
         )
         .expect("render drifted macOS service definition");
         fs::write(
@@ -5864,6 +5900,7 @@ mod tests {
                     &service_path,
                     "host-123",
                     &DaemonPathOverrides::default(),
+                    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
                 )
                 .expect("a well-formed drifted launchd environment is observable")
                 .is_none()
@@ -5876,9 +5913,10 @@ mod tests {
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
                     "printf 'managed\\r\\n",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                    "{{\"schema\":\"satelle.host-service.v1\",",
+                    "{{\"schema\":\"satelle.host-service.v2\",",
                     "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
-                    "\"127.0.0.1:3001\"],\"environment\":{{}}}}\\r\\n",
+                    "\"127.0.0.1:3001\"],\"environment\":{{}},",
+                    "\"setup_ledger_retention_ms\":2592000000}}\\r\\n",
                     "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
                     "win32-x64-msvc\\\\satelle-",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n"
@@ -5899,6 +5937,7 @@ mod tests {
                     &windows_service_path,
                     "host-123",
                     &DaemonPathOverrides::default(),
+                    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
                 )
                 .expect("run audited Windows service probe")
                 .as_ref()
@@ -5906,6 +5945,19 @@ mod tests {
             Some(
                 r"C:\Users\operator\AppData\Local\Satelle\host\v0.1.0\win32-x64-msvc\satelle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe"
             )
+        );
+        assert!(
+            windows
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &windows_service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                    3_600_000,
+                )
+                .expect("a drifted Windows retention is observable")
+                .is_none()
         );
         let invocation = fs::read_to_string(audit_log).expect("read Windows fake SSH audit");
         let command = invocation
@@ -5961,9 +6013,10 @@ mod tests {
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                "{\"schema\":\"satelle.host-service.v1\",",
+                "{\"schema\":\"satelle.host-service.v2\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
-                "\"127.0.0.1:3002\"],\"environment\":{}}\\r\\n",
+                "\"127.0.0.1:3002\"],\"environment\":{},",
+                "\"setup_ledger_retention_ms\":2592000000}\\r\\n",
                 "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
                 "win32-x64-msvc\\\\satelle-",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n",
@@ -5978,6 +6031,7 @@ mod tests {
                     &windows_service_path,
                     "host-123",
                     &DaemonPathOverrides::default(),
+                    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
                 )
                 .expect("a well-formed drifted Windows service config is observable")
                 .is_none()
@@ -5988,10 +6042,11 @@ mod tests {
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                "{\"schema\":\"satelle.host-service.v1\",",
+                "{\"schema\":\"satelle.host-service.v2\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                 "\"127.0.0.1:3001\"],",
-                "\"environment\":{\"SATELLE_HOME\":\"C:\\\\\\\\Drifted\"}}\\r\\n",
+                "\"environment\":{\"SATELLE_HOME\":\"C:\\\\\\\\Drifted\"},",
+                "\"setup_ledger_retention_ms\":2592000000}\\r\\n",
                 "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
                 "win32-x64-msvc\\\\satelle-",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n",
@@ -6006,6 +6061,7 @@ mod tests {
                     &windows_service_path,
                     "host-123",
                     &DaemonPathOverrides::default(),
+                    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
                 )
                 .expect("a well-formed drifted Windows service environment is observable")
                 .is_none()
@@ -6457,9 +6513,10 @@ mod tests {
     #[test]
     fn persistent_service_path_override_parsers_are_closed() {
         let windows = br#"{
-          "schema":"satelle.host-service.v1",
+          "schema":"satelle.host-service.v2",
           "daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],
-          "environment":{"SATELLE_STATE_DIR":"C:\\Users\\operator\\AppData\\Local\\Satelle\\state"}
+          "environment":{"SATELLE_STATE_DIR":"C:\\Users\\operator\\AppData\\Local\\Satelle\\state"},
+          "setup_ledger_retention_ms":3600000
         }"#;
         let parsed = parse_service_path_overrides(RemoteTarget::WindowsX64Msvc, windows)
             .expect("valid Windows service config");
@@ -6470,7 +6527,7 @@ mod tests {
         assert!(
             parse_service_path_overrides(
                 RemoteTarget::WindowsX64Msvc,
-                br#"{"schema":"satelle.host-service.v1","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"}}"#,
+                br#"{"schema":"satelle.host-service.v2","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"},"setup_ledger_retention_ms":3600000}"#,
             )
             .is_err()
         );
@@ -6486,6 +6543,7 @@ mod tests {
             Path::new("/Users/operator/Applications/Satelle & Host/satelle"),
             "127.0.0.1:4001",
             &overrides,
+            3_600_000,
         )
         .expect("valid launchd plist");
         let parsed = parse_service_path_overrides(RemoteTarget::DarwinArm64, plist.as_bytes())

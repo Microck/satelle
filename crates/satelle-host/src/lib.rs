@@ -2707,7 +2707,17 @@ impl HostService {
 
     /// Builds the persistent Host service with the exact path overrides from
     /// its Satelle-owned launchd or Windows service configuration.
-    pub fn production_for_service(overrides: &DaemonPathOverrides) -> Self {
+    pub fn production_for_service(
+        overrides: &DaemonPathOverrides,
+        setup_ledger_retention_ms: u64,
+    ) -> Result<Self, SatelleError> {
+        if setup_ledger_retention_ms == 0
+            || setup_ledger_retention_ms > satelle_core::MAX_SETUP_LEDGER_RETENTION_MS
+        {
+            return Err(SatelleError::invalid_usage(
+                "persistent Host service setup-ledger retention is invalid",
+            ));
+        }
         let mut config = satelle_core::SatelleConfig::defaults()
             .hosts
             .remove(LOCAL_DEMO_HOST)
@@ -2717,7 +2727,14 @@ impl HostService {
         config.daemon_state_dir = overrides.state_dir.clone();
         config.daemon_cache_dir = overrides.cache_dir.clone();
         config.daemon_log_dir = overrides.log_dir.clone();
-        Self::production_for_host(&config)
+        config.setup_ledger_retention =
+            satelle_core::ExplicitDuration::parse(&format!("{setup_ledger_retention_ms}ms"));
+        Ok(Self::production_for_host(&config))
+    }
+
+    #[cfg(test)]
+    fn setup_ledger_retention_for_tests(&self) -> time::Duration {
+        self.runtime.setup_ledger_retention_for_tests()
     }
 
     /// Builds an on-demand Host whose only bootstrap credential is held in

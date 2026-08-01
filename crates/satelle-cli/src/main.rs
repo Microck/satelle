@@ -31,7 +31,7 @@ use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 #[cfg(any(windows, test))]
-use satelle_core::daemon_service::WindowsServiceConfigV1;
+use satelle_core::daemon_service::WindowsServiceConfigV2;
 use satelle_core::daemon_service::{
     DaemonServicePlatform, PersistentServiceDecision, SetupModeSelection, SetupModeSource,
 };
@@ -537,6 +537,14 @@ struct HostStartCommand {
     /// Internal Controller-resolved idle timeout for a durable SSH launch.
     #[arg(long, hide = true, value_name = "MILLISECONDS")]
     on_demand_idle_timeout_ms: Option<u64>,
+    /// Internal resolved setup-ledger retention for a persistent launchd service.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "MILLISECONDS",
+        requires = "launchd_service"
+    )]
+    setup_ledger_retention_ms: Option<u64>,
     /// Internal owner-only configuration used by the per-user Windows task.
     #[arg(
         long,
@@ -1987,6 +1995,7 @@ mod history_target_tests {
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
                 on_demand_idle_timeout_ms: None,
+                setup_ledger_retention_ms: None,
                 service_config: None,
                 output_args: OutputArgs::default(),
             }),
@@ -2116,6 +2125,8 @@ mod history_target_tests {
             "start",
             "--foreground",
             "--launchd-service",
+            "--setup-ledger-retention-ms",
+            "3600000",
         ])
         .expect("parse internal launchd service start command");
         assert!(
@@ -2130,6 +2141,7 @@ mod history_target_tests {
             panic!("expected Host start command");
         };
         assert!(command.launchd_service);
+        assert_eq!(command.setup_ledger_retention_ms, Some(3_600_000));
         validate_host_start_mode(&command).expect("launchd service is a valid closed start mode");
     }
 
@@ -6539,7 +6551,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.bootstrap_scope.is_some()
             || command.bootstrap_native_readiness_timeout_ms.is_some()
             || command.bootstrap_provider_smoke_timeout_ms.is_some()
-            || command.on_demand_idle_timeout_ms.is_some())
+            || command.on_demand_idle_timeout_ms.is_some()
+            || command.setup_ledger_retention_ms.is_none())
     {
         return Err(SatelleError::invalid_usage(
             "--launchd-service is an internal launchd input and cannot be combined with other internal or TLS Host start options",
@@ -6554,7 +6567,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.bootstrap_scope.is_some()
             || command.bootstrap_native_readiness_timeout_ms.is_some()
             || command.bootstrap_provider_smoke_timeout_ms.is_some()
-            || command.on_demand_idle_timeout_ms.is_some())
+            || command.on_demand_idle_timeout_ms.is_some()
+            || command.setup_ledger_retention_ms.is_some())
     {
         return Err(SatelleError::invalid_usage(
             "--service-config is an internal Windows service input and cannot be combined with ordinary Host start options",
@@ -6640,7 +6654,7 @@ fn start_host_daemon_with(
     ) -> HostService,
 ) -> Result<(), CliFailure> {
     validate_host_start_mode(&command).map_err(failure)?;
-    let service_path_overrides =
+    let (service_path_overrides, service_setup_ledger_retention_ms) =
         if let Some(_service_config_path) = command.service_config.as_deref() {
             #[cfg(not(windows))]
             return Err(failure(SatelleError::invalid_usage(
@@ -6654,12 +6668,18 @@ fn start_host_daemon_with(
                 apply_windows_service_environment(&service_config);
                 command.bind = service_config.bind().to_string();
                 command.foreground = true;
-                Some(path_overrides)
+                (
+                    Some(path_overrides),
+                    Some(service_config.setup_ledger_retention_ms()),
+                )
             }
         } else if command.launchd_service {
-            Some(daemon_path_overrides_from_process_environment())
+            (
+                Some(daemon_path_overrides_from_process_environment()),
+                command.setup_ledger_retention_ms,
+            )
         } else {
-            None
+            (None, None)
         };
     let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
         (true, Some(scope)) => Some(scope.api_scopes()),
@@ -6779,7 +6799,9 @@ fn start_host_daemon_with(
             service_path_overrides
                 .as_ref()
                 .expect("persistent service path overrides were checked"),
-        ),
+            service_setup_ledger_retention_ms.expect("persistent service retention was checked"),
+        )
+        .map_err(failure)?,
         (_, Some(token)) => {
             let mut host_config = satelle_core::SatelleConfig::defaults()
                 .hosts
@@ -6895,7 +6917,7 @@ fn start_host_daemon_with(
 }
 
 #[cfg(any(windows, test))]
-fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV1, CliFailure> {
+fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV2, CliFailure> {
     if !path.is_absolute() {
         return Err(failure(SatelleError::invalid_usage(
             "Windows Host service config path must be absolute",
@@ -6947,7 +6969,7 @@ mod windows_service_config_tests {
             log_dir: Some(PathBuf::from(r"C:\Users\owner\AppData\Local\Satelle\logs")),
             sources: BTreeMap::new(),
         };
-        let expected = WindowsServiceConfigV1::new("127.0.0.1:3001", &overrides)
+        let expected = WindowsServiceConfigV2::new("127.0.0.1:3001", &overrides, 3_600_000)
             .expect("build service config");
         write_owner_only_config(
             &path,
@@ -6965,6 +6987,7 @@ mod windows_service_config_tests {
             ["host", "start", "--foreground", "--bind", "127.0.0.1:3001"]
         );
         assert_eq!(observed.environment().len(), 5);
+        assert_eq!(observed.setup_ledger_retention_ms(), 3_600_000);
     }
 
     #[test]
@@ -6998,7 +7021,7 @@ mod windows_service_config_tests {
 }
 
 #[cfg(windows)]
-fn apply_windows_service_environment(config: &WindowsServiceConfigV1) {
+fn apply_windows_service_environment(config: &WindowsServiceConfigV2) {
     const PATH_OVERRIDES: [&str; 5] = [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -7533,6 +7556,7 @@ mod daemon_tls_watcher_tests {
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: None,
+            setup_ledger_retention_ms: None,
             service_config: None,
             output_args: OutputArgs::default(),
         }
@@ -8056,6 +8080,7 @@ mod bootstrap_startup_tests {
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: Some(75_000),
+            setup_ledger_retention_ms: None,
             service_config: None,
             output_args: OutputArgs::default(),
         };

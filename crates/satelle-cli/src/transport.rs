@@ -1,7 +1,7 @@
 use crate::{CliFailure, SelectedHost, bootstrap_lock, failure, on_demand_idle_timeout};
 use satelle_core::daemon_service::{
     DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentServiceDecision,
-    SetupModeSelection, WindowsServiceConfigV1, WindowsTaskDefinition,
+    SetupModeSelection, WindowsServiceConfigV2, WindowsTaskDefinition,
 };
 use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
@@ -1309,7 +1309,7 @@ fn coordinate_persistent_setup(
 enum PreparedPersistentService {
     Windows {
         task: Box<WindowsTaskDefinition>,
-        config: Box<WindowsServiceConfigV1>,
+        config: Box<WindowsServiceConfigV2>,
     },
     Launchd(ssh_bootstrap::LaunchdServiceDefinition),
 }
@@ -2424,6 +2424,7 @@ impl SshSetupTransport {
         daemon_path_overrides: &DaemonPathOverrides,
         remote: &ssh_bootstrap::PersistentServiceRemote<'_>,
     ) -> Result<PreparedPersistentService, SatelleError> {
+        let setup_ledger_retention_ms = resolved_setup_ledger_retention_ms(&self.host_config);
         match target.service_platform() {
             DaemonServicePlatform::Windows => {
                 let task = remote
@@ -2432,16 +2433,19 @@ impl SshSetupTransport {
                         artifact,
                     )
                     .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
-                let config =
-                    WindowsServiceConfigV1::new("127.0.0.1:3001", daemon_path_overrides)
-                        .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
+                let config = WindowsServiceConfigV2::new(
+                    "127.0.0.1:3001",
+                    daemon_path_overrides,
+                    setup_ledger_retention_ms,
+                )
+                .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
                 Ok(PreparedPersistentService::Windows {
                     task: Box::new(task),
                     config: Box::new(config),
                 })
             }
             DaemonServicePlatform::Macos => remote
-                .launchd_definition(artifact, daemon_path_overrides)
+                .launchd_definition(artifact, daemon_path_overrides, setup_ledger_retention_ms)
                 .map(PreparedPersistentService::Launchd)
                 .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error)),
             DaemonServicePlatform::Linux => Err(SatelleError::persistent_service_unsupported(
@@ -3109,6 +3113,13 @@ pub(crate) fn preflight_ssh_storage_maintenance(host: &SelectedHost) -> Result<(
     Ok(())
 }
 
+fn resolved_setup_ledger_retention_ms(config: &satelle_core::HostConfig) -> u64 {
+    config.setup_ledger_retention.as_ref().map_or(
+        satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
+        satelle_core::ExplicitDuration::milliseconds,
+    )
+}
+
 pub(crate) fn preview_ssh_storage_restore(
     host: &SelectedHost,
     backup: &Path,
@@ -3145,6 +3156,7 @@ pub(crate) fn preview_ssh_storage_restore(
             &service_asset_path,
             host_id,
             &path_overrides,
+            resolved_setup_ledger_retention_ms(&host.config),
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
         .ok_or_else(SatelleError::state_conflict)?;
@@ -3204,6 +3216,7 @@ pub(crate) fn plan_ssh_storage_backup_cleanup(
             &service_asset_path,
             host_id,
             &path_overrides,
+            resolved_setup_ledger_retention_ms(&host.config),
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
         .ok_or_else(SatelleError::state_conflict)?;
@@ -3819,6 +3832,7 @@ fn inspect_host_maintenance(
                                 &destination,
                                 host_id,
                                 &expected_path_overrides,
+                                resolved_setup_ledger_retention_ms(&host.config),
                             )
                             .map_err(|error| {
                                 map_ssh_daemon_bootstrap_error(&transport.alias, error)

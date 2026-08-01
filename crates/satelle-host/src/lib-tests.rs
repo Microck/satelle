@@ -81,10 +81,14 @@ fn production_host_reports_the_frozen_service_config_path_set() {
 fn production_service_reports_the_frozen_service_config_path_set() {
     let state = TestStateDir::new().expect("temporary state directory");
     let configured_state_root = state.path().join("persistent-service-state");
-    let service = HostService::production_for_service(&DaemonPathOverrides {
-        state_dir: Some(configured_state_root.clone()),
-        ..DaemonPathOverrides::default()
-    });
+    let service = HostService::production_for_service(
+        &DaemonPathOverrides {
+            state_dir: Some(configured_state_root.clone()),
+            ..DaemonPathOverrides::default()
+        },
+        3_600_000,
+    )
+    .expect("valid persistent service configuration");
     let paths = service
         .daemon_resolved_paths()
         .expect("persistent service paths resolve once during construction");
@@ -96,6 +100,10 @@ fn production_service_reports_the_frozen_service_config_path_set() {
     assert_eq!(
         paths.sources.state_root,
         satelle_core::PathSource::ServiceConfig
+    );
+    assert_eq!(
+        service.setup_ledger_retention_for_tests(),
+        time::Duration::hours(1)
     );
 }
 
