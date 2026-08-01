@@ -8802,8 +8802,16 @@ fn run_host_storage(
                 .then(|| local_storage_state_root(&host))
                 .transpose()?;
             if let Some(state_root) = &local_state_root {
-                satelle_host::HostService::validate_storage_restore(state_root, &command.backup)
+                if command.dry_run {
+                    satelle_host::HostService::preview_storage_restore(state_root, &command.backup)
+                        .map_err(failure)?;
+                } else {
+                    satelle_host::HostService::validate_storage_restore(
+                        state_root,
+                        &command.backup,
+                    )
                     .map_err(failure)?;
+                }
             } else {
                 transport::preflight_ssh_storage_maintenance(&host).map_err(failure)?;
             }
@@ -9221,6 +9229,7 @@ fn run_offline_storage_maintenance(
                 &command.operation_id,
                 action_id,
             );
+            let _ = print_json(&json!({"error": &source}));
             return Err(failure(source));
         }
     };

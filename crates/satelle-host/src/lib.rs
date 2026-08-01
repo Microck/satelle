@@ -1870,6 +1870,15 @@ impl HostService {
             .map_err(runtime::storage_failure)
     }
 
+    pub fn preview_storage_restore(
+        state_root: &std::path::Path,
+        backup: &std::path::Path,
+    ) -> Result<(), SatelleError> {
+        let backup_file_name = storage_backup_file_name(state_root, backup)?;
+        storage::validate_migration_backup_for_preview(state_root, backup_file_name)
+            .map_err(runtime::storage_failure)
+    }
+
     pub fn restore_storage_backup_offline(
         state_root: &std::path::Path,
         backup: &std::path::Path,

@@ -25,6 +25,7 @@ use super::bootstrap_lock;
 use super::ssh_tunnel::{SshStderrClassification, classify_stderr};
 
 const PROBE_OUTPUT_LIMIT: usize = 4096;
+const OFFLINE_STORAGE_RESULT_LIMIT: usize = 64 * 1024;
 const SERVICE_DEFINITION_LIMIT: usize = 64 * 1024;
 const TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT: usize = 1024 * 1024;
 const START_OUTPUT_LIMIT: u64 = 16 * 1024;
@@ -2709,7 +2710,13 @@ impl<'a> PersistentServiceRemote<'a> {
         let binary = self.absolute_artifact_path(artifact);
         let command = offline_storage_maintenance_command(self.target, &binary, request);
         let output = self.mutate_with_output("offline_storage_maintenance", &command, None)?;
-        parse_offline_storage_maintenance_result(request.operation, &output.stdout)
+        if output.status.success() {
+            parse_offline_storage_maintenance_result(request.operation, &output.stdout)
+        } else if output.stderr.host_key_verification_failed() {
+            Err(SshBootstrapError::HostKeyVerificationRequired)
+        } else {
+            parse_offline_storage_maintenance_failure(&output.stdout)
+        }
     }
 
     pub(super) fn observe_canonical_daemon_path_overrides(
@@ -2847,7 +2854,12 @@ impl<'a> PersistentServiceRemote<'a> {
         let command = self
             .bootstrap_lock
             .fenced_command(self.target, phase, command)?;
-        require_success_output(run_fenced_ssh_command(self.destination, &command, input)?)
+        run_fenced_ssh_command_with_output_limit(
+            self.destination,
+            &command,
+            input,
+            OFFLINE_STORAGE_RESULT_LIMIT,
+        )
     }
 
     fn observe(&self, command: &str) -> Result<PersistentServiceObservation, SshBootstrapError> {
@@ -3028,6 +3040,22 @@ fn parse_offline_storage_maintenance_result(
     } else {
         Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfflineStorageMaintenanceFailure {
+    error: satelle_core::SatelleError,
+}
+
+fn parse_offline_storage_maintenance_failure(
+    stdout: &[u8],
+) -> Result<serde_json::Value, SshBootstrapError> {
+    let failure = serde_json::from_slice::<OfflineStorageMaintenanceFailure>(stdout)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    Err(SshBootstrapError::OfflineStorageMaintenanceFailed(
+        Box::new(failure.error),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -5171,7 +5199,16 @@ fn run_ssh_command_with_output_limit(
 fn run_fenced_ssh_command(
     destination: &str,
     remote_command: &str,
+    input: Option<FencedMutationInput<'_>>,
+) -> Result<CommandOutput, SshBootstrapError> {
+    run_fenced_ssh_command_with_output_limit(destination, remote_command, input, PROBE_OUTPUT_LIMIT)
+}
+
+fn run_fenced_ssh_command_with_output_limit(
+    destination: &str,
+    remote_command: &str,
     mut input: Option<FencedMutationInput<'_>>,
+    output_limit: usize,
 ) -> Result<CommandOutput, SshBootstrapError> {
     let mut child = Command::new("ssh")
         .arg("-T")
@@ -5188,7 +5225,7 @@ fn run_fenced_ssh_command(
         .expect("SSH upload stdout was configured as piped");
     let stdout_reader = thread::Builder::new()
         .name("satelle-ssh-upload-stdout".to_string())
-        .spawn(move || read_bounded(stdout, PROBE_OUTPUT_LIMIT))
+        .spawn(move || read_bounded(stdout, output_limit))
         .map_err(|error| terminate_child(&mut child, SshBootstrapError::ReaderThread(error)))?;
     let stderr = child
         .stderr
@@ -5495,6 +5532,8 @@ pub(super) enum SshBootstrapError {
     InvalidCacheCleanupResponse,
     #[error("the remote Host returned an invalid offline storage maintenance result")]
     InvalidOfflineStorageMaintenanceResponse,
+    #[error("the remote Host storage mutation returned a typed failure")]
+    OfflineStorageMaintenanceFailed(#[source] Box<satelle_core::SatelleError>),
     #[error("the remote Host returned an invalid SHA-256 result")]
     InvalidRemoteDigest,
     #[error("a local bootstrap artifact file operation failed")]
@@ -5578,6 +5617,38 @@ mod tests {
         assert!(plan.contains("offline-storage-backup-cleanup-plan"));
         assert!(!plan.contains("--yes"));
         assert!(!plan.contains("--approved-backup"));
+    }
+
+    #[test]
+    fn offline_storage_failure_parser_preserves_typed_partial_results() {
+        let source = satelle_core::SatelleError::storage_maintenance_partially_applied(
+            &["delete-host-recordings".to_string()],
+            "delete-host-metadata",
+            &[],
+            "satelle host store reset --host remote --delete-recordings --no-input --yes",
+            "metadata deletion failed",
+        );
+        let mut source = source;
+        source.details.insert(
+            "removed_metadata_file_names".to_string(),
+            serde_json::json!(["satelle.sqlite3-wal"]),
+        );
+        source
+            .details
+            .insert("recordings_deleted".to_string(), serde_json::json!(true));
+        let encoded = serde_json::to_vec(&serde_json::json!({"error": source}))
+            .expect("serialize typed remote failure");
+
+        let error = parse_offline_storage_maintenance_failure(&encoded)
+            .expect_err("typed remote failure remains a failure");
+        let SshBootstrapError::OfflineStorageMaintenanceFailed(error) = error else {
+            panic!("expected the typed storage maintenance failure");
+        };
+        assert_eq!(
+            error.details["removed_metadata_file_names"],
+            serde_json::json!(["satelle.sqlite3-wal"])
+        );
+        assert_eq!(error.details["recordings_deleted"], serde_json::json!(true));
     }
 
     fn persistent_windows_task() -> satelle_core::daemon_service::WindowsTaskDefinition {

@@ -68,6 +68,13 @@ pub(crate) fn validate_migration_backup_for_restore(
     open::validate_migration_backup_for_restore(state_root, backup_file_name)
 }
 
+pub(crate) fn validate_migration_backup_for_preview(
+    state_root: &std::path::Path,
+    backup_file_name: &str,
+) -> Result<(), StorageError> {
+    open::validate_migration_backup_for_preview(state_root, backup_file_name)
+}
+
 pub(crate) fn restore_migration_backup_offline(
     state_root: &std::path::Path,
     backup_file_name: &str,

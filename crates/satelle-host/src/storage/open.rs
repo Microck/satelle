@@ -252,6 +252,12 @@ enum ValidationStep {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackupValidationMode {
+    DurableStaging,
+    ReadOnlyMemory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CleanupStep {
     CandidateValidated,
     BeforeBackupQuarantineMove,
@@ -1472,6 +1478,7 @@ fn validate_migration_backup_at(
         backup_file_name,
         physical_backup_file_name,
         physical_manifest_file_name,
+        BackupValidationMode::DurableStaging,
         |_| Ok(()),
     )
 }
@@ -1482,6 +1489,7 @@ fn validate_migration_backup_at_with_hook(
     backup_file_name: &str,
     physical_backup_file_name: &str,
     physical_manifest_file_name: &str,
+    mode: BackupValidationMode,
     mut hook: impl FnMut(ValidationStep) -> Result<(), StorageError>,
 ) -> Result<ValidatedMigrationBackup, StorageError> {
     #[cfg(unix)]
@@ -1508,8 +1516,32 @@ fn validate_migration_backup_at_with_hook(
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    if mode == BackupValidationMode::ReadOnlyMemory {
+        let database_size = usize::try_from(
+            backup_file
+                .metadata()
+                .map_err(|source| {
+                    StorageError::with_source(StorageErrorKind::IntegrityCheckFailed, source)
+                })?
+                .len(),
+        )
+        .map_err(|source| {
+            StorageError::with_source(StorageErrorKind::IntegrityCheckFailed, source)
+        })?;
+        let mut source = &backup_file;
+        source.rewind().map_err(|source| {
+            StorageError::with_source(StorageErrorKind::IntegrityCheckFailed, source)
+        })?;
+        let mut validation = Connection::open_in_memory()
+            .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?;
+        validation
+            .deserialize_read_exact("main", &mut source, database_size, true)
+            .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?;
+        validate_backup_migration_state(&validation, manifest_read.manifest.source_schema_version)?;
+        verify_integrity(&validation)?;
+    }
     #[cfg(any(target_os = "linux", windows))]
-    {
+    if mode == BackupValidationMode::DurableStaging {
         let staging_file_name = format!("satelle.sqlite3.restore-{}.staged", Uuid::now_v7());
         let staging_identity = {
             let mut source = &backup_file;
@@ -1564,7 +1596,7 @@ fn validate_migration_backup_at_with_hook(
         }
     }
     #[cfg(target_os = "macos")]
-    {
+    if mode == BackupValidationMode::DurableStaging {
         let validation_registration = unix_vfs::register_validation_file(&backup_file)?;
         let validation = Connection::open_with_flags_and_vfs(
             validation_registration.path(),
@@ -1637,7 +1669,25 @@ fn validate_migration_backup_with_hook(
         backup_file_name,
         backup_file_name,
         &manifest_file_name,
+        BackupValidationMode::DurableStaging,
         hook,
+    )
+}
+
+pub(super) fn validate_migration_backup_preview(
+    state_root: &Path,
+    state_directory: &StateDirectory,
+    backup_file_name: &str,
+) -> Result<ValidatedMigrationBackup, StorageError> {
+    let manifest_file_name = format!("{backup_file_name}.json");
+    validate_migration_backup_at_with_hook(
+        state_root,
+        state_directory,
+        backup_file_name,
+        backup_file_name,
+        &manifest_file_name,
+        BackupValidationMode::ReadOnlyMemory,
+        |_| Ok(()),
     )
 }
 
@@ -2617,6 +2667,14 @@ pub(super) fn validate_migration_backup_for_restore(
 ) -> Result<(), StorageError> {
     let state_directory = prepare_state_root(state_root)?;
     validate_migration_backup(state_root, &state_directory, backup_file_name).map(|_| ())
+}
+
+pub(super) fn validate_migration_backup_for_preview(
+    state_root: &Path,
+    backup_file_name: &str,
+) -> Result<(), StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    validate_migration_backup_preview(state_root, &state_directory, backup_file_name).map(|_| ())
 }
 
 pub(super) fn restore_migration_backup_offline(

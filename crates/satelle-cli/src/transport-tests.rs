@@ -77,6 +77,30 @@ fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
         serde_json::json!("restore-storage-backup")
     );
 
+    let mut remote_partial = SatelleError::storage_maintenance_partially_applied(
+        &["cleanup-storage-backups".to_string()],
+        "cleanup-storage-backups",
+        &[],
+        &recovery_command,
+        "second backup deletion failed",
+    );
+    remote_partial.details.insert(
+        "removed_backup_file_names".to_string(),
+        serde_json::json!(["satelle.sqlite3.migration-v14-first.backup"]),
+    );
+    let preserved = storage_maintenance_partial_error(
+        "remote host",
+        &["stop-host-api-service".to_string()],
+        "cleanup-storage-backups",
+        &["restart-host-api-service".to_string()],
+        &recovery_command,
+        remote_partial,
+    );
+    assert_eq!(
+        preserved.details["removed_backup_file_names"],
+        serde_json::json!(["satelle.sqlite3.migration-v14-first.backup"])
+    );
+
     assert!(
         SshStorageMaintenance::StoreReset
             .recovery_command("remote", None, true)

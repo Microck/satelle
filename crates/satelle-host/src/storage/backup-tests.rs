@@ -82,6 +82,28 @@ impl BackupFixture {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn restore_preview_validation_does_not_require_state_directory_writes() {
+    let fixture = BackupFixture::new(1);
+    let state_directory = fixture.state_directory();
+    let original_permissions = fs::metadata(&fixture.state_root)
+        .expect("read state directory metadata")
+        .permissions();
+    fs::set_permissions(&fixture.state_root, fs::Permissions::from_mode(0o500))
+        .expect("make the state directory read-only");
+
+    let validation = validate_migration_backup_preview(
+        &fixture.state_root,
+        &state_directory,
+        fixture.backup_file_name(),
+    );
+
+    fs::set_permissions(&fixture.state_root, original_permissions)
+        .expect("restore state directory permissions");
+    validation.expect("preview validates without staging a writable copy");
+}
+
 #[test]
 fn migration_backup_restore_preserves_active_and_retired_idempotency_hmac_keys() {
     const PAYLOAD: &[u8] = b"deterministic migration restore HMAC payload";

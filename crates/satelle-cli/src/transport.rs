@@ -1084,6 +1084,7 @@ fn map_ssh_daemon_bootstrap_error(
         ssh_bootstrap::SshBootstrapError::DaemonPathOverrideNotAbsolute { name, value } => {
             SatelleError::daemon_path_override_not_absolute(name, value)
         }
+        ssh_bootstrap::SshBootstrapError::OfflineStorageMaintenanceFailed(source) => *source,
         ssh_bootstrap::SshBootstrapError::VerifiedRelease {
             version,
             target,
@@ -3040,7 +3041,7 @@ fn storage_maintenance_partial_error(
     recovery_command: &str,
     source: SatelleError,
 ) -> SatelleError {
-    if completed_actions.is_empty() {
+    let mut error = if completed_actions.is_empty() {
         let mut error = SatelleError::setup_action_failed(
             host,
             failed_action,
@@ -3061,7 +3062,19 @@ fn storage_maintenance_partial_error(
             recovery_command,
             source.to_string(),
         )
+    };
+    // The remote mutation can fail after deleting only part of the approved
+    // set. Keep those exact identities in the outer service-recovery error.
+    for key in [
+        "removed_backup_file_names",
+        "removed_metadata_file_names",
+        "recordings_deleted",
+    ] {
+        if let Some(value) = source.details.get(key) {
+            error.details.insert(key.to_string(), value.clone());
+        }
     }
+    error
 }
 
 pub(crate) fn preflight_ssh_storage_maintenance(host: &SelectedHost) -> Result<(), SatelleError> {
