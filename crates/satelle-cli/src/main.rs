@@ -431,6 +431,8 @@ enum HostCommand {
     },
     #[command(hide = true)]
     OfflineStorageMaintenance(OfflineStorageMaintenanceCommand),
+    #[command(hide = true)]
+    OfflineStorageBackupCleanupPlan(OfflineStorageBackupCleanupPlanCommand),
 }
 
 #[derive(Args, Debug)]
@@ -749,9 +751,21 @@ struct OfflineStorageMaintenanceCommand {
     backup: Option<PathBuf>,
     #[arg(long)]
     delete_recordings: bool,
+    /// Exact backup identities approved by the caller for cleanup.
+    #[arg(long = "approved-backup")]
+    approved_backup_file_names: Vec<String>,
+    /// Apply the already-confirmed offline mutation.
+    #[arg(long)]
+    yes: bool,
     /// Reconcile a mutation that already completed without repeating it.
     #[arg(long)]
     reconcile_completion: bool,
+}
+
+#[derive(Args, Debug)]
+struct OfflineStorageBackupCleanupPlanCommand {
+    #[arg(long)]
+    state_root: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1552,6 +1566,9 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         Command::Host {
             command: HostCommand::OfflineStorageMaintenance(_),
         } => return None,
+        Command::Host {
+            command: HostCommand::OfflineStorageBackupCleanupPlan(_),
+        } => return None,
         Command::Host { command } => HistoryTarget {
             family: "host",
             selects_host: match command {
@@ -1591,6 +1608,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                     command: HostStoreCommand::Reset(command),
                 } => command.host.as_deref(),
                 HostCommand::OfflineStorageMaintenance(_) => None,
+                HostCommand::OfflineStorageBackupCleanupPlan(_) => None,
             },
             session_id: None,
         },
@@ -6073,6 +6091,9 @@ fn run_host(
         HostCommand::Storage { command } => run_host_storage(command, config, format),
         HostCommand::Store { command } => run_host_store(command, config, format),
         HostCommand::OfflineStorageMaintenance(command) => run_offline_storage_maintenance(command),
+        HostCommand::OfflineStorageBackupCleanupPlan(command) => {
+            run_offline_storage_backup_cleanup_plan(command)
+        }
     }
 }
 
@@ -8618,7 +8639,7 @@ fn offline_storage_completion_recovery_command(
     if delete_recordings {
         command.push_str(" --delete-recordings");
     }
-    command.push_str(" --reconcile-completion");
+    command.push_str(" --yes --reconcile-completion");
     command
 }
 
@@ -8699,7 +8720,7 @@ fn storage_completion_recovery_command_preserves_operation_identity() {
             Some(Path::new("/state root/backup file")),
             false,
         ),
-        "satelle host offline-storage-maintenance --operation restore --host 'remote host' --operation-id storage-maintenance-exact --state-root '/state root' --backup '/state root/backup file' --reconcile-completion"
+        "satelle host offline-storage-maintenance --operation restore --host 'remote host' --operation-id storage-maintenance-exact --state-root '/state root' --backup '/state root/backup file' --yes --reconcile-completion"
     );
 }
 
@@ -8726,6 +8747,8 @@ fn storage_completion_recovery_reconciles_the_retained_operation_without_restart
         state_root: state.path().to_path_buf(),
         backup: None,
         delete_recordings: false,
+        approved_backup_file_names: Vec::new(),
+        yes: true,
         reconcile_completion: true,
     };
     assert!(
@@ -8817,6 +8840,7 @@ fn run_host_storage(
                     transport::SshStorageMaintenance::Restore,
                     Some(&command.backup),
                     false,
+                    &[],
                 )
                 .map_err(failure)?;
                 activation
@@ -8841,24 +8865,17 @@ fn run_host_storage(
             let local_state_root = (host.config.transport == TransportKind::Local)
                 .then(|| local_storage_state_root(&host))
                 .transpose()?;
-            if local_state_root.is_none() {
-                transport::preflight_ssh_storage_maintenance(&host).map_err(failure)?;
-            }
-            let local_cleanup_plan = local_state_root
-                .as_ref()
-                .map(|state_root| {
-                    satelle_host::HostService::plan_storage_backup_cleanup(state_root)
-                        .map_err(failure)
-                })
-                .transpose()?;
-            let planned_actions = if let Some(plan) = &local_cleanup_plan {
-                plan.eligible_backup_file_names
-                    .iter()
-                    .map(|name| format!("delete validated migration backup {name}"))
-                    .collect::<Vec<_>>()
+            let cleanup_plan = if let Some(state_root) = &local_state_root {
+                satelle_host::HostService::plan_storage_backup_cleanup(state_root)
+                    .map_err(failure)?
             } else {
-                vec!["delete older eligible validated migration backups".to_string()]
+                transport::plan_ssh_storage_backup_cleanup(&host).map_err(failure)?
             };
+            let planned_actions = cleanup_plan
+                .eligible_backup_file_names
+                .iter()
+                .map(|name| format!("delete validated migration backup {name}"))
+                .collect::<Vec<_>>();
             if command.dry_run {
                 return print_storage_plan(&host.alias, "backup_cleanup", &planned_actions, format);
             }
@@ -8904,10 +8921,7 @@ fn run_host_storage(
                     || {
                         satelle_host::HostService::cleanup_planned_storage_backups_offline(
                             state_root,
-                            &local_cleanup_plan
-                                .as_ref()
-                                .expect("local cleanup planning produced an exact candidate set")
-                                .eligible_backup_file_names,
+                            &cleanup_plan.eligible_backup_file_names,
                             &recovery_command,
                         )
                     },
@@ -8919,6 +8933,7 @@ fn run_host_storage(
                     transport::SshStorageMaintenance::BackupCleanup,
                     None,
                     false,
+                    &cleanup_plan.eligible_backup_file_names,
                 )
                 .map_err(failure)?
             };
@@ -9015,6 +9030,7 @@ fn run_host_store(
                     transport::SshStorageMaintenance::StoreReset,
                     None,
                     command.delete_recordings,
+                    &[],
                 )
                 .map_err(failure)?;
                 reset
@@ -9046,6 +9062,11 @@ fn run_host_store(
 fn run_offline_storage_maintenance(
     command: OfflineStorageMaintenanceCommand,
 ) -> Result<(), CliFailure> {
+    if !command.yes {
+        return Err(failure(SatelleError::invalid_usage(
+            "offline storage maintenance requires explicit --yes authorization",
+        )));
+    }
     let (action_id, action_label) = match command.operation {
         OfflineStorageOperation::Restore => (
             "restore-storage-backup",
@@ -9072,6 +9093,13 @@ fn run_offline_storage_maintenance(
             None
         }
     };
+    if !matches!(command.operation, OfflineStorageOperation::BackupCleanup)
+        && !command.approved_backup_file_names.is_empty()
+    {
+        return Err(failure(SatelleError::invalid_usage(
+            "only offline backup cleanup accepts --approved-backup",
+        )));
+    }
     let recovery_command = match command.operation {
         OfflineStorageOperation::Restore => format!(
             "satelle host storage restore --host {} --backup {} --no-input --yes",
@@ -9134,8 +9162,9 @@ fn run_offline_storage_maintenance(
             })
         }
         OfflineStorageOperation::BackupCleanup => {
-            satelle_host::HostService::cleanup_storage_backups_offline(
+            satelle_host::HostService::cleanup_planned_storage_backups_offline(
                 &command.state_root,
+                &command.approved_backup_file_names,
                 &recovery_command,
             )
             .map(|removed_backup_file_names| {
@@ -9193,6 +9222,40 @@ fn run_offline_storage_maintenance(
         ));
     }
     print_json(&result).map_err(failure)
+}
+
+fn run_offline_storage_backup_cleanup_plan(
+    command: OfflineStorageBackupCleanupPlanCommand,
+) -> Result<(), CliFailure> {
+    let plan = satelle_host::HostService::plan_storage_backup_cleanup(&command.state_root)
+        .map_err(failure)?;
+    print_json(&plan).map_err(failure)
+}
+
+#[cfg(test)]
+#[test]
+fn direct_offline_storage_mutation_requires_explicit_authorization() {
+    let state = satelle_host::test_support::TestStateDir::new()
+        .expect("create unauthorized offline maintenance state");
+    let operation_id = "unauthorized-offline-storage-maintenance";
+    let failure = run_offline_storage_maintenance(OfflineStorageMaintenanceCommand {
+        operation: OfflineStorageOperation::BackupCleanup,
+        host: "local-demo".to_string(),
+        operation_id: operation_id.to_string(),
+        state_root: state.path().to_path_buf(),
+        backup: None,
+        delete_recordings: false,
+        approved_backup_file_names: Vec::new(),
+        yes: false,
+        reconcile_completion: false,
+    })
+    .expect_err("reject a hidden offline mutation without explicit authorization");
+
+    assert_eq!(ErrorCode::InvalidUsage, failure.error.code);
+    assert!(
+        !state.path().join("satelle.sqlite3").exists(),
+        "authorization must be checked before the operation is persisted"
+    );
 }
 
 fn print_storage_plan(

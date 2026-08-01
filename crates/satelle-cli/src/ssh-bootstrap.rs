@@ -2703,24 +2703,12 @@ impl<'a> PersistentServiceRemote<'a> {
     pub(super) fn run_offline_storage_maintenance(
         &mut self,
         artifact: &UploadedHostArtifact,
-        operation: &str,
-        identity: OfflineStorageMaintenanceIdentity<'_>,
-        state_root: &str,
-        backup: Option<&str>,
-        delete_recordings: bool,
+        request: &OfflineStorageMaintenanceRequest<'_>,
     ) -> Result<serde_json::Value, SshBootstrapError> {
         let binary = self.absolute_artifact_path(artifact);
-        let command = offline_storage_maintenance_command(
-            self.target,
-            &binary,
-            operation,
-            identity,
-            state_root,
-            backup,
-            delete_recordings,
-        );
+        let command = offline_storage_maintenance_command(self.target, &binary, request);
         let output = self.mutate_with_output("offline_storage_maintenance", &command, None)?;
-        parse_offline_storage_maintenance_result(operation, &output.stdout)
+        parse_offline_storage_maintenance_result(request.operation, &output.stdout)
     }
 
     pub(super) fn observe_canonical_daemon_path_overrides(
@@ -2894,48 +2882,111 @@ pub(super) struct OfflineStorageMaintenanceIdentity<'a> {
     pub(super) operation_id: &'a str,
 }
 
+pub(super) struct OfflineStorageMaintenanceRequest<'a> {
+    pub(super) operation: &'a str,
+    pub(super) identity: OfflineStorageMaintenanceIdentity<'a>,
+    pub(super) state_root: &'a str,
+    pub(super) backup: Option<&'a str>,
+    pub(super) delete_recordings: bool,
+    pub(super) approved_backup_file_names: &'a [String],
+}
+
 fn offline_storage_maintenance_command(
     target: RemoteTarget,
     binary: &str,
-    operation: &str,
-    identity: OfflineStorageMaintenanceIdentity<'_>,
-    state_root: &str,
-    backup: Option<&str>,
-    delete_recordings: bool,
+    request: &OfflineStorageMaintenanceRequest<'_>,
 ) -> String {
     if target.is_windows() {
         let mut script = format!(
             "& {} host offline-storage-maintenance --operation {} --host {} --operation-id {} --state-root {}",
             powershell_quote(binary),
-            powershell_quote(operation),
-            powershell_quote(identity.host),
-            powershell_quote(identity.operation_id),
-            powershell_quote(state_root),
+            powershell_quote(request.operation),
+            powershell_quote(request.identity.host),
+            powershell_quote(request.identity.operation_id),
+            powershell_quote(request.state_root),
         );
-        if let Some(backup) = backup {
+        if let Some(backup) = request.backup {
             script.push_str(&format!(" --backup {}", powershell_quote(backup)));
         }
-        if delete_recordings {
+        if request.delete_recordings {
             script.push_str(" --delete-recordings");
         }
+        for backup_file_name in request.approved_backup_file_names {
+            script.push_str(&format!(
+                " --approved-backup {}",
+                powershell_quote(backup_file_name)
+            ));
+        }
+        script.push_str(" --yes");
         powershell_encoded_command(&script)
     } else {
         let mut arguments = format!(
             "{} host offline-storage-maintenance --operation {} --host {} --operation-id {} --state-root {}",
             posix_quote(binary),
-            posix_quote(operation),
-            posix_quote(identity.host),
-            posix_quote(identity.operation_id),
-            posix_quote(state_root),
+            posix_quote(request.operation),
+            posix_quote(request.identity.host),
+            posix_quote(request.identity.operation_id),
+            posix_quote(request.state_root),
         );
-        if let Some(backup) = backup {
+        if let Some(backup) = request.backup {
             arguments.push_str(&format!(" --backup {}", posix_quote(backup)));
         }
-        if delete_recordings {
+        if request.delete_recordings {
             arguments.push_str(" --delete-recordings");
         }
+        for backup_file_name in request.approved_backup_file_names {
+            arguments.push_str(&format!(
+                " --approved-backup {}",
+                posix_quote(backup_file_name)
+            ));
+        }
+        arguments.push_str(" --yes");
         format!("sh -c {}", posix_quote(&format!("exec {arguments}")))
     }
+}
+
+fn offline_storage_backup_cleanup_plan_command(
+    target: RemoteTarget,
+    binary: &str,
+    state_root: &str,
+) -> String {
+    if target.is_windows() {
+        powershell_encoded_command(&format!(
+            "& {} host offline-storage-backup-cleanup-plan --state-root {}",
+            powershell_quote(binary),
+            powershell_quote(state_root),
+        ))
+    } else {
+        let arguments = format!(
+            "{} host offline-storage-backup-cleanup-plan --state-root {}",
+            posix_quote(binary),
+            posix_quote(state_root),
+        );
+        format!("sh -c {}", posix_quote(&format!("exec {arguments}")))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfflineStorageBackupCleanupPlan {
+    eligible_backup_file_names: Vec<String>,
+}
+
+pub(super) fn plan_offline_storage_backup_cleanup(
+    destination: &str,
+    target: RemoteTarget,
+    binary: &str,
+    state_root: &str,
+) -> Result<Vec<String>, SshBootstrapError> {
+    let command = offline_storage_backup_cleanup_plan_command(target, binary, state_root);
+    let output = require_success_output(run_ssh_command_with_output_limit(
+        destination,
+        &command,
+        PROBE_OUTPUT_LIMIT,
+    )?)?;
+    serde_json::from_slice::<OfflineStorageBackupCleanupPlan>(&output.stdout)
+        .map(|plan| plan.eligible_backup_file_names)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)
 }
 
 fn parse_offline_storage_maintenance_result(
@@ -3788,6 +3839,10 @@ pub(super) struct ManagedServiceExecutableObservation {
 }
 
 impl ManagedServiceExecutableObservation {
+    pub(super) fn path(&self) -> &str {
+        &self.path
+    }
+
     #[cfg(test)]
     pub(super) fn for_tests(path: impl Into<String>, sha256: [u8; 32]) -> Self {
         Self {
@@ -5484,6 +5539,45 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn offline_cleanup_commands_bind_authorization_and_the_exact_approved_set() {
+        let identity = OfflineStorageMaintenanceIdentity {
+            host: "remote host",
+            operation_id: "storage-maintenance-exact",
+        };
+        let approved = vec![
+            "satelle.sqlite3.migration-backup.1".to_string(),
+            "operator's backup".to_string(),
+        ];
+        let windows = offline_storage_maintenance_command(
+            RemoteTarget::WindowsX64Msvc,
+            r"C:\Satelle\satelle.exe",
+            &OfflineStorageMaintenanceRequest {
+                operation: "backup-cleanup",
+                identity,
+                state_root: r"C:\Satelle\state",
+                backup: None,
+                delete_recordings: false,
+                approved_backup_file_names: &approved,
+            },
+        );
+        let windows_script =
+            decode_powershell_command(&windows).expect("decode offline cleanup command");
+        assert_eq!(
+            windows_script,
+            "& 'C:\\Satelle\\satelle.exe' host offline-storage-maintenance --operation 'backup-cleanup' --host 'remote host' --operation-id 'storage-maintenance-exact' --state-root 'C:\\Satelle\\state' --approved-backup 'satelle.sqlite3.migration-backup.1' --approved-backup 'operator''s backup' --yes"
+        );
+
+        let plan = offline_storage_backup_cleanup_plan_command(
+            RemoteTarget::DarwinArm64,
+            "/Applications/Satelle/satelle",
+            "/Users/operator/Library/Application Support/Satelle/state",
+        );
+        assert!(plan.contains("offline-storage-backup-cleanup-plan"));
+        assert!(!plan.contains("--yes"));
+        assert!(!plan.contains("--approved-backup"));
+    }
 
     fn persistent_windows_task() -> satelle_core::daemon_service::WindowsTaskDefinition {
         satelle_core::daemon_service::WindowsTaskDefinition {

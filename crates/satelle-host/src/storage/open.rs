@@ -2423,16 +2423,6 @@ pub(super) fn restore_migration_backup_offline(
     activate_migration_backup(state_root, &state_directory, &backup)
 }
 
-pub(super) fn cleanup_migration_backups_offline(
-    state_root: &Path,
-) -> Result<Vec<String>, BackupCleanupFailure> {
-    let state_directory = prepare_state_root(state_root)
-        .map_err(|source| BackupCleanupFailure::new(Vec::new(), source))?;
-    let _ownership = acquire_ownership_lock(&state_directory)
-        .map_err(|source| BackupCleanupFailure::new(Vec::new(), source))?;
-    cleanup_migration_backups_with_hook(state_root, &state_directory, None, |_| Ok(()))
-}
-
 pub(super) fn cleanup_migration_backups_offline_exact(
     state_root: &Path,
     approved_backup_file_names: &[String],

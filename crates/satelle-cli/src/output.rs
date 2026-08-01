@@ -220,7 +220,7 @@ impl HostCommand {
             Self::Sessions(command) => (command.output_args, EventOutput::None),
             Self::Storage { command } => command.output_request(),
             Self::Store { command } => command.output_request(),
-            Self::OfflineStorageMaintenance(_) => (
+            Self::OfflineStorageMaintenance(_) | Self::OfflineStorageBackupCleanupPlan(_) => (
                 OutputArgs {
                     format: None,
                     json: false,

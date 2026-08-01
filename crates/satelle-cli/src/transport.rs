@@ -3082,12 +3082,73 @@ pub(crate) fn preflight_ssh_storage_maintenance(host: &SelectedHost) -> Result<(
     Ok(())
 }
 
+pub(crate) fn plan_ssh_storage_backup_cleanup(
+    host: &SelectedHost,
+) -> Result<satelle_host::StorageBackupCleanupPlan, SatelleError> {
+    let transport = SshSetupTransport::new(host)?;
+    if transport.requires_first_trust {
+        return Err(SatelleError::invalid_usage(format!(
+            "host '{}' must have a trusted expected Host Identity before storage maintenance can run",
+            transport.alias
+        )));
+    }
+    let target = transport.remote_target()?;
+    if target.service_platform() == DaemonServicePlatform::Linux {
+        return Err(SatelleError::persistent_service_unsupported(
+            target.service_platform().as_str(),
+        ));
+    }
+    let directories = transport.remote_directories(target)?;
+    let path_overrides = DaemonPathOverrides {
+        home: host.config.daemon_home.clone(),
+        config_file: host.config.daemon_config_file.clone(),
+        state_dir: host.config.daemon_state_dir.clone(),
+        cache_dir: host.config.daemon_cache_dir.clone(),
+        log_dir: host.config.daemon_log_dir.clone(),
+        ..DaemonPathOverrides::default()
+    };
+    let host_id = transport.binding.expected_host_identity().as_str();
+    let service_asset_path = directories
+        .persistent_service_asset_path(host_id)
+        .ok_or_else(|| SatelleError::persistent_service_unsupported("unknown"))?;
+    let executable = directories
+        .probe_managed_service_executable(
+            transport.binding.destination(),
+            &service_asset_path,
+            host_id,
+            &path_overrides,
+        )
+        .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
+        .ok_or_else(SatelleError::state_conflict)?;
+    let state_root = directories
+        .resolved_path_set()
+        .with_service_overrides(&path_overrides)
+        .state_root;
+    let eligible_backup_file_names = ssh_bootstrap::plan_offline_storage_backup_cleanup(
+        transport.binding.destination(),
+        target,
+        executable.path(),
+        &state_root,
+    )
+    .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?;
+    Ok(satelle_host::StorageBackupCleanupPlan {
+        eligible_backup_file_names,
+    })
+}
+
 pub(crate) fn apply_ssh_storage_maintenance(
     host: &SelectedHost,
     maintenance: SshStorageMaintenance,
     backup: Option<&Path>,
     delete_recordings: bool,
+    approved_backup_file_names: &[String],
 ) -> Result<serde_json::Value, SatelleError> {
+    if maintenance != SshStorageMaintenance::BackupCleanup && !approved_backup_file_names.is_empty()
+    {
+        return Err(SatelleError::invalid_usage(
+            "only SSH backup cleanup accepts approved backup identities",
+        ));
+    }
     let transport = SshSetupTransport::new(host)?;
     if transport.requires_first_trust {
         return Err(SatelleError::invalid_usage(format!(
@@ -3187,14 +3248,17 @@ pub(crate) fn apply_ssh_storage_maintenance(
             Ok(mut remote) => remote
                 .run_offline_storage_maintenance(
                     &artifact,
-                    maintenance.token(),
-                    ssh_bootstrap::OfflineStorageMaintenanceIdentity {
-                        host: &transport.alias,
-                        operation_id: &operation_id,
+                    &ssh_bootstrap::OfflineStorageMaintenanceRequest {
+                        operation: maintenance.token(),
+                        identity: ssh_bootstrap::OfflineStorageMaintenanceIdentity {
+                            host: &transport.alias,
+                            operation_id: &operation_id,
+                        },
+                        state_root: &state_root,
+                        backup: backup.as_deref(),
+                        delete_recordings,
+                        approved_backup_file_names,
                     },
-                    &state_root,
-                    backup.as_deref(),
-                    delete_recordings,
                 )
                 .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error)),
             Err(error) => Err(map_ssh_daemon_bootstrap_error(&transport.alias, error)),
