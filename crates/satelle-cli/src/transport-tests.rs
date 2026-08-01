@@ -5093,6 +5093,21 @@ fn selected_repair_run_checks_the_daemon_before_operation_bound_recovery() {
 }
 
 #[test]
+fn pre_action_repair_failure_preserves_selected_run_recovery_command() {
+    let mut source = SatelleError::host_unreachable("remote");
+    source.recovery_command =
+        Some("satelle repair --host remote --run exact-run --no-input --yes".to_string());
+
+    let error = setup_action_failure_with_source_recovery("remote", "replace-host", &[], &source);
+
+    assert_eq!(error.recovery_command, source.recovery_command);
+    assert_eq!(
+        error.details["recovery_command"],
+        serde_json::json!("satelle repair --host remote --run exact-run --no-input --yes")
+    );
+}
+
+#[test]
 fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
     #[derive(Clone, Copy)]
     enum FixtureReadiness {

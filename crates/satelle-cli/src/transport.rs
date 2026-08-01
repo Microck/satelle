@@ -5516,11 +5516,11 @@ pub(crate) fn apply_repair_upgrades(
         }
     }
     if completed_actions.is_empty() {
-        return Err(SatelleError::setup_action_failed(
+        return Err(setup_action_failure_with_source_recovery(
             &repair.host,
             &failed_action,
             &repair.skipped_actions,
-            source.to_string(),
+            &source,
         ));
     }
     let mut partial = repair.partial_failure(completed_actions, &failed_action);
@@ -5534,6 +5534,24 @@ pub(crate) fn apply_repair_upgrades(
         &failed_action,
         source.to_string(),
     ))
+}
+
+fn setup_action_failure_with_source_recovery(
+    host: &str,
+    failed_action: &str,
+    skipped_actions: &[String],
+    source: &SatelleError,
+) -> SatelleError {
+    let mut error =
+        SatelleError::setup_action_failed(host, failed_action, skipped_actions, source.to_string());
+    if let Some(recovery_command) = &source.recovery_command {
+        error.recovery_command = Some(recovery_command.clone());
+        error.details.insert(
+            "recovery_command".to_string(),
+            serde_json::Value::String(recovery_command.clone()),
+        );
+    }
+    error
 }
 
 fn canonical_remote_platform(platform: &str) -> (Option<ssh_bootstrap::RemoteTarget>, String) {
