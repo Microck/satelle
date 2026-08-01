@@ -499,14 +499,32 @@ test("release check returns the canonical package and archive ownership plan", (
   const plan = release.check();
   const version = workspaceVersion();
 
-  assert.equal(plan.schemaVersion, "satelle.release-plan.v1");
+  assert.equal(plan.schemaVersion, "satelle.release-plan.v2");
   assert.equal(plan.version, version);
-  assert.deepEqual(plan.targets, expectedTargets);
+  assert.deepEqual(plan.controllerTargets, expectedTargets);
+  assert.deepEqual(plan.nativeComputerUseHostTargets, [
+    "darwin-arm64",
+    "darwin-x64",
+    "win32-arm64-msvc",
+    "win32-x64-msvc",
+  ]);
   assert.deepEqual(plan.publicationOrder, [
     ...expectedTargets.map((target) => `@microck/satelle-${target}`),
     "@microck/satelle",
     "satelle",
   ]);
+  assert.deepEqual(
+    plan.artifacts.map(({ target, rustTarget, nativeComputerUseHost }) => ({
+      target,
+      rustTarget,
+      nativeComputerUseHost,
+    })),
+    expectedTargets.map((target) => ({
+      target,
+      rustTarget: platformMatrix[target].rustTarget,
+      nativeComputerUseHost: platformMatrix[target].nativeComputerUseHost,
+    })),
+  );
   assert.deepEqual(
     plan.artifacts.map(({ archive }) => archive),
     expectedTargets.map((target) =>
@@ -518,9 +536,16 @@ test("release check returns the canonical package and archive ownership plan", (
     expectedTargets.map((target) => `npm-${target}.tgz`),
   );
 
-  plan.targets.length = 0;
+  plan.controllerTargets.length = 0;
+  plan.nativeComputerUseHostTargets.length = 0;
   plan.publicationOrder.reverse();
-  assert.deepEqual(release.check().targets, expectedTargets);
+  assert.deepEqual(release.check().controllerTargets, expectedTargets);
+  assert.deepEqual(release.check().nativeComputerUseHostTargets, [
+    "darwin-arm64",
+    "darwin-x64",
+    "win32-arm64-msvc",
+    "win32-x64-msvc",
+  ]);
   assert.deepEqual(release.check().publicationOrder, [
     ...expectedTargets.map((target) => `@microck/satelle-${target}`),
     "@microck/satelle",
@@ -544,6 +569,31 @@ test("release check rejects a missing optional dependency for a matrix target", 
     () => createReleaseContext(fixtureRoot).check(),
     expectReleaseError("release-package-graph-mismatch"),
   );
+});
+
+test("release check rejects Controller and native Host matrix drift", (context) => {
+  for (const mutate of [
+    (matrix) => {
+      matrix["linux-x64-gnu"].nativeComputerUseHost = true;
+    },
+    (matrix) => {
+      matrix["darwin-arm64"].rustTarget = "x86_64-apple-darwin";
+    },
+    (matrix) => {
+      delete matrix["win32-arm64-msvc"];
+    },
+  ]) {
+    const fixtureRoot = fixtureRepository(context);
+    const matrixPath = path.join(fixtureRoot, "npm", "satelle", "platforms.json");
+    const matrix = readJson(matrixPath);
+    mutate(matrix);
+    writeJson(matrixPath, matrix);
+
+    assert.throws(
+      () => createReleaseContext(fixtureRoot).check(),
+      expectReleaseError("release-target-matrix-mismatch"),
+    );
+  }
 });
 
 test("release check rejects stray published install-time dependency edges", (context) => {
@@ -1183,6 +1233,17 @@ test("native release archives use canonical names and match native npm executabl
     );
     assert.equal(sha256(readFileSync(archive.archivePath)), archive.archiveSha256);
     assert.equal(sha256(readFileSync(archive.npmArtifactPath)), archive.npmArtifactSha256);
+  }
+  if (process.platform !== "win32") {
+    assert.equal(statSync(validation.stagingDirectory).mode & 0o777, 0o700);
+    assert.equal(
+      statSync(path.join(validation.stagingDirectory, "npm")).mode & 0o777,
+      0o700,
+    );
+    assert.equal(
+      statSync(path.join(validation.stagingDirectory, "github")).mode & 0o777,
+      0o500,
+    );
   }
 
   const [first] = plan.artifacts;

@@ -2,7 +2,7 @@ use assert_cmd::cargo::CommandCargoExt;
 use satelle_host::{ApiBearerToken, test_support::TestStateDir};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
@@ -156,6 +156,73 @@ fn run_mcp_command(command: &mut Command, messages: &[Value]) -> Output {
         }
     }
     child.wait_with_output().expect("wait for MCP server")
+}
+
+fn run_mcp_command_until_response(
+    command: &mut Command,
+    messages: &[Value],
+    response_id: u64,
+) -> Output {
+    let mut child = command.spawn().expect("spawn MCP server");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (response_sender, response_receiver) = mpsc::sync_channel(1);
+
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        for line in BufReader::new(stdout).lines() {
+            let line = line.expect("read MCP stdout");
+            output.extend_from_slice(line.as_bytes());
+            output.push(b'\n');
+            if let Ok(response) = serde_json::from_str::<Value>(&line)
+                && response["id"] == response_id
+            {
+                let _ = response_sender.try_send(());
+            }
+        }
+        output
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        BufReader::new(stderr)
+            .read_to_end(&mut output)
+            .expect("read MCP stderr");
+        output
+    });
+
+    for message in messages {
+        serde_json::to_writer(&mut stdin, message).expect("serialize MCP message");
+        stdin.write_all(b"\n").expect("write MCP delimiter");
+    }
+    stdin.flush().expect("flush MCP messages");
+
+    match response_receiver.recv_timeout(TEST_INFRASTRUCTURE_DEADLOCK_LIMIT) {
+        Ok(()) => {}
+        Err(error) => {
+            child.kill().expect("terminate wedged MCP server");
+            drop(stdin);
+            child.wait().expect("reap wedged MCP server");
+            let stdout = stdout_reader.join().expect("join MCP stdout reader");
+            let stderr = stderr_reader.join().expect("join MCP stderr reader");
+            panic!(
+                "MCP response {response_id} did not arrive before the test infrastructure deadline ({error}); stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+    }
+
+    // An MCP client must remain connected until it receives the response it
+    // requested. Closing stdin earlier lets EOF race the in-flight request
+    // and tests server cancellation instead of the tool result.
+    drop(stdin);
+    let status = child.wait().expect("wait for MCP server");
+    Output {
+        status,
+        stdout: stdout_reader.join().expect("join MCP stdout reader"),
+        stderr: stderr_reader.join().expect("join MCP stderr reader"),
+    }
 }
 
 fn wait_with_open_stdin(mut child: Child, stdin: ChildStdin, timeout_message: &str) -> Output {
@@ -677,13 +744,14 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
 fn blocked_doctor_is_a_structured_error_with_the_complete_report_as_text() {
     let home = TestStateDir::new().expect("production-safe temporary Satelle home");
     let mut command = mcp_command_for(home.path(), false);
-    let output = run_mcp_command(
+    let output = run_mcp_command_until_response(
         &mut command,
         &[
             initialize(1),
             initialized(),
             tool_call(2, "doctor", json!({"scope": "codex"})),
         ],
+        2,
     );
     assert!(
         output.status.success(),

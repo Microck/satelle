@@ -39,6 +39,7 @@ rustls-platform-verifier = "0.7.0"
 rustix = { version = "1.1.4", features = ["fs", "process", "pty", "termios"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+self-replace = "=1.5.0"
 sha2 = "0.11.0"
 subtle = "2.6.1"
 tempfile = "3.23.0"

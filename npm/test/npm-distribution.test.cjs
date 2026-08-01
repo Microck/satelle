@@ -9,6 +9,7 @@ const {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } = require("node:fs");
 const { tmpdir } = require("node:os");
@@ -396,6 +397,288 @@ test("installation scope detection recognizes global and local package layouts",
   assert.equal(launcher.detectInstallationScope("/opt/satelle/bin/satelle.cjs"), undefined);
 });
 
+test("self-update package context requires unambiguous local manifest ownership", (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-install-context-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const launcherPath = path.join(
+    fixtureRoot,
+    "node_modules",
+    "@microck",
+    "satelle",
+    "bin",
+    "satelle.cjs",
+  );
+  mkdirSync(path.dirname(launcherPath), { recursive: true });
+  writeFileSync(launcherPath, "fixture");
+  writeFileSync(
+    path.join(fixtureRoot, "package.json"),
+    JSON.stringify({
+      packageManager: "pnpm@10.0.0",
+      dependencies: { "@microck/satelle": "0.1.0" },
+    }),
+  );
+  writeFileSync(path.join(fixtureRoot, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+
+  assert.deepEqual(
+    launcher.packageInstallContext({
+      packageName: "@microck/satelle",
+      launcherPath,
+      globalOwners: [],
+    }),
+    {
+      manager: "pnpm",
+      scope: "local",
+      package_name: "@microck/satelle",
+      install_root: fixtureRoot,
+      launcher_path: realpathSync(launcherPath),
+    },
+  );
+
+  writeFileSync(path.join(fixtureRoot, "package-lock.json"), "{}");
+  assert.equal(
+    launcher.packageInstallContext({
+      packageName: "@microck/satelle",
+      launcherPath,
+      globalOwners: [],
+    }),
+    undefined,
+  );
+});
+
+test("self-update package context preserves global unscoped ownership", (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-global-context-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const globalRoot = path.join(fixtureRoot, "node_modules");
+  const launcherPath = path.join(globalRoot, "satelle", "bin", "satelle.cjs");
+  mkdirSync(path.dirname(launcherPath), { recursive: true });
+  writeFileSync(launcherPath, "fixture");
+
+  assert.deepEqual(
+    launcher.packageInstallContext({
+      packageName: "satelle",
+      launcherPath,
+      globalOwners: [{ manager: "npm", installRoot: globalRoot }],
+    }),
+    {
+      manager: "npm",
+      scope: "global",
+      package_name: "satelle",
+      install_root: globalRoot,
+      launcher_path: realpathSync(launcherPath),
+    },
+  );
+  assert.equal(
+    launcher.packageInstallContext({
+      packageName: "satelle",
+      launcherPath,
+      globalOwners: [
+        { manager: "npm", installRoot: globalRoot },
+        { manager: "pnpm", installRoot: globalRoot },
+      ],
+    }),
+    undefined,
+  );
+});
+
+test("package install context is reserved for self update", () => {
+  assert.equal(launcher.isSelfUpdate(["self", "update"]), true);
+  assert.equal(
+    launcher.isSelfUpdate([
+      "--profile",
+      "ci",
+      "self",
+      "--error-format=json",
+      "update",
+      "--no-color",
+    ]),
+    true,
+  );
+  assert.equal(launcher.isSelfUpdate(["run", "--agent", "codex"]), false);
+  assert.equal(launcher.isSelfUpdate(["self", "version"]), false);
+  const options = {
+    get globalOwners() {
+      throw new Error("ordinary commands must not probe package managers");
+    },
+  };
+  assert.equal(launcher.packageInstallContextForCommand(["run"], options), undefined);
+});
+
+test("Windows global discovery invokes package-manager launcher files", () => {
+  const probes = [];
+  launcher.discoverGlobalOwnership({
+    packageName: "@microck/satelle",
+    launcherPath: "C:\\fixture\\node_modules\\@microck\\satelle\\bin\\satelle.cjs",
+    platform: "win32",
+    runCommand(command, argumentsToForward) {
+      probes.push([command, argumentsToForward]);
+      return undefined;
+    },
+  });
+
+  assert.deepEqual(
+    probes.map(([command]) => command),
+    ["npm.cmd", "pnpm.cmd", "bun.exe"],
+  );
+});
+
+test(
+  "Windows package-manager launcher files execute through the command shell",
+  { skip: process.platform !== "win32" },
+  (context) => {
+    const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-command-line-"));
+    context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+    const command = path.join(fixtureRoot, "probe.cmd");
+    writeFileSync(command, "@echo probe-result\r\n");
+
+    assert.equal(launcher.commandLine(command, []), "probe-result");
+  },
+);
+
+test("self-update context rejects cross-lane ownership ambiguity", (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-cross-lane-context-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const launcherPath = path.join(
+    fixtureRoot,
+    "node_modules",
+    "@microck",
+    "satelle",
+    "bin",
+    "satelle.cjs",
+  );
+  mkdirSync(path.dirname(launcherPath), { recursive: true });
+  writeFileSync(launcherPath, "fixture");
+  writeFileSync(
+    path.join(fixtureRoot, "package.json"),
+    JSON.stringify({
+      packageManager: "npm@11.0.0",
+      dependencies: { "@microck/satelle": "0.1.0" },
+    }),
+  );
+  writeFileSync(path.join(fixtureRoot, "package-lock.json"), "{}");
+
+  assert.equal(
+    launcher.packageInstallContext({
+      packageName: "@microck/satelle",
+      launcherPath,
+      globalOwners: [{ manager: "npm", installRoot: path.join(fixtureRoot, "node_modules") }],
+    }),
+    undefined,
+  );
+});
+
+test("Bun global discovery selects the nearest package-owning node_modules root", (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-bun-root-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const innerRoot = path.join(
+    fixtureRoot,
+    "node_modules",
+    "foreign",
+    "node_modules",
+  );
+  const launcherPath = path.join(
+    innerRoot,
+    "@microck",
+    "satelle",
+    "bin",
+    "satelle.cjs",
+  );
+  const bunBin = path.join(fixtureRoot, "bun-bin");
+  mkdirSync(path.dirname(launcherPath), { recursive: true });
+  mkdirSync(bunBin);
+  writeFileSync(launcherPath, "fixture");
+  symlinkSync(launcherPath, path.join(bunBin, "satelle"));
+
+  const owners = launcher.discoverGlobalOwnership({
+    packageName: "@microck/satelle",
+    launcherPath,
+    platform: "linux",
+    runCommand(command) {
+      return command === "bun" ? bunBin : undefined;
+    },
+  });
+
+  assert.deepEqual(owners, [{ manager: "bun", installRoot: innerRoot }]);
+});
+
+test("package install context fails closed when the launcher path is missing", () => {
+  assert.equal(
+    launcher.packageInstallContext({
+      packageName: "@microck/satelle",
+      launcherPath: "/missing/satelle/bin/satelle.cjs",
+      globalOwners: [],
+    }),
+    undefined,
+  );
+});
+
+test("global discovery requires the probed manager root to own the real launcher", (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-global-discovery-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const globalRoot = path.join(fixtureRoot, "node_modules");
+  const launcherPath = path.join(globalRoot, "@microck", "satelle", "bin", "satelle.cjs");
+  mkdirSync(path.dirname(launcherPath), { recursive: true });
+  writeFileSync(launcherPath, "fixture");
+  const probes = [];
+  const owners = launcher.discoverGlobalOwnership({
+    packageName: "@microck/satelle",
+    launcherPath,
+    // The Windows launcher-name contract has its own test above. Keep this
+    // ownership test platform-independent so its probe names stay deterministic.
+    platform: "linux",
+    runCommand(command, argumentsToForward) {
+      probes.push([command, argumentsToForward]);
+      if (command === "npm") {
+        return globalRoot;
+      }
+      return path.join(fixtureRoot, "unrelated");
+    },
+  });
+  assert.deepEqual(owners, [{ manager: "npm", installRoot: globalRoot }]);
+  assert.deepEqual(
+    probes.map(([command]) => command),
+    ["npm", "pnpm", "bun"],
+  );
+});
+
+test("native execution clears stale package context and installs a fresh one", (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-context-env-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const probe = path.join(fixtureRoot, "probe.cjs");
+  const output = path.join(fixtureRoot, "output.json");
+  writeFileSync(
+    probe,
+    `const context = Object.entries(process.env).find(([name]) => name.toUpperCase() === "SATELLE_PACKAGE_INSTALL_CONTEXT")?.[1];\nrequire("node:fs").writeFileSync(process.argv[2], context || "missing");\n`,
+  );
+  const previous = process.env.SATELLE_PACKAGE_INSTALL_CONTEXT;
+  const previousMixedCase = process.env.Satelle_Package_Install_Context;
+  process.env.SATELLE_PACKAGE_INSTALL_CONTEXT = "stale";
+  process.env.Satelle_Package_Install_Context = "forged";
+  try {
+    assert.equal(launcher.executeNativeBinary(process.execPath, [probe, output]), 0);
+    assert.equal(readFileSync(output, "utf8"), "missing");
+    const fresh = {
+      manager: "npm",
+      scope: "global",
+      package_name: "satelle",
+      install_root: "/tmp/node_modules",
+      launcher_path: "/tmp/node_modules/satelle/bin/satelle.cjs",
+    };
+    assert.equal(launcher.executeNativeBinary(process.execPath, [probe, output], fresh), 0);
+    assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), fresh);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.SATELLE_PACKAGE_INSTALL_CONTEXT;
+    } else {
+      process.env.SATELLE_PACKAGE_INSTALL_CONTEXT = previous;
+    }
+    if (previousMixedCase === undefined) {
+      delete process.env.Satelle_Package_Install_Context;
+    } else {
+      process.env.Satelle_Package_Install_Context = previousMixedCase;
+    }
+  }
+});
+
 test("canonical launches detect an installed unscoped forwarding package", (context) => {
   const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-forwarding-context-"));
   context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
@@ -416,6 +699,7 @@ test("canonical launches detect an installed unscoped forwarding package", (cont
     path.join(unscopedRoot, "package.json"),
     JSON.stringify({
       name: "satelle",
+      version: "0.1.0",
       dependencies: { "@microck/satelle": "0.1.0" },
     }),
   );
@@ -425,7 +709,23 @@ test("canonical launches detect an installed unscoped forwarding package", (cont
       packageName: "@microck/satelle",
       launcherPath: canonicalLauncher,
     }),
-    { packageName: "satelle", launcherPath: unscopedLauncher },
+    { packageName: "satelle", launcherPath: realpathSync(unscopedLauncher) },
+  );
+
+  writeFileSync(
+    path.join(unscopedRoot, "package.json"),
+    JSON.stringify({
+      name: "satelle",
+      version: "0.0.9",
+      dependencies: { "@microck/satelle": "0.1.0" },
+    }),
+  );
+  assert.deepEqual(
+    launcher.detectForwardingContext({
+      packageName: "@microck/satelle",
+      launcherPath: canonicalLauncher,
+    }),
+    { packageName: "@microck/satelle", launcherPath: canonicalLauncher },
   );
 });
 

@@ -361,6 +361,19 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::AuthenticationFailed
         | ErrorCode::AuthorizationInsufficientScope
         | ErrorCode::HostIdentityMismatch
+        // Self-update is a Controller-local installation workflow. None of
+        // its process errors belong in the Host wire-error vocabulary.
+        | ErrorCode::SelfUpdateManagedInstall
+        | ErrorCode::SelfUpdateInstallOwnerUnknown
+        | ErrorCode::SelfUpdateVersionInvalid
+        | ErrorCode::SelfUpdateExplicitVersionRequired
+        | ErrorCode::UnsupportedLocalPlatform
+        | ErrorCode::UnsupportedReleaseTarget
+        | ErrorCode::SelfUpdateLocked
+        | ErrorCode::SelfUpdateRollbackFailed
+        | ErrorCode::SelfUpdateReceiptInvalid
+        | ErrorCode::SelfUpdateVerificationFailed
+        | ErrorCode::SelfUpdateFailed
         // This is a Controller-local reachability error. If it ever reaches
         // the Host boundary, fail closed instead of inventing a wire code.
         | ErrorCode::HostDaemonUnreachable
@@ -370,6 +383,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         // must never be reclassified as Host wire failures.
         | ErrorCode::HostBinaryNewerThanCli
         | ErrorCode::HostArtifactUnavailable
+        | ErrorCode::ReleaseVerifierUnavailable
         | ErrorCode::HostUpdateRequiresCliUpgrade
         | ErrorCode::HostUpdateRecoveryPending
         | ErrorCode::AmbiguousCodexComponentOwnership

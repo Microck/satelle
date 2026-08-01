@@ -610,7 +610,7 @@ fn default_missing_ssh_host_plan_skips_unavailable_codex_targets() {
         path: std::env::temp_dir().join("unread-token"),
     }));
 
-    let report = plan_host_update(&host, &[], false)
+    let report = plan_host_update(&host, env!("CARGO_PKG_VERSION"), &[], false)
         .expect("default planning must preserve the missing Host recovery target");
 
     assert_eq!(

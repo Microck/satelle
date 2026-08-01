@@ -252,7 +252,7 @@ fn read_messages<R: Read>(stdout: &mut R, deadline: Instant, sender: mpsc::SyncS
 #[cfg(all(test, unix))]
 mod tests {
     use super::{ReadEvent, read_messages};
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
     use std::thread;
@@ -284,8 +284,17 @@ mod tests {
         writer
             .write_all(b"pipe remains owned")
             .expect("completed reader must retain its pipe");
-        let retained_pipe = reader.join().expect("reader thread must stop cleanly");
+        let mut retained_pipe = reader.join().expect("reader thread must stop cleanly");
+        let mut proof = [0_u8; 18];
+        retained_pipe
+            .read_exact(&mut proof)
+            .expect("drain the retained-pipe proof before closing");
+        assert_eq!(&proof, b"pipe remains owned");
         drop(retained_pipe);
-        assert!(writer.write_all(b"pipe is now closed").is_err());
+        let mut closed = [0_u8; 1];
+        assert_eq!(
+            writer.read(&mut closed).expect("observe the closed peer"),
+            0
+        );
     }
 }

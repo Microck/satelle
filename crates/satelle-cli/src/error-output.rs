@@ -271,7 +271,8 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         ErrorCode::BootstrapBusy
         | ErrorCode::HostBusy
         | ErrorCode::StateConflict
-        | ErrorCode::StopNotConfirmed => ErrorContract {
+        | ErrorCode::StopNotConfirmed
+        | ErrorCode::SelfUpdateLocked => ErrorContract {
             category: ErrorCategory::Conflict,
             retryable: true,
             outcome: "The requested state change was not applied.",
@@ -301,6 +302,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The Host readiness check did not finish.",
             default_recovery: "run satelle doctor --refresh and retry the command",
         },
+        ErrorCode::ReleaseVerifierUnavailable => ErrorContract {
+            category: ErrorCategory::Readiness,
+            retryable: false,
+            outcome: "Satelle cannot verify a release artifact.",
+            default_recovery: "install gh, authenticate it for github.com, and retry the command",
+        },
         ErrorCode::HostBinaryNewerThanCli
         | ErrorCode::HostArtifactUnavailable
         | ErrorCode::HostUpdateRequiresCliUpgrade
@@ -321,6 +328,16 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             retryable: false,
             outcome: "The Host state could not be read safely.",
             default_recovery: "run satelle doctor and repair the reported storage problem",
+        },
+        ErrorCode::SelfUpdateInstallOwnerUnknown
+        | ErrorCode::SelfUpdateReceiptInvalid
+        | ErrorCode::SelfUpdateVerificationFailed
+        | ErrorCode::SelfUpdateRollbackFailed
+        | ErrorCode::SelfUpdateFailed => ErrorContract {
+            category: ErrorCategory::Storage,
+            retryable: false,
+            outcome: "Satelle could not update its installation safely.",
+            default_recovery: "correct the reported installation problem and retry self update",
         },
         ErrorCode::HostUnreachable
         | ErrorCode::HostDaemonUnreachable
@@ -386,6 +403,9 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ConcurrencyWithoutRemoteUpdate
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent
+        | ErrorCode::SelfUpdateManagedInstall
+        | ErrorCode::SelfUpdateVersionInvalid
+        | ErrorCode::SelfUpdateExplicitVersionRequired
         | ErrorCode::PersistentServiceUnsupported
         | ErrorCode::SetupConsentRequired
         | ErrorCode::ProviderSecretSourceRequired
@@ -407,6 +427,14 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             },
             default_recovery: "review satelle --help and retry with valid input",
         },
+        ErrorCode::UnsupportedLocalPlatform | ErrorCode::UnsupportedReleaseTarget => {
+            ErrorContract {
+                category: ErrorCategory::InvalidRequest,
+                retryable: false,
+                outcome: "The selected platform or release target is not in the Controller matrix.",
+                default_recovery: "select a supported Controller target",
+            }
+        }
         ErrorCode::Interrupted => ErrorContract {
             category: ErrorCategory::Interrupted,
             retryable: true,
@@ -760,6 +788,22 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_release_targets_report_the_platform_contract() {
+        for code in [
+            ErrorCode::UnsupportedLocalPlatform,
+            ErrorCode::UnsupportedReleaseTarget,
+        ] {
+            let error = error_with_code(code);
+            let rendered = human_error(&error);
+
+            assert!(rendered.starts_with(
+                "error: The selected platform or release target is not in the Controller matrix."
+            ));
+            assert!(rendered.ends_with("next: select a supported Controller target"));
+        }
+    }
+
+    #[test]
     fn consent_and_interrupt_errors_have_stable_cli_contracts() {
         let doctor_fix = SatelleError::doctor_fix_consent_required(
             &["repair Host state".to_string()],
@@ -806,6 +850,14 @@ mod tests {
         let contract = error_contract(ErrorCode::SshBootstrapUnavailable);
 
         assert_eq!(contract.category.as_str(), "invalid_request");
+        assert!(!contract.retryable);
+    }
+
+    #[test]
+    fn unavailable_release_verifier_is_a_non_retryable_readiness_blocker() {
+        let contract = error_contract(ErrorCode::ReleaseVerifierUnavailable);
+
+        assert_eq!(contract.category.as_str(), "readiness");
         assert!(!contract.retryable);
     }
 }

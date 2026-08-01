@@ -141,30 +141,88 @@ test("Windows drive-style npm archive paths reach tar only as basenames", {
   }
 });
 
-test("release workflow is dry-run safe and owns six-target release validation", () => {
+test("release workflow validates six targets and publishes only a fully verified tag", () => {
   const workflow = readFileSync(
     path.join(repositoryRoot, ".github", "workflows", "release.yml"),
     "utf8",
   ).replaceAll("\r\n", "\n");
-  for (const target of [
-    "linux-arm64-gnu",
-    "linux-x64-gnu",
-    "darwin-arm64",
-    "darwin-x64",
-    "win32-arm64-msvc",
-    "win32-x64-msvc",
-  ]) {
-    assert.match(workflow, new RegExp(target));
-  }
+  const platformMatrix = JSON.parse(
+    readFileSync(
+      path.join(repositoryRoot, "npm", "satelle", "platforms.json"),
+      "utf8",
+    ),
+  );
+  const buildMatrix = workflow.match(
+    /^  build:\n[\s\S]*?^      matrix:\n^        include:\n(?<entries>[\s\S]*?)^    steps:/m,
+  )?.groups?.entries;
+  assert.ok(buildMatrix, "release build matrix is missing");
+
+  const declaredTargets = buildMatrix.match(/^          - target:/gm) ?? [];
+  const actualTargets = [
+    ...buildMatrix.matchAll(
+      /^          - target: ([^\n]+)\n            rust-target: ([^\n]+)$/gm,
+    ),
+  ]
+    .map(([, target, rustTarget]) => ({ target, rustTarget }))
+    .sort((left, right) => left.target.localeCompare(right.target));
+  assert.equal(
+    actualTargets.length,
+    declaredTargets.length,
+    "every workflow target needs one Rust target",
+  );
+  assert.doesNotMatch(
+    workflow,
+    /runner:.*self-hosted/,
+    "pull-request release builds must not run untrusted code on persistent runners",
+  );
+
+  const expectedTargets = Object.entries(platformMatrix)
+    .map(([target, { rustTarget }]) => ({ target, rustTarget }))
+    .sort((left, right) => left.target.localeCompare(right.target));
+  assert.deepEqual(actualTargets, expectedTargets);
   assert.match(workflow, /workflow_dispatch:/);
   assert.match(workflow, /npm publish[^\n]*--dry-run/);
-  assert.doesNotMatch(workflow, /npm publish(?![^\n]*--dry-run)/);
+  assert.match(
+    workflow,
+    /publish:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[collect, attest, lifecycle\]/,
+  );
+  assert.match(
+    workflow,
+    /publish:\n[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?id-token: write/,
+  );
+  assert.match(
+    workflow,
+    /Install trusted publishing npm[\s\S]*?npm install --global npm@11\.5\.1[\s\S]*?test "\$\(npm --version\)" = "11\.5\.1"/,
+  );
+  assert.match(
+    workflow,
+    /npm publish "\$package" --provenance --access public --tag "rc-v\$RELEASE_VERSION"/,
+  );
+  assert.match(workflow, /npm view "\$package_name@\$RELEASE_VERSION" dist\.integrity --json/);
+  assert.match(workflow, /published package integrity does not match the validated artifact/);
+  assert.doesNotMatch(workflow, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
+  assert.match(workflow, /gh release create "\$GITHUB_REF_NAME" --draft/);
+  assert.match(workflow, /gh release upload "\$GITHUB_REF_NAME"/);
+  assert.match(workflow, /release asset set does not match the validated artifact set/);
+  assert.doesNotMatch(workflow, /gh release edit "\$GITHUB_REF_NAME" --draft=false --latest/);
+  assert.match(
+    workflow,
+    /Keep the GitHub release draft until recoverable npm promotion is available/,
+  );
+  assert.ok(
+    workflow.indexOf(
+      'npm publish "$package" --provenance --access public --tag "rc-v$RELEASE_VERSION"',
+    ) <
+      workflow.indexOf(
+        "- name: Keep the GitHub release draft until recoverable npm promotion is available",
+      ),
+    "the release must remain a draft after every candidate package is published",
+  );
   assert.doesNotMatch(workflow, /^\s+(?:validated|dist)\/npm-.*\.tgz \\?$/m);
   assert.match(workflow, /\.\/dist\/npm-satelle-scoped\.tgz/);
   assert.match(workflow, /\.\/dist\/npm-satelle-unscoped\.tgz/);
   assert.match(workflow, /dist\/npm-satelle-scoped\.tgz/);
   assert.match(workflow, /dist\/npm-satelle-unscoped\.tgz/);
-  assert.doesNotMatch(workflow, /gh release (?:create|upload|edit)/);
   assert.match(workflow, /actions\/attest-build-provenance@/);
   assert.match(
     workflow,
@@ -178,11 +236,24 @@ test("release workflow is dry-run safe and owns six-target release validation", 
   assert.match(workflow, /shasum -a 256 -c/);
   assert.match(workflow, /validate-native-release-archives/);
   assert.match(workflow, /SHA256SUMS/);
+  const completePublicationSet = workflow.indexOf(
+    "- name: Complete validated npm publication set",
+  );
+  const sealPublicationFiles = workflow.indexOf("chmod 400 validated/npm/*");
+  const sealPublicationDirectories = workflow.indexOf("chmod 500 validated/npm validated");
+  const publicationDryRuns = workflow.indexOf("- name: Run npm publication dry-runs sequentially");
+  assert.ok(completePublicationSet >= 0, "validated npm publication set is not completed");
+  assert.ok(
+    completePublicationSet < sealPublicationFiles &&
+      sealPublicationFiles < sealPublicationDirectories &&
+      sealPublicationDirectories < publicationDryRuns,
+    "the complete npm publication set must be sealed before dry-run validation",
+  );
   const checkoutUses = workflow.match(/uses: actions\/checkout@[^\n]+/g) ?? [];
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
   ) ?? [];
-  assert.equal(checkoutUses.length, 4);
+  assert.equal(checkoutUses.length, 5);
   assert.equal(hardenedCheckoutUses.length, checkoutUses.length);
 });
 
@@ -213,9 +284,13 @@ test("Unix installer bounds network commands and releases its lock on TERM", {
     [installerPath, "--version", "0.1.0", "--bin-dir", bin],
     {
       env: { ...process.env, PATH: `${commands}:${process.env.PATH}` },
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", "pipe"],
     },
   );
+  let installerStderr = "";
+  installerProcess.stderr.on("data", (chunk) => {
+    installerStderr += chunk;
+  });
   context.after(() => {
     if (installerProcess.exitCode === null) installerProcess.kill("SIGKILL");
   });
@@ -225,7 +300,7 @@ test("Unix installer bounds network commands and releases its lock on TERM", {
   installerProcess.kill("SIGTERM");
   const [exitCode, signal] = await once(installerProcess, "exit");
   assert.equal(signal, null);
-  assert.equal(exitCode, 143);
+  assert.equal(exitCode, 143, installerStderr);
   assert.equal(existsSync(lockPath), false);
 });
 
@@ -367,7 +442,7 @@ test("Unix installer performs verified install, upgrade, smoke, receipt, and uni
   assert.equal(existsSync(path.join(bin, "satelle")), false);
 
   const prereleaseResult = runInstaller("--version", "0.1.0-rc.1", "--bin-dir", bin);
-  assert.equal(prereleaseResult.status, 64);
+  assert.equal(prereleaseResult.status, 64, prereleaseResult.stderr);
   assert.match(prereleaseResult.stderr, /invalid Satelle version/);
 
   const failedSmokeBin = path.join(root, "failed-version-smoke");

@@ -975,6 +975,28 @@ fn map_ssh_daemon_bootstrap_error(
         ssh_bootstrap::SshBootstrapError::DaemonPathOverrideNotAbsolute { name, value } => {
             SatelleError::daemon_path_override_not_absolute(name, value)
         }
+        ssh_bootstrap::SshBootstrapError::VerifiedRelease {
+            version,
+            target,
+            source,
+        } if source.release_artifact_is_unavailable() => {
+            SatelleError::host_artifact_unavailable(&version, target.id())
+        }
+        ssh_bootstrap::SshBootstrapError::VerifiedRelease {
+            version,
+            target,
+            source,
+        } => {
+            let mut error = (*source).into_satelle_error();
+            error
+                .details
+                .insert("cli_version".to_string(), serde_json::json!(version));
+            error.details.insert(
+                "remote_platform".to_string(),
+                serde_json::json!(target.id()),
+            );
+            error
+        }
         _ => SatelleError::host_unreachable(alias),
     }
 }
@@ -1369,11 +1391,12 @@ impl SshSetupTransport {
     fn release_artifact(
         &self,
         target: ssh_bootstrap::RemoteTarget,
+        version: &str,
     ) -> Result<ssh_bootstrap::ReleaseArtifactMetadata, SatelleError> {
         self.release_artifact.map_or_else(
             || {
-                ssh_bootstrap::ReleaseArtifactMetadata::fetch(target)
-                    .map_err(|error| map_release_artifact_error(&self.alias, target, error))
+                ssh_bootstrap::ReleaseArtifactMetadata::fetch(target, version)
+                    .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))
             },
             Ok,
         )
@@ -1616,7 +1639,7 @@ impl SshSetupTransport {
         let planned_paths = current_paths.with_service_overrides(&daemon_path_overrides);
         report.current_daemon_paths = Some(current_paths);
         report.planned_daemon_paths = Some(planned_paths);
-        let release = self.release_artifact(target)?;
+        let release = self.release_artifact(target, env!("CARGO_PKG_VERSION"))?;
         report.host_artifact = Some(
             DaemonArtifactPlan::new(
                 current_daemon.current_version.as_deref(),
@@ -2950,8 +2973,8 @@ fn host_service_inspection_from_executable(
 fn inspect_host_maintenance(
     host: &SelectedHost,
     kind: HostMaintenancePlanKind,
+    cli_version: &str,
 ) -> Result<HostMaintenanceInspection, SatelleError> {
-    let cli_version = env!("CARGO_PKG_VERSION");
     match host.config.transport {
         TransportKind::Local => {
             let service = local_host_service(&host.config).map_err(|failure| failure.error)?;
@@ -2988,6 +3011,7 @@ fn inspect_host_maintenance(
                         match target {
                             Some(target) => verified_host_update_artifact(
                                 &host.alias,
+                                cli_version,
                                 maintenance_release_artifact_required(
                                     kind,
                                     relation_to_cli,
@@ -3093,7 +3117,8 @@ fn inspect_host_maintenance(
                             // Current service state is trustworthy only when
                             // the observed executable content matches the
                             // invoking release manifest.
-                            service_release_artifact = Some(transport.release_artifact(target)?);
+                            service_release_artifact =
+                                Some(transport.release_artifact(target, cli_version)?);
                         }
                         Some(host_service_inspection_from_executable(
                             target,
@@ -3120,7 +3145,7 @@ fn inspect_host_maintenance(
             let release_artifact = if needs_host_release_artifact {
                 Some(match service_release_artifact {
                     Some(metadata) => metadata,
-                    None => transport.release_artifact(target)?,
+                    None => transport.release_artifact(target, cli_version)?,
                 })
             } else {
                 None
@@ -3136,6 +3161,7 @@ fn inspect_host_maintenance(
             let artifact = if kind != HostMaintenancePlanKind::CodexOnly {
                 verified_host_update_artifact(
                     &host.alias,
+                    cli_version,
                     needs_host_release_artifact,
                     target,
                     install_path,
@@ -3210,10 +3236,10 @@ fn read_direct_maintenance_evidence(
 
 pub(crate) fn plan_host_update(
     host: &SelectedHost,
+    cli_version: &str,
     components: &[satelle_core::host_update::HostUpdateComponent],
     includes_all: bool,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
-    let cli_version = env!("CARGO_PKG_VERSION");
     let needs_host_artifact = includes_all
         || components.is_empty()
         || components.contains(&satelle_core::host_update::HostUpdateComponent::Host);
@@ -3222,7 +3248,7 @@ pub(crate) fn plan_host_update(
     } else {
         HostMaintenancePlanKind::CodexOnly
     };
-    let inspection = inspect_host_maintenance(host, kind)?;
+    let inspection = inspect_host_maintenance(host, kind, cli_version)?;
     let host_automation_is_safe = inspection.host_automation_is_safe;
     let service_inspection = inspection.service_inspection;
 
@@ -3274,6 +3300,7 @@ pub(crate) fn plan_host_update(
 
 pub(crate) fn apply_host_update(
     host: &SelectedHost,
+    cli_version: &str,
     mut report: satelle_core::host_update::HostUpdateReport,
     components: &[satelle_core::host_update::HostUpdateComponent],
     includes_all: bool,
@@ -3333,7 +3360,7 @@ pub(crate) fn apply_host_update(
         &old_client,
         &operation_id,
         &report,
-        || plan_host_update(host, components, includes_all),
+        || plan_host_update(host, cli_version, components, includes_all),
     )?;
 
     let mut bootstrap_lock = match acquire_bootstrap_lock_for_operation(
@@ -3423,7 +3450,7 @@ pub(crate) fn apply_host_update(
                 ));
             }
         };
-        match remote.install_verified_host_artifact(&expected_artifact_digest) {
+        match remote.install_verified_host_artifact(cli_version, &expected_artifact_digest) {
             Ok(artifact) => artifact,
             Err(error) => {
                 let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
@@ -3750,7 +3777,7 @@ pub(crate) fn apply_host_update(
             source,
         ));
     }
-    if new_capabilities.daemon_version() != env!("CARGO_PKG_VERSION") {
+    if new_capabilities.daemon_version() != cli_version {
         return Err(host_update_recovery_pending(
             &mut report,
             "restart-host-daemon",
@@ -4380,7 +4407,7 @@ pub(crate) fn plan_repair_upgrades(
     };
 
     let cli_version = env!("CARGO_PKG_VERSION");
-    let inspection = inspect_host_maintenance(host, HostMaintenancePlanKind::Repair)?;
+    let inspection = inspect_host_maintenance(host, HostMaintenancePlanKind::Repair, cli_version)?;
     let cli_release = parse_release_version(cli_version)?;
     let current_host_release = inspection
         .current_version
@@ -4503,22 +4530,6 @@ fn append_codex_repair_inspections(
     Ok(())
 }
 
-fn map_release_artifact_error(
-    host: &str,
-    target: ssh_bootstrap::RemoteTarget,
-    error: ssh_bootstrap::SshBootstrapError,
-) -> SatelleError {
-    match error {
-        ssh_bootstrap::SshBootstrapError::MissingReleaseManifest
-        | ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry
-        | ssh_bootstrap::SshBootstrapError::ManifestTooLarge
-        | ssh_bootstrap::SshBootstrapError::InvalidManifest => {
-            SatelleError::host_artifact_unavailable(env!("CARGO_PKG_VERSION"), target.id())
-        }
-        error => map_ssh_daemon_bootstrap_error(host, error),
-    }
-}
-
 fn canonical_remote_platform(platform: &str) -> (Option<ssh_bootstrap::RemoteTarget>, String) {
     (
         ssh_bootstrap::RemoteTarget::from_id(platform),
@@ -4528,6 +4539,7 @@ fn canonical_remote_platform(platform: &str) -> (Option<ssh_bootstrap::RemoteTar
 
 fn verified_host_update_artifact(
     host: &str,
+    version: &str,
     required: bool,
     target: ssh_bootstrap::RemoteTarget,
     install_path: Option<String>,
@@ -4536,21 +4548,24 @@ fn verified_host_update_artifact(
     if !required {
         return Ok(None);
     }
-    let metadata =
-        known_metadata.map_or_else(|| ssh_bootstrap::ReleaseArtifactMetadata::fetch(target), Ok);
-    verified_host_update_artifact_from_metadata(host, target, install_path, metadata).map(Some)
+    let metadata = known_metadata.map_or_else(
+        || ssh_bootstrap::ReleaseArtifactMetadata::fetch(target, version),
+        Ok,
+    );
+    verified_host_update_artifact_from_metadata(host, version, target, install_path, metadata)
+        .map(Some)
 }
 
 fn verified_host_update_artifact_from_metadata(
     host: &str,
+    version: &str,
     target: ssh_bootstrap::RemoteTarget,
     install_path: Option<String>,
     metadata: Result<ssh_bootstrap::ReleaseArtifactMetadata, ssh_bootstrap::SshBootstrapError>,
 ) -> Result<crate::host_update::VerifiedHostArtifact, SatelleError> {
-    let metadata = metadata.map_err(|error| map_release_artifact_error(host, target, error))?;
-    let _verified_digest = metadata.digest();
+    let metadata = metadata.map_err(|error| map_ssh_daemon_bootstrap_error(host, error))?;
     Ok(crate::host_update::VerifiedHostArtifact {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: version.to_string(),
         remote_platform: target.id().to_string(),
         digest: metadata.digest_hex(),
         daemon_destination: install_path,
@@ -7820,11 +7835,15 @@ mod bootstrap_ordering_tests {
             satelle_core::ErrorCode::HostBinaryNewerThanCli
         );
 
-        let missing_error = map_release_artifact_error(
-            "remote",
-            ssh_bootstrap::RemoteTarget::DarwinArm64,
-            ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry,
-        );
+        let target = ssh_bootstrap::RemoteTarget::DarwinArm64;
+        let release_error = |error| {
+            map_ssh_daemon_bootstrap_error(
+                "remote",
+                ssh_bootstrap::SshBootstrapError::verified_release("1.2.3", target, error),
+            )
+        };
+        let missing_error =
+            release_error(crate::self_update::SelfUpdateError::ManifestEntryMissing);
         assert_eq!(
             missing_error.code,
             satelle_core::ErrorCode::HostArtifactUnavailable
@@ -7833,32 +7852,42 @@ mod bootstrap_ordering_tests {
             missing_error.details["remote_platform"],
             serde_json::json!("darwin-arm64")
         );
-
-        let missing_manifest_error = map_release_artifact_error(
-            "remote",
-            ssh_bootstrap::RemoteTarget::DarwinArm64,
-            ssh_bootstrap::SshBootstrapError::MissingReleaseManifest,
-        );
         assert_eq!(
-            missing_manifest_error.code,
+            missing_error.details["cli_version"],
+            serde_json::json!("1.2.3")
+        );
+
+        let oversized_manifest_error =
+            release_error(crate::self_update::SelfUpdateError::ResponseTooLarge);
+        assert_eq!(
+            oversized_manifest_error.code,
             satelle_core::ErrorCode::HostArtifactUnavailable
         );
         assert_eq!(
-            missing_manifest_error.details["remote_platform"],
+            oversized_manifest_error.details["remote_platform"],
             serde_json::json!("darwin-arm64")
         );
 
-        for malformed in [
-            ssh_bootstrap::SshBootstrapError::ManifestTooLarge,
-            ssh_bootstrap::SshBootstrapError::InvalidManifest,
-        ] {
-            let error = map_release_artifact_error(
-                "remote",
-                ssh_bootstrap::RemoteTarget::DarwinArm64,
-                malformed,
-            );
-            assert_eq!(error.code, satelle_core::ErrorCode::HostArtifactUnavailable);
-        }
+        let malformed = release_error(crate::self_update::SelfUpdateError::ManifestInvalid);
+        assert_eq!(
+            malformed.code,
+            satelle_core::ErrorCode::HostArtifactUnavailable
+        );
+
+        let verifier_unavailable =
+            release_error(crate::self_update::SelfUpdateError::GhUnavailable);
+        assert_eq!(
+            verifier_unavailable.code,
+            satelle_core::ErrorCode::ReleaseVerifierUnavailable
+        );
+        assert_eq!(
+            verifier_unavailable.details["cli_version"],
+            serde_json::json!("1.2.3")
+        );
+        assert_eq!(
+            verifier_unavailable.details["remote_platform"],
+            serde_json::json!("darwin-arm64")
+        );
     }
 
     #[test]
@@ -7896,9 +7925,14 @@ mod bootstrap_ordering_tests {
     fn host_update_metadata_failures_keep_the_typed_error_and_real_host_alias() {
         let missing = verified_host_update_artifact_from_metadata(
             "office",
+            "1.2.3",
             ssh_bootstrap::RemoteTarget::DarwinArm64,
             None,
-            Err(ssh_bootstrap::SshBootstrapError::MissingIntegrityEntry),
+            Err(ssh_bootstrap::SshBootstrapError::verified_release(
+                "1.2.3",
+                ssh_bootstrap::RemoteTarget::DarwinArm64,
+                crate::self_update::SelfUpdateError::ManifestEntryMissing,
+            )),
         )
         .expect_err("missing integrity metadata must block the update plan");
         assert_eq!(
@@ -7908,6 +7942,7 @@ mod bootstrap_ordering_tests {
 
         let unreachable = verified_host_update_artifact_from_metadata(
             "office",
+            "1.2.3",
             ssh_bootstrap::RemoteTarget::DarwinArm64,
             None,
             Err(ssh_bootstrap::SshBootstrapError::InvalidServiceObservation),
@@ -8017,6 +8052,7 @@ mod bootstrap_ordering_tests {
     fn current_host_artifact_resolution_does_not_fetch_release_metadata() {
         let artifact = verified_host_update_artifact(
             "remote",
+            "1.2.3",
             false,
             ssh_bootstrap::RemoteTarget::LinuxX64Gnu,
             None,
@@ -8025,6 +8061,24 @@ mod bootstrap_ordering_tests {
         .expect("current Host artifact resolution is self-contained");
 
         assert_eq!(artifact, None);
+    }
+
+    #[test]
+    fn host_update_artifact_preserves_the_requested_release_version() {
+        let artifact = verified_host_update_artifact_from_metadata(
+            "remote",
+            "9.8.7",
+            ssh_bootstrap::RemoteTarget::DarwinArm64,
+            Some("/tmp/satelle".to_string()),
+            Ok(ssh_bootstrap::ReleaseArtifactMetadata::from_digest(
+                [0x4d; 32],
+            )),
+        )
+        .expect("build the version-exact Host artifact");
+
+        assert_eq!(artifact.version, "9.8.7");
+        assert_eq!(artifact.remote_platform, "darwin-arm64");
+        assert_eq!(artifact.digest, "4d".repeat(32));
     }
 
     #[test]

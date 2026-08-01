@@ -82,7 +82,7 @@ available:
 - Local setup mutation after planning.
 - Direct transport setup or automatic direct-token provisioning.
 - Persistent Host service installation and Host stop/restart lifecycle control.
-- Repair, Host update, self-update, storage migration, or support bundle export.
+- Repair, storage migration, or support bundle export.
 - The Satelle Agent Skill Bundle and `satelle skills` commands.
 - Native Linux Computer Use Host execution.
 

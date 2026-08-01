@@ -727,6 +727,54 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
   }
   const matrix = options.matrixSnapshot ?? readJson(path.join(npmRoot, "satelle", "platforms.json"));
   const targets = Object.keys(matrix).sort();
+  const controllerTargetContract = {
+    "darwin-arm64": {
+      rustTarget: "aarch64-apple-darwin",
+      nativeComputerUseHost: true,
+    },
+    "darwin-x64": {
+      rustTarget: "x86_64-apple-darwin",
+      nativeComputerUseHost: true,
+    },
+    "linux-arm64-gnu": {
+      rustTarget: "aarch64-unknown-linux-gnu",
+      nativeComputerUseHost: false,
+    },
+    "linux-x64-gnu": {
+      rustTarget: "x86_64-unknown-linux-gnu",
+      nativeComputerUseHost: false,
+    },
+    "win32-arm64-msvc": {
+      rustTarget: "aarch64-pc-windows-msvc",
+      nativeComputerUseHost: true,
+    },
+    "win32-x64-msvc": {
+      rustTarget: "x86_64-pc-windows-msvc",
+      nativeComputerUseHost: true,
+    },
+  };
+  const expectedControllerTargets = Object.keys(controllerTargetContract).sort();
+  if (!sameJson(targets, expectedControllerTargets)) {
+    fail(
+      "release-target-matrix-mismatch",
+      "the Controller target matrix does not exactly match the six supported MVP targets",
+    );
+  }
+  for (const target of targets) {
+    const contract = controllerTargetContract[target];
+    if (
+      matrix[target].rustTarget !== contract.rustTarget ||
+      matrix[target].nativeComputerUseHost !== contract.nativeComputerUseHost
+    ) {
+      fail(
+        "release-target-matrix-mismatch",
+        `target ${target} does not match its Controller and native Computer Use Host contract`,
+      );
+    }
+  }
+  const nativeComputerUseHostTargets = targets.filter(
+    (target) => matrix[target].nativeComputerUseHost,
+  );
   const nativePackages = targets.map((target) => matrix[target].packageName);
   const topLevelPackages = ["@microck/satelle", "satelle"];
   const publicationOrder = [...nativePackages, ...topLevelPackages];
@@ -1067,12 +1115,15 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
   function check(tag) {
     const version = expectedVersion(tag);
     return {
-      schemaVersion: "satelle.release-plan.v1",
+      schemaVersion: "satelle.release-plan.v2",
       version,
-      targets: [...targets],
+      controllerTargets: [...targets],
+      nativeComputerUseHostTargets: [...nativeComputerUseHostTargets],
       publicationOrder: [...publicationOrder],
       artifacts: targets.map((target) => ({
         target,
+        rustTarget: matrix[target].rustTarget,
+        nativeComputerUseHost: matrix[target].nativeComputerUseHost,
         package: matrix[target].packageName,
         archive: expectedArchiveName(version, target),
         npmArtifact: npmArtifactName(matrix[target].packageName),
@@ -2021,8 +2072,6 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         chmodSync(snapshot.snapshotPath, 0o400);
       }
       chmodSync(githubRoot, 0o500);
-      chmodSync(npmArtifactRoot, 0o500);
-      chmodSync(stagingRoot, 0o500);
       complete = true;
       return { version, stagingDirectory: stagingRoot, checksums, archives };
     } finally {

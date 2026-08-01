@@ -19,7 +19,7 @@ Global options include `--no-color`, `--profile <name>`, and
 | `satelle host status` | Read Host status | Implemented |
 | `satelle host sessions` | List eligible native desktop sessions | Implemented |
 | `satelle host stop` / `restart` | Control Host service lifecycle | Not implemented |
-| `satelle host update` | Update remote components | Not implemented |
+| `satelle host update` | Update remote components | Current Host and single selected remote Host updates implemented; explicit multi-Host selectors remain unavailable |
 | `satelle host storage migrate` | Run an explicit storage migration | Not implemented |
 | `satelle run` | Create a Session and first Turn | Implemented |
 | `satelle steer` | Add a follow-up Turn to a Session | Implemented |
@@ -29,7 +29,7 @@ Global options include `--no-color`, `--profile <name>`, and
 | `satelle mcp serve` | Serve the MCP interface over stdio | Implemented |
 | `satelle mcp install` | Configure a supported AI client to call Satelle MCP | Implemented |
 | `satelle support bundle` | Export a support bundle | Not implemented |
-| `satelle self update` | Update the executable and optional remotes | Not implemented |
+| `satelle self update` | Update the executable and optional remotes | Verified local update and optional stable-release single-Host handoff implemented; prerelease and explicit multi-Host handoffs remain unavailable |
 | `satelle completions` | Generate shell completions | Implemented |
 
 `setup` application is transport-specific. Local setup is dry-run planning
@@ -72,6 +72,6 @@ result was refreshed. It does not create a Session or admit a prompt Turn.
 ## Unavailable command families
 
 Commands can appear in `--help` before their implementation is complete.
-`repair`, Host stop/restart/update, storage migration, self-update, and support
-bundle export currently return typed not-implemented errors. There is no
+`repair`, Host stop/restart, storage migration, and support bundle export
+currently return typed not-implemented errors. There is no
 `satelle skills` command or embedded Agent Skill Bundle in this source tree.
