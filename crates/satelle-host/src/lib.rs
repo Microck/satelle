@@ -1708,6 +1708,51 @@ fn storage_recording_deletion_failure(
     }
 }
 
+fn storage_backup_cleanup_failure(
+    failure: storage::BackupCleanupFailure,
+    recovery_command: &str,
+) -> SatelleError {
+    if failure.removed_backup_file_names.is_empty() {
+        return runtime::storage_failure(failure.source);
+    }
+    let mut error = SatelleError::storage_maintenance_partially_applied(
+        &["cleanup-storage-backups".to_string()],
+        "cleanup-storage-backups",
+        &[],
+        recovery_command,
+        runtime::storage_failure(failure.source).to_string(),
+    );
+    error.details.insert(
+        "removed_backup_file_names".to_string(),
+        serde_json::to_value(failure.removed_backup_file_names).unwrap_or(serde_json::Value::Null),
+    );
+    error
+}
+
+#[cfg(test)]
+#[test]
+fn storage_backup_cleanup_failure_reports_already_removed_names() {
+    let recovery_command = "satelle host storage backup cleanup --host local-demo --no-input --yes";
+    let error = storage_backup_cleanup_failure(
+        storage::BackupCleanupFailure::new(
+            vec!["satelle.sqlite3.migration-v14-test.backup".to_string()],
+            storage::StorageError::for_test(storage::StorageErrorKind::OperationFailed),
+        ),
+        recovery_command,
+    );
+
+    assert_eq!(satelle_core::ErrorCode::SetupPartiallyApplied, error.code);
+    assert_eq!(
+        serde_json::json!(["satelle.sqlite3.migration-v14-test.backup"]),
+        error.details["removed_backup_file_names"]
+    );
+    assert_eq!(
+        serde_json::json!(["cleanup-storage-backups"]),
+        error.details["completed_actions"]
+    );
+    assert_eq!(error.recovery_command.as_deref(), Some(recovery_command));
+}
+
 impl HostService {
     pub fn validate_storage_restore(
         state_root: &std::path::Path,
@@ -1744,16 +1789,19 @@ impl HostService {
 
     pub fn cleanup_storage_backups_offline(
         state_root: &std::path::Path,
+        recovery_command: &str,
     ) -> Result<Vec<String>, SatelleError> {
-        storage::cleanup_migration_backups_offline(state_root).map_err(runtime::storage_failure)
+        storage::cleanup_migration_backups_offline(state_root)
+            .map_err(|source| storage_backup_cleanup_failure(source, recovery_command))
     }
 
     pub fn cleanup_planned_storage_backups_offline(
         state_root: &std::path::Path,
         approved_backup_file_names: &[String],
+        recovery_command: &str,
     ) -> Result<Vec<String>, SatelleError> {
         storage::cleanup_migration_backups_offline_exact(state_root, approved_backup_file_names)
-            .map_err(runtime::storage_failure)
+            .map_err(|source| storage_backup_cleanup_failure(source, recovery_command))
     }
 
     pub fn reset_store_metadata_offline(

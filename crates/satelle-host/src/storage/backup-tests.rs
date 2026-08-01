@@ -1663,7 +1663,7 @@ fn cleanup_retry_recovers_an_asymmetric_durable_deleting_state() {
 }
 
 #[test]
-fn cleanup_plan_excludes_an_invalid_durable_deleting_manifest() {
+fn cleanup_plan_and_result_include_a_backup_only_durable_deletion() {
     let fixture = BackupFixture::new(3);
     let state_directory = fixture.state_directory();
     cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
@@ -1685,17 +1685,41 @@ fn cleanup_plan_excludes_an_invalid_durable_deleting_manifest() {
         .expect("pending manifest tombstone");
     fs::remove_file(fixture.state_root.join(manifest_tombstone_name))
         .expect("remove the valid pending manifest");
-    let manifest_deleting_name =
-        backup_deleting_name.replace("~backup.deleting", "~manifest.deleting");
-    write_private_file(
-        &fixture.state_root.join(manifest_deleting_name),
-        b"invalid manifest deletion state",
-    );
 
     let planned =
         plan_migration_backup_cleanup(&fixture.state_root).expect("plan safe cleanup work");
+    assert_eq!(vec![fixture.backup_file_names[0].clone()], planned);
 
-    assert!(planned.is_empty());
+    let removed = cleanup_migration_backups_offline_exact(&fixture.state_root, &planned)
+        .expect("resume the approved backup deletion");
+
+    assert_eq!(planned, removed);
+    assert!(!fixture.state_root.join(backup_deleting_name).exists());
+}
+
+#[test]
+fn cleanup_failure_preserves_names_removed_before_a_later_resume_error() {
+    let fixture = BackupFixture::new(4);
+    let state_directory = fixture.state_directory();
+    let mut delete_attempts = 0;
+
+    let failure =
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
+            if step == CleanupStep::BeforeBackupDelete {
+                delete_attempts += 1;
+                if delete_attempts == 2 {
+                    return Err(StorageError::for_test(StorageErrorKind::OperationFailed));
+                }
+            }
+            Ok(())
+        })
+        .expect_err("fail after one candidate is durably removed");
+
+    assert_eq!(
+        vec![fixture.backup_file_names[0].clone()],
+        failure.removed_backup_file_names
+    );
+    assert_eq!(StorageErrorKind::OperationFailed, failure.kind());
 }
 
 #[cfg(windows)]

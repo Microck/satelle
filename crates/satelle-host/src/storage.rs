@@ -82,14 +82,14 @@ pub(crate) fn restore_migration_backup_offline(
 
 pub(crate) fn cleanup_migration_backups_offline(
     state_root: &std::path::Path,
-) -> Result<Vec<String>, StorageError> {
+) -> Result<Vec<String>, BackupCleanupFailure> {
     open::cleanup_migration_backups_offline(state_root)
 }
 
 pub(crate) fn cleanup_migration_backups_offline_exact(
     state_root: &std::path::Path,
     approved_backup_file_names: &[String],
-) -> Result<Vec<String>, StorageError> {
+) -> Result<Vec<String>, BackupCleanupFailure> {
     open::cleanup_migration_backups_offline_exact(state_root, approved_backup_file_names)
 }
 
@@ -653,6 +653,26 @@ pub(crate) struct StorageError {
     kind: StorageErrorKind,
     conflicting_session_id: Option<SessionId>,
     source: Option<Box<dyn Error + Send + Sync>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackupCleanupFailure {
+    pub(crate) removed_backup_file_names: Vec<String>,
+    pub(crate) source: StorageError,
+}
+
+impl BackupCleanupFailure {
+    pub(crate) fn new(removed_backup_file_names: Vec<String>, source: StorageError) -> Self {
+        Self {
+            removed_backup_file_names,
+            source,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> StorageErrorKind {
+        self.source.kind()
+    }
 }
 
 impl fmt::Debug for StorageError {

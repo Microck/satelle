@@ -1,5 +1,5 @@
 use super::codec::{format_time, parse_time};
-use super::{StorageError, StorageErrorKind};
+use super::{BackupCleanupFailure, StorageError, StorageErrorKind};
 use rusqlite::backup::Backup;
 use rusqlite::ffi::ErrorCode as SqliteErrorCode;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -2238,6 +2238,7 @@ pub(super) fn cleanup_migration_backups(
     state_directory: &StateDirectory,
 ) -> Result<Vec<String>, StorageError> {
     cleanup_migration_backups_with_hook(state_root, state_directory, None, |_| Ok(()))
+        .map_err(|failure| failure.source)
 }
 
 fn logical_backup_file_name(key: &CleanupTombstoneKey) -> String {
@@ -2274,6 +2275,26 @@ fn cleanup_manifest_matches_key(
             )
 }
 
+fn cleanup_backup_matches_key(
+    state_directory: &StateDirectory,
+    file_name: &str,
+    key: &CleanupTombstoneKey,
+) -> Result<bool, StorageError> {
+    let Some(file) = open_private_leaf(
+        state_directory,
+        file_name,
+        LeafOpenMode::ExistingPrivateGuarded,
+        StorageErrorKind::OperationFailed,
+    )?
+    else {
+        return Ok(false);
+    };
+    let identity = leaf_identity(&file, StorageErrorKind::OperationFailed)?;
+    let digest = digest_file(&file, StorageErrorKind::OperationFailed)?;
+    Ok(key.backup_fingerprint
+        == backup_fingerprint_from_parts(key.backup_id, key.schema_version, &digest, identity))
+}
+
 fn cleanup_plan_file_names(
     state_root: &Path,
     state_directory: &StateDirectory,
@@ -2289,11 +2310,18 @@ fn cleanup_plan_file_names(
                 CleanupTombstoneKind::Backup => pair.backup_file_name = Some(file_name),
                 CleanupTombstoneKind::Manifest => pair.manifest_file_name = Some(file_name),
             }
-        } else if let Some((key, CleanupDeletingKind::Manifest)) =
-            parse_cleanup_deleting_file_name(&file_name)
-            && cleanup_manifest_matches_key(state_directory, &file_name, &key)
-        {
-            planned.insert(logical_backup_file_name(&key));
+        } else if let Some((key, kind)) = parse_cleanup_deleting_file_name(&file_name) {
+            let recoverable = match kind {
+                CleanupDeletingKind::Backup => {
+                    cleanup_backup_matches_key(state_directory, &file_name, &key)?
+                }
+                CleanupDeletingKind::Manifest => {
+                    cleanup_manifest_matches_key(state_directory, &file_name, &key)
+                }
+            };
+            if recoverable {
+                planned.insert(logical_backup_file_name(&key));
+            }
         }
     }
     for (key, pair) in tombstones {
@@ -2397,18 +2425,22 @@ pub(super) fn restore_migration_backup_offline(
 
 pub(super) fn cleanup_migration_backups_offline(
     state_root: &Path,
-) -> Result<Vec<String>, StorageError> {
-    let state_directory = prepare_state_root(state_root)?;
-    let _ownership = acquire_ownership_lock(&state_directory)?;
-    cleanup_migration_backups(state_root, &state_directory)
+) -> Result<Vec<String>, BackupCleanupFailure> {
+    let state_directory = prepare_state_root(state_root)
+        .map_err(|source| BackupCleanupFailure::new(Vec::new(), source))?;
+    let _ownership = acquire_ownership_lock(&state_directory)
+        .map_err(|source| BackupCleanupFailure::new(Vec::new(), source))?;
+    cleanup_migration_backups_with_hook(state_root, &state_directory, None, |_| Ok(()))
 }
 
 pub(super) fn cleanup_migration_backups_offline_exact(
     state_root: &Path,
     approved_backup_file_names: &[String],
-) -> Result<Vec<String>, StorageError> {
-    let state_directory = prepare_state_root(state_root)?;
-    let _ownership = acquire_ownership_lock(&state_directory)?;
+) -> Result<Vec<String>, BackupCleanupFailure> {
+    let state_directory = prepare_state_root(state_root)
+        .map_err(|source| BackupCleanupFailure::new(Vec::new(), source))?;
+    let _ownership = acquire_ownership_lock(&state_directory)
+        .map_err(|source| BackupCleanupFailure::new(Vec::new(), source))?;
     cleanup_migration_backups_with_hook(
         state_root,
         &state_directory,
@@ -2548,7 +2580,13 @@ fn resume_cleanup_deleting(
                 }
                 drop(file);
                 hook(CleanupStep::BackupDeleteCommitted)?;
-                remove_private_leaf_checked(state_directory, &file_name, identity)?;
+                if remove_private_leaf_checked(state_directory, &file_name, identity)?
+                    && !removed
+                        .iter()
+                        .any(|removed_name| removed_name == &logical_backup_file_name(&key))
+                {
+                    removed.push(logical_backup_file_name(&key));
+                }
             }
             CleanupDeletingKind::Manifest => {
                 let manifest_read = match read_backup_manifest(state_directory, &file_name) {
@@ -2756,36 +2794,116 @@ fn resume_cleanup_tombstones(
     Ok(())
 }
 
+fn delete_cleanup_candidate(
+    state_root: &Path,
+    state_directory: &StateDirectory,
+    backup: ValidatedMigrationBackup,
+    hook: &mut impl FnMut(CleanupStep) -> Result<(), StorageError>,
+    removed: &mut Vec<String>,
+) -> Result<(), StorageError> {
+    let fresh = validate_migration_backup(state_root, state_directory, &backup.backup_file_name)?;
+    if fresh.token != backup.token {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    hook(CleanupStep::CandidateValidated)?;
+
+    let cleanup_id = Uuid::now_v7();
+    let backup_tombstone =
+        cleanup_tombstone_file_name(&backup.token, cleanup_id, CleanupTombstoneKind::Backup);
+    let manifest_tombstone =
+        cleanup_tombstone_file_name(&backup.token, cleanup_id, CleanupTombstoneKind::Manifest);
+    move_private_leaf_durable_with_hook(
+        state_directory,
+        &backup.backup_file_name,
+        &backup_tombstone,
+        backup.token.backup_identity,
+        || hook(CleanupStep::BeforeBackupQuarantineMove),
+    )?;
+    hook(CleanupStep::BackupQuarantined)?;
+
+    if let Err(error) = move_private_leaf_durable_with_hook(
+        state_directory,
+        &backup.manifest_file_name,
+        &manifest_tombstone,
+        backup.token.manifest_identity,
+        || hook(CleanupStep::BeforeManifestQuarantineMove),
+    ) {
+        if open_private_leaf_identity(state_directory, &backup.backup_file_name)?.is_none() {
+            move_private_leaf_durable(
+                state_directory,
+                &backup_tombstone,
+                &backup.backup_file_name,
+                backup.token.backup_identity,
+            )?;
+        }
+        return Err(error);
+    }
+    hook(CleanupStep::PairQuarantined)?;
+    let quarantined = validate_migration_backup_at(
+        state_root,
+        state_directory,
+        &backup.backup_file_name,
+        &backup_tombstone,
+        &manifest_tombstone,
+    )?;
+    if quarantined.token != backup.token {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    delete_quarantined_pair(
+        state_directory,
+        &CleanupTombstoneKey {
+            schema_version: backup.token.schema_version,
+            backup_id: backup.token.backup_id,
+            cleanup_id,
+            backup_fingerprint: backup_fingerprint(&backup.token),
+            manifest_fingerprint: manifest_fingerprint(&backup.token),
+        },
+        &backup_tombstone,
+        &manifest_tombstone,
+        &quarantined.token,
+        hook,
+        removed,
+    )
+}
+
 fn cleanup_migration_backups_with_hook(
     state_root: &Path,
     state_directory: &StateDirectory,
     approved_backup_file_names: Option<&[String]>,
     mut hook: impl FnMut(CleanupStep) -> Result<(), StorageError>,
-) -> Result<Vec<String>, StorageError> {
-    let approved_candidates = if let Some(approved) = approved_backup_file_names {
-        let validated = list_validated_migration_backups(state_root, state_directory)?;
-        let retained_valid_count = validated.len();
-        let delete_count = validated.len().saturating_sub(2);
-        let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
-        if !cleanup_plan_file_names(
-            state_root,
-            state_directory,
-            &candidates,
-            retained_valid_count,
-        )?
-        .iter()
-        .map(String::as_str)
-        .eq(approved.iter().map(String::as_str))
-        {
-            return Err(StorageError::new(StorageErrorKind::StateConflict));
-        }
-        Some(candidates)
-    } else {
-        None
-    };
+) -> Result<Vec<String>, BackupCleanupFailure> {
+    let approved_candidates =
+        (|| -> Result<Option<Vec<ValidatedMigrationBackup>>, StorageError> {
+            let Some(approved) = approved_backup_file_names else {
+                return Ok(None);
+            };
+            let validated = list_validated_migration_backups(state_root, state_directory)?;
+            let retained_valid_count = validated.len();
+            let delete_count = validated.len().saturating_sub(2);
+            let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
+            if cleanup_plan_file_names(
+                state_root,
+                state_directory,
+                &candidates,
+                retained_valid_count,
+            )?
+            .iter()
+            .map(String::as_str)
+            .eq(approved.iter().map(String::as_str))
+            {
+                Ok(Some(candidates))
+            } else {
+                Err(StorageError::new(StorageErrorKind::StateConflict))
+            }
+        })()
+        .map_err(|source| BackupCleanupFailure::new(Vec::new(), source))?;
 
     let mut removed = Vec::new();
-    resume_cleanup_tombstones(state_root, state_directory, &mut hook, &mut removed)?;
+    if let Err(source) =
+        resume_cleanup_tombstones(state_root, state_directory, &mut hook, &mut removed)
+    {
+        return Err(BackupCleanupFailure::new(removed, source));
+    }
 
     // Tombstone recovery changes only previously quarantined pairs, not these
     // canonical candidates. Reuse the consent preflight instead of validating
@@ -2793,75 +2911,19 @@ fn cleanup_migration_backups_with_hook(
     let candidates = if let Some(candidates) = approved_candidates {
         candidates
     } else {
-        let validated = list_validated_migration_backups(state_root, state_directory)?;
+        let validated = match list_validated_migration_backups(state_root, state_directory) {
+            Ok(validated) => validated,
+            Err(source) => return Err(BackupCleanupFailure::new(removed, source)),
+        };
         let delete_count = validated.len().saturating_sub(2);
         validated.into_iter().take(delete_count).collect()
     };
     for backup in candidates {
-        let fresh =
-            validate_migration_backup(state_root, state_directory, &backup.backup_file_name)?;
-        if fresh.token != backup.token {
-            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        if let Err(source) =
+            delete_cleanup_candidate(state_root, state_directory, backup, &mut hook, &mut removed)
+        {
+            return Err(BackupCleanupFailure::new(removed, source));
         }
-        hook(CleanupStep::CandidateValidated)?;
-
-        let cleanup_id = Uuid::now_v7();
-        let backup_tombstone =
-            cleanup_tombstone_file_name(&backup.token, cleanup_id, CleanupTombstoneKind::Backup);
-        let manifest_tombstone =
-            cleanup_tombstone_file_name(&backup.token, cleanup_id, CleanupTombstoneKind::Manifest);
-        move_private_leaf_durable_with_hook(
-            state_directory,
-            &backup.backup_file_name,
-            &backup_tombstone,
-            backup.token.backup_identity,
-            || hook(CleanupStep::BeforeBackupQuarantineMove),
-        )?;
-        hook(CleanupStep::BackupQuarantined)?;
-
-        if let Err(error) = move_private_leaf_durable_with_hook(
-            state_directory,
-            &backup.manifest_file_name,
-            &manifest_tombstone,
-            backup.token.manifest_identity,
-            || hook(CleanupStep::BeforeManifestQuarantineMove),
-        ) {
-            if open_private_leaf_identity(state_directory, &backup.backup_file_name)?.is_none() {
-                move_private_leaf_durable(
-                    state_directory,
-                    &backup_tombstone,
-                    &backup.backup_file_name,
-                    backup.token.backup_identity,
-                )?;
-            }
-            return Err(error);
-        }
-        hook(CleanupStep::PairQuarantined)?;
-        let quarantined = validate_migration_backup_at(
-            state_root,
-            state_directory,
-            &backup.backup_file_name,
-            &backup_tombstone,
-            &manifest_tombstone,
-        )?;
-        if quarantined.token != backup.token {
-            return Err(StorageError::new(StorageErrorKind::StateConflict));
-        }
-        delete_quarantined_pair(
-            state_directory,
-            &CleanupTombstoneKey {
-                schema_version: backup.token.schema_version,
-                backup_id: backup.token.backup_id,
-                cleanup_id,
-                backup_fingerprint: backup_fingerprint(&backup.token),
-                manifest_fingerprint: manifest_fingerprint(&backup.token),
-            },
-            &backup_tombstone,
-            &manifest_tombstone,
-            &quarantined.token,
-            &mut hook,
-            &mut removed,
-        )?;
     }
     Ok(removed)
 }

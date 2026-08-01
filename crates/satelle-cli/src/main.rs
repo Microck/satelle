@@ -8841,6 +8841,7 @@ fn run_host_storage(
                                 .as_ref()
                                 .expect("local cleanup planning produced an exact candidate set")
                                 .eligible_backup_file_names,
+                            &recovery_command,
                         )
                     },
                 )?;
@@ -9051,10 +9052,13 @@ fn run_offline_storage_maintenance(
             })
         }
         OfflineStorageOperation::BackupCleanup => {
-            satelle_host::HostService::cleanup_storage_backups_offline(&command.state_root)
-                .map(|removed_backup_file_names| {
-                    json!({"removed_backup_file_names": removed_backup_file_names})
-                })
+            satelle_host::HostService::cleanup_storage_backups_offline(
+                &command.state_root,
+                &recovery_command,
+            )
+            .map(|removed_backup_file_names| {
+                json!({"removed_backup_file_names": removed_backup_file_names})
+            })
         }
         OfflineStorageOperation::StoreReset => {
             satelle_host::HostService::reset_store_metadata_offline(
