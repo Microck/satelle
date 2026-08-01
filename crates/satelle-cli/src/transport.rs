@@ -982,8 +982,20 @@ fn map_ssh_daemon_bootstrap_error(
         } if source.release_artifact_is_unavailable() => {
             SatelleError::host_artifact_unavailable(&version, target.id())
         }
-        ssh_bootstrap::SshBootstrapError::VerifiedRelease { source, .. } => {
-            (*source).into_satelle_error()
+        ssh_bootstrap::SshBootstrapError::VerifiedRelease {
+            version,
+            target,
+            source,
+        } => {
+            let mut error = (*source).into_satelle_error();
+            error
+                .details
+                .insert("cli_version".to_string(), serde_json::json!(version));
+            error.details.insert(
+                "remote_platform".to_string(),
+                serde_json::json!(target.id()),
+            );
+            error
         }
         _ => SatelleError::host_unreachable(alias),
     }
@@ -7840,6 +7852,10 @@ mod bootstrap_ordering_tests {
             missing_error.details["remote_platform"],
             serde_json::json!("darwin-arm64")
         );
+        assert_eq!(
+            missing_error.details["cli_version"],
+            serde_json::json!("1.2.3")
+        );
 
         let oversized_manifest_error =
             release_error(crate::self_update::SelfUpdateError::ResponseTooLarge);
@@ -7863,6 +7879,14 @@ mod bootstrap_ordering_tests {
         assert_eq!(
             verifier_unavailable.code,
             satelle_core::ErrorCode::ReleaseVerifierUnavailable
+        );
+        assert_eq!(
+            verifier_unavailable.details["cli_version"],
+            serde_json::json!("1.2.3")
+        );
+        assert_eq!(
+            verifier_unavailable.details["remote_platform"],
+            serde_json::json!("darwin-arm64")
         );
     }
 
