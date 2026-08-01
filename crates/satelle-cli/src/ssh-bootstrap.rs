@@ -2437,7 +2437,8 @@ impl<'a> PersistentServiceRemote<'a> {
         version: &str,
         expected_digest: &str,
     ) -> Result<UploadedHostArtifact, SshBootstrapError> {
-        let metadata = ReleaseArtifactMetadata::from_digest_hex(expected_digest)?;
+        let metadata =
+            ReleaseArtifactMetadata::from_digest_hex(self.target, version, expected_digest)?;
         let artifact = DownloadedArtifact::fetch_with_metadata(self.target, version, metadata)?;
         self.install_host_artifact(artifact)
     }
@@ -4570,20 +4571,26 @@ impl ReleaseArtifactMetadata {
     pub(super) fn fetch(target: RemoteTarget, version: &str) -> Result<Self, SshBootstrapError> {
         self_update::fetch_host_artifact_digest(version, target.id())
             .map(|digest| Self { digest })
-            .map_err(|error| SshBootstrapError::VerifiedRelease(Box::new(error)))
+            .map_err(|error| SshBootstrapError::verified_release(version, target, error))
     }
 
     pub(super) const fn from_digest(digest: [u8; 32]) -> Self {
         Self { digest }
     }
 
-    pub(super) fn from_digest_hex(digest: &str) -> Result<Self, SshBootstrapError> {
+    pub(super) fn from_digest_hex(
+        target: RemoteTarget,
+        version: &str,
+        digest: &str,
+    ) -> Result<Self, SshBootstrapError> {
         parse_digest_hex(digest)
             .map(Self::from_digest)
             .map_err(|_| {
-                SshBootstrapError::VerifiedRelease(Box::new(
+                SshBootstrapError::verified_release(
+                    version,
+                    target,
                     self_update::SelfUpdateError::ManifestInvalid,
-                ))
+                )
             })
     }
 
@@ -4602,9 +4609,10 @@ impl ReleaseArtifactMetadata {
 
 impl DownloadedArtifact {
     fn fetch(target: RemoteTarget) -> Result<Self, SshBootstrapError> {
-        self_update::fetch_verified_host_artifact(env!("CARGO_PKG_VERSION"), target.id())
+        let version = env!("CARGO_PKG_VERSION");
+        self_update::fetch_verified_host_artifact(version, target.id())
             .map(|artifact| Self { artifact })
-            .map_err(|error| SshBootstrapError::VerifiedRelease(Box::new(error)))
+            .map_err(|error| SshBootstrapError::verified_release(version, target, error))
     }
 
     fn fetch_with_metadata(
@@ -4613,11 +4621,13 @@ impl DownloadedArtifact {
         metadata: ReleaseArtifactMetadata,
     ) -> Result<Self, SshBootstrapError> {
         let artifact = self_update::fetch_verified_host_artifact(version, target.id())
-            .map_err(|error| SshBootstrapError::VerifiedRelease(Box::new(error)))?;
+            .map_err(|error| SshBootstrapError::verified_release(version, target, error))?;
         if artifact.artifact_digest_bytes() != metadata.digest() {
-            return Err(SshBootstrapError::VerifiedRelease(Box::new(
+            return Err(SshBootstrapError::verified_release(
+                version,
+                target,
                 self_update::SelfUpdateError::ArchiveDigestMismatch,
-            )));
+            ));
         }
         Ok(Self { artifact })
     }
@@ -5272,7 +5282,12 @@ pub(super) enum SshBootstrapError {
     #[error("{name} is not an absolute path for the detected remote platform")]
     DaemonPathOverrideNotAbsolute { name: &'static str, value: String },
     #[error("the selected release artifact did not pass canonical verification")]
-    VerifiedRelease(#[source] Box<self_update::SelfUpdateError>),
+    VerifiedRelease {
+        version: String,
+        target: RemoteTarget,
+        #[source]
+        source: Box<self_update::SelfUpdateError>,
+    },
     #[error("the selected Host binary does not match the committed SSH identity")]
     IdentityArtifactMismatch,
     #[error("the uploaded Host binary failed SHA-256 verification")]
@@ -5313,6 +5328,20 @@ pub(super) enum SshBootstrapError {
     InvalidStartResponse,
     #[error("the on-demand Host Daemon exited before it became usable")]
     DaemonExited,
+}
+
+impl SshBootstrapError {
+    pub(super) fn verified_release(
+        version: &str,
+        target: RemoteTarget,
+        source: self_update::SelfUpdateError,
+    ) -> Self {
+        Self::VerifiedRelease {
+            version: version.to_string(),
+            target,
+            source: Box::new(source),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7051,8 +7080,12 @@ mod tests {
     #[test]
     fn accepted_update_digest_round_trips_without_refetching_manifest_state() {
         let digest = "ab".repeat(32);
-        let metadata =
-            ReleaseArtifactMetadata::from_digest_hex(&digest).expect("parse accepted plan digest");
+        let metadata = ReleaseArtifactMetadata::from_digest_hex(
+            RemoteTarget::WindowsX64Msvc,
+            "1.2.3",
+            &digest,
+        )
+        .expect("parse accepted plan digest");
 
         assert_eq!(metadata.digest_hex(), digest);
     }

@@ -975,7 +975,16 @@ fn map_ssh_daemon_bootstrap_error(
         ssh_bootstrap::SshBootstrapError::DaemonPathOverrideNotAbsolute { name, value } => {
             SatelleError::daemon_path_override_not_absolute(name, value)
         }
-        ssh_bootstrap::SshBootstrapError::VerifiedRelease(error) => (*error).into_satelle_error(),
+        ssh_bootstrap::SshBootstrapError::VerifiedRelease {
+            version,
+            target,
+            source,
+        } if source.release_artifact_is_unavailable() => {
+            SatelleError::host_artifact_unavailable(&version, target.id())
+        }
+        ssh_bootstrap::SshBootstrapError::VerifiedRelease { source, .. } => {
+            (*source).into_satelle_error()
+        }
         _ => SatelleError::host_unreachable(alias),
     }
 }
@@ -1374,9 +1383,8 @@ impl SshSetupTransport {
     ) -> Result<ssh_bootstrap::ReleaseArtifactMetadata, SatelleError> {
         self.release_artifact.map_or_else(
             || {
-                ssh_bootstrap::ReleaseArtifactMetadata::fetch(target, version).map_err(|error| {
-                    map_release_artifact_error(&self.alias, version, target, error)
-                })
+                ssh_bootstrap::ReleaseArtifactMetadata::fetch(target, version)
+                    .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))
             },
             Ok,
         )
@@ -2442,14 +2450,9 @@ impl RemotePersistentSetupExecution<'_> {
                 self.bootstrap_lock,
             )
             .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?;
-            remote.install_current_host_artifact().map_err(|error| {
-                map_release_artifact_error(
-                    &self.transport.alias,
-                    env!("CARGO_PKG_VERSION"),
-                    self.target,
-                    error,
-                )
-            })?
+            remote
+                .install_current_host_artifact()
+                .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?
         };
         let service = {
             let remote = ssh_bootstrap::PersistentServiceRemote::new(
@@ -4515,22 +4518,6 @@ fn append_codex_repair_inspections(
     Ok(())
 }
 
-fn map_release_artifact_error(
-    host: &str,
-    version: &str,
-    target: ssh_bootstrap::RemoteTarget,
-    error: ssh_bootstrap::SshBootstrapError,
-) -> SatelleError {
-    match error {
-        ssh_bootstrap::SshBootstrapError::VerifiedRelease(error)
-            if error.release_artifact_is_unavailable() =>
-        {
-            SatelleError::host_artifact_unavailable(version, target.id())
-        }
-        error => map_ssh_daemon_bootstrap_error(host, error),
-    }
-}
-
 fn canonical_remote_platform(platform: &str) -> (Option<ssh_bootstrap::RemoteTarget>, String) {
     (
         ssh_bootstrap::RemoteTarget::from_id(platform),
@@ -4564,8 +4551,7 @@ fn verified_host_update_artifact_from_metadata(
     install_path: Option<String>,
     metadata: Result<ssh_bootstrap::ReleaseArtifactMetadata, ssh_bootstrap::SshBootstrapError>,
 ) -> Result<crate::host_update::VerifiedHostArtifact, SatelleError> {
-    let metadata =
-        metadata.map_err(|error| map_release_artifact_error(host, version, target, error))?;
+    let metadata = metadata.map_err(|error| map_ssh_daemon_bootstrap_error(host, error))?;
     Ok(crate::host_update::VerifiedHostArtifact {
         version: version.to_string(),
         remote_platform: target.id().to_string(),
@@ -7837,14 +7823,15 @@ mod bootstrap_ordering_tests {
             satelle_core::ErrorCode::HostBinaryNewerThanCli
         );
 
-        let missing_error = map_release_artifact_error(
-            "remote",
-            "1.2.3",
-            ssh_bootstrap::RemoteTarget::DarwinArm64,
-            ssh_bootstrap::SshBootstrapError::VerifiedRelease(Box::new(
-                crate::self_update::SelfUpdateError::ManifestEntryMissing,
-            )),
-        );
+        let target = ssh_bootstrap::RemoteTarget::DarwinArm64;
+        let release_error = |error| {
+            map_ssh_daemon_bootstrap_error(
+                "remote",
+                ssh_bootstrap::SshBootstrapError::verified_release("1.2.3", target, error),
+            )
+        };
+        let missing_error =
+            release_error(crate::self_update::SelfUpdateError::ManifestEntryMissing);
         assert_eq!(
             missing_error.code,
             satelle_core::ErrorCode::HostArtifactUnavailable
@@ -7854,14 +7841,8 @@ mod bootstrap_ordering_tests {
             serde_json::json!("darwin-arm64")
         );
 
-        let oversized_manifest_error = map_release_artifact_error(
-            "remote",
-            "1.2.3",
-            ssh_bootstrap::RemoteTarget::DarwinArm64,
-            ssh_bootstrap::SshBootstrapError::VerifiedRelease(Box::new(
-                crate::self_update::SelfUpdateError::ResponseTooLarge,
-            )),
-        );
+        let oversized_manifest_error =
+            release_error(crate::self_update::SelfUpdateError::ResponseTooLarge);
         assert_eq!(
             oversized_manifest_error.code,
             satelle_core::ErrorCode::HostArtifactUnavailable
@@ -7871,27 +7852,14 @@ mod bootstrap_ordering_tests {
             serde_json::json!("darwin-arm64")
         );
 
-        let malformed = map_release_artifact_error(
-            "remote",
-            "1.2.3",
-            ssh_bootstrap::RemoteTarget::DarwinArm64,
-            ssh_bootstrap::SshBootstrapError::VerifiedRelease(Box::new(
-                crate::self_update::SelfUpdateError::ManifestInvalid,
-            )),
-        );
+        let malformed = release_error(crate::self_update::SelfUpdateError::ManifestInvalid);
         assert_eq!(
             malformed.code,
             satelle_core::ErrorCode::HostArtifactUnavailable
         );
 
-        let verifier_unavailable = map_release_artifact_error(
-            "remote",
-            "1.2.3",
-            ssh_bootstrap::RemoteTarget::DarwinArm64,
-            ssh_bootstrap::SshBootstrapError::VerifiedRelease(Box::new(
-                crate::self_update::SelfUpdateError::GhUnavailable,
-            )),
-        );
+        let verifier_unavailable =
+            release_error(crate::self_update::SelfUpdateError::GhUnavailable);
         assert_eq!(
             verifier_unavailable.code,
             satelle_core::ErrorCode::ReleaseVerifierUnavailable
@@ -7936,9 +7904,11 @@ mod bootstrap_ordering_tests {
             "1.2.3",
             ssh_bootstrap::RemoteTarget::DarwinArm64,
             None,
-            Err(ssh_bootstrap::SshBootstrapError::VerifiedRelease(Box::new(
+            Err(ssh_bootstrap::SshBootstrapError::verified_release(
+                "1.2.3",
+                ssh_bootstrap::RemoteTarget::DarwinArm64,
                 crate::self_update::SelfUpdateError::ManifestEntryMissing,
-            ))),
+            )),
         )
         .expect_err("missing integrity metadata must block the update plan");
         assert_eq!(
