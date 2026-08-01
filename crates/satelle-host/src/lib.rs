@@ -2432,16 +2432,20 @@ impl HostService {
 
     /// Builds a production Host whose probe timeouts and cache TTLs come from
     /// the fully resolved host/profile configuration.
-    pub fn production_for_host(config: &HostConfig) -> Self {
+    pub fn resolved_daemon_paths_for_host(
+        config: &HostConfig,
+    ) -> Result<DaemonResolvedPathSet, SatelleError> {
         let paths = satelle_core::resolve_path_set(
             &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        );
+        )?;
         let daemon_path_overrides = configured_daemon_path_overrides(config);
-        let daemon_paths = paths
-            .as_ref()
-            .map(DaemonResolvedPathSet::from)
-            .map(|paths| paths.with_service_overrides(&daemon_path_overrides))
-            .map_err(Clone::clone);
+        Ok(DaemonResolvedPathSet::from(&paths).with_service_overrides(&daemon_path_overrides))
+    }
+
+    /// Builds a production Host whose probe timeouts and cache TTLs come from
+    /// the fully resolved host/profile configuration.
+    pub fn production_for_host(config: &HostConfig) -> Self {
+        let daemon_paths = Self::resolved_daemon_paths_for_host(config);
         let state_root = daemon_paths
             .as_ref()
             .map(|paths| std::path::PathBuf::from(&paths.state_root))

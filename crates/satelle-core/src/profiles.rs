@@ -443,7 +443,7 @@ fn reject_profile_duration_errors(
         let Some(value) = value.as_str() else {
             return Err(SatelleError::duration_unit_required(path, &retention_path));
         };
-        if ExplicitDuration::parse(value).is_none() {
+        if super::setup_ledger_retention_duration(value).is_none() {
             return Err(SatelleError::duration_unit_required(path, &retention_path));
         }
     }

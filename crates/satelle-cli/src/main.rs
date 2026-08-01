@@ -8544,11 +8544,39 @@ fn confirm_storage_maintenance(
 }
 
 fn local_storage_state_root(host: &SelectedHost) -> Result<PathBuf, CliFailure> {
-    host.config
-        .daemon_state_dir
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(|| satelle_core::state_dir().map_err(failure))
+    satelle_host::HostService::resolved_daemon_paths_for_host(&host.config)
+        .map(|paths| PathBuf::from(paths.state_root))
+        .map_err(failure)
+}
+
+#[cfg(test)]
+#[test]
+fn local_storage_state_root_uses_the_selected_hosts_resolved_daemon_home() {
+    let state =
+        satelle_host::test_support::TestStateDir::new().expect("create local storage path state");
+    let daemon_home = state.path().join("configured-daemon-home");
+    let mut config = satelle_core::SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .expect("the built-in local Host exists");
+    config.daemon_home = Some(daemon_home.clone());
+    let mut host = SelectedHost::from(("configured-local".to_string(), config));
+
+    assert_eq!(
+        daemon_home.join("state"),
+        local_storage_state_root(&host)
+            .ok()
+            .expect("resolve state under configured daemon home")
+    );
+
+    let explicit_state = state.path().join("explicit-state");
+    host.config.daemon_state_dir = Some(explicit_state.clone());
+    assert_eq!(
+        explicit_state,
+        local_storage_state_root(&host)
+            .ok()
+            .expect("prefer the explicit daemon state directory")
+    );
 }
 
 fn storage_maintenance_mutation_failure(

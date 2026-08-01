@@ -1643,6 +1643,9 @@ impl ExplicitDuration {
 
 pub const DEFAULT_TURN_EXECUTION_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 pub const MAX_TURN_EXECUTION_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
+// Keep retention inside an i64 nanosecond span so subtracting it from a
+// contemporary OffsetDateTime cannot cross the timestamp representation.
+pub const MAX_SETUP_LEDGER_RETENTION_MS: u64 = (i64::MAX as u64) / 1_000_000;
 
 /// A finite Turn deadline. It deliberately has its own grammar so supporting
 /// hour-scale prompt execution does not broaden unrelated probe timeouts.
@@ -3362,7 +3365,7 @@ fn reject_timeout_config_errors(path: &Path, value: &toml::Value) -> Result<(), 
             let Some(value) = value.as_str() else {
                 return Err(SatelleError::duration_unit_required(path, &retention_path));
             };
-            if ExplicitDuration::parse(value).is_none() {
+            if setup_ledger_retention_duration(value).is_none() {
                 return Err(SatelleError::duration_unit_required(path, &retention_path));
             }
         }
@@ -3820,6 +3823,47 @@ fn parse_turn_execution_seconds(value: &str) -> Option<u64> {
 
 fn parse_positive_u64(value: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|value| *value > 0)
+}
+
+fn setup_ledger_retention_duration(value: &str) -> Option<ExplicitDuration> {
+    let duration = ExplicitDuration::parse(value)?;
+    (duration.milliseconds() <= MAX_SETUP_LEDGER_RETENTION_MS).then_some(duration)
+}
+
+#[cfg(test)]
+mod setup_ledger_retention_duration_tests {
+    use super::*;
+
+    #[test]
+    fn host_and_profile_retention_reject_values_larger_than_timestamp_arithmetic_supports() {
+        let too_large = MAX_SETUP_LEDGER_RETENTION_MS + 1;
+        for (raw, expected_path) in [
+            (
+                format!(
+                    "[hosts.local-demo]\ntransport = \"local\"\nadapter = \"codex\"\nsetup_ledger_retention = \"{too_large}ms\"\n"
+                ),
+                "hosts.local-demo.setup_ledger_retention",
+            ),
+            (
+                format!("[profiles.archive]\nsetup_ledger_retention = \"{too_large}ms\"\n"),
+                "profiles.archive.setup_ledger_retention",
+            ),
+        ] {
+            let error = parse_user_config(Path::new("/test/config.toml"), &raw)
+                .expect_err("reject an unrepresentable setup-ledger retention");
+            assert_eq!(ErrorCode::DurationUnitRequired, error.code);
+            assert_eq!(
+                Some(&serde_json::json!(expected_path)),
+                error.details.get("path")
+            );
+        }
+
+        let exact_maximum = format!("{MAX_SETUP_LEDGER_RETENTION_MS}ms");
+        assert!(
+            setup_ledger_retention_duration(&exact_maximum).is_some(),
+            "the exact timestamp-safe boundary remains valid"
+        );
+    }
 }
 
 #[cfg(test)]
