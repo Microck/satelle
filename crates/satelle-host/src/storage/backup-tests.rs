@@ -1720,6 +1720,11 @@ fn cleanup_failure_preserves_names_removed_before_a_later_resume_error() {
         failure.removed_backup_file_names
     );
     assert_eq!(StorageErrorKind::OperationFailed, failure.kind());
+    assert_eq!("the Satelle storage operation failed", failure.to_string());
+    assert_eq!(
+        Some("the Satelle storage operation failed".to_string()),
+        std::error::Error::source(&failure).map(ToString::to_string)
+    );
 }
 
 #[cfg(windows)]
