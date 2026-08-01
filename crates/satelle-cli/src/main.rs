@@ -8534,10 +8534,10 @@ fn local_storage_state_root(host: &SelectedHost) -> Result<PathBuf, CliFailure> 
 }
 
 fn apply_local_offline_storage_maintenance<T>(
-    host: &str,
     state_root: &Path,
     action_id: &str,
     action_label: &str,
+    recovery_command: &str,
     mutate: impl FnOnce() -> Result<T, SatelleError>,
 ) -> Result<T, CliFailure> {
     let operation_id = format!("storage-maintenance-{}", Uuid::now_v7());
@@ -8567,10 +8567,10 @@ fn apply_local_offline_storage_maintenance<T>(
     ) {
         return Err(failure(
             SatelleError::storage_maintenance_partially_applied(
-                host,
                 &[action_id.to_string()],
                 "record-storage-maintenance-ledger-completion",
                 &[],
+                recovery_command,
                 source.to_string(),
             ),
         ));
@@ -8611,12 +8611,12 @@ fn run_host_storage(
             }
             let recovery_command = format!(
                 "satelle host storage restore --host {} --backup {} --no-input --yes",
-                host.alias,
-                command.backup.display()
+                shell_argument(&host.alias),
+                shell_argument(&command.backup.display().to_string())
             );
             if !confirm_storage_maintenance(
                 &planned_actions,
-                recovery_command,
+                recovery_command.clone(),
                 command.yes,
                 command.no_input,
                 format,
@@ -8625,10 +8625,10 @@ fn run_host_storage(
             }
             let activation = if let Some(state_root) = &local_state_root {
                 serde_json::to_value(apply_local_offline_storage_maintenance(
-                    &host.alias,
                     state_root,
                     "restore-storage-backup",
                     "Restore the validated Host storage backup",
+                    &recovery_command,
                     || {
                         satelle_host::HostService::restore_storage_backup_offline(
                             state_root,
@@ -8680,12 +8680,13 @@ fn run_host_storage(
             if command.dry_run || planned_actions.is_empty() {
                 return print_storage_plan(&host.alias, "backup_cleanup", &planned_actions, format);
             }
+            let recovery_command = format!(
+                "satelle host storage backup cleanup --host {} --no-input --yes",
+                shell_argument(&host.alias)
+            );
             if !confirm_storage_maintenance(
                 &planned_actions,
-                format!(
-                    "satelle host storage backup cleanup --host {} --no-input --yes",
-                    host.alias
-                ),
+                recovery_command.clone(),
                 command.yes,
                 command.no_input,
                 format,
@@ -8694,10 +8695,10 @@ fn run_host_storage(
             }
             let cleanup = if let Some(state_root) = &local_state_root {
                 let removed_backup_file_names = apply_local_offline_storage_maintenance(
-                    &host.alias,
                     state_root,
                     "cleanup-storage-backups",
                     "Delete older validated Host storage backups",
+                    &recovery_command,
                     || satelle_host::HostService::cleanup_storage_backups_offline(state_root),
                 )?;
                 json!({"removed_backup_file_names": removed_backup_file_names})
@@ -8739,12 +8740,18 @@ fn run_host_store(
             if command.dry_run {
                 return print_storage_plan(&host.alias, "store_reset", &planned_actions, format);
             }
+            let recovery_command = format!(
+                "satelle host store reset --host {}{} --no-input --yes",
+                shell_argument(&host.alias),
+                if command.delete_recordings {
+                    " --delete-recordings"
+                } else {
+                    ""
+                }
+            );
             if !confirm_storage_maintenance(
                 &planned_actions,
-                format!(
-                    "satelle host store reset --host {} --no-input --yes",
-                    host.alias
-                ),
+                recovery_command.clone(),
                 command.yes,
                 command.no_input,
                 format,
@@ -8753,10 +8760,10 @@ fn run_host_store(
             }
             let reset = if let Some(state_root) = &local_state_root {
                 serde_json::to_value(apply_local_offline_storage_maintenance(
-                    &host.alias,
                     state_root,
                     "reset-host-store",
                     "Reset Host metadata",
+                    &recovery_command,
                     || {
                         satelle_host::HostService::reset_store_metadata_offline(
                             state_root,
@@ -8816,6 +8823,31 @@ fn run_offline_storage_maintenance(
             }
             None
         }
+    };
+    let recovery_command = match command.operation {
+        OfflineStorageOperation::Restore => format!(
+            "satelle host storage restore --host {} --backup {} --no-input --yes",
+            shell_argument(&command.host),
+            shell_argument(
+                &backup
+                    .expect("validated restore backup")
+                    .display()
+                    .to_string()
+            )
+        ),
+        OfflineStorageOperation::BackupCleanup => format!(
+            "satelle host storage backup cleanup --host {} --no-input --yes",
+            shell_argument(&command.host)
+        ),
+        OfflineStorageOperation::StoreReset => format!(
+            "satelle host store reset --host {}{} --no-input --yes",
+            shell_argument(&command.host),
+            if command.delete_recordings {
+                " --delete-recordings"
+            } else {
+                ""
+            }
+        ),
     };
     satelle_host::HostService::start_offline_storage_maintenance(
         &command.state_root,
@@ -8877,10 +8909,10 @@ fn run_offline_storage_maintenance(
     ) {
         return Err(failure(
             SatelleError::storage_maintenance_partially_applied(
-                &command.host,
                 &[action_id.to_string()],
                 "record-storage-maintenance-ledger-completion",
                 &[],
+                recovery_command,
                 source.to_string(),
             ),
         ));

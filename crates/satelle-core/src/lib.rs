@@ -5803,16 +5803,13 @@ impl SatelleError {
     }
 
     pub fn storage_maintenance_partially_applied(
-        host: &str,
         completed_actions: &[String],
         failed_action: &str,
         skipped_actions: &[String],
+        recovery_command: impl Into<String>,
         source: impl Into<String>,
     ) -> Self {
-        let recovery_command = Some(format!(
-            "satelle repair --host {} --no-input --yes",
-            shell_argument(host)
-        ));
+        let recovery_command = Some(recovery_command.into());
         Self {
             code: ErrorCode::SetupPartiallyApplied,
             message: format!(
@@ -6182,13 +6179,18 @@ mod error_contract_tests {
         assert_eq!(setup.recovery_command.as_deref(), Some(repair_command));
 
         let storage = SatelleError::storage_maintenance_partially_applied(
-            host,
             &["restore-storage-backup".to_string()],
             "restart-host-api-service",
             &[],
+            "satelle host storage restore --host remote --backup backup.sqlite3 --no-input --yes",
             "restart failed",
         );
-        assert_eq!(storage.recovery_command.as_deref(), Some(repair_command));
+        assert_eq!(
+            storage.recovery_command.as_deref(),
+            Some(
+                "satelle host storage restore --host remote --backup backup.sqlite3 --no-input --yes"
+            )
+        );
 
         let repair = crate::host_update::RepairUpgradeReport::new(host, Vec::new())
             .partial_failure(
@@ -6246,10 +6248,10 @@ mod error_contract_tests {
         );
 
         let storage_partial = SatelleError::storage_maintenance_partially_applied(
-            "remote",
             &["restore-storage-backup".to_string()],
             "restart-host-api-service",
             &["verify-host-api-service".to_string()],
+            "satelle host storage restore --host remote --backup backup.sqlite3 --no-input --yes",
             "service restart failed",
         );
         assert_eq!(storage_partial.code, ErrorCode::SetupPartiallyApplied);

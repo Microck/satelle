@@ -489,7 +489,13 @@ impl RepairUpgradeReport {
     pub fn new(host: impl Into<String>, actions: Vec<RepairUpgradeAction>) -> Self {
         let mut planned_actions = actions
             .iter()
-            .filter(|action| action.disposition == RepairUpgradeDisposition::Required)
+            .filter(|action| {
+                action.disposition == RepairUpgradeDisposition::Required
+                    && !matches!(
+                        action.target,
+                        HostUpdateTarget::HostDaemon | HostUpdateTarget::HostDaemonService
+                    )
+            })
             .map(|action| action.action_id.clone())
             .collect::<Vec<_>>();
         if actions.iter().any(|action| {
@@ -706,7 +712,6 @@ mod tests {
         assert_eq!(
             planned.planned_actions,
             [
-                "repair-host-daemon",
                 "install-host-artifact",
                 "publish-host-service",
                 "restart-host-daemon",
@@ -725,15 +730,15 @@ mod tests {
         );
 
         let partial = planned.partial_failure(
-            vec!["repair-host-daemon".to_string()],
-            "repair-native-computer-use",
+            vec!["install-host-artifact".to_string()],
+            "publish-host-service",
         );
         assert_eq!(partial.status, RepairStatus::PartialFailure);
         assert!(partial.changed);
-        assert_eq!(partial.completed_actions, ["repair-host-daemon"]);
+        assert_eq!(partial.completed_actions, ["install-host-artifact"]);
         assert_eq!(
             partial.failed_action.as_deref(),
-            Some("repair-native-computer-use")
+            Some("publish-host-service")
         );
         assert_eq!(
             partial.recovery_command.as_deref(),
@@ -804,7 +809,6 @@ mod tests {
         assert_eq!(
             report.planned_actions,
             [
-                "repair-host-daemon",
                 "repair-codex-runtime",
                 "install-host-artifact",
                 "publish-host-service",

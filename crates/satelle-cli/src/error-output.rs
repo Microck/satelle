@@ -162,26 +162,6 @@ fn human_error(error: &SatelleError) -> String {
                 lines.push(format!("applied: {actions}"));
             }
         }
-        if error.code == ErrorCode::HostUpdatePartiallyApplied {
-            if let Some(failed_action) = error.details.get("failed_action").and_then(Value::as_str)
-            {
-                lines.push(format!("failed action: {failed_action}"));
-            }
-            if let Some(skipped_actions) = error
-                .details
-                .get("skipped_actions")
-                .and_then(Value::as_array)
-            {
-                let skipped_actions = skipped_actions
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if !skipped_actions.is_empty() {
-                    lines.push(format!("skipped actions: {skipped_actions}"));
-                }
-            }
-        }
         if let Some(failed_action) = error.details.get("failed_action").and_then(Value::as_str) {
             lines.push(format!("failed action: {failed_action}"));
         }
@@ -195,7 +175,9 @@ fn human_error(error: &SatelleError) -> String {
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
-            lines.push(format!("skipped: {skipped}"));
+            if !skipped.is_empty() {
+                lines.push(format!("skipped actions: {skipped}"));
+            }
         }
         if let Some(postchecks) = error
             .details
@@ -688,6 +670,13 @@ mod tests {
         };
 
         let rendered = human_error(&error);
+        assert_eq!(
+            rendered
+                .matches("failed action: publish-host-service")
+                .count(),
+            1
+        );
+        assert_eq!(rendered.matches("skipped actions:").count(), 1);
         assert!(rendered.contains("\nfailed action: publish-host-service"));
         assert!(rendered.contains(
             "\nskipped actions: publish-host-service, restart-host-daemon, \

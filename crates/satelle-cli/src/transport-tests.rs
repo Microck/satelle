@@ -30,7 +30,62 @@ use std::thread;
 use std::time::Duration;
 
 #[test]
-fn only_outcome_unknown_host_updates_resume_the_selected_operation_id() {
+fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
+    let recovery_command = SshStorageMaintenance::Restore.recovery_command(
+        "remote host",
+        Some(std::path::Path::new("/state/backup file.sqlite3")),
+        false,
+    );
+    assert_eq!(
+        recovery_command,
+        "satelle host storage restore --host 'remote host' --backup \
+         '/state/backup file.sqlite3' --no-input --yes"
+    );
+
+    let before_mutation = storage_maintenance_partial_error(
+        "remote host",
+        &[],
+        "stop-host-api-service",
+        &["restore-storage-backup".to_string()],
+        &recovery_command,
+        SatelleError::state_conflict(),
+    );
+    assert_eq!(
+        before_mutation.code,
+        satelle_core::ErrorCode::SetupActionFailed
+    );
+    assert_eq!(
+        before_mutation.recovery_command.as_deref(),
+        Some(recovery_command.as_str())
+    );
+
+    let partial = storage_maintenance_partial_error(
+        "remote host",
+        &["stop-host-api-service".to_string()],
+        "restore-storage-backup",
+        &[],
+        &recovery_command,
+        SatelleError::state_conflict(),
+    );
+    assert_eq!(partial.code, satelle_core::ErrorCode::SetupPartiallyApplied);
+    assert_eq!(
+        partial.details["completed_actions"],
+        serde_json::json!(["stop-host-api-service"])
+    );
+    assert_eq!(
+        partial.details["failed_action"],
+        serde_json::json!("restore-storage-backup")
+    );
+
+    assert!(
+        SshStorageMaintenance::StoreReset
+            .recovery_command("remote", None, true)
+            .contains("--delete-recordings")
+    );
+}
+
+#[test]
+fn active_or_outcome_unknown_host_updates_resume_the_selected_operation_id() {
     let selected = |operation_kind, run_status| RepairLedgerPlan {
         available: true,
         automatic_action_ids: Vec::new(),
@@ -43,6 +98,10 @@ fn only_outcome_unknown_host_updates_resume_the_selected_operation_id() {
     let interrupted_host_update = selected(
         satelle_transport::SetupRepairOperationKind::HostUpdate,
         satelle_transport::SetupRepairRunStatus::OutcomeUnknown,
+    );
+    let running_host_update = selected(
+        satelle_transport::SetupRepairOperationKind::HostUpdate,
+        satelle_transport::SetupRepairRunStatus::Running,
     );
     let completed_host_update = selected(
         satelle_transport::SetupRepairOperationKind::HostUpdate,
@@ -61,6 +120,7 @@ fn only_outcome_unknown_host_updates_resume_the_selected_operation_id() {
     };
 
     assert!(resumes_selected_host_update(Some(&interrupted_host_update)));
+    assert!(resumes_selected_host_update(Some(&running_host_update)));
     assert!(!resumes_selected_host_update(Some(&completed_host_update)));
     assert!(!resumes_selected_host_update(Some(&interrupted_repair)));
     assert!(!resumes_selected_host_update(Some(

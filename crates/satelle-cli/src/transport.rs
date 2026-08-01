@@ -2982,22 +2982,69 @@ impl SshStorageMaintenance {
             Self::StoreReset => "reset-host-store",
         }
     }
+
+    fn recovery_command(
+        self,
+        host: &str,
+        backup: Option<&Path>,
+        delete_recordings: bool,
+    ) -> String {
+        let host = crate::shell_argument(host);
+        match self {
+            Self::Restore => format!(
+                "satelle host storage restore --host {host} --backup {} --no-input --yes",
+                crate::shell_argument(
+                    &backup
+                        .expect("restore maintenance has a backup")
+                        .display()
+                        .to_string()
+                )
+            ),
+            Self::BackupCleanup => {
+                format!("satelle host storage backup cleanup --host {host} --no-input --yes")
+            }
+            Self::StoreReset => format!(
+                "satelle host store reset --host {host}{} --no-input --yes",
+                if delete_recordings {
+                    " --delete-recordings"
+                } else {
+                    ""
+                }
+            ),
+        }
+    }
 }
 
 fn storage_maintenance_partial_error(
     host: &str,
-    maintenance: SshStorageMaintenance,
+    completed_actions: &[String],
     failed_action: &str,
     skipped_actions: &[String],
+    recovery_command: &str,
     source: SatelleError,
 ) -> SatelleError {
-    SatelleError::storage_maintenance_partially_applied(
-        host,
-        &[maintenance.action_id().to_string()],
-        failed_action,
-        skipped_actions,
-        source.to_string(),
-    )
+    if completed_actions.is_empty() {
+        let mut error = SatelleError::setup_action_failed(
+            host,
+            failed_action,
+            skipped_actions,
+            source.to_string(),
+        );
+        error.recovery_command = Some(recovery_command.to_string());
+        error.details.insert(
+            "recovery_command".to_string(),
+            serde_json::Value::String(recovery_command.to_string()),
+        );
+        error
+    } else {
+        SatelleError::storage_maintenance_partially_applied(
+            completed_actions,
+            failed_action,
+            skipped_actions,
+            recovery_command,
+            source.to_string(),
+        )
+    }
 }
 
 pub(crate) fn preflight_ssh_storage_maintenance(host: &SelectedHost) -> Result<(), SatelleError> {
@@ -3014,12 +3061,7 @@ pub(crate) fn preflight_ssh_storage_maintenance(host: &SelectedHost) -> Result<(
             target.service_platform().as_str(),
         ));
     }
-    let (tunnel, client) = transport.durable_service_client()?;
-    client
-        .capabilities()
-        .map_err(|error| direct_transport_error(&transport.alias, error))?;
-    drop(client);
-    drop(tunnel);
+    transport.remote_directories(target)?;
     Ok(())
 }
 
@@ -3044,10 +3086,8 @@ pub(crate) fn apply_ssh_storage_maintenance(
     }
     let directories = transport.remote_directories(target)?;
     let operation_id = format!("storage-maintenance-{}", Uuid::now_v7());
-    let (durable_tunnel, durable_client) = transport.durable_service_client()?;
-    durable_client
-        .capabilities()
-        .map_err(|error| direct_transport_error(&transport.alias, error))?;
+    let recovery_command =
+        maintenance.recovery_command(&transport.alias, backup, delete_recordings);
     let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
         &transport.alias,
         transport.binding.destination(),
@@ -3088,8 +3128,6 @@ pub(crate) fn apply_ssh_storage_maintenance(
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| directories.resolved_path_set().state_root);
     let backup = backup.map(|path| path.display().to_string());
-    drop(durable_client);
-    drop(durable_tunnel);
 
     stop_persistent_service(
         &transport,
@@ -3102,16 +3140,18 @@ pub(crate) fn apply_ssh_storage_maintenance(
     .map_err(|source| {
         storage_maintenance_partial_error(
             &transport.alias,
-            maintenance,
+            &[],
             "stop-host-api-service",
             &[
                 maintenance.action_id().to_string(),
                 "restart-host-api-service".to_string(),
                 "verify-host-api-service".to_string(),
             ],
+            &recovery_command,
             source,
         )
     })?;
+    let mut completed_actions = vec!["stop-host-api-service".to_string()];
     let mutation = {
         match ssh_bootstrap::PersistentServiceRemote::new(
             transport.binding.destination(),
@@ -3135,6 +3175,9 @@ pub(crate) fn apply_ssh_storage_maintenance(
             Err(error) => Err(map_ssh_daemon_bootstrap_error(&transport.alias, error)),
         }
     };
+    if mutation.is_ok() {
+        completed_actions.push(maintenance.action_id().to_string());
+    }
     {
         let mut remote = ssh_bootstrap::PersistentServiceRemote::new(
             transport.binding.destination(),
@@ -3145,9 +3188,10 @@ pub(crate) fn apply_ssh_storage_maintenance(
         .map_err(|error| {
             storage_maintenance_partial_error(
                 &transport.alias,
-                maintenance,
+                &completed_actions,
                 "restart-host-api-service",
                 &["verify-host-api-service".to_string()],
+                &recovery_command,
                 map_ssh_daemon_bootstrap_error(&transport.alias, error),
             )
         })?;
@@ -3163,12 +3207,14 @@ pub(crate) fn apply_ssh_storage_maintenance(
         .map_err(|error| {
             storage_maintenance_partial_error(
                 &transport.alias,
-                maintenance,
+                &completed_actions,
                 "restart-host-api-service",
                 &["verify-host-api-service".to_string()],
+                &recovery_command,
                 map_ssh_daemon_bootstrap_error(&transport.alias, error),
             )
         })?;
+        completed_actions.push("restart-host-api-service".to_string());
         wait_for_service_observation(
             &transport.alias,
             || match target.service_platform() {
@@ -3187,20 +3233,23 @@ pub(crate) fn apply_ssh_storage_maintenance(
         .map_err(|error| {
             storage_maintenance_partial_error(
                 &transport.alias,
-                maintenance,
+                &completed_actions,
                 "verify-host-api-service",
                 &[],
+                &recovery_command,
                 error,
             )
         })?;
+        completed_actions.push("verify-host-api-service".to_string());
     }
     let (verification_tunnel, verification_client) =
         transport.durable_service_client().map_err(|error| {
             storage_maintenance_partial_error(
                 &transport.alias,
-                maintenance,
+                &completed_actions,
                 "verify-host-api-service",
                 &[],
+                &recovery_command,
                 error,
             )
         })?;
@@ -3208,9 +3257,10 @@ pub(crate) fn apply_ssh_storage_maintenance(
         |error| {
             storage_maintenance_partial_error(
                 &transport.alias,
-                maintenance,
+                &completed_actions,
                 "verify-host-api-service",
                 &[],
+                &recovery_command,
                 error,
             )
         },
@@ -3218,9 +3268,10 @@ pub(crate) fn apply_ssh_storage_maintenance(
     commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock).map_err(|error| {
         storage_maintenance_partial_error(
             &transport.alias,
-            maintenance,
+            &completed_actions,
             "commit-storage-maintenance-fence",
             &[],
+            &recovery_command,
             error,
         )
     })?;
@@ -3230,17 +3281,19 @@ pub(crate) fn apply_ssh_storage_maintenance(
             bootstrap_lock.release_committed_handoff().map_err(|_| {
                 storage_maintenance_partial_error(
                     &transport.alias,
-                    maintenance,
+                    &completed_actions,
                     "release-storage-maintenance-fence",
                     &[],
+                    &recovery_command,
                     SatelleError::host_unreachable(&transport.alias),
                 )
             })?;
             return Err(storage_maintenance_partial_error(
                 &transport.alias,
-                maintenance,
+                &completed_actions,
                 maintenance.action_id(),
                 &[],
+                &recovery_command,
                 source,
             ));
         }
@@ -3261,18 +3314,20 @@ pub(crate) fn apply_ssh_storage_maintenance(
         .map_err(|error| {
             storage_maintenance_partial_error(
                 &transport.alias,
-                maintenance,
+                &completed_actions,
                 "verify-storage-maintenance-ledger",
                 &[],
+                &recovery_command,
                 direct_transport_error(&transport.alias, error),
             )
         })?;
     if !response.ledger_available() {
         return Err(storage_maintenance_partial_error(
             &transport.alias,
-            maintenance,
+            &completed_actions,
             "verify-storage-maintenance-ledger",
             &[],
+            &recovery_command,
             SatelleError::setup_ledger_unavailable(&operation_id),
         ));
     }
@@ -3281,9 +3336,10 @@ pub(crate) fn apply_ssh_storage_maintenance(
     bootstrap_lock.release_committed_handoff().map_err(|_| {
         storage_maintenance_partial_error(
             &transport.alias,
-            maintenance,
+            &completed_actions,
             "release-storage-maintenance-fence",
             &[],
+            &recovery_command,
             SatelleError::host_unreachable(&transport.alias),
         )
     })?;
@@ -4966,8 +5022,13 @@ fn selected_repair_run(
 fn resumes_selected_host_update(selected_run: Option<&RepairLedgerPlan>) -> bool {
     selected_run.is_some_and(|run| {
         run.selected_operation_kind == Some(satelle_transport::SetupRepairOperationKind::HostUpdate)
-            && run.selected_run_status
-                == Some(satelle_transport::SetupRepairRunStatus::OutcomeUnknown)
+            && matches!(
+                run.selected_run_status,
+                Some(
+                    satelle_transport::SetupRepairRunStatus::Running
+                        | satelle_transport::SetupRepairRunStatus::OutcomeUnknown
+                )
+            )
             && run.host_update_recovery_identity.is_some()
     })
 }
