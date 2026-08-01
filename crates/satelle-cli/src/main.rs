@@ -8736,8 +8736,6 @@ fn offline_storage_completion_recovery_command(
     host: &str,
     operation_id: &str,
     state_root: &Path,
-    backup: Option<&Path>,
-    delete_recordings: bool,
 ) -> String {
     let operation = match operation {
         OfflineStorageOperation::Restore => "restore",
@@ -8750,15 +8748,6 @@ fn offline_storage_completion_recovery_command(
         shell_argument(operation_id),
         shell_argument(&state_root.display().to_string()),
     );
-    if let Some(backup) = backup {
-        command.push_str(&format!(
-            " --backup {}",
-            shell_argument(&backup.display().to_string())
-        ));
-    }
-    if delete_recordings {
-        command.push_str(" --delete-recordings");
-    }
     command.push_str(" --yes --reconcile-completion");
     command
 }
@@ -8837,10 +8826,17 @@ fn storage_completion_recovery_command_preserves_operation_identity() {
             "remote host",
             "storage-maintenance-exact",
             Path::new("/state root"),
-            Some(Path::new("/state root/backup file")),
-            false,
         ),
-        "satelle host offline-storage-maintenance --operation restore --host 'remote host' --operation-id storage-maintenance-exact --state-root '/state root' --backup '/state root/backup file' --yes --reconcile-completion"
+        "satelle host offline-storage-maintenance --operation restore --host 'remote host' --operation-id storage-maintenance-exact --state-root '/state root' --yes --reconcile-completion"
+    );
+    assert_eq!(
+        offline_storage_completion_recovery_command(
+            OfflineStorageOperation::StoreReset,
+            "remote host",
+            "storage-maintenance-exact",
+            Path::new("/state root"),
+        ),
+        "satelle host offline-storage-maintenance --operation store-reset --host 'remote host' --operation-id storage-maintenance-exact --state-root '/state root' --yes --reconcile-completion"
     );
 }
 
@@ -8960,8 +8956,6 @@ fn run_host_storage(
                             &host.alias,
                             operation_id,
                             state_root,
-                            Some(&command.backup),
-                            false,
                         )
                     },
                     || {
@@ -9060,8 +9054,6 @@ fn run_host_storage(
                             &host.alias,
                             operation_id,
                             state_root,
-                            None,
-                            false,
                         )
                     },
                     || {
@@ -9155,8 +9147,6 @@ fn run_host_store(
                             &host.alias,
                             operation_id,
                             state_root,
-                            None,
-                            command.delete_recordings,
                         )
                     },
                     || {
@@ -9466,8 +9456,6 @@ fn run_offline_storage_maintenance(
             &command.host,
             &command.operation_id,
             &command.state_root,
-            backup,
-            command.delete_recordings,
         );
         return Err(failure(
             SatelleError::storage_maintenance_partially_applied(

@@ -26,7 +26,9 @@ use super::ssh_tunnel::{SshStderrClassification, classify_stderr};
 
 const PROBE_OUTPUT_LIMIT: usize = 4096;
 const OFFLINE_STORAGE_PLAN_LIMIT: usize = 64 * 1024;
-const OFFLINE_STORAGE_RESULT_LIMIT: usize = 64 * 1024;
+// A cleanup failure can carry the full accepted plan back as removed-file
+// evidence plus the typed error envelope.
+const OFFLINE_STORAGE_RESULT_LIMIT: usize = 2 * OFFLINE_STORAGE_PLAN_LIMIT;
 const SERVICE_DEFINITION_LIMIT: usize = 64 * 1024;
 const TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT: usize = 1024 * 1024;
 const START_OUTPUT_LIMIT: u64 = 16 * 1024;
@@ -5802,6 +5804,43 @@ mod tests {
 
         assert!(encoded.len() > PROBE_OUTPUT_LIMIT);
         assert!(encoded.len() <= OFFLINE_STORAGE_PLAN_LIMIT);
+    }
+
+    #[test]
+    fn offline_cleanup_result_limit_covers_an_accepted_plan_error_envelope() {
+        let mut removed_backup_file_names = Vec::new();
+        loop {
+            let mut candidate = removed_backup_file_names.clone();
+            candidate.push(format!(
+                "satelle.sqlite3.migration-v14-00000000-0000-0000-0000-{:012}.backup",
+                candidate.len()
+            ));
+            let plan = serde_json::to_vec(&serde_json::json!({
+                "eligible_backup_file_names": &candidate,
+            }))
+            .expect("serialize cleanup plan candidate");
+            if plan.len() > OFFLINE_STORAGE_PLAN_LIMIT {
+                break;
+            }
+            removed_backup_file_names = candidate;
+        }
+
+        let mut source = satelle_core::SatelleError::storage_maintenance_partially_applied(
+            &["cleanup-storage-backups".to_string()],
+            "cleanup-storage-backups",
+            &[],
+            "satelle host storage backup cleanup --host remote --no-input --yes",
+            "backup deletion failed",
+        );
+        source.details.insert(
+            "removed_backup_file_names".to_string(),
+            serde_json::json!(removed_backup_file_names),
+        );
+        let encoded = serde_json::to_vec(&serde_json::json!({"error": source}))
+            .expect("serialize maximum accepted cleanup failure");
+
+        assert!(encoded.len() > OFFLINE_STORAGE_PLAN_LIMIT);
+        assert!(encoded.len() <= OFFLINE_STORAGE_RESULT_LIMIT);
     }
 
     #[test]
