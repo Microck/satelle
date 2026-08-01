@@ -8699,7 +8699,14 @@ fn run_host_storage(
                     .insert("api_service_restarted".to_string(), json!(true));
                 activation
             };
-            print_storage_result(&host.alias, "restore", activation, true, format)
+            print_storage_result(
+                &host.alias,
+                "restore",
+                activation,
+                true,
+                &["restore-storage-backup"],
+                format,
+            )
         }
         HostStorageCommand::Backup {
             command: HostStorageBackupCommand::Cleanup(command),
@@ -8735,6 +8742,7 @@ fn run_host_storage(
                     "backup_cleanup",
                     json!({"removed_backup_file_names": []}),
                     false,
+                    &[],
                     format,
                 );
             }
@@ -8781,7 +8789,14 @@ fn run_host_storage(
                 .get("removed_backup_file_names")
                 .and_then(Value::as_array)
                 .is_some_and(|removed| !removed.is_empty());
-            print_storage_result(&host.alias, "backup_cleanup", cleanup, changed, format)
+            print_storage_result(
+                &host.alias,
+                "backup_cleanup",
+                cleanup,
+                changed,
+                &["cleanup-storage-backups"],
+                format,
+            )
         }
     }
 }
@@ -8869,7 +8884,14 @@ fn run_host_store(
                     .get("recordings_deleted")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-            print_storage_result(&host.alias, "store_reset", reset, changed, format)
+            print_storage_result(
+                &host.alias,
+                "store_reset",
+                reset,
+                changed,
+                &["reset-host-store"],
+                format,
+            )
         }
     }
 }
@@ -9058,6 +9080,7 @@ fn print_storage_result(
     operation: &str,
     result: Value,
     changed: bool,
+    applied_actions: &[&str],
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     if format.is_json() {
@@ -9068,7 +9091,7 @@ fn print_storage_result(
             "status": "applied",
             "changed": changed,
             "planned_actions": [],
-            "applied_actions": [],
+            "applied_actions": applied_actions,
             "cancellation_reason": null,
             "result": result
         }))

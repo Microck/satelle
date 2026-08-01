@@ -1200,10 +1200,21 @@ fn cleanup_retains_the_newest_validated_backup_and_one_previous_backup() {
 
 #[test]
 fn cleanup_rejects_a_candidate_set_that_changed_after_consent() {
-    let fixture = BackupFixture::new(3);
+    let fixture = BackupFixture::new(4);
+    let state_directory = fixture.state_directory();
+    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
+        if step == CleanupStep::BackupQuarantined {
+            Err(StorageError::for_test(StorageErrorKind::OperationFailed))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("leave an interrupted cleanup tombstone");
+    assert_eq!(1, cleanup_tombstone_names(&fixture).len());
+
     let approved = plan_migration_backup_cleanup(&fixture.state_root)
         .expect("plan initial cleanup candidates");
-    assert_eq!(vec![fixture.backup_file_names[0].clone()], approved);
+    assert_eq!(vec![fixture.backup_file_names[1].clone()], approved);
 
     let (connection, ownership_lock, state_directory) =
         open_parts(&fixture.state_root).expect("open fixture store");

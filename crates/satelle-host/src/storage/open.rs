@@ -2655,20 +2655,35 @@ fn cleanup_migration_backups_with_hook(
     approved_backup_file_names: Option<&[String]>,
     mut hook: impl FnMut(CleanupStep) -> Result<(), StorageError>,
 ) -> Result<Vec<String>, StorageError> {
-    let mut removed = Vec::new();
-    resume_cleanup_tombstones(state_root, state_directory, &mut hook, &mut removed)?;
-
-    let validated = list_validated_migration_backups(state_root, state_directory)?;
-    let delete_count = validated.len().saturating_sub(2);
-    let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
-    if approved_backup_file_names.is_some_and(|approved| {
-        !candidates
+    let approved_candidates = if let Some(approved) = approved_backup_file_names {
+        let validated = list_validated_migration_backups(state_root, state_directory)?;
+        let delete_count = validated.len().saturating_sub(2);
+        let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
+        if !candidates
             .iter()
             .map(|backup| backup.backup_file_name.as_str())
             .eq(approved.iter().map(String::as_str))
-    }) {
-        return Err(StorageError::new(StorageErrorKind::StateConflict));
-    }
+        {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        Some(candidates)
+    } else {
+        None
+    };
+
+    let mut removed = Vec::new();
+    resume_cleanup_tombstones(state_root, state_directory, &mut hook, &mut removed)?;
+
+    // Tombstone recovery changes only previously quarantined pairs, not these
+    // canonical candidates. Reuse the consent preflight instead of validating
+    // the same files twice on the destructive path.
+    let candidates = if let Some(candidates) = approved_candidates {
+        candidates
+    } else {
+        let validated = list_validated_migration_backups(state_root, state_directory)?;
+        let delete_count = validated.len().saturating_sub(2);
+        validated.into_iter().take(delete_count).collect()
+    };
     for backup in candidates {
         let fresh =
             validate_migration_backup(state_root, state_directory, &backup.backup_file_name)?;

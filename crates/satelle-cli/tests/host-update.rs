@@ -299,6 +299,10 @@ fn store_reset_dry_run_is_a_noop_and_apply_preserves_recordings_by_default() {
     let report: Value = serde_json::from_slice(&applied.stdout).expect("parse reset report");
     assert_eq!(report["schema_version"], "satelle.host.storage.v1");
     assert_eq!(report["status"], "applied");
+    assert_eq!(
+        report["applied_actions"],
+        serde_json::json!(["reset-host-store"])
+    );
     assert_eq!(report["result"]["recordings_deleted"], false);
     assert!(recording.exists());
     assert!(state.path().join("satelle.sqlite3").exists());
@@ -333,6 +337,10 @@ fn store_reset_deletes_recordings_only_with_the_explicit_option() {
     );
     let report: Value = serde_json::from_slice(&applied.stdout).expect("parse reset report");
     assert_eq!(report["schema_version"], "satelle.host.storage.v1");
+    assert_eq!(
+        report["applied_actions"],
+        serde_json::json!(["reset-host-store"])
+    );
     assert_eq!(report["result"]["recordings_deleted"], true);
     assert!(!recordings.exists());
 }

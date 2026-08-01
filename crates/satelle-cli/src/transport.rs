@@ -5117,7 +5117,7 @@ fn recover_selected_repair_daemon(
         bootstrap_lock::OperationKind::HostBinaryReplacement,
     )?;
 
-    let relaunched = relaunch_durable_daemon_under_lock(
+    let relaunched = match relaunch_durable_daemon_under_lock(
         DurableRelaunchTarget {
             host: &transport.alias,
             expected_host_identity: transport.binding.expected_host_identity().as_str(),
@@ -5172,7 +5172,21 @@ fn recover_selected_repair_daemon(
         },
         || observe_remote_durable_readiness(durable_client.capabilities()),
         Instant::now() + SSH_DAEMON_LAUNCH_TIMEOUT,
-    )?;
+    ) {
+        Ok(relaunched) => relaunched,
+        Err(error) => {
+            if bootstrap_lock.has_mutation_attempt() {
+                // A fenced restart may have executed even when its response or
+                // readiness proof failed. Keep the exact operation claim for
+                // stale recovery instead of falsely releasing it as unmodified.
+                return Err(error);
+            }
+            bootstrap_lock
+                .release_unmodified()
+                .map_err(|_| SatelleError::host_unreachable(&transport.alias))?;
+            return Err(error);
+        }
+    };
     if relaunched {
         commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock)?;
         bootstrap_lock

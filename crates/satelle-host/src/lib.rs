@@ -965,6 +965,32 @@ mod bootstrap_maintenance_tests {
     }
 
     #[test]
+    fn store_reset_retries_a_quarantined_recording_directory() {
+        let state = TestStateDir::new().expect("create reset state directory");
+        let service = HostService::production_for_offline_storage(state.path());
+        service
+            .load_setup_run("missing-reset-fixture")
+            .expect("create the Host metadata store");
+        drop(service);
+        let quarantined = state
+            .path()
+            .join("recordings.deleted-0198a146-5ec2-7dd5-b51c-7d5e241e5882");
+        std::fs::create_dir(&quarantined).expect("create interrupted recording quarantine");
+        std::fs::write(quarantined.join("recording.webm"), b"recording")
+            .expect("write quarantined recording fixture");
+
+        let reset = HostService::reset_store_metadata_offline(
+            state.path(),
+            true,
+            "satelle host store reset --host local-demo --delete-recordings --no-input --yes",
+        )
+        .expect("retry explicit recording deletion");
+
+        assert!(reset.recordings_deleted);
+        assert!(!quarantined.exists());
+    }
+
+    #[test]
     fn offline_store_reset_rejects_a_running_store_owner() {
         let state = TestStateDir::new().expect("create active state directory");
         let service = HostService::production_for_offline_storage(state.path());
@@ -1587,9 +1613,59 @@ fn storage_backup_file_name<'a>(
 
 fn delete_recordings_directory(state_root: &std::path::Path) -> Result<bool, SatelleError> {
     let recordings = state_root.join("recordings");
-    let metadata = match std::fs::symlink_metadata(&recordings) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+    let mut quarantines = Vec::new();
+    for entry in std::fs::read_dir(state_root)
+        .map_err(|error| storage_recording_deletion_failure(state_root, "inspect", error))?
+    {
+        let entry = entry
+            .map_err(|error| storage_recording_deletion_failure(state_root, "inspect", error))?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(quarantine_id) = file_name.strip_prefix("recordings.deleted-") else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(quarantine_id).is_err() {
+            continue;
+        }
+        let quarantine = entry.path();
+        let metadata = std::fs::symlink_metadata(&quarantine)
+            .map_err(|error| storage_recording_deletion_failure(&quarantine, "inspect", error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(SatelleError::invalid_usage(
+                "the recording deletion quarantine is not a private directory",
+            ));
+        }
+        quarantines.push(quarantine);
+    }
+    quarantines.sort();
+    if quarantines.len() > 1 {
+        return Err(SatelleError::state_conflict());
+    }
+
+    let quarantined = match std::fs::symlink_metadata(&recordings) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(SatelleError::invalid_usage(
+                    "the recording root is not a private directory",
+                ));
+            }
+            if !quarantines.is_empty() {
+                return Err(SatelleError::state_conflict());
+            }
+            let quarantined =
+                state_root.join(format!("recordings.deleted-{}", uuid::Uuid::now_v7()));
+            std::fs::rename(&recordings, &quarantined).map_err(|error| {
+                storage_recording_deletion_failure(&recordings, "quarantine", error)
+            })?;
+            quarantined
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(quarantined) = quarantines.pop() else {
+                return Ok(false);
+            };
+            quarantined
+        }
         Err(error) => {
             return Err(storage_recording_deletion_failure(
                 &recordings,
@@ -1598,16 +1674,20 @@ fn delete_recordings_directory(state_root: &std::path::Path) -> Result<bool, Sat
             ));
         }
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(SatelleError::invalid_usage(
-            "the recording root is not a private directory",
+    if let Err(error) = std::fs::remove_dir_all(&quarantined) {
+        // Restore the canonical name when possible so the next explicit retry
+        // cannot mistake a failed deletion for an already-completed no-op.
+        let recovery_path = if std::fs::rename(&quarantined, &recordings).is_ok() {
+            &recordings
+        } else {
+            &quarantined
+        };
+        return Err(storage_recording_deletion_failure(
+            recovery_path,
+            "delete",
+            error,
         ));
     }
-    let quarantined = state_root.join(format!("recordings.deleted-{}", uuid::Uuid::now_v7()));
-    std::fs::rename(&recordings, &quarantined)
-        .map_err(|error| storage_recording_deletion_failure(&recordings, "quarantine", error))?;
-    std::fs::remove_dir_all(&quarantined)
-        .map_err(|error| storage_recording_deletion_failure(&quarantined, "delete", error))?;
     Ok(true)
 }
 
