@@ -1261,6 +1261,30 @@ fn cleanup_plan_and_retry_include_an_interrupted_tombstone() {
 }
 
 #[test]
+fn cleanup_plan_excludes_a_tombstone_without_two_retained_restore_points() {
+    let fixture = BackupFixture::new(3);
+    let state_directory = fixture.state_directory();
+    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
+        if step == CleanupStep::BackupQuarantined {
+            Err(StorageError::for_test(StorageErrorKind::OperationFailed))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("leave an interrupted cleanup tombstone");
+    assert_eq!(1, cleanup_tombstone_names(&fixture).len());
+
+    fs::remove_file(fixture.state_root.join(&fixture.backup_file_names[1]))
+        .expect("invalidate one retained restore point");
+
+    let planned =
+        plan_migration_backup_cleanup(&fixture.state_root).expect("plan safe cleanup work");
+
+    assert!(planned.is_empty());
+    assert_eq!(1, cleanup_tombstone_names(&fixture).len());
+}
+
+#[test]
 fn cleanup_never_deletes_the_only_valid_restore_point() {
     let fixture = BackupFixture::new(1);
     let state_directory = fixture.state_directory();
@@ -1636,6 +1660,42 @@ fn cleanup_retry_recovers_an_asymmetric_durable_deleting_state() {
         fixture.backup_file_names[1..].to_vec(),
         validated_backup_names(&fixture)
     );
+}
+
+#[test]
+fn cleanup_plan_excludes_an_invalid_durable_deleting_manifest() {
+    let fixture = BackupFixture::new(3);
+    let state_directory = fixture.state_directory();
+    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
+        if step == CleanupStep::BackupDeleteCommitted {
+            Err(StorageError::for_test(StorageErrorKind::OperationFailed))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("interrupt after durable backup delete commit");
+
+    let backup_deleting_name = existing_files(&fixture.state_root)
+        .into_iter()
+        .find(|name| name.ends_with("~backup.deleting"))
+        .expect("durable backup deleting name");
+    let manifest_tombstone_name = cleanup_tombstone_names(&fixture)
+        .into_iter()
+        .find(|name| name.ends_with("~manifest.tombstone"))
+        .expect("pending manifest tombstone");
+    fs::remove_file(fixture.state_root.join(manifest_tombstone_name))
+        .expect("remove the valid pending manifest");
+    let manifest_deleting_name =
+        backup_deleting_name.replace("~backup.deleting", "~manifest.deleting");
+    write_private_file(
+        &fixture.state_root.join(manifest_deleting_name),
+        b"invalid manifest deletion state",
+    );
+
+    let planned =
+        plan_migration_backup_cleanup(&fixture.state_root).expect("plan safe cleanup work");
+
+    assert!(planned.is_empty());
 }
 
 #[cfg(windows)]

@@ -2247,17 +2247,93 @@ fn logical_backup_file_name(key: &CleanupTombstoneKey) -> String {
     )
 }
 
+fn cleanup_manifest_matches_key(
+    state_directory: &StateDirectory,
+    file_name: &str,
+    key: &CleanupTombstoneKey,
+) -> bool {
+    let Ok(manifest_read) = read_backup_manifest(state_directory, file_name) else {
+        return false;
+    };
+    let logical_backup_file_name = logical_backup_file_name(key);
+    let Some(parsed_name) = parse_migration_backup_file_name(&logical_backup_file_name) else {
+        return false;
+    };
+    validate_manifest_contract(
+        &logical_backup_file_name,
+        parsed_name,
+        &manifest_read.manifest,
+    )
+    .is_ok()
+        && key.manifest_fingerprint
+            == manifest_fingerprint_from_parts(
+                key.backup_id,
+                key.schema_version,
+                &manifest_read.digest,
+                manifest_read.identity,
+            )
+}
+
 fn cleanup_plan_file_names(
+    state_root: &Path,
     state_directory: &StateDirectory,
     candidates: &[ValidatedMigrationBackup],
+    retained_valid_count: usize,
 ) -> Result<Vec<String>, StorageError> {
     let mut planned = BTreeSet::new();
+    let mut tombstones = BTreeMap::<CleanupTombstoneKey, CleanupTombstonePair>::new();
     for file_name in state_directory.leaf_names()? {
-        let key = parse_cleanup_tombstone_file_name(&file_name)
-            .map(|(key, _)| key)
-            .or_else(|| parse_cleanup_deleting_file_name(&file_name).map(|(key, _)| key));
-        if let Some(key) = key {
+        if let Some((key, kind)) = parse_cleanup_tombstone_file_name(&file_name) {
+            let pair = tombstones.entry(key).or_default();
+            match kind {
+                CleanupTombstoneKind::Backup => pair.backup_file_name = Some(file_name),
+                CleanupTombstoneKind::Manifest => pair.manifest_file_name = Some(file_name),
+            }
+        } else if let Some((key, CleanupDeletingKind::Manifest)) =
+            parse_cleanup_deleting_file_name(&file_name)
+            && cleanup_manifest_matches_key(state_directory, &file_name, &key)
+        {
             planned.insert(logical_backup_file_name(&key));
+        }
+    }
+    for (key, pair) in tombstones {
+        let logical_backup_file_name = logical_backup_file_name(&key);
+        let logical_manifest_file_name = format!("{logical_backup_file_name}.json");
+        let recoverable = match (
+            pair.backup_file_name.as_deref(),
+            pair.manifest_file_name.as_deref(),
+        ) {
+            (Some(backup_tombstone), Some(manifest_tombstone)) => {
+                retained_valid_count >= 2
+                    && validate_migration_backup_at(
+                        state_root,
+                        state_directory,
+                        &logical_backup_file_name,
+                        backup_tombstone,
+                        manifest_tombstone,
+                    )
+                    .is_ok_and(|validated| tombstone_matches_token(&key, &validated.token))
+            }
+            (Some(backup_tombstone), None) => {
+                retained_valid_count >= 2
+                    && open_private_leaf_identity(state_directory, &logical_backup_file_name)?
+                        .is_none()
+                    && validate_migration_backup_at(
+                        state_root,
+                        state_directory,
+                        &logical_backup_file_name,
+                        backup_tombstone,
+                        &logical_manifest_file_name,
+                    )
+                    .is_ok_and(|validated| tombstone_matches_token(&key, &validated.token))
+            }
+            (None, Some(manifest_tombstone)) => {
+                cleanup_manifest_matches_key(state_directory, manifest_tombstone, &key)
+            }
+            (None, None) => false,
+        };
+        if recoverable {
+            planned.insert(logical_backup_file_name);
         }
     }
     planned.extend(
@@ -2290,9 +2366,15 @@ pub(super) fn plan_migration_backup_cleanup(
 ) -> Result<Vec<String>, StorageError> {
     let state_directory = prepare_state_root(state_root)?;
     let validated = list_validated_migration_backups(state_root, &state_directory)?;
+    let retained_valid_count = validated.len();
     let delete_count = validated.len().saturating_sub(2);
     let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
-    cleanup_plan_file_names(&state_directory, &candidates)
+    cleanup_plan_file_names(
+        state_root,
+        &state_directory,
+        &candidates,
+        retained_valid_count,
+    )
 }
 
 pub(super) fn validate_migration_backup_for_restore(
@@ -2682,12 +2764,18 @@ fn cleanup_migration_backups_with_hook(
 ) -> Result<Vec<String>, StorageError> {
     let approved_candidates = if let Some(approved) = approved_backup_file_names {
         let validated = list_validated_migration_backups(state_root, state_directory)?;
+        let retained_valid_count = validated.len();
         let delete_count = validated.len().saturating_sub(2);
         let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
-        if !cleanup_plan_file_names(state_directory, &candidates)?
-            .iter()
-            .map(String::as_str)
-            .eq(approved.iter().map(String::as_str))
+        if !cleanup_plan_file_names(
+            state_root,
+            state_directory,
+            &candidates,
+            retained_valid_count,
+        )?
+        .iter()
+        .map(String::as_str)
+        .eq(approved.iter().map(String::as_str))
         {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
