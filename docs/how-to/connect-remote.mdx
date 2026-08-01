@@ -13,6 +13,12 @@ SSH authenticates the transport, but never replaces Satelle API authentication.
 
 ## Set up an SSH Host
 
+Install system OpenSSH and the GitHub CLI (`gh`) on the Controller, then
+authenticate `gh` for `github.com`. Satelle checks this release-verifier
+prerequisite before it reads Host artifact metadata or downloads an archive.
+It does not upload or run an artifact that lacks the canonical signed-tag,
+attestation, and SHA-256 verification.
+
 Create an owner-controlled user configuration with an SSH destination, the
 expected Host identity, and an absolute token-file destination:
 

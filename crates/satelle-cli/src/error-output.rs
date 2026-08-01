@@ -302,6 +302,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The Host readiness check did not finish.",
             default_recovery: "run satelle doctor --refresh and retry the command",
         },
+        ErrorCode::ReleaseVerifierUnavailable => ErrorContract {
+            category: ErrorCategory::Readiness,
+            retryable: false,
+            outcome: "Satelle cannot verify a release artifact.",
+            default_recovery: "install gh, authenticate it for github.com, and retry the command",
+        },
         ErrorCode::HostBinaryNewerThanCli
         | ErrorCode::HostArtifactUnavailable
         | ErrorCode::HostUpdateRequiresCliUpgrade
@@ -844,6 +850,14 @@ mod tests {
         let contract = error_contract(ErrorCode::SshBootstrapUnavailable);
 
         assert_eq!(contract.category.as_str(), "invalid_request");
+        assert!(!contract.retryable);
+    }
+
+    #[test]
+    fn unavailable_release_verifier_is_a_non_retryable_readiness_blocker() {
+        let contract = error_contract(ErrorCode::ReleaseVerifierUnavailable);
+
+        assert_eq!(contract.category.as_str(), "readiness");
         assert!(!contract.retryable);
     }
 }

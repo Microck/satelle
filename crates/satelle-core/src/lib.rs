@@ -4014,6 +4014,7 @@ pub enum ErrorCode {
     UnsupportedUpdateComponent,
     HostBinaryNewerThanCli,
     HostArtifactUnavailable,
+    ReleaseVerifierUnavailable,
     HostUpdateRequiresCliUpgrade,
     HostUpdateRecoveryPending,
     HostUpdatePartiallyApplied,
@@ -4137,6 +4138,7 @@ impl ErrorCode {
             Self::UnsupportedUpdateComponent => "unsupported-update-component",
             Self::HostBinaryNewerThanCli => "host-binary-newer-than-cli",
             Self::HostArtifactUnavailable => "host-artifact-unavailable",
+            Self::ReleaseVerifierUnavailable => "release-verifier-unavailable",
             Self::HostUpdateRequiresCliUpgrade => "host-update-requires-cli-upgrade",
             Self::HostUpdateRecoveryPending => "host-update-recovery-pending",
             Self::HostUpdatePartiallyApplied => "host-update-partially-applied",
@@ -4227,7 +4229,8 @@ impl ErrorCode {
             Self::HostUnreachable
             | Self::HostDaemonUnreachable
             | Self::DirectDaemonUnreachable
-            | Self::SshBootstrapUnavailable => 69,
+            | Self::SshBootstrapUnavailable
+            | Self::ReleaseVerifierUnavailable => 69,
             Self::CertificateUntrusted
             | Self::CertificateHostnameMismatch
             | Self::CertificateExpired
@@ -6061,6 +6064,11 @@ mod error_contract_tests {
     #[test]
     fn self_update_error_codes_have_stable_tokens_and_exit_classes() {
         for (code, token, exit_code) in [
+            (
+                ErrorCode::ReleaseVerifierUnavailable,
+                "release-verifier-unavailable",
+                69,
+            ),
             (
                 ErrorCode::SelfUpdateManagedInstall,
                 "self-update-managed-install",

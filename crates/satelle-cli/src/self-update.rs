@@ -29,6 +29,7 @@ const LOCK_FILE_NAME: &str = ".satelle-install.lock";
 const STAGED_RECEIPT_FILE_NAME: &str = ".satelle-receipt.updating";
 const PREVIOUS_RECEIPT_FILE_NAME: &str = ".satelle-receipt.previous";
 const PACKAGE_INSTALL_CONTEXT_ENV: &str = "SATELLE_PACKAGE_INSTALL_CONTEXT";
+const RELEASE_VERIFIER_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SelfUpdateRequest {
@@ -497,6 +498,9 @@ impl ReleaseSource for GithubReleaseSource {
         target: LocalTarget,
         executable_verification: ExecutableVerification,
     ) -> Result<VerifiedRelease, SelfUpdateError> {
+        // Host bootstrap is available from package-manager installations that
+        // do not own `gh`. Surface the verifier prerequisite before release I/O.
+        require_release_verifier()?;
         let archive_name = target.archive_name(version);
         let release_url = format!("{RELEASE_BASE_URL}/v{version}");
         let archive_bytes =
@@ -528,6 +532,9 @@ impl ReleaseSource for GithubReleaseSource {
         version: &str,
         target: LocalTarget,
     ) -> Result<[u8; 32], SelfUpdateError> {
+        // Planning must not advertise an applicable Host artifact when the
+        // apply phase cannot authenticate it with the canonical verifier.
+        require_release_verifier()?;
         let archive_name = target.archive_name(version);
         let release_url = format!("{RELEASE_BASE_URL}/v{version}");
         let manifest = self.download(&format!("{release_url}/SHA256SUMS"), MANIFEST_LIMIT)?;
@@ -1458,6 +1465,27 @@ fn parse_version_number(value: Option<&str>, raw: &str) -> Result<u64, SelfUpdat
         .map_err(|_| SelfUpdateError::VersionInvalid(raw.to_string()))
 }
 
+fn require_release_verifier() -> Result<(), SelfUpdateError> {
+    require_release_verifier_with(Path::new("gh"))
+}
+
+fn require_release_verifier_with(program: &Path) -> Result<(), SelfUpdateError> {
+    let mut child = Command::new(program)
+        .args(["auth", "status", "--active", "--hostname", "github.com"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| SelfUpdateError::GhUnavailable)?;
+    let status = wait_bounded(&mut child, RELEASE_VERIFIER_PREFLIGHT_TIMEOUT)
+        .map_err(|_| SelfUpdateError::GhUnavailable)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(SelfUpdateError::GhUnavailable)
+    }
+}
+
 fn verify_release_attestation(archive: &Path, version: &str) -> Result<(), SelfUpdateError> {
     let tag_ref = run_gh_line(&[
         "api",
@@ -1860,6 +1888,7 @@ impl SelfUpdateError {
             Self::ExplicitVersionRequired { .. } => ErrorCode::SelfUpdateExplicitVersionRequired,
             Self::UnsupportedLocalPlatform => ErrorCode::UnsupportedLocalPlatform,
             Self::UnsupportedReleaseTarget(_) => ErrorCode::UnsupportedReleaseTarget,
+            Self::GhUnavailable => ErrorCode::ReleaseVerifierUnavailable,
             Self::InstallLocked(_) => ErrorCode::SelfUpdateLocked,
             Self::ReceiptRollback { .. } => ErrorCode::SelfUpdateRollbackFailed,
             Self::ReceiptInvalid(_) | Self::ReceiptRead(_) => ErrorCode::SelfUpdateReceiptInvalid,
@@ -2043,6 +2072,21 @@ mod tests {
         assert_eq!(
             source.requests.into_inner(),
             [("1.2.3".to_string(), "darwin-arm64".to_string())]
+        );
+    }
+
+    #[test]
+    fn host_artifact_preflight_rejects_a_missing_release_verifier() {
+        let directory = tempdir().unwrap();
+        let missing_gh = directory.path().join("gh");
+
+        let error = require_release_verifier_with(&missing_gh)
+            .expect_err("missing gh must fail before Host artifact release I/O");
+        assert!(matches!(&error, SelfUpdateError::GhUnavailable));
+        assert_eq!(error.code(), "release-verifier-unavailable");
+        assert_eq!(
+            error.recovery_command().as_deref(),
+            Some("install and authenticate gh, then retry")
         );
     }
 

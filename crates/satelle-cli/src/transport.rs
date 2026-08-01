@@ -7878,6 +7878,19 @@ mod bootstrap_ordering_tests {
             malformed.code,
             satelle_core::ErrorCode::HostArtifactUnavailable
         );
+
+        let verifier_unavailable = map_release_artifact_error(
+            "remote",
+            "1.2.3",
+            ssh_bootstrap::RemoteTarget::DarwinArm64,
+            ssh_bootstrap::SshBootstrapError::VerifiedRelease(Box::new(
+                crate::self_update::SelfUpdateError::GhUnavailable,
+            )),
+        );
+        assert_eq!(
+            verifier_unavailable.code,
+            satelle_core::ErrorCode::ReleaseVerifierUnavailable
+        );
     }
 
     #[test]
