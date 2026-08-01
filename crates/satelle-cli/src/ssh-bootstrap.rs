@@ -2714,7 +2714,14 @@ impl<'a> PersistentServiceRemote<'a> {
         let command = offline_storage_maintenance_command(self.target, &binary, request);
         let output = self.mutate_with_output("offline_storage_maintenance", &command, None)?;
         if output.status.success() {
-            parse_offline_storage_maintenance_result(request.operation, &output.stdout)
+            if request.reconcile_completion {
+                parse_offline_storage_completion_recovery_result(
+                    request.identity.operation_id,
+                    &output.stdout,
+                )
+            } else {
+                parse_offline_storage_maintenance_result(request.operation, &output.stdout)
+            }
         } else if output.stderr.host_key_verification_failed() {
             Err(SshBootstrapError::HostKeyVerificationRequired)
         } else {
@@ -2905,6 +2912,7 @@ pub(super) struct OfflineStorageMaintenanceRequest<'a> {
     pub(super) backup: Option<&'a str>,
     pub(super) delete_recordings: bool,
     pub(super) approved_backup_file_names: &'a [String],
+    pub(super) reconcile_completion: bool,
 }
 
 fn offline_storage_maintenance_command(
@@ -2934,6 +2942,9 @@ fn offline_storage_maintenance_command(
             ));
         }
         script.push_str(" --yes");
+        if request.reconcile_completion {
+            script.push_str(" --reconcile-completion");
+        }
         powershell_encoded_command(&script)
     } else {
         let mut arguments = format!(
@@ -2957,6 +2968,9 @@ fn offline_storage_maintenance_command(
             ));
         }
         arguments.push_str(" --yes");
+        if request.reconcile_completion {
+            arguments.push_str(" --reconcile-completion");
+        }
         format!("sh -c {}", posix_quote(&format!("exec {arguments}")))
     }
 }
@@ -3479,6 +3493,32 @@ $matching=$executableIsExact -and ({definition_matches})
         operation = operation,
     );
     powershell_encoded_command(&script)
+}
+
+fn parse_offline_storage_completion_recovery_result(
+    operation_id: &str,
+    stdout: &[u8],
+) -> Result<serde_json::Value, SshBootstrapError> {
+    let value: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    let object = value
+        .as_object()
+        .ok_or(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    if object.len() == 3
+        && object
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(operation_id)
+        && object.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+        && object
+            .get("reconciled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        Ok(value)
+    } else {
+        Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)
+    }
 }
 
 #[cfg(test)]
@@ -5672,6 +5712,7 @@ mod tests {
                 backup: None,
                 delete_recordings: false,
                 approved_backup_file_names: &approved,
+                reconcile_completion: false,
             },
         );
         let windows_script =
@@ -5701,6 +5742,49 @@ mod tests {
         assert_eq!(
             restore_preview_script,
             "& 'C:\\Satelle\\satelle.exe' host offline-storage-restore-preview --state-root 'C:\\Satelle\\state' --backup 'C:\\Satelle\\state\\operator''s backup'"
+        );
+
+        let completion_recovery = offline_storage_maintenance_command(
+            RemoteTarget::DarwinArm64,
+            "/Applications/Satelle/satelle",
+            &OfflineStorageMaintenanceRequest {
+                operation: "restore",
+                identity,
+                state_root: "/Users/operator/Library/Application Support/Satelle/state",
+                backup: None,
+                delete_recordings: false,
+                approved_backup_file_names: &[],
+                reconcile_completion: true,
+            },
+        );
+        assert_eq!(
+            completion_recovery,
+            "sh -c 'exec '\"'\"'/Applications/Satelle/satelle'\"'\"' host \
+             offline-storage-maintenance --operation '\"'\"'restore'\"'\"' --host \
+             '\"'\"'remote host'\"'\"' --operation-id '\"'\"'storage-maintenance-exact'\"'\"' \
+             --state-root '\"'\"'/Users/operator/Library/Application Support/Satelle/state'\"'\"' --yes \
+             --reconcile-completion'"
+        );
+        let completion_result = serde_json::json!({
+            "operation_id": "storage-maintenance-exact",
+            "status": "completed",
+            "reconciled": true,
+        });
+        assert_eq!(
+            parse_offline_storage_completion_recovery_result(
+                "storage-maintenance-exact",
+                &serde_json::to_vec(&completion_result).expect("encode completion result"),
+            )
+            .expect("parse exact completion result"),
+            completion_result
+        );
+        assert!(
+            parse_offline_storage_completion_recovery_result(
+                "different-operation",
+                &serde_json::to_vec(&completion_result).expect("encode mismatched result"),
+            )
+            .is_err(),
+            "completion recovery must bind the exact remote operation identity"
         );
     }
 

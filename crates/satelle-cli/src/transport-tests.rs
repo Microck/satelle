@@ -87,6 +87,10 @@ fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
         completion_recovery_command,
         "completion write failed",
     );
+    let controller_recovery_command = SshStorageMaintenance::Restore
+        .completion_recovery_command("remote host", "storage-maintenance-exact");
+    let completion_failure =
+        bind_remote_storage_completion_recovery(completion_failure, &controller_recovery_command);
     let wrapped_completion_failure = storage_maintenance_partial_error(
         "remote host",
         &[
@@ -102,8 +106,36 @@ fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
     );
     assert_eq!(
         wrapped_completion_failure.recovery_command.as_deref(),
-        Some(completion_recovery_command),
-        "the remote operation-bound reconciliation command must survive wrapping"
+        Some(controller_recovery_command.as_str()),
+        "the controller recovery command must preserve the remote operation identity"
+    );
+    assert!(controller_recovery_command.contains("--host 'remote host'"));
+    assert!(controller_recovery_command.contains("--operation-id storage-maintenance-exact"));
+    assert!(!controller_recovery_command.contains("--state-root"));
+    let pending_completion = Err(bind_remote_storage_completion_recovery(
+        SatelleError::storage_maintenance_partially_applied(
+            &["restore-storage-backup".to_string()],
+            "record-storage-maintenance-ledger-completion",
+            &[],
+            completion_recovery_command,
+            "completion write failed",
+        ),
+        &controller_recovery_command,
+    ));
+    let restart_failure = storage_maintenance_partial_error(
+        "remote host",
+        &["restore-storage-backup".to_string()],
+        "restart-host-api-service",
+        &["verify-host-api-service".to_string()],
+        &recovery_command,
+        SatelleError::host_unreachable("remote host"),
+    );
+    let restart_with_pending_completion =
+        preserve_pending_storage_mutation(restart_failure, &pending_completion);
+    assert_eq!(
+        restart_with_pending_completion.recovery_command.as_deref(),
+        Some(controller_recovery_command.as_str()),
+        "a later service failure must keep the operation-bound completion command"
     );
 
     let mut remote_partial = SatelleError::storage_maintenance_partially_applied(

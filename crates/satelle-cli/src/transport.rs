@@ -3035,6 +3035,39 @@ impl SshStorageMaintenance {
             ),
         }
     }
+
+    fn completion_recovery_command(self, host: &str, operation_id: &str) -> String {
+        format!(
+            "satelle host storage-completion-recovery --host {} --operation {} \
+             --operation-id {} --no-input --yes",
+            crate::shell_argument(host),
+            self.token(),
+            crate::shell_argument(operation_id),
+        )
+    }
+}
+
+fn is_remote_storage_completion_failure(source: &SatelleError) -> bool {
+    source.code == ErrorCode::SetupPartiallyApplied
+        && source
+            .details
+            .get("failed_action")
+            .and_then(serde_json::Value::as_str)
+            == Some("record-storage-maintenance-ledger-completion")
+}
+
+fn bind_remote_storage_completion_recovery(
+    mut source: SatelleError,
+    recovery_command: &str,
+) -> SatelleError {
+    if is_remote_storage_completion_failure(&source) {
+        source.recovery_command = Some(recovery_command.to_string());
+        source.details.insert(
+            "recovery_command".to_string(),
+            serde_json::Value::String(recovery_command.to_string()),
+        );
+    }
+    source
 }
 
 fn storage_maintenance_partial_error(
@@ -3102,14 +3135,28 @@ fn copy_storage_maintenance_evidence(error: &mut SatelleError, source: &SatelleE
     }
 }
 
-fn preserve_pending_storage_mutation(
-    mut error: SatelleError,
-    mutation: &Result<serde_json::Value, SatelleError>,
-) -> SatelleError {
-    if let Err(source) = mutation {
-        copy_storage_maintenance_evidence(&mut error, source);
+fn copy_pending_storage_mutation(mut error: SatelleError, source: &SatelleError) -> SatelleError {
+    copy_storage_maintenance_evidence(&mut error, source);
+    if is_remote_storage_completion_failure(source)
+        && let Some(recovery_command) = source.recovery_command.as_ref()
+    {
+        error.recovery_command = Some(recovery_command.clone());
+        error.details.insert(
+            "recovery_command".to_string(),
+            serde_json::Value::String(recovery_command.clone()),
+        );
     }
     error
+}
+
+fn preserve_pending_storage_mutation(
+    error: SatelleError,
+    mutation: &Result<serde_json::Value, SatelleError>,
+) -> SatelleError {
+    match mutation {
+        Ok(_) => error,
+        Err(source) => copy_pending_storage_mutation(error, source),
+    }
 }
 
 pub(crate) fn preflight_ssh_storage_maintenance(host: &SelectedHost) -> Result<(), SatelleError> {
@@ -3281,7 +3328,15 @@ pub(crate) fn apply_ssh_storage_maintenance(
     backup: Option<&Path>,
     delete_recordings: bool,
     approved_backup_file_names: &[String],
+    completion_recovery_operation_id: Option<&str>,
 ) -> Result<serde_json::Value, SatelleError> {
+    if completion_recovery_operation_id.is_some()
+        && (backup.is_some() || delete_recordings || !approved_backup_file_names.is_empty())
+    {
+        return Err(SatelleError::invalid_usage(
+            "SSH storage completion recovery accepts only the exact operation identity",
+        ));
+    }
     if maintenance != SshStorageMaintenance::BackupCleanup && !approved_backup_file_names.is_empty()
     {
         return Err(SatelleError::invalid_usage(
@@ -3302,9 +3357,15 @@ pub(crate) fn apply_ssh_storage_maintenance(
         ));
     }
     let directories = transport.remote_directories(target)?;
-    let operation_id = format!("storage-maintenance-{}", Uuid::now_v7());
-    let recovery_command =
-        maintenance.recovery_command(&transport.alias, backup, delete_recordings);
+    let operation_id = completion_recovery_operation_id.map_or_else(
+        || format!("storage-maintenance-{}", Uuid::now_v7()),
+        ToString::to_string,
+    );
+    let recovery_command = if completion_recovery_operation_id.is_some() {
+        maintenance.completion_recovery_command(&transport.alias, &operation_id)
+    } else {
+        maintenance.recovery_command(&transport.alias, backup, delete_recordings)
+    };
     let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
         &transport.alias,
         transport.binding.destination(),
@@ -3397,12 +3458,15 @@ pub(crate) fn apply_ssh_storage_maintenance(
                         backup: backup.as_deref(),
                         delete_recordings,
                         approved_backup_file_names,
+                        reconcile_completion: completion_recovery_operation_id.is_some(),
                     },
                 )
                 .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error)),
             Err(error) => Err(map_ssh_daemon_bootstrap_error(&transport.alias, error)),
         }
     };
+    let mutation = mutation
+        .map_err(|source| bind_remote_storage_completion_recovery(source, &recovery_command));
     if mutation.is_ok() {
         completed_actions.push(maintenance.action_id().to_string());
     }
@@ -3525,16 +3589,17 @@ pub(crate) fn apply_ssh_storage_maintenance(
         Ok(result) => result,
         Err(source) => {
             bootstrap_lock.release_committed_handoff().map_err(|_| {
-                let mut error = storage_maintenance_partial_error(
-                    &transport.alias,
-                    &completed_actions,
-                    "release-storage-maintenance-fence",
-                    &[],
-                    &recovery_command,
-                    SatelleError::host_unreachable(&transport.alias),
-                );
-                copy_storage_maintenance_evidence(&mut error, &source);
-                error
+                copy_pending_storage_mutation(
+                    storage_maintenance_partial_error(
+                        &transport.alias,
+                        &completed_actions,
+                        "release-storage-maintenance-fence",
+                        &[],
+                        &recovery_command,
+                        SatelleError::host_unreachable(&transport.alias),
+                    ),
+                    &source,
+                )
             })?;
             return Err(storage_maintenance_partial_error(
                 &transport.alias,
