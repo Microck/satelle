@@ -2442,9 +2442,14 @@ impl RemotePersistentSetupExecution<'_> {
                 self.bootstrap_lock,
             )
             .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?;
-            remote
-                .install_current_host_artifact()
-                .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?
+            remote.install_current_host_artifact().map_err(|error| {
+                map_release_artifact_error(
+                    &self.transport.alias,
+                    env!("CARGO_PKG_VERSION"),
+                    self.target,
+                    error,
+                )
+            })?
         };
         let service = {
             let remote = ssh_bootstrap::PersistentServiceRemote::new(

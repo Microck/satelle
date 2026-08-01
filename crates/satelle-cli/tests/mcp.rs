@@ -173,11 +173,12 @@ fn run_mcp_command_until_response(
         let mut output = Vec::new();
         for line in BufReader::new(stdout).lines() {
             let line = line.expect("read MCP stdout");
-            let response: Value = serde_json::from_str(&line).expect("MCP stdout line is JSON");
             output.extend_from_slice(line.as_bytes());
             output.push(b'\n');
-            if response["id"] == response_id {
-                let _ = response_sender.send(());
+            if let Ok(response) = serde_json::from_str::<Value>(&line)
+                && response["id"] == response_id
+            {
+                let _ = response_sender.try_send(());
             }
         }
         output
