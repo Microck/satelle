@@ -4418,8 +4418,13 @@ fn run_repair(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let host = config.resolve_host(command.host.as_deref())?;
-    let mut report =
-        transport::plan_repair_upgrades(&host, command.run.as_deref()).map_err(failure)?;
+    let mut mutation_consent = command.yes;
+    let mut report = transport::plan_repair_upgrades(
+        &host,
+        command.run.as_deref(),
+        mutation_consent && !command.dry_run,
+    )
+    .map_err(failure)?;
     if command.dry_run {
         report = report.into_dry_run();
         if format.is_json() {
@@ -4479,12 +4484,14 @@ fn run_repair(
             }
             return Ok(());
         }
+        mutation_consent = true;
     }
 
     // Consent applies to one exact live plan. Re-read every Host-owned input
     // immediately before the first durable maintenance transition.
     let revalidated =
-        transport::plan_repair_upgrades(&host, command.run.as_deref()).map_err(failure)?;
+        transport::plan_repair_upgrades(&host, command.run.as_deref(), mutation_consent)
+            .map_err(failure)?;
     if revalidated != report {
         return Err(failure(SatelleError::state_conflict()));
     }
@@ -8704,10 +8711,15 @@ fn run_host_storage(
             if local_state_root.is_none() {
                 transport::preflight_ssh_storage_maintenance(&host).map_err(failure)?;
             }
-            let planned_actions = if let Some(state_root) = &local_state_root {
-                satelle_host::HostService::plan_storage_backup_cleanup(state_root)
-                    .map_err(failure)?
-                    .eligible_backup_file_names
+            let local_cleanup_plan = local_state_root
+                .as_ref()
+                .map(|state_root| {
+                    satelle_host::HostService::plan_storage_backup_cleanup(state_root)
+                        .map_err(failure)
+                })
+                .transpose()?;
+            let planned_actions = if let Some(plan) = &local_cleanup_plan {
+                plan.eligible_backup_file_names
                     .iter()
                     .map(|name| format!("delete validated migration backup {name}"))
                     .collect::<Vec<_>>()
@@ -8745,7 +8757,15 @@ fn run_host_storage(
                     "cleanup-storage-backups",
                     "Delete older validated Host storage backups",
                     &recovery_command,
-                    || satelle_host::HostService::cleanup_storage_backups_offline(state_root),
+                    || {
+                        satelle_host::HostService::cleanup_planned_storage_backups_offline(
+                            state_root,
+                            &local_cleanup_plan
+                                .as_ref()
+                                .expect("local cleanup planning produced an exact candidate set")
+                                .eligible_backup_file_names,
+                        )
+                    },
                 )?;
                 json!({"removed_backup_file_names": removed_backup_file_names})
             } else {

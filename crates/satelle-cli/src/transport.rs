@@ -5057,14 +5057,135 @@ fn host_update_recovery_pending(
 fn selected_repair_run(
     host: &SelectedHost,
     run_id: Option<&str>,
+    recovery_authorized: bool,
 ) -> Result<Option<RepairLedgerPlan>, SatelleError> {
     let Some(run_id) = run_id else {
         return Ok(None);
     };
-    transport_for(host)
-        .map_err(|failure| failure.error)?
-        .plan_setup_repair(Some(run_id), &[])
-        .map(Some)
+    let launch_policy =
+        selected_repair_initial_launch_policy(host.config.transport.clone(), Some(run_id));
+    match transport_for_with_ssh_launch_policy(host, launch_policy) {
+        Ok(transport) => transport.plan_setup_repair(Some(run_id), &[]).map(Some),
+        Err(failure)
+            if host.config.transport == TransportKind::Ssh
+                && recovery_authorized
+                && is_daemon_reachability_failure(&failure.error) =>
+        {
+            recover_selected_repair_daemon(host, run_id)?;
+            transport_for_with_ssh_launch_policy(host, SshDaemonLaunchPolicy::Never)
+                .map_err(|failure| failure.error)?
+                .plan_setup_repair(Some(run_id), &[])
+                .map(Some)
+        }
+        Err(failure) => Err(failure.error),
+    }
+}
+
+const fn selected_repair_initial_launch_policy(
+    transport: TransportKind,
+    run_id: Option<&str>,
+) -> SshDaemonLaunchPolicy {
+    if matches!(transport, TransportKind::Ssh) && run_id.is_some() {
+        SshDaemonLaunchPolicy::Never
+    } else {
+        SshDaemonLaunchPolicy::DurableOnly
+    }
+}
+
+fn recover_selected_repair_daemon(
+    host: &SelectedHost,
+    operation_id: &str,
+) -> Result<(), SatelleError> {
+    let transport = SshSetupTransport::new(host)?;
+    if transport.requires_first_trust {
+        return Err(SatelleError::ssh_host_key_verification_required(
+            &transport.alias,
+        ));
+    }
+    let target = transport.remote_target()?;
+    if target.service_platform() == DaemonServicePlatform::Linux {
+        return Err(SatelleError::persistent_service_unsupported(
+            target.service_platform().as_str(),
+        ));
+    }
+    let directories = transport.remote_directories(target)?;
+    let (durable_tunnel, durable_client) = transport.durable_service_client()?;
+    let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
+        &transport.alias,
+        transport.binding.destination(),
+        operation_id.to_string(),
+        bootstrap_lock::OperationKind::HostBinaryReplacement,
+    )?;
+
+    let relaunched = relaunch_durable_daemon_under_lock(
+        DurableRelaunchTarget {
+            host: &transport.alias,
+            expected_host_identity: transport.binding.expected_host_identity().as_str(),
+        },
+        &mut bootstrap_lock,
+        |lock| confirm_bootstrap_lock(&transport.alias, lock),
+        || observe_remote_durable_readiness(durable_client.capabilities()),
+        |lock| {
+            let mut remote = ssh_bootstrap::PersistentServiceRemote::new(
+                transport.binding.destination(),
+                target,
+                &directories,
+                lock,
+            )
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?;
+            let expected_host_id = transport.binding.expected_host_identity().to_string();
+            remote
+                .observe_canonical_daemon_path_overrides(&expected_host_id)
+                .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?;
+            let windows_task = if target.service_platform() == DaemonServicePlatform::Windows {
+                Some(
+                    remote
+                        .current_windows_task_definition(&expected_host_id)
+                        .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?,
+                )
+            } else {
+                None
+            };
+            match target.service_platform() {
+                DaemonServicePlatform::Windows => remote.restart_current_windows_task(
+                    windows_task
+                        .as_ref()
+                        .expect("Windows recovery preflight provides an exact task"),
+                ),
+                DaemonServicePlatform::Macos => remote.restart_launchd(),
+                DaemonServicePlatform::Linux => unreachable!("Linux recovery is rejected"),
+            }
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?;
+            wait_for_service_observation(
+                &transport.alias,
+                || match target.service_platform() {
+                    DaemonServicePlatform::Windows => remote.observe_current_windows_task(
+                        windows_task
+                            .as_ref()
+                            .expect("Windows recovery preflight provides an exact task"),
+                    ),
+                    DaemonServicePlatform::Macos => remote.observe_launchd_runtime(),
+                    DaemonServicePlatform::Linux => unreachable!("Linux recovery is rejected"),
+                },
+                ssh_bootstrap::PersistentServiceObservation::Running,
+            )
+        },
+        || observe_remote_durable_readiness(durable_client.capabilities()),
+        Instant::now() + SSH_DAEMON_LAUNCH_TIMEOUT,
+    )?;
+    if relaunched {
+        commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock)?;
+        bootstrap_lock
+            .release_committed_handoff()
+            .map_err(|_| SatelleError::host_unreachable(&transport.alias))?;
+    } else {
+        bootstrap_lock
+            .release_unmodified()
+            .map_err(|_| SatelleError::host_unreachable(&transport.alias))?;
+    }
+    drop(durable_client);
+    drop(durable_tunnel);
+    Ok(())
 }
 
 fn selected_host_replacement_operation(
@@ -5095,12 +5216,13 @@ fn selected_host_replacement_operation(
 pub(crate) fn plan_repair_upgrades(
     host: &SelectedHost,
     run_id: Option<&str>,
+    recovery_authorized: bool,
 ) -> Result<satelle_core::host_update::RepairUpgradeReport, SatelleError> {
     use satelle_core::host_update::{
         HostUpdateTarget, HostUpdateVersionSource, RepairCompatibilityReason,
     };
 
-    let selected_run = selected_repair_run(host, run_id)?;
+    let selected_run = selected_repair_run(host, run_id, recovery_authorized)?;
     let resumes_host_replacement =
         selected_host_replacement_operation(selected_run.as_ref()).is_some();
     let target_version = if resumes_host_replacement {
@@ -5304,7 +5426,7 @@ pub(crate) fn apply_repair_upgrades(
     if !repair.requires_mutation() {
         return Ok(repair);
     }
-    let selected_run = selected_repair_run(host, recovery_run_id)?;
+    let selected_run = selected_repair_run(host, recovery_run_id, false)?;
     let resumed_operation = selected_host_replacement_operation(selected_run.as_ref());
     let recovery_identity = resumed_operation
         .is_some()
@@ -6977,28 +7099,42 @@ fn authenticate_durable_with_confirmation(
     }
 }
 
-#[cfg(test)]
-fn relaunch_durable_daemon_under_lock(
-    host: &str,
-    expected_host_identity: &str,
-    mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
+#[derive(Clone, Copy)]
+struct DurableRelaunchTarget<'a> {
+    host: &'a str,
+    expected_host_identity: &'a str,
+}
+
+fn relaunch_durable_daemon_under_lock<C>(
+    target: DurableRelaunchTarget<'_>,
+    context: &mut C,
+    mut confirm_lock_ownership: impl FnMut(&mut C) -> Result<(), SatelleError>,
     initial_readiness: impl FnOnce() -> DurableReadinessObservation,
-    launch: impl FnOnce() -> Result<(), SatelleError>,
+    launch: impl FnOnce(&mut C) -> Result<(), SatelleError>,
     final_readiness: impl FnMut() -> DurableReadinessObservation,
+    deadline: Instant,
 ) -> Result<bool, SatelleError> {
-    match probe_durable_daemon_under_lock(host, &mut confirm_lock_ownership, initial_readiness)? {
+    match probe_durable_daemon_under_lock(
+        target.host,
+        || confirm_lock_ownership(context),
+        initial_readiness,
+    )? {
         DurableDaemonProbe::Ready(readiness) => {
-            require_exact_durable_readiness(host, expected_host_identity, &readiness)?;
+            require_exact_durable_readiness(
+                target.host,
+                target.expected_host_identity,
+                &readiness,
+            )?;
             Ok(false)
         }
         DurableDaemonProbe::Missing => {
-            launch()?;
+            launch(context)?;
             authenticate_durable_with_confirmation(
-                host,
-                expected_host_identity,
-                confirm_lock_ownership,
+                target.host,
+                target.expected_host_identity,
+                || confirm_lock_ownership(context),
                 final_readiness,
-                Instant::now(),
+                deadline,
             )?;
             Ok(true)
         }

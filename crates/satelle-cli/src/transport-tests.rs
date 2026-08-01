@@ -5077,6 +5077,22 @@ fn durable_ssh_relaunch_policy_covers_read_and_stop_without_credential_bootstrap
 }
 
 #[test]
+fn selected_repair_run_checks_the_daemon_before_operation_bound_recovery() {
+    assert_eq!(
+        SshDaemonLaunchPolicy::Never,
+        selected_repair_initial_launch_policy(TransportKind::Ssh, Some("host-update-run"))
+    );
+    assert_eq!(
+        SshDaemonLaunchPolicy::DurableOnly,
+        selected_repair_initial_launch_policy(TransportKind::Ssh, None)
+    );
+    assert_eq!(
+        SshDaemonLaunchPolicy::DurableOnly,
+        selected_repair_initial_launch_policy(TransportKind::Local, Some("local-run"))
+    );
+}
+
+#[test]
 fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
     #[derive(Clone, Copy)]
     enum FixtureReadiness {
@@ -5151,9 +5167,12 @@ fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
         let events = std::cell::RefCell::new(Vec::new());
         let confirmations = std::cell::Cell::new(0_u8);
         let outcome = relaunch_durable_daemon_under_lock(
-            "remote",
-            "host-exact",
-            || {
+            DurableRelaunchTarget {
+                host: "remote",
+                expected_host_identity: "host-exact",
+            },
+            &mut (),
+            |_| {
                 assert!(held.load(Ordering::SeqCst));
                 let confirmation = confirmations.get();
                 confirmations.set(confirmation + 1);
@@ -5170,7 +5189,7 @@ fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
                 events.borrow_mut().push("initial-readiness");
                 observe_remote_durable_readiness(raw_readiness(initial))
             },
-            || {
+            |_| {
                 events.borrow_mut().push("launch");
                 events.borrow_mut().push("bootstrap-authenticated");
                 Ok(())
@@ -5179,6 +5198,7 @@ fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
                 events.borrow_mut().push("durable-readiness");
                 observe_remote_durable_readiness(raw_readiness(final_readiness))
             },
+            Instant::now(),
         );
         match expected_error {
             None => {

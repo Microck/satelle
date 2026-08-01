@@ -2237,7 +2237,7 @@ pub(super) fn cleanup_migration_backups(
     state_root: &Path,
     state_directory: &StateDirectory,
 ) -> Result<Vec<String>, StorageError> {
-    cleanup_migration_backups_with_hook(state_root, state_directory, |_| Ok(()))
+    cleanup_migration_backups_with_hook(state_root, state_directory, None, |_| Ok(()))
 }
 
 fn logical_backup_file_name(key: &CleanupTombstoneKey) -> String {
@@ -2301,6 +2301,20 @@ pub(super) fn cleanup_migration_backups_offline(
     let state_directory = prepare_state_root(state_root)?;
     let _ownership = acquire_ownership_lock(&state_directory)?;
     cleanup_migration_backups(state_root, &state_directory)
+}
+
+pub(super) fn cleanup_migration_backups_offline_exact(
+    state_root: &Path,
+    approved_backup_file_names: &[String],
+) -> Result<Vec<String>, StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    let _ownership = acquire_ownership_lock(&state_directory)?;
+    cleanup_migration_backups_with_hook(
+        state_root,
+        &state_directory,
+        Some(approved_backup_file_names),
+        |_| Ok(()),
+    )
 }
 
 pub(crate) struct OfflineStoreReset {
@@ -2638,6 +2652,7 @@ fn resume_cleanup_tombstones(
 fn cleanup_migration_backups_with_hook(
     state_root: &Path,
     state_directory: &StateDirectory,
+    approved_backup_file_names: Option<&[String]>,
     mut hook: impl FnMut(CleanupStep) -> Result<(), StorageError>,
 ) -> Result<Vec<String>, StorageError> {
     let mut removed = Vec::new();
@@ -2645,7 +2660,16 @@ fn cleanup_migration_backups_with_hook(
 
     let validated = list_validated_migration_backups(state_root, state_directory)?;
     let delete_count = validated.len().saturating_sub(2);
-    for backup in validated.into_iter().take(delete_count) {
+    let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
+    if approved_backup_file_names.is_some_and(|approved| {
+        !candidates
+            .iter()
+            .map(|backup| backup.backup_file_name.as_str())
+            .eq(approved.iter().map(String::as_str))
+    }) {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    for backup in candidates {
         let fresh =
             validate_migration_backup(state_root, state_directory, &backup.backup_file_name)?;
         if fresh.token != backup.token {

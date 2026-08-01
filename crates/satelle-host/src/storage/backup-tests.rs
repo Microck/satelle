@@ -1199,6 +1199,34 @@ fn cleanup_retains_the_newest_validated_backup_and_one_previous_backup() {
 }
 
 #[test]
+fn cleanup_rejects_a_candidate_set_that_changed_after_consent() {
+    let fixture = BackupFixture::new(3);
+    let approved = plan_migration_backup_cleanup(&fixture.state_root)
+        .expect("plan initial cleanup candidates");
+    assert_eq!(vec![fixture.backup_file_names[0].clone()], approved);
+
+    let (connection, ownership_lock, state_directory) =
+        open_parts(&fixture.state_root).expect("open fixture store");
+    create_migration_backup(
+        &connection,
+        &fixture.state_root,
+        &state_directory,
+        MIGRATIONS.last().expect("migration registry").version,
+    )
+    .expect("create a backup after consent");
+    drop(connection);
+    drop(ownership_lock);
+    drop(state_directory);
+    let files_before = existing_files(&fixture.state_root);
+
+    let error = cleanup_migration_backups_offline_exact(&fixture.state_root, &approved)
+        .expect_err("reject cleanup when the eligible set changed after consent");
+
+    assert_eq!(StorageErrorKind::StateConflict, error.kind());
+    assert_eq!(files_before, existing_files(&fixture.state_root));
+}
+
+#[test]
 fn cleanup_never_deletes_the_only_valid_restore_point() {
     let fixture = BackupFixture::new(1);
     let state_directory = fixture.state_directory();
@@ -1220,7 +1248,7 @@ fn cleanup_identity_swap_never_deletes_the_replacement() {
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::CandidateValidated {
                 fs::rename(fixture.state_root.join(&oldest), &swapped_out)
                     .expect("move cleanup candidate aside");
@@ -1266,7 +1294,7 @@ fn cleanup_inside_quarantine_race_preserves_the_replacement() {
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BeforeBackupQuarantineMove {
                 fs::rename(fixture.state_root.join(&oldest), &swapped_out)
                     .expect("move selected backup inside quarantine primitive");
@@ -1304,7 +1332,7 @@ fn cleanup_second_quarantine_move_failure_restores_the_selected_pair() {
     let mut blocking_manifest_tombstone = None;
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BeforeManifestQuarantineMove {
                 let backup_tombstone = cleanup_tombstone_names(&fixture)
                     .into_iter()
@@ -1354,7 +1382,7 @@ fn cleanup_interruption_after_first_quarantine_is_retryable() {
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BackupQuarantined {
                 Err(StorageError::for_test(StorageErrorKind::OperationFailed))
             } else {
@@ -1400,7 +1428,7 @@ fn backup_only_recovery_refuses_to_borrow_a_canonical_replacement_manifest() {
     let manifest_bytes = fs::read(fixture.manifest_path(&oldest)).expect("read oldest manifest");
     let state_directory = fixture.state_directory();
 
-    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
         if step == CleanupStep::BackupQuarantined {
             Err(StorageError::for_test(StorageErrorKind::OperationFailed))
         } else {
@@ -1444,7 +1472,7 @@ fn cleanup_first_delete_failure_keeps_a_retryable_quarantined_pair() {
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BeforeBackupDelete {
                 Err(StorageError::for_test(StorageErrorKind::OperationFailed))
             } else {
@@ -1496,7 +1524,7 @@ fn cleanup_second_delete_failure_leaves_only_a_verified_manifest_tombstone_for_r
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BeforeManifestDelete {
                 Err(StorageError::for_test(StorageErrorKind::OperationFailed))
             } else {
@@ -1538,7 +1566,7 @@ fn cleanup_retry_recovers_an_asymmetric_durable_deleting_state() {
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BackupDeleteCommitted {
                 Err(StorageError::for_test(StorageErrorKind::OperationFailed))
             } else {
@@ -1614,7 +1642,7 @@ fn windows_cleanup_uses_real_write_through_and_handle_delete_primitives() {
     let mut deleting_names = Vec::new();
 
     let removed =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if matches!(
                 step,
                 CleanupStep::BackupDeleteCommitted | CleanupStep::ManifestDeleteCommitted

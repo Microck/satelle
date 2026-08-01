@@ -86,6 +86,13 @@ pub(crate) fn cleanup_migration_backups_offline(
     open::cleanup_migration_backups_offline(state_root)
 }
 
+pub(crate) fn cleanup_migration_backups_offline_exact(
+    state_root: &std::path::Path,
+    approved_backup_file_names: &[String],
+) -> Result<Vec<String>, StorageError> {
+    open::cleanup_migration_backups_offline_exact(state_root, approved_backup_file_names)
+}
+
 pub(crate) fn begin_store_reset_offline(
     state_root: &std::path::Path,
 ) -> Result<open::OfflineStoreReset, StorageError> {

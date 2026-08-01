@@ -1668,6 +1668,14 @@ impl HostService {
         storage::cleanup_migration_backups_offline(state_root).map_err(runtime::storage_failure)
     }
 
+    pub fn cleanup_planned_storage_backups_offline(
+        state_root: &std::path::Path,
+        approved_backup_file_names: &[String],
+    ) -> Result<Vec<String>, SatelleError> {
+        storage::cleanup_migration_backups_offline_exact(state_root, approved_backup_file_names)
+            .map_err(runtime::storage_failure)
+    }
+
     pub fn reset_store_metadata_offline(
         state_root: &std::path::Path,
         delete_recordings: bool,
