@@ -95,6 +95,40 @@ fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
 }
 
 #[test]
+fn cleanup_retries_only_classify_a_connect_failure_as_service_recovery() {
+    assert!(
+        !classify_storage_service_recovery(
+            "remote",
+            Err(DaemonClientError::ProtocolResponseMismatch)
+        )
+        .expect("a protocol response proves the service is running")
+    );
+
+    let connect_failure = reqwest::blocking::Client::new()
+        .get("http://127.0.0.1:0")
+        .send()
+        .expect_err("closed loopback endpoint creates a connect error");
+    assert!(
+        classify_storage_service_recovery(
+            "remote",
+            Err(DaemonClientError::Transport(connect_failure))
+        )
+        .expect("a stopped service requires recovery")
+    );
+
+    let invalid_request = reqwest::blocking::Client::new()
+        .get("not a valid URL")
+        .build()
+        .expect_err("invalid URL creates a non-connect transport error");
+    let error = classify_storage_service_recovery(
+        "remote",
+        Err(DaemonClientError::Transport(invalid_request)),
+    )
+    .expect_err("an unproven transport failure remains blocking");
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+}
+
+#[test]
 fn active_host_replacements_resume_with_the_selected_operation_kind() {
     let selected = |operation_kind, run_status| RepairLedgerPlan {
         available: true,

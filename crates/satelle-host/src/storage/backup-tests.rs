@@ -1,6 +1,7 @@
 use super::*;
 use std::error::Error as _;
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -1046,6 +1047,96 @@ fn interruption_before_replacement_leaves_a_recoverable_store() {
 }
 
 #[test]
+fn startup_reconciles_an_interrupted_restore_before_create_if_missing() {
+    let fixture = BackupFixture::new(1);
+    let connection =
+        Connection::open(fixture.state_root.join(DATABASE_FILE_NAME)).expect("open active store");
+    connection
+        .execute_batch("CREATE TABLE restore_recovery_sentinel (id INTEGER PRIMARY KEY);")
+        .expect("mark the active store after the backup");
+    drop(connection);
+
+    let state_directory = fixture.state_directory();
+    let validated = validate_migration_backup(
+        &fixture.state_root,
+        &state_directory,
+        fixture.backup_file_name(),
+    )
+    .expect("validate backup");
+    let interrupted = catch_unwind(AssertUnwindSafe(|| {
+        let _ = activate_migration_backup_with_hook(
+            &fixture.state_root,
+            &state_directory,
+            &validated,
+            |step| {
+                if step == ActivationStep::RecoveryStateDurable {
+                    panic!("simulate process stop between restore renames");
+                }
+                Ok(())
+            },
+        );
+    }));
+    assert!(interrupted.is_err());
+    assert!(!fixture.state_root.join(DATABASE_FILE_NAME).exists());
+    assert!(
+        fixture
+            .state_root
+            .join(RESTORE_ACTIVATION_JOURNAL)
+            .is_file()
+    );
+    drop(state_directory);
+
+    let (connection, ownership, state_directory) =
+        open_parts(&fixture.state_root).expect("startup reconciles the interrupted restore");
+    let sentinel_exists = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'restore_recovery_sentinel')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .expect("query prior active store");
+    assert!(sentinel_exists);
+    assert!(!fixture.state_root.join(RESTORE_ACTIVATION_JOURNAL).exists());
+    drop(connection);
+    drop(ownership);
+    drop(state_directory);
+}
+
+#[test]
+fn store_reset_reconciles_an_interrupted_restore_before_deleting_metadata() {
+    let fixture = BackupFixture::new(1);
+    let state_directory = fixture.state_directory();
+    let validated = validate_migration_backup(
+        &fixture.state_root,
+        &state_directory,
+        fixture.backup_file_name(),
+    )
+    .expect("validate backup");
+    let interrupted = catch_unwind(AssertUnwindSafe(|| {
+        let _ = activate_migration_backup_with_hook(
+            &fixture.state_root,
+            &state_directory,
+            &validated,
+            |step| {
+                if step == ActivationStep::RecoveryStateDurable {
+                    panic!("simulate process stop before store reset");
+                }
+                Ok(())
+            },
+        );
+    }));
+    assert!(interrupted.is_err());
+    assert!(!fixture.state_root.join(DATABASE_FILE_NAME).exists());
+    drop(state_directory);
+
+    let reset = begin_store_reset_offline(&fixture.state_root)
+        .expect("reset reconciles the interrupted restore");
+    let removed = reset.reset_metadata().expect("reset reconciled metadata");
+    assert!(removed.iter().any(|name| name == DATABASE_FILE_NAME));
+    assert!(!fixture.state_root.join(RESTORE_ACTIVATION_JOURNAL).exists());
+}
+
+#[test]
 fn interruption_after_replacement_leaves_both_active_and_failed_stores_recoverable() {
     let fixture = BackupFixture::new(1);
     let failed_store: &[u8] = b"store before post-replacement interruption";
@@ -1093,6 +1184,20 @@ fn interruption_after_replacement_leaves_both_active_and_failed_stores_recoverab
         fixture.backup_file_name(),
     )
     .expect("source restore point remains valid");
+    assert!(
+        fixture
+            .state_root
+            .join(RESTORE_ACTIVATION_JOURNAL)
+            .is_file()
+    );
+    drop(state_directory);
+
+    let (connection, ownership, state_directory) =
+        open_parts(&fixture.state_root).expect("startup accepts the durable restored store");
+    assert!(!fixture.state_root.join(RESTORE_ACTIVATION_JOURNAL).exists());
+    drop(connection);
+    drop(ownership);
+    drop(state_directory);
 }
 
 fn existing_files(path: &Path) -> Vec<String> {

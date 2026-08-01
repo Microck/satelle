@@ -3084,7 +3084,7 @@ pub(crate) fn preflight_ssh_storage_maintenance(host: &SelectedHost) -> Result<(
 
 pub(crate) fn plan_ssh_storage_backup_cleanup(
     host: &SelectedHost,
-) -> Result<satelle_host::StorageBackupCleanupPlan, SatelleError> {
+) -> Result<(satelle_host::StorageBackupCleanupPlan, bool), SatelleError> {
     let transport = SshSetupTransport::new(host)?;
     if transport.requires_first_trust {
         return Err(SatelleError::invalid_usage(format!(
@@ -3099,6 +3099,13 @@ pub(crate) fn plan_ssh_storage_backup_cleanup(
         ));
     }
     let directories = transport.remote_directories(target)?;
+    let service_recovery_required = match transport.durable_service_client() {
+        Ok((_tunnel, client)) => {
+            classify_storage_service_recovery(&transport.alias, client.capabilities())?
+        }
+        Err(error) if error.code == ErrorCode::HostUnreachable => true,
+        Err(error) => return Err(error),
+    };
     let path_overrides = DaemonPathOverrides {
         home: host.config.daemon_home.clone(),
         config_file: host.config.daemon_config_file.clone(),
@@ -3131,9 +3138,31 @@ pub(crate) fn plan_ssh_storage_backup_cleanup(
         &state_root,
     )
     .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?;
-    Ok(satelle_host::StorageBackupCleanupPlan {
-        eligible_backup_file_names,
-    })
+    Ok((
+        satelle_host::StorageBackupCleanupPlan {
+            eligible_backup_file_names,
+        },
+        service_recovery_required,
+    ))
+}
+
+fn classify_storage_service_recovery(
+    alias: &str,
+    response: Result<satelle_transport::CapabilitiesResponse, DaemonClientError>,
+) -> Result<bool, SatelleError> {
+    match response {
+        Ok(_) => Ok(false),
+        Err(DaemonClientError::ProtocolResponseMismatch) => Ok(false),
+        Err(DaemonClientError::Api { status: _, error })
+            if error.code() == ApiErrorCode::IncompatibleProtocol =>
+        {
+            Ok(false)
+        }
+        Err(DaemonClientError::Transport(error)) if error.is_connect() || error.is_timeout() => {
+            Ok(true)
+        }
+        Err(error) => Err(direct_transport_error(alias, error)),
+    }
 }
 
 pub(crate) fn apply_ssh_storage_maintenance(

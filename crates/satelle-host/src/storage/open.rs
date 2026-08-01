@@ -44,6 +44,8 @@ pub(super) const PROTECTED_FILE_NAMES: [&str; 5] = [
 ];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
+const RESTORE_ACTIVATION_JOURNAL: &str = ".satelle-restore-activation-v1";
+const RESTORE_ACTIVATION_JOURNAL_LIMIT: usize = 64 * 1024;
 const MIGRATIONS: [Migration; 14] = [
     Migration {
         version: 1,
@@ -172,7 +174,7 @@ struct MigrationBackupName {
     backup_id: Uuid,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct LeafIdentity {
     #[cfg(unix)]
     device: u64,
@@ -561,6 +563,7 @@ pub(super) fn open_parts_with_locked_preflight(
     let state_directory = prepare_state_root(state_root)?;
     preflight_protected_files(&state_directory)?;
     let ownership_lock = acquire_ownership_lock(&state_directory)?;
+    reconcile_restore_activation(state_root, &state_directory)?;
     locked_preflight(&state_directory)?;
     // Pre-create and permission the database through the pinned state
     // directory. Existing SQLite sidecars were checked before this point, so
@@ -1857,11 +1860,58 @@ fn remove_private_leaf_checked(
     Ok(removed)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct MovedActiveSidecar {
     active_file_name: String,
     failed_file_name: String,
     identity: LeafIdentity,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreActivationJournal {
+    schema_version: u32,
+    activation_id: String,
+    backup_file_name: String,
+    manifest_file_name: String,
+    staged_file_name: String,
+    failed_store_file_name: String,
+    staged_token: JournalRestorePointToken,
+    failed_store_identity: LeafIdentity,
+    moved_sidecars: Vec<MovedActiveSidecar>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JournalRestorePointToken {
+    backup_id: String,
+    schema_version: i64,
+    source_database_digest: String,
+    manifest_digest: String,
+    backup_identity: LeafIdentity,
+    manifest_identity: LeafIdentity,
+}
+
+impl JournalRestorePointToken {
+    fn from_token(token: &RestorePointToken) -> Self {
+        Self {
+            backup_id: token.backup_id.to_string(),
+            schema_version: token.schema_version,
+            source_database_digest: token.source_database_digest.clone(),
+            manifest_digest: token.manifest_digest.clone(),
+            backup_identity: token.backup_identity,
+            manifest_identity: token.manifest_identity,
+        }
+    }
+
+    fn matches(&self, token: &RestorePointToken) -> bool {
+        self.backup_id == token.backup_id.to_string()
+            && self.schema_version == token.schema_version
+            && self.source_database_digest == token.source_database_digest
+            && self.manifest_digest == token.manifest_digest
+            && self.backup_identity == token.backup_identity
+            && self.manifest_identity == token.manifest_identity
+    }
 }
 
 #[derive(Debug)]
@@ -1972,6 +2022,154 @@ fn restore_prior_active_sidecars(
     recovery_errors
 }
 
+fn validate_restore_activation_journal(
+    journal: &RestoreActivationJournal,
+) -> Result<(), StorageError> {
+    let activation_id = Uuid::parse_str(&journal.activation_id)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    let backup_name = parse_migration_backup_file_name(&journal.backup_file_name)
+        .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    let backup_id = Uuid::parse_str(&journal.staged_token.backup_id)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    if journal.schema_version != 1
+        || journal.activation_id != activation_id.to_string()
+        || backup_id != backup_name.backup_id
+        || journal.staged_token.schema_version != backup_name.schema_version
+        || journal.staged_file_name
+            != format!("satelle.sqlite3.restore-{}.staged", journal.activation_id)
+        || journal.failed_store_file_name
+            != format!("satelle.sqlite3.failed-{}.sqlite3", journal.activation_id)
+        || journal.manifest_file_name != format!("{}.json", journal.backup_file_name)
+    {
+        return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+    }
+
+    let mut expected_sidecars = PROTECTED_FILE_NAMES[2..].iter();
+    for sidecar in &journal.moved_sidecars {
+        if expected_sidecars
+            .find(|name| **name == sidecar.active_file_name)
+            .is_none()
+            || sidecar.failed_file_name
+                != format!(
+                    "{}{}",
+                    journal.failed_store_file_name,
+                    &sidecar.active_file_name[DATABASE_FILE_NAME.len()..]
+                )
+        {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+    }
+    Ok(())
+}
+
+fn read_restore_activation_journal(
+    state_directory: &StateDirectory,
+) -> Result<Option<RestoreActivationJournal>, StorageError> {
+    let Some(encoded) = state_directory
+        .read_private_leaf_bounded(RESTORE_ACTIVATION_JOURNAL, RESTORE_ACTIVATION_JOURNAL_LIMIT)?
+    else {
+        return Ok(None);
+    };
+    let journal =
+        serde_json::from_slice::<RestoreActivationJournal>(&encoded).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::InvalidStoredState, source)
+        })?;
+    validate_restore_activation_journal(&journal)?;
+    Ok(Some(journal))
+}
+
+fn create_restore_activation_journal(
+    state_directory: &StateDirectory,
+    journal: &RestoreActivationJournal,
+) -> Result<(), StorageError> {
+    validate_restore_activation_journal(journal)?;
+    let encoded = serde_json::to_vec(journal)
+        .map_err(|source| StorageError::with_source(StorageErrorKind::OperationFailed, source))?;
+    state_directory.create_private_leaf_durable(RESTORE_ACTIVATION_JOURNAL, &encoded)
+}
+
+fn delete_exact_staged_restore(
+    state_directory: &StateDirectory,
+    journal: &RestoreActivationJournal,
+) -> Result<(), StorageError> {
+    match open_private_leaf_identity(state_directory, &journal.staged_file_name)? {
+        Some(identity) if identity == journal.staged_token.backup_identity => {
+            if !remove_private_leaf_checked(state_directory, &journal.staged_file_name, identity)? {
+                return Err(StorageError::new(StorageErrorKind::StateConflict));
+            }
+        }
+        None => {}
+        Some(_) => return Err(StorageError::new(StorageErrorKind::StateConflict)),
+    }
+    Ok(())
+}
+
+/// Reconciles the only crash window where the canonical SQLite name can be
+/// absent. This runs under the ownership lock before create-if-missing can
+/// turn that absence into a new empty store.
+fn reconcile_restore_activation(
+    state_root: &Path,
+    state_directory: &StateDirectory,
+) -> Result<(), StorageError> {
+    let Some(journal) = read_restore_activation_journal(state_directory)? else {
+        return Ok(());
+    };
+    let active_identity = open_private_leaf_identity(state_directory, DATABASE_FILE_NAME)?;
+    let failed_identity =
+        open_private_leaf_identity(state_directory, &journal.failed_store_file_name)?;
+
+    if active_identity == Some(journal.staged_token.backup_identity)
+        && failed_identity == Some(journal.failed_store_identity)
+    {
+        for sidecar in &journal.moved_sidecars {
+            if open_private_leaf_identity(state_directory, &sidecar.active_file_name)?.is_some()
+                || open_private_leaf_identity(state_directory, &sidecar.failed_file_name)?
+                    != Some(sidecar.identity)
+            {
+                return Err(StorageError::new(StorageErrorKind::StateConflict));
+            }
+        }
+        let installed = validate_migration_backup_at(
+            state_root,
+            state_directory,
+            &journal.backup_file_name,
+            DATABASE_FILE_NAME,
+            &journal.manifest_file_name,
+        )?;
+        if !journal.staged_token.matches(&installed.token) {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        state_directory.delete_private_leaf_durable(RESTORE_ACTIVATION_JOURNAL)?;
+        return Ok(());
+    }
+
+    match (active_identity, failed_identity) {
+        (Some(active), None) if active == journal.failed_store_identity => {}
+        (None, Some(failed)) if failed == journal.failed_store_identity => {
+            move_private_leaf_durable(
+                state_directory,
+                &journal.failed_store_file_name,
+                DATABASE_FILE_NAME,
+                journal.failed_store_identity,
+            )?;
+        }
+        _ => return Err(StorageError::new(StorageErrorKind::StateConflict)),
+    }
+    let recovery_errors = restore_prior_active_sidecars(state_directory, &journal.moved_sidecars);
+    if !recovery_errors.is_empty() {
+        return Err(StorageError::with_source(
+            StorageErrorKind::OperationFailed,
+            ActivationRecoveryError {
+                trigger: StorageError::new(StorageErrorKind::OperationFailed),
+                recovery_errors,
+            },
+        ));
+    }
+    delete_exact_staged_restore(state_directory, &journal)?;
+    state_directory.delete_private_leaf_durable(RESTORE_ACTIVATION_JOURNAL)?;
+    Ok(())
+}
+
 fn same_restore_content_and_manifest(
     left: &ValidatedMigrationBackup,
     right: &ValidatedMigrationBackup,
@@ -2008,6 +2206,7 @@ fn activate_migration_backup_with_hook(
     backup: &ValidatedMigrationBackup,
     mut hook: impl FnMut(ActivationStep) -> Result<(), StorageError>,
 ) -> Result<RestoreActivation, StorageError> {
+    reconcile_restore_activation(state_root, state_directory)?;
     // Consent and guard acquisition may happen after initial validation. Check
     // the named restore point again at the mutation boundary so a changed file
     // cannot inherit an earlier validation result.
@@ -2040,7 +2239,7 @@ fn activate_migration_backup_with_hook(
     hook(ActivationStep::StagedValidated)?;
 
     let mut moved_sidecars = Vec::new();
-    for (sidecar_index, sidecar_file_name) in PROTECTED_FILE_NAMES[2..].iter().enumerate() {
+    for sidecar_file_name in &PROTECTED_FILE_NAMES[2..] {
         let identity = match open_private_leaf_identity(state_directory, sidecar_file_name) {
             Ok(Some(identity)) => identity,
             Ok(None) => continue,
@@ -2062,14 +2261,36 @@ fn activate_migration_backup_with_hook(
             failed_file_name: failed_sidecar_file_name,
             identity,
         });
-        let moved_sidecar = moved_sidecars
-            .last()
-            .expect("the sidecar move was registered");
+    }
+    let failed_store_identity = open_private_leaf_identity(state_directory, DATABASE_FILE_NAME)?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+    if open_private_leaf_identity(state_directory, &failed_store_file_name)?.is_some() {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    for sidecar in &moved_sidecars {
+        if open_private_leaf_identity(state_directory, &sidecar.failed_file_name)?.is_some() {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+    }
+    let journal = RestoreActivationJournal {
+        schema_version: 1,
+        activation_id: activation_id.to_string(),
+        backup_file_name: backup.backup_file_name.clone(),
+        manifest_file_name: backup.manifest_file_name.clone(),
+        staged_file_name: staged_file_name.clone(),
+        failed_store_file_name: failed_store_file_name.clone(),
+        staged_token: JournalRestorePointToken::from_token(&staged.token),
+        failed_store_identity,
+        moved_sidecars: moved_sidecars.clone(),
+    };
+    create_restore_activation_journal(state_directory, &journal)?;
+
+    for (sidecar_index, moved_sidecar) in moved_sidecars.iter().enumerate() {
         if let Err(error) = move_private_leaf_durable_with_hooks(
             state_directory,
             &moved_sidecar.active_file_name,
             &moved_sidecar.failed_file_name,
-            identity,
+            moved_sidecar.identity,
             || Ok(()),
             || hook(ActivationStep::SidecarRenamedBeforeSync(sidecar_index)),
         ) {
@@ -2116,22 +2337,6 @@ fn activate_migration_backup_with_hook(
 
     // Remove the prior active name without overwriting it. From this point
     // until installation succeeds, every error restores this exact object.
-    let failed_store_identity =
-        match open_private_leaf_identity(state_directory, DATABASE_FILE_NAME) {
-            Ok(Some(identity)) => identity,
-            Ok(None) => {
-                return Err(activation_error_after_recovery(
-                    StorageError::new(StorageErrorKind::StateConflict),
-                    restore_prior_active_sidecars(state_directory, &moved_sidecars),
-                ));
-            }
-            Err(error) => {
-                return Err(activation_error_after_recovery(
-                    error,
-                    restore_prior_active_sidecars(state_directory, &moved_sidecars),
-                ));
-            }
-        };
     if let Err(error) = move_private_leaf_durable(
         state_directory,
         DATABASE_FILE_NAME,
@@ -2217,6 +2422,7 @@ fn activate_migration_backup_with_hook(
         }
     }
     hook(ActivationStep::ReplacementDurable)?;
+    state_directory.delete_private_leaf_durable(RESTORE_ACTIVATION_JOURNAL)?;
 
     Ok(RestoreActivation {
         failed_store_file_name,
@@ -2471,6 +2677,7 @@ pub(super) fn begin_store_reset_offline(
 ) -> Result<OfflineStoreReset, StorageError> {
     let state_directory = prepare_state_root(state_root)?;
     let ownership = acquire_ownership_lock(&state_directory)?;
+    reconcile_restore_activation(state_root, &state_directory)?;
     Ok(OfflineStoreReset {
         state_directory,
         _ownership: ownership,

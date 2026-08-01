@@ -2297,6 +2297,15 @@ mod history_target_tests {
     }
 }
 
+#[test]
+fn empty_remote_cleanup_plan_retains_interrupted_service_recovery() {
+    assert!(storage_backup_cleanup_actions(&[], false).is_empty());
+    assert_eq!(
+        storage_backup_cleanup_actions(&[], true),
+        ["restart and verify the unavailable Host API service"]
+    );
+}
+
 fn canonical_history_session_id(value: &str) -> Option<String> {
     SessionId::from_str(value)
         .ok()
@@ -8761,6 +8770,20 @@ fn storage_completion_recovery_reconciles_the_retained_operation_without_restart
     );
 }
 
+fn storage_backup_cleanup_actions(
+    eligible_backup_file_names: &[String],
+    service_recovery_required: bool,
+) -> Vec<String> {
+    let mut actions = eligible_backup_file_names
+        .iter()
+        .map(|name| format!("delete validated migration backup {name}"))
+        .collect::<Vec<_>>();
+    if service_recovery_required {
+        actions.push("restart and verify the unavailable Host API service".to_string());
+    }
+    actions
+}
+
 fn run_host_storage(
     command: HostStorageCommand,
     config: ConfigContext<'_>,
@@ -8865,17 +8888,20 @@ fn run_host_storage(
             let local_state_root = (host.config.transport == TransportKind::Local)
                 .then(|| local_storage_state_root(&host))
                 .transpose()?;
-            let cleanup_plan = if let Some(state_root) = &local_state_root {
-                satelle_host::HostService::plan_storage_backup_cleanup(state_root)
-                    .map_err(failure)?
-            } else {
-                transport::plan_ssh_storage_backup_cleanup(&host).map_err(failure)?
-            };
-            let planned_actions = cleanup_plan
-                .eligible_backup_file_names
-                .iter()
-                .map(|name| format!("delete validated migration backup {name}"))
-                .collect::<Vec<_>>();
+            let (cleanup_plan, service_recovery_required) =
+                if let Some(state_root) = &local_state_root {
+                    (
+                        satelle_host::HostService::plan_storage_backup_cleanup(state_root)
+                            .map_err(failure)?,
+                        false,
+                    )
+                } else {
+                    transport::plan_ssh_storage_backup_cleanup(&host).map_err(failure)?
+                };
+            let planned_actions = storage_backup_cleanup_actions(
+                &cleanup_plan.eligible_backup_file_names,
+                service_recovery_required,
+            );
             if command.dry_run {
                 return print_storage_plan(&host.alias, "backup_cleanup", &planned_actions, format);
             }
@@ -8940,7 +8966,8 @@ fn run_host_storage(
             let changed = cleanup
                 .get("removed_backup_file_names")
                 .and_then(Value::as_array)
-                .is_some_and(|removed| !removed.is_empty());
+                .is_some_and(|removed| !removed.is_empty())
+                || service_recovery_required;
             print_storage_result(
                 &host.alias,
                 "backup_cleanup",
