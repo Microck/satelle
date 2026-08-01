@@ -1200,7 +1200,9 @@ fn execute_command(
         Command::Config { command } => run_config(command, config, output).map(|_| None),
         Command::Paths(command) => show_paths(command, config, output).map(|_| None),
         Command::Host { command } => run_host(command, config, output).map(|_| None),
-        Command::SelfCtl { command } => run_self(command, config, output).map(|_| None),
+        Command::SelfCtl { command } => {
+            run_self(command, config, output, no_color, *error_format).map(|_| None)
+        }
         Command::Run(command) => run_prompt(command, config, output).map(Some),
         Command::Steer(command) => steer_prompt(command, config, output).map(Some),
         Command::Status(command) => show_status(command, config, output).map(|_| None),
@@ -8261,12 +8263,22 @@ mod host_update_consent_tests {
     }
 
     #[test]
-    fn self_update_remote_handoff_reexecutes_the_canonical_host_update_command() {
+    fn self_update_remote_handoff_preserves_global_presentation_options() {
         assert_eq!(
-            self_update_remote_handoff_arguments(Some("work"), "office", true, true),
+            self_update_remote_handoff_arguments(
+                Some("work"),
+                "office",
+                true,
+                ErrorFormat::Json,
+                true,
+                true,
+            ),
             [
+                "--no-color",
                 "--profile",
                 "work",
+                "--error-format",
+                "json",
                 "host",
                 "update",
                 "--host",
@@ -8276,8 +8288,22 @@ mod host_update_consent_tests {
             ]
         );
         assert_eq!(
-            self_update_remote_handoff_arguments(None, "office", false, false),
-            ["host", "update", "--host", "office"]
+            self_update_remote_handoff_arguments(
+                None,
+                "office",
+                false,
+                ErrorFormat::Human,
+                false,
+                false,
+            ),
+            [
+                "--error-format",
+                "human",
+                "host",
+                "update",
+                "--host",
+                "office",
+            ]
         );
     }
 }
@@ -8297,6 +8323,8 @@ fn run_self(
     command: SelfSubcommand,
     config: ConfigContext<'_>,
     output: OutputFormat,
+    no_color: bool,
+    error_format: ErrorFormat,
 ) -> Result<(), CliFailure> {
     match command {
         SelfSubcommand::Update(command) => {
@@ -8414,6 +8442,8 @@ fn run_self(
                 report.installed_executable(),
                 config.flag_profile,
                 &host,
+                no_color,
+                error_format,
                 command.no_input,
                 command.yes,
             )
@@ -8424,13 +8454,26 @@ fn run_self(
 fn self_update_remote_handoff_arguments(
     profile: Option<&str>,
     host: &str,
+    no_color: bool,
+    error_format: ErrorFormat,
     no_input: bool,
     yes: bool,
 ) -> Vec<String> {
     let mut arguments = Vec::new();
+    if no_color {
+        arguments.push("--no-color".to_string());
+    }
     if let Some(profile) = profile {
         arguments.extend(["--profile".to_string(), profile.to_string()]);
     }
+    arguments.extend([
+        "--error-format".to_string(),
+        match error_format {
+            ErrorFormat::Human => "human",
+            ErrorFormat::Json => "json",
+        }
+        .to_string(),
+    ]);
     arguments.extend([
         "host".to_string(),
         "update".to_string(),
@@ -8450,6 +8493,8 @@ fn run_self_update_remote_handoff(
     installed_executable: &Path,
     profile: Option<&str>,
     host: &str,
+    no_color: bool,
+    error_format: ErrorFormat,
     no_input: bool,
     yes: bool,
 ) -> Result<(), CliFailure> {
@@ -8464,7 +8509,12 @@ fn run_self_update_remote_handoff(
     })?;
     let status = ProcessCommand::new(installed_executable)
         .args(self_update_remote_handoff_arguments(
-            profile, host, no_input, yes,
+            profile,
+            host,
+            no_color,
+            error_format,
+            no_input,
+            yes,
         ))
         .status()
         .map_err(|error| {
