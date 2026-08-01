@@ -1529,7 +1529,8 @@ if ($terminalClaimExact) {{
       (($status -eq {digest_mismatch_exit_code}) -and
        (($phase -ceq 'cache_upload') -or ($phase -ceq 'cache_staging_permissions')))) {{
     [IO.File]::Open((Join-Path $claimPath ('execution_succeeded.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
-  }} elseif ($phase -ceq 'daemon_start') {{
+  }} elseif (($phase -ceq 'daemon_start') -or
+            ($phase -ceq 'offline_storage_maintenance')) {{
     [IO.File]::Open((Join-Path $claimPath ('execution_failed.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
   }}
 }}
@@ -1583,7 +1584,7 @@ if exact_terminal_attempt; then
   if [ "$status" -eq 0 ] || {{ [ "$status" -eq {digest_mismatch_exit_code} ] &&
        {{ [ "$phase" = cache_upload ] || [ "$phase" = cache_staging_permissions ]; }}; }}; then
     mkdir "$claim_path/execution_succeeded.$attempt" || exit 75
-  elif [ "$phase" = daemon_start ]; then
+  elif [ "$phase" = daemon_start ] || [ "$phase" = offline_storage_maintenance ]; then
     mkdir "$claim_path/execution_failed.$attempt" || exit 75
   fi
 fi
@@ -8027,6 +8028,54 @@ mod tests {
                 retire_attempt,
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn posix_offline_storage_failure_records_a_terminal_fence_marker() {
+        let state = tempfile::tempdir().expect("temporary state");
+        let operation_id = "offline-storage-operation";
+        let identity = "0123456789abcdef0123456789abcdef";
+        let basename = "claim.offline-storage-operation.0123456789abcdef";
+        let attempt = "11111111111111111111111111111111";
+        let claim = state.path().join("bootstrap.lock").join(basename);
+        fs::create_dir_all(&claim).expect("create claim");
+        fs::write(claim.join("operation_id"), operation_id).expect("write operation id");
+        fs::write(claim.join("claim_identity"), identity).expect("write claim identity");
+        fs::write(claim.join("state"), "mutation_started").expect("write claim state");
+        fs::write(claim.join("mutation_phase"), "offline_storage_maintenance")
+            .expect("write mutation phase");
+        fs::write(claim.join("mutation_attempt"), attempt).expect("write mutation attempt");
+        let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+            operation_id,
+            identity,
+            basename,
+            "offline_storage_maintenance",
+            attempt,
+            "exit 23",
+        );
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(fenced)
+            .env("SATELLE_STATE_DIR", state.path())
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("run offline storage fence");
+        writeln!(
+            child.stdin.as_mut().expect("piped storage fence stdin"),
+            "{MUTATION_EXECUTE}"
+        )
+        .expect("write execution gate");
+        drop(child.stdin.take());
+
+        assert_eq!(
+            child.wait().expect("wait for storage fence").code(),
+            Some(23)
+        );
+        assert!(
+            claim.join(format!("execution_failed.{attempt}")).is_dir(),
+            "a known failed offline attempt must terminate before the restart phase"
+        );
     }
 
     #[cfg(target_os = "linux")]

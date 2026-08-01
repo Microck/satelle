@@ -92,6 +92,135 @@ pub(crate) fn begin_store_reset_offline(
 ) -> Result<open::OfflineStoreReset, StorageError> {
     open::begin_store_reset_offline(state_root)
 }
+
+pub(crate) fn begin_offline_storage_maintenance(
+    state_root: &Path,
+    operation_id: &str,
+    action_id: &str,
+    action_label: &str,
+    started_at: OffsetDateTime,
+) -> Result<(), StorageError> {
+    let journal =
+        OfflineStorageMaintenanceJournal::new(operation_id, action_id, action_label, started_at)?;
+    let encoded = journal.encode()?;
+    let state_directory = open::prepare_state_root(state_root)?;
+    let existing = read_offline_storage_maintenance_journal(&state_directory)?;
+    let failed = read_offline_storage_maintenance_failure(&state_directory)?;
+
+    match (existing, failed) {
+        (None, None) => state_directory
+            .create_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_JOURNAL, &encoded),
+        (Some((observed, _)), None)
+            if observed.matches(operation_id, action_id, Some(action_label)) =>
+        {
+            Ok(())
+        }
+        (Some((_, observed)), Some(failed)) if observed == failed => {
+            // Delete the active journal first. If cleanup is interrupted, the
+            // remaining failure marker is terminal and the next authorized
+            // operation can retire it without mistaking old work for active.
+            state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_JOURNAL)?;
+            state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_FAILED)?;
+            state_directory
+                .create_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_JOURNAL, &encoded)
+        }
+        (None, Some(failed)) => {
+            OfflineStorageMaintenanceJournal::parse(&failed)?;
+            state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_FAILED)?;
+            state_directory
+                .create_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_JOURNAL, &encoded)
+        }
+        (Some(_), None) => Err(StorageError::new(StorageErrorKind::StateConflict)),
+        _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+    }
+}
+
+pub(crate) fn offline_storage_maintenance_started_at(
+    state_root: &Path,
+    operation_id: &str,
+    action_id: &str,
+    action_label: Option<&str>,
+) -> Result<OffsetDateTime, StorageError> {
+    let state_directory = open::prepare_state_root(state_root)?;
+    let (journal, _) = read_offline_storage_maintenance_journal(&state_directory)?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+    if !journal.matches(operation_id, action_id, action_label) {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    journal.started_at()
+}
+
+pub(crate) fn mark_offline_storage_maintenance_failed(
+    state_root: &Path,
+    operation_id: &str,
+    action_id: &str,
+) -> Result<(), StorageError> {
+    let state_directory = open::prepare_state_root(state_root)?;
+    let (journal, encoded) = read_offline_storage_maintenance_journal(&state_directory)?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+    if !journal.matches(operation_id, action_id, None) {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    match read_offline_storage_maintenance_failure(&state_directory)? {
+        Some(observed) if observed == encoded => Ok(()),
+        Some(_) => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+        None => state_directory
+            .create_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_FAILED, &encoded),
+    }
+}
+
+pub(crate) fn finish_offline_storage_maintenance(
+    state_root: &Path,
+    operation_id: &str,
+    action_id: &str,
+    action_label: Option<&str>,
+    failed: bool,
+) -> Result<(), StorageError> {
+    let state_directory = open::prepare_state_root(state_root)?;
+    let (journal, encoded) = read_offline_storage_maintenance_journal(&state_directory)?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+    if !journal.matches(operation_id, action_id, action_label) {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    let failure = read_offline_storage_maintenance_failure(&state_directory)?;
+    match (failed, failure) {
+        (false, None) => {}
+        (true, Some(observed)) if observed == encoded => {}
+        _ => return Err(StorageError::new(StorageErrorKind::StateConflict)),
+    }
+    state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_JOURNAL)?;
+    if failed {
+        state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_FAILED)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_completed_offline_storage_maintenance_if_present(
+    state_root: &Path,
+    operation_id: &str,
+    action_id: &str,
+    action_label: &str,
+) -> Result<bool, StorageError> {
+    let state_directory = open::prepare_state_root(state_root)?;
+    if read_offline_storage_maintenance_journal(&state_directory)?.is_none() {
+        if let Some(failed) = read_offline_storage_maintenance_failure(&state_directory)? {
+            let failed = OfflineStorageMaintenanceJournal::parse(&failed)?;
+            if !failed.matches(operation_id, action_id, Some(action_label)) {
+                return Err(StorageError::new(StorageErrorKind::StateConflict));
+            }
+            state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_FAILED)?;
+        }
+        return Ok(false);
+    }
+    finish_offline_storage_maintenance(
+        state_root,
+        operation_id,
+        action_id,
+        Some(action_label),
+        false,
+    )?;
+    Ok(true)
+}
 use self::sql::{
     StoredIdempotency, ensure_control_lease_available, ensure_no_pending_stop,
     insert_control_lease, insert_idempotency, insert_initial_session, insert_safe_log,
@@ -123,6 +252,94 @@ use std::path::PathBuf;
 use time::OffsetDateTime;
 
 const SSH_IDENTITY_COMMIT_JOURNAL: &str = ".satelle-ssh-identity-commit";
+const OFFLINE_STORAGE_MAINTENANCE_JOURNAL: &str = ".satelle-offline-storage-maintenance-v1";
+const OFFLINE_STORAGE_MAINTENANCE_FAILED: &str = ".satelle-offline-storage-maintenance-v1.failed";
+const OFFLINE_STORAGE_MAINTENANCE_JOURNAL_LIMIT: usize = 4_096;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OfflineStorageMaintenanceJournal {
+    schema: String,
+    operation_id: String,
+    action_id: String,
+    action_label: String,
+    started_at: String,
+}
+
+impl OfflineStorageMaintenanceJournal {
+    fn new(
+        operation_id: &str,
+        action_id: &str,
+        action_label: &str,
+        started_at: OffsetDateTime,
+    ) -> Result<Self, StorageError> {
+        Ok(Self {
+            schema: "satelle.offline-storage-maintenance.v1".to_string(),
+            operation_id: validated_private_reference(operation_id.to_string())?,
+            action_id: validated_private_reference(action_id.to_string())?,
+            action_label: action_label.to_string(),
+            started_at: format_time(started_at)?,
+        })
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, StorageError> {
+        let mut encoded = serde_json::to_vec(self).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::OperationFailed, source)
+        })?;
+        encoded.push(b'\n');
+        Ok(encoded)
+    }
+
+    fn parse(encoded: &[u8]) -> Result<Self, StorageError> {
+        let journal = serde_json::from_slice::<Self>(encoded).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::InvalidStoredState, source)
+        })?;
+        if journal.schema != "satelle.offline-storage-maintenance.v1"
+            || journal.operation_id.is_empty()
+            || journal.action_id.is_empty()
+            || journal.action_label.is_empty()
+        {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+        parse_time(&journal.started_at)?;
+        Ok(journal)
+    }
+
+    fn started_at(&self) -> Result<OffsetDateTime, StorageError> {
+        parse_time(&self.started_at)
+    }
+
+    fn matches(&self, operation_id: &str, action_id: &str, action_label: Option<&str>) -> bool {
+        self.operation_id == operation_id
+            && self.action_id == action_id
+            && action_label.is_none_or(|label| self.action_label == label)
+    }
+}
+
+fn read_offline_storage_maintenance_journal(
+    state_directory: &open::StateDirectory,
+) -> Result<Option<(OfflineStorageMaintenanceJournal, Vec<u8>)>, StorageError> {
+    let Some(encoded) = state_directory.read_private_leaf_bounded(
+        OFFLINE_STORAGE_MAINTENANCE_JOURNAL,
+        OFFLINE_STORAGE_MAINTENANCE_JOURNAL_LIMIT,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        OfflineStorageMaintenanceJournal::parse(&encoded)?,
+        encoded,
+    )))
+}
+
+fn read_offline_storage_maintenance_failure(
+    state_directory: &open::StateDirectory,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    state_directory.read_private_leaf_bounded(
+        OFFLINE_STORAGE_MAINTENANCE_FAILED,
+        OFFLINE_STORAGE_MAINTENANCE_JOURNAL_LIMIT,
+    )
+}
 
 fn sha256_path(path: &Path) -> Result<String, StorageError> {
     let mut file = std::fs::File::open(path).map_err(|source| {

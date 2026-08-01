@@ -877,6 +877,15 @@ mod bootstrap_maintenance_tests {
             )
             .expect("load pre-activation ledger state");
         assert_eq!(("running".to_string(), "started".to_string()), old_statuses);
+        std::fs::rename(
+            old_state
+                .path()
+                .join(".satelle-offline-storage-maintenance-v1"),
+            restored_state
+                .path()
+                .join(".satelle-offline-storage-maintenance-v1"),
+        )
+        .expect("retain the database-independent handoff across store activation");
 
         HostService::record_completed_offline_storage_maintenance(
             restored_state.path(),
@@ -940,6 +949,97 @@ mod bootstrap_maintenance_tests {
             .expect("failed reset ledger exists");
         assert_eq!(SetupRunStatus::Failed, failed.status());
         assert_eq!(SetupActionStatus::Failed, failed.actions()[0].status());
+    }
+
+    #[test]
+    fn corrupt_store_does_not_block_restore_or_reset_handoff() {
+        for (operation_id, action_id, action_label) in [
+            (
+                "corrupt-store-restore",
+                "restore-storage-backup",
+                "Restore the validated Host storage backup",
+            ),
+            (
+                "corrupt-store-reset",
+                "reset-host-store",
+                "Reset Host metadata",
+            ),
+        ] {
+            let state = TestStateDir::new().expect("create corrupt storage state");
+            let database = state.path().join("satelle.sqlite3");
+            std::fs::write(&database, b"not a SQLite database")
+                .expect("write corrupt database fixture");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+                    .expect("keep the corrupt fixture owner-only");
+            }
+
+            HostService::start_offline_storage_maintenance(
+                state.path(),
+                operation_id,
+                action_id,
+                action_label,
+            )
+            .expect("persist the recovery handoff without opening the failed database");
+
+            assert!(
+                state
+                    .path()
+                    .join(".satelle-offline-storage-maintenance-v1")
+                    .exists(),
+                "the pre-mutation handoff must survive independently from SQLite"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_store_reset_imports_the_handoff_into_the_new_sqlite_ledger() {
+        let state = TestStateDir::new().expect("create corrupt reset state");
+        let database = state.path().join("satelle.sqlite3");
+        std::fs::write(&database, b"not a SQLite database")
+            .expect("write corrupt database fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+                .expect("keep the corrupt fixture owner-only");
+        }
+        let operation_id = "corrupt-store-reset-completion";
+        HostService::start_offline_storage_maintenance(
+            state.path(),
+            operation_id,
+            "reset-host-store",
+            "Reset Host metadata",
+        )
+        .expect("persist reset recovery handoff");
+        HostService::reset_store_metadata_offline(
+            state.path(),
+            false,
+            "satelle host store reset --host local-demo --no-input --yes",
+        )
+        .expect("remove the corrupt store");
+        HostService::record_completed_offline_storage_maintenance(
+            state.path(),
+            operation_id,
+            "reset-host-store",
+            "Reset Host metadata",
+        )
+        .expect("import the completed handoff into the replacement store");
+
+        let completed = HostService::production_for_offline_storage(state.path())
+            .load_setup_run(operation_id)
+            .expect("load replacement setup ledger")
+            .expect("replacement ledger contains the reset operation");
+        assert_eq!(SetupRunStatus::Completed, completed.status());
+        assert!(
+            !state
+                .path()
+                .join(".satelle-offline-storage-maintenance-v1")
+                .exists(),
+            "SQLite is authoritative after the handoff is imported"
+        );
     }
 
     #[test]
@@ -1869,20 +1969,47 @@ impl HostService {
                 return Err(SatelleError::state_conflict());
             }
             if existing.status() == SetupRunStatus::Completed {
+                storage::finish_completed_offline_storage_maintenance_if_present(
+                    state_root,
+                    operation_id,
+                    action_id,
+                    action_label,
+                )
+                .map_err(runtime::storage_failure)?;
                 return Ok(());
             }
+            storage::offline_storage_maintenance_started_at(
+                state_root,
+                operation_id,
+                action_id,
+                Some(action_label),
+            )
+            .map_err(runtime::storage_failure)?;
             let mut observer = OfflineStoragePostcondition {
                 action_id,
                 satisfied: true,
             };
             let status = service.reconcile_setup_maintenance(&mut observer)?;
-            return if status == Some(SetupRunStatus::Completed) {
-                Ok(())
-            } else {
-                Err(SatelleError::state_conflict())
-            };
+            if status != Some(SetupRunStatus::Completed) {
+                return Err(SatelleError::state_conflict());
+            }
+            storage::finish_offline_storage_maintenance(
+                state_root,
+                operation_id,
+                action_id,
+                Some(action_label),
+                false,
+            )
+            .map_err(runtime::storage_failure)?;
+            return Ok(());
         }
-        let started_at = time::OffsetDateTime::now_utc();
+        let started_at = storage::offline_storage_maintenance_started_at(
+            state_root,
+            operation_id,
+            action_id,
+            Some(action_label),
+        )
+        .map_err(runtime::storage_failure)?;
         let plan = SetupRunPlan::new(
             operation_id,
             SetupOperationKind::StorageMigration,
@@ -1898,6 +2025,14 @@ impl HostService {
             time::OffsetDateTime::now_utc(),
         )?;
         service.finish_setup_run(&mut operation, time::OffsetDateTime::now_utc())?;
+        storage::finish_offline_storage_maintenance(
+            state_root,
+            operation_id,
+            action_id,
+            Some(action_label),
+            false,
+        )
+        .map_err(runtime::storage_failure)?;
         Ok(())
     }
 
@@ -1910,7 +2045,6 @@ impl HostService {
         action_id: &str,
         action_label: &str,
     ) -> Result<(), SatelleError> {
-        let service = Self::production_for_offline_storage(state_root);
         let started_at = time::OffsetDateTime::now_utc();
         let plan = SetupRunPlan::new(
             operation_id,
@@ -1919,10 +2053,37 @@ impl HostService {
             started_at,
             vec![SetupActionPlan::new(action_id, action_label, true)?],
         )?;
-        let mut operation = service.begin_setup_run(&plan)?;
-        service.start_setup_action(&operation, action_id, started_at)?;
-        service.runtime.handoff_offline_maintenance(&mut operation);
-        Ok(())
+        storage::begin_offline_storage_maintenance(
+            state_root,
+            operation_id,
+            action_id,
+            action_label,
+            started_at,
+        )
+        .map_err(runtime::storage_failure)?;
+        let service = Self::production_for_offline_storage(state_root);
+        let ledger_start = (|| {
+            let mut operation = service.begin_setup_run(&plan)?;
+            service.start_setup_action(&operation, action_id, started_at)?;
+            service.runtime.handoff_offline_maintenance(&mut operation);
+            Ok::<_, SatelleError>(())
+        })();
+        match ledger_start {
+            Ok(()) => Ok(()),
+            // The durable handoff record is authoritative only until the
+            // repaired or reset SQLite store can accept the canonical ledger
+            // entry. Other conflicts still stop before filesystem mutation.
+            Err(error) if error.code == satelle_core::ErrorCode::StorageIntegrityFailed => Ok(()),
+            Err(error) => {
+                storage::mark_offline_storage_maintenance_failed(
+                    state_root,
+                    operation_id,
+                    action_id,
+                )
+                .map_err(runtime::storage_failure)?;
+                Err(error)
+            }
+        }
     }
 
     pub fn record_failed_offline_storage_maintenance(
@@ -1930,6 +2091,8 @@ impl HostService {
         operation_id: &str,
         action_id: &str,
     ) -> Result<(), SatelleError> {
+        storage::mark_offline_storage_maintenance_failed(state_root, operation_id, action_id)
+            .map_err(runtime::storage_failure)?;
         let service = Self::production_for_offline_storage(state_root);
         let existing = service
             .load_setup_run(operation_id)?
@@ -1946,6 +2109,14 @@ impl HostService {
         };
         let status = service.reconcile_setup_maintenance(&mut observer)?;
         if status == Some(SetupRunStatus::Failed) {
+            storage::finish_offline_storage_maintenance(
+                state_root,
+                operation_id,
+                action_id,
+                None,
+                true,
+            )
+            .map_err(runtime::storage_failure)?;
             Ok(())
         } else {
             Err(SatelleError::state_conflict())
