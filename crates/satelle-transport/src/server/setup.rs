@@ -4,17 +4,17 @@ use super::{ApiFailure, DaemonState, api_error_response, authenticated_json_resp
 use crate::contract::{
     ApiErrorCategory, ApiErrorCode, BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL,
     DurableTokenActivationResponse, DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
-    NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
-    NativeReadinessInvalidationScope, PROVIDER_SECRET_UPLOAD_CONTENT_TYPE,
-    PROVIDER_SECRET_UPLOAD_INFO, ProviderBindingAuthorizationRequest,
-    ProviderBindingAuthorizationResponse, ProviderBindingDeletionResponse,
-    ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
-    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
-    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, SetupRepairDecision,
-    SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
-    SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairPreviousStatus,
-    SetupRepairRunStatus, SetupVerificationRequest, SetupVerificationResponse,
-    provider_secret_upload_aad,
+    HostUpdateMaintenanceRequest, NativeReadinessInvalidationRequest,
+    NativeReadinessInvalidationResponse, NativeReadinessInvalidationScope,
+    PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
+    ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
+    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
+    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
+    ProviderSecretUploadEnvelope, SetupRepairDecision, SetupRepairOperationKind,
+    SetupRepairPlanAction, SetupRepairPlanRequest, SetupRepairPlanResponse,
+    SetupRepairPostcondition, SetupRepairPreviousStatus, SetupRepairRunStatus,
+    SetupVerificationRequest, SetupVerificationResponse, provider_secret_upload_aad,
 };
 use axum::extract::{Extension, Path, Request, State};
 use axum::http::header::CONTENT_TYPE;
@@ -172,6 +172,7 @@ pub(super) async fn plan_setup_repair(
             state.host_identity.clone(),
             selected_operation_kind,
             selected_run_status,
+            plan.host_update_recovery_identity().cloned(),
             actions,
         ),
         authorized.request_id(),
@@ -909,6 +910,38 @@ pub(super) async fn begin_bootstrap_maintenance(
     let operation = operation_id.clone();
     match tokio::task::spawn_blocking(move || {
         service.acquire_bootstrap_maintenance_plan(&operation, operation_kind, plan_kind)
+    })
+    .await
+    {
+        Ok(Ok(())) => authenticated_json_response(
+            StatusCode::OK,
+            &BootstrapMaintenanceResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                operation_id,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
+}
+
+pub(super) async fn begin_host_update_maintenance(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(operation_id): Path<String>,
+    ApiJson(request): ApiJson<HostUpdateMaintenanceRequest>,
+) -> Response {
+    if !persistent_service_maintenance_principal_is_authorized(&authorized) {
+        return bootstrap_maintenance_principal_required(&state, &authorized);
+    }
+    let service = Arc::clone(&state.service);
+    let operation = operation_id.clone();
+    let recovery_identity = request.recovery_identity().clone();
+    match tokio::task::spawn_blocking(move || {
+        service.acquire_host_update_maintenance(&operation, &recovery_identity)
     })
     .await
     {

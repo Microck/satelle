@@ -355,6 +355,8 @@ pub(crate) struct RepairLedgerPlan {
     pub(crate) automatic_action_ids: Vec<String>,
     pub(crate) selected_operation_kind: Option<satelle_transport::SetupRepairOperationKind>,
     pub(crate) selected_run_status: Option<satelle_transport::SetupRepairRunStatus>,
+    pub(crate) host_update_recovery_identity:
+        Option<satelle_core::host_update::HostUpdateRecoveryIdentity>,
 }
 
 struct LocalTransport {
@@ -742,6 +744,7 @@ impl TransportClient for LocalTransport {
                     satelle_transport::SetupRepairRunStatus::OutcomeUnknown
                 }
             }),
+            host_update_recovery_identity: plan.host_update_recovery_identity().cloned(),
         })
     }
 
@@ -1063,6 +1066,28 @@ fn map_ssh_daemon_bootstrap_error(
         }
         ssh_bootstrap::SshBootstrapError::DaemonPathOverrideNotAbsolute { name, value } => {
             SatelleError::daemon_path_override_not_absolute(name, value)
+        }
+        ssh_bootstrap::SshBootstrapError::VerifiedRelease {
+            version,
+            target,
+            source,
+        } if source.release_artifact_is_unavailable() => {
+            SatelleError::host_artifact_unavailable(&version, target.id())
+        }
+        ssh_bootstrap::SshBootstrapError::VerifiedRelease {
+            version,
+            target,
+            source,
+        } => {
+            let mut error = (*source).into_satelle_error();
+            error
+                .details
+                .insert("cli_version".to_string(), serde_json::json!(version));
+            error.details.insert(
+                "remote_platform".to_string(),
+                serde_json::json!(target.id()),
+            );
+            error
         }
         _ => SatelleError::host_unreachable(alias),
     }
@@ -3296,6 +3321,7 @@ struct HostMaintenanceInspection {
 enum HostMaintenancePlanKind {
     CodexOnly,
     HostUpdate,
+    HostUpdateRecovery,
     Repair,
 }
 
@@ -3319,6 +3345,7 @@ fn maintenance_release_artifact_required(
             host_release_artifact_required(relation)
                 || service_relation.is_some_and(host_release_artifact_required)
         }
+        HostMaintenancePlanKind::HostUpdateRecovery => true,
         HostMaintenancePlanKind::Repair => {
             relation == crate::host_update::HostVersionRelation::Missing
                 || (!protocol_compatible
@@ -3371,6 +3398,7 @@ fn host_service_inspection_from_executable(
 fn inspect_host_maintenance(
     host: &SelectedHost,
     kind: HostMaintenancePlanKind,
+    cli_version: &str,
 ) -> Result<HostMaintenanceInspection, SatelleError> {
     match host.config.transport {
         TransportKind::Local => {
@@ -3408,6 +3436,7 @@ fn inspect_host_maintenance(
                         match target {
                             Some(target) => verified_host_update_artifact(
                                 &host.alias,
+                                cli_version,
                                 maintenance_release_artifact_required(
                                     kind,
                                     relation_to_cli,
@@ -3471,8 +3500,11 @@ fn inspect_host_maintenance(
                 current.minimum_host_version.as_deref(),
                 cli_version,
             )?;
-            let inspect_service = kind == HostMaintenancePlanKind::HostUpdate
-                && host.config.setup_mode == Some(satelle_core::SetupMode::Persistent);
+            let inspect_service = matches!(
+                kind,
+                HostMaintenancePlanKind::HostUpdate | HostMaintenancePlanKind::HostUpdateRecovery
+            ) && host.config.setup_mode
+                == Some(satelle_core::SetupMode::Persistent);
             let initial_artifact_required = maintenance_release_artifact_required(
                 kind,
                 relation_to_cli,
@@ -3513,7 +3545,8 @@ fn inspect_host_maintenance(
                             // Current service state is trustworthy only when
                             // the observed executable content matches the
                             // invoking release manifest.
-                            service_release_artifact = Some(transport.release_artifact(target)?);
+                            service_release_artifact =
+                                Some(transport.release_artifact(target, cli_version)?);
                         }
                         Some(host_service_inspection_from_executable(
                             target,
@@ -3540,7 +3573,7 @@ fn inspect_host_maintenance(
             let release_artifact = if needs_host_release_artifact {
                 Some(match service_release_artifact {
                     Some(metadata) => metadata,
-                    None => transport.release_artifact(target)?,
+                    None => transport.release_artifact(target, cli_version)?,
                 })
             } else {
                 None
@@ -3556,6 +3589,7 @@ fn inspect_host_maintenance(
             let artifact = if kind != HostMaintenancePlanKind::CodexOnly {
                 verified_host_update_artifact(
                     &host.alias,
+                    cli_version,
                     needs_host_release_artifact,
                     target,
                     install_path,
@@ -3581,6 +3615,22 @@ fn inspect_host_maintenance(
             })
         }
     }
+}
+
+fn validate_host_update_recovery_artifact(
+    inspection: &HostMaintenanceInspection,
+    recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
+) -> Result<(), SatelleError> {
+    let artifact = inspection
+        .artifact
+        .as_ref()
+        .ok_or_else(SatelleError::state_conflict)?;
+    if artifact.version != recovery_identity.target_version()
+        || artifact.digest != recovery_identity.artifact_digest()
+    {
+        return Err(SatelleError::state_conflict());
+    }
+    Ok(())
 }
 
 enum DirectMaintenanceEvidence {
@@ -3634,21 +3684,52 @@ pub(crate) fn plan_host_update(
     components: &[satelle_core::host_update::HostUpdateComponent],
     includes_all: bool,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
-    let cli_version = env!("CARGO_PKG_VERSION");
+    plan_host_update_internal(host, cli_version, components, includes_all, None)
+}
+
+fn plan_host_update_recovery(
+    host: &SelectedHost,
+    recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
+) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
+    plan_host_update_internal(
+        host,
+        recovery_identity.target_version(),
+        &[satelle_core::host_update::HostUpdateComponent::Host],
+        false,
+        Some(recovery_identity),
+    )
+}
+
+fn plan_host_update_internal(
+    host: &SelectedHost,
+    cli_version: &str,
+    components: &[satelle_core::host_update::HostUpdateComponent],
+    includes_all: bool,
+    recovery_identity: Option<&satelle_core::host_update::HostUpdateRecoveryIdentity>,
+) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
     let needs_host_artifact = includes_all
         || components.is_empty()
         || components.contains(&satelle_core::host_update::HostUpdateComponent::Host);
-    let kind = if needs_host_artifact {
+    let kind = if recovery_identity.is_some() {
+        HostMaintenancePlanKind::HostUpdateRecovery
+    } else if needs_host_artifact {
         HostMaintenancePlanKind::HostUpdate
     } else {
         HostMaintenancePlanKind::CodexOnly
     };
-    let inspection = inspect_host_maintenance(host, kind)?;
+    let inspection = inspect_host_maintenance(host, kind, cli_version)?;
+    if let Some(recovery_identity) = recovery_identity {
+        validate_host_update_recovery_artifact(&inspection, recovery_identity)?;
+    }
     let host_automation_is_safe = inspection.host_automation_is_safe;
     let service_inspection = inspection.service_inspection;
 
     let host_inspection = crate::host_update::HostUpdateInspection {
-        relation_to_cli: inspection.relation_to_cli,
+        relation_to_cli: if recovery_identity.is_some() {
+            crate::host_update::HostVersionRelation::OlderThanCli
+        } else {
+            inspection.relation_to_cli
+        },
         current_version: inspection.current_version,
         remote_platform: inspection.remote_platform,
     };
@@ -3695,13 +3776,19 @@ pub(crate) fn plan_host_update(
 
 pub(crate) fn apply_host_update(
     host: &SelectedHost,
+    cli_version: &str,
     report: satelle_core::host_update::HostUpdateReport,
     components: &[satelle_core::host_update::HostUpdateComponent],
     includes_all: bool,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
-    apply_host_update_with_operation(host, report, HostUpdateOperation::Update, None, || {
-        plan_host_update(host, components, includes_all)
-    })
+    apply_host_update_with_operation(
+        host,
+        cli_version,
+        report,
+        HostUpdateOperation::Update,
+        None,
+        || plan_host_update(host, cli_version, components, includes_all),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -3712,6 +3799,7 @@ enum HostUpdateOperation {
 
 fn apply_host_update_with_operation(
     host: &SelectedHost,
+    cli_version: &str,
     mut report: satelle_core::host_update::HostUpdateReport,
     operation: HostUpdateOperation,
     existing_operation_id: Option<&str>,
@@ -3746,6 +3834,7 @@ fn apply_host_update_with_operation(
             )
         })?;
     let (expected_artifact_path, expected_artifact_digest) = expected_artifact_path;
+    let recovery_identity = host_update_recovery_identity(&report)?;
     let publish_service = report.targets.iter().any(|target| {
         target.target == HostUpdateTarget::HostDaemonService && target.requires_mutation()
     });
@@ -4206,7 +4295,7 @@ fn apply_host_update_with_operation(
             source,
         ));
     }
-    if new_capabilities.daemon_version() != env!("CARGO_PKG_VERSION") {
+    if new_capabilities.daemon_version() != cli_version {
         return Err(host_update_recovery_pending(
             &mut report,
             "restart-host-daemon",
@@ -4215,7 +4304,9 @@ fn apply_host_update_with_operation(
         ));
     }
     let adopted = match operation {
-        HostUpdateOperation::Update => new_client.begin_host_update_maintenance(&operation_id),
+        HostUpdateOperation::Update => {
+            new_client.begin_host_update_maintenance(&operation_id, &recovery_identity)
+        }
         HostUpdateOperation::Repair => new_client.begin_repair_maintenance(&operation_id),
     };
     let adopted = match adopted {
@@ -4516,7 +4607,8 @@ fn begin_host_update_maintenance_with_revalidation(
     revalidate: impl FnOnce() -> Result<satelle_core::host_update::HostUpdateReport, SatelleError>,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
     let begin = match operation {
-        HostUpdateOperation::Update => client.begin_host_update_maintenance(operation_id),
+        HostUpdateOperation::Update => client
+            .begin_host_update_maintenance(operation_id, &host_update_recovery_identity(accepted)?),
         HostUpdateOperation::Repair => client.begin_repair_maintenance(operation_id),
     }
     .map_err(|error| host_update_maintenance_begin_error(host, operation_id, error))?;
@@ -4559,6 +4651,28 @@ fn begin_host_update_maintenance_with_revalidation(
         ));
     }
     Ok(current)
+}
+
+fn host_update_recovery_identity(
+    report: &satelle_core::host_update::HostUpdateReport,
+) -> Result<satelle_core::host_update::HostUpdateRecoveryIdentity, SatelleError> {
+    let target = report
+        .targets
+        .iter()
+        .find(|target| {
+            target.target == satelle_core::host_update::HostUpdateTarget::HostDaemon
+                && target.requires_mutation()
+        })
+        .ok_or_else(|| {
+            SatelleError::invalid_usage("the Host update plan lacks a mutating Host daemon target")
+        })?;
+    let artifact_digest = target.artifact_digest.as_deref().ok_or_else(|| {
+        SatelleError::invalid_usage("the Host update plan lacks a verified artifact digest")
+    })?;
+    Ok(satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+        &target.target_version,
+        artifact_digest,
+    ))
 }
 
 fn host_update_maintenance_begin_error(
@@ -4854,6 +4968,7 @@ fn resumes_selected_host_update(selected_run: Option<&RepairLedgerPlan>) -> bool
         run.selected_operation_kind == Some(satelle_transport::SetupRepairOperationKind::HostUpdate)
             && run.selected_run_status
                 == Some(satelle_transport::SetupRepairRunStatus::OutcomeUnknown)
+            && run.host_update_recovery_identity.is_some()
     })
 }
 
@@ -4865,18 +4980,36 @@ pub(crate) fn plan_repair_upgrades(
         HostUpdateTarget, HostUpdateVersionSource, RepairCompatibilityReason,
     };
 
-    let cli_version = env!("CARGO_PKG_VERSION");
     let selected_run = selected_repair_run(host, run_id)?;
     let resumes_host_update = resumes_selected_host_update(selected_run.as_ref());
+    let target_version = if resumes_host_update {
+        selected_run
+            .as_ref()
+            .and_then(|run| run.host_update_recovery_identity.as_ref())
+            .map(|identity| identity.target_version())
+            .ok_or_else(SatelleError::state_conflict)?
+    } else {
+        env!("CARGO_PKG_VERSION")
+    };
     let inspection = inspect_host_maintenance(
         host,
         if resumes_host_update {
-            HostMaintenancePlanKind::HostUpdate
+            HostMaintenancePlanKind::HostUpdateRecovery
         } else {
             HostMaintenancePlanKind::Repair
         },
+        target_version,
     )?;
-    let cli_release = parse_release_version(cli_version)?;
+    if resumes_host_update {
+        validate_host_update_recovery_artifact(
+            &inspection,
+            selected_run
+                .as_ref()
+                .and_then(|run| run.host_update_recovery_identity.as_ref())
+                .ok_or_else(SatelleError::state_conflict)?,
+        )?;
+    }
+    let cli_release = parse_release_version(target_version)?;
     let current_host_release = inspection
         .current_version
         .as_deref()
@@ -4888,7 +5021,7 @@ pub(crate) fn plan_repair_upgrades(
                 .current_version
                 .as_deref()
                 .expect("parsed Host version retains its source value"),
-            cli_version,
+            target_version,
         ));
     }
     let minimum_host_release = inspection
@@ -4914,7 +5047,7 @@ pub(crate) fn plan_repair_upgrades(
             .clone()
             .expect("minimum-version comparison retains its source value")
     } else {
-        cli_version.to_string()
+        target_version.to_string()
     };
     let host_version_source = if minimum_exceeds_cli {
         HostUpdateVersionSource::HostCompatibilityRequirement
@@ -5052,8 +5185,25 @@ pub(crate) fn apply_repair_upgrades(
     }
     let selected_run = selected_repair_run(host, recovery_run_id)?;
     let resumes_host_update = resumes_selected_host_update(selected_run.as_ref());
+    let recovery_identity = resumes_host_update
+        .then(|| {
+            selected_run
+                .as_ref()
+                .and_then(|run| run.host_update_recovery_identity.as_ref())
+                .cloned()
+                .ok_or_else(SatelleError::state_conflict)
+        })
+        .transpose()?;
+    let target_version = recovery_identity.as_ref().map_or(
+        env!("CARGO_PKG_VERSION"),
+        satelle_core::host_update::HostUpdateRecoveryIdentity::target_version,
+    );
     let components = [HostUpdateComponent::Host];
-    let host_update = plan_host_update(host, &components, false)?;
+    let host_update = if let Some(recovery_identity) = recovery_identity.as_ref() {
+        plan_host_update_recovery(host, recovery_identity)?
+    } else {
+        plan_host_update(host, target_version, &components, false)?
+    };
     let operation = if resumes_host_update {
         HostUpdateOperation::Update
     } else {
@@ -5061,10 +5211,17 @@ pub(crate) fn apply_repair_upgrades(
     };
     let source = match apply_host_update_with_operation(
         host,
+        target_version,
         host_update,
         operation,
         recovery_run_id.filter(|_| resumes_host_update),
-        || plan_host_update(host, &components, false),
+        || {
+            if let Some(recovery_identity) = recovery_identity.as_ref() {
+                plan_host_update_recovery(host, recovery_identity)
+            } else {
+                plan_host_update(host, target_version, &components, false)
+            }
+        },
     ) {
         Ok(applied) => return Ok(repair.applied(applied.applied_actions)),
         Err(source) => source,
@@ -5137,9 +5294,12 @@ fn verified_host_update_artifact(
     if !required {
         return Ok(None);
     }
-    let metadata =
-        known_metadata.map_or_else(|| ssh_bootstrap::ReleaseArtifactMetadata::fetch(target), Ok);
-    verified_host_update_artifact_from_metadata(host, target, install_path, metadata).map(Some)
+    let metadata = known_metadata.map_or_else(
+        || ssh_bootstrap::ReleaseArtifactMetadata::fetch(target, version),
+        Ok,
+    );
+    verified_host_update_artifact_from_metadata(host, version, target, install_path, metadata)
+        .map(Some)
 }
 
 fn verified_host_update_artifact_from_metadata(
@@ -6116,6 +6276,7 @@ impl TransportClient for DirectTransport {
                 .collect(),
             selected_operation_kind: response.selected_operation_kind(),
             selected_run_status: response.selected_run_status(),
+            host_update_recovery_identity: response.host_update_recovery_identity().cloned(),
         })
     }
 

@@ -1,5 +1,32 @@
 use serde::{Deserialize, Serialize};
 
+/// Exact release artifact identity retained by the Host for interrupted
+/// Host-update recovery. Repair must resume this identity instead of deriving
+/// a new target from whichever CLI release happens to run later.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostUpdateRecoveryIdentity {
+    target_version: String,
+    artifact_digest: String,
+}
+
+impl HostUpdateRecoveryIdentity {
+    pub fn new(target_version: impl Into<String>, artifact_digest: impl Into<String>) -> Self {
+        Self {
+            target_version: target_version.into(),
+            artifact_digest: artifact_digest.into(),
+        }
+    }
+
+    pub fn target_version(&self) -> &str {
+        &self.target_version
+    }
+
+    pub fn artifact_digest(&self) -> &str {
+        &self.artifact_digest
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum HostUpdateSchemaVersion {
     #[serde(rename = "satelle.host.update.v1")]

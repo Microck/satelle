@@ -32,7 +32,7 @@ pub use session::{
 };
 pub use setup::{
     BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
-    DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
+    DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostUpdateMaintenanceRequest,
     NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
     NativeReadinessInvalidationScope, ProviderBindingAuthorizationRequest,
     ProviderBindingAuthorizationResponse, ProviderBindingDeletionResponse,
@@ -48,10 +48,10 @@ pub(crate) use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v12 adds authoritative setup-repair planning and selected-run
-// inspection. The protocol remains a hard cut because the repair executor
-// cannot safely infer whether an older Host applied ledger retry rules.
-pub(crate) const PROTOCOL_VERSION: &str = "12";
+// Protocol v13 binds Host-update maintenance and selected-run recovery to the
+// exact release artifact accepted before mutation. The protocol remains a
+// hard cut because repair cannot safely infer an interrupted update target.
+pub(crate) const PROTOCOL_VERSION: &str = "13";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v12_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "12");
+    fn protocol_version_is_the_v13_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "13");
     }
 }

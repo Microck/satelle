@@ -862,6 +862,15 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_read,
         ));
+    let host_update_maintenance_route = Router::new()
+        .route(
+            "/v1/maintenance/host-update/{operation_id}/begin",
+            post(setup::begin_host_update_maintenance),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_setup_mutation,
+        ));
     let bootstrap_maintenance_routes = Router::new()
         .route(
             "/v1/maintenance/bootstrap/{operation_id}/complete",
@@ -1001,6 +1010,7 @@ fn router(state: Arc<DaemonState>) -> Router {
             auth::require_control,
         ));
     let protected = read_routes
+        .merge(host_update_maintenance_route)
         .merge(bootstrap_maintenance_routes)
         .merge(setup_routes)
         .merge(provider_binding_authorization_routes)

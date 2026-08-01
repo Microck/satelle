@@ -36,6 +36,9 @@ fn only_outcome_unknown_host_updates_resume_the_selected_operation_id() {
         automatic_action_ids: Vec::new(),
         selected_operation_kind: Some(operation_kind),
         selected_run_status: Some(run_status),
+        host_update_recovery_identity: (operation_kind
+            == satelle_transport::SetupRepairOperationKind::HostUpdate)
+            .then(test_host_update_recovery_identity),
     };
     let interrupted_host_update = selected(
         satelle_transport::SetupRepairOperationKind::HostUpdate,
@@ -49,14 +52,98 @@ fn only_outcome_unknown_host_updates_resume_the_selected_operation_id() {
         satelle_transport::SetupRepairOperationKind::Repair,
         satelle_transport::SetupRepairRunStatus::OutcomeUnknown,
     );
+    let interrupted_bootstrap_handoff = RepairLedgerPlan {
+        available: interrupted_host_update.available,
+        automatic_action_ids: Vec::new(),
+        selected_operation_kind: interrupted_host_update.selected_operation_kind,
+        selected_run_status: interrupted_host_update.selected_run_status,
+        host_update_recovery_identity: None,
+    };
 
     assert!(resumes_selected_host_update(Some(&interrupted_host_update)));
     assert!(!resumes_selected_host_update(Some(&completed_host_update)));
     assert!(!resumes_selected_host_update(Some(&interrupted_repair)));
+    assert!(!resumes_selected_host_update(Some(
+        &interrupted_bootstrap_handoff
+    )));
     assert!(!resumes_selected_host_update(None));
+}
+
+#[test]
+fn host_update_recovery_requires_and_rechecks_the_persisted_artifact() {
+    assert!(maintenance_release_artifact_required(
+        HostMaintenancePlanKind::HostUpdateRecovery,
+        crate::host_update::HostVersionRelation::MatchesCli,
+        true,
+        Some(crate::host_update::HostVersionRelation::MatchesCli),
+    ));
+
+    let identity = test_host_update_recovery_identity();
+    let inspection = HostMaintenanceInspection {
+        current_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        minimum_host_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        protocol_compatible: true,
+        relation_to_cli: crate::host_update::HostVersionRelation::MatchesCli,
+        remote_platform: "linux-x64-gnu".to_string(),
+        artifact: Some(crate::host_update::VerifiedHostArtifact {
+            version: identity.target_version().to_string(),
+            remote_platform: "linux-x64-gnu".to_string(),
+            digest: identity.artifact_digest().to_string(),
+            daemon_destination: Some("/tmp/satelle-host".to_string()),
+        }),
+        service_inspection: None,
+        codex_evidence: None,
+        host_automation_is_safe: true,
+    };
+    validate_host_update_recovery_artifact(&inspection, &identity)
+        .expect("the persisted release identity matches");
+    assert!(
+        validate_host_update_recovery_artifact(
+            &inspection,
+            &satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+                identity.target_version(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        )
+        .is_err(),
+        "repair must fail closed when release metadata no longer matches"
+    );
+    assert_eq!(
+        host_update_recovery_identity(&test_host_update_report()).unwrap(),
+        identity
+    );
 }
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+fn test_host_update_recovery_identity() -> satelle_core::host_update::HostUpdateRecoveryIdentity {
+    satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+        env!("CARGO_PKG_VERSION"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+}
+
+fn test_host_update_report() -> satelle_core::host_update::HostUpdateReport {
+    satelle_core::host_update::HostUpdateReport::new(
+        "office",
+        vec![satelle_core::host_update::HostUpdateComponent::Host],
+        vec![satelle_core::host_update::HostUpdateTargetPlan {
+            target: satelle_core::host_update::HostUpdateTarget::HostDaemon,
+            current_version: Some("0.0.9".to_string()),
+            target_version: env!("CARGO_PKG_VERSION").to_string(),
+            version_source: satelle_core::host_update::HostUpdateVersionSource::InvokingCliRelease,
+            artifact_digest: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
+            disposition: satelle_core::host_update::HostUpdateDisposition::Update,
+            restart_impact: satelle_core::host_update::HostUpdateRestartImpact::HostDaemon,
+            remote_mutations: vec![satelle_core::host_update::HostUpdateMutation {
+                operation: "install-host-artifact".to_string(),
+                remote_path: Some("/tmp/satelle-host".to_string()),
+            }],
+        }],
+    )
+}
 
 fn setup_selection(mode: satelle_core::SetupMode) -> SetupModeSelection {
     SetupModeSelection::new(
@@ -1235,7 +1322,7 @@ fn uncertain_first_host_update_action_start_closes_the_unmodified_operation() {
         |client, fake_ssh, _, _, ledger, _| {
             let operation_id = "host-update-lost-first-start-response";
             client
-                .begin_host_update_maintenance(operation_id)
+                .begin_host_update_maintenance(operation_id, &test_host_update_recovery_identity())
                 .expect("begin Host update maintenance");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "host-update-clean-failure-host",
@@ -1301,7 +1388,10 @@ fn uncertain_first_host_update_action_start_closes_the_unmodified_operation() {
 
             let next_operation = "host-update-after-clean-first-start-failure";
             client
-                .begin_host_update_maintenance(next_operation)
+                .begin_host_update_maintenance(
+                    next_operation,
+                    &test_host_update_recovery_identity(),
+                )
                 .expect("clean failure releases Maintenance ownership");
             for action_id in HOST_UPDATE_ACTIONS {
                 client
@@ -1323,7 +1413,7 @@ fn rejected_first_host_update_action_start_closes_the_unmodified_operation() {
         |client, fake_ssh, _, _, _, _| {
             let operation_id = "host-update-rejected-first-start";
             client
-                .begin_host_update_maintenance(operation_id)
+                .begin_host_update_maintenance(operation_id, &test_host_update_recovery_identity())
                 .expect("begin Host update maintenance");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "host-update-clean-rejection-host",
@@ -1356,7 +1446,10 @@ fn rejected_first_host_update_action_start_closes_the_unmodified_operation() {
 
             let next_operation = "host-update-after-clean-first-start-rejection";
             client
-                .begin_host_update_maintenance(next_operation)
+                .begin_host_update_maintenance(
+                    next_operation,
+                    &test_host_update_recovery_identity(),
+                )
                 .expect("clean rejection releases Maintenance ownership");
             for action_id in HOST_UPDATE_ACTIONS {
                 client
@@ -1378,7 +1471,7 @@ fn lost_first_host_update_action_start_closes_the_still_planned_operation() {
         |client, fake_ssh, _, _, _, _| {
             let operation_id = "host-update-lost-unprocessed-first-start";
             client
-                .begin_host_update_maintenance(operation_id)
+                .begin_host_update_maintenance(operation_id, &test_host_update_recovery_identity())
                 .expect("begin Host update maintenance");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "host-update-lost-start-host",
@@ -1407,7 +1500,10 @@ fn lost_first_host_update_action_start_closes_the_still_planned_operation() {
 
             let next_operation = "host-update-after-lost-first-start";
             client
-                .begin_host_update_maintenance(next_operation)
+                .begin_host_update_maintenance(
+                    next_operation,
+                    &test_host_update_recovery_identity(),
+                )
                 .expect("reconciled transport loss releases Maintenance ownership");
             for action_id in HOST_UPDATE_ACTIONS {
                 client
@@ -1426,11 +1522,7 @@ fn lost_first_host_update_action_start_closes_the_still_planned_operation() {
 fn final_host_update_revalidation_holds_and_releases_maintenance_on_drift() {
     with_bootstrap_handoff_test_context_with_scope(ApiScopes::ADMIN, |client, _, _, _, _, _| {
         let operation_id = "host-update-final-revalidation";
-        let accepted = satelle_core::host_update::HostUpdateReport::new(
-            "office",
-            vec![satelle_core::host_update::HostUpdateComponent::Host],
-            Vec::new(),
-        );
+        let accepted = test_host_update_report();
 
         let error = begin_host_update_maintenance_with_revalidation(
             "office",
@@ -1440,7 +1532,10 @@ fn final_host_update_revalidation_holds_and_releases_maintenance_on_drift() {
             &accepted,
             || {
                 let competing = client
-                    .begin_host_update_maintenance("competing-host-update")
+                    .begin_host_update_maintenance(
+                        "competing-host-update",
+                        &test_host_update_recovery_identity(),
+                    )
                     .expect_err("Maintenance is held before final revalidation");
                 assert!(matches!(
                     competing,
@@ -1454,11 +1549,11 @@ fn final_host_update_revalidation_holds_and_releases_maintenance_on_drift() {
             },
         )
         .expect_err("drift invalidates the accepted update plan");
-        assert_eq!(error.code, ErrorCode::StateConflict);
+        assert_eq!(error.code, ErrorCode::StateConflict, "{error:?}");
 
         let next_operation = "host-update-after-revalidation-drift";
         client
-            .begin_host_update_maintenance(next_operation)
+            .begin_host_update_maintenance(next_operation, &test_host_update_recovery_identity())
             .expect("drift cleanup releases Maintenance ownership");
         for action_id in HOST_UPDATE_ACTIONS {
             client
@@ -1487,11 +1582,7 @@ fn uncertain_host_update_maintenance_begin_reports_the_recovery_pending_operatio
     )
     .expect("construct unavailable Host update client");
     let operation_id = "host-update-uncertain-maintenance-begin";
-    let accepted = satelle_core::host_update::HostUpdateReport::new(
-        "office",
-        vec![satelle_core::host_update::HostUpdateComponent::Host],
-        Vec::new(),
-    );
+    let accepted = test_host_update_report();
 
     let error = begin_host_update_maintenance_with_revalidation(
         "office",
@@ -1521,11 +1612,7 @@ fn failed_final_revalidation_cleanup_reports_the_recovery_pending_operation() {
         ApiScopes::ADMIN,
         |client, _, _, _, service, bootstrap_token_id| {
             let operation_id = "host-update-revalidation-cleanup-failure";
-            let accepted = satelle_core::host_update::HostUpdateReport::new(
-                "office",
-                vec![satelle_core::host_update::HostUpdateComponent::Host],
-                Vec::new(),
-            );
+            let accepted = test_host_update_report();
 
             let error = begin_host_update_maintenance_with_revalidation(
                 "office",
@@ -1565,7 +1652,7 @@ fn failed_prechange_action_cleanup_reports_the_recovery_pending_operation() {
         |client, fake_ssh, _, _, service, bootstrap_token_id| {
             let operation_id = "host-update-prechange-action-cleanup-failure";
             client
-                .begin_host_update_maintenance(operation_id)
+                .begin_host_update_maintenance(operation_id, &test_host_update_recovery_identity())
                 .expect("begin Host update maintenance");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "host-update-cleanup-failure-host",
@@ -1624,7 +1711,7 @@ fn failed_first_action_start_cleanup_keeps_the_operation_unmodified() {
         |client, fake_ssh, _, _, service, bootstrap_token_id| {
             let operation_id = "host-update-first-start-cleanup-failure";
             client
-                .begin_host_update_maintenance(operation_id)
+                .begin_host_update_maintenance(operation_id, &test_host_update_recovery_identity())
                 .expect("begin Host update maintenance");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "host-update-first-start-cleanup-host",
@@ -1679,7 +1766,7 @@ fn failed_read_only_preflight_cleanup_reports_the_unchanged_operation() {
         |client, fake_ssh, _, _, service, bootstrap_token_id| {
             let operation_id = "host-update-read-only-preflight-cleanup-failure";
             client
-                .begin_host_update_maintenance(operation_id)
+                .begin_host_update_maintenance(operation_id, &test_host_update_recovery_identity())
                 .expect("begin Host update maintenance");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "host-update-read-only-cleanup-failure-host",
@@ -1725,7 +1812,7 @@ fn failed_postchange_action_cleanup_retains_the_partial_operation_identity() {
         |client, fake_ssh, _, _, service, bootstrap_token_id| {
             let operation_id = "host-update-postchange-action-cleanup-failure";
             client
-                .begin_host_update_maintenance(operation_id)
+                .begin_host_update_maintenance(operation_id, &test_host_update_recovery_identity())
                 .expect("begin Host update maintenance");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "host-update-postchange-cleanup-failure-host",
@@ -1790,7 +1877,7 @@ fn confirmed_action_failure_records_dependency_skips() {
         |client, fake_ssh, _, _, _, _| {
             let operation_id = "host-update-confirmed-action-failure";
             client
-                .begin_host_update_maintenance(operation_id)
+                .begin_host_update_maintenance(operation_id, &test_host_update_recovery_identity())
                 .expect("begin Host update maintenance");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "host-update-confirmed-action-failure-host",
@@ -1957,7 +2044,7 @@ fn rejected_later_action_start_retains_the_partial_operation_identity() {
         |client, fake_ssh, _, _, service, bootstrap_token_id| {
             let operation_id = "host-update-rejected-later-action-start";
             client
-                .begin_host_update_maintenance(operation_id)
+                .begin_host_update_maintenance(operation_id, &test_host_update_recovery_identity())
                 .expect("begin Host update maintenance");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "host-update-rejected-later-action-host",
@@ -2036,7 +2123,7 @@ fn lost_later_action_start_response_retains_the_partial_operation_identity() {
         |client, fake_ssh, _, _, _, _| {
             let operation_id = "host-update-lost-later-action-start";
             client
-                .begin_host_update_maintenance(operation_id)
+                .begin_host_update_maintenance(operation_id, &test_host_update_recovery_identity())
                 .expect("begin Host update maintenance");
             let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
                 "host-update-lost-later-action-host",
@@ -4835,7 +4922,7 @@ fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance
         "details": {
             "daemon_version": "0.0.9",
             "reason": "unsupported",
-            "supported_versions": ["12"],
+            "supported_versions": ["13"],
             "received_version": "11",
         },
         "docs_url": null,

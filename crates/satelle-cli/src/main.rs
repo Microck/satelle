@@ -8425,6 +8425,79 @@ fn validate_host_update_components(raw_components: &[String]) -> Result<(), Sate
     Ok(())
 }
 
+#[cfg(test)]
+mod host_update_consent_tests {
+    use super::*;
+
+    #[test]
+    fn trusted_profile_consent_satisfies_both_host_update_confirmation_gates() {
+        assert!(host_update_consent_granted(false, true));
+        assert!(host_update_consent_granted(true, false));
+        assert!(!host_update_consent_granted(false, false));
+    }
+
+    #[test]
+    fn recovery_command_preserves_the_exact_component_selection() {
+        assert_eq!(
+            host_update_consent_command("office", &["host".to_string(), "codex".to_string()]),
+            "satelle host update --host office --component host --component codex --no-input --yes --json"
+        );
+        assert_eq!(
+            host_update_consent_command("office", &[]),
+            "satelle host update --host office --no-input --yes --json"
+        );
+        assert_eq!(
+            host_update_consent_command("remote host'; touch /tmp/pwn", &["host".to_string()]),
+            "satelle host update --host 'remote host'\"'\"'; touch /tmp/pwn' --component host --no-input --yes --json"
+        );
+    }
+
+    #[test]
+    fn self_update_remote_handoff_preserves_global_presentation_options() {
+        assert_eq!(
+            self_update_remote_handoff_arguments(
+                Some("work"),
+                "office",
+                true,
+                ErrorFormat::Json,
+                true,
+                true,
+            ),
+            [
+                "--no-color",
+                "--profile",
+                "work",
+                "--error-format",
+                "json",
+                "host",
+                "update",
+                "--host",
+                "office",
+                "--no-input",
+                "--yes",
+            ]
+        );
+        assert_eq!(
+            self_update_remote_handoff_arguments(
+                None,
+                "office",
+                false,
+                ErrorFormat::Human,
+                false,
+                false,
+            ),
+            [
+                "--error-format",
+                "human",
+                "host",
+                "update",
+                "--host",
+                "office",
+            ]
+        );
+    }
+}
+
 fn confirm_storage_maintenance(
     planned_actions: &[String],
     recovery_command: String,

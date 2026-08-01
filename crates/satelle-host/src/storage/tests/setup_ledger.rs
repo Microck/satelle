@@ -4,6 +4,7 @@ use crate::storage::{
     SetupActionStatus, SetupOperationKind, SetupRepairDecision, SetupRepairPostcondition,
     SetupRepairProbe, SetupRunPlan, SetupRunStatus,
 };
+use satelle_core::host_update::HostUpdateRecoveryIdentity;
 
 fn plan() -> SetupRunPlan {
     plan_with_run_id("setup-run-1")
@@ -90,6 +91,46 @@ fn setup_action_ledger_migrates_and_persists_ordered_state_transitions() {
         Some(SetupActionSkipReason::AlreadySatisfied),
         stored.actions()[1].skip_reason()
     );
+}
+
+#[test]
+fn host_update_recovery_identity_survives_reopen_and_selected_run_planning() {
+    let state = TempDir::new().expect("temporary state directory");
+    let identity = HostUpdateRecoveryIdentity::new(
+        "0.1.0",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let plan = SetupRunPlan::new(
+        "host-update-recovery-identity",
+        SetupOperationKind::HostUpdate,
+        None,
+        at(1),
+        vec![
+            SetupActionPlan::new(
+                "install-host-artifact",
+                "Install the verified Host artifact",
+                true,
+            )
+            .unwrap(),
+        ],
+    )
+    .and_then(|plan| plan.with_host_update_recovery_identity(identity.clone()))
+    .unwrap();
+    {
+        let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+        let _capability = begin_setup_run(&mut storage, &plan);
+    }
+
+    let (storage, _) = Storage::open(state.path()).expect("reopen storage");
+    let selected = storage
+        .load_setup_run(plan.run_id())
+        .expect("load Host update run")
+        .expect("Host update run exists");
+    assert_eq!(selected.host_update_recovery_identity(), Some(&identity));
+    let repair = storage
+        .plan_setup_repair(None, Some(&selected), &[])
+        .expect("plan selected Host update recovery");
+    assert_eq!(repair.host_update_recovery_identity(), Some(&identity));
 }
 
 #[test]
@@ -1715,6 +1756,12 @@ fn repair_adopts_and_replays_the_exact_interrupted_host_update_run() {
             SetupActionPlan::new("restart-host", "Restart Host", true).unwrap(),
         ],
     )
+    .and_then(|plan| {
+        plan.with_host_update_recovery_identity(HostUpdateRecoveryIdentity::new(
+            env!("CARGO_PKG_VERSION"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ))
+    })
     .unwrap();
     let capability = begin_setup_run(&mut storage, &plan);
     storage

@@ -202,10 +202,11 @@ mod ssh_identity_commit_tests {
         (11, "fnv1a64:a861bcf791484f8b"),
         (12, "fnv1a64:a5672c42bd40d2a8"),
         (13, "fnv1a64:5db2b0aa00a5f745"),
+        (14, "fnv1a64:fb04115e0082c148"),
     ];
     const EXPECTED_SCHEMA_ROW_COUNT: usize = 69;
     const EXPECTED_SCHEMA_SHA256: &str =
-        "6d8e2eba05361b91d977feb785033618a1f1688094fe52adb0056b933c70f1be";
+        "e16065c8dd757275ff5085bb1a16e1edb9c27bb088af1ba0ae1a58fb52327f11";
 
     fn identity() -> HostIdentityRef {
         HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")
@@ -354,7 +355,7 @@ mod ssh_identity_commit_tests {
         let user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema user version");
-        assert_eq!(user_version, 13);
+        assert_eq!(user_version, 14);
 
         let schema = connection
             .prepare(

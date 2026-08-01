@@ -2,6 +2,7 @@ use super::codec::{format_time, parse_time, validated_private_reference};
 use super::{LeaseOwner, Storage, StorageError, StorageErrorKind, sqlite_error};
 use crate::runtime::VerifiedSetupPostconditions;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use satelle_core::host_update::HostUpdateRecoveryIdentity;
 use satelle_core::session::DesktopBindingRef;
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
@@ -215,6 +216,7 @@ pub struct SetupRunPlan {
     desktop_binding: Option<DesktopBindingRef>,
     started_at: OffsetDateTime,
     actions: Vec<SetupActionPlan>,
+    host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
 }
 
 impl SetupRunPlan {
@@ -253,7 +255,22 @@ impl SetupRunPlan {
             desktop_binding,
             started_at,
             actions,
+            host_update_recovery_identity: None,
         })
+    }
+
+    pub fn with_host_update_recovery_identity(
+        mut self,
+        identity: HostUpdateRecoveryIdentity,
+    ) -> Result<Self, satelle_core::SatelleError> {
+        if self.operation_kind != SetupOperationKind::HostUpdate {
+            return Err(satelle_core::SatelleError::invalid_usage(
+                "Host update recovery identity requires a Host update plan",
+            ));
+        }
+        validate_host_update_recovery_identity(&identity).map_err(crate::runtime::storage_error)?;
+        self.host_update_recovery_identity = Some(identity);
+        Ok(self)
     }
 
     pub fn run_id(&self) -> &str {
@@ -274,6 +291,10 @@ impl SetupRunPlan {
 
     pub fn actions(&self) -> &[SetupActionPlan] {
         &self.actions
+    }
+
+    pub fn host_update_recovery_identity(&self) -> Option<&HostUpdateRecoveryIdentity> {
+        self.host_update_recovery_identity.as_ref()
     }
 }
 
@@ -348,6 +369,7 @@ pub struct SetupRunRecord {
     started_at: OffsetDateTime,
     finished_at: Option<OffsetDateTime>,
     actions: Vec<SetupActionRecord>,
+    host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
 }
 
 impl SetupRunRecord {
@@ -381,6 +403,10 @@ impl SetupRunRecord {
 
     pub fn actions(&self) -> &[SetupActionRecord] {
         &self.actions
+    }
+
+    pub fn host_update_recovery_identity(&self) -> Option<&HostUpdateRecoveryIdentity> {
+        self.host_update_recovery_identity.as_ref()
     }
 }
 
@@ -485,6 +511,7 @@ pub struct SetupRepairPlan {
     actions: Vec<SetupRepairAction>,
     selected_operation_kind: Option<SetupOperationKind>,
     selected_run_status: Option<SetupRunStatus>,
+    host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
 }
 
 pub(crate) struct MaintenanceRecoverySubject {
@@ -538,6 +565,10 @@ impl SetupRepairPlan {
 
     pub const fn selected_run_status(&self) -> Option<SetupRunStatus> {
         self.selected_run_status
+    }
+
+    pub fn host_update_recovery_identity(&self) -> Option<&HostUpdateRecoveryIdentity> {
+        self.host_update_recovery_identity.as_ref()
     }
 
     pub fn automatic_actions(&self) -> impl Iterator<Item = &SetupRepairAction> {
@@ -1118,7 +1149,8 @@ impl Storage {
             .connection
             .query_row(
                 "SELECT run_id, operation_kind, desktop_binding_ref, satelle_version,
-                        status, started_at, finished_at
+                        status, started_at, finished_at, host_update_target_version,
+                        host_update_artifact_digest
                  FROM setup_runs WHERE run_id = ?1",
                 [&run_id],
                 |row| {
@@ -1130,6 +1162,8 @@ impl Storage {
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -1143,6 +1177,8 @@ impl Storage {
             status,
             started_at,
             finished_at,
+            host_update_target_version,
+            host_update_artifact_digest,
         )) = run
         else {
             return Ok(None);
@@ -1214,6 +1250,16 @@ impl Storage {
                     .transpose()?,
             });
         }
+        let host_update_recovery_identity =
+            match (host_update_target_version, host_update_artifact_digest) {
+                (Some(target_version), Some(artifact_digest)) => {
+                    let identity = HostUpdateRecoveryIdentity::new(target_version, artifact_digest);
+                    validate_stored_host_update_recovery_identity(&identity)?;
+                    Some(identity)
+                }
+                (None, None) => None,
+                _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+            };
         Ok(Some(SetupRunRecord {
             run_id: validated_stored_private_reference(run_id)?,
             operation_kind: SetupOperationKind::parse(&operation_kind)?,
@@ -1223,6 +1269,7 @@ impl Storage {
             started_at: parse_time(&started_at)?,
             finished_at: finished_at.as_deref().map(parse_time).transpose()?,
             actions,
+            host_update_recovery_identity,
         }))
     }
 
@@ -1299,6 +1346,9 @@ impl Storage {
             actions,
             selected_operation_kind: selected_run.map(SetupRunRecord::operation_kind),
             selected_run_status: selected_run.map(SetupRunRecord::status),
+            host_update_recovery_identity: selected_run
+                .and_then(SetupRunRecord::host_update_recovery_identity)
+                .cloned(),
         })
     }
 
@@ -1635,6 +1685,13 @@ fn begin_setup_run_in_transaction(
     owner: &LeaseOwner,
     host_identity: &str,
 ) -> Result<(), StorageError> {
+    let bootstrap_handoff_only =
+        plan.actions.len() == 1 && plan.actions[0].action_id == "bootstrap-handoff";
+    let host_update_artifact_identity_required =
+        plan.operation_kind == SetupOperationKind::HostUpdate && !bootstrap_handoff_only;
+    if host_update_artifact_identity_required != plan.host_update_recovery_identity.is_some() {
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
+    }
     let maintenance_exists: i64 = transaction
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM maintenance_leases WHERE host_identity_ref = ?1)",
@@ -1664,8 +1721,9 @@ fn begin_setup_run_in_transaction(
         .execute(
             "INSERT INTO setup_runs (
                 run_id, host_identity_ref, desktop_binding_ref, satelle_version,
-                operation_kind, status, started_at, finished_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, NULL)",
+                operation_kind, status, started_at, finished_at,
+                host_update_target_version, host_update_artifact_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, NULL, ?7, ?8)",
             params![
                 plan.run_id,
                 host_identity,
@@ -1673,6 +1731,12 @@ fn begin_setup_run_in_transaction(
                 env!("CARGO_PKG_VERSION"),
                 plan.operation_kind.as_str(),
                 format_time(plan.started_at)?,
+                plan.host_update_recovery_identity
+                    .as_ref()
+                    .map(HostUpdateRecoveryIdentity::target_version),
+                plan.host_update_recovery_identity
+                    .as_ref()
+                    .map(HostUpdateRecoveryIdentity::artifact_digest),
             ],
         )
         .map_err(setup_write_error)?;
@@ -1714,6 +1778,28 @@ fn begin_setup_run_in_transaction(
         )
         .map_err(|source| sqlite_error(StorageErrorKind::LeaseConflict, source))?;
     Ok(())
+}
+
+fn validate_host_update_recovery_identity(
+    identity: &HostUpdateRecoveryIdentity,
+) -> Result<(), StorageError> {
+    validated_private_reference(identity.target_version().to_string())?;
+    if identity.artifact_digest().len() != 64
+        || !identity
+            .artifact_digest()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
+    }
+    Ok(())
+}
+
+fn validate_stored_host_update_recovery_identity(
+    identity: &HostUpdateRecoveryIdentity,
+) -> Result<(), StorageError> {
+    validate_host_update_recovery_identity(identity)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
 }
 
 fn release_active_maintenance_in_transaction(

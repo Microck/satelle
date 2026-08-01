@@ -4,6 +4,7 @@ use satelle_core::{
     DoctorReport, ProviderAuthObservationSource, ProviderAuthValidationMode,
     ProviderAuthValidationOutcome, ProviderAuthValidationResult, ProviderBindingAuthorization,
     PublicProviderDescriptorValidation, PublicResolvedProviderBinding,
+    host_update::HostUpdateRecoveryIdentity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +25,10 @@ define_schema_token!(
 define_schema_token!(
     BootstrapMaintenanceSchema,
     "satelle.bootstrap-maintenance.v1"
+);
+define_schema_token!(
+    HostUpdateMaintenanceSchema,
+    "satelle.host-update-maintenance.v1"
 );
 define_schema_token!(
     ProviderBindingAuthorizationSchema,
@@ -95,6 +100,30 @@ pub struct SetupRepairProbe {
     pub label: String,
     pub retry_safe: bool,
     pub postcondition: SetupRepairPostcondition,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostUpdateMaintenanceRequest {
+    schema_version: HostUpdateMaintenanceSchema,
+    recovery_identity: HostUpdateRecoveryIdentity,
+}
+
+impl HostUpdateMaintenanceRequest {
+    pub fn new(recovery_identity: HostUpdateRecoveryIdentity) -> Self {
+        Self {
+            schema_version: HostUpdateMaintenanceSchema,
+            recovery_identity,
+        }
+    }
+
+    pub fn recovery_identity(&self) -> &HostUpdateRecoveryIdentity {
+        &self.recovery_identity
+    }
+}
+
+impl ApiRequestContract for HostUpdateMaintenanceRequest {
+    const SCHEMA_VERSION: &'static str = HostUpdateMaintenanceSchema::TOKEN;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -188,6 +217,7 @@ pub struct SetupRepairPlanResponse {
     ledger_available: bool,
     selected_operation_kind: Option<SetupRepairOperationKind>,
     selected_run_status: Option<SetupRepairRunStatus>,
+    host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
     actions: Vec<SetupRepairPlanAction>,
 }
 
@@ -197,6 +227,7 @@ impl SetupRepairPlanResponse {
         host_identity: String,
         selected_operation_kind: Option<SetupRepairOperationKind>,
         selected_run_status: Option<SetupRepairRunStatus>,
+        host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
         actions: Vec<SetupRepairPlanAction>,
     ) -> Self {
         let ledger_available = selected_operation_kind.is_some()
@@ -210,6 +241,7 @@ impl SetupRepairPlanResponse {
             ledger_available,
             selected_operation_kind,
             selected_run_status,
+            host_update_recovery_identity,
             actions,
         }
     }
@@ -224,6 +256,10 @@ impl SetupRepairPlanResponse {
 
     pub const fn selected_run_status(&self) -> Option<SetupRepairRunStatus> {
         self.selected_run_status
+    }
+
+    pub fn host_update_recovery_identity(&self) -> Option<&HostUpdateRecoveryIdentity> {
+        self.host_update_recovery_identity.as_ref()
     }
 
     pub fn actions(&self) -> &[SetupRepairPlanAction] {

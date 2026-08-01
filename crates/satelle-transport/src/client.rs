@@ -553,12 +553,17 @@ impl DaemonClient {
     pub fn begin_host_update_maintenance(
         &self,
         operation_id: &str,
+        recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
     ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
-        let path = format!(
-            "/v1/maintenance/bootstrap/{operation_id}/host_binary_replacement/host_update/begin"
-        );
+        let path = format!("/v1/maintenance/host-update/{operation_id}/begin");
         let (request, request_id) = self.mutation_request(&path, operation_id)?;
-        self.send_authenticated(request, request_id, StatusCode::OK)
+        self.send_authenticated(
+            request.json(&crate::HostUpdateMaintenanceRequest::new(
+                recovery_identity.clone(),
+            )),
+            request_id,
+            StatusCode::OK,
+        )
     }
 
     pub fn begin_repair_maintenance(

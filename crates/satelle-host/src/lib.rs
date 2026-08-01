@@ -470,19 +470,35 @@ mod bootstrap_maintenance_tests {
         let service =
             HostService::local_demo_for_tests_at(state.path()).expect("create Host service");
         let operation_id = "host-update-operation";
+        let recovery_identity = satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+            env!("CARGO_PKG_VERSION"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
 
         service
-            .acquire_bootstrap_maintenance_plan(
-                operation_id,
-                SetupOperationKind::HostUpdate,
-                BootstrapMaintenancePlanKind::HostUpdate,
-            )
+            .acquire_host_update_maintenance(operation_id, &recovery_identity)
             .expect("acquire Host update maintenance");
         let run = service
             .load_setup_run(operation_id)
             .expect("load Host update run")
             .expect("Host update run exists");
         assert_eq!(SetupOperationKind::HostUpdate, run.operation_kind());
+        assert_eq!(
+            run.host_update_recovery_identity(),
+            Some(&recovery_identity)
+        );
+        assert!(
+            service
+                .acquire_host_update_maintenance(
+                    operation_id,
+                    &satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+                        env!("CARGO_PKG_VERSION"),
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    ),
+                )
+                .is_err(),
+            "adoption must reject a different release artifact identity"
+        );
         assert_eq!(
             run.actions()
                 .iter()
@@ -1777,6 +1793,41 @@ impl HostService {
         operation_kind: SetupOperationKind,
         plan_kind: BootstrapMaintenancePlanKind,
     ) -> Result<(), SatelleError> {
+        if plan_kind == BootstrapMaintenancePlanKind::HostUpdate
+            && operation_kind == SetupOperationKind::HostUpdate
+        {
+            return Err(SatelleError::invalid_usage(
+                "Host update maintenance requires an exact recovery identity",
+            ));
+        }
+        self.acquire_bootstrap_maintenance_plan_with_identity(
+            operation_id,
+            operation_kind,
+            plan_kind,
+            None,
+        )
+    }
+
+    pub fn acquire_host_update_maintenance(
+        &self,
+        operation_id: &str,
+        recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
+    ) -> Result<(), SatelleError> {
+        self.acquire_bootstrap_maintenance_plan_with_identity(
+            operation_id,
+            SetupOperationKind::HostUpdate,
+            BootstrapMaintenancePlanKind::HostUpdate,
+            Some(recovery_identity),
+        )
+    }
+
+    fn acquire_bootstrap_maintenance_plan_with_identity(
+        &self,
+        operation_id: &str,
+        operation_kind: SetupOperationKind,
+        plan_kind: BootstrapMaintenancePlanKind,
+        recovery_identity: Option<&satelle_core::host_update::HostUpdateRecoveryIdentity>,
+    ) -> Result<(), SatelleError> {
         if !plan_kind.accepts_operation_kind(operation_kind) {
             return Err(SatelleError::invalid_usage(
                 "maintenance plan and operation kind do not match",
@@ -1794,7 +1845,10 @@ impl HostService {
                 .runtime
                 .load_setup_run(operation_id)?
                 .ok_or_else(SatelleError::state_conflict)?;
-            return if run.operation_kind() == operation_kind && plan_kind.matches_run(&run)? {
+            return if run.operation_kind() == operation_kind
+                && plan_kind.matches_run(&run)?
+                && run.host_update_recovery_identity() == recovery_identity
+            {
                 Ok(())
             } else {
                 Err(SatelleError::state_conflict())
@@ -1802,7 +1856,10 @@ impl HostService {
         }
         let existing_run = self.runtime.load_setup_run(operation_id)?;
         if let Some(run) = existing_run.as_ref() {
-            if run.operation_kind() != operation_kind || !plan_kind.matches_run(run)? {
+            if run.operation_kind() != operation_kind
+                || !plan_kind.matches_run(run)?
+                || run.host_update_recovery_identity() != recovery_identity
+            {
                 return Err(SatelleError::state_conflict());
             }
             if run.status() == SetupRunStatus::Completed {
@@ -1819,6 +1876,10 @@ impl HostService {
                 time::OffsetDateTime::now_utc(),
                 plan_kind.actions()?,
             )?;
+            let plan = match recovery_identity {
+                Some(identity) => plan.with_host_update_recovery_identity(identity.clone())?,
+                None => plan,
+            };
             self.runtime.begin_bootstrap_maintenance(&plan)?
         };
         *slot = Some(operation);

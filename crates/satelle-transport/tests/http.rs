@@ -25,6 +25,7 @@ use rustls::pki_types::ServerName;
 use satelle_core::session::TurnExecutionMode;
 use satelle_core::{
     ApiRateLimits, ApiTokenSource, DirectHostBinding, ErrorCode, SatelleConfig, TransportKind,
+    host_update::HostUpdateRecoveryIdentity,
 };
 use satelle_host::{
     ApiBearerToken, ApiScopes, HostService, MutationAuthority, SetupActionPlan, SetupOperationKind,
@@ -147,13 +148,13 @@ impl RunningServer {
 
     fn request(&self, path: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::GET, path)
-            .header("Satelle-Protocol-Version", "12")
+            .header("Satelle-Protocol-Version", "13")
     }
 
     fn mutation(&self, path: &str, idempotency_key: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::POST, path)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "12")
+            .header("Satelle-Protocol-Version", "13")
     }
 
     fn mutation_with_request_id(
@@ -164,7 +165,7 @@ impl RunningServer {
     ) -> reqwest::RequestBuilder {
         self.protected_request_with_request_id(reqwest::Method::POST, path, request_id)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "12")
+            .header("Satelle-Protocol-Version", "13")
     }
 
     fn protected_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -370,7 +371,7 @@ fn setup_mutation_request(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string())
         .header("Idempotency-Key", idempotency_key)
-        .header("Satelle-Protocol-Version", "12")
+        .header("Satelle-Protocol-Version", "13")
 }
 
 fn replacement_token(token_id: &str) -> ApiBearerToken {
@@ -1786,7 +1787,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("12"),
+            Some("13"),
             None,
             false,
             false,
@@ -1795,7 +1796,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("12"),
+            Some("13"),
             Some("query-key"),
             true,
             false,
@@ -1804,7 +1805,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("12"),
+            Some("13"),
             Some("cookie-key"),
             false,
             true,
@@ -1917,7 +1918,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("12"),
+            Some("13"),
             None,
             false,
             false,
@@ -1926,7 +1927,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("12"),
+            Some("13"),
             Some("complete-query-key"),
             true,
             false,
@@ -1935,7 +1936,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("12"),
+            Some("13"),
             Some("complete-cookie-key"),
             false,
             true,
@@ -2078,6 +2079,12 @@ async fn setup_repair_plan_uses_live_probes_and_reports_missing_selected_runs() 
             .unwrap(),
         ],
     )
+    .and_then(|plan| {
+        plan.with_host_update_recovery_identity(HostUpdateRecoveryIdentity::new(
+            "0.1.0",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ))
+    })
     .unwrap();
     let mut selected_operation = running
         .service
@@ -2115,6 +2122,13 @@ async fn setup_repair_plan_uses_live_probes_and_reports_missing_selected_runs() 
     assert_eq!(selected_body["ledger_available"], true);
     assert_eq!(selected_body["selected_operation_kind"], "host_update");
     assert_eq!(selected_body["selected_run_status"], "completed");
+    assert_eq!(
+        selected_body["host_update_recovery_identity"],
+        serde_json::json!({
+            "target_version": "0.1.0",
+            "artifact_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        })
+    );
 
     let missing = running
         .mutation("/v1/setup/repair-plan", "repair-plan-missing-run")
