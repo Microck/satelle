@@ -1501,13 +1501,31 @@ fn validate_migration_backup_at(
     physical_backup_file_name: &str,
     physical_manifest_file_name: &str,
 ) -> Result<ValidatedMigrationBackup, StorageError> {
-    validate_migration_backup_at_with_hook(
+    validate_migration_backup_at_in_mode(
         state_root,
         state_directory,
         backup_file_name,
         physical_backup_file_name,
         physical_manifest_file_name,
         BackupValidationMode::DurableStaging,
+    )
+}
+
+fn validate_migration_backup_at_in_mode(
+    state_root: &Path,
+    state_directory: &StateDirectory,
+    backup_file_name: &str,
+    physical_backup_file_name: &str,
+    physical_manifest_file_name: &str,
+    mode: BackupValidationMode,
+) -> Result<ValidatedMigrationBackup, StorageError> {
+    validate_migration_backup_at_with_hook(
+        state_root,
+        state_directory,
+        backup_file_name,
+        physical_backup_file_name,
+        physical_manifest_file_name,
+        mode,
         |_| Ok(()),
     )
 }
@@ -2595,6 +2613,7 @@ fn cleanup_plan_file_names(
     state_directory: &StateDirectory,
     candidates: &[ValidatedMigrationBackup],
     retained_valid_count: usize,
+    validation_mode: BackupValidationMode,
 ) -> Result<Vec<String>, StorageError> {
     let mut planned = BTreeSet::new();
     let mut tombstones = BTreeMap::<CleanupTombstoneKey, CleanupTombstonePair>::new();
@@ -2628,12 +2647,13 @@ fn cleanup_plan_file_names(
         ) {
             (Some(backup_tombstone), Some(manifest_tombstone)) => {
                 retained_valid_count >= 2
-                    && validate_migration_backup_at(
+                    && validate_migration_backup_at_in_mode(
                         state_root,
                         state_directory,
                         &logical_backup_file_name,
                         backup_tombstone,
                         manifest_tombstone,
+                        validation_mode,
                     )
                     .is_ok_and(|validated| tombstone_matches_token(&key, &validated.token))
             }
@@ -2641,12 +2661,13 @@ fn cleanup_plan_file_names(
                 retained_valid_count >= 2
                     && open_private_leaf_identity(state_directory, &logical_backup_file_name)?
                         .is_none()
-                    && validate_migration_backup_at(
+                    && validate_migration_backup_at_in_mode(
                         state_root,
                         state_directory,
                         &logical_backup_file_name,
                         backup_tombstone,
                         &logical_manifest_file_name,
+                        validation_mode,
                     )
                     .is_ok_and(|validated| tombstone_matches_token(&key, &validated.token))
             }
@@ -2670,13 +2691,22 @@ fn cleanup_plan_file_names(
 fn list_validated_migration_backups(
     state_root: &Path,
     state_directory: &StateDirectory,
+    validation_mode: BackupValidationMode,
 ) -> Result<Vec<ValidatedMigrationBackup>, StorageError> {
     let mut validated = Vec::new();
     for file_name in state_directory.leaf_names()? {
         if parse_migration_backup_file_name(&file_name).is_none() {
             continue;
         }
-        if let Ok(backup) = validate_migration_backup(state_root, state_directory, &file_name) {
+        let manifest_file_name = format!("{file_name}.json");
+        if let Ok(backup) = validate_migration_backup_at_in_mode(
+            state_root,
+            state_directory,
+            &file_name,
+            &file_name,
+            &manifest_file_name,
+            validation_mode,
+        ) {
             validated.push(backup);
         }
     }
@@ -2688,7 +2718,11 @@ pub(super) fn plan_migration_backup_cleanup(
     state_root: &Path,
 ) -> Result<Vec<String>, StorageError> {
     let state_directory = open_state_root_read_only(state_root)?;
-    let validated = list_validated_migration_backups(state_root, &state_directory)?;
+    let validated = list_validated_migration_backups(
+        state_root,
+        &state_directory,
+        BackupValidationMode::ReadOnlyFile,
+    )?;
     let retained_valid_count = validated.len();
     let delete_count = validated.len().saturating_sub(2);
     let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
@@ -2697,6 +2731,7 @@ pub(super) fn plan_migration_backup_cleanup(
         &state_directory,
         &candidates,
         retained_valid_count,
+        BackupValidationMode::ReadOnlyFile,
     )
 }
 
@@ -2931,7 +2966,12 @@ fn resume_cleanup_tombstones(
     removed: &mut Vec<String>,
 ) -> Result<(), StorageError> {
     resume_cleanup_deleting(state_directory, hook, removed)?;
-    let retained_valid_count = list_validated_migration_backups(state_root, state_directory)?.len();
+    let retained_valid_count = list_validated_migration_backups(
+        state_root,
+        state_directory,
+        BackupValidationMode::DurableStaging,
+    )?
+    .len();
     let mut tombstones = BTreeMap::<CleanupTombstoneKey, CleanupTombstonePair>::new();
     for file_name in state_directory.leaf_names()? {
         let Some((key, kind)) = parse_cleanup_tombstone_file_name(&file_name) else {
@@ -3171,7 +3211,11 @@ fn cleanup_migration_backups_with_hook(
             let Some(approved) = approved_backup_file_names else {
                 return Ok(None);
             };
-            let validated = list_validated_migration_backups(state_root, state_directory)?;
+            let validated = list_validated_migration_backups(
+                state_root,
+                state_directory,
+                BackupValidationMode::DurableStaging,
+            )?;
             let retained_valid_count = validated.len();
             let delete_count = validated.len().saturating_sub(2);
             let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
@@ -3180,6 +3224,7 @@ fn cleanup_migration_backups_with_hook(
                 state_directory,
                 &candidates,
                 retained_valid_count,
+                BackupValidationMode::DurableStaging,
             )?
             .iter()
             .map(String::as_str)
@@ -3205,7 +3250,11 @@ fn cleanup_migration_backups_with_hook(
     let candidates = if let Some(candidates) = approved_candidates {
         candidates
     } else {
-        let validated = match list_validated_migration_backups(state_root, state_directory) {
+        let validated = match list_validated_migration_backups(
+            state_root,
+            state_directory,
+            BackupValidationMode::DurableStaging,
+        ) {
             Ok(validated) => validated,
             Err(source) => return Err(BackupCleanupFailure::new(removed, source)),
         };

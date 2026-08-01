@@ -2883,7 +2883,7 @@ pub(crate) fn manage_ssh_persistent_service(
         let expected_host_id = transport.binding.expected_host_identity().to_string();
         let overrides = remote.observe_canonical_daemon_path_overrides(&expected_host_id)?;
         let windows_task = if target.service_platform() == DaemonServicePlatform::Windows {
-            Some(remote.current_windows_task_definition(&expected_host_id)?)
+            Some(remote.registered_windows_task(&expected_host_id)?)
         } else {
             None
         };
@@ -3384,7 +3384,7 @@ pub(crate) fn apply_ssh_storage_maintenance(
         let expected_host_id = transport.binding.expected_host_identity().to_string();
         let overrides = remote.observe_canonical_daemon_path_overrides(&expected_host_id)?;
         let windows_task = if target.service_platform() == DaemonServicePlatform::Windows {
-            Some(remote.current_windows_task_definition(&expected_host_id)?)
+            Some(remote.registered_windows_task(&expected_host_id)?)
         } else {
             None
         };
@@ -3491,10 +3491,10 @@ pub(crate) fn apply_ssh_storage_maintenance(
             )
         })?;
         match target.service_platform() {
-            DaemonServicePlatform::Windows => remote.restart_current_windows_task(
+            DaemonServicePlatform::Windows => remote.restart_registered_windows_task(
                 windows_task
                     .as_ref()
-                    .expect("Windows storage preflight provides an exact task"),
+                    .expect("Windows storage preflight provides the registered task"),
             ),
             DaemonServicePlatform::Macos => remote.restart_launchd(),
             DaemonServicePlatform::Linux => unreachable!("Linux storage maintenance is rejected"),
@@ -3516,10 +3516,10 @@ pub(crate) fn apply_ssh_storage_maintenance(
         wait_for_service_observation(
             &transport.alias,
             || match target.service_platform() {
-                DaemonServicePlatform::Windows => remote.observe_current_windows_task(
+                DaemonServicePlatform::Windows => remote.observe_registered_windows_task(
                     windows_task
                         .as_ref()
-                        .expect("Windows storage preflight provides an exact task"),
+                        .expect("Windows storage preflight provides the registered task"),
                 ),
                 DaemonServicePlatform::Macos => remote.observe_launchd_runtime(),
                 DaemonServicePlatform::Linux => {
@@ -5592,17 +5592,17 @@ fn recover_selected_repair_daemon(
             let windows_task = if target.service_platform() == DaemonServicePlatform::Windows {
                 Some(
                     remote
-                        .current_windows_task_definition(&expected_host_id)
+                        .registered_windows_task(&expected_host_id)
                         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?,
                 )
             } else {
                 None
             };
             match target.service_platform() {
-                DaemonServicePlatform::Windows => remote.restart_current_windows_task(
+                DaemonServicePlatform::Windows => remote.restart_registered_windows_task(
                     windows_task
                         .as_ref()
-                        .expect("Windows recovery preflight provides an exact task"),
+                        .expect("Windows recovery preflight provides the registered task"),
                 ),
                 DaemonServicePlatform::Macos => remote.restart_launchd(),
                 DaemonServicePlatform::Linux => unreachable!("Linux recovery is rejected"),
@@ -5611,10 +5611,10 @@ fn recover_selected_repair_daemon(
             wait_for_service_observation(
                 &transport.alias,
                 || match target.service_platform() {
-                    DaemonServicePlatform::Windows => remote.observe_current_windows_task(
+                    DaemonServicePlatform::Windows => remote.observe_registered_windows_task(
                         windows_task
                             .as_ref()
-                            .expect("Windows recovery preflight provides an exact task"),
+                            .expect("Windows recovery preflight provides the registered task"),
                     ),
                     DaemonServicePlatform::Macos => remote.observe_launchd_runtime(),
                     DaemonServicePlatform::Linux => unreachable!("Linux recovery is rejected"),
@@ -6167,7 +6167,7 @@ fn restart_persistent_service(
     transport: &SshSetupTransport,
     target: ssh_bootstrap::RemoteTarget,
     directories: &ssh_bootstrap::RemoteUserDirectories,
-    windows_task: Option<&ssh_bootstrap::VerifiedCurrentWindowsTask>,
+    windows_task: Option<&ssh_bootstrap::RegisteredWindowsTask>,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
 ) -> Result<(), SatelleError> {
     {
@@ -6179,8 +6179,8 @@ fn restart_persistent_service(
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?;
         match target.service_platform() {
-            DaemonServicePlatform::Windows => remote.restart_current_windows_task(
-                windows_task.expect("Windows lifecycle preflight provides an exact task"),
+            DaemonServicePlatform::Windows => remote.restart_registered_windows_task(
+                windows_task.expect("Windows lifecycle preflight provides the registered task"),
             ),
             DaemonServicePlatform::Macos => remote.restart_launchd(),
             DaemonServicePlatform::Linux => unreachable!("Linux lifecycle is rejected"),
@@ -6189,8 +6189,8 @@ fn restart_persistent_service(
         wait_for_service_observation(
             &transport.alias,
             || match target.service_platform() {
-                DaemonServicePlatform::Windows => remote.observe_current_windows_task(
-                    windows_task.expect("Windows lifecycle preflight provides an exact task"),
+                DaemonServicePlatform::Windows => remote.observe_registered_windows_task(
+                    windows_task.expect("Windows lifecycle preflight provides the registered task"),
                 ),
                 DaemonServicePlatform::Macos => remote.observe_launchd_runtime(),
                 DaemonServicePlatform::Linux => unreachable!("Linux lifecycle is rejected"),
@@ -6224,7 +6224,7 @@ fn stop_persistent_service(
     target: ssh_bootstrap::RemoteTarget,
     directories: &ssh_bootstrap::RemoteUserDirectories,
     persisted_overrides: &DaemonPathOverrides,
-    windows_task: Option<&ssh_bootstrap::VerifiedCurrentWindowsTask>,
+    windows_task: Option<&ssh_bootstrap::RegisteredWindowsTask>,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
 ) -> Result<(), SatelleError> {
     let expected_host_id = transport.binding.expected_host_identity().to_string();
@@ -6281,7 +6281,7 @@ fn verify_stopped_service_postconditions(
     target: ssh_bootstrap::RemoteTarget,
     directories: &ssh_bootstrap::RemoteUserDirectories,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
-    windows_task: Option<&ssh_bootstrap::VerifiedCurrentWindowsTask>,
+    windows_task: Option<&ssh_bootstrap::RegisteredWindowsTask>,
     perform_stop: bool,
 ) -> Result<(), SatelleError> {
     let mut remote = ssh_bootstrap::PersistentServiceRemote::new(
@@ -6293,8 +6293,8 @@ fn verify_stopped_service_postconditions(
     .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?;
     if perform_stop {
         match target.service_platform() {
-            DaemonServicePlatform::Windows => remote.stop_current_windows_task(
-                windows_task.expect("Windows lifecycle preflight provides an exact task"),
+            DaemonServicePlatform::Windows => remote.stop_registered_windows_task(
+                windows_task.expect("Windows lifecycle preflight provides the registered task"),
             ),
             DaemonServicePlatform::Macos => remote.bootout_launchd(),
             DaemonServicePlatform::Linux => unreachable!("Linux lifecycle is rejected"),
@@ -6309,8 +6309,8 @@ fn verify_stopped_service_postconditions(
     wait_for_service_observation(
         &transport.alias,
         || match target.service_platform() {
-            DaemonServicePlatform::Windows => remote.observe_current_windows_task(
-                windows_task.expect("Windows lifecycle preflight provides an exact task"),
+            DaemonServicePlatform::Windows => remote.observe_registered_windows_task(
+                windows_task.expect("Windows lifecycle preflight provides the registered task"),
             ),
             DaemonServicePlatform::Macos => remote.observe_launchd_runtime(),
             DaemonServicePlatform::Linux => unreachable!("Linux lifecycle is rejected"),

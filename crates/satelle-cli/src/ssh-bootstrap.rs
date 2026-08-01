@@ -2372,9 +2372,26 @@ impl UploadedHostArtifact {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct VerifiedCurrentWindowsTask {
-    definition: satelle_core::daemon_service::WindowsTaskDefinition,
-    executable_sha256: String,
+pub(super) struct RegisteredWindowsTask {
+    host_id: String,
+    local_app_data: String,
+}
+
+impl RegisteredWindowsTask {
+    fn new(host_id: &str, local_app_data: &str) -> Result<Self, SshBootstrapError> {
+        if host_id.is_empty()
+            || !host_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !target_path_is_absolute(RemoteTarget::WindowsX64Msvc, local_app_data)
+        {
+            return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
+        }
+        Ok(Self {
+            host_id: host_id.to_string(),
+            local_app_data: local_app_data.to_string(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2510,31 +2527,27 @@ impl<'a> PersistentServiceRemote<'a> {
         .map_err(|_| SshBootstrapError::InvalidPersistentServiceDefinition)
     }
 
-    pub(super) fn current_windows_task_definition(
+    pub(super) fn registered_windows_task(
         &self,
         host_id: &str,
-    ) -> Result<VerifiedCurrentWindowsTask, SshBootstrapError> {
+    ) -> Result<RegisteredWindowsTask, SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
-        let artifact = DownloadedArtifact::fetch(self.target)?;
-        let remote_path = self
-            .target
-            .planned_install_path(self.directories, &artifact.release_digest())?;
-        let binary_sha256: String = sha256_file(artifact.path())?
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let definition = self.prepare_windows_task(
-            host_id,
-            &UploadedHostArtifact {
-                remote_path,
-                binary_sha256: binary_sha256.clone(),
-                cache_changed: false,
-            },
-        )?;
-        Ok(VerifiedCurrentWindowsTask {
-            definition,
-            executable_sha256: binary_sha256,
-        })
+        let local_app_data = self
+            .directories
+            .local_app_data
+            .as_deref()
+            .ok_or(SshBootstrapError::InvalidPersistentServiceDefinition)?;
+        let task = RegisteredWindowsTask::new(host_id, local_app_data)?;
+        match self.observe(&registered_windows_task_command(&task, "observe")?)? {
+            PersistentServiceObservation::Running | PersistentServiceObservation::Stopped => {
+                Ok(task)
+            }
+            PersistentServiceObservation::Absent
+            | PersistentServiceObservation::Matching
+            | PersistentServiceObservation::Drifted => {
+                Err(SshBootstrapError::InvalidPersistentServiceDefinition)
+            }
+        }
     }
 
     pub(super) fn publish_windows_service_config(
@@ -2582,36 +2595,30 @@ impl<'a> PersistentServiceRemote<'a> {
         self.windows_task_mutation("persistent_service_restart", task, "restart")
     }
 
-    pub(super) fn restart_current_windows_task(
+    pub(super) fn restart_registered_windows_task(
         &mut self,
-        task: &VerifiedCurrentWindowsTask,
+        task: &RegisteredWindowsTask,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
-        self.mutate(
-            "persistent_service_restart",
-            &windows_task_lifecycle_command(task, "restart"),
-            None,
-        )
+        let command = registered_windows_task_command(task, "restart")?;
+        self.mutate("persistent_service_restart", &command, None)
     }
 
-    pub(super) fn stop_current_windows_task(
+    pub(super) fn stop_registered_windows_task(
         &mut self,
-        task: &VerifiedCurrentWindowsTask,
+        task: &RegisteredWindowsTask,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
-        self.mutate(
-            "persistent_service_stop",
-            &windows_task_lifecycle_command(task, "stop"),
-            None,
-        )
+        let command = registered_windows_task_command(task, "stop")?;
+        self.mutate("persistent_service_stop", &command, None)
     }
 
-    pub(super) fn observe_current_windows_task(
+    pub(super) fn observe_registered_windows_task(
         &self,
-        task: &VerifiedCurrentWindowsTask,
+        task: &RegisteredWindowsTask,
     ) -> Result<PersistentServiceObservation, SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
-        self.observe(&windows_task_lifecycle_command(task, "observe"))
+        self.observe(&registered_windows_task_command(task, "observe")?)
     }
 
     pub(super) fn launchd_definition(
@@ -3436,67 +3443,6 @@ fn windows_task_instance_command(
     powershell_encoded_command(&script)
 }
 
-fn windows_task_lifecycle_command(task: &VerifiedCurrentWindowsTask, action: &str) -> String {
-    let (task_path, task_name) =
-        windows_task_parts(&task.definition).expect("core task path is validated");
-    let lookup = format!(
-        "-TaskPath {} -TaskName {}",
-        powershell_quote(task_path),
-        powershell_quote(task_name),
-    );
-    let definition_matches = windows_task_definition_match_expression(&task.definition);
-    let (missing, operation) = match action {
-        "observe" => (
-            "Write-Output 'satelle-persistent-service-v1'; Write-Output 'absent'; exit 0",
-            concat!(
-                "Write-Output 'satelle-persistent-service-v1'; ",
-                "if (-not $matching) { Write-Output 'drifted' } ",
-                "elseif ($task.State -eq 'Running') { Write-Output 'running' } ",
-                "else { Write-Output 'stopped' }",
-            )
-            .to_string(),
-        ),
-        "restart" => (
-            "exit 75",
-            format!(
-                "if (-not $matching) {{ exit 75 }}; Stop-ScheduledTask {lookup} -ErrorAction SilentlyContinue; Start-ScheduledTask {lookup}"
-            ),
-        ),
-        "stop" => (
-            "exit 75",
-            format!("if (-not $matching) {{ exit 75 }}; Stop-ScheduledTask {lookup}"),
-        ),
-        _ => unreachable!("closed Windows task lifecycle action"),
-    };
-    let script = format!(
-        r#"$ErrorActionPreference='Stop'
-$task=Get-ScheduledTask {lookup} -ErrorAction SilentlyContinue
-if ($null -eq $task) {{ {missing} }}
-[xml]$xml=Export-ScheduledTask {lookup}
-$root=$xml.Task
-$command=[string]$root.Actions.Exec.Command
-$executableIsExact=$false
-try {{
-  $item=Get-Item -LiteralPath $command -Force -ErrorAction Stop
-  $canonical=[IO.Path]::GetFullPath($item.FullName)
-  $requested=[IO.Path]::GetFullPath($command)
-  $digest=(Get-FileHash -Algorithm SHA256 -LiteralPath $command).Hash.ToLowerInvariant()
-  $executableIsExact=($item -is [IO.FileInfo]) -and (-not $item.PSIsContainer) -and
-    (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
-    [StringComparer]::OrdinalIgnoreCase.Equals($requested,$canonical) -and
-    ($digest -ceq {expected_digest})
-}} catch {{ $executableIsExact=$false }}
-$matching=$executableIsExact -and ({definition_matches})
-{operation}"#,
-        lookup = lookup,
-        missing = missing,
-        expected_digest = powershell_quote(&task.executable_sha256),
-        definition_matches = definition_matches,
-        operation = operation,
-    );
-    powershell_encoded_command(&script)
-}
-
 fn parse_offline_storage_completion_recovery_result(
     operation_id: &str,
     stdout: &[u8],
@@ -3523,20 +3469,15 @@ fn parse_offline_storage_completion_recovery_result(
     }
 }
 
-#[cfg(test)]
-fn canonical_windows_task_command(
-    host_id: &str,
-    local_app_data: &str,
+fn registered_windows_task_command(
+    task: &RegisteredWindowsTask,
     action: &str,
 ) -> Result<String, SshBootstrapError> {
-    if host_id.is_empty() || host_id.contains(['\\', '/', '\0']) {
-        return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
-    }
-    let task_name = format!("Host-{host_id}");
+    let task_name = format!("Host-{}", task.host_id);
     let service_config_path = join_target_path(
         RemoteTarget::WindowsX64Msvc,
-        local_app_data,
-        &format!("Satelle/service/{host_id}.json"),
+        &task.local_app_data,
+        &format!("Satelle/service/{}.json", task.host_id),
     );
     let service_config_argument = if service_config_path.contains([' ', '\t', '"']) {
         format!("\"{}\"", service_config_path.replace('"', "\\\""))
@@ -3544,6 +3485,12 @@ fn canonical_windows_task_command(
         service_config_path
     };
     let expected_arguments = format!("host start --service-config {service_config_argument}");
+    let definition_matches = windows_task_definition_match_expression_for_values(
+        "$sid",
+        "$sid",
+        "$command",
+        &powershell_quote(&expected_arguments),
+    );
     let lookup = format!(
         "-TaskPath {} -TaskName {}",
         powershell_quote(r"\Satelle\"),
@@ -3587,19 +3534,14 @@ try {{
   $requested=[IO.Path]::GetFullPath($command)
   $executableIsSafe=($item -is [IO.FileInfo]) -and (-not $item.PSIsContainer) -and
     (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
+    [IO.Path]::IsPathFullyQualified($command) -and
     [StringComparer]::OrdinalIgnoreCase.Equals($requested,$canonical)
 }} catch {{ $executableIsSafe=$false }}
-$matching=$executableIsSafe -and
-  ($root.Principals.Principal.UserId -eq $sid) -and
-  ($root.Principals.Principal.LogonType -eq 'InteractiveToken') -and
-  ($root.Principals.Principal.RunLevel -eq 'LeastPrivilege') -and
-  ($root.Triggers.LogonTrigger.UserId -eq $sid) -and
-  ($root.Settings.MultipleInstancesPolicy -eq 'IgnoreNew') -and
-  ($root.Actions.Exec.Arguments -eq {expected_arguments})
+$matching=$executableIsSafe -and ({definition_matches})
 {operation}"#,
         lookup = lookup,
         missing = missing,
-        expected_arguments = powershell_quote(&expected_arguments),
+        definition_matches = definition_matches,
         operation = operation,
     );
     Ok(powershell_encoded_command(&script))
@@ -6391,13 +6333,11 @@ mod tests {
 
     #[test]
     fn persistent_service_windows_canonical_lifecycle_revalidates_before_mutation() {
+        let task =
+            RegisteredWindowsTask::new("host-123", r"C:\Users\Satelle Operator\AppData\Local")
+                .expect("canonical registered task identity");
         let restart = decode_powershell_command(
-            &canonical_windows_task_command(
-                "host-123",
-                r"C:\Users\Satelle Operator\AppData\Local",
-                "restart",
-            )
-            .expect("canonical restart command"),
+            &registered_windows_task_command(&task, "restart").expect("canonical restart command"),
         )
         .expect("decode canonical restart");
         assert!(restart.contains(r"'\Satelle\'"));
@@ -6407,6 +6347,10 @@ mod tests {
         assert!(restart.contains("LeastPrivilege"));
         assert!(restart.contains("IgnoreNew"));
         assert!(restart.contains("ReparsePoint"));
+        assert!(restart.contains("LogonTrigger.ChildNodes).Count -eq 2"));
+        assert!(restart.contains("Actions.Exec.ChildNodes).Count -eq 2"));
+        assert!(restart.contains("$root.Actions.Exec.Command -eq $command"));
+        assert!(!restart.contains("Get-FileHash"));
         assert!(restart.contains(
             r#"host start --service-config "C:\Users\Satelle Operator\AppData\Local\Satelle\service\host-123.json""#
         ));
@@ -6415,50 +6359,20 @@ mod tests {
         assert!(restart.contains("Stop-ScheduledTask"));
         assert!(restart.contains("Start-ScheduledTask"));
 
+        let observe_task =
+            RegisteredWindowsTask::new("host-123", r"C:\Users\operator\AppData\Local")
+                .expect("canonical registered task identity");
         let observe = decode_powershell_command(
-            &canonical_windows_task_command(
-                "host-123",
-                r"C:\Users\operator\AppData\Local",
-                "observe",
-            )
-            .expect("canonical observation command"),
+            &registered_windows_task_command(&observe_task, "observe")
+                .expect("canonical observation command"),
         )
         .expect("decode canonical observation");
         assert!(observe.contains("Write-Output 'absent'; exit 0"));
         assert!(observe.contains("$task.State -eq 'Running'"));
         assert!(observe.contains("Write-Output 'stopped'"));
-        assert!(canonical_windows_task_command("bad\\host", r"C:\Users\operator", "stop").is_err());
-    }
-
-    #[test]
-    fn persistent_service_windows_current_task_lifecycle_binds_definition_and_digest() {
-        let task = VerifiedCurrentWindowsTask {
-            definition: persistent_windows_task(),
-            executable_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_string(),
-        };
-        let restart = decode_powershell_command(&windows_task_lifecycle_command(&task, "restart"))
-            .expect("decode exact current-task restart");
-        assert!(restart.contains("Get-FileHash -Algorithm SHA256"));
-        assert!(restart.contains(&task.executable_sha256));
-        assert!(restart.contains(&task.definition.executable));
-        assert!(restart.contains(&windows_task_arguments(&task.definition)));
-        assert!(restart.contains("LogonTrigger.ChildNodes).Count -eq 2"));
-        assert!(restart.contains("LogonTrigger.Enabled -eq 'true'"));
-        assert!(restart.contains("Settings.Enabled -eq 'true'"));
-        assert!(restart.contains("DisallowStartIfOnBatteries -eq 'false'"));
-        assert!(restart.contains("StopIfGoingOnBatteries -eq 'false'"));
-        assert!(restart.contains("Actions.ChildNodes).Count -eq 1"));
-        assert!(restart.contains("Actions.Exec.ChildNodes).Count -eq 2"));
-        assert!(restart.contains("if (-not $matching) { exit 75 }"));
-        assert!(restart.contains("Stop-ScheduledTask"));
-        assert!(restart.contains("Start-ScheduledTask"));
-
-        let observe = decode_powershell_command(&windows_task_lifecycle_command(&task, "observe"))
-            .expect("decode exact current-task observation");
-        assert!(observe.contains("Write-Output 'drifted'"));
-        assert!(observe.contains("$task.State -eq 'Running'"));
-        assert!(observe.contains("Write-Output 'stopped'"));
+        assert!(
+            RegisteredWindowsTask::new("bad\\host", r"C:\Users\operator\AppData\Local").is_err()
+        );
     }
 
     #[test]

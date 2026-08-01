@@ -135,7 +135,11 @@ fn backup_cleanup_plan_does_not_require_state_directory_writes() {
 
     fs::set_permissions(&fixture.state_root, original_permissions)
         .expect("restore state directory permissions");
-    plan.expect("plan cleanup without mutation");
+    assert_eq!(
+        vec![fixture.backup_file_names[0].clone()],
+        plan.expect("plan cleanup without mutation"),
+        "read-only validation must retain valid backups in the cleanup plan",
+    );
     assert_eq!(
         0o500, preview_mode,
         "cleanup planning must not change directory mode"
