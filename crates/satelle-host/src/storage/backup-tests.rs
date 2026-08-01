@@ -1214,7 +1214,7 @@ fn cleanup_rejects_a_candidate_set_that_changed_after_consent() {
 
     let approved = plan_migration_backup_cleanup(&fixture.state_root)
         .expect("plan initial cleanup candidates");
-    assert_eq!(vec![fixture.backup_file_names[1].clone()], approved);
+    assert_eq!(fixture.backup_file_names[..2].to_vec(), approved);
 
     let (connection, ownership_lock, state_directory) =
         open_parts(&fixture.state_root).expect("open fixture store");
@@ -1235,6 +1235,29 @@ fn cleanup_rejects_a_candidate_set_that_changed_after_consent() {
 
     assert_eq!(StorageErrorKind::StateConflict, error.kind());
     assert_eq!(files_before, existing_files(&fixture.state_root));
+}
+
+#[test]
+fn cleanup_plan_and_retry_include_an_interrupted_tombstone() {
+    let fixture = BackupFixture::new(3);
+    let state_directory = fixture.state_directory();
+    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
+        if step == CleanupStep::BackupQuarantined {
+            Err(StorageError::for_test(StorageErrorKind::OperationFailed))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("leave an interrupted cleanup tombstone");
+
+    let approved =
+        plan_migration_backup_cleanup(&fixture.state_root).expect("plan interrupted cleanup retry");
+    assert_eq!(vec![fixture.backup_file_names[0].clone()], approved);
+
+    let removed = cleanup_migration_backups_offline_exact(&fixture.state_root, &approved)
+        .expect("resume the exact interrupted cleanup");
+    assert_eq!(approved, removed);
+    assert!(cleanup_tombstone_names(&fixture).is_empty());
 }
 
 #[test]
@@ -1601,8 +1624,12 @@ fn cleanup_retry_recovers_an_asymmetric_durable_deleting_state() {
             .any(|name| name.ends_with("~manifest.tombstone"))
     );
 
-    cleanup_migration_backups(&fixture.state_root, &state_directory)
+    let approved =
+        plan_migration_backup_cleanup(&fixture.state_root).expect("plan asymmetric deletion retry");
+    assert_eq!(vec![oldest], approved);
+    let removed = cleanup_migration_backups_offline_exact(&fixture.state_root, &approved)
         .expect("retry asymmetric deleting state");
+    assert_eq!(approved, removed);
     assert!(!fixture.state_root.join(deleting_name).exists());
     assert!(cleanup_tombstone_names(&fixture).is_empty());
     assert_eq!(

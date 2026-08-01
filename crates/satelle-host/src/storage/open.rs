@@ -5,7 +5,7 @@ use rusqlite::ffi::ErrorCode as SqliteErrorCode;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, TryLockError};
 use std::io::{Read, Seek, Write};
@@ -2247,6 +2247,27 @@ fn logical_backup_file_name(key: &CleanupTombstoneKey) -> String {
     )
 }
 
+fn cleanup_plan_file_names(
+    state_directory: &StateDirectory,
+    candidates: &[ValidatedMigrationBackup],
+) -> Result<Vec<String>, StorageError> {
+    let mut planned = BTreeSet::new();
+    for file_name in state_directory.leaf_names()? {
+        let key = parse_cleanup_tombstone_file_name(&file_name)
+            .map(|(key, _)| key)
+            .or_else(|| parse_cleanup_deleting_file_name(&file_name).map(|(key, _)| key));
+        if let Some(key) = key {
+            planned.insert(logical_backup_file_name(&key));
+        }
+    }
+    planned.extend(
+        candidates
+            .iter()
+            .map(|backup| backup.backup_file_name.clone()),
+    );
+    Ok(planned.into_iter().collect())
+}
+
 fn list_validated_migration_backups(
     state_root: &Path,
     state_directory: &StateDirectory,
@@ -2270,11 +2291,8 @@ pub(super) fn plan_migration_backup_cleanup(
     let state_directory = prepare_state_root(state_root)?;
     let validated = list_validated_migration_backups(state_root, &state_directory)?;
     let delete_count = validated.len().saturating_sub(2);
-    Ok(validated
-        .into_iter()
-        .take(delete_count)
-        .map(|backup| backup.backup_file_name)
-        .collect())
+    let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
+    cleanup_plan_file_names(&state_directory, &candidates)
 }
 
 pub(super) fn validate_migration_backup_for_restore(
@@ -2417,6 +2435,7 @@ fn delete_quarantined_pair(
 fn resume_cleanup_deleting(
     state_directory: &StateDirectory,
     hook: &mut impl FnMut(CleanupStep) -> Result<(), StorageError>,
+    removed: &mut Vec<String>,
 ) -> Result<(), StorageError> {
     for file_name in state_directory.leaf_names()? {
         let Some((key, kind)) = parse_cleanup_deleting_file_name(&file_name) else {
@@ -2478,7 +2497,13 @@ fn resume_cleanup_deleting(
                 let identity = manifest_read.identity;
                 drop(manifest_read);
                 hook(CleanupStep::ManifestDeleteCommitted)?;
-                remove_private_leaf_checked(state_directory, &file_name, identity)?;
+                if remove_private_leaf_checked(state_directory, &file_name, identity)?
+                    && !removed
+                        .iter()
+                        .any(|removed_name| removed_name == &logical_backup_file_name)
+                {
+                    removed.push(logical_backup_file_name);
+                }
             }
         }
     }
@@ -2491,7 +2516,7 @@ fn resume_cleanup_tombstones(
     hook: &mut impl FnMut(CleanupStep) -> Result<(), StorageError>,
     removed: &mut Vec<String>,
 ) -> Result<(), StorageError> {
-    resume_cleanup_deleting(state_directory, hook)?;
+    resume_cleanup_deleting(state_directory, hook, removed)?;
     let retained_valid_count = list_validated_migration_backups(state_root, state_directory)?.len();
     let mut tombstones = BTreeMap::<CleanupTombstoneKey, CleanupTombstonePair>::new();
     for file_name in state_directory.leaf_names()? {
@@ -2659,9 +2684,9 @@ fn cleanup_migration_backups_with_hook(
         let validated = list_validated_migration_backups(state_root, state_directory)?;
         let delete_count = validated.len().saturating_sub(2);
         let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
-        if !candidates
+        if !cleanup_plan_file_names(state_directory, &candidates)?
             .iter()
-            .map(|backup| backup.backup_file_name.as_str())
+            .map(String::as_str)
             .eq(approved.iter().map(String::as_str))
         {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
