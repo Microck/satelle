@@ -374,6 +374,8 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "status",
             "started_at",
             "finished_at",
+            "host_update_target_version",
+            "host_update_artifact_digest",
         ],
     );
     assert_table_columns(

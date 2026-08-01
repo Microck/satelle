@@ -1,5 +1,32 @@
 use serde::{Deserialize, Serialize};
 
+/// Exact release artifact identity retained by the Host for interrupted
+/// Host-update recovery. Repair must resume this identity instead of deriving
+/// a new target from whichever CLI release happens to run later.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostUpdateRecoveryIdentity {
+    target_version: String,
+    artifact_digest: String,
+}
+
+impl HostUpdateRecoveryIdentity {
+    pub fn new(target_version: impl Into<String>, artifact_digest: impl Into<String>) -> Self {
+        Self {
+            target_version: target_version.into(),
+            artifact_digest: artifact_digest.into(),
+        }
+    }
+
+    pub fn target_version(&self) -> &str {
+        &self.target_version
+    }
+
+    pub fn artifact_digest(&self) -> &str {
+        &self.artifact_digest
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum HostUpdateSchemaVersion {
     #[serde(rename = "satelle.host.update.v1")]
@@ -397,6 +424,18 @@ pub enum RepairUpgradeDisposition {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairStatus {
+    Planned,
+    DryRun,
+    UpToDate,
+    Cancelled,
+    Applied,
+    PartialFailure,
+    ManualActionRequired,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RepairUpgradeSchemaVersion {
     #[serde(rename = "satelle.repair.v1")]
     V1,
@@ -405,17 +444,20 @@ pub enum RepairUpgradeSchemaVersion {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepairLedgerStatus {
+    Available,
     Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepairPlanSource {
+    SetupLedger,
     LiveProbes,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RepairUpgradeAction {
+    pub action_id: String,
     pub target: HostUpdateTarget,
     pub current_version: Option<String>,
     pub target_version: String,
@@ -428,20 +470,130 @@ pub struct RepairUpgradeAction {
 pub struct RepairUpgradeReport {
     pub schema_version: RepairUpgradeSchemaVersion,
     pub host: String,
+    pub status: RepairStatus,
+    pub changed: bool,
     pub ledger_status: RepairLedgerStatus,
     pub plan_source: RepairPlanSource,
     pub actions: Vec<RepairUpgradeAction>,
+    pub planned_actions: Vec<String>,
+    pub applied_actions: Vec<String>,
+    pub completed_actions: Vec<String>,
+    pub failed_action: Option<String>,
+    pub skipped_actions: Vec<String>,
+    pub preserved_state: Option<String>,
+    pub recovery_command: Option<String>,
+    pub cancellation_reason: Option<String>,
 }
 
 impl RepairUpgradeReport {
     pub fn new(host: impl Into<String>, actions: Vec<RepairUpgradeAction>) -> Self {
+        let mut planned_actions = actions
+            .iter()
+            .filter(|action| {
+                action.disposition == RepairUpgradeDisposition::Required
+                    && !matches!(
+                        action.target,
+                        HostUpdateTarget::HostDaemon | HostUpdateTarget::HostDaemonService
+                    )
+            })
+            .map(|action| action.action_id.clone())
+            .collect::<Vec<_>>();
+        if actions.iter().any(|action| {
+            action.disposition == RepairUpgradeDisposition::Required
+                && matches!(
+                    action.target,
+                    HostUpdateTarget::HostDaemon | HostUpdateTarget::HostDaemonService
+                )
+        }) {
+            for action_id in [
+                "install-host-artifact",
+                "publish-host-service",
+                "restart-host-daemon",
+                "invalidate-readiness-caches",
+                "host-update-postcheck",
+            ] {
+                push_unique_action(&mut planned_actions, action_id);
+            }
+        }
+        let skipped_actions = actions
+            .iter()
+            .filter(|action| action.disposition == RepairUpgradeDisposition::ManualActionRequired)
+            .map(|action| action.action_id.clone())
+            .collect::<Vec<_>>();
+        let status = if !planned_actions.is_empty() {
+            RepairStatus::Planned
+        } else if !skipped_actions.is_empty() {
+            RepairStatus::ManualActionRequired
+        } else {
+            RepairStatus::UpToDate
+        };
         Self {
             schema_version: RepairUpgradeSchemaVersion::V1,
             host: host.into(),
+            status,
+            changed: false,
             ledger_status: RepairLedgerStatus::Unavailable,
             plan_source: RepairPlanSource::LiveProbes,
             actions,
+            planned_actions,
+            applied_actions: Vec::new(),
+            completed_actions: Vec::new(),
+            failed_action: None,
+            skipped_actions,
+            preserved_state: None,
+            recovery_command: None,
+            cancellation_reason: None,
         }
+    }
+
+    pub fn requires_mutation(&self) -> bool {
+        !self.planned_actions.is_empty()
+    }
+
+    pub fn into_dry_run(mut self) -> Self {
+        if self.requires_mutation() {
+            self.status = RepairStatus::DryRun;
+        }
+        self
+    }
+
+    pub fn cancelled(mut self) -> Self {
+        self.status = RepairStatus::Cancelled;
+        self.changed = false;
+        self.applied_actions.clear();
+        self.completed_actions.clear();
+        self.cancellation_reason = Some("user_declined_confirmation".to_string());
+        self
+    }
+
+    pub fn applied(mut self, completed_actions: Vec<String>) -> Self {
+        self.status = if self.skipped_actions.is_empty() {
+            RepairStatus::Applied
+        } else {
+            RepairStatus::ManualActionRequired
+        };
+        self.changed = !completed_actions.is_empty();
+        self.applied_actions.clone_from(&completed_actions);
+        self.completed_actions = completed_actions;
+        self
+    }
+
+    pub fn partial_failure(
+        mut self,
+        completed_actions: Vec<String>,
+        failed_action: impl Into<String>,
+    ) -> Self {
+        self.status = RepairStatus::PartialFailure;
+        self.changed = !completed_actions.is_empty();
+        self.applied_actions.clone_from(&completed_actions);
+        self.completed_actions = completed_actions;
+        self.failed_action = Some(failed_action.into());
+        self.preserved_state = Some("completed repair actions were preserved".to_string());
+        self.recovery_command = Some(format!(
+            "satelle repair --host {} --no-input --yes",
+            crate::shell_argument(&self.host)
+        ));
+        self
     }
 }
 
@@ -548,6 +700,95 @@ mod tests {
     }
 
     #[test]
+    fn repair_report_has_stable_action_and_terminal_result_contracts() {
+        let action = RepairUpgradeAction {
+            action_id: "repair-host-daemon".to_string(),
+            target: HostUpdateTarget::HostDaemon,
+            current_version: Some("1.0.0".to_string()),
+            target_version: "1.1.0".to_string(),
+            compatibility_reason: Some(RepairCompatibilityReason::BelowMinimumVersion),
+            version_source: HostUpdateVersionSource::HostCompatibilityRequirement,
+            disposition: RepairUpgradeDisposition::Required,
+        };
+        let planned = RepairUpgradeReport::new("remote", vec![action]);
+        assert_eq!(planned.schema_version, RepairUpgradeSchemaVersion::V1);
+        assert_eq!(planned.status, RepairStatus::Planned);
+        assert_eq!(
+            planned.planned_actions,
+            [
+                "install-host-artifact",
+                "publish-host-service",
+                "restart-host-daemon",
+                "invalidate-readiness-caches",
+                "host-update-postcheck",
+            ]
+        );
+
+        let cancelled = planned.clone().cancelled();
+        assert_eq!(cancelled.status, RepairStatus::Cancelled);
+        assert!(!cancelled.changed);
+        assert!(cancelled.applied_actions.is_empty());
+        assert_eq!(
+            cancelled.cancellation_reason.as_deref(),
+            Some("user_declined_confirmation")
+        );
+
+        let partial = planned.partial_failure(
+            vec!["install-host-artifact".to_string()],
+            "publish-host-service",
+        );
+        assert_eq!(partial.status, RepairStatus::PartialFailure);
+        assert!(partial.changed);
+        assert_eq!(partial.completed_actions, ["install-host-artifact"]);
+        assert_eq!(
+            partial.failed_action.as_deref(),
+            Some("publish-host-service")
+        );
+        assert_eq!(
+            partial.recovery_command.as_deref(),
+            Some("satelle repair --host remote --no-input --yes")
+        );
+    }
+
+    #[test]
+    fn applied_repair_work_preserves_manual_action_required_status() {
+        let report = RepairUpgradeReport::new(
+            "remote",
+            vec![
+                RepairUpgradeAction {
+                    action_id: "repair-host-daemon".to_string(),
+                    target: HostUpdateTarget::HostDaemon,
+                    current_version: None,
+                    target_version: "1.1.0".to_string(),
+                    compatibility_reason: Some(RepairCompatibilityReason::Missing),
+                    version_source: HostUpdateVersionSource::InvokingCliRelease,
+                    disposition: RepairUpgradeDisposition::Required,
+                },
+                RepairUpgradeAction {
+                    action_id: "repair-codex-runtime".to_string(),
+                    target: HostUpdateTarget::CodexRuntime,
+                    current_version: None,
+                    target_version: "1.1.0".to_string(),
+                    compatibility_reason: Some(RepairCompatibilityReason::Missing),
+                    version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
+                    disposition: RepairUpgradeDisposition::ManualActionRequired,
+                },
+            ],
+        )
+        .applied(vec![
+            "install-host-artifact".to_string(),
+            "publish-host-service".to_string(),
+            "restart-host-daemon".to_string(),
+            "invalidate-readiness-caches".to_string(),
+            "host-update-postcheck".to_string(),
+        ]);
+
+        assert_eq!(RepairStatus::ManualActionRequired, report.status);
+        assert!(report.changed);
+        assert_eq!(report.skipped_actions, ["repair-codex-runtime"]);
+    }
+
+    #[test]
     fn dry_run_and_up_to_date_results_are_non_mutating() {
         let dry_run = HostUpdateReport::new(
             "office",
@@ -578,6 +819,63 @@ mod tests {
         assert_eq!(up_to_date.status, HostUpdateStatus::UpToDate);
         assert!(!up_to_date.confirmation_required);
         assert!(up_to_date.planned_actions.is_empty());
+    }
+
+    #[test]
+    fn repair_plan_keeps_required_non_host_actions_with_the_host_sequence() {
+        let report = RepairUpgradeReport::new(
+            "remote",
+            vec![
+                RepairUpgradeAction {
+                    action_id: "repair-host-daemon".to_string(),
+                    target: HostUpdateTarget::HostDaemon,
+                    current_version: None,
+                    target_version: "1.1.0".to_string(),
+                    compatibility_reason: Some(RepairCompatibilityReason::Missing),
+                    version_source: HostUpdateVersionSource::InvokingCliRelease,
+                    disposition: RepairUpgradeDisposition::Required,
+                },
+                RepairUpgradeAction {
+                    action_id: "repair-codex-runtime".to_string(),
+                    target: HostUpdateTarget::CodexRuntime,
+                    current_version: None,
+                    target_version: "1.1.0".to_string(),
+                    compatibility_reason: Some(RepairCompatibilityReason::Missing),
+                    version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
+                    disposition: RepairUpgradeDisposition::Required,
+                },
+            ],
+        );
+
+        assert!(report.requires_mutation());
+        assert_eq!(
+            report.planned_actions,
+            [
+                "repair-codex-runtime",
+                "install-host-artifact",
+                "publish-host-service",
+                "restart-host-daemon",
+                "invalidate-readiness-caches",
+                "host-update-postcheck",
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_postchecks_cannot_finish_as_applied() {
+        let mut report = HostUpdateReport::new(
+            "remote",
+            vec![HostUpdateComponent::Host],
+            vec![update_target(
+                HostUpdateTarget::HostDaemon,
+                "install-host-artifact",
+            )],
+        );
+        report.changed = true;
+
+        let finished = report.finish_postchecks();
+
+        assert_eq!(finished.status, HostUpdateStatus::PostcheckFailed);
     }
 
     #[test]

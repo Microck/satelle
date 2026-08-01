@@ -173,6 +173,20 @@ pub trait SetupPostconditionObserver {
     fn observe(&mut self, action: &SetupActionRecord) -> Result<bool, SatelleError>;
 }
 
+struct OfflineStoragePostcondition<'a> {
+    action_id: &'a str,
+    satisfied: bool,
+}
+
+impl SetupPostconditionObserver for OfflineStoragePostcondition<'_> {
+    fn observe(&mut self, action: &SetupActionRecord) -> Result<bool, SatelleError> {
+        if action.action_id() != self.action_id {
+            return Err(SatelleError::state_conflict());
+        }
+        Ok(self.satisfied)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapMaintenancePlanKind {
     OnDemandHandoff,
@@ -180,6 +194,7 @@ pub enum BootstrapMaintenancePlanKind {
     PersistentHostStop,
     PersistentHostRestart,
     HostUpdate,
+    Repair,
 }
 
 impl BootstrapMaintenancePlanKind {
@@ -190,6 +205,7 @@ impl BootstrapMaintenancePlanKind {
             Self::PersistentHostStop => "persistent_host_stop",
             Self::PersistentHostRestart => "persistent_host_restart",
             Self::HostUpdate => "host_update",
+            Self::Repair => "repair",
         }
     }
 
@@ -200,6 +216,7 @@ impl BootstrapMaintenancePlanKind {
             "persistent_host_stop" => Ok(Self::PersistentHostStop),
             "persistent_host_restart" => Ok(Self::PersistentHostRestart),
             "host_update" => Ok(Self::HostUpdate),
+            "repair" => Ok(Self::Repair),
             _ => Err(SatelleError::invalid_usage(
                 "invalid Bootstrap maintenance plan kind",
             )),
@@ -246,7 +263,7 @@ impl BootstrapMaintenancePlanKind {
                 "Restart the registered Host service",
                 true,
             )?],
-            Self::HostUpdate => vec![
+            Self::HostUpdate | Self::Repair => vec![
                 SetupActionPlan::new(
                     "install-host-artifact",
                     "Install the verified Host artifact",
@@ -278,6 +295,7 @@ impl BootstrapMaintenancePlanKind {
             Self::PersistentHostStop => operation_kind == SetupOperationKind::ServiceStop,
             Self::PersistentHostRestart => operation_kind == SetupOperationKind::ServiceRestart,
             Self::HostUpdate => operation_kind == SetupOperationKind::HostUpdate,
+            Self::Repair => operation_kind == SetupOperationKind::Repair,
             Self::OnDemandHandoff | Self::PersistentHostService => !matches!(
                 operation_kind,
                 SetupOperationKind::ServiceStop | SetupOperationKind::ServiceRestart
@@ -452,19 +470,35 @@ mod bootstrap_maintenance_tests {
         let service =
             HostService::local_demo_for_tests_at(state.path()).expect("create Host service");
         let operation_id = "host-update-operation";
+        let recovery_identity = satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+            env!("CARGO_PKG_VERSION"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
 
         service
-            .acquire_bootstrap_maintenance_plan(
-                operation_id,
-                SetupOperationKind::HostUpdate,
-                BootstrapMaintenancePlanKind::HostUpdate,
-            )
+            .acquire_host_update_maintenance(operation_id, &recovery_identity)
             .expect("acquire Host update maintenance");
         let run = service
             .load_setup_run(operation_id)
             .expect("load Host update run")
             .expect("Host update run exists");
         assert_eq!(SetupOperationKind::HostUpdate, run.operation_kind());
+        assert_eq!(
+            run.host_update_recovery_identity(),
+            Some(&recovery_identity)
+        );
+        assert!(
+            service
+                .acquire_host_update_maintenance(
+                    operation_id,
+                    &satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+                        env!("CARGO_PKG_VERSION"),
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    ),
+                )
+                .is_err(),
+            "adoption must reject a different release artifact identity"
+        );
         assert_eq!(
             run.actions()
                 .iter()
@@ -503,6 +537,44 @@ mod bootstrap_maintenance_tests {
                     BootstrapMaintenancePlanKind::HostUpdate,
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn repair_host_replacement_persists_its_exact_recovery_identity() {
+        let state = TestStateDir::new().expect("create state directory");
+        let service =
+            HostService::local_demo_for_tests_at(state.path()).expect("create Host service");
+        let operation_id = "repair-host-replacement";
+        let recovery_identity = satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+            env!("CARGO_PKG_VERSION"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        service
+            .acquire_repair_maintenance(operation_id, &recovery_identity)
+            .expect("acquire repair maintenance");
+        let run = service
+            .load_setup_run(operation_id)
+            .expect("load repair run")
+            .expect("repair run exists");
+
+        assert_eq!(SetupOperationKind::Repair, run.operation_kind());
+        assert_eq!(
+            Some(&recovery_identity),
+            run.host_update_recovery_identity()
+        );
+        assert!(
+            service
+                .acquire_repair_maintenance(
+                    operation_id,
+                    &satelle_core::host_update::HostUpdateRecoveryIdentity::new(
+                        env!("CARGO_PKG_VERSION"),
+                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    ),
+                )
+                .is_err(),
+            "adoption must reject a different repair artifact identity"
         );
     }
 
@@ -778,6 +850,277 @@ mod bootstrap_maintenance_tests {
             completed.actions()[0].status()
         );
     }
+
+    #[test]
+    fn offline_restore_hands_ledger_authority_from_old_store_to_restored_store() {
+        let old_state = TestStateDir::new().expect("create old state directory");
+        let restored_state = TestStateDir::new().expect("create restored state directory");
+        let operation_id = "storage-restore-ledger-handoff";
+
+        HostService::start_offline_storage_maintenance(
+            old_state.path(),
+            operation_id,
+            "restore-storage-backup",
+            "Restore the validated Host storage backup",
+        )
+        .expect("record restore start before replacing the active store");
+        let old_connection = rusqlite::Connection::open(old_state.path().join("satelle.sqlite3"))
+            .expect("open preserved old store");
+        let old_statuses = old_connection
+            .query_row(
+                "SELECT setup_runs.status, setup_actions.status
+                 FROM setup_runs
+                 JOIN setup_actions USING (run_id)
+                 WHERE run_id = ?1",
+                [operation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("load pre-activation ledger state");
+        assert_eq!(("running".to_string(), "started".to_string()), old_statuses);
+        std::fs::rename(
+            old_state
+                .path()
+                .join(".satelle-offline-storage-maintenance-v1"),
+            restored_state
+                .path()
+                .join(".satelle-offline-storage-maintenance-v1"),
+        )
+        .expect("retain the database-independent handoff across store activation");
+
+        HostService::record_completed_offline_storage_maintenance(
+            restored_state.path(),
+            operation_id,
+            "restore-storage-backup",
+            "Restore the validated Host storage backup",
+        )
+        .expect("record restore completion in the activated store");
+        let restored = HostService::production_for_offline_storage(restored_state.path())
+            .load_setup_run(operation_id)
+            .expect("load restored-store ledger")
+            .expect("restored-store ledger contains the operation");
+        assert_eq!(SetupRunStatus::Completed, restored.status());
+        assert_eq!(SetupActionStatus::Completed, restored.actions()[0].status());
+
+        let cleanup_state = TestStateDir::new().expect("create cleanup state directory");
+        HostService::start_offline_storage_maintenance(
+            cleanup_state.path(),
+            "storage-cleanup-ledger",
+            "cleanup-storage-backups",
+            "Delete older validated Host storage backups",
+        )
+        .expect("record cleanup start");
+        HostService::record_completed_offline_storage_maintenance(
+            cleanup_state.path(),
+            "storage-cleanup-ledger",
+            "cleanup-storage-backups",
+            "Delete older validated Host storage backups",
+        )
+        .expect("reconcile cleanup completion in the same store");
+        HostService::record_completed_offline_storage_maintenance(
+            cleanup_state.path(),
+            "storage-cleanup-ledger",
+            "cleanup-storage-backups",
+            "Delete older validated Host storage backups",
+        )
+        .expect("repeat exact cleanup completion recovery");
+        let cleanup = HostService::production_for_offline_storage(cleanup_state.path())
+            .load_setup_run("storage-cleanup-ledger")
+            .expect("load cleanup ledger")
+            .expect("cleanup ledger exists");
+        assert_eq!(SetupRunStatus::Completed, cleanup.status());
+
+        let failed_state = TestStateDir::new().expect("create failed state directory");
+        HostService::start_offline_storage_maintenance(
+            failed_state.path(),
+            "storage-reset-ledger-failure",
+            "reset-host-store",
+            "Reset Host metadata",
+        )
+        .expect("record reset start");
+        HostService::record_failed_offline_storage_maintenance(
+            failed_state.path(),
+            "storage-reset-ledger-failure",
+            "reset-host-store",
+        )
+        .expect("record verified reset failure");
+        let failed = HostService::production_for_offline_storage(failed_state.path())
+            .load_setup_run("storage-reset-ledger-failure")
+            .expect("load failed reset ledger")
+            .expect("failed reset ledger exists");
+        assert_eq!(SetupRunStatus::Failed, failed.status());
+        assert_eq!(SetupActionStatus::Failed, failed.actions()[0].status());
+    }
+
+    #[test]
+    fn corrupt_store_does_not_block_restore_or_reset_handoff() {
+        for (operation_id, action_id, action_label) in [
+            (
+                "corrupt-store-restore",
+                "restore-storage-backup",
+                "Restore the validated Host storage backup",
+            ),
+            (
+                "corrupt-store-reset",
+                "reset-host-store",
+                "Reset Host metadata",
+            ),
+        ] {
+            let state = TestStateDir::new().expect("create corrupt storage state");
+            let database = state.path().join("satelle.sqlite3");
+            std::fs::write(&database, b"not a SQLite database")
+                .expect("write corrupt database fixture");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+                    .expect("keep the corrupt fixture owner-only");
+            }
+
+            HostService::start_offline_storage_maintenance(
+                state.path(),
+                operation_id,
+                action_id,
+                action_label,
+            )
+            .expect("persist the recovery handoff without opening the failed database");
+
+            assert!(
+                state
+                    .path()
+                    .join(".satelle-offline-storage-maintenance-v1")
+                    .exists(),
+                "the pre-mutation handoff must survive independently from SQLite"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_store_reset_imports_the_handoff_into_the_new_sqlite_ledger() {
+        let state = TestStateDir::new().expect("create corrupt reset state");
+        let database = state.path().join("satelle.sqlite3");
+        std::fs::write(&database, b"not a SQLite database")
+            .expect("write corrupt database fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+                .expect("keep the corrupt fixture owner-only");
+        }
+        let operation_id = "corrupt-store-reset-completion";
+        HostService::start_offline_storage_maintenance(
+            state.path(),
+            operation_id,
+            "reset-host-store",
+            "Reset Host metadata",
+        )
+        .expect("persist reset recovery handoff");
+        HostService::reset_store_metadata_offline(
+            state.path(),
+            false,
+            "satelle host store reset --host local-demo --no-input --yes",
+        )
+        .expect("remove the corrupt store");
+        HostService::record_completed_offline_storage_maintenance(
+            state.path(),
+            operation_id,
+            "reset-host-store",
+            "Reset Host metadata",
+        )
+        .expect("import the completed handoff into the replacement store");
+
+        let completed = HostService::production_for_offline_storage(state.path())
+            .load_setup_run(operation_id)
+            .expect("load replacement setup ledger")
+            .expect("replacement ledger contains the reset operation");
+        assert_eq!(SetupRunStatus::Completed, completed.status());
+        assert!(
+            !state
+                .path()
+                .join(".satelle-offline-storage-maintenance-v1")
+                .exists(),
+            "SQLite is authoritative after the handoff is imported"
+        );
+    }
+
+    #[test]
+    fn store_reset_preserves_recordings_unless_deletion_is_explicit() {
+        for delete_recordings in [false, true] {
+            let state = TestStateDir::new().expect("create reset state directory");
+            let service = HostService::production_for_offline_storage(state.path());
+            service
+                .load_setup_run("missing-reset-fixture")
+                .expect("create the Host metadata store");
+            drop(service);
+            let recordings = state.path().join("recordings");
+            std::fs::create_dir(&recordings).expect("create recordings directory");
+            std::fs::write(recordings.join("recording.webm"), b"recording")
+                .expect("write recording fixture");
+
+            let reset = HostService::reset_store_metadata_offline(
+                state.path(),
+                delete_recordings,
+                "satelle host store reset --host local-demo --no-input --yes",
+            )
+            .expect("reset Host store");
+            assert_eq!(delete_recordings, reset.recordings_deleted);
+            assert_eq!(!delete_recordings, recordings.exists());
+            assert!(
+                !state.path().join("satelle.sqlite3").exists(),
+                "store reset deletes Host metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn store_reset_retries_a_quarantined_recording_directory() {
+        let state = TestStateDir::new().expect("create reset state directory");
+        let service = HostService::production_for_offline_storage(state.path());
+        service
+            .load_setup_run("missing-reset-fixture")
+            .expect("create the Host metadata store");
+        drop(service);
+        let quarantined = state
+            .path()
+            .join("recordings.deleted-0198a146-5ec2-7dd5-b51c-7d5e241e5882");
+        std::fs::create_dir(&quarantined).expect("create interrupted recording quarantine");
+        std::fs::write(quarantined.join("recording.webm"), b"recording")
+            .expect("write quarantined recording fixture");
+
+        let reset = HostService::reset_store_metadata_offline(
+            state.path(),
+            true,
+            "satelle host store reset --host local-demo --delete-recordings --no-input --yes",
+        )
+        .expect("retry explicit recording deletion");
+
+        assert!(reset.recordings_deleted);
+        assert!(!quarantined.exists());
+    }
+
+    #[test]
+    fn offline_store_reset_rejects_a_running_store_owner() {
+        let state = TestStateDir::new().expect("create active state directory");
+        let service = HostService::production_for_offline_storage(state.path());
+        service
+            .load_setup_run("missing-active-fixture")
+            .expect("open the active Host metadata store");
+        let recordings = state.path().join("recordings");
+        std::fs::create_dir(&recordings).expect("create recordings directory");
+        let recording = recordings.join("recording.webm");
+        std::fs::write(&recording, b"recording").expect("write recording fixture");
+
+        let error = HostService::reset_store_metadata_offline(
+            state.path(),
+            true,
+            "satelle host store reset --host local-demo --delete-recordings --no-input --yes",
+        )
+        .expect_err("an active Host owner must block offline reset");
+        assert_eq!(satelle_core::ErrorCode::StoreInUse, error.code);
+        assert!(
+            recording.exists(),
+            "ownership rejection must precede recording deletion"
+        );
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -831,6 +1174,23 @@ pub struct HostService {
     bootstrap_auth: Option<Arc<EphemeralApiAuthenticator>>,
     bootstrap_maintenance: Arc<Mutex<Option<MaintenanceOperationHandle>>>,
     doctor_tasks: DoctorTaskRegistry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct StorageRestoreActivation {
+    pub failed_store_file_name: String,
+    pub failed_sidecar_file_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct StorageBackupCleanupPlan {
+    pub eligible_backup_file_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct StoreResetResult {
+    pub removed_metadata_file_names: Vec<String>,
+    pub recordings_deleted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1343,7 +1703,435 @@ pub(crate) fn validate_provider_binding_authorization(
     Ok(())
 }
 
+fn storage_backup_file_name<'a>(
+    state_root: &std::path::Path,
+    backup: &'a std::path::Path,
+) -> Result<&'a str, SatelleError> {
+    if backup.parent() != Some(state_root) {
+        return Err(SatelleError::invalid_usage(
+            "the backup path must name a file directly inside the Host state directory",
+        ));
+    }
+    backup
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| SatelleError::invalid_usage("the backup path has an invalid file name"))
+}
+
+fn delete_recordings_directory(state_root: &std::path::Path) -> Result<bool, SatelleError> {
+    let recordings = state_root.join("recordings");
+    let mut quarantines = Vec::new();
+    for entry in std::fs::read_dir(state_root)
+        .map_err(|error| storage_recording_deletion_failure(state_root, "inspect", error))?
+    {
+        let entry = entry
+            .map_err(|error| storage_recording_deletion_failure(state_root, "inspect", error))?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(quarantine_id) = file_name.strip_prefix("recordings.deleted-") else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(quarantine_id).is_err() {
+            continue;
+        }
+        let quarantine = entry.path();
+        let metadata = std::fs::symlink_metadata(&quarantine)
+            .map_err(|error| storage_recording_deletion_failure(&quarantine, "inspect", error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(SatelleError::invalid_usage(
+                "the recording deletion quarantine is not a private directory",
+            ));
+        }
+        quarantines.push(quarantine);
+    }
+    quarantines.sort();
+    if quarantines.len() > 1 {
+        return Err(SatelleError::state_conflict());
+    }
+
+    let quarantined = match std::fs::symlink_metadata(&recordings) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(SatelleError::invalid_usage(
+                    "the recording root is not a private directory",
+                ));
+            }
+            if !quarantines.is_empty() {
+                return Err(SatelleError::state_conflict());
+            }
+            let quarantined =
+                state_root.join(format!("recordings.deleted-{}", uuid::Uuid::now_v7()));
+            std::fs::rename(&recordings, &quarantined).map_err(|error| {
+                storage_recording_deletion_failure(&recordings, "quarantine", error)
+            })?;
+            quarantined
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(quarantined) = quarantines.pop() else {
+                return Ok(false);
+            };
+            quarantined
+        }
+        Err(error) => {
+            return Err(storage_recording_deletion_failure(
+                &recordings,
+                "inspect",
+                error,
+            ));
+        }
+    };
+    if let Err(error) = std::fs::remove_dir_all(&quarantined) {
+        // Restore the canonical name when possible so the next explicit retry
+        // cannot mistake a failed deletion for an already-completed no-op.
+        let recovery_path = if std::fs::rename(&quarantined, &recordings).is_ok() {
+            &recordings
+        } else {
+            &quarantined
+        };
+        return Err(storage_recording_deletion_failure(
+            recovery_path,
+            "delete",
+            error,
+        ));
+    }
+    Ok(true)
+}
+
+fn storage_recording_deletion_failure(
+    path: &std::path::Path,
+    operation: &str,
+    error: std::io::Error,
+) -> SatelleError {
+    SatelleError {
+        code: satelle_core::ErrorCode::StorageIntegrityFailed,
+        message: format!("could not {operation} the Host recording directory"),
+        recovery_command: Some(format!(
+            "inspect '{}' before retrying the explicit recording deletion",
+            path.display()
+        )),
+        source_detail: Some(error.to_string()),
+        details: std::collections::BTreeMap::new(),
+    }
+}
+
+fn storage_backup_cleanup_failure(
+    failure: storage::BackupCleanupFailure,
+    recovery_command: &str,
+) -> SatelleError {
+    if failure.removed_backup_file_names.is_empty() {
+        return runtime::storage_failure(failure.source);
+    }
+    let mut error = SatelleError::storage_maintenance_partially_applied(
+        &["cleanup-storage-backups".to_string()],
+        "cleanup-storage-backups",
+        &[],
+        recovery_command,
+        runtime::storage_failure(failure.source).to_string(),
+    );
+    error.details.insert(
+        "removed_backup_file_names".to_string(),
+        serde_json::to_value(failure.removed_backup_file_names).unwrap_or(serde_json::Value::Null),
+    );
+    error
+}
+
+#[cfg(test)]
+#[test]
+fn storage_backup_cleanup_failure_reports_already_removed_names() {
+    let recovery_command = "satelle host storage backup cleanup --host local-demo --no-input --yes";
+    let error = storage_backup_cleanup_failure(
+        storage::BackupCleanupFailure::new(
+            vec!["satelle.sqlite3.migration-v14-test.backup".to_string()],
+            storage::StorageError::for_test(storage::StorageErrorKind::OperationFailed),
+        ),
+        recovery_command,
+    );
+
+    assert_eq!(satelle_core::ErrorCode::SetupPartiallyApplied, error.code);
+    assert_eq!(
+        serde_json::json!(["satelle.sqlite3.migration-v14-test.backup"]),
+        error.details["removed_backup_file_names"]
+    );
+    assert_eq!(
+        serde_json::json!(["cleanup-storage-backups"]),
+        error.details["completed_actions"]
+    );
+    assert_eq!(error.recovery_command.as_deref(), Some(recovery_command));
+}
+
 impl HostService {
+    pub fn validate_storage_restore(
+        state_root: &std::path::Path,
+        backup: &std::path::Path,
+    ) -> Result<(), SatelleError> {
+        let backup_file_name = storage_backup_file_name(state_root, backup)?;
+        storage::validate_migration_backup_for_restore(state_root, backup_file_name)
+            .map_err(runtime::storage_failure)
+    }
+
+    pub fn preview_storage_restore(
+        state_root: &std::path::Path,
+        backup: &std::path::Path,
+    ) -> Result<(), SatelleError> {
+        let backup_file_name = storage_backup_file_name(state_root, backup)?;
+        storage::validate_migration_backup_for_preview(state_root, backup_file_name)
+            .map_err(runtime::storage_failure)
+    }
+
+    pub fn restore_storage_backup_offline(
+        state_root: &std::path::Path,
+        backup: &std::path::Path,
+    ) -> Result<StorageRestoreActivation, SatelleError> {
+        let backup_file_name = storage_backup_file_name(state_root, backup)?;
+        let (failed_store_file_name, failed_sidecar_file_names) =
+            storage::restore_migration_backup_offline(state_root, backup_file_name)
+                .map_err(runtime::storage_failure)?;
+        Ok(StorageRestoreActivation {
+            failed_store_file_name,
+            failed_sidecar_file_names,
+        })
+    }
+
+    pub fn plan_storage_backup_cleanup(
+        state_root: &std::path::Path,
+    ) -> Result<StorageBackupCleanupPlan, SatelleError> {
+        storage::plan_migration_backup_cleanup(state_root)
+            .map(|eligible_backup_file_names| StorageBackupCleanupPlan {
+                eligible_backup_file_names,
+            })
+            .map_err(runtime::storage_failure)
+    }
+
+    pub fn cleanup_planned_storage_backups_offline(
+        state_root: &std::path::Path,
+        approved_backup_file_names: &[String],
+        recovery_command: &str,
+    ) -> Result<Vec<String>, SatelleError> {
+        storage::cleanup_migration_backups_offline_exact(state_root, approved_backup_file_names)
+            .map_err(|source| storage_backup_cleanup_failure(source, recovery_command))
+    }
+
+    pub fn reset_store_metadata_offline(
+        state_root: &std::path::Path,
+        delete_recordings: bool,
+        recovery_command: &str,
+    ) -> Result<StoreResetResult, SatelleError> {
+        // Retain the exclusive Storage owner across both destructive steps.
+        // A live daemon must reject the reset before recordings can move.
+        let reset =
+            storage::begin_store_reset_offline(state_root).map_err(runtime::storage_failure)?;
+        let recordings_deleted = if delete_recordings {
+            delete_recordings_directory(state_root)?
+        } else {
+            false
+        };
+        match reset.reset_metadata() {
+            Ok(removed_metadata_file_names) => Ok(StoreResetResult {
+                removed_metadata_file_names,
+                recordings_deleted,
+            }),
+            Err((removed_metadata_file_names, source)) => {
+                if removed_metadata_file_names.is_empty() && !recordings_deleted {
+                    return Err(runtime::storage_failure(source));
+                }
+                let mut completed_actions = Vec::new();
+                if recordings_deleted {
+                    completed_actions.push("delete-host-recordings".to_string());
+                }
+                if !removed_metadata_file_names.is_empty() {
+                    completed_actions.push("delete-host-metadata".to_string());
+                }
+                let mut error = SatelleError::storage_maintenance_partially_applied(
+                    &completed_actions,
+                    "delete-host-metadata",
+                    &[],
+                    recovery_command,
+                    runtime::storage_failure(source).to_string(),
+                );
+                error.details.insert(
+                    "removed_metadata_file_names".to_string(),
+                    serde_json::to_value(removed_metadata_file_names)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                error.details.insert(
+                    "recordings_deleted".to_string(),
+                    serde_json::Value::Bool(recordings_deleted),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    pub fn record_completed_offline_storage_maintenance(
+        state_root: &std::path::Path,
+        operation_id: &str,
+        action_id: &str,
+        action_label: &str,
+    ) -> Result<(), SatelleError> {
+        let service = Self::production_for_offline_storage(state_root);
+        if let Some(existing) = service.load_setup_run(operation_id)? {
+            if existing.operation_kind() != SetupOperationKind::StorageMigration
+                || existing.actions().len() != 1
+                || existing.actions()[0].action_id() != action_id
+            {
+                return Err(SatelleError::state_conflict());
+            }
+            if existing.status() == SetupRunStatus::Completed {
+                storage::finish_completed_offline_storage_maintenance_if_present(
+                    state_root,
+                    operation_id,
+                    action_id,
+                    action_label,
+                )
+                .map_err(runtime::storage_failure)?;
+                return Ok(());
+            }
+            storage::offline_storage_maintenance_started_at(
+                state_root,
+                operation_id,
+                action_id,
+                Some(action_label),
+            )
+            .map_err(runtime::storage_failure)?;
+            let mut observer = OfflineStoragePostcondition {
+                action_id,
+                satisfied: true,
+            };
+            let status = service.reconcile_setup_maintenance(&mut observer)?;
+            if status != Some(SetupRunStatus::Completed) {
+                return Err(SatelleError::state_conflict());
+            }
+            storage::finish_offline_storage_maintenance(
+                state_root,
+                operation_id,
+                action_id,
+                Some(action_label),
+                false,
+            )
+            .map_err(runtime::storage_failure)?;
+            return Ok(());
+        }
+        let started_at = storage::offline_storage_maintenance_started_at(
+            state_root,
+            operation_id,
+            action_id,
+            Some(action_label),
+        )
+        .map_err(runtime::storage_failure)?;
+        let plan = SetupRunPlan::new(
+            operation_id,
+            SetupOperationKind::StorageMigration,
+            None,
+            started_at,
+            vec![SetupActionPlan::new(action_id, action_label, true)?],
+        )?;
+        let mut operation = service.begin_setup_run(&plan)?;
+        service.start_setup_action(&operation, action_id, started_at)?;
+        service.complete_setup_action_after_verified_postcondition(
+            &operation,
+            action_id,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        service.finish_setup_run(&mut operation, time::OffsetDateTime::now_utc())?;
+        storage::finish_offline_storage_maintenance(
+            state_root,
+            operation_id,
+            action_id,
+            Some(action_label),
+            false,
+        )
+        .map_err(runtime::storage_failure)?;
+        Ok(())
+    }
+
+    /// Persists an offline storage action before its first filesystem
+    /// mutation. Restore and reset can replace this store; their successful
+    /// activation writes the terminal record under the same operation id.
+    pub fn start_offline_storage_maintenance(
+        state_root: &std::path::Path,
+        operation_id: &str,
+        action_id: &str,
+        action_label: &str,
+    ) -> Result<(), SatelleError> {
+        let started_at = time::OffsetDateTime::now_utc();
+        let plan = SetupRunPlan::new(
+            operation_id,
+            SetupOperationKind::StorageMigration,
+            None,
+            started_at,
+            vec![SetupActionPlan::new(action_id, action_label, true)?],
+        )?;
+        storage::begin_offline_storage_maintenance(
+            state_root,
+            operation_id,
+            action_id,
+            action_label,
+            started_at,
+        )
+        .map_err(runtime::storage_failure)?;
+        let service = Self::production_for_offline_storage(state_root);
+        let ledger_start = (|| {
+            let mut operation = service.begin_setup_run(&plan)?;
+            service.start_setup_action(&operation, action_id, started_at)?;
+            service.runtime.handoff_offline_maintenance(&mut operation);
+            Ok::<_, SatelleError>(())
+        })();
+        match ledger_start {
+            Ok(()) => Ok(()),
+            // The durable handoff record is authoritative only until the
+            // repaired or reset SQLite store can accept the canonical ledger
+            // entry. Other conflicts still stop before filesystem mutation.
+            Err(error) if error.code == satelle_core::ErrorCode::StorageIntegrityFailed => Ok(()),
+            Err(error) => {
+                storage::mark_offline_storage_maintenance_failed(
+                    state_root,
+                    operation_id,
+                    action_id,
+                )
+                .map_err(runtime::storage_failure)?;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn record_failed_offline_storage_maintenance(
+        state_root: &std::path::Path,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<(), SatelleError> {
+        storage::mark_offline_storage_maintenance_failed(state_root, operation_id, action_id)
+            .map_err(runtime::storage_failure)?;
+        let service = Self::production_for_offline_storage(state_root);
+        let existing = service
+            .load_setup_run(operation_id)?
+            .ok_or_else(SatelleError::state_conflict)?;
+        if existing.operation_kind() != SetupOperationKind::StorageMigration
+            || existing.actions().len() != 1
+            || existing.actions()[0].action_id() != action_id
+        {
+            return Err(SatelleError::state_conflict());
+        }
+        let mut observer = OfflineStoragePostcondition {
+            action_id,
+            satisfied: false,
+        };
+        let status = service.reconcile_setup_maintenance(&mut observer)?;
+        if status == Some(SetupRunStatus::Failed) {
+            storage::finish_offline_storage_maintenance(
+                state_root,
+                operation_id,
+                action_id,
+                None,
+                true,
+            )
+            .map_err(runtime::storage_failure)?;
+            Ok(())
+        } else {
+            Err(SatelleError::state_conflict())
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn local_demo_with_readiness_driver_for_tests_at<
         D: runtime::ReadinessProbeDriver,
@@ -1398,6 +2186,54 @@ impl HostService {
         operation_kind: SetupOperationKind,
         plan_kind: BootstrapMaintenancePlanKind,
     ) -> Result<(), SatelleError> {
+        if plan_kind == BootstrapMaintenancePlanKind::HostUpdate
+            && operation_kind == SetupOperationKind::HostUpdate
+        {
+            return Err(SatelleError::invalid_usage(
+                "Host update maintenance requires an exact recovery identity",
+            ));
+        }
+        self.acquire_bootstrap_maintenance_plan_with_identity(
+            operation_id,
+            operation_kind,
+            plan_kind,
+            None,
+        )
+    }
+
+    pub fn acquire_host_update_maintenance(
+        &self,
+        operation_id: &str,
+        recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
+    ) -> Result<(), SatelleError> {
+        self.acquire_bootstrap_maintenance_plan_with_identity(
+            operation_id,
+            SetupOperationKind::HostUpdate,
+            BootstrapMaintenancePlanKind::HostUpdate,
+            Some(recovery_identity),
+        )
+    }
+
+    pub fn acquire_repair_maintenance(
+        &self,
+        operation_id: &str,
+        recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
+    ) -> Result<(), SatelleError> {
+        self.acquire_bootstrap_maintenance_plan_with_identity(
+            operation_id,
+            SetupOperationKind::Repair,
+            BootstrapMaintenancePlanKind::Repair,
+            Some(recovery_identity),
+        )
+    }
+
+    fn acquire_bootstrap_maintenance_plan_with_identity(
+        &self,
+        operation_id: &str,
+        operation_kind: SetupOperationKind,
+        plan_kind: BootstrapMaintenancePlanKind,
+        recovery_identity: Option<&satelle_core::host_update::HostUpdateRecoveryIdentity>,
+    ) -> Result<(), SatelleError> {
         if !plan_kind.accepts_operation_kind(operation_kind) {
             return Err(SatelleError::invalid_usage(
                 "maintenance plan and operation kind do not match",
@@ -1415,7 +2251,10 @@ impl HostService {
                 .runtime
                 .load_setup_run(operation_id)?
                 .ok_or_else(SatelleError::state_conflict)?;
-            return if run.operation_kind() == operation_kind && plan_kind.matches_run(&run)? {
+            return if run.operation_kind() == operation_kind
+                && plan_kind.matches_run(&run)?
+                && run.host_update_recovery_identity() == recovery_identity
+            {
                 Ok(())
             } else {
                 Err(SatelleError::state_conflict())
@@ -1423,7 +2262,10 @@ impl HostService {
         }
         let existing_run = self.runtime.load_setup_run(operation_id)?;
         if let Some(run) = existing_run.as_ref() {
-            if run.operation_kind() != operation_kind || !plan_kind.matches_run(run)? {
+            if run.operation_kind() != operation_kind
+                || !plan_kind.matches_run(run)?
+                || run.host_update_recovery_identity() != recovery_identity
+            {
                 return Err(SatelleError::state_conflict());
             }
             if run.status() == SetupRunStatus::Completed {
@@ -1440,6 +2282,10 @@ impl HostService {
                 time::OffsetDateTime::now_utc(),
                 plan_kind.actions()?,
             )?;
+            let plan = match recovery_identity {
+                Some(identity) => plan.with_host_update_recovery_identity(identity.clone())?,
+                None => plan,
+            };
             self.runtime.begin_bootstrap_maintenance(&plan)?
         };
         *slot = Some(operation);
@@ -1730,9 +2576,11 @@ impl HostService {
     pub fn plan_setup_repair(
         &self,
         desktop_binding: Option<&satelle_core::session::DesktopBindingRef>,
+        run_id: Option<&str>,
         probes: &[SetupRepairProbe],
     ) -> Result<SetupRepairPlan, SatelleError> {
-        self.runtime.plan_setup_repair(desktop_binding, probes)
+        self.runtime
+            .plan_setup_repair(desktop_binding, run_id, probes)
     }
 
     /// Reconciles an interrupted maintenance run from current, operation-
@@ -1756,17 +2604,20 @@ impl HostService {
 
     /// Builds a production Host whose probe timeouts and cache TTLs come from
     /// the fully resolved host/profile configuration.
-    pub fn production_for_host(config: &HostConfig) -> Self {
-        let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect(None)));
+    pub fn resolved_daemon_paths_for_host(
+        config: &HostConfig,
+    ) -> Result<DaemonResolvedPathSet, SatelleError> {
         let paths = satelle_core::resolve_path_set(
             &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        );
+        )?;
         let daemon_path_overrides = configured_daemon_path_overrides(config);
-        let daemon_paths = paths
-            .as_ref()
-            .map(DaemonResolvedPathSet::from)
-            .map(|paths| paths.with_service_overrides(&daemon_path_overrides))
-            .map_err(Clone::clone);
+        Ok(DaemonResolvedPathSet::from(&paths).with_service_overrides(&daemon_path_overrides))
+    }
+
+    /// Builds a production Host whose probe timeouts and cache TTLs come from
+    /// the fully resolved host/profile configuration.
+    pub fn production_for_host(config: &HostConfig) -> Self {
+        let daemon_paths = Self::resolved_daemon_paths_for_host(config);
         let state_root = daemon_paths
             .as_ref()
             .map(|paths| std::path::PathBuf::from(&paths.state_root))
@@ -1775,6 +2626,16 @@ impl HostService {
             .as_ref()
             .map(|paths| std::path::PathBuf::from(&paths.operator_log_root))
             .map_err(Clone::clone);
+        Self::production_for_host_at(config, state_root, operator_log_root, daemon_paths)
+    }
+
+    fn production_for_host_at(
+        config: &HostConfig,
+        state_root: Result<std::path::PathBuf, SatelleError>,
+        operator_log_root: Result<std::path::PathBuf, SatelleError>,
+        daemon_paths: Result<DaemonResolvedPathSet, SatelleError>,
+    ) -> Self {
+        let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect(None)));
         let working_directory = state_root
             .as_ref()
             .map(|path| path.join("codex-app-server-work"))
@@ -1792,6 +2653,10 @@ impl HostService {
             .provider_smoke_failure_cache_ttl
             .as_ref()
             .map_or(DEFAULT_PROVIDER_SMOKE_FAILURE_TTL, duration_to_time);
+        let setup_ledger_retention = config
+            .setup_ledger_retention
+            .as_ref()
+            .map_or(storage::DEFAULT_SETUP_LEDGER_RETENTION, duration_to_time);
         let policy = runtime::ProductionAdapterPolicy {
             native_readiness_timeout: timeout,
             native_readiness_ttl: ttl,
@@ -1811,6 +2676,7 @@ impl HostService {
                 operator_log_root,
                 adapter,
                 runtime::RuntimeProviderPolicy::from_host_config(config),
+                setup_ledger_retention,
             ),
             operation_capacity: Arc::new(OperationCapacity::default()),
             turn_execution_timeout: configured_turn_execution_timeout(config),
@@ -1824,9 +2690,34 @@ impl HostService {
         }
     }
 
+    fn production_for_offline_storage(state_root: &std::path::Path) -> Self {
+        let config = satelle_core::SatelleConfig::defaults()
+            .hosts
+            .remove(LOCAL_DEMO_HOST)
+            .expect("the built-in local Host config exists");
+        let daemon_paths =
+            satelle_core::daemon_service::DaemonResolvedPathSet::for_offline_state_root(state_root);
+        Self::production_for_host_at(
+            &config,
+            Ok(state_root.to_path_buf()),
+            Ok(state_root.join("logs")),
+            Ok(daemon_paths),
+        )
+    }
+
     /// Builds the persistent Host service with the exact path overrides from
     /// its Satelle-owned launchd or Windows service configuration.
-    pub fn production_for_service(overrides: &DaemonPathOverrides) -> Self {
+    pub fn production_for_service(
+        overrides: &DaemonPathOverrides,
+        setup_ledger_retention_ms: u64,
+    ) -> Result<Self, SatelleError> {
+        if setup_ledger_retention_ms == 0
+            || setup_ledger_retention_ms > satelle_core::MAX_SETUP_LEDGER_RETENTION_MS
+        {
+            return Err(SatelleError::invalid_usage(
+                "persistent Host service setup-ledger retention is invalid",
+            ));
+        }
         let mut config = satelle_core::SatelleConfig::defaults()
             .hosts
             .remove(LOCAL_DEMO_HOST)
@@ -1836,7 +2727,14 @@ impl HostService {
         config.daemon_state_dir = overrides.state_dir.clone();
         config.daemon_cache_dir = overrides.cache_dir.clone();
         config.daemon_log_dir = overrides.log_dir.clone();
-        Self::production_for_host(&config)
+        config.setup_ledger_retention =
+            satelle_core::ExplicitDuration::parse(&format!("{setup_ledger_retention_ms}ms"));
+        Ok(Self::production_for_host(&config))
+    }
+
+    #[cfg(test)]
+    fn setup_ledger_retention_for_tests(&self) -> time::Duration {
+        self.runtime.setup_ledger_retention_for_tests()
     }
 
     /// Builds an on-demand Host whose only bootstrap credential is held in

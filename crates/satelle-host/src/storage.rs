@@ -45,6 +45,7 @@ pub(crate) use self::provider_secret_journal::{
     ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay,
     provider_secret_file_paths,
 };
+pub(crate) use self::retention::DEFAULT_SETUP_LEDGER_RETENTION;
 pub(crate) use self::setup_ledger::{
     MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,
 };
@@ -53,6 +54,180 @@ pub use self::setup_ledger::{
     SetupOperationKind, SetupRepairAction, SetupRepairDecision, SetupRepairPlan,
     SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus,
 };
+
+pub(crate) fn plan_migration_backup_cleanup(
+    state_root: &std::path::Path,
+) -> Result<Vec<String>, StorageError> {
+    open::plan_migration_backup_cleanup(state_root)
+}
+
+pub(crate) fn validate_migration_backup_for_restore(
+    state_root: &std::path::Path,
+    backup_file_name: &str,
+) -> Result<(), StorageError> {
+    open::validate_migration_backup_for_restore(state_root, backup_file_name)
+}
+
+pub(crate) fn validate_migration_backup_for_preview(
+    state_root: &std::path::Path,
+    backup_file_name: &str,
+) -> Result<(), StorageError> {
+    open::validate_migration_backup_for_preview(state_root, backup_file_name)
+}
+
+pub(crate) fn restore_migration_backup_offline(
+    state_root: &std::path::Path,
+    backup_file_name: &str,
+) -> Result<(String, Vec<String>), StorageError> {
+    open::restore_migration_backup_offline(state_root, backup_file_name).map(|activation| {
+        (
+            activation.failed_store_file_name,
+            activation.failed_sidecar_file_names,
+        )
+    })
+}
+
+pub(crate) fn cleanup_migration_backups_offline_exact(
+    state_root: &std::path::Path,
+    approved_backup_file_names: &[String],
+) -> Result<Vec<String>, BackupCleanupFailure> {
+    open::cleanup_migration_backups_offline_exact(state_root, approved_backup_file_names)
+}
+
+pub(crate) fn begin_store_reset_offline(
+    state_root: &std::path::Path,
+) -> Result<open::OfflineStoreReset, StorageError> {
+    open::begin_store_reset_offline(state_root)
+}
+
+pub(crate) fn begin_offline_storage_maintenance(
+    state_root: &Path,
+    operation_id: &str,
+    action_id: &str,
+    action_label: &str,
+    started_at: OffsetDateTime,
+) -> Result<(), StorageError> {
+    let journal =
+        OfflineStorageMaintenanceJournal::new(operation_id, action_id, action_label, started_at)?;
+    let encoded = journal.encode()?;
+    let state_directory = open::prepare_state_root(state_root)?;
+    let existing = read_offline_storage_maintenance_journal(&state_directory)?;
+    let failed = read_offline_storage_maintenance_failure(&state_directory)?;
+
+    match (existing, failed) {
+        (None, None) => state_directory
+            .create_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_JOURNAL, &encoded),
+        (Some((observed, _)), None)
+            if observed.matches(operation_id, action_id, Some(action_label)) =>
+        {
+            Ok(())
+        }
+        (Some((_, observed)), Some(failed)) if observed == failed => {
+            // Delete the active journal first. If cleanup is interrupted, the
+            // remaining failure marker is terminal and the next authorized
+            // operation can retire it without mistaking old work for active.
+            state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_JOURNAL)?;
+            state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_FAILED)?;
+            state_directory
+                .create_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_JOURNAL, &encoded)
+        }
+        (None, Some(failed)) => {
+            OfflineStorageMaintenanceJournal::parse(&failed)?;
+            state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_FAILED)?;
+            state_directory
+                .create_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_JOURNAL, &encoded)
+        }
+        (Some(_), None) => Err(StorageError::new(StorageErrorKind::StateConflict)),
+        _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+    }
+}
+
+pub(crate) fn offline_storage_maintenance_started_at(
+    state_root: &Path,
+    operation_id: &str,
+    action_id: &str,
+    action_label: Option<&str>,
+) -> Result<OffsetDateTime, StorageError> {
+    let state_directory = open::prepare_state_root(state_root)?;
+    let (journal, _) = read_offline_storage_maintenance_journal(&state_directory)?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+    if !journal.matches(operation_id, action_id, action_label) {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    journal.started_at()
+}
+
+pub(crate) fn mark_offline_storage_maintenance_failed(
+    state_root: &Path,
+    operation_id: &str,
+    action_id: &str,
+) -> Result<(), StorageError> {
+    let state_directory = open::prepare_state_root(state_root)?;
+    let (journal, encoded) = read_offline_storage_maintenance_journal(&state_directory)?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+    if !journal.matches(operation_id, action_id, None) {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    match read_offline_storage_maintenance_failure(&state_directory)? {
+        Some(observed) if observed == encoded => Ok(()),
+        Some(_) => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+        None => state_directory
+            .create_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_FAILED, &encoded),
+    }
+}
+
+pub(crate) fn finish_offline_storage_maintenance(
+    state_root: &Path,
+    operation_id: &str,
+    action_id: &str,
+    action_label: Option<&str>,
+    failed: bool,
+) -> Result<(), StorageError> {
+    let state_directory = open::prepare_state_root(state_root)?;
+    let (journal, encoded) = read_offline_storage_maintenance_journal(&state_directory)?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+    if !journal.matches(operation_id, action_id, action_label) {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    let failure = read_offline_storage_maintenance_failure(&state_directory)?;
+    match (failed, failure) {
+        (false, None) => {}
+        (true, Some(observed)) if observed == encoded => {}
+        _ => return Err(StorageError::new(StorageErrorKind::StateConflict)),
+    }
+    state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_JOURNAL)?;
+    if failed {
+        state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_FAILED)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_completed_offline_storage_maintenance_if_present(
+    state_root: &Path,
+    operation_id: &str,
+    action_id: &str,
+    action_label: &str,
+) -> Result<bool, StorageError> {
+    let state_directory = open::prepare_state_root(state_root)?;
+    if read_offline_storage_maintenance_journal(&state_directory)?.is_none() {
+        if let Some(failed) = read_offline_storage_maintenance_failure(&state_directory)? {
+            let failed = OfflineStorageMaintenanceJournal::parse(&failed)?;
+            if !failed.matches(operation_id, action_id, Some(action_label)) {
+                return Err(StorageError::new(StorageErrorKind::StateConflict));
+            }
+            state_directory.delete_private_leaf_durable(OFFLINE_STORAGE_MAINTENANCE_FAILED)?;
+        }
+        return Ok(false);
+    }
+    finish_offline_storage_maintenance(
+        state_root,
+        operation_id,
+        action_id,
+        Some(action_label),
+        false,
+    )?;
+    Ok(true)
+}
 use self::sql::{
     StoredIdempotency, ensure_control_lease_available, ensure_no_pending_stop,
     insert_control_lease, insert_idempotency, insert_initial_session, insert_safe_log,
@@ -84,6 +259,94 @@ use std::path::PathBuf;
 use time::OffsetDateTime;
 
 const SSH_IDENTITY_COMMIT_JOURNAL: &str = ".satelle-ssh-identity-commit";
+const OFFLINE_STORAGE_MAINTENANCE_JOURNAL: &str = ".satelle-offline-storage-maintenance-v1";
+const OFFLINE_STORAGE_MAINTENANCE_FAILED: &str = ".satelle-offline-storage-maintenance-v1.failed";
+const OFFLINE_STORAGE_MAINTENANCE_JOURNAL_LIMIT: usize = 4_096;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OfflineStorageMaintenanceJournal {
+    schema: String,
+    operation_id: String,
+    action_id: String,
+    action_label: String,
+    started_at: String,
+}
+
+impl OfflineStorageMaintenanceJournal {
+    fn new(
+        operation_id: &str,
+        action_id: &str,
+        action_label: &str,
+        started_at: OffsetDateTime,
+    ) -> Result<Self, StorageError> {
+        Ok(Self {
+            schema: "satelle.offline-storage-maintenance.v1".to_string(),
+            operation_id: validated_private_reference(operation_id.to_string())?,
+            action_id: validated_private_reference(action_id.to_string())?,
+            action_label: action_label.to_string(),
+            started_at: format_time(started_at)?,
+        })
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, StorageError> {
+        let mut encoded = serde_json::to_vec(self).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::OperationFailed, source)
+        })?;
+        encoded.push(b'\n');
+        Ok(encoded)
+    }
+
+    fn parse(encoded: &[u8]) -> Result<Self, StorageError> {
+        let journal = serde_json::from_slice::<Self>(encoded).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::InvalidStoredState, source)
+        })?;
+        if journal.schema != "satelle.offline-storage-maintenance.v1"
+            || journal.operation_id.is_empty()
+            || journal.action_id.is_empty()
+            || journal.action_label.is_empty()
+        {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+        parse_time(&journal.started_at)?;
+        Ok(journal)
+    }
+
+    fn started_at(&self) -> Result<OffsetDateTime, StorageError> {
+        parse_time(&self.started_at)
+    }
+
+    fn matches(&self, operation_id: &str, action_id: &str, action_label: Option<&str>) -> bool {
+        self.operation_id == operation_id
+            && self.action_id == action_id
+            && action_label.is_none_or(|label| self.action_label == label)
+    }
+}
+
+fn read_offline_storage_maintenance_journal(
+    state_directory: &open::StateDirectory,
+) -> Result<Option<(OfflineStorageMaintenanceJournal, Vec<u8>)>, StorageError> {
+    let Some(encoded) = state_directory.read_private_leaf_bounded(
+        OFFLINE_STORAGE_MAINTENANCE_JOURNAL,
+        OFFLINE_STORAGE_MAINTENANCE_JOURNAL_LIMIT,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        OfflineStorageMaintenanceJournal::parse(&encoded)?,
+        encoded,
+    )))
+}
+
+fn read_offline_storage_maintenance_failure(
+    state_directory: &open::StateDirectory,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    state_directory.read_private_leaf_bounded(
+        OFFLINE_STORAGE_MAINTENANCE_FAILED,
+        OFFLINE_STORAGE_MAINTENANCE_JOURNAL_LIMIT,
+    )
+}
 
 fn sha256_path(path: &Path) -> Result<String, StorageError> {
     let mut file = std::fs::File::open(path).map_err(|source| {
@@ -164,10 +427,11 @@ mod ssh_identity_commit_tests {
         (11, "fnv1a64:a861bcf791484f8b"),
         (12, "fnv1a64:a5672c42bd40d2a8"),
         (13, "fnv1a64:5db2b0aa00a5f745"),
+        (14, "fnv1a64:fb04115e0082c148"),
     ];
     const EXPECTED_SCHEMA_ROW_COUNT: usize = 69;
     const EXPECTED_SCHEMA_SHA256: &str =
-        "6d8e2eba05361b91d977feb785033618a1f1688094fe52adb0056b933c70f1be";
+        "e16065c8dd757275ff5085bb1a16e1edb9c27bb088af1ba0ae1a58fb52327f11";
 
     fn identity() -> HostIdentityRef {
         HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")
@@ -316,7 +580,7 @@ mod ssh_identity_commit_tests {
         let user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema user version");
-        assert_eq!(user_version, 13);
+        assert_eq!(user_version, 14);
 
         let schema = connection
             .prepare(
@@ -607,6 +871,38 @@ pub(crate) struct StorageError {
     kind: StorageErrorKind,
     conflicting_session_id: Option<SessionId>,
     source: Option<Box<dyn Error + Send + Sync>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackupCleanupFailure {
+    pub(crate) removed_backup_file_names: Vec<String>,
+    pub(crate) source: StorageError,
+}
+
+impl BackupCleanupFailure {
+    pub(crate) fn new(removed_backup_file_names: Vec<String>, source: StorageError) -> Self {
+        Self {
+            removed_backup_file_names,
+            source,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> StorageErrorKind {
+        self.source.kind()
+    }
+}
+
+impl fmt::Display for BackupCleanupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for BackupCleanupFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 impl fmt::Debug for StorageError {

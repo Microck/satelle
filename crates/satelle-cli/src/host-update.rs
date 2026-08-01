@@ -497,6 +497,13 @@ pub fn build_repair_upgrade_plan(
         inspections
             .iter()
             .map(|inspection| RepairUpgradeAction {
+                action_id: match inspection.target {
+                    HostUpdateTarget::HostDaemon => "repair-host-daemon",
+                    HostUpdateTarget::HostDaemonService => "repair-host-daemon-service",
+                    HostUpdateTarget::CodexRuntime => "repair-codex-runtime",
+                    HostUpdateTarget::CodexNativeComputerUse => "repair-codex-native-computer-use",
+                }
+                .to_string(),
                 target: inspection.target,
                 current_version: inspection.current_version.clone(),
                 target_version: inspection.target_version.clone(),
@@ -602,6 +609,19 @@ pub fn render_repair_upgrade_plan(
             reason,
             action.version_source
         );
+    }
+    output
+}
+
+pub fn render_repair_upgrade_result(
+    report: &satelle_core::host_update::RepairUpgradeReport,
+) -> String {
+    let mut output = format!("Repair status for {}: {:?}\n", report.host, report.status);
+    for action in &report.completed_actions {
+        let _ = writeln!(output, "- completed: {action}");
+    }
+    for action in &report.skipped_actions {
+        let _ = writeln!(output, "- skipped: {action}");
     }
     output
 }
@@ -1283,6 +1303,7 @@ mod tests {
         assert_eq!(
             report.actions[0],
             RepairUpgradeAction {
+                action_id: "repair-codex-runtime".to_string(),
                 target: HostUpdateTarget::CodexRuntime,
                 current_version: Some("0.9.0".to_string()),
                 target_version: "1.0.0".to_string(),

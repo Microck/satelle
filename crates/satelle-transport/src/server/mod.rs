@@ -862,6 +862,19 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_read,
         ));
+    let host_update_maintenance_route = Router::new()
+        .route(
+            "/v1/maintenance/host-update/{operation_id}/begin",
+            post(setup::begin_host_update_maintenance),
+        )
+        .route(
+            "/v1/maintenance/repair/{operation_id}/begin",
+            post(setup::begin_repair_maintenance),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_setup_mutation,
+        ));
     let bootstrap_maintenance_routes = Router::new()
         .route(
             "/v1/maintenance/bootstrap/{operation_id}/complete",
@@ -971,6 +984,12 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_control,
         ));
+    let setup_repair_plan_route = Router::new()
+        .route("/v1/setup/repair-plan", post(setup::plan_setup_repair))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
     let native_readiness_invalidation_route = Router::new()
         .route(
             "/v1/setup/readiness/native/invalidate",
@@ -995,6 +1014,7 @@ fn router(state: Arc<DaemonState>) -> Router {
             auth::require_control,
         ));
     let protected = read_routes
+        .merge(host_update_maintenance_route)
         .merge(bootstrap_maintenance_routes)
         .merge(setup_routes)
         .merge(provider_binding_authorization_routes)
@@ -1002,6 +1022,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         .merge(provider_descriptor_validation_route)
         .merge(provider_secret_provisioning_routes)
         .merge(setup_verification_route)
+        .merge(setup_repair_plan_route)
         .merge(native_readiness_invalidation_route)
         .merge(control_routes)
         .method_not_allowed_fallback(protected_method_not_allowed)

@@ -10,8 +10,9 @@ use crate::contract::{
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, RequestId, SessionResponse, SetupVerificationRequest,
-    SetupVerificationResponse, StopRequest, StopResponse, TurnRequest, provider_secret_upload_aad,
+    ProviderSecretUploadEnvelope, RequestId, SessionResponse, SetupRepairPlanRequest,
+    SetupRepairPlanResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
+    StopResponse, TurnRequest, provider_secret_upload_aad,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
@@ -474,6 +475,16 @@ impl DaemonClient {
         )
     }
 
+    pub fn plan_setup_repair(
+        &self,
+        plan: &SetupRepairPlanRequest,
+        idempotency_key: &str,
+    ) -> Result<SetupRepairPlanResponse, DaemonClientError> {
+        let (request, request_id) =
+            self.mutation_request("/v1/setup/repair-plan", idempotency_key)?;
+        self.send_authenticated(request.json(plan), request_id, StatusCode::OK)
+    }
+
     pub fn invalidate_native_readiness(
         &self,
         invalidation: &NativeReadinessInvalidationRequest,
@@ -542,12 +553,33 @@ impl DaemonClient {
     pub fn begin_host_update_maintenance(
         &self,
         operation_id: &str,
+        recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
     ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
-        let path = format!(
-            "/v1/maintenance/bootstrap/{operation_id}/host_binary_replacement/host_update/begin"
-        );
+        let path = format!("/v1/maintenance/host-update/{operation_id}/begin");
         let (request, request_id) = self.mutation_request(&path, operation_id)?;
-        self.send_authenticated(request, request_id, StatusCode::OK)
+        self.send_authenticated(
+            request.json(&crate::HostUpdateMaintenanceRequest::new(
+                recovery_identity.clone(),
+            )),
+            request_id,
+            StatusCode::OK,
+        )
+    }
+
+    pub fn begin_repair_maintenance(
+        &self,
+        operation_id: &str,
+        recovery_identity: &satelle_core::host_update::HostUpdateRecoveryIdentity,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!("/v1/maintenance/repair/{operation_id}/begin");
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
+        self.send_authenticated(
+            request.json(&crate::RepairMaintenanceRequest::new(
+                recovery_identity.clone(),
+            )),
+            request_id,
+            StatusCode::OK,
+        )
     }
 
     pub fn start_maintenance_action(

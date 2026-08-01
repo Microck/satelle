@@ -1,11 +1,11 @@
 use super::codec::{format_time, parse_time};
-use super::{StorageError, StorageErrorKind};
+use super::{BackupCleanupFailure, StorageError, StorageErrorKind};
 use rusqlite::backup::Backup;
 use rusqlite::ffi::ErrorCode as SqliteErrorCode;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, TryLockError};
 use std::io::{Read, Seek, Write};
@@ -18,6 +18,8 @@ use uuid::Uuid;
 use rustix::fs::{FileType, Mode, OFlags};
 #[cfg(unix)]
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -44,7 +46,9 @@ pub(super) const PROTECTED_FILE_NAMES: [&str; 5] = [
 ];
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
-const MIGRATIONS: [Migration; 13] = [
+const RESTORE_ACTIVATION_JOURNAL: &str = ".satelle-restore-activation-v1";
+const RESTORE_ACTIVATION_JOURNAL_LIMIT: usize = 64 * 1024;
+const MIGRATIONS: [Migration; 14] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -123,6 +127,12 @@ const MIGRATIONS: [Migration; 13] = [
         seeds_sensitive_state: false,
         irreversible: false,
     },
+    Migration {
+        version: 14,
+        sql: include_str!("0014_host_update_recovery_identity.sql"),
+        seeds_sensitive_state: false,
+        irreversible: false,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -166,7 +176,7 @@ struct MigrationBackupName {
     backup_id: Uuid,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct LeafIdentity {
     #[cfg(unix)]
     device: u64,
@@ -241,6 +251,12 @@ enum ActivationStep {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ValidationStep {
     DigestVerified,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackupValidationMode {
+    DurableStaging,
+    ReadOnlyFile,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,6 +571,7 @@ pub(super) fn open_parts_with_locked_preflight(
     let state_directory = prepare_state_root(state_root)?;
     preflight_protected_files(&state_directory)?;
     let ownership_lock = acquire_ownership_lock(&state_directory)?;
+    reconcile_restore_activation(state_root, &state_directory)?;
     locked_preflight(&state_directory)?;
     // Pre-create and permission the database through the pinned state
     // directory. Existing SQLite sidecars were checked before this point, so
@@ -698,7 +715,23 @@ pub(super) fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, St
     // Recheck the full ancestor chain after creation. A writable or symlinked
     // parent is rejected before any protected leaf is opened.
     validate_state_root_ancestors(state_root)?;
-    open_and_restrict_state_directory(state_root)
+    open_state_directory(state_root, true)
+}
+
+#[cfg(unix)]
+fn open_state_root_read_only(state_root: &Path) -> Result<StateDirectory, StorageError> {
+    if !state_root.is_absolute() || state_root.parent().is_none() {
+        return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
+    }
+    validate_state_root_ancestors(state_root)?;
+    let metadata = fs::symlink_metadata(state_root).map_err(|source| {
+        StorageError::with_source(StorageErrorKind::StateDirectoryUnavailable, source)
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
+    }
+    validate_state_root_owner(&metadata)?;
+    open_state_directory(state_root, false)
 }
 
 #[cfg(unix)]
@@ -737,7 +770,10 @@ fn validate_state_root_owner(metadata: &fs::Metadata) -> Result<(), StorageError
 }
 
 #[cfg(unix)]
-fn open_and_restrict_state_directory(path: &Path) -> Result<StateDirectory, StorageError> {
+fn open_state_directory(
+    path: &Path,
+    restrict_permissions: bool,
+) -> Result<StateDirectory, StorageError> {
     let descriptor = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -752,9 +788,11 @@ fn open_and_restrict_state_directory(path: &Path) -> Result<StateDirectory, Stor
     {
         return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
     }
-    rustix::fs::fchmod(&descriptor, Mode::RWXU).map_err(|source| {
-        StorageError::with_source(StorageErrorKind::StateDirectoryUnavailable, source)
-    })?;
+    if restrict_permissions {
+        rustix::fs::fchmod(&descriptor, Mode::RWXU).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::StateDirectoryUnavailable, source)
+        })?;
+    }
     let path_metadata = fs::symlink_metadata(path).map_err(|source| {
         StorageError::with_source(StorageErrorKind::StateDirectoryUnavailable, source)
     })?;
@@ -783,6 +821,12 @@ fn open_and_restrict_state_directory(path: &Path) -> Result<StateDirectory, Stor
 #[cfg(windows)]
 pub(super) fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, StorageError> {
     windows::SecureStateDirectory::prepare(state_root).map(|secure| StateDirectory { secure })
+}
+
+#[cfg(windows)]
+fn open_state_root_read_only(state_root: &Path) -> Result<StateDirectory, StorageError> {
+    windows::SecureStateDirectory::open_read_only(state_root)
+        .map(|secure| StateDirectory { secure })
 }
 
 fn acquire_ownership_lock(state_directory: &StateDirectory) -> Result<OwnershipLock, StorageError> {
@@ -1457,12 +1501,31 @@ fn validate_migration_backup_at(
     physical_backup_file_name: &str,
     physical_manifest_file_name: &str,
 ) -> Result<ValidatedMigrationBackup, StorageError> {
+    validate_migration_backup_at_in_mode(
+        state_root,
+        state_directory,
+        backup_file_name,
+        physical_backup_file_name,
+        physical_manifest_file_name,
+        BackupValidationMode::DurableStaging,
+    )
+}
+
+fn validate_migration_backup_at_in_mode(
+    state_root: &Path,
+    state_directory: &StateDirectory,
+    backup_file_name: &str,
+    physical_backup_file_name: &str,
+    physical_manifest_file_name: &str,
+    mode: BackupValidationMode,
+) -> Result<ValidatedMigrationBackup, StorageError> {
     validate_migration_backup_at_with_hook(
         state_root,
         state_directory,
         backup_file_name,
         physical_backup_file_name,
         physical_manifest_file_name,
+        mode,
         |_| Ok(()),
     )
 }
@@ -1473,6 +1536,7 @@ fn validate_migration_backup_at_with_hook(
     backup_file_name: &str,
     physical_backup_file_name: &str,
     physical_manifest_file_name: &str,
+    mode: BackupValidationMode,
     mut hook: impl FnMut(ValidationStep) -> Result<(), StorageError>,
 ) -> Result<ValidatedMigrationBackup, StorageError> {
     #[cfg(unix)]
@@ -1499,8 +1563,42 @@ fn validate_migration_backup_at_with_hook(
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    if mode == BackupValidationMode::ReadOnlyFile {
+        #[cfg(target_os = "linux")]
+        // The guarded descriptor is the authority boundary. Reopening its
+        // process-local descriptor path gives SQLite a file-backed view
+        // without granting a writable state-directory pathname.
+        let validation = Connection::open_with_flags(
+            std::path::PathBuf::from(format!("/proc/self/fd/{}", backup_file.as_raw_fd())),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?;
+        #[cfg(target_os = "macos")]
+        let validation_registration = unix_vfs::register_validation_file(&backup_file)?;
+        #[cfg(target_os = "macos")]
+        let validation = Connection::open_with_flags_and_vfs(
+            validation_registration.path(),
+            flags,
+            unix_vfs::name()?,
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?;
+        #[cfg(windows)]
+        let validation = {
+            let validation_path =
+                sqlite_leaf_path(state_root, state_directory, physical_backup_file_name);
+            let mut validation_uri = url::Url::from_file_path(validation_path)
+                .map_err(|()| StorageError::new(StorageErrorKind::UnsafeStatePath))?;
+            validation_uri
+                .query_pairs_mut()
+                .append_pair("immutable", "1");
+            Connection::open_with_flags(validation_uri.as_str(), flags | OpenFlags::SQLITE_OPEN_URI)
+                .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?
+        };
+        validate_backup_migration_state(&validation, manifest_read.manifest.source_schema_version)?;
+        verify_integrity(&validation)?;
+    }
     #[cfg(any(target_os = "linux", windows))]
-    {
+    if mode == BackupValidationMode::DurableStaging {
         let staging_file_name = format!("satelle.sqlite3.restore-{}.staged", Uuid::now_v7());
         let staging_identity = {
             let mut source = &backup_file;
@@ -1555,7 +1653,7 @@ fn validate_migration_backup_at_with_hook(
         }
     }
     #[cfg(target_os = "macos")]
-    {
+    if mode == BackupValidationMode::DurableStaging {
         let validation_registration = unix_vfs::register_validation_file(&backup_file)?;
         let validation = Connection::open_with_flags_and_vfs(
             validation_registration.path(),
@@ -1628,7 +1726,25 @@ fn validate_migration_backup_with_hook(
         backup_file_name,
         backup_file_name,
         &manifest_file_name,
+        BackupValidationMode::DurableStaging,
         hook,
+    )
+}
+
+pub(super) fn validate_migration_backup_preview(
+    state_root: &Path,
+    state_directory: &StateDirectory,
+    backup_file_name: &str,
+) -> Result<ValidatedMigrationBackup, StorageError> {
+    let manifest_file_name = format!("{backup_file_name}.json");
+    validate_migration_backup_at_with_hook(
+        state_root,
+        state_directory,
+        backup_file_name,
+        backup_file_name,
+        &manifest_file_name,
+        BackupValidationMode::ReadOnlyFile,
+        |_| Ok(()),
     )
 }
 
@@ -1851,11 +1967,58 @@ fn remove_private_leaf_checked(
     Ok(removed)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct MovedActiveSidecar {
     active_file_name: String,
     failed_file_name: String,
     identity: LeafIdentity,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreActivationJournal {
+    schema_version: u32,
+    activation_id: String,
+    backup_file_name: String,
+    manifest_file_name: String,
+    staged_file_name: String,
+    failed_store_file_name: String,
+    staged_token: JournalRestorePointToken,
+    failed_store_identity: LeafIdentity,
+    moved_sidecars: Vec<MovedActiveSidecar>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JournalRestorePointToken {
+    backup_id: String,
+    schema_version: i64,
+    source_database_digest: String,
+    manifest_digest: String,
+    backup_identity: LeafIdentity,
+    manifest_identity: LeafIdentity,
+}
+
+impl JournalRestorePointToken {
+    fn from_token(token: &RestorePointToken) -> Self {
+        Self {
+            backup_id: token.backup_id.to_string(),
+            schema_version: token.schema_version,
+            source_database_digest: token.source_database_digest.clone(),
+            manifest_digest: token.manifest_digest.clone(),
+            backup_identity: token.backup_identity,
+            manifest_identity: token.manifest_identity,
+        }
+    }
+
+    fn matches(&self, token: &RestorePointToken) -> bool {
+        self.backup_id == token.backup_id.to_string()
+            && self.schema_version == token.schema_version
+            && self.source_database_digest == token.source_database_digest
+            && self.manifest_digest == token.manifest_digest
+            && self.backup_identity == token.backup_identity
+            && self.manifest_identity == token.manifest_identity
+    }
 }
 
 #[derive(Debug)]
@@ -1966,6 +2129,154 @@ fn restore_prior_active_sidecars(
     recovery_errors
 }
 
+fn validate_restore_activation_journal(
+    journal: &RestoreActivationJournal,
+) -> Result<(), StorageError> {
+    let activation_id = Uuid::parse_str(&journal.activation_id)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    let backup_name = parse_migration_backup_file_name(&journal.backup_file_name)
+        .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    let backup_id = Uuid::parse_str(&journal.staged_token.backup_id)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    if journal.schema_version != 1
+        || journal.activation_id != activation_id.to_string()
+        || backup_id != backup_name.backup_id
+        || journal.staged_token.schema_version != backup_name.schema_version
+        || journal.staged_file_name
+            != format!("satelle.sqlite3.restore-{}.staged", journal.activation_id)
+        || journal.failed_store_file_name
+            != format!("satelle.sqlite3.failed-{}.sqlite3", journal.activation_id)
+        || journal.manifest_file_name != format!("{}.json", journal.backup_file_name)
+    {
+        return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+    }
+
+    let mut expected_sidecars = PROTECTED_FILE_NAMES[2..].iter();
+    for sidecar in &journal.moved_sidecars {
+        if expected_sidecars
+            .find(|name| **name == sidecar.active_file_name)
+            .is_none()
+            || sidecar.failed_file_name
+                != format!(
+                    "{}{}",
+                    journal.failed_store_file_name,
+                    &sidecar.active_file_name[DATABASE_FILE_NAME.len()..]
+                )
+        {
+            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+        }
+    }
+    Ok(())
+}
+
+fn read_restore_activation_journal(
+    state_directory: &StateDirectory,
+) -> Result<Option<RestoreActivationJournal>, StorageError> {
+    let Some(encoded) = state_directory
+        .read_private_leaf_bounded(RESTORE_ACTIVATION_JOURNAL, RESTORE_ACTIVATION_JOURNAL_LIMIT)?
+    else {
+        return Ok(None);
+    };
+    let journal =
+        serde_json::from_slice::<RestoreActivationJournal>(&encoded).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::InvalidStoredState, source)
+        })?;
+    validate_restore_activation_journal(&journal)?;
+    Ok(Some(journal))
+}
+
+fn create_restore_activation_journal(
+    state_directory: &StateDirectory,
+    journal: &RestoreActivationJournal,
+) -> Result<(), StorageError> {
+    validate_restore_activation_journal(journal)?;
+    let encoded = serde_json::to_vec(journal)
+        .map_err(|source| StorageError::with_source(StorageErrorKind::OperationFailed, source))?;
+    state_directory.create_private_leaf_durable(RESTORE_ACTIVATION_JOURNAL, &encoded)
+}
+
+fn delete_exact_staged_restore(
+    state_directory: &StateDirectory,
+    journal: &RestoreActivationJournal,
+) -> Result<(), StorageError> {
+    match open_private_leaf_identity(state_directory, &journal.staged_file_name)? {
+        Some(identity) if identity == journal.staged_token.backup_identity => {
+            if !remove_private_leaf_checked(state_directory, &journal.staged_file_name, identity)? {
+                return Err(StorageError::new(StorageErrorKind::StateConflict));
+            }
+        }
+        None => {}
+        Some(_) => return Err(StorageError::new(StorageErrorKind::StateConflict)),
+    }
+    Ok(())
+}
+
+/// Reconciles the only crash window where the canonical SQLite name can be
+/// absent. This runs under the ownership lock before create-if-missing can
+/// turn that absence into a new empty store.
+fn reconcile_restore_activation(
+    state_root: &Path,
+    state_directory: &StateDirectory,
+) -> Result<(), StorageError> {
+    let Some(journal) = read_restore_activation_journal(state_directory)? else {
+        return Ok(());
+    };
+    let active_identity = open_private_leaf_identity(state_directory, DATABASE_FILE_NAME)?;
+    let failed_identity =
+        open_private_leaf_identity(state_directory, &journal.failed_store_file_name)?;
+
+    if active_identity == Some(journal.staged_token.backup_identity)
+        && failed_identity == Some(journal.failed_store_identity)
+    {
+        for sidecar in &journal.moved_sidecars {
+            if open_private_leaf_identity(state_directory, &sidecar.active_file_name)?.is_some()
+                || open_private_leaf_identity(state_directory, &sidecar.failed_file_name)?
+                    != Some(sidecar.identity)
+            {
+                return Err(StorageError::new(StorageErrorKind::StateConflict));
+            }
+        }
+        let installed = validate_migration_backup_at(
+            state_root,
+            state_directory,
+            &journal.backup_file_name,
+            DATABASE_FILE_NAME,
+            &journal.manifest_file_name,
+        )?;
+        if !journal.staged_token.matches(&installed.token) {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+        state_directory.delete_private_leaf_durable(RESTORE_ACTIVATION_JOURNAL)?;
+        return Ok(());
+    }
+
+    match (active_identity, failed_identity) {
+        (Some(active), None) if active == journal.failed_store_identity => {}
+        (None, Some(failed)) if failed == journal.failed_store_identity => {
+            move_private_leaf_durable(
+                state_directory,
+                &journal.failed_store_file_name,
+                DATABASE_FILE_NAME,
+                journal.failed_store_identity,
+            )?;
+        }
+        _ => return Err(StorageError::new(StorageErrorKind::StateConflict)),
+    }
+    let recovery_errors = restore_prior_active_sidecars(state_directory, &journal.moved_sidecars);
+    if !recovery_errors.is_empty() {
+        return Err(StorageError::with_source(
+            StorageErrorKind::OperationFailed,
+            ActivationRecoveryError {
+                trigger: StorageError::new(StorageErrorKind::OperationFailed),
+                recovery_errors,
+            },
+        ));
+    }
+    delete_exact_staged_restore(state_directory, &journal)?;
+    state_directory.delete_private_leaf_durable(RESTORE_ACTIVATION_JOURNAL)?;
+    Ok(())
+}
+
 fn same_restore_content_and_manifest(
     left: &ValidatedMigrationBackup,
     right: &ValidatedMigrationBackup,
@@ -2002,6 +2313,7 @@ fn activate_migration_backup_with_hook(
     backup: &ValidatedMigrationBackup,
     mut hook: impl FnMut(ActivationStep) -> Result<(), StorageError>,
 ) -> Result<RestoreActivation, StorageError> {
+    reconcile_restore_activation(state_root, state_directory)?;
     // Consent and guard acquisition may happen after initial validation. Check
     // the named restore point again at the mutation boundary so a changed file
     // cannot inherit an earlier validation result.
@@ -2034,7 +2346,7 @@ fn activate_migration_backup_with_hook(
     hook(ActivationStep::StagedValidated)?;
 
     let mut moved_sidecars = Vec::new();
-    for (sidecar_index, sidecar_file_name) in PROTECTED_FILE_NAMES[2..].iter().enumerate() {
+    for sidecar_file_name in &PROTECTED_FILE_NAMES[2..] {
         let identity = match open_private_leaf_identity(state_directory, sidecar_file_name) {
             Ok(Some(identity)) => identity,
             Ok(None) => continue,
@@ -2056,14 +2368,36 @@ fn activate_migration_backup_with_hook(
             failed_file_name: failed_sidecar_file_name,
             identity,
         });
-        let moved_sidecar = moved_sidecars
-            .last()
-            .expect("the sidecar move was registered");
+    }
+    let failed_store_identity = open_private_leaf_identity(state_directory, DATABASE_FILE_NAME)?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+    if open_private_leaf_identity(state_directory, &failed_store_file_name)?.is_some() {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    for sidecar in &moved_sidecars {
+        if open_private_leaf_identity(state_directory, &sidecar.failed_file_name)?.is_some() {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
+        }
+    }
+    let journal = RestoreActivationJournal {
+        schema_version: 1,
+        activation_id: activation_id.to_string(),
+        backup_file_name: backup.backup_file_name.clone(),
+        manifest_file_name: backup.manifest_file_name.clone(),
+        staged_file_name: staged_file_name.clone(),
+        failed_store_file_name: failed_store_file_name.clone(),
+        staged_token: JournalRestorePointToken::from_token(&staged.token),
+        failed_store_identity,
+        moved_sidecars: moved_sidecars.clone(),
+    };
+    create_restore_activation_journal(state_directory, &journal)?;
+
+    for (sidecar_index, moved_sidecar) in moved_sidecars.iter().enumerate() {
         if let Err(error) = move_private_leaf_durable_with_hooks(
             state_directory,
             &moved_sidecar.active_file_name,
             &moved_sidecar.failed_file_name,
-            identity,
+            moved_sidecar.identity,
             || Ok(()),
             || hook(ActivationStep::SidecarRenamedBeforeSync(sidecar_index)),
         ) {
@@ -2110,22 +2444,6 @@ fn activate_migration_backup_with_hook(
 
     // Remove the prior active name without overwriting it. From this point
     // until installation succeeds, every error restores this exact object.
-    let failed_store_identity =
-        match open_private_leaf_identity(state_directory, DATABASE_FILE_NAME) {
-            Ok(Some(identity)) => identity,
-            Ok(None) => {
-                return Err(activation_error_after_recovery(
-                    StorageError::new(StorageErrorKind::StateConflict),
-                    restore_prior_active_sidecars(state_directory, &moved_sidecars),
-                ));
-            }
-            Err(error) => {
-                return Err(activation_error_after_recovery(
-                    error,
-                    restore_prior_active_sidecars(state_directory, &moved_sidecars),
-                ));
-            }
-        };
     if let Err(error) = move_private_leaf_durable(
         state_directory,
         DATABASE_FILE_NAME,
@@ -2211,6 +2529,7 @@ fn activate_migration_backup_with_hook(
         }
     }
     hook(ActivationStep::ReplacementDurable)?;
+    state_directory.delete_private_leaf_durable(RESTORE_ACTIVATION_JOURNAL)?;
 
     Ok(RestoreActivation {
         failed_store_file_name,
@@ -2231,7 +2550,8 @@ pub(super) fn cleanup_migration_backups(
     state_root: &Path,
     state_directory: &StateDirectory,
 ) -> Result<Vec<String>, StorageError> {
-    cleanup_migration_backups_with_hook(state_root, state_directory, |_| Ok(()))
+    cleanup_migration_backups_with_hook(state_root, state_directory, None, |_| Ok(()))
+        .map_err(|failure| failure.source)
 }
 
 fn logical_backup_file_name(key: &CleanupTombstoneKey) -> String {
@@ -2241,21 +2561,259 @@ fn logical_backup_file_name(key: &CleanupTombstoneKey) -> String {
     )
 }
 
+fn cleanup_manifest_matches_key(
+    state_directory: &StateDirectory,
+    file_name: &str,
+    key: &CleanupTombstoneKey,
+) -> bool {
+    let Ok(manifest_read) = read_backup_manifest(state_directory, file_name) else {
+        return false;
+    };
+    let logical_backup_file_name = logical_backup_file_name(key);
+    let Some(parsed_name) = parse_migration_backup_file_name(&logical_backup_file_name) else {
+        return false;
+    };
+    validate_manifest_contract(
+        &logical_backup_file_name,
+        parsed_name,
+        &manifest_read.manifest,
+    )
+    .is_ok()
+        && key.manifest_fingerprint
+            == manifest_fingerprint_from_parts(
+                key.backup_id,
+                key.schema_version,
+                &manifest_read.digest,
+                manifest_read.identity,
+            )
+}
+
+fn cleanup_backup_matches_key(
+    state_directory: &StateDirectory,
+    file_name: &str,
+    key: &CleanupTombstoneKey,
+) -> Result<bool, StorageError> {
+    let Some(file) = open_private_leaf(
+        state_directory,
+        file_name,
+        LeafOpenMode::ExistingPrivateGuarded,
+        StorageErrorKind::OperationFailed,
+    )?
+    else {
+        return Ok(false);
+    };
+    let identity = leaf_identity(&file, StorageErrorKind::OperationFailed)?;
+    let digest = digest_file(&file, StorageErrorKind::OperationFailed)?;
+    Ok(key.backup_fingerprint
+        == backup_fingerprint_from_parts(key.backup_id, key.schema_version, &digest, identity))
+}
+
+fn cleanup_plan_file_names(
+    state_root: &Path,
+    state_directory: &StateDirectory,
+    candidates: &[ValidatedMigrationBackup],
+    retained_valid_count: usize,
+    validation_mode: BackupValidationMode,
+) -> Result<Vec<String>, StorageError> {
+    let mut planned = BTreeSet::new();
+    let mut tombstones = BTreeMap::<CleanupTombstoneKey, CleanupTombstonePair>::new();
+    for file_name in state_directory.leaf_names()? {
+        if let Some((key, kind)) = parse_cleanup_tombstone_file_name(&file_name) {
+            let pair = tombstones.entry(key).or_default();
+            match kind {
+                CleanupTombstoneKind::Backup => pair.backup_file_name = Some(file_name),
+                CleanupTombstoneKind::Manifest => pair.manifest_file_name = Some(file_name),
+            }
+        } else if let Some((key, kind)) = parse_cleanup_deleting_file_name(&file_name) {
+            let recoverable = match kind {
+                CleanupDeletingKind::Backup => {
+                    cleanup_backup_matches_key(state_directory, &file_name, &key)?
+                }
+                CleanupDeletingKind::Manifest => {
+                    cleanup_manifest_matches_key(state_directory, &file_name, &key)
+                }
+            };
+            if recoverable {
+                planned.insert(logical_backup_file_name(&key));
+            }
+        }
+    }
+    for (key, pair) in tombstones {
+        let logical_backup_file_name = logical_backup_file_name(&key);
+        let logical_manifest_file_name = format!("{logical_backup_file_name}.json");
+        let recoverable = match (
+            pair.backup_file_name.as_deref(),
+            pair.manifest_file_name.as_deref(),
+        ) {
+            (Some(backup_tombstone), Some(manifest_tombstone)) => {
+                retained_valid_count >= 2
+                    && validate_migration_backup_at_in_mode(
+                        state_root,
+                        state_directory,
+                        &logical_backup_file_name,
+                        backup_tombstone,
+                        manifest_tombstone,
+                        validation_mode,
+                    )
+                    .is_ok_and(|validated| tombstone_matches_token(&key, &validated.token))
+            }
+            (Some(backup_tombstone), None) => {
+                retained_valid_count >= 2
+                    && open_private_leaf_identity(state_directory, &logical_backup_file_name)?
+                        .is_none()
+                    && validate_migration_backup_at_in_mode(
+                        state_root,
+                        state_directory,
+                        &logical_backup_file_name,
+                        backup_tombstone,
+                        &logical_manifest_file_name,
+                        validation_mode,
+                    )
+                    .is_ok_and(|validated| tombstone_matches_token(&key, &validated.token))
+            }
+            (None, Some(manifest_tombstone)) => {
+                cleanup_manifest_matches_key(state_directory, manifest_tombstone, &key)
+            }
+            (None, None) => false,
+        };
+        if recoverable {
+            planned.insert(logical_backup_file_name);
+        }
+    }
+    planned.extend(
+        candidates
+            .iter()
+            .map(|backup| backup.backup_file_name.clone()),
+    );
+    Ok(planned.into_iter().collect())
+}
+
 fn list_validated_migration_backups(
     state_root: &Path,
     state_directory: &StateDirectory,
+    validation_mode: BackupValidationMode,
 ) -> Result<Vec<ValidatedMigrationBackup>, StorageError> {
     let mut validated = Vec::new();
     for file_name in state_directory.leaf_names()? {
         if parse_migration_backup_file_name(&file_name).is_none() {
             continue;
         }
-        if let Ok(backup) = validate_migration_backup(state_root, state_directory, &file_name) {
+        let manifest_file_name = format!("{file_name}.json");
+        if let Ok(backup) = validate_migration_backup_at_in_mode(
+            state_root,
+            state_directory,
+            &file_name,
+            &file_name,
+            &manifest_file_name,
+            validation_mode,
+        ) {
             validated.push(backup);
         }
     }
     validated.sort_by_key(|backup| backup.token.backup_id);
     Ok(validated)
+}
+
+pub(super) fn plan_migration_backup_cleanup(
+    state_root: &Path,
+) -> Result<Vec<String>, StorageError> {
+    let state_directory = open_state_root_read_only(state_root)?;
+    let validated = list_validated_migration_backups(
+        state_root,
+        &state_directory,
+        BackupValidationMode::ReadOnlyFile,
+    )?;
+    let retained_valid_count = validated.len();
+    let delete_count = validated.len().saturating_sub(2);
+    let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
+    cleanup_plan_file_names(
+        state_root,
+        &state_directory,
+        &candidates,
+        retained_valid_count,
+        BackupValidationMode::ReadOnlyFile,
+    )
+}
+
+pub(super) fn validate_migration_backup_for_restore(
+    state_root: &Path,
+    backup_file_name: &str,
+) -> Result<(), StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    validate_migration_backup(state_root, &state_directory, backup_file_name).map(|_| ())
+}
+
+pub(super) fn validate_migration_backup_for_preview(
+    state_root: &Path,
+    backup_file_name: &str,
+) -> Result<(), StorageError> {
+    let state_directory = open_state_root_read_only(state_root)?;
+    validate_migration_backup_preview(state_root, &state_directory, backup_file_name).map(|_| ())
+}
+
+pub(super) fn restore_migration_backup_offline(
+    state_root: &Path,
+    backup_file_name: &str,
+) -> Result<RestoreActivation, StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    let _ownership = acquire_ownership_lock(&state_directory)?;
+    let backup = validate_migration_backup(state_root, &state_directory, backup_file_name)?;
+    activate_migration_backup(state_root, &state_directory, &backup)
+}
+
+pub(super) fn cleanup_migration_backups_offline_exact(
+    state_root: &Path,
+    approved_backup_file_names: &[String],
+) -> Result<Vec<String>, BackupCleanupFailure> {
+    let state_directory = prepare_state_root(state_root)
+        .map_err(|source| BackupCleanupFailure::new(Vec::new(), source))?;
+    let _ownership = acquire_ownership_lock(&state_directory)
+        .map_err(|source| BackupCleanupFailure::new(Vec::new(), source))?;
+    cleanup_migration_backups_with_hook(
+        state_root,
+        &state_directory,
+        Some(approved_backup_file_names),
+        |_| Ok(()),
+    )
+}
+
+pub(crate) struct OfflineStoreReset {
+    state_directory: StateDirectory,
+    _ownership: OwnershipLock,
+}
+
+impl OfflineStoreReset {
+    pub(crate) fn reset_metadata(self) -> Result<Vec<String>, (Vec<String>, StorageError)> {
+        let mut removed = Vec::new();
+        for file_name in &PROTECTED_FILE_NAMES[2..] {
+            match self.state_directory.delete_private_leaf_durable(file_name) {
+                Ok(true) => removed.push((*file_name).to_string()),
+                Ok(false) => {}
+                Err(error) => return Err((removed, error)),
+            }
+        }
+        match self
+            .state_directory
+            .delete_private_leaf_durable(DATABASE_FILE_NAME)
+        {
+            Ok(true) => removed.push(DATABASE_FILE_NAME.to_string()),
+            Ok(false) => {}
+            Err(error) => return Err((removed, error)),
+        }
+        Ok(removed)
+    }
+}
+
+pub(super) fn begin_store_reset_offline(
+    state_root: &Path,
+) -> Result<OfflineStoreReset, StorageError> {
+    let state_directory = prepare_state_root(state_root)?;
+    let ownership = acquire_ownership_lock(&state_directory)?;
+    reconcile_restore_activation(state_root, &state_directory)?;
+    Ok(OfflineStoreReset {
+        state_directory,
+        _ownership: ownership,
+    })
 }
 
 fn tombstone_matches_token(key: &CleanupTombstoneKey, token: &RestorePointToken) -> bool {
@@ -2320,6 +2878,7 @@ fn delete_quarantined_pair(
 fn resume_cleanup_deleting(
     state_directory: &StateDirectory,
     hook: &mut impl FnMut(CleanupStep) -> Result<(), StorageError>,
+    removed: &mut Vec<String>,
 ) -> Result<(), StorageError> {
     for file_name in state_directory.leaf_names()? {
         let Some((key, kind)) = parse_cleanup_deleting_file_name(&file_name) else {
@@ -2350,7 +2909,13 @@ fn resume_cleanup_deleting(
                 }
                 drop(file);
                 hook(CleanupStep::BackupDeleteCommitted)?;
-                remove_private_leaf_checked(state_directory, &file_name, identity)?;
+                if remove_private_leaf_checked(state_directory, &file_name, identity)?
+                    && !removed
+                        .iter()
+                        .any(|removed_name| removed_name == &logical_backup_file_name(&key))
+                {
+                    removed.push(logical_backup_file_name(&key));
+                }
             }
             CleanupDeletingKind::Manifest => {
                 let manifest_read = match read_backup_manifest(state_directory, &file_name) {
@@ -2381,7 +2946,13 @@ fn resume_cleanup_deleting(
                 let identity = manifest_read.identity;
                 drop(manifest_read);
                 hook(CleanupStep::ManifestDeleteCommitted)?;
-                remove_private_leaf_checked(state_directory, &file_name, identity)?;
+                if remove_private_leaf_checked(state_directory, &file_name, identity)?
+                    && !removed
+                        .iter()
+                        .any(|removed_name| removed_name == &logical_backup_file_name)
+                {
+                    removed.push(logical_backup_file_name);
+                }
             }
         }
     }
@@ -2394,8 +2965,13 @@ fn resume_cleanup_tombstones(
     hook: &mut impl FnMut(CleanupStep) -> Result<(), StorageError>,
     removed: &mut Vec<String>,
 ) -> Result<(), StorageError> {
-    resume_cleanup_deleting(state_directory, hook)?;
-    let retained_valid_count = list_validated_migration_backups(state_root, state_directory)?.len();
+    resume_cleanup_deleting(state_directory, hook, removed)?;
+    let retained_valid_count = list_validated_migration_backups(
+        state_root,
+        state_directory,
+        BackupValidationMode::DurableStaging,
+    )?
+    .len();
     let mut tombstones = BTreeMap::<CleanupTombstoneKey, CleanupTombstonePair>::new();
     for file_name in state_directory.leaf_names()? {
         let Some((key, kind)) = parse_cleanup_tombstone_file_name(&file_name) else {
@@ -2552,81 +3128,145 @@ fn resume_cleanup_tombstones(
     Ok(())
 }
 
+fn delete_cleanup_candidate(
+    state_root: &Path,
+    state_directory: &StateDirectory,
+    backup: ValidatedMigrationBackup,
+    hook: &mut impl FnMut(CleanupStep) -> Result<(), StorageError>,
+    removed: &mut Vec<String>,
+) -> Result<(), StorageError> {
+    let fresh = validate_migration_backup(state_root, state_directory, &backup.backup_file_name)?;
+    if fresh.token != backup.token {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    hook(CleanupStep::CandidateValidated)?;
+
+    let cleanup_id = Uuid::now_v7();
+    let backup_tombstone =
+        cleanup_tombstone_file_name(&backup.token, cleanup_id, CleanupTombstoneKind::Backup);
+    let manifest_tombstone =
+        cleanup_tombstone_file_name(&backup.token, cleanup_id, CleanupTombstoneKind::Manifest);
+    move_private_leaf_durable_with_hook(
+        state_directory,
+        &backup.backup_file_name,
+        &backup_tombstone,
+        backup.token.backup_identity,
+        || hook(CleanupStep::BeforeBackupQuarantineMove),
+    )?;
+    hook(CleanupStep::BackupQuarantined)?;
+
+    if let Err(error) = move_private_leaf_durable_with_hook(
+        state_directory,
+        &backup.manifest_file_name,
+        &manifest_tombstone,
+        backup.token.manifest_identity,
+        || hook(CleanupStep::BeforeManifestQuarantineMove),
+    ) {
+        if open_private_leaf_identity(state_directory, &backup.backup_file_name)?.is_none() {
+            move_private_leaf_durable(
+                state_directory,
+                &backup_tombstone,
+                &backup.backup_file_name,
+                backup.token.backup_identity,
+            )?;
+        }
+        return Err(error);
+    }
+    hook(CleanupStep::PairQuarantined)?;
+    let quarantined = validate_migration_backup_at(
+        state_root,
+        state_directory,
+        &backup.backup_file_name,
+        &backup_tombstone,
+        &manifest_tombstone,
+    )?;
+    if quarantined.token != backup.token {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    delete_quarantined_pair(
+        state_directory,
+        &CleanupTombstoneKey {
+            schema_version: backup.token.schema_version,
+            backup_id: backup.token.backup_id,
+            cleanup_id,
+            backup_fingerprint: backup_fingerprint(&backup.token),
+            manifest_fingerprint: manifest_fingerprint(&backup.token),
+        },
+        &backup_tombstone,
+        &manifest_tombstone,
+        &quarantined.token,
+        hook,
+        removed,
+    )
+}
+
 fn cleanup_migration_backups_with_hook(
     state_root: &Path,
     state_directory: &StateDirectory,
+    approved_backup_file_names: Option<&[String]>,
     mut hook: impl FnMut(CleanupStep) -> Result<(), StorageError>,
-) -> Result<Vec<String>, StorageError> {
-    let mut removed = Vec::new();
-    resume_cleanup_tombstones(state_root, state_directory, &mut hook, &mut removed)?;
-
-    let validated = list_validated_migration_backups(state_root, state_directory)?;
-    let delete_count = validated.len().saturating_sub(2);
-    for backup in validated.into_iter().take(delete_count) {
-        let fresh =
-            validate_migration_backup(state_root, state_directory, &backup.backup_file_name)?;
-        if fresh.token != backup.token {
-            return Err(StorageError::new(StorageErrorKind::StateConflict));
-        }
-        hook(CleanupStep::CandidateValidated)?;
-
-        let cleanup_id = Uuid::now_v7();
-        let backup_tombstone =
-            cleanup_tombstone_file_name(&backup.token, cleanup_id, CleanupTombstoneKind::Backup);
-        let manifest_tombstone =
-            cleanup_tombstone_file_name(&backup.token, cleanup_id, CleanupTombstoneKind::Manifest);
-        move_private_leaf_durable_with_hook(
-            state_directory,
-            &backup.backup_file_name,
-            &backup_tombstone,
-            backup.token.backup_identity,
-            || hook(CleanupStep::BeforeBackupQuarantineMove),
-        )?;
-        hook(CleanupStep::BackupQuarantined)?;
-
-        if let Err(error) = move_private_leaf_durable_with_hook(
-            state_directory,
-            &backup.manifest_file_name,
-            &manifest_tombstone,
-            backup.token.manifest_identity,
-            || hook(CleanupStep::BeforeManifestQuarantineMove),
-        ) {
-            if open_private_leaf_identity(state_directory, &backup.backup_file_name)?.is_none() {
-                move_private_leaf_durable(
-                    state_directory,
-                    &backup_tombstone,
-                    &backup.backup_file_name,
-                    backup.token.backup_identity,
-                )?;
+) -> Result<Vec<String>, BackupCleanupFailure> {
+    let approved_candidates =
+        (|| -> Result<Option<Vec<ValidatedMigrationBackup>>, StorageError> {
+            let Some(approved) = approved_backup_file_names else {
+                return Ok(None);
+            };
+            let validated = list_validated_migration_backups(
+                state_root,
+                state_directory,
+                BackupValidationMode::DurableStaging,
+            )?;
+            let retained_valid_count = validated.len();
+            let delete_count = validated.len().saturating_sub(2);
+            let candidates = validated.into_iter().take(delete_count).collect::<Vec<_>>();
+            if cleanup_plan_file_names(
+                state_root,
+                state_directory,
+                &candidates,
+                retained_valid_count,
+                BackupValidationMode::DurableStaging,
+            )?
+            .iter()
+            .map(String::as_str)
+            .eq(approved.iter().map(String::as_str))
+            {
+                Ok(Some(candidates))
+            } else {
+                Err(StorageError::new(StorageErrorKind::StateConflict))
             }
-            return Err(error);
-        }
-        hook(CleanupStep::PairQuarantined)?;
-        let quarantined = validate_migration_backup_at(
+        })()
+        .map_err(|source| BackupCleanupFailure::new(Vec::new(), source))?;
+
+    let mut removed = Vec::new();
+    if let Err(source) =
+        resume_cleanup_tombstones(state_root, state_directory, &mut hook, &mut removed)
+    {
+        return Err(BackupCleanupFailure::new(removed, source));
+    }
+
+    // Tombstone recovery changes only previously quarantined pairs, not these
+    // canonical candidates. Reuse the consent preflight instead of validating
+    // the same files twice on the destructive path.
+    let candidates = if let Some(candidates) = approved_candidates {
+        candidates
+    } else {
+        let validated = match list_validated_migration_backups(
             state_root,
             state_directory,
-            &backup.backup_file_name,
-            &backup_tombstone,
-            &manifest_tombstone,
-        )?;
-        if quarantined.token != backup.token {
-            return Err(StorageError::new(StorageErrorKind::StateConflict));
+            BackupValidationMode::DurableStaging,
+        ) {
+            Ok(validated) => validated,
+            Err(source) => return Err(BackupCleanupFailure::new(removed, source)),
+        };
+        let delete_count = validated.len().saturating_sub(2);
+        validated.into_iter().take(delete_count).collect()
+    };
+    for backup in candidates {
+        if let Err(source) =
+            delete_cleanup_candidate(state_root, state_directory, backup, &mut hook, &mut removed)
+        {
+            return Err(BackupCleanupFailure::new(removed, source));
         }
-        delete_quarantined_pair(
-            state_directory,
-            &CleanupTombstoneKey {
-                schema_version: backup.token.schema_version,
-                backup_id: backup.token.backup_id,
-                cleanup_id,
-                backup_fingerprint: backup_fingerprint(&backup.token),
-                manifest_fingerprint: manifest_fingerprint(&backup.token),
-            },
-            &backup_tombstone,
-            &manifest_tombstone,
-            &quarantined.token,
-            &mut hook,
-            &mut removed,
-        )?;
     }
     Ok(removed)
 }

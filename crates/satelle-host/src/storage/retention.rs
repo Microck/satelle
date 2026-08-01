@@ -8,7 +8,9 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const DEFAULT_SESSION_RETENTION: time::Duration = time::Duration::days(7);
-const DEFAULT_SETUP_LEDGER_RETENTION: time::Duration = time::Duration::days(30);
+pub(crate) const DEFAULT_SETUP_LEDGER_RETENTION: time::Duration = time::Duration::milliseconds(
+    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS as i64,
+);
 
 impl Storage {
     /// Removes only expired Satelle-owned Session and setup-ledger metadata.
@@ -19,16 +21,28 @@ impl Storage {
     /// operation replays, and known terminal setup runs are then deleted in the
     /// same immediate transaction. Setup cleanup cannot invoke an executor or
     /// change external host state.
+    #[cfg(test)]
     pub(crate) fn prune_expired_session_metadata(
         &mut self,
         observed_at: OffsetDateTime,
+    ) -> Result<(), StorageError> {
+        self.prune_expired_session_metadata_with_setup_retention(
+            observed_at,
+            DEFAULT_SETUP_LEDGER_RETENTION,
+        )
+    }
+
+    pub(crate) fn prune_expired_session_metadata_with_setup_retention(
+        &mut self,
+        observed_at: OffsetDateTime,
+        setup_ledger_retention: time::Duration,
     ) -> Result<(), StorageError> {
         let session_cutoff = observed_at
             .checked_sub(DEFAULT_SESSION_RETENTION)
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
         let session_cutoff_nanos = unix_timestamp_nanos(session_cutoff)?;
         let setup_cutoff = observed_at
-            .checked_sub(DEFAULT_SETUP_LEDGER_RETENTION)
+            .checked_sub(setup_ledger_retention)
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
         // Status and log polling call this path frequently. Keep the common
         // no-work case read-only instead of taking SQLite write ownership.

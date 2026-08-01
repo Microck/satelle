@@ -4,6 +4,7 @@ use crate::storage::{
     SetupActionStatus, SetupOperationKind, SetupRepairDecision, SetupRepairPostcondition,
     SetupRepairProbe, SetupRunPlan, SetupRunStatus,
 };
+use satelle_core::host_update::HostUpdateRecoveryIdentity;
 
 fn plan() -> SetupRunPlan {
     plan_with_run_id("setup-run-1")
@@ -90,6 +91,46 @@ fn setup_action_ledger_migrates_and_persists_ordered_state_transitions() {
         Some(SetupActionSkipReason::AlreadySatisfied),
         stored.actions()[1].skip_reason()
     );
+}
+
+#[test]
+fn host_update_recovery_identity_survives_reopen_and_selected_run_planning() {
+    let state = TempDir::new().expect("temporary state directory");
+    let identity = HostUpdateRecoveryIdentity::new(
+        "0.1.0",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let plan = SetupRunPlan::new(
+        "host-update-recovery-identity",
+        SetupOperationKind::HostUpdate,
+        None,
+        at(1),
+        vec![
+            SetupActionPlan::new(
+                "install-host-artifact",
+                "Install the verified Host artifact",
+                true,
+            )
+            .unwrap(),
+        ],
+    )
+    .and_then(|plan| plan.with_host_update_recovery_identity(identity.clone()))
+    .unwrap();
+    {
+        let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+        let _capability = begin_setup_run(&mut storage, &plan);
+    }
+
+    let (storage, _) = Storage::open(state.path()).expect("reopen storage");
+    let selected = storage
+        .load_setup_run(plan.run_id())
+        .expect("load Host update run")
+        .expect("Host update run exists");
+    assert_eq!(selected.host_update_recovery_identity(), Some(&identity));
+    let repair = storage
+        .plan_setup_repair(None, Some(&selected), &[])
+        .expect("plan selected Host update recovery");
+    assert_eq!(repair.host_update_recovery_identity(), Some(&identity));
 }
 
 #[test]
@@ -1065,6 +1106,7 @@ fn repair_waits_for_a_live_postcondition_before_retrying_outcome_unknown() {
     let unknown = storage
         .plan_setup_repair(
             setup_plan.desktop_binding(),
+            None,
             &[SetupRepairProbe::try_new(
                 "install-codex",
                 "Install Codex runtime",
@@ -1082,6 +1124,7 @@ fn repair_waits_for_a_live_postcondition_before_retrying_outcome_unknown() {
     let satisfied = storage
         .plan_setup_repair(
             setup_plan.desktop_binding(),
+            None,
             &[SetupRepairProbe::try_new(
                 "install-codex",
                 "Install Codex runtime",
@@ -1099,6 +1142,7 @@ fn repair_waits_for_a_live_postcondition_before_retrying_outcome_unknown() {
     let unsatisfied = storage
         .plan_setup_repair(
             setup_plan.desktop_binding(),
+            None,
             &[SetupRepairProbe::try_new(
                 "install-codex",
                 "Install Codex runtime",
@@ -1184,6 +1228,7 @@ fn repair_uses_the_durable_retry_safe_marker_for_incomplete_actions() {
     let repair = storage
         .plan_setup_repair(
             None,
+            None,
             &[
                 SetupRepairProbe::try_new(
                     "install-codex",
@@ -1224,6 +1269,7 @@ fn repair_replans_from_live_probes_when_ledger_history_is_missing() {
 
     let repair = storage
         .plan_setup_repair(
+            None,
             None,
             &[
                 SetupRepairProbe::try_new(
@@ -1299,12 +1345,12 @@ fn repair_blocks_automatic_retry_while_a_compatible_run_is_active() {
     .unwrap();
 
     let error = storage
-        .plan_setup_repair(Some(&active_binding), std::slice::from_ref(&probe))
+        .plan_setup_repair(Some(&active_binding), None, std::slice::from_ref(&probe))
         .expect_err("an active host mutation blocks repair planning");
     assert_eq!(StorageErrorKind::StateConflict, error.kind());
 
     let other_binding_plan = storage
-        .plan_setup_repair(Some(&other_binding), std::slice::from_ref(&probe))
+        .plan_setup_repair(Some(&other_binding), None, std::slice::from_ref(&probe))
         .expect("an active run for another binding does not block repair");
     assert_eq!(
         SetupRepairDecision::RetryAutomatically,
@@ -1321,7 +1367,7 @@ fn repair_blocks_automatic_retry_while_a_compatible_run_is_active() {
         )
         .unwrap();
     let other_version_plan = storage
-        .plan_setup_repair(Some(&active_binding), &[probe])
+        .plan_setup_repair(Some(&active_binding), None, &[probe])
         .expect("an active run from another version does not block repair");
     assert_eq!(
         SetupRepairDecision::RetryAutomatically,
@@ -1378,9 +1424,11 @@ fn beginning_repair_atomically_reserves_compatible_scope() {
 
     // Both callers can plan before either reserves the repair scope.
     storage
-        .plan_setup_repair(Some(&binding), std::slice::from_ref(&probe))
+        .plan_setup_repair(Some(&binding), None, std::slice::from_ref(&probe))
         .unwrap();
-    storage.plan_setup_repair(Some(&binding), &[probe]).unwrap();
+    storage
+        .plan_setup_repair(Some(&binding), None, &[probe])
+        .unwrap();
 
     let _first_capability = begin_setup_run(&mut storage, &first);
     let error = storage
@@ -1446,7 +1494,7 @@ fn repair_ignores_history_from_other_bindings_or_satelle_versions() {
     .unwrap();
 
     let other_binding = storage
-        .plan_setup_repair(Some(&current_binding), std::slice::from_ref(&probe))
+        .plan_setup_repair(Some(&current_binding), None, std::slice::from_ref(&probe))
         .unwrap();
     assert_eq!(
         SetupRepairDecision::RetryAutomatically,
@@ -1464,7 +1512,7 @@ fn repair_ignores_history_from_other_bindings_or_satelle_versions() {
         )
         .unwrap();
     let other_version = storage
-        .plan_setup_repair(Some(&current_binding), &[probe])
+        .plan_setup_repair(Some(&current_binding), None, &[probe])
         .unwrap();
     assert_eq!(
         SetupRepairDecision::RetryAutomatically,
@@ -1531,6 +1579,7 @@ fn repair_uses_each_actions_most_recent_retained_ledger_entry() {
     let repair = storage
         .plan_setup_repair(
             None,
+            None,
             &[SetupRepairProbe::try_new(
                 "install-codex",
                 "Install Codex runtime",
@@ -1548,6 +1597,77 @@ fn repair_uses_each_actions_most_recent_retained_ledger_entry() {
     assert_eq!(
         Some(SetupActionStatus::Completed),
         repair.actions()[0].previous_status()
+    );
+
+    let selected_run = storage
+        .load_setup_run("setup-run-2")
+        .unwrap()
+        .expect("selected setup run remains retained");
+    let selected_repair = storage
+        .plan_setup_repair(
+            None,
+            Some(&selected_run),
+            &[SetupRepairProbe::try_new(
+                "install-codex",
+                "Install Codex runtime",
+                true,
+                SetupRepairPostcondition::Unsatisfied,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        SetupRepairDecision::OperatorActionRequired,
+        selected_repair.actions()[0].decision()
+    );
+    assert!(!selected_repair.actions()[0].retry_safe());
+    assert_eq!(
+        Some("setup-run-2"),
+        selected_repair.actions()[0].previous_run_id()
+    );
+    assert_eq!(
+        Some(SetupActionStatus::Completed),
+        selected_repair.actions()[0].previous_status()
+    );
+}
+
+#[test]
+fn repair_adopts_the_first_planned_action_after_a_completed_action() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let plan = SetupRunPlan::new(
+        "planned-action-recovery",
+        SetupOperationKind::Repair,
+        None,
+        at(1),
+        vec![
+            SetupActionPlan::new("replace-host", "Replace Host", true).unwrap(),
+            SetupActionPlan::new("restart-host", "Restart Host", true).unwrap(),
+        ],
+    )
+    .unwrap();
+    let capability = begin_setup_run(&mut storage, &plan);
+    storage
+        .start_setup_action(&capability, "replace-host", at(2))
+        .unwrap();
+    storage
+        .complete_setup_action_after_verified_postcondition(&capability, "replace-host", at(3))
+        .unwrap();
+    storage
+        .retain_lease_recovery(capability.lease_owner())
+        .expect("retain recovery between maintenance actions");
+
+    let adopted = storage
+        .adopt_recovery_maintenance(plan.run_id(), maintenance_owner(plan.run_id(), at(4)))
+        .expect("adopt the first remaining planned action");
+    storage
+        .complete_setup_action_after_verified_postcondition(&adopted, "restart-host", at(5))
+        .expect("complete the action started during adoption");
+    assert_eq!(
+        SetupRunStatus::Completed,
+        storage
+            .finish_setup_run_and_release_maintenance(&adopted, at(6))
+            .expect("finish the adopted operation")
     );
 }
 
@@ -1668,7 +1788,7 @@ fn bootstrap_completion_finalizes_an_already_completed_recovery() {
 }
 
 #[test]
-fn host_update_recovery_adopts_the_interrupted_ordered_action() {
+fn repair_adopts_and_replays_the_exact_interrupted_host_update_run() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
     let plan = SetupRunPlan::new(
@@ -1677,71 +1797,107 @@ fn host_update_recovery_adopts_the_interrupted_ordered_action() {
         None,
         at(1),
         vec![
-            SetupActionPlan::new(
-                "install-host-artifact",
-                "Install the verified Host artifact",
-                true,
-            )
-            .unwrap(),
-            SetupActionPlan::new(
-                "publish-host-service",
-                "Publish the Host service definition",
-                true,
-            )
-            .unwrap(),
-            SetupActionPlan::new("restart-host-daemon", "Restart the Host daemon", true).unwrap(),
-            SetupActionPlan::new(
-                "invalidate-readiness-caches",
-                "Invalidate readiness caches",
-                true,
-            )
-            .unwrap(),
-            SetupActionPlan::new("host-update-postcheck", "Run Host postchecks", true).unwrap(),
+            SetupActionPlan::new("replace-host", "Replace Host", true).unwrap(),
+            SetupActionPlan::new("restart-host", "Restart Host", true).unwrap(),
         ],
     )
+    .and_then(|plan| {
+        plan.with_host_update_recovery_identity(HostUpdateRecoveryIdentity::new(
+            env!("CARGO_PKG_VERSION"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ))
+    })
     .unwrap();
-    let capability = storage
-        .begin_bootstrap_maintenance(&plan, maintenance_owner(plan.run_id(), plan.started_at()))
-        .expect("begin Host update maintenance");
-    for (action_id, started_at, finished_at) in [
-        ("install-host-artifact", at(2), at(3)),
-        ("publish-host-service", at(4), at(5)),
-    ] {
-        storage
-            .start_setup_action(&capability, action_id, started_at)
-            .expect("start completed Host update action");
-        storage
-            .complete_setup_action_after_verified_postcondition(&capability, action_id, finished_at)
-            .expect("complete Host update action");
-    }
+    let capability = begin_setup_run(&mut storage, &plan);
     storage
-        .start_setup_action(&capability, "restart-host-daemon", at(6))
-        .expect("start daemon restart before replacement");
+        .start_setup_action(&capability, "replace-host", at(2))
+        .unwrap();
     storage
-        .retain_lease_recovery(capability.lease_owner())
-        .expect("retain interrupted Host update ownership");
+        .complete_setup_action_after_verified_postcondition(&capability, "replace-host", at(3))
+        .unwrap();
+    storage
+        .start_setup_action(&capability, "restart-host", at(4))
+        .unwrap();
+    storage
+        .mark_interrupted_setup_actions_outcome_unknown(at(5))
+        .unwrap();
 
-    storage
-        .adopt_recovery_maintenance(plan.run_id(), maintenance_owner(plan.run_id(), at(7)))
-        .expect("replacement daemon adopts the interrupted Host update action");
-
-    let run = storage
+    let interrupted = storage
         .load_setup_run(plan.run_id())
         .unwrap()
-        .expect("Host update run exists");
-    assert_eq!(SetupRunStatus::Running, run.status());
+        .expect("interrupted run remains selectable by its exact operation ID");
+    let repair = storage
+        .plan_setup_repair(
+            None,
+            Some(&interrupted),
+            &[
+                SetupRepairProbe::try_new(
+                    "replace-host",
+                    "Replace Host",
+                    true,
+                    SetupRepairPostcondition::Satisfied,
+                )
+                .unwrap(),
+                SetupRepairProbe::try_new(
+                    "restart-host",
+                    "Restart Host",
+                    true,
+                    SetupRepairPostcondition::Unsatisfied,
+                )
+                .unwrap(),
+            ],
+        )
+        .expect("the selected active recovery run is the repair source");
     assert_eq!(
-        [
-            SetupActionStatus::Completed,
-            SetupActionStatus::Completed,
-            SetupActionStatus::Started,
-            SetupActionStatus::Planned,
-            SetupActionStatus::Planned,
+        Some(SetupOperationKind::HostUpdate),
+        repair.selected_operation_kind()
+    );
+    assert_eq!(
+        Some(SetupRunStatus::OutcomeUnknown),
+        repair.selected_run_status()
+    );
+    assert_eq!(
+        &[
+            SetupRepairDecision::NoActionRequired,
+            SetupRepairDecision::RetryAutomatically,
         ],
-        run.actions()
+        repair
+            .actions()
             .iter()
-            .map(|action| action.status())
+            .map(|action| action.decision())
             .collect::<Vec<_>>()
             .as_slice()
     );
+
+    let adopted = storage
+        .adopt_recovery_maintenance(plan.run_id(), maintenance_owner(plan.run_id(), at(6)))
+        .expect("repair adopts the exact interrupted operation");
+    storage
+        .start_setup_action(&adopted, "replace-host", at(7))
+        .expect("completed retry-safe actions can be replayed idempotently");
+    storage
+        .complete_setup_action_after_verified_postcondition(&adopted, "replace-host", at(7))
+        .expect("completed retry-safe actions remain completed");
+    storage
+        .start_setup_action(&adopted, "restart-host", at(7))
+        .expect("the interrupted action remains started after adoption");
+    storage
+        .complete_setup_action_after_verified_postcondition(&adopted, "restart-host", at(8))
+        .expect("the interrupted action completes under the original operation ID");
+    assert_eq!(
+        SetupRunStatus::Completed,
+        storage
+            .finish_setup_run_and_release_maintenance(&adopted, at(9))
+            .expect("exact-run repair finalizes and releases maintenance")
+    );
+
+    let completed = storage.load_setup_run(plan.run_id()).unwrap().unwrap();
+    assert_eq!(SetupRunStatus::Completed, completed.status());
+    assert!(
+        completed
+            .actions()
+            .iter()
+            .all(|action| action.status() == SetupActionStatus::Completed)
+    );
+    assert!(storage.maintenance_lease_state().unwrap().is_none());
 }

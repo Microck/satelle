@@ -4,14 +4,18 @@ use super::{ApiFailure, DaemonState, api_error_response, authenticated_json_resp
 use crate::contract::{
     ApiErrorCategory, ApiErrorCode, BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL,
     DurableTokenActivationResponse, DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
-    NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
-    NativeReadinessInvalidationScope, PROVIDER_SECRET_UPLOAD_CONTENT_TYPE,
-    PROVIDER_SECRET_UPLOAD_INFO, ProviderBindingAuthorizationRequest,
-    ProviderBindingAuthorizationResponse, ProviderBindingDeletionResponse,
-    ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
-    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
-    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, SetupVerificationRequest,
-    SetupVerificationResponse, provider_secret_upload_aad,
+    HostUpdateMaintenanceRequest, NativeReadinessInvalidationRequest,
+    NativeReadinessInvalidationResponse, NativeReadinessInvalidationScope,
+    PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
+    ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
+    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
+    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
+    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
+    ProviderSecretUploadEnvelope, RepairMaintenanceRequest, SetupRepairDecision,
+    SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
+    SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairPreviousStatus,
+    SetupRepairRunStatus, SetupVerificationRequest, SetupVerificationResponse,
+    provider_secret_upload_aad,
 };
 use axum::extract::{Extension, Path, Request, State};
 use axum::http::header::CONTENT_TYPE;
@@ -65,6 +69,116 @@ enum SetupTokenMutationOutcome {
     Conflict,
     HostError(SatelleError),
     TaskFailure,
+}
+
+pub(super) async fn plan_setup_repair(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(_authority): Extension<MutationAuthority>,
+    ApiJson(request): ApiJson<SetupRepairPlanRequest>,
+) -> Response {
+    // The route's control-scope middleware is the authorization boundary.
+    // Planning reads Host-owned ledger and live-probe state but does not grant
+    // the persistent-service mutation capability used by apply handlers.
+    let run_id = request.run_id().map(str::to_string);
+    let probes = match request
+        .probes()
+        .iter()
+        .map(|probe| {
+            satelle_host::SetupRepairProbe::new(
+                &probe.action_id,
+                &probe.label,
+                probe.retry_safe,
+                match probe.postcondition {
+                    SetupRepairPostcondition::Satisfied => {
+                        satelle_host::SetupRepairPostcondition::Satisfied
+                    }
+                    SetupRepairPostcondition::Unsatisfied => {
+                        satelle_host::SetupRepairPostcondition::Unsatisfied
+                    }
+                    SetupRepairPostcondition::Unknown => {
+                        satelle_host::SetupRepairPostcondition::Unknown
+                    }
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(probes) => probes,
+        Err(error) => return host_error::response(&state, &authorized, &error),
+    };
+    let service = Arc::clone(&state.service);
+    let plan = match tokio::task::spawn_blocking(move || {
+        service.plan_setup_repair(None, run_id.as_deref(), &probes)
+    })
+    .await
+    {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let selected_operation_kind = plan.selected_operation_kind().map(|kind| match kind {
+        SetupOperationKind::Setup => SetupRepairOperationKind::Setup,
+        SetupOperationKind::Repair => SetupRepairOperationKind::Repair,
+        SetupOperationKind::HostUpdate => SetupRepairOperationKind::HostUpdate,
+        SetupOperationKind::StorageMigration => SetupRepairOperationKind::StorageMigration,
+        SetupOperationKind::ServiceStop => SetupRepairOperationKind::ServiceStop,
+        SetupOperationKind::ServiceRestart => SetupRepairOperationKind::ServiceRestart,
+    });
+    let selected_run_status = plan.selected_run_status().map(|status| match status {
+        satelle_host::SetupRunStatus::Running => SetupRepairRunStatus::Running,
+        satelle_host::SetupRunStatus::Completed => SetupRepairRunStatus::Completed,
+        satelle_host::SetupRunStatus::Failed => SetupRepairRunStatus::Failed,
+        satelle_host::SetupRunStatus::PartialFailure => SetupRepairRunStatus::PartialFailure,
+        satelle_host::SetupRunStatus::OutcomeUnknown => SetupRepairRunStatus::OutcomeUnknown,
+    });
+    let actions = plan
+        .actions()
+        .iter()
+        .map(|action| SetupRepairPlanAction {
+            action_id: action.action_id().to_string(),
+            label: action.label().to_string(),
+            decision: match action.decision() {
+                satelle_host::SetupRepairDecision::NoActionRequired => {
+                    SetupRepairDecision::NoActionRequired
+                }
+                satelle_host::SetupRepairDecision::RetryAutomatically => {
+                    SetupRepairDecision::RetryAutomatically
+                }
+                satelle_host::SetupRepairDecision::OperatorActionRequired => {
+                    SetupRepairDecision::OperatorActionRequired
+                }
+                satelle_host::SetupRepairDecision::ProbeRequired => {
+                    SetupRepairDecision::ProbeRequired
+                }
+            },
+            retry_safe: action.retry_safe(),
+            previous_run_id: action.previous_run_id().map(str::to_string),
+            previous_status: action.previous_status().map(|status| match status {
+                satelle_host::SetupActionStatus::Planned => SetupRepairPreviousStatus::Planned,
+                satelle_host::SetupActionStatus::Started => SetupRepairPreviousStatus::Started,
+                satelle_host::SetupActionStatus::Completed => SetupRepairPreviousStatus::Completed,
+                satelle_host::SetupActionStatus::Failed => SetupRepairPreviousStatus::Failed,
+                satelle_host::SetupActionStatus::Skipped => SetupRepairPreviousStatus::Skipped,
+                satelle_host::SetupActionStatus::OutcomeUnknown => {
+                    SetupRepairPreviousStatus::OutcomeUnknown
+                }
+            }),
+        })
+        .collect();
+    authenticated_json_response(
+        StatusCode::OK,
+        &SetupRepairPlanResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            selected_operation_kind,
+            selected_run_status,
+            plan.host_update_recovery_identity().cloned(),
+            actions,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
 }
 
 pub(super) async fn verify_setup(
@@ -785,7 +899,8 @@ pub(super) async fn begin_bootstrap_maintenance(
         satelle_host::BootstrapMaintenancePlanKind::PersistentHostService
         | satelle_host::BootstrapMaintenancePlanKind::PersistentHostStop
         | satelle_host::BootstrapMaintenancePlanKind::PersistentHostRestart
-        | satelle_host::BootstrapMaintenancePlanKind::HostUpdate => {
+        | satelle_host::BootstrapMaintenancePlanKind::HostUpdate
+        | satelle_host::BootstrapMaintenancePlanKind::Repair => {
             persistent_service_maintenance_principal_is_authorized(&authorized)
         }
     };
@@ -796,6 +911,70 @@ pub(super) async fn begin_bootstrap_maintenance(
     let operation = operation_id.clone();
     match tokio::task::spawn_blocking(move || {
         service.acquire_bootstrap_maintenance_plan(&operation, operation_kind, plan_kind)
+    })
+    .await
+    {
+        Ok(Ok(())) => authenticated_json_response(
+            StatusCode::OK,
+            &BootstrapMaintenanceResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                operation_id,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
+}
+
+pub(super) async fn begin_host_update_maintenance(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(operation_id): Path<String>,
+    ApiJson(request): ApiJson<HostUpdateMaintenanceRequest>,
+) -> Response {
+    if !persistent_service_maintenance_principal_is_authorized(&authorized) {
+        return bootstrap_maintenance_principal_required(&state, &authorized);
+    }
+    let service = Arc::clone(&state.service);
+    let operation = operation_id.clone();
+    let recovery_identity = request.recovery_identity().clone();
+    match tokio::task::spawn_blocking(move || {
+        service.acquire_host_update_maintenance(&operation, &recovery_identity)
+    })
+    .await
+    {
+        Ok(Ok(())) => authenticated_json_response(
+            StatusCode::OK,
+            &BootstrapMaintenanceResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                operation_id,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
+}
+
+pub(super) async fn begin_repair_maintenance(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(operation_id): Path<String>,
+    ApiJson(request): ApiJson<RepairMaintenanceRequest>,
+) -> Response {
+    if !persistent_service_maintenance_principal_is_authorized(&authorized) {
+        return bootstrap_maintenance_principal_required(&state, &authorized);
+    }
+    let service = Arc::clone(&state.service);
+    let operation = operation_id.clone();
+    let recovery_identity = request.recovery_identity().clone();
+    match tokio::task::spawn_blocking(move || {
+        service.acquire_repair_maintenance(&operation, &recovery_identity)
     })
     .await
     {

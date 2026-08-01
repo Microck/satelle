@@ -4,6 +4,7 @@ use satelle_core::{
     DoctorReport, ProviderAuthObservationSource, ProviderAuthValidationMode,
     ProviderAuthValidationOutcome, ProviderAuthValidationResult, ProviderBindingAuthorization,
     PublicProviderDescriptorValidation, PublicResolvedProviderBinding,
+    host_update::HostUpdateRecoveryIdentity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +26,11 @@ define_schema_token!(
     BootstrapMaintenanceSchema,
     "satelle.bootstrap-maintenance.v1"
 );
+define_schema_token!(
+    HostUpdateMaintenanceSchema,
+    "satelle.host-update-maintenance.v1"
+);
+define_schema_token!(RepairMaintenanceSchema, "satelle.repair-maintenance.v1");
 define_schema_token!(
     ProviderBindingAuthorizationSchema,
     "satelle.provider-binding-authorization.v2"
@@ -74,6 +80,227 @@ define_schema_token!(
     NativeReadinessInvalidationResponseSchema,
     "satelle.native-readiness-invalidation-response.v1"
 );
+define_schema_token!(SetupRepairPlanSchema, "satelle.setup-repair-plan.v1");
+define_schema_token!(
+    SetupRepairPlanResponseSchema,
+    "satelle.setup-repair-plan-response.v2"
+);
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRepairPostcondition {
+    Satisfied,
+    Unsatisfied,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRepairProbe {
+    pub action_id: String,
+    pub label: String,
+    pub retry_safe: bool,
+    pub postcondition: SetupRepairPostcondition,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostUpdateMaintenanceRequest {
+    schema_version: HostUpdateMaintenanceSchema,
+    recovery_identity: HostUpdateRecoveryIdentity,
+}
+
+impl HostUpdateMaintenanceRequest {
+    pub fn new(recovery_identity: HostUpdateRecoveryIdentity) -> Self {
+        Self {
+            schema_version: HostUpdateMaintenanceSchema,
+            recovery_identity,
+        }
+    }
+
+    pub fn recovery_identity(&self) -> &HostUpdateRecoveryIdentity {
+        &self.recovery_identity
+    }
+}
+
+impl ApiRequestContract for HostUpdateMaintenanceRequest {
+    const SCHEMA_VERSION: &'static str = HostUpdateMaintenanceSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepairMaintenanceRequest {
+    schema_version: RepairMaintenanceSchema,
+    recovery_identity: HostUpdateRecoveryIdentity,
+}
+
+impl RepairMaintenanceRequest {
+    pub fn new(recovery_identity: HostUpdateRecoveryIdentity) -> Self {
+        Self {
+            schema_version: RepairMaintenanceSchema,
+            recovery_identity,
+        }
+    }
+
+    pub fn recovery_identity(&self) -> &HostUpdateRecoveryIdentity {
+        &self.recovery_identity
+    }
+}
+
+impl ApiRequestContract for RepairMaintenanceRequest {
+    const SCHEMA_VERSION: &'static str = RepairMaintenanceSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRepairPlanRequest {
+    schema_version: SetupRepairPlanSchema,
+    run_id: Option<String>,
+    probes: Vec<SetupRepairProbe>,
+}
+
+impl SetupRepairPlanRequest {
+    pub fn new(run_id: Option<String>, probes: Vec<SetupRepairProbe>) -> Self {
+        Self {
+            schema_version: SetupRepairPlanSchema,
+            run_id,
+            probes,
+        }
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
+    }
+
+    pub fn probes(&self) -> &[SetupRepairProbe] {
+        &self.probes
+    }
+}
+
+impl ApiRequestContract for SetupRepairPlanRequest {
+    const SCHEMA_VERSION: &'static str = SetupRepairPlanSchema::TOKEN;
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRepairDecision {
+    NoActionRequired,
+    RetryAutomatically,
+    OperatorActionRequired,
+    ProbeRequired,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRepairPreviousStatus {
+    Planned,
+    Started,
+    Completed,
+    Failed,
+    Skipped,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRepairOperationKind {
+    Setup,
+    Repair,
+    HostUpdate,
+    StorageMigration,
+    ServiceStop,
+    ServiceRestart,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupRepairRunStatus {
+    Running,
+    Completed,
+    Failed,
+    PartialFailure,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRepairPlanAction {
+    pub action_id: String,
+    pub label: String,
+    pub decision: SetupRepairDecision,
+    pub retry_safe: bool,
+    pub previous_run_id: Option<String>,
+    pub previous_status: Option<SetupRepairPreviousStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRepairPlanResponse {
+    schema_version: SetupRepairPlanResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    ledger_available: bool,
+    selected_operation_kind: Option<SetupRepairOperationKind>,
+    selected_run_status: Option<SetupRepairRunStatus>,
+    host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
+    actions: Vec<SetupRepairPlanAction>,
+}
+
+impl SetupRepairPlanResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        selected_operation_kind: Option<SetupRepairOperationKind>,
+        selected_run_status: Option<SetupRepairRunStatus>,
+        host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
+        actions: Vec<SetupRepairPlanAction>,
+    ) -> Self {
+        let ledger_available = selected_operation_kind.is_some()
+            || actions
+                .iter()
+                .any(|action| action.previous_run_id.is_some());
+        Self {
+            schema_version: SetupRepairPlanResponseSchema,
+            request_id,
+            host_identity,
+            ledger_available,
+            selected_operation_kind,
+            selected_run_status,
+            host_update_recovery_identity,
+            actions,
+        }
+    }
+
+    pub const fn ledger_available(&self) -> bool {
+        self.ledger_available
+    }
+
+    pub const fn selected_operation_kind(&self) -> Option<SetupRepairOperationKind> {
+        self.selected_operation_kind
+    }
+
+    pub const fn selected_run_status(&self) -> Option<SetupRepairRunStatus> {
+        self.selected_run_status
+    }
+
+    pub fn host_update_recovery_identity(&self) -> Option<&HostUpdateRecoveryIdentity> {
+        self.host_update_recovery_identity.as_ref()
+    }
+
+    pub fn actions(&self) -> &[SetupRepairPlanAction] {
+        &self.actions
+    }
+}
+
+impl AuthenticatedResponseContract for SetupRepairPlanResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProviderBindingAuthorizationRequest {

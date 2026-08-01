@@ -7,7 +7,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v1";
+pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v2";
+pub const DEFAULT_SETUP_LEDGER_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -172,6 +173,34 @@ pub struct DaemonResolvedPathSet {
 }
 
 impl DaemonResolvedPathSet {
+    /// Builds the path evidence needed by an offline Host operation from its
+    /// already-authoritative state root. Offline maintenance must not depend
+    /// on project discovery, the process working directory, or OS defaults.
+    pub fn for_offline_state_root(state_root: &Path) -> Self {
+        let state_root = state_root.display().to_string();
+        let source = crate::PathSource::ServiceConfig;
+        Self {
+            config_file: join_remote_path(&state_root, "config.toml"),
+            cache_root: join_remote_path(&state_root, "cache"),
+            sqlite_store: join_remote_path(&state_root, "satelle.sqlite3"),
+            operator_log_root: join_remote_path(&state_root, "logs"),
+            recording_root: join_remote_path(&state_root, "recordings"),
+            project_config_file: None,
+            install_receipt: join_remote_path(&state_root, "install-receipt.json"),
+            state_root,
+            sources: crate::SatellePathSources {
+                config_file: source,
+                cache_root: source,
+                state_root: source,
+                sqlite_store: source,
+                operator_log_root: source,
+                recording_root: source,
+                project_config_file: source,
+                install_receipt: source,
+            },
+        }
+    }
+
     pub fn with_service_overrides(&self, overrides: &DaemonPathOverrides) -> Self {
         let mut planned = self.clone();
         if let Some(home) = overrides.home.as_ref() {
@@ -412,6 +441,7 @@ pub fn render_launchd_user_plist(
     binary: &Path,
     bind: &str,
     overrides: &DaemonPathOverrides,
+    setup_ledger_retention_ms: u64,
 ) -> Result<String, WindowsServiceDefinitionError> {
     let binary = binary
         .to_str()
@@ -423,6 +453,8 @@ pub fn render_launchd_user_plist(
     if !bind.ip().is_loopback() {
         return Err(WindowsServiceDefinitionError::InvalidServiceConfig);
     }
+    validate_setup_ledger_retention_ms(setup_ledger_retention_ms)
+        .map_err(|_| WindowsServiceDefinitionError::InvalidServiceConfig)?;
     let mut environment = String::new();
     for entry in overrides.entries() {
         if !is_absolute_posix_path(&entry.value) {
@@ -447,12 +479,14 @@ pub fn render_launchd_user_plist(
             "<string>{}</string><string>host</string><string>start</string>",
             "<string>--foreground</string><string>--launchd-service</string>",
             "<string>--bind</string><string>{}</string>",
+            "<string>--setup-ledger-retention-ms</string><string>{}</string>",
             "</array><key>EnvironmentVariables</key><dict>{}</dict>",
             "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
             "</dict></plist>"
         ),
         xml_escape(binary),
         xml_escape(&bind.to_string()),
+        setup_ledger_retention_ms,
         environment
     ))
 }
@@ -489,16 +523,18 @@ pub enum WindowsServiceDefinitionError {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct WindowsServiceConfigV1 {
+pub struct WindowsServiceConfigV2 {
     schema: String,
     daemon_arguments: Vec<String>,
     environment: BTreeMap<String, String>,
+    setup_ledger_retention_ms: u64,
 }
 
-impl WindowsServiceConfigV1 {
+impl WindowsServiceConfigV2 {
     pub fn new(
         bind: &str,
         overrides: &DaemonPathOverrides,
+        setup_ledger_retention_ms: u64,
     ) -> Result<Self, WindowsServiceDefinitionError> {
         let mut environment = BTreeMap::new();
         insert_path_override(&mut environment, "SATELLE_HOME", overrides.home.as_ref());
@@ -533,6 +569,7 @@ impl WindowsServiceConfigV1 {
                 bind.to_string(),
             ],
             environment,
+            setup_ledger_retention_ms,
         };
         config
             .validate()
@@ -556,6 +593,10 @@ impl WindowsServiceConfigV1 {
 
     pub fn environment(&self) -> &BTreeMap<String, String> {
         &self.environment
+    }
+
+    pub fn setup_ledger_retention_ms(&self) -> u64 {
+        self.setup_ledger_retention_ms
     }
 
     pub fn path_overrides(&self) -> DaemonPathOverrides {
@@ -600,11 +641,12 @@ impl WindowsServiceConfigV1 {
         }) {
             return Err("invalid daemon environment");
         }
+        validate_setup_ledger_retention_ms(self.setup_ledger_retention_ms)?;
         Ok(())
     }
 }
 
-impl<'de> Deserialize<'de> for WindowsServiceConfigV1 {
+impl<'de> Deserialize<'de> for WindowsServiceConfigV2 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -615,6 +657,7 @@ impl<'de> Deserialize<'de> for WindowsServiceConfigV1 {
             schema: String,
             daemon_arguments: Vec<String>,
             environment: BTreeMap<String, String>,
+            setup_ledger_retention_ms: u64,
         }
 
         let wire = WireConfig::deserialize(deserializer)?;
@@ -622,10 +665,18 @@ impl<'de> Deserialize<'de> for WindowsServiceConfigV1 {
             schema: wire.schema,
             daemon_arguments: wire.daemon_arguments,
             environment: wire.environment,
+            setup_ledger_retention_ms: wire.setup_ledger_retention_ms,
         };
         config.validate().map_err(D::Error::custom)?;
         Ok(config)
     }
+}
+
+fn validate_setup_ledger_retention_ms(value: u64) -> Result<(), &'static str> {
+    if value == 0 || value > crate::MAX_SETUP_LEDGER_RETENTION_MS {
+        return Err("invalid setup ledger retention");
+    }
+    Ok(())
 }
 
 fn insert_path_override(
@@ -897,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_service_config_contains_only_launch_arguments_and_five_path_overrides() {
+    fn windows_service_config_contains_only_owned_launch_configuration() {
         let overrides = DaemonPathOverrides {
             home: Some(PathBuf::from(r"C:\Satelle")),
             config_file: Some(PathBuf::from(r"C:\Satelle\config.toml")),
@@ -906,7 +957,7 @@ mod tests {
             log_dir: Some(PathBuf::from(r"C:\Satelle\logs")),
             ..DaemonPathOverrides::default()
         };
-        let config = WindowsServiceConfigV1::new("127.0.0.1:3001", &overrides)
+        let config = WindowsServiceConfigV2::new("127.0.0.1:3001", &overrides, 3_600_000)
             .expect("valid service config");
         assert_eq!(config.schema(), WINDOWS_SERVICE_CONFIG_SCHEMA);
         assert_eq!(
@@ -914,6 +965,7 @@ mod tests {
             ["host", "start", "--foreground", "--bind", "127.0.0.1:3001"]
         );
         assert_eq!(config.environment().len(), 5);
+        assert_eq!(config.setup_ledger_retention_ms(), 3_600_000);
         assert_eq!(
             config.environment().keys().cloned().collect::<Vec<_>>(),
             [
@@ -933,25 +985,40 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<Vec<_>>(),
-            ["daemon_arguments", "environment", "schema"]
+            [
+                "daemon_arguments",
+                "environment",
+                "schema",
+                "setup_ledger_retention_ms",
+            ]
         );
     }
 
     #[test]
-    fn windows_service_config_rejects_arbitrary_arguments_and_environment_keys() {
+    fn windows_service_config_rejects_arbitrary_or_invalid_configuration() {
         let invalid_arguments = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
             "daemon_arguments": ["host", "start", "--foreground", "--bind", "0.0.0.0:3001"],
-            "environment": {}
+            "environment": {},
+            "setup_ledger_retention_ms": 3600000
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV1>(invalid_arguments).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV2>(invalid_arguments).is_err());
 
         let invalid_environment = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
             "daemon_arguments": ["host", "start", "--foreground", "--bind", "127.0.0.1:3001"],
-            "environment": {"PATH": "C:\\attacker"}
+            "environment": {"PATH": "C:\\attacker"},
+            "setup_ledger_retention_ms": 3600000
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV1>(invalid_environment).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV2>(invalid_environment).is_err());
+
+        let invalid_retention = serde_json::json!({
+            "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
+            "daemon_arguments": ["host", "start", "--foreground", "--bind", "127.0.0.1:3001"],
+            "environment": {},
+            "setup_ledger_retention_ms": 0
+        });
+        assert!(serde_json::from_value::<WindowsServiceConfigV2>(invalid_retention).is_err());
     }
 
     #[test]
@@ -1186,6 +1253,7 @@ mod tests {
                 home: Some(PathBuf::from("/Users/operator/Satelle & Host")),
                 ..DaemonPathOverrides::default()
             },
+            3_600_000,
         )
         .expect("valid launchd definition");
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
@@ -1193,6 +1261,8 @@ mod tests {
         assert!(plist.contains("Satelle &amp; Host"));
         assert!(plist.contains("127.0.0.1:3001"));
         assert!(plist.contains("<string>--launchd-service</string>"));
+        assert!(plist.contains("<string>--setup-ledger-retention-ms</string>"));
+        assert!(plist.contains("<string>3600000</string>"));
         assert!(!plist.contains("0.0.0.0"));
         assert!(!plist.contains("UserName"));
     }
@@ -1204,9 +1274,10 @@ mod tests {
             state_dir: Some(PathBuf::from(r"C:\Users\operator\Satelle\state")),
             ..DaemonPathOverrides::default()
         };
-        let config = WindowsServiceConfigV1::new("127.0.0.1:3001", &overrides)
+        let config = WindowsServiceConfigV2::new("127.0.0.1:3001", &overrides, 3_600_000)
             .expect("valid Windows service config");
 
         assert_eq!(config.path_overrides(), overrides);
+        assert_eq!(config.setup_ledger_retention_ms(), 3_600_000);
     }
 }

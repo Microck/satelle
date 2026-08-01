@@ -1,6 +1,7 @@
 use super::*;
 use std::error::Error as _;
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -79,6 +80,70 @@ impl BackupFixture {
     fn state_directory(&self) -> StateDirectory {
         prepare_state_root(&self.state_root).expect("prepare fixture state directory")
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_preview_validation_does_not_require_state_directory_writes() {
+    let fixture = BackupFixture::new(1);
+    let original_permissions = fs::metadata(&fixture.state_root)
+        .expect("read state directory metadata")
+        .permissions();
+    fs::set_permissions(&fixture.state_root, fs::Permissions::from_mode(0o500))
+        .expect("make the state directory read-only");
+
+    let validation =
+        validate_migration_backup_for_preview(&fixture.state_root, fixture.backup_file_name());
+    let preview_mode = fs::metadata(&fixture.state_root)
+        .expect("read state directory metadata after preview")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    fs::set_permissions(&fixture.state_root, original_permissions)
+        .expect("restore state directory permissions");
+    if let Err(error) = validation {
+        panic!(
+            "preview validates without staging a writable copy: {error}; source: {}",
+            error
+                .source()
+                .map_or_else(|| "none".to_string(), ToString::to_string)
+        );
+    }
+    assert_eq!(
+        0o500, preview_mode,
+        "preview must not change directory mode"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_cleanup_plan_does_not_require_state_directory_writes() {
+    let fixture = BackupFixture::new(3);
+    let original_permissions = fs::metadata(&fixture.state_root)
+        .expect("read state directory metadata")
+        .permissions();
+    fs::set_permissions(&fixture.state_root, fs::Permissions::from_mode(0o500))
+        .expect("make the state directory read-only");
+
+    let plan = plan_migration_backup_cleanup(&fixture.state_root);
+    let preview_mode = fs::metadata(&fixture.state_root)
+        .expect("read state directory metadata after planning")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    fs::set_permissions(&fixture.state_root, original_permissions)
+        .expect("restore state directory permissions");
+    assert_eq!(
+        vec![fixture.backup_file_names[0].clone()],
+        plan.expect("plan cleanup without mutation"),
+        "read-only validation must retain valid backups in the cleanup plan",
+    );
+    assert_eq!(
+        0o500, preview_mode,
+        "cleanup planning must not change directory mode"
+    );
 }
 
 #[test]
@@ -1046,6 +1111,96 @@ fn interruption_before_replacement_leaves_a_recoverable_store() {
 }
 
 #[test]
+fn startup_reconciles_an_interrupted_restore_before_create_if_missing() {
+    let fixture = BackupFixture::new(1);
+    let connection =
+        Connection::open(fixture.state_root.join(DATABASE_FILE_NAME)).expect("open active store");
+    connection
+        .execute_batch("CREATE TABLE restore_recovery_sentinel (id INTEGER PRIMARY KEY);")
+        .expect("mark the active store after the backup");
+    drop(connection);
+
+    let state_directory = fixture.state_directory();
+    let validated = validate_migration_backup(
+        &fixture.state_root,
+        &state_directory,
+        fixture.backup_file_name(),
+    )
+    .expect("validate backup");
+    let interrupted = catch_unwind(AssertUnwindSafe(|| {
+        let _ = activate_migration_backup_with_hook(
+            &fixture.state_root,
+            &state_directory,
+            &validated,
+            |step| {
+                if step == ActivationStep::RecoveryStateDurable {
+                    panic!("simulate process stop between restore renames");
+                }
+                Ok(())
+            },
+        );
+    }));
+    assert!(interrupted.is_err());
+    assert!(!fixture.state_root.join(DATABASE_FILE_NAME).exists());
+    assert!(
+        fixture
+            .state_root
+            .join(RESTORE_ACTIVATION_JOURNAL)
+            .is_file()
+    );
+    drop(state_directory);
+
+    let (connection, ownership, state_directory) =
+        open_parts(&fixture.state_root).expect("startup reconciles the interrupted restore");
+    let sentinel_exists = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'restore_recovery_sentinel')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .expect("query prior active store");
+    assert!(sentinel_exists);
+    assert!(!fixture.state_root.join(RESTORE_ACTIVATION_JOURNAL).exists());
+    drop(connection);
+    drop(ownership);
+    drop(state_directory);
+}
+
+#[test]
+fn store_reset_reconciles_an_interrupted_restore_before_deleting_metadata() {
+    let fixture = BackupFixture::new(1);
+    let state_directory = fixture.state_directory();
+    let validated = validate_migration_backup(
+        &fixture.state_root,
+        &state_directory,
+        fixture.backup_file_name(),
+    )
+    .expect("validate backup");
+    let interrupted = catch_unwind(AssertUnwindSafe(|| {
+        let _ = activate_migration_backup_with_hook(
+            &fixture.state_root,
+            &state_directory,
+            &validated,
+            |step| {
+                if step == ActivationStep::RecoveryStateDurable {
+                    panic!("simulate process stop before store reset");
+                }
+                Ok(())
+            },
+        );
+    }));
+    assert!(interrupted.is_err());
+    assert!(!fixture.state_root.join(DATABASE_FILE_NAME).exists());
+    drop(state_directory);
+
+    let reset = begin_store_reset_offline(&fixture.state_root)
+        .expect("reset reconciles the interrupted restore");
+    let removed = reset.reset_metadata().expect("reset reconciled metadata");
+    assert!(removed.iter().any(|name| name == DATABASE_FILE_NAME));
+    assert!(!fixture.state_root.join(RESTORE_ACTIVATION_JOURNAL).exists());
+}
+
+#[test]
 fn interruption_after_replacement_leaves_both_active_and_failed_stores_recoverable() {
     let fixture = BackupFixture::new(1);
     let failed_store: &[u8] = b"store before post-replacement interruption";
@@ -1093,6 +1248,20 @@ fn interruption_after_replacement_leaves_both_active_and_failed_stores_recoverab
         fixture.backup_file_name(),
     )
     .expect("source restore point remains valid");
+    assert!(
+        fixture
+            .state_root
+            .join(RESTORE_ACTIVATION_JOURNAL)
+            .is_file()
+    );
+    drop(state_directory);
+
+    let (connection, ownership, state_directory) =
+        open_parts(&fixture.state_root).expect("startup accepts the durable restored store");
+    assert!(!fixture.state_root.join(RESTORE_ACTIVATION_JOURNAL).exists());
+    drop(connection);
+    drop(ownership);
+    drop(state_directory);
 }
 
 fn existing_files(path: &Path) -> Vec<String> {
@@ -1199,6 +1368,92 @@ fn cleanup_retains_the_newest_validated_backup_and_one_previous_backup() {
 }
 
 #[test]
+fn cleanup_rejects_a_candidate_set_that_changed_after_consent() {
+    let fixture = BackupFixture::new(4);
+    let state_directory = fixture.state_directory();
+    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
+        if step == CleanupStep::BackupQuarantined {
+            Err(StorageError::for_test(StorageErrorKind::OperationFailed))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("leave an interrupted cleanup tombstone");
+    assert_eq!(1, cleanup_tombstone_names(&fixture).len());
+
+    let approved = plan_migration_backup_cleanup(&fixture.state_root)
+        .expect("plan initial cleanup candidates");
+    assert_eq!(fixture.backup_file_names[..2].to_vec(), approved);
+
+    let (connection, ownership_lock, state_directory) =
+        open_parts(&fixture.state_root).expect("open fixture store");
+    create_migration_backup(
+        &connection,
+        &fixture.state_root,
+        &state_directory,
+        MIGRATIONS.last().expect("migration registry").version,
+    )
+    .expect("create a backup after consent");
+    drop(connection);
+    drop(ownership_lock);
+    drop(state_directory);
+    let files_before = existing_files(&fixture.state_root);
+
+    let error = cleanup_migration_backups_offline_exact(&fixture.state_root, &approved)
+        .expect_err("reject cleanup when the eligible set changed after consent");
+
+    assert_eq!(StorageErrorKind::StateConflict, error.kind());
+    assert_eq!(files_before, existing_files(&fixture.state_root));
+}
+
+#[test]
+fn cleanup_plan_and_retry_include_an_interrupted_tombstone() {
+    let fixture = BackupFixture::new(3);
+    let state_directory = fixture.state_directory();
+    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
+        if step == CleanupStep::BackupQuarantined {
+            Err(StorageError::for_test(StorageErrorKind::OperationFailed))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("leave an interrupted cleanup tombstone");
+
+    let approved =
+        plan_migration_backup_cleanup(&fixture.state_root).expect("plan interrupted cleanup retry");
+    assert_eq!(vec![fixture.backup_file_names[0].clone()], approved);
+
+    let removed = cleanup_migration_backups_offline_exact(&fixture.state_root, &approved)
+        .expect("resume the exact interrupted cleanup");
+    assert_eq!(approved, removed);
+    assert!(cleanup_tombstone_names(&fixture).is_empty());
+}
+
+#[test]
+fn cleanup_plan_excludes_a_tombstone_without_two_retained_restore_points() {
+    let fixture = BackupFixture::new(3);
+    let state_directory = fixture.state_directory();
+    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
+        if step == CleanupStep::BackupQuarantined {
+            Err(StorageError::for_test(StorageErrorKind::OperationFailed))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("leave an interrupted cleanup tombstone");
+    assert_eq!(1, cleanup_tombstone_names(&fixture).len());
+
+    fs::remove_file(fixture.state_root.join(&fixture.backup_file_names[1]))
+        .expect("invalidate one retained restore point");
+
+    let planned =
+        plan_migration_backup_cleanup(&fixture.state_root).expect("plan safe cleanup work");
+
+    assert!(planned.is_empty());
+    assert_eq!(1, cleanup_tombstone_names(&fixture).len());
+}
+
+#[test]
 fn cleanup_never_deletes_the_only_valid_restore_point() {
     let fixture = BackupFixture::new(1);
     let state_directory = fixture.state_directory();
@@ -1220,7 +1475,7 @@ fn cleanup_identity_swap_never_deletes_the_replacement() {
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::CandidateValidated {
                 fs::rename(fixture.state_root.join(&oldest), &swapped_out)
                     .expect("move cleanup candidate aside");
@@ -1266,7 +1521,7 @@ fn cleanup_inside_quarantine_race_preserves_the_replacement() {
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BeforeBackupQuarantineMove {
                 fs::rename(fixture.state_root.join(&oldest), &swapped_out)
                     .expect("move selected backup inside quarantine primitive");
@@ -1304,7 +1559,7 @@ fn cleanup_second_quarantine_move_failure_restores_the_selected_pair() {
     let mut blocking_manifest_tombstone = None;
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BeforeManifestQuarantineMove {
                 let backup_tombstone = cleanup_tombstone_names(&fixture)
                     .into_iter()
@@ -1354,7 +1609,7 @@ fn cleanup_interruption_after_first_quarantine_is_retryable() {
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BackupQuarantined {
                 Err(StorageError::for_test(StorageErrorKind::OperationFailed))
             } else {
@@ -1400,7 +1655,7 @@ fn backup_only_recovery_refuses_to_borrow_a_canonical_replacement_manifest() {
     let manifest_bytes = fs::read(fixture.manifest_path(&oldest)).expect("read oldest manifest");
     let state_directory = fixture.state_directory();
 
-    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
         if step == CleanupStep::BackupQuarantined {
             Err(StorageError::for_test(StorageErrorKind::OperationFailed))
         } else {
@@ -1444,7 +1699,7 @@ fn cleanup_first_delete_failure_keeps_a_retryable_quarantined_pair() {
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BeforeBackupDelete {
                 Err(StorageError::for_test(StorageErrorKind::OperationFailed))
             } else {
@@ -1496,7 +1751,7 @@ fn cleanup_second_delete_failure_leaves_only_a_verified_manifest_tombstone_for_r
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BeforeManifestDelete {
                 Err(StorageError::for_test(StorageErrorKind::OperationFailed))
             } else {
@@ -1538,7 +1793,7 @@ fn cleanup_retry_recovers_an_asymmetric_durable_deleting_state() {
     let state_directory = fixture.state_directory();
 
     let error =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if step == CleanupStep::BackupDeleteCommitted {
                 Err(StorageError::for_test(StorageErrorKind::OperationFailed))
             } else {
@@ -1562,13 +1817,82 @@ fn cleanup_retry_recovers_an_asymmetric_durable_deleting_state() {
             .any(|name| name.ends_with("~manifest.tombstone"))
     );
 
-    cleanup_migration_backups(&fixture.state_root, &state_directory)
+    let approved =
+        plan_migration_backup_cleanup(&fixture.state_root).expect("plan asymmetric deletion retry");
+    assert_eq!(vec![oldest], approved);
+    let removed = cleanup_migration_backups_offline_exact(&fixture.state_root, &approved)
         .expect("retry asymmetric deleting state");
+    assert_eq!(approved, removed);
     assert!(!fixture.state_root.join(deleting_name).exists());
     assert!(cleanup_tombstone_names(&fixture).is_empty());
     assert_eq!(
         fixture.backup_file_names[1..].to_vec(),
         validated_backup_names(&fixture)
+    );
+}
+
+#[test]
+fn cleanup_plan_and_result_include_a_backup_only_durable_deletion() {
+    let fixture = BackupFixture::new(3);
+    let state_directory = fixture.state_directory();
+    cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
+        if step == CleanupStep::BackupDeleteCommitted {
+            Err(StorageError::for_test(StorageErrorKind::OperationFailed))
+        } else {
+            Ok(())
+        }
+    })
+    .expect_err("interrupt after durable backup delete commit");
+
+    let backup_deleting_name = existing_files(&fixture.state_root)
+        .into_iter()
+        .find(|name| name.ends_with("~backup.deleting"))
+        .expect("durable backup deleting name");
+    let manifest_tombstone_name = cleanup_tombstone_names(&fixture)
+        .into_iter()
+        .find(|name| name.ends_with("~manifest.tombstone"))
+        .expect("pending manifest tombstone");
+    fs::remove_file(fixture.state_root.join(manifest_tombstone_name))
+        .expect("remove the valid pending manifest");
+
+    let planned =
+        plan_migration_backup_cleanup(&fixture.state_root).expect("plan safe cleanup work");
+    assert_eq!(vec![fixture.backup_file_names[0].clone()], planned);
+
+    let removed = cleanup_migration_backups_offline_exact(&fixture.state_root, &planned)
+        .expect("resume the approved backup deletion");
+
+    assert_eq!(planned, removed);
+    assert!(!fixture.state_root.join(backup_deleting_name).exists());
+}
+
+#[test]
+fn cleanup_failure_preserves_names_removed_before_a_later_resume_error() {
+    let fixture = BackupFixture::new(4);
+    let state_directory = fixture.state_directory();
+    let mut delete_attempts = 0;
+
+    let failure =
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
+            if step == CleanupStep::BeforeBackupDelete {
+                delete_attempts += 1;
+                if delete_attempts == 2 {
+                    return Err(StorageError::for_test(StorageErrorKind::OperationFailed));
+                }
+            }
+            Ok(())
+        })
+        .expect_err("fail after one candidate is durably removed");
+
+    assert_eq!(
+        vec![fixture.backup_file_names[0].clone()],
+        failure.removed_backup_file_names
+    );
+    assert_eq!(StorageErrorKind::OperationFailed, failure.kind());
+    assert_eq!("the Satelle storage operation failed", failure.to_string());
+    assert_eq!(
+        Some("the Satelle storage operation failed".to_string()),
+        std::error::Error::source(&failure).map(ToString::to_string)
     );
 }
 
@@ -1614,7 +1938,7 @@ fn windows_cleanup_uses_real_write_through_and_handle_delete_primitives() {
     let mut deleting_names = Vec::new();
 
     let removed =
-        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, |step| {
+        cleanup_migration_backups_with_hook(&fixture.state_root, &state_directory, None, |step| {
             if matches!(
                 step,
                 CleanupStep::BackupDeleteCommitted | CleanupStep::ManifestDeleteCommitted
@@ -1773,4 +2097,20 @@ fn cleanup_ignores_malformed_lookalikes_without_deleting_them() {
                 .expect("read preserved cleanup lookalike")
         );
     }
+}
+
+#[test]
+fn offline_store_reset_returns_files_removed_before_a_later_delete_failure() {
+    let state = crate::TestStateDir::new().expect("create state directory");
+    let reset = begin_store_reset_offline(state.path()).expect("acquire offline reset ownership");
+    write_private_file(&state.path().join("satelle.sqlite3-wal"), b"wal");
+    fs::create_dir(state.path().join("satelle.sqlite3-shm")).expect("create invalid later sidecar");
+
+    let (removed, _) = reset
+        .reset_metadata()
+        .expect_err("the invalid later sidecar must fail reset");
+
+    assert_eq!(removed, ["satelle.sqlite3-wal"]);
+    assert!(!state.path().join("satelle.sqlite3-wal").exists());
+    assert!(state.path().join("satelle.sqlite3-shm").is_dir());
 }

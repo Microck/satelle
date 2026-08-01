@@ -2,6 +2,7 @@ use super::codec::{format_time, parse_time, validated_private_reference};
 use super::{LeaseOwner, Storage, StorageError, StorageErrorKind, sqlite_error};
 use crate::runtime::VerifiedSetupPostconditions;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use satelle_core::host_update::HostUpdateRecoveryIdentity;
 use satelle_core::session::DesktopBindingRef;
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
@@ -215,6 +216,7 @@ pub struct SetupRunPlan {
     desktop_binding: Option<DesktopBindingRef>,
     started_at: OffsetDateTime,
     actions: Vec<SetupActionPlan>,
+    host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
 }
 
 impl SetupRunPlan {
@@ -253,7 +255,34 @@ impl SetupRunPlan {
             desktop_binding,
             started_at,
             actions,
+            host_update_recovery_identity: None,
         })
+    }
+
+    pub fn with_host_update_recovery_identity(
+        mut self,
+        identity: HostUpdateRecoveryIdentity,
+    ) -> Result<Self, satelle_core::SatelleError> {
+        let repair_replaces_host = self.operation_kind == SetupOperationKind::Repair
+            && self
+                .actions
+                .iter()
+                .map(|action| action.action_id.as_str())
+                .eq([
+                    "install-host-artifact",
+                    "publish-host-service",
+                    "restart-host-daemon",
+                    "invalidate-readiness-caches",
+                    "host-update-postcheck",
+                ]);
+        if self.operation_kind != SetupOperationKind::HostUpdate && !repair_replaces_host {
+            return Err(satelle_core::SatelleError::invalid_usage(
+                "Host replacement recovery identity requires a Host update or Host-replacing repair plan",
+            ));
+        }
+        validate_host_update_recovery_identity(&identity).map_err(crate::runtime::storage_error)?;
+        self.host_update_recovery_identity = Some(identity);
+        Ok(self)
     }
 
     pub fn run_id(&self) -> &str {
@@ -274,6 +303,10 @@ impl SetupRunPlan {
 
     pub fn actions(&self) -> &[SetupActionPlan] {
         &self.actions
+    }
+
+    pub fn host_update_recovery_identity(&self) -> Option<&HostUpdateRecoveryIdentity> {
+        self.host_update_recovery_identity.as_ref()
     }
 }
 
@@ -348,6 +381,7 @@ pub struct SetupRunRecord {
     started_at: OffsetDateTime,
     finished_at: Option<OffsetDateTime>,
     actions: Vec<SetupActionRecord>,
+    host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
 }
 
 impl SetupRunRecord {
@@ -381,6 +415,10 @@ impl SetupRunRecord {
 
     pub fn actions(&self) -> &[SetupActionRecord] {
         &self.actions
+    }
+
+    pub fn host_update_recovery_identity(&self) -> Option<&HostUpdateRecoveryIdentity> {
+        self.host_update_recovery_identity.as_ref()
     }
 }
 
@@ -483,6 +521,9 @@ impl SetupRepairAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupRepairPlan {
     actions: Vec<SetupRepairAction>,
+    selected_operation_kind: Option<SetupOperationKind>,
+    selected_run_status: Option<SetupRunStatus>,
+    host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
 }
 
 pub(crate) struct MaintenanceRecoverySubject {
@@ -528,6 +569,18 @@ pub(crate) enum MaintenanceLeaseState {
 impl SetupRepairPlan {
     pub fn actions(&self) -> &[SetupRepairAction] {
         &self.actions
+    }
+
+    pub const fn selected_operation_kind(&self) -> Option<SetupOperationKind> {
+        self.selected_operation_kind
+    }
+
+    pub const fn selected_run_status(&self) -> Option<SetupRunStatus> {
+        self.selected_run_status
+    }
+
+    pub fn host_update_recovery_identity(&self) -> Option<&HostUpdateRecoveryIdentity> {
+        self.host_update_recovery_identity.as_ref()
     }
 
     pub fn automatic_actions(&self) -> impl Iterator<Item = &SetupRepairAction> {
@@ -721,46 +774,55 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        let (recovery_action_id, recovery_action_count) = transaction
+        let recovery_action = transaction
             .query_row(
-                "SELECT min(setup_actions.action_id), count(*)
-                 FROM setup_actions
+                "SELECT setup_actions.action_id, setup_actions.status
+                FROM setup_actions
                  JOIN setup_runs USING (run_id)
                  WHERE setup_runs.run_id = ?1
                    AND setup_runs.status = 'outcome_unknown'
-                   AND setup_actions.status = 'outcome_unknown'",
+                   AND (
+                       setup_actions.status IN ('outcome_unknown', 'planned', 'started')
+                       OR (
+                           setup_actions.action_id = 'bootstrap-handoff'
+                           AND setup_actions.status = 'completed'
+                       )
+                   )
+                 ORDER BY
+                   CASE setup_actions.status
+                       WHEN 'outcome_unknown' THEN 0
+                       WHEN 'planned' THEN 1
+                       WHEN 'started' THEN 2
+                       ELSE 3
+                   END,
+                   setup_actions.action_order
+                 LIMIT 1",
                 [operation_id.as_str()],
-                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
-            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        if recovery_action_count > 1 {
-            return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+            .optional()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))?;
+        let (action_id, action_status) = recovery_action;
+        let parsed_action_status = SetupActionStatus::parse(&action_status)?;
+        if action_id == "bootstrap-handoff" {
+            if !matches!(
+                parsed_action_status,
+                SetupActionStatus::Planned
+                    | SetupActionStatus::Started
+                    | SetupActionStatus::OutcomeUnknown
+                    | SetupActionStatus::Completed
+            ) {
+                return Err(StorageError::new(StorageErrorKind::StateConflict));
+            }
+        } else if !matches!(
+            parsed_action_status,
+            SetupActionStatus::Planned
+                | SetupActionStatus::Started
+                | SetupActionStatus::OutcomeUnknown
+        ) {
+            return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
-        let recovery_action = if let Some(action_id) = recovery_action_id {
-            Some((
-                validated_stored_private_reference(action_id)?,
-                "outcome_unknown",
-            ))
-        } else {
-            transaction
-                .query_row(
-                    "SELECT setup_actions.action_id
-                     FROM setup_actions
-                     JOIN setup_runs USING (run_id)
-                     WHERE setup_runs.run_id = ?1
-                       AND setup_runs.status = 'outcome_unknown'
-                       AND setup_actions.status = 'planned'
-                     ORDER BY setup_actions.action_order
-                     LIMIT 1",
-                    [operation_id.as_str()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
-                .map(validated_stored_private_reference)
-                .transpose()?
-                .map(|action_id| (action_id, "planned"))
-        };
         require_one_transition(
             transaction
                 .execute(
@@ -771,7 +833,7 @@ impl Storage {
                 )
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
         )?;
-        if let Some((recovery_action_id, recovery_action_status)) = recovery_action {
+        if parsed_action_status != SetupActionStatus::Completed {
             require_one_transition(
                 transaction
                     .execute(
@@ -783,12 +845,7 @@ impl Storage {
                          WHERE run_id = ?1
                            AND action_id = ?3
                            AND status = ?4",
-                        params![
-                            operation_id.as_str(),
-                            acquired_at,
-                            recovery_action_id.as_str(),
-                            recovery_action_status,
-                        ],
+                        params![operation_id.as_str(), acquired_at, action_id, action_status],
                     )
                     .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?,
             )?;
@@ -836,6 +893,22 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         require_active_maintenance_owner(&transaction, capability)?;
+        let existing_status = transaction
+            .query_row(
+                "SELECT status FROM setup_actions
+                 WHERE run_id = ?1 AND action_id = ?2",
+                params![run_id, action_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
+        if matches!(
+            SetupActionStatus::parse(&existing_status)?,
+            SetupActionStatus::Started | SetupActionStatus::Completed
+        ) {
+            return Ok(());
+        }
         require_run_and_predecessor_times(&transaction, run_id, &action_id, started_at)?;
         let changed = transaction
             .execute(
@@ -1101,7 +1174,8 @@ impl Storage {
             .connection
             .query_row(
                 "SELECT run_id, operation_kind, desktop_binding_ref, satelle_version,
-                        status, started_at, finished_at
+                        status, started_at, finished_at, host_update_target_version,
+                        host_update_artifact_digest
                  FROM setup_runs WHERE run_id = ?1",
                 [&run_id],
                 |row| {
@@ -1113,6 +1187,8 @@ impl Storage {
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -1126,6 +1202,8 @@ impl Storage {
             status,
             started_at,
             finished_at,
+            host_update_target_version,
+            host_update_artifact_digest,
         )) = run
         else {
             return Ok(None);
@@ -1197,6 +1275,16 @@ impl Storage {
                     .transpose()?,
             });
         }
+        let host_update_recovery_identity =
+            match (host_update_target_version, host_update_artifact_digest) {
+                (Some(target_version), Some(artifact_digest)) => {
+                    let identity = HostUpdateRecoveryIdentity::new(target_version, artifact_digest);
+                    validate_stored_host_update_recovery_identity(&identity)?;
+                    Some(identity)
+                }
+                (None, None) => None,
+                _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+            };
         Ok(Some(SetupRunRecord {
             run_id: validated_stored_private_reference(run_id)?,
             operation_kind: SetupOperationKind::parse(&operation_kind)?,
@@ -1206,6 +1294,7 @@ impl Storage {
             started_at: parse_time(&started_at)?,
             finished_at: finished_at.as_deref().map(parse_time).transpose()?,
             actions,
+            host_update_recovery_identity,
         }))
     }
 
@@ -1215,6 +1304,7 @@ impl Storage {
     pub(crate) fn plan_setup_repair(
         &self,
         desktop_binding: Option<&DesktopBindingRef>,
+        selected_run: Option<&SetupRunRecord>,
         probes: &[SetupRepairProbe],
     ) -> Result<SetupRepairPlan, StorageError> {
         let mut action_ids = HashSet::with_capacity(probes.len());
@@ -1224,11 +1314,36 @@ impl Storage {
         {
             return Err(StorageError::new(StorageErrorKind::InvalidInput));
         }
-        if active_setup_run_in_scope(&self.connection, desktop_binding)? {
+        if let Some(active_run_id) =
+            active_setup_run_id_in_scope(&self.connection, desktop_binding)?
+            && selected_run.is_none_or(|run| run.run_id() != active_run_id)
+        {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
 
-        let history = self.latest_setup_actions(desktop_binding)?;
+        let history = match selected_run {
+            Some(run) => {
+                let accumulated = self.latest_setup_actions(desktop_binding)?;
+                run.actions()
+                    .iter()
+                    .map(|action| {
+                        let historical_retry_safe = accumulated
+                            .get(action.action_id())
+                            .is_none_or(|previous| previous.retry_safe);
+                        (
+                            action.action_id().to_string(),
+                            PreviousSetupAction {
+                                run_id: run.run_id().to_string(),
+                                status: action.status(),
+                                retry_safe: action.retry_safe() && historical_retry_safe,
+                                row_id: 0,
+                            },
+                        )
+                    })
+                    .collect()
+            }
+            None => self.latest_setup_actions(desktop_binding)?,
+        };
         let actions = probes
             .iter()
             .map(|probe| {
@@ -1257,7 +1372,14 @@ impl Storage {
                 }
             })
             .collect();
-        Ok(SetupRepairPlan { actions })
+        Ok(SetupRepairPlan {
+            actions,
+            selected_operation_kind: selected_run.map(SetupRunRecord::operation_kind),
+            selected_run_status: selected_run.map(SetupRunRecord::status),
+            host_update_recovery_identity: selected_run
+                .and_then(SetupRunRecord::host_update_recovery_identity)
+                .cloned(),
+        })
     }
 
     fn latest_setup_actions(
@@ -1350,6 +1472,21 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         require_active_maintenance_owner(&transaction, capability)?;
+        let existing_status = transaction
+            .query_row(
+                "SELECT status FROM setup_actions
+                 WHERE run_id = ?1 AND action_id = ?2",
+                params![run_id, action_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
+        if status == "completed"
+            && SetupActionStatus::parse(&existing_status)? == SetupActionStatus::Completed
+        {
+            return Ok(());
+        }
         require_started_action_time(&transaction, run_id, &action_id, finished_at)?;
         let changed = transaction
             .execute(
@@ -1578,6 +1715,25 @@ fn begin_setup_run_in_transaction(
     owner: &LeaseOwner,
     host_identity: &str,
 ) -> Result<(), StorageError> {
+    let bootstrap_handoff_only =
+        plan.actions.len() == 1 && plan.actions[0].action_id == "bootstrap-handoff";
+    let host_replacement_actions = plan
+        .actions
+        .iter()
+        .map(|action| action.action_id.as_str())
+        .eq([
+            "install-host-artifact",
+            "publish-host-service",
+            "restart-host-daemon",
+            "invalidate-readiness-caches",
+            "host-update-postcheck",
+        ]);
+    let host_update_artifact_identity_required =
+        (plan.operation_kind == SetupOperationKind::HostUpdate && !bootstrap_handoff_only)
+            || (plan.operation_kind == SetupOperationKind::Repair && host_replacement_actions);
+    if host_update_artifact_identity_required != plan.host_update_recovery_identity.is_some() {
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
+    }
     let maintenance_exists: i64 = transaction
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM maintenance_leases WHERE host_identity_ref = ?1)",
@@ -1607,8 +1763,9 @@ fn begin_setup_run_in_transaction(
         .execute(
             "INSERT INTO setup_runs (
                 run_id, host_identity_ref, desktop_binding_ref, satelle_version,
-                operation_kind, status, started_at, finished_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, NULL)",
+                operation_kind, status, started_at, finished_at,
+                host_update_target_version, host_update_artifact_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, NULL, ?7, ?8)",
             params![
                 plan.run_id,
                 host_identity,
@@ -1616,6 +1773,12 @@ fn begin_setup_run_in_transaction(
                 env!("CARGO_PKG_VERSION"),
                 plan.operation_kind.as_str(),
                 format_time(plan.started_at)?,
+                plan.host_update_recovery_identity
+                    .as_ref()
+                    .map(HostUpdateRecoveryIdentity::target_version),
+                plan.host_update_recovery_identity
+                    .as_ref()
+                    .map(HostUpdateRecoveryIdentity::artifact_digest),
             ],
         )
         .map_err(setup_write_error)?;
@@ -1659,6 +1822,28 @@ fn begin_setup_run_in_transaction(
     Ok(())
 }
 
+fn validate_host_update_recovery_identity(
+    identity: &HostUpdateRecoveryIdentity,
+) -> Result<(), StorageError> {
+    validated_private_reference(identity.target_version().to_string())?;
+    if identity.artifact_digest().len() != 64
+        || !identity
+            .artifact_digest()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
+    }
+    Ok(())
+}
+
+fn validate_stored_host_update_recovery_identity(
+    identity: &HostUpdateRecoveryIdentity,
+) -> Result<(), StorageError> {
+    validate_host_update_recovery_identity(identity)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+}
+
 fn release_active_maintenance_in_transaction(
     transaction: &Transaction<'_>,
     capability: &MaintenanceLeaseCapability,
@@ -1693,23 +1878,30 @@ fn active_setup_run_in_scope(
     connection: &Connection,
     desktop_binding: Option<&DesktopBindingRef>,
 ) -> Result<bool, StorageError> {
+    active_setup_run_id_in_scope(connection, desktop_binding).map(|run_id| run_id.is_some())
+}
+
+fn active_setup_run_id_in_scope(
+    connection: &Connection,
+    desktop_binding: Option<&DesktopBindingRef>,
+) -> Result<Option<String>, StorageError> {
     connection
         .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM setup_runs
-                WHERE status = 'running'
-                  AND satelle_version = ?1
-                  AND (
-                      (?2 IS NULL AND desktop_binding_ref IS NULL)
-                      OR desktop_binding_ref = ?2
-                  )
-             )",
+            "SELECT run_id FROM setup_runs
+             WHERE status = 'running'
+               AND satelle_version = ?1
+               AND (
+                   (?2 IS NULL AND desktop_binding_ref IS NULL)
+                   OR desktop_binding_ref = ?2
+               )
+             LIMIT 1",
             params![
                 env!("CARGO_PKG_VERSION"),
                 desktop_binding.map(DesktopBindingRef::as_str)
             ],
             |row| row.get(0),
         )
+        .optional()
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
 }
 
@@ -1952,7 +2144,7 @@ fn load_run_started_at(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
         .ok_or_else(|| StorageError::new(StorageErrorKind::StateConflict))
 }
 

@@ -25,6 +25,10 @@ use super::bootstrap_lock;
 use super::ssh_tunnel::{SshStderrClassification, classify_stderr};
 
 const PROBE_OUTPUT_LIMIT: usize = 4096;
+const OFFLINE_STORAGE_PLAN_LIMIT: usize = 64 * 1024;
+// A cleanup failure can carry the full accepted plan back as removed-file
+// evidence plus the typed error envelope.
+const OFFLINE_STORAGE_RESULT_LIMIT: usize = 2 * OFFLINE_STORAGE_PLAN_LIMIT;
 const SERVICE_DEFINITION_LIMIT: usize = 64 * 1024;
 const TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT: usize = 1024 * 1024;
 const START_OUTPUT_LIMIT: u64 = 16 * 1024;
@@ -412,6 +416,10 @@ impl SshBootstrapLock {
 
     pub(super) fn current_mutation_is_committed(&self) -> bool {
         self.mutation_committed
+    }
+
+    pub(super) fn has_mutation_attempt(&self) -> bool {
+        self.mutation_phase.is_some() || self.mutation_attempt.is_some()
     }
 
     #[cfg(all(test, unix))]
@@ -1525,7 +1533,8 @@ if ($terminalClaimExact) {{
       (($status -eq {digest_mismatch_exit_code}) -and
        (($phase -ceq 'cache_upload') -or ($phase -ceq 'cache_staging_permissions')))) {{
     [IO.File]::Open((Join-Path $claimPath ('execution_succeeded.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
-  }} elseif ($phase -ceq 'daemon_start') {{
+  }} elseif (($phase -ceq 'daemon_start') -or
+            ($phase -ceq 'offline_storage_maintenance')) {{
     [IO.File]::Open((Join-Path $claimPath ('execution_failed.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
   }}
 }}
@@ -1579,7 +1588,7 @@ if exact_terminal_attempt; then
   if [ "$status" -eq 0 ] || {{ [ "$status" -eq {digest_mismatch_exit_code} ] &&
        {{ [ "$phase" = cache_upload ] || [ "$phase" = cache_staging_permissions ]; }}; }}; then
     mkdir "$claim_path/execution_succeeded.$attempt" || exit 75
-  elif [ "$phase" = daemon_start ]; then
+  elif [ "$phase" = daemon_start ] || [ "$phase" = offline_storage_maintenance ]; then
     mkdir "$claim_path/execution_failed.$attempt" || exit 75
   fi
 fi
@@ -2356,12 +2365,33 @@ impl UploadedHostArtifact {
     pub(super) fn binary_sha256(&self) -> &str {
         &self.binary_sha256
     }
+
+    pub(super) const fn cache_changed(&self) -> bool {
+        self.cache_changed
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct VerifiedCurrentWindowsTask {
-    definition: satelle_core::daemon_service::WindowsTaskDefinition,
-    executable_sha256: String,
+pub(super) struct RegisteredWindowsTask {
+    host_id: String,
+    local_app_data: String,
+}
+
+impl RegisteredWindowsTask {
+    fn new(host_id: &str, local_app_data: &str) -> Result<Self, SshBootstrapError> {
+        if host_id.is_empty()
+            || !host_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !target_path_is_absolute(RemoteTarget::WindowsX64Msvc, local_app_data)
+        {
+            return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
+        }
+        Ok(Self {
+            host_id: host_id.to_string(),
+            local_app_data: local_app_data.to_string(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2497,37 +2527,33 @@ impl<'a> PersistentServiceRemote<'a> {
         .map_err(|_| SshBootstrapError::InvalidPersistentServiceDefinition)
     }
 
-    pub(super) fn current_windows_task_definition(
+    pub(super) fn registered_windows_task(
         &self,
         host_id: &str,
-    ) -> Result<VerifiedCurrentWindowsTask, SshBootstrapError> {
+    ) -> Result<RegisteredWindowsTask, SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
-        let artifact = DownloadedArtifact::fetch(self.target)?;
-        let remote_path = self
-            .target
-            .planned_install_path(self.directories, &artifact.release_digest())?;
-        let binary_sha256: String = sha256_file(artifact.path())?
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let definition = self.prepare_windows_task(
-            host_id,
-            &UploadedHostArtifact {
-                remote_path,
-                binary_sha256: binary_sha256.clone(),
-                cache_changed: false,
-            },
-        )?;
-        Ok(VerifiedCurrentWindowsTask {
-            definition,
-            executable_sha256: binary_sha256,
-        })
+        let local_app_data = self
+            .directories
+            .local_app_data
+            .as_deref()
+            .ok_or(SshBootstrapError::InvalidPersistentServiceDefinition)?;
+        let task = RegisteredWindowsTask::new(host_id, local_app_data)?;
+        match self.observe(&registered_windows_task_command(&task, "observe")?)? {
+            PersistentServiceObservation::Running | PersistentServiceObservation::Stopped => {
+                Ok(task)
+            }
+            PersistentServiceObservation::Absent
+            | PersistentServiceObservation::Matching
+            | PersistentServiceObservation::Drifted => {
+                Err(SshBootstrapError::InvalidPersistentServiceDefinition)
+            }
+        }
     }
 
     pub(super) fn publish_windows_service_config(
         &mut self,
         task: &satelle_core::daemon_service::WindowsTaskDefinition,
-        config: &satelle_core::daemon_service::WindowsServiceConfigV1,
+        config: &satelle_core::daemon_service::WindowsServiceConfigV2,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
         let contents = serde_json::to_vec_pretty(config)
@@ -2569,42 +2595,37 @@ impl<'a> PersistentServiceRemote<'a> {
         self.windows_task_mutation("persistent_service_restart", task, "restart")
     }
 
-    pub(super) fn restart_current_windows_task(
+    pub(super) fn restart_registered_windows_task(
         &mut self,
-        task: &VerifiedCurrentWindowsTask,
+        task: &RegisteredWindowsTask,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
-        self.mutate(
-            "persistent_service_restart",
-            &windows_task_lifecycle_command(task, "restart"),
-            None,
-        )
+        let command = registered_windows_task_command(task, "restart")?;
+        self.mutate("persistent_service_restart", &command, None)
     }
 
-    pub(super) fn stop_current_windows_task(
+    pub(super) fn stop_registered_windows_task(
         &mut self,
-        task: &VerifiedCurrentWindowsTask,
+        task: &RegisteredWindowsTask,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
-        self.mutate(
-            "persistent_service_stop",
-            &windows_task_lifecycle_command(task, "stop"),
-            None,
-        )
+        let command = registered_windows_task_command(task, "stop")?;
+        self.mutate("persistent_service_stop", &command, None)
     }
 
-    pub(super) fn observe_current_windows_task(
+    pub(super) fn observe_registered_windows_task(
         &self,
-        task: &VerifiedCurrentWindowsTask,
+        task: &RegisteredWindowsTask,
     ) -> Result<PersistentServiceObservation, SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
-        self.observe(&windows_task_lifecycle_command(task, "observe"))
+        self.observe(&registered_windows_task_command(task, "observe")?)
     }
 
     pub(super) fn launchd_definition(
         &self,
         artifact: &UploadedHostArtifact,
         overrides: &DaemonPathOverrides,
+        setup_ledger_retention_ms: u64,
     ) -> Result<LaunchdServiceDefinition, SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
         let binary = self.absolute_artifact_path(artifact);
@@ -2612,6 +2633,7 @@ impl<'a> PersistentServiceRemote<'a> {
             Path::new(&binary),
             "127.0.0.1:3001",
             overrides,
+            setup_ledger_retention_ms,
         )
         .map_err(|_| SshBootstrapError::InvalidPersistentServiceDefinition)?;
         Ok(LaunchdServiceDefinition {
@@ -2690,6 +2712,30 @@ impl<'a> PersistentServiceRemote<'a> {
             PROBE_OUTPUT_LIMIT,
         )?)?;
         parse_loopback_listener_observation(&output.stdout)
+    }
+
+    pub(super) fn run_offline_storage_maintenance(
+        &mut self,
+        artifact: &UploadedHostArtifact,
+        request: &OfflineStorageMaintenanceRequest<'_>,
+    ) -> Result<serde_json::Value, SshBootstrapError> {
+        let binary = self.absolute_artifact_path(artifact);
+        let command = offline_storage_maintenance_command(self.target, &binary, request);
+        let output = self.mutate_with_output("offline_storage_maintenance", &command, None)?;
+        if output.status.success() {
+            if request.reconcile_completion {
+                parse_offline_storage_completion_recovery_result(
+                    request.identity.operation_id,
+                    &output.stdout,
+                )
+            } else {
+                parse_offline_storage_maintenance_result(request.operation, &output.stdout)
+            }
+        } else if output.stderr.host_key_verification_failed() {
+            Err(SshBootstrapError::HostKeyVerificationRequired)
+        } else {
+            parse_offline_storage_maintenance_failure(&output.stdout)
+        }
     }
 
     pub(super) fn observe_canonical_daemon_path_overrides(
@@ -2818,6 +2864,23 @@ impl<'a> PersistentServiceRemote<'a> {
         require_success(run_fenced_ssh_command(self.destination, &command, input)?)
     }
 
+    fn mutate_with_output(
+        &mut self,
+        phase: &str,
+        command: &str,
+        input: Option<FencedMutationInput<'_>>,
+    ) -> Result<CommandOutput, SshBootstrapError> {
+        let command = self
+            .bootstrap_lock
+            .fenced_command(self.target, phase, command)?;
+        run_fenced_ssh_command_with_output_limit(
+            self.destination,
+            &command,
+            input,
+            OFFLINE_STORAGE_RESULT_LIMIT,
+        )
+    }
+
     fn observe(&self, command: &str) -> Result<PersistentServiceObservation, SshBootstrapError> {
         let output = require_success_output(run_ssh_command_with_output_limit(
             self.destination,
@@ -2843,6 +2906,233 @@ impl<'a> PersistentServiceRemote<'a> {
             join_target_path(self.target, &self.directories.home, artifact.remote_path())
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct OfflineStorageMaintenanceIdentity<'a> {
+    pub(super) host: &'a str,
+    pub(super) operation_id: &'a str,
+}
+
+pub(super) struct OfflineStorageMaintenanceRequest<'a> {
+    pub(super) operation: &'a str,
+    pub(super) identity: OfflineStorageMaintenanceIdentity<'a>,
+    pub(super) state_root: &'a str,
+    pub(super) backup: Option<&'a str>,
+    pub(super) delete_recordings: bool,
+    pub(super) approved_backup_file_names: &'a [String],
+    pub(super) reconcile_completion: bool,
+}
+
+fn offline_storage_maintenance_command(
+    target: RemoteTarget,
+    binary: &str,
+    request: &OfflineStorageMaintenanceRequest<'_>,
+) -> String {
+    if target.is_windows() {
+        let mut script = format!(
+            "& {} host offline-storage-maintenance --operation {} --host {} --operation-id {} --state-root {}",
+            powershell_quote(binary),
+            powershell_quote(request.operation),
+            powershell_quote(request.identity.host),
+            powershell_quote(request.identity.operation_id),
+            powershell_quote(request.state_root),
+        );
+        if let Some(backup) = request.backup {
+            script.push_str(&format!(" --backup {}", powershell_quote(backup)));
+        }
+        if request.delete_recordings {
+            script.push_str(" --delete-recordings");
+        }
+        for backup_file_name in request.approved_backup_file_names {
+            script.push_str(&format!(
+                " --approved-backup {}",
+                powershell_quote(backup_file_name)
+            ));
+        }
+        script.push_str(" --yes");
+        if request.reconcile_completion {
+            script.push_str(" --reconcile-completion");
+        }
+        powershell_encoded_command(&script)
+    } else {
+        let mut arguments = format!(
+            "{} host offline-storage-maintenance --operation {} --host {} --operation-id {} --state-root {}",
+            posix_quote(binary),
+            posix_quote(request.operation),
+            posix_quote(request.identity.host),
+            posix_quote(request.identity.operation_id),
+            posix_quote(request.state_root),
+        );
+        if let Some(backup) = request.backup {
+            arguments.push_str(&format!(" --backup {}", posix_quote(backup)));
+        }
+        if request.delete_recordings {
+            arguments.push_str(" --delete-recordings");
+        }
+        for backup_file_name in request.approved_backup_file_names {
+            arguments.push_str(&format!(
+                " --approved-backup {}",
+                posix_quote(backup_file_name)
+            ));
+        }
+        arguments.push_str(" --yes");
+        if request.reconcile_completion {
+            arguments.push_str(" --reconcile-completion");
+        }
+        format!("sh -c {}", posix_quote(&format!("exec {arguments}")))
+    }
+}
+
+fn offline_storage_backup_cleanup_plan_command(
+    target: RemoteTarget,
+    binary: &str,
+    state_root: &str,
+) -> String {
+    if target.is_windows() {
+        powershell_encoded_command(&format!(
+            "& {} host offline-storage-backup-cleanup-plan --state-root {}",
+            powershell_quote(binary),
+            powershell_quote(state_root),
+        ))
+    } else {
+        let arguments = format!(
+            "{} host offline-storage-backup-cleanup-plan --state-root {}",
+            posix_quote(binary),
+            posix_quote(state_root),
+        );
+        format!("sh -c {}", posix_quote(&format!("exec {arguments}")))
+    }
+}
+
+fn offline_storage_restore_preview_command(
+    target: RemoteTarget,
+    binary: &str,
+    state_root: &str,
+    backup: &str,
+) -> String {
+    if target.is_windows() {
+        powershell_encoded_command(&format!(
+            "& {} host offline-storage-restore-preview --state-root {} --backup {}",
+            powershell_quote(binary),
+            powershell_quote(state_root),
+            powershell_quote(backup),
+        ))
+    } else {
+        let arguments = format!(
+            "{} host offline-storage-restore-preview --state-root {} --backup {}",
+            posix_quote(binary),
+            posix_quote(state_root),
+            posix_quote(backup),
+        );
+        format!("sh -c {}", posix_quote(&format!("exec {arguments}")))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfflineStorageBackupCleanupPlan {
+    eligible_backup_file_names: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfflineStorageRestorePreview {
+    valid: bool,
+}
+
+pub(super) fn plan_offline_storage_backup_cleanup(
+    destination: &str,
+    target: RemoteTarget,
+    binary: &str,
+    state_root: &str,
+) -> Result<Vec<String>, SshBootstrapError> {
+    let command = offline_storage_backup_cleanup_plan_command(target, binary, state_root);
+    let output = require_success_output(run_ssh_command_with_output_limit(
+        destination,
+        &command,
+        OFFLINE_STORAGE_PLAN_LIMIT,
+    )?)?;
+    serde_json::from_slice::<OfflineStorageBackupCleanupPlan>(&output.stdout)
+        .map(|plan| plan.eligible_backup_file_names)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)
+}
+
+pub(super) fn preview_offline_storage_restore(
+    destination: &str,
+    target: RemoteTarget,
+    binary: &str,
+    state_root: &str,
+    backup: &str,
+) -> Result<(), SshBootstrapError> {
+    let command = offline_storage_restore_preview_command(target, binary, state_root, backup);
+    let output = require_success_output(run_ssh_command_with_output_limit(
+        destination,
+        &command,
+        PROBE_OUTPUT_LIMIT,
+    )?)?;
+    let preview = serde_json::from_slice::<OfflineStorageRestorePreview>(&output.stdout)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    if !preview.valid {
+        return Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse);
+    }
+    Ok(())
+}
+
+fn parse_offline_storage_maintenance_result(
+    operation: &str,
+    stdout: &[u8],
+) -> Result<serde_json::Value, SshBootstrapError> {
+    let value: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    let object = value
+        .as_object()
+        .ok_or(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    let string_array = |field: &str| {
+        object
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| values.iter().all(serde_json::Value::is_string))
+    };
+    let valid = match operation {
+        "restore" => {
+            object.len() == 2
+                && object
+                    .get("failed_store_file_name")
+                    .is_some_and(serde_json::Value::is_string)
+                && string_array("failed_sidecar_file_names")
+        }
+        "backup-cleanup" => object.len() == 1 && string_array("removed_backup_file_names"),
+        "store-reset" => {
+            object.len() == 2
+                && string_array("removed_metadata_file_names")
+                && object
+                    .get("recordings_deleted")
+                    .is_some_and(serde_json::Value::is_boolean)
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(value)
+    } else {
+        Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OfflineStorageMaintenanceFailure {
+    error: satelle_core::SatelleError,
+}
+
+fn parse_offline_storage_maintenance_failure(
+    stdout: &[u8],
+) -> Result<serde_json::Value, SshBootstrapError> {
+    let failure = serde_json::from_slice::<OfflineStorageMaintenanceFailure>(stdout)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    Err(SshBootstrapError::OfflineStorageMaintenanceFailed(
+        Box::new(failure.error),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -3153,81 +3443,41 @@ fn windows_task_instance_command(
     powershell_encoded_command(&script)
 }
 
-fn windows_task_lifecycle_command(task: &VerifiedCurrentWindowsTask, action: &str) -> String {
-    let (task_path, task_name) =
-        windows_task_parts(&task.definition).expect("core task path is validated");
-    let lookup = format!(
-        "-TaskPath {} -TaskName {}",
-        powershell_quote(task_path),
-        powershell_quote(task_name),
-    );
-    let definition_matches = windows_task_definition_match_expression(&task.definition);
-    let (missing, operation) = match action {
-        "observe" => (
-            "Write-Output 'satelle-persistent-service-v1'; Write-Output 'absent'; exit 0",
-            concat!(
-                "Write-Output 'satelle-persistent-service-v1'; ",
-                "if (-not $matching) { Write-Output 'drifted' } ",
-                "elseif ($task.State -eq 'Running') { Write-Output 'running' } ",
-                "else { Write-Output 'stopped' }",
-            )
-            .to_string(),
-        ),
-        "restart" => (
-            "exit 75",
-            format!(
-                "if (-not $matching) {{ exit 75 }}; Stop-ScheduledTask {lookup} -ErrorAction SilentlyContinue; Start-ScheduledTask {lookup}"
-            ),
-        ),
-        "stop" => (
-            "exit 75",
-            format!("if (-not $matching) {{ exit 75 }}; Stop-ScheduledTask {lookup}"),
-        ),
-        _ => unreachable!("closed Windows task lifecycle action"),
-    };
-    let script = format!(
-        r#"$ErrorActionPreference='Stop'
-$task=Get-ScheduledTask {lookup} -ErrorAction SilentlyContinue
-if ($null -eq $task) {{ {missing} }}
-[xml]$xml=Export-ScheduledTask {lookup}
-$root=$xml.Task
-$command=[string]$root.Actions.Exec.Command
-$executableIsExact=$false
-try {{
-  $item=Get-Item -LiteralPath $command -Force -ErrorAction Stop
-  $canonical=[IO.Path]::GetFullPath($item.FullName)
-  $requested=[IO.Path]::GetFullPath($command)
-  $digest=(Get-FileHash -Algorithm SHA256 -LiteralPath $command).Hash.ToLowerInvariant()
-  $executableIsExact=($item -is [IO.FileInfo]) -and (-not $item.PSIsContainer) -and
-    (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
-    [StringComparer]::OrdinalIgnoreCase.Equals($requested,$canonical) -and
-    ($digest -ceq {expected_digest})
-}} catch {{ $executableIsExact=$false }}
-$matching=$executableIsExact -and ({definition_matches})
-{operation}"#,
-        lookup = lookup,
-        missing = missing,
-        expected_digest = powershell_quote(&task.executable_sha256),
-        definition_matches = definition_matches,
-        operation = operation,
-    );
-    powershell_encoded_command(&script)
+fn parse_offline_storage_completion_recovery_result(
+    operation_id: &str,
+    stdout: &[u8],
+) -> Result<serde_json::Value, SshBootstrapError> {
+    let value: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    let object = value
+        .as_object()
+        .ok_or(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    if object.len() == 3
+        && object
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(operation_id)
+        && object.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+        && object
+            .get("reconciled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        Ok(value)
+    } else {
+        Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)
+    }
 }
 
-#[cfg(test)]
-fn canonical_windows_task_command(
-    host_id: &str,
-    local_app_data: &str,
+fn registered_windows_task_command(
+    task: &RegisteredWindowsTask,
     action: &str,
 ) -> Result<String, SshBootstrapError> {
-    if host_id.is_empty() || host_id.contains(['\\', '/', '\0']) {
-        return Err(SshBootstrapError::InvalidPersistentServiceDefinition);
-    }
-    let task_name = format!("Host-{host_id}");
+    let task_name = format!("Host-{}", task.host_id);
     let service_config_path = join_target_path(
         RemoteTarget::WindowsX64Msvc,
-        local_app_data,
-        &format!("Satelle/service/{host_id}.json"),
+        &task.local_app_data,
+        &format!("Satelle/service/{}.json", task.host_id),
     );
     let service_config_argument = if service_config_path.contains([' ', '\t', '"']) {
         format!("\"{}\"", service_config_path.replace('"', "\\\""))
@@ -3235,6 +3485,12 @@ fn canonical_windows_task_command(
         service_config_path
     };
     let expected_arguments = format!("host start --service-config {service_config_argument}");
+    let definition_matches = windows_task_definition_match_expression_for_values(
+        "$sid",
+        "$sid",
+        "$command",
+        &powershell_quote(&expected_arguments),
+    );
     let lookup = format!(
         "-TaskPath {} -TaskName {}",
         powershell_quote(r"\Satelle\"),
@@ -3278,19 +3534,14 @@ try {{
   $requested=[IO.Path]::GetFullPath($command)
   $executableIsSafe=($item -is [IO.FileInfo]) -and (-not $item.PSIsContainer) -and
     (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
+    [IO.Path]::IsPathFullyQualified($command) -and
     [StringComparer]::OrdinalIgnoreCase.Equals($requested,$canonical)
 }} catch {{ $executableIsSafe=$false }}
-$matching=$executableIsSafe -and
-  ($root.Principals.Principal.UserId -eq $sid) -and
-  ($root.Principals.Principal.LogonType -eq 'InteractiveToken') -and
-  ($root.Principals.Principal.RunLevel -eq 'LeastPrivilege') -and
-  ($root.Triggers.LogonTrigger.UserId -eq $sid) -and
-  ($root.Settings.MultipleInstancesPolicy -eq 'IgnoreNew') -and
-  ($root.Actions.Exec.Arguments -eq {expected_arguments})
+$matching=$executableIsSafe -and ({definition_matches})
 {operation}"#,
         lookup = lookup,
         missing = missing,
-        expected_arguments = powershell_quote(&expected_arguments),
+        definition_matches = definition_matches,
         operation = operation,
     );
     Ok(powershell_encoded_command(&script))
@@ -3378,7 +3629,7 @@ fn parse_service_path_overrides(
     output: &[u8],
 ) -> Result<DaemonPathOverrides, SshBootstrapError> {
     if target.is_windows() {
-        let config: satelle_core::daemon_service::WindowsServiceConfigV1 =
+        let config: satelle_core::daemon_service::WindowsServiceConfigV2 =
             serde_json::from_slice(output)
                 .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
         if config.bind() != "127.0.0.1:3001" {
@@ -3418,6 +3669,7 @@ struct ObservedLaunchdServiceDefinition {
     executable: String,
     bind: SocketAddr,
     path_overrides: DaemonPathOverrides,
+    setup_ledger_retention_ms: u64,
 }
 
 fn parse_launchd_service_definition(
@@ -3436,6 +3688,7 @@ fn parse_launchd_service_definition(
         "<string>--foreground</string><string>--launchd-service</string>",
         "<string>--bind</string><string>",
     );
+    const RETENTION_PREFIX: &str = "</string><string>--setup-ledger-retention-ms</string><string>";
     const ENVIRONMENT_PREFIX: &str =
         concat!("</string></array>", "<key>EnvironmentVariables</key><dict>",);
     const SUFFIX: &str = concat!(
@@ -3455,7 +3708,7 @@ fn parse_launchd_service_definition(
         return Err(SshBootstrapError::InvalidServiceObservation);
     }
     let (bind, body) = body
-        .split_once(ENVIRONMENT_PREFIX)
+        .split_once(RETENTION_PREFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
     let bind = decode_plist_text(bind)?
         .parse::<SocketAddr>()
@@ -3463,6 +3716,14 @@ fn parse_launchd_service_definition(
     if !bind.ip().is_loopback() {
         return Err(SshBootstrapError::InvalidServiceObservation);
     }
+    let (setup_ledger_retention_ms, body) = body
+        .split_once(ENVIRONMENT_PREFIX)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let setup_ledger_retention_ms = setup_ledger_retention_ms
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0 && *value <= satelle_core::MAX_SETUP_LEDGER_RETENTION_MS)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
     let environment = body
         .strip_suffix(SUFFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
@@ -3488,6 +3749,7 @@ fn parse_launchd_service_definition(
     Ok(ObservedLaunchdServiceDefinition {
         executable: binary,
         bind,
+        setup_ledger_retention_ms,
         path_overrides: daemon_path_overrides_from_environment(
             RemoteTarget::DarwinArm64,
             &entries,
@@ -3655,6 +3917,10 @@ pub(super) struct ManagedServiceExecutableObservation {
 }
 
 impl ManagedServiceExecutableObservation {
+    pub(super) fn path(&self) -> &str {
+        &self.path
+    }
+
     #[cfg(test)]
     pub(super) fn for_tests(path: impl Into<String>, sha256: [u8; 32]) -> Self {
         Self {
@@ -3827,6 +4093,7 @@ impl RemoteUserDirectories {
         path: &str,
         host_id: &str,
         expected_path_overrides: &DaemonPathOverrides,
+        expected_setup_ledger_retention_ms: u64,
     ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         self.probe_managed_service_executable_with_program(
             OsStr::new("ssh"),
@@ -3834,6 +4101,7 @@ impl RemoteUserDirectories {
             path,
             host_id,
             expected_path_overrides,
+            expected_setup_ledger_retention_ms,
         )
     }
 
@@ -3845,6 +4113,7 @@ impl RemoteUserDirectories {
         path: &str,
         host_id: &str,
         expected_path_overrides: &DaemonPathOverrides,
+        expected_setup_ledger_retention_ms: u64,
     ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         self.probe_managed_service_executable_with_program(
             ssh_program.as_os_str(),
@@ -3852,6 +4121,7 @@ impl RemoteUserDirectories {
             path,
             host_id,
             expected_path_overrides,
+            expected_setup_ledger_retention_ms,
         )
     }
 
@@ -3862,6 +4132,7 @@ impl RemoteUserDirectories {
         path: &str,
         host_id: &str,
         expected_path_overrides: &DaemonPathOverrides,
+        expected_setup_ledger_retention_ms: u64,
     ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         if host_id.is_empty()
             || !host_id
@@ -3896,7 +4167,7 @@ impl RemoteUserDirectories {
                     "$config=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json; ",
                     "$task=Get-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name} ",
                     "-ErrorAction SilentlyContinue; ",
-                    "if ($config.schema -cne 'satelle.host-service.v1' -or $null -eq $task) {{ ",
+                    "if ($config.schema -cne 'satelle.host-service.v2' -or $null -eq $task) {{ ",
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "[xml]$xml=Export-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name}; ",
                     "$root=$xml.Task; ",
@@ -3986,13 +4257,14 @@ impl RemoteUserDirectories {
                 .ok_or(SshBootstrapError::InvalidServiceObservation)?;
             let config = config.strip_suffix('\r').unwrap_or(config);
             let Ok(config) = serde_json::from_str::<
-                satelle_core::daemon_service::WindowsServiceConfigV1,
+                satelle_core::daemon_service::WindowsServiceConfigV2,
             >(config) else {
                 return Ok(None);
             };
-            let expected = satelle_core::daemon_service::WindowsServiceConfigV1::new(
+            let expected = satelle_core::daemon_service::WindowsServiceConfigV2::new(
                 "127.0.0.1:3001",
                 expected_path_overrides,
+                expected_setup_ledger_retention_ms,
             )
             .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
             if config != expected {
@@ -4011,6 +4283,7 @@ impl RemoteUserDirectories {
         };
         if definition.bind != "127.0.0.1:3001".parse().expect("static socket address")
             || definition.path_overrides != *expected_path_overrides
+            || definition.setup_ledger_retention_ms != expected_setup_ledger_retention_ms
         {
             return Ok(None);
         }
@@ -4982,7 +5255,16 @@ fn run_ssh_command_with_output_limit(
 fn run_fenced_ssh_command(
     destination: &str,
     remote_command: &str,
+    input: Option<FencedMutationInput<'_>>,
+) -> Result<CommandOutput, SshBootstrapError> {
+    run_fenced_ssh_command_with_output_limit(destination, remote_command, input, PROBE_OUTPUT_LIMIT)
+}
+
+fn run_fenced_ssh_command_with_output_limit(
+    destination: &str,
+    remote_command: &str,
     mut input: Option<FencedMutationInput<'_>>,
+    output_limit: usize,
 ) -> Result<CommandOutput, SshBootstrapError> {
     let mut child = Command::new("ssh")
         .arg("-T")
@@ -4999,7 +5281,7 @@ fn run_fenced_ssh_command(
         .expect("SSH upload stdout was configured as piped");
     let stdout_reader = thread::Builder::new()
         .name("satelle-ssh-upload-stdout".to_string())
-        .spawn(move || read_bounded(stdout, PROBE_OUTPUT_LIMIT))
+        .spawn(move || read_bounded(stdout, output_limit))
         .map_err(|error| terminate_child(&mut child, SshBootstrapError::ReaderThread(error)))?;
     let stderr = child
         .stderr
@@ -5304,6 +5586,10 @@ pub(super) enum SshBootstrapError {
     ServiceDefinitionTooLarge,
     #[error("the remote Host returned an invalid cache-cleanup result")]
     InvalidCacheCleanupResponse,
+    #[error("the remote Host returned an invalid offline storage maintenance result")]
+    InvalidOfflineStorageMaintenanceResponse,
+    #[error("the remote Host storage mutation returned a typed failure")]
+    OfflineStorageMaintenanceFailed(#[source] Box<satelle_core::SatelleError>),
     #[error("the remote Host returned an invalid SHA-256 result")]
     InvalidRemoteDigest,
     #[error("a local bootstrap artifact file operation failed")]
@@ -5350,6 +5636,187 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    #[test]
+    fn offline_cleanup_commands_bind_authorization_and_the_exact_approved_set() {
+        let identity = OfflineStorageMaintenanceIdentity {
+            host: "remote host",
+            operation_id: "storage-maintenance-exact",
+        };
+        let approved = vec![
+            "satelle.sqlite3.migration-backup.1".to_string(),
+            "operator's backup".to_string(),
+        ];
+        let windows = offline_storage_maintenance_command(
+            RemoteTarget::WindowsX64Msvc,
+            r"C:\Satelle\satelle.exe",
+            &OfflineStorageMaintenanceRequest {
+                operation: "backup-cleanup",
+                identity,
+                state_root: r"C:\Satelle\state",
+                backup: None,
+                delete_recordings: false,
+                approved_backup_file_names: &approved,
+                reconcile_completion: false,
+            },
+        );
+        let windows_script =
+            decode_powershell_command(&windows).expect("decode offline cleanup command");
+        assert_eq!(
+            windows_script,
+            "& 'C:\\Satelle\\satelle.exe' host offline-storage-maintenance --operation 'backup-cleanup' --host 'remote host' --operation-id 'storage-maintenance-exact' --state-root 'C:\\Satelle\\state' --approved-backup 'satelle.sqlite3.migration-backup.1' --approved-backup 'operator''s backup' --yes"
+        );
+
+        let plan = offline_storage_backup_cleanup_plan_command(
+            RemoteTarget::DarwinArm64,
+            "/Applications/Satelle/satelle",
+            "/Users/operator/Library/Application Support/Satelle/state",
+        );
+        assert!(plan.contains("offline-storage-backup-cleanup-plan"));
+        assert!(!plan.contains("--yes"));
+        assert!(!plan.contains("--approved-backup"));
+
+        let restore_preview = offline_storage_restore_preview_command(
+            RemoteTarget::WindowsX64Msvc,
+            r"C:\Satelle\satelle.exe",
+            r"C:\Satelle\state",
+            r"C:\Satelle\state\operator's backup",
+        );
+        let restore_preview_script =
+            decode_powershell_command(&restore_preview).expect("decode restore preview command");
+        assert_eq!(
+            restore_preview_script,
+            "& 'C:\\Satelle\\satelle.exe' host offline-storage-restore-preview --state-root 'C:\\Satelle\\state' --backup 'C:\\Satelle\\state\\operator''s backup'"
+        );
+
+        let completion_recovery = offline_storage_maintenance_command(
+            RemoteTarget::DarwinArm64,
+            "/Applications/Satelle/satelle",
+            &OfflineStorageMaintenanceRequest {
+                operation: "restore",
+                identity,
+                state_root: "/Users/operator/Library/Application Support/Satelle/state",
+                backup: None,
+                delete_recordings: false,
+                approved_backup_file_names: &[],
+                reconcile_completion: true,
+            },
+        );
+        assert_eq!(
+            completion_recovery,
+            "sh -c 'exec '\"'\"'/Applications/Satelle/satelle'\"'\"' host \
+             offline-storage-maintenance --operation '\"'\"'restore'\"'\"' --host \
+             '\"'\"'remote host'\"'\"' --operation-id '\"'\"'storage-maintenance-exact'\"'\"' \
+             --state-root '\"'\"'/Users/operator/Library/Application Support/Satelle/state'\"'\"' --yes \
+             --reconcile-completion'"
+        );
+        let completion_result = serde_json::json!({
+            "operation_id": "storage-maintenance-exact",
+            "status": "completed",
+            "reconciled": true,
+        });
+        assert_eq!(
+            parse_offline_storage_completion_recovery_result(
+                "storage-maintenance-exact",
+                &serde_json::to_vec(&completion_result).expect("encode completion result"),
+            )
+            .expect("parse exact completion result"),
+            completion_result
+        );
+        assert!(
+            parse_offline_storage_completion_recovery_result(
+                "different-operation",
+                &serde_json::to_vec(&completion_result).expect("encode mismatched result"),
+            )
+            .is_err(),
+            "completion recovery must bind the exact remote operation identity"
+        );
+    }
+
+    #[test]
+    fn offline_cleanup_plan_limit_covers_many_exact_backup_identities() {
+        let eligible_backup_file_names = (0..64)
+            .map(|index| {
+                format!("satelle.sqlite3.migration-v14-00000000-0000-0000-0000-{index:012}.backup")
+            })
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "eligible_backup_file_names": eligible_backup_file_names,
+        }))
+        .expect("serialize a large cleanup plan");
+
+        assert!(encoded.len() > PROBE_OUTPUT_LIMIT);
+        assert!(encoded.len() <= OFFLINE_STORAGE_PLAN_LIMIT);
+    }
+
+    #[test]
+    fn offline_cleanup_result_limit_covers_an_accepted_plan_error_envelope() {
+        let mut removed_backup_file_names = Vec::new();
+        loop {
+            let mut candidate = removed_backup_file_names.clone();
+            candidate.push(format!(
+                "satelle.sqlite3.migration-v14-00000000-0000-0000-0000-{:012}.backup",
+                candidate.len()
+            ));
+            let plan = serde_json::to_vec(&serde_json::json!({
+                "eligible_backup_file_names": &candidate,
+            }))
+            .expect("serialize cleanup plan candidate");
+            if plan.len() > OFFLINE_STORAGE_PLAN_LIMIT {
+                break;
+            }
+            removed_backup_file_names = candidate;
+        }
+
+        let mut source = satelle_core::SatelleError::storage_maintenance_partially_applied(
+            &["cleanup-storage-backups".to_string()],
+            "cleanup-storage-backups",
+            &[],
+            "satelle host storage backup cleanup --host remote --no-input --yes",
+            "backup deletion failed",
+        );
+        source.details.insert(
+            "removed_backup_file_names".to_string(),
+            serde_json::json!(removed_backup_file_names),
+        );
+        let encoded = serde_json::to_vec(&serde_json::json!({"error": source}))
+            .expect("serialize maximum accepted cleanup failure");
+
+        assert!(encoded.len() > OFFLINE_STORAGE_PLAN_LIMIT);
+        assert!(encoded.len() <= OFFLINE_STORAGE_RESULT_LIMIT);
+    }
+
+    #[test]
+    fn offline_storage_failure_parser_preserves_typed_partial_results() {
+        let source = satelle_core::SatelleError::storage_maintenance_partially_applied(
+            &["delete-host-recordings".to_string()],
+            "delete-host-metadata",
+            &[],
+            "satelle host store reset --host remote --delete-recordings --no-input --yes",
+            "metadata deletion failed",
+        );
+        let mut source = source;
+        source.details.insert(
+            "removed_metadata_file_names".to_string(),
+            serde_json::json!(["satelle.sqlite3-wal"]),
+        );
+        source
+            .details
+            .insert("recordings_deleted".to_string(), serde_json::json!(true));
+        let encoded = serde_json::to_vec(&serde_json::json!({"error": source}))
+            .expect("serialize typed remote failure");
+
+        let error = parse_offline_storage_maintenance_failure(&encoded)
+            .expect_err("typed remote failure remains a failure");
+        let SshBootstrapError::OfflineStorageMaintenanceFailed(error) = error else {
+            panic!("expected the typed storage maintenance failure");
+        };
+        assert_eq!(
+            error.details["removed_metadata_file_names"],
+            serde_json::json!(["satelle.sqlite3-wal"])
+        );
+        assert_eq!(error.details["recordings_deleted"], serde_json::json!(true));
+    }
+
     fn persistent_windows_task() -> satelle_core::daemon_service::WindowsTaskDefinition {
         satelle_core::daemon_service::WindowsTaskDefinition {
             task_path: r"\Satelle\Host-host-123".to_string(),
@@ -5384,6 +5851,7 @@ mod tests {
             Path::new("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle"),
             "127.0.0.1:3001",
             &DaemonPathOverrides::default(),
+            satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
         )
         .expect("render canonical macOS service definition");
         fs::write(
@@ -5418,11 +5886,25 @@ mod tests {
                     &service_path,
                     "host-123",
                     &DaemonPathOverrides::default(),
+                    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
                 )
                 .expect("run audited read-only service probe")
                 .as_ref()
                 .map(|observation| observation.path.as_str()),
             Some("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle")
+        );
+        assert!(
+            directories
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                    3_600_000,
+                )
+                .expect("a drifted macOS retention is observable")
+                .is_none()
         );
 
         let invocation = fs::read_to_string(&audit_log).expect("read fake SSH audit");
@@ -5463,6 +5945,7 @@ mod tests {
                 state_dir: Some(PathBuf::from("/Users/operator/drifted-state")),
                 ..DaemonPathOverrides::default()
             },
+            satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
         )
         .expect("render drifted macOS service definition");
         fs::write(
@@ -5482,6 +5965,7 @@ mod tests {
                     &service_path,
                     "host-123",
                     &DaemonPathOverrides::default(),
+                    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
                 )
                 .expect("a well-formed drifted launchd environment is observable")
                 .is_none()
@@ -5494,9 +5978,10 @@ mod tests {
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
                     "printf 'managed\\r\\n",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                    "{{\"schema\":\"satelle.host-service.v1\",",
+                    "{{\"schema\":\"satelle.host-service.v2\",",
                     "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
-                    "\"127.0.0.1:3001\"],\"environment\":{{}}}}\\r\\n",
+                    "\"127.0.0.1:3001\"],\"environment\":{{}},",
+                    "\"setup_ledger_retention_ms\":2592000000}}\\r\\n",
                     "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
                     "win32-x64-msvc\\\\satelle-",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n"
@@ -5517,6 +6002,7 @@ mod tests {
                     &windows_service_path,
                     "host-123",
                     &DaemonPathOverrides::default(),
+                    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
                 )
                 .expect("run audited Windows service probe")
                 .as_ref()
@@ -5524,6 +6010,19 @@ mod tests {
             Some(
                 r"C:\Users\operator\AppData\Local\Satelle\host\v0.1.0\win32-x64-msvc\satelle-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe"
             )
+        );
+        assert!(
+            windows
+                .probe_managed_service_executable_for_tests(
+                    &fake_ssh,
+                    "operator@example",
+                    &windows_service_path,
+                    "host-123",
+                    &DaemonPathOverrides::default(),
+                    3_600_000,
+                )
+                .expect("a drifted Windows retention is observable")
+                .is_none()
         );
         let invocation = fs::read_to_string(audit_log).expect("read Windows fake SSH audit");
         let command = invocation
@@ -5579,9 +6078,10 @@ mod tests {
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                "{\"schema\":\"satelle.host-service.v1\",",
+                "{\"schema\":\"satelle.host-service.v2\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
-                "\"127.0.0.1:3002\"],\"environment\":{}}\\r\\n",
+                "\"127.0.0.1:3002\"],\"environment\":{},",
+                "\"setup_ledger_retention_ms\":2592000000}\\r\\n",
                 "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
                 "win32-x64-msvc\\\\satelle-",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n",
@@ -5596,6 +6096,7 @@ mod tests {
                     &windows_service_path,
                     "host-123",
                     &DaemonPathOverrides::default(),
+                    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
                 )
                 .expect("a well-formed drifted Windows service config is observable")
                 .is_none()
@@ -5606,10 +6107,11 @@ mod tests {
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                "{\"schema\":\"satelle.host-service.v1\",",
+                "{\"schema\":\"satelle.host-service.v2\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                 "\"127.0.0.1:3001\"],",
-                "\"environment\":{\"SATELLE_HOME\":\"C:\\\\\\\\Drifted\"}}\\r\\n",
+                "\"environment\":{\"SATELLE_HOME\":\"C:\\\\\\\\Drifted\"},",
+                "\"setup_ledger_retention_ms\":2592000000}\\r\\n",
                 "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
                 "win32-x64-msvc\\\\satelle-",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe'\n",
@@ -5624,6 +6126,7 @@ mod tests {
                     &windows_service_path,
                     "host-123",
                     &DaemonPathOverrides::default(),
+                    satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
                 )
                 .expect("a well-formed drifted Windows service environment is observable")
                 .is_none()
@@ -5830,13 +6333,11 @@ mod tests {
 
     #[test]
     fn persistent_service_windows_canonical_lifecycle_revalidates_before_mutation() {
+        let task =
+            RegisteredWindowsTask::new("host-123", r"C:\Users\Satelle Operator\AppData\Local")
+                .expect("canonical registered task identity");
         let restart = decode_powershell_command(
-            &canonical_windows_task_command(
-                "host-123",
-                r"C:\Users\Satelle Operator\AppData\Local",
-                "restart",
-            )
-            .expect("canonical restart command"),
+            &registered_windows_task_command(&task, "restart").expect("canonical restart command"),
         )
         .expect("decode canonical restart");
         assert!(restart.contains(r"'\Satelle\'"));
@@ -5846,6 +6347,10 @@ mod tests {
         assert!(restart.contains("LeastPrivilege"));
         assert!(restart.contains("IgnoreNew"));
         assert!(restart.contains("ReparsePoint"));
+        assert!(restart.contains("LogonTrigger.ChildNodes).Count -eq 2"));
+        assert!(restart.contains("Actions.Exec.ChildNodes).Count -eq 2"));
+        assert!(restart.contains("$root.Actions.Exec.Command -eq $command"));
+        assert!(!restart.contains("Get-FileHash"));
         assert!(restart.contains(
             r#"host start --service-config "C:\Users\Satelle Operator\AppData\Local\Satelle\service\host-123.json""#
         ));
@@ -5854,50 +6359,20 @@ mod tests {
         assert!(restart.contains("Stop-ScheduledTask"));
         assert!(restart.contains("Start-ScheduledTask"));
 
+        let observe_task =
+            RegisteredWindowsTask::new("host-123", r"C:\Users\operator\AppData\Local")
+                .expect("canonical registered task identity");
         let observe = decode_powershell_command(
-            &canonical_windows_task_command(
-                "host-123",
-                r"C:\Users\operator\AppData\Local",
-                "observe",
-            )
-            .expect("canonical observation command"),
+            &registered_windows_task_command(&observe_task, "observe")
+                .expect("canonical observation command"),
         )
         .expect("decode canonical observation");
         assert!(observe.contains("Write-Output 'absent'; exit 0"));
         assert!(observe.contains("$task.State -eq 'Running'"));
         assert!(observe.contains("Write-Output 'stopped'"));
-        assert!(canonical_windows_task_command("bad\\host", r"C:\Users\operator", "stop").is_err());
-    }
-
-    #[test]
-    fn persistent_service_windows_current_task_lifecycle_binds_definition_and_digest() {
-        let task = VerifiedCurrentWindowsTask {
-            definition: persistent_windows_task(),
-            executable_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_string(),
-        };
-        let restart = decode_powershell_command(&windows_task_lifecycle_command(&task, "restart"))
-            .expect("decode exact current-task restart");
-        assert!(restart.contains("Get-FileHash -Algorithm SHA256"));
-        assert!(restart.contains(&task.executable_sha256));
-        assert!(restart.contains(&task.definition.executable));
-        assert!(restart.contains(&windows_task_arguments(&task.definition)));
-        assert!(restart.contains("LogonTrigger.ChildNodes).Count -eq 2"));
-        assert!(restart.contains("LogonTrigger.Enabled -eq 'true'"));
-        assert!(restart.contains("Settings.Enabled -eq 'true'"));
-        assert!(restart.contains("DisallowStartIfOnBatteries -eq 'false'"));
-        assert!(restart.contains("StopIfGoingOnBatteries -eq 'false'"));
-        assert!(restart.contains("Actions.ChildNodes).Count -eq 1"));
-        assert!(restart.contains("Actions.Exec.ChildNodes).Count -eq 2"));
-        assert!(restart.contains("if (-not $matching) { exit 75 }"));
-        assert!(restart.contains("Stop-ScheduledTask"));
-        assert!(restart.contains("Start-ScheduledTask"));
-
-        let observe = decode_powershell_command(&windows_task_lifecycle_command(&task, "observe"))
-            .expect("decode exact current-task observation");
-        assert!(observe.contains("Write-Output 'drifted'"));
-        assert!(observe.contains("$task.State -eq 'Running'"));
-        assert!(observe.contains("Write-Output 'stopped'"));
+        assert!(
+            RegisteredWindowsTask::new("bad\\host", r"C:\Users\operator\AppData\Local").is_err()
+        );
     }
 
     #[test]
@@ -6075,9 +6550,10 @@ mod tests {
     #[test]
     fn persistent_service_path_override_parsers_are_closed() {
         let windows = br#"{
-          "schema":"satelle.host-service.v1",
+          "schema":"satelle.host-service.v2",
           "daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],
-          "environment":{"SATELLE_STATE_DIR":"C:\\Users\\operator\\AppData\\Local\\Satelle\\state"}
+          "environment":{"SATELLE_STATE_DIR":"C:\\Users\\operator\\AppData\\Local\\Satelle\\state"},
+          "setup_ledger_retention_ms":3600000
         }"#;
         let parsed = parse_service_path_overrides(RemoteTarget::WindowsX64Msvc, windows)
             .expect("valid Windows service config");
@@ -6088,7 +6564,7 @@ mod tests {
         assert!(
             parse_service_path_overrides(
                 RemoteTarget::WindowsX64Msvc,
-                br#"{"schema":"satelle.host-service.v1","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"}}"#,
+                br#"{"schema":"satelle.host-service.v2","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"},"setup_ledger_retention_ms":3600000}"#,
             )
             .is_err()
         );
@@ -6104,6 +6580,7 @@ mod tests {
             Path::new("/Users/operator/Applications/Satelle & Host/satelle"),
             "127.0.0.1:4001",
             &overrides,
+            3_600_000,
         )
         .expect("valid launchd plist");
         let parsed = parse_service_path_overrides(RemoteTarget::DarwinArm64, plist.as_bytes())
@@ -7400,6 +7877,7 @@ mod tests {
             native_readiness_cache_ttl: None,
             provider_smoke_success_cache_ttl: None,
             provider_smoke_failure_cache_ttl: None,
+            setup_ledger_retention: None,
             daemon_idle_timeout: None,
             desktop_user: None,
             desktop_session_preference: None,
@@ -7797,6 +8275,54 @@ mod tests {
                 retire_attempt,
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn posix_offline_storage_failure_records_a_terminal_fence_marker() {
+        let state = tempfile::tempdir().expect("temporary state");
+        let operation_id = "offline-storage-operation";
+        let identity = "0123456789abcdef0123456789abcdef";
+        let basename = "claim.offline-storage-operation.0123456789abcdef";
+        let attempt = "11111111111111111111111111111111";
+        let claim = state.path().join("bootstrap.lock").join(basename);
+        fs::create_dir_all(&claim).expect("create claim");
+        fs::write(claim.join("operation_id"), operation_id).expect("write operation id");
+        fs::write(claim.join("claim_identity"), identity).expect("write claim identity");
+        fs::write(claim.join("state"), "mutation_started").expect("write claim state");
+        fs::write(claim.join("mutation_phase"), "offline_storage_maintenance")
+            .expect("write mutation phase");
+        fs::write(claim.join("mutation_attempt"), attempt).expect("write mutation attempt");
+        let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+            operation_id,
+            identity,
+            basename,
+            "offline_storage_maintenance",
+            attempt,
+            "exit 23",
+        );
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(fenced)
+            .env("SATELLE_STATE_DIR", state.path())
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("run offline storage fence");
+        writeln!(
+            child.stdin.as_mut().expect("piped storage fence stdin"),
+            "{MUTATION_EXECUTE}"
+        )
+        .expect("write execution gate");
+        drop(child.stdin.take());
+
+        assert_eq!(
+            child.wait().expect("wait for storage fence").code(),
+            Some(23)
+        );
+        assert!(
+            claim.join(format!("execution_failed.{attempt}")).is_dir(),
+            "a known failed offline attempt must terminate before the restart phase"
+        );
     }
 
     #[cfg(target_os = "linux")]

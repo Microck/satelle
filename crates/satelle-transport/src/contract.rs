@@ -32,25 +32,26 @@ pub use session::{
 };
 pub use setup::{
     BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
-    DurableTokenConfirmationResponse, DurableTokenIssuanceResponse,
+    DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostUpdateMaintenanceRequest,
     NativeReadinessInvalidationRequest, NativeReadinessInvalidationResponse,
     NativeReadinessInvalidationScope, ProviderBindingAuthorizationRequest,
     ProviderBindingAuthorizationResponse, ProviderBindingDeletionResponse,
     ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
     ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
-    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, SetupVerificationRequest,
-    SetupVerificationResponse,
+    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, RepairMaintenanceRequest,
+    SetupRepairDecision, SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
+    SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairPreviousStatus, SetupRepairProbe,
+    SetupRepairRunStatus, SetupVerificationRequest, SetupVerificationResponse,
 };
 pub(crate) use setup::{
     PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO, provider_secret_upload_aad,
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v12 hard-cuts capabilities v6, fresh maintenance update evidence,
-// and authenticated Host Path Set inspection. A v11 client accepts only
-// capabilities v5 and cannot represent these contracts, so it must receive the
-// typed protocol incompatibility response before either side decodes them.
-pub(crate) const PROTOCOL_VERSION: &str = "12";
+// Protocol v13 binds Host-update maintenance and selected-run recovery to the
+// exact release artifact accepted before mutation. The protocol remains a
+// hard cut because repair cannot safely infer an interrupted update target.
+pub(crate) const PROTOCOL_VERSION: &str = "13";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -188,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v12_host_paths_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "12");
+    fn protocol_version_is_the_v13_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "13");
     }
 }

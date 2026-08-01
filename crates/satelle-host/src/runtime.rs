@@ -68,6 +68,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
+pub(crate) fn storage_failure(error: crate::storage::StorageError) -> SatelleError {
+    model::storage_failure(error)
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_MAINTENANCE_START_AND_RETAIN: std::cell::Cell<bool> = const {
@@ -611,6 +615,7 @@ pub(crate) struct RuntimeEngine {
     live_events: LiveEventHub,
     process_identity: ProcessIdentity,
     attachment_store: crate::attachment::AttachmentStore,
+    setup_ledger_retention: time::Duration,
 }
 
 #[derive(Clone, Default)]
@@ -665,6 +670,7 @@ impl RuntimeEngine {
         adapter: Arc<dyn ComputerUseAdapter>,
         readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
         provider_policy: RuntimeProviderPolicy,
+        setup_ledger_retention: time::Duration,
         provider_smoke_fingerprinter: Option<
             crate::provider_auth::ProviderSmokeCredentialFingerprinter,
         >,
@@ -699,6 +705,7 @@ impl RuntimeEngine {
             live_events: LiveEventHub::new(),
             process_identity,
             attachment_store,
+            setup_ledger_retention,
         });
         Ok(engine)
     }
@@ -2166,7 +2173,10 @@ impl RuntimeEngine {
         observed_at: time::OffsetDateTime,
     ) -> Result<(), SatelleError> {
         self.lock_storage()?
-            .prune_expired_session_metadata(observed_at)
+            .prune_expired_session_metadata_with_setup_retention(
+                observed_at,
+                self.setup_ledger_retention,
+            )
             .map_err(model::storage_failure)
     }
 
@@ -2217,6 +2227,7 @@ struct LazyRuntime {
     operator_log_root: Result<PathBuf, SatelleError>,
     engine: Option<Arc<RuntimeEngine>>,
     provider_policy: RuntimeProviderPolicy,
+    setup_ledger_retention: time::Duration,
     provider_smoke_fingerprinter:
         Option<crate::provider_auth::ProviderSmokeCredentialFingerprinter>,
 }
@@ -2352,6 +2363,13 @@ impl RuntimeHandle {
         self.with_maintenance_operation(operation, |storage, capability| {
             storage.start_setup_action(capability, action_id, started_at)
         })
+    }
+
+    /// Stops the in-process heartbeat without classifying the action as
+    /// abandoned. The caller must own the external offline-operation fence
+    /// and reopen the store to reconcile the exact action outcome.
+    pub(crate) fn handoff_offline_maintenance(&self, operation: &mut MaintenanceOperationHandle) {
+        operation.disarm();
     }
 
     pub(crate) fn complete_setup_action_after_verified_postcondition(
@@ -2574,11 +2592,21 @@ impl RuntimeHandle {
     pub(crate) fn plan_setup_repair(
         &self,
         desktop_binding: Option<&DesktopBindingRef>,
+        run_id: Option<&str>,
         probes: &[SetupRepairProbe],
     ) -> Result<SetupRepairPlan, SatelleError> {
-        self.engine()?
-            .lock_storage()?
-            .plan_setup_repair(desktop_binding, probes)
+        let engine = self.engine()?;
+        let storage = engine.lock_storage()?;
+        let selected_run = run_id
+            .map(|run_id| {
+                storage
+                    .load_setup_run(run_id)
+                    .map_err(model::storage_failure)?
+                    .ok_or_else(|| SatelleError::setup_ledger_unavailable(run_id))
+            })
+            .transpose()?;
+        storage
+            .plan_setup_repair(desktop_binding, selected_run.as_ref(), probes)
             .map_err(model::storage_failure)
     }
 
@@ -2607,6 +2635,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy: RuntimeProviderPolicy::default(),
+                setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
                 provider_smoke_fingerprinter: None,
             })),
         }
@@ -2631,6 +2660,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy,
+                setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
                 provider_smoke_fingerprinter: Some(
                     crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
                 ),
@@ -2662,6 +2692,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy,
+                setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
                 provider_smoke_fingerprinter: Some(
                     crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
                 ),
@@ -2674,6 +2705,7 @@ impl RuntimeHandle {
         operator_log_root: Result<PathBuf, SatelleError>,
         adapter: ProductionComputerUseAdapter,
         provider_policy: RuntimeProviderPolicy,
+        setup_ledger_retention: time::Duration,
     ) -> Self {
         let provider_smoke_fingerprinter = adapter.provider_smoke_fingerprinter();
         let adapter = Arc::new(adapter);
@@ -2688,9 +2720,18 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy,
+                setup_ledger_retention,
                 provider_smoke_fingerprinter: Some(provider_smoke_fingerprinter),
             })),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn setup_ledger_retention_for_tests(&self) -> time::Duration {
+        self.lazy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .setup_ledger_retention
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2716,6 +2757,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy: RuntimeProviderPolicy::default(),
+                setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
                 provider_smoke_fingerprinter: Some(
                     crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
                 ),
@@ -3841,6 +3883,7 @@ impl RuntimeHandle {
             Arc::clone(&self.adapter),
             self.readiness_probe_driver.clone(),
             lazy.provider_policy.clone(),
+            lazy.setup_ledger_retention,
             lazy.provider_smoke_fingerprinter.clone(),
         )?;
         lazy.engine = Some(Arc::clone(&engine));

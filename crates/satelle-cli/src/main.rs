@@ -31,7 +31,7 @@ use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 #[cfg(any(windows, test))]
-use satelle_core::daemon_service::WindowsServiceConfigV1;
+use satelle_core::daemon_service::WindowsServiceConfigV2;
 use satelle_core::daemon_service::{
     DaemonServicePlatform, PersistentServiceDecision, SetupModeSelection, SetupModeSource,
 };
@@ -48,10 +48,10 @@ use satelle_core::{
     ProfileSelectionSource, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN,
     SatelleError, SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode,
     SetupReadinessSummary, SetupReport, SetupRequiredInput, SetupSchemaVersion, SetupVerification,
-    load_config, load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_desktop_session,
-    resolve_path_set, utc_now,
+    TransportKind, load_config, load_config_for_profile, load_config_without_profile,
+    load_user_api_rate_limits, open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    open_owner_only_directory, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, DoctorExecutionFailure, DoctorExecutionResult, HostService,
@@ -62,7 +62,7 @@ use satelle_transport::{
     DaemonTlsReloadError, DaemonTlsReloader, ProviderBindingAuthorization,
     SetupVerificationRequest, TurnRequest,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -80,6 +80,7 @@ use transport::{
     discover_direct_host_identity, discover_ssh_host, transport_for, transport_for_setup,
     transport_for_with_ssh_bootstrap,
 };
+use uuid::Uuid;
 
 const CONFIG_CHECK_SCHEMA_VERSION: &str = "satelle.config.check.v1";
 const CONFIG_EXPLAIN_SCHEMA_VERSION: &str = "satelle.config.explain.v2";
@@ -337,6 +338,8 @@ struct SetupCommand {
 struct RepairCommand {
     #[arg(long)]
     host: Option<String>,
+    #[arg(long, value_name = "RUN_ID")]
+    run: Option<String>,
     #[arg(long)]
     dry_run: bool,
     #[arg(
@@ -422,6 +425,20 @@ enum HostCommand {
         #[command(subcommand)]
         command: HostStorageCommand,
     },
+    Store {
+        #[command(subcommand)]
+        command: HostStoreCommand,
+    },
+    /// Controller-side recovery for a completed remote storage mutation whose
+    /// Host-owned ledger completion still needs reconciliation.
+    #[command(hide = true)]
+    StorageCompletionRecovery(HostStorageCompletionRecoveryCommand),
+    #[command(hide = true)]
+    OfflineStorageMaintenance(OfflineStorageMaintenanceCommand),
+    #[command(hide = true)]
+    OfflineStorageRestorePreview(OfflineStorageRestorePreviewCommand),
+    #[command(hide = true)]
+    OfflineStorageBackupCleanupPlan(OfflineStorageBackupCleanupPlanCommand),
 }
 
 #[derive(Args, Debug)]
@@ -524,6 +541,14 @@ struct HostStartCommand {
     /// Internal Controller-resolved idle timeout for a durable SSH launch.
     #[arg(long, hide = true, value_name = "MILLISECONDS")]
     on_demand_idle_timeout_ms: Option<u64>,
+    /// Internal resolved setup-ledger retention for a persistent launchd service.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "MILLISECONDS",
+        requires = "launchd_service"
+    )]
+    setup_ledger_retention_ms: Option<u64>,
     /// Internal owner-only configuration used by the per-user Windows task.
     #[arg(
         long,
@@ -640,6 +665,11 @@ struct HostSessionsCommand {
 #[derive(Subcommand, Debug)]
 enum HostStorageCommand {
     Migrate(HostStorageMigrateCommand),
+    Restore(HostStorageRestoreCommand),
+    Backup {
+        #[command(subcommand)]
+        command: HostStorageBackupCommand,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -656,6 +686,124 @@ struct HostStorageMigrateCommand {
     no_input: bool,
     #[command(flatten)]
     output_args: OutputArgs,
+}
+
+#[derive(Args, Debug)]
+struct HostStorageRestoreCommand {
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long)]
+    backup: PathBuf,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    no_input: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum HostStorageBackupCommand {
+    Cleanup(HostStorageBackupCleanupCommand),
+}
+
+#[derive(Args, Debug)]
+struct HostStorageBackupCleanupCommand {
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    no_input: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum HostStoreCommand {
+    Reset(HostStoreResetCommand),
+}
+
+#[derive(Args, Debug)]
+struct HostStoreResetCommand {
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long)]
+    delete_recordings: bool,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    no_input: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OfflineStorageOperation {
+    Restore,
+    BackupCleanup,
+    StoreReset,
+}
+
+#[derive(Args, Debug)]
+struct HostStorageCompletionRecoveryCommand {
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long, value_enum)]
+    operation: OfflineStorageOperation,
+    #[arg(long)]
+    operation_id: String,
+    #[arg(long)]
+    no_input: bool,
+    #[arg(long)]
+    yes: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Args, Debug)]
+struct OfflineStorageMaintenanceCommand {
+    #[arg(long, value_enum)]
+    operation: OfflineStorageOperation,
+    #[arg(long)]
+    host: String,
+    #[arg(long)]
+    operation_id: String,
+    #[arg(long)]
+    state_root: PathBuf,
+    #[arg(long)]
+    backup: Option<PathBuf>,
+    #[arg(long)]
+    delete_recordings: bool,
+    /// Exact backup identities approved by the caller for cleanup.
+    #[arg(long = "approved-backup")]
+    approved_backup_file_names: Vec<String>,
+    /// Apply the already-confirmed offline mutation.
+    #[arg(long)]
+    yes: bool,
+    /// Reconcile a mutation that already completed without repeating it.
+    #[arg(long)]
+    reconcile_completion: bool,
+}
+
+#[derive(Args, Debug)]
+struct OfflineStorageBackupCleanupPlanCommand {
+    #[arg(long)]
+    state_root: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct OfflineStorageRestorePreviewCommand {
+    #[arg(long)]
+    state_root: PathBuf,
+    #[arg(long)]
+    backup: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1399,9 +1547,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         Command::Repair(command) => HistoryTarget {
             family: "repair",
             selects_host: true,
-            // Repair does not consume ConfigContext; its handler defaults
-            // directly to the local demo Host when --host is absent.
-            explicit_host: Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)),
+            explicit_host: command.host.as_deref(),
             session_id: None,
         },
         Command::Doctor(command) => HistoryTarget {
@@ -1432,7 +1578,37 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 },
         } if command.dry_run => return None,
         Command::Host {
+            command:
+                HostCommand::Storage {
+                    command: HostStorageCommand::Restore(command),
+                },
+        } if command.dry_run => return None,
+        Command::Host {
+            command:
+                HostCommand::Storage {
+                    command:
+                        HostStorageCommand::Backup {
+                            command: HostStorageBackupCommand::Cleanup(command),
+                        },
+                },
+        } if command.dry_run => return None,
+        Command::Host {
+            command:
+                HostCommand::Store {
+                    command: HostStoreCommand::Reset(command),
+                },
+        } if command.dry_run => return None,
+        Command::Host {
             command: HostCommand::ReleaseState,
+        } => return None,
+        Command::Host {
+            command: HostCommand::OfflineStorageMaintenance(_),
+        } => return None,
+        Command::Host {
+            command: HostCommand::OfflineStorageRestorePreview(_),
+        } => return None,
+        Command::Host {
+            command: HostCommand::OfflineStorageBackupCleanupPlan(_),
         } => return None,
         Command::Host { command } => HistoryTarget {
             family: "host",
@@ -1451,7 +1627,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 HostCommand::Trust(command) => Some(command.host.as_str()),
                 HostCommand::Status(command) => command.host.as_deref(),
                 HostCommand::Stop(command) | HostCommand::Restart(command) => {
-                    Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST))
+                    command.host.as_deref()
                 }
                 HostCommand::Update(command) => (command.host.len() == 1 && !command.all_remotes)
                     .then(|| command.host[0].as_str()),
@@ -1459,7 +1635,23 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 HostCommand::Sessions(command) => command.host.as_deref(),
                 HostCommand::Storage {
                     command: HostStorageCommand::Migrate(command),
-                } => Some(command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)),
+                } => command.host.as_deref(),
+                HostCommand::Storage {
+                    command: HostStorageCommand::Restore(command),
+                } => command.host.as_deref(),
+                HostCommand::Storage {
+                    command:
+                        HostStorageCommand::Backup {
+                            command: HostStorageBackupCommand::Cleanup(command),
+                        },
+                } => command.host.as_deref(),
+                HostCommand::Store {
+                    command: HostStoreCommand::Reset(command),
+                } => command.host.as_deref(),
+                HostCommand::StorageCompletionRecovery(command) => command.host.as_deref(),
+                HostCommand::OfflineStorageMaintenance(_) => None,
+                HostCommand::OfflineStorageRestorePreview(_) => None,
+                HostCommand::OfflineStorageBackupCleanupPlan(_) => None,
             },
             session_id: None,
         },
@@ -1824,6 +2016,7 @@ mod history_target_tests {
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
                 on_demand_idle_timeout_ms: None,
+                setup_ledger_retention_ms: None,
                 service_config: None,
                 output_args: OutputArgs::default(),
             }),
@@ -1953,6 +2146,8 @@ mod history_target_tests {
             "start",
             "--foreground",
             "--launchd-service",
+            "--setup-ledger-retention-ms",
+            "3600000",
         ])
         .expect("parse internal launchd service start command");
         assert!(
@@ -1967,6 +2162,7 @@ mod history_target_tests {
             panic!("expected Host start command");
         };
         assert!(command.launchd_service);
+        assert_eq!(command.setup_ledger_retention_ms, Some(3_600_000));
         validate_host_start_mode(&command).expect("launchd service is a valid closed start mode");
     }
 
@@ -2074,6 +2270,132 @@ mod history_target_tests {
             serde_json::json!({"removed_entries": 3, "retained_entries": 2})
         );
     }
+
+    #[test]
+    fn storage_maintenance_commands_parse_exact_public_paths() {
+        let restore = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "storage",
+            "restore",
+            "--host",
+            "remote",
+            "--backup",
+            "/state/satelle.sqlite3.migration-v13-example.backup",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("parse storage restore");
+        let Command::Host {
+            command:
+                HostCommand::Storage {
+                    command: HostStorageCommand::Restore(restore),
+                },
+        } = restore.command
+        else {
+            panic!("expected storage restore command");
+        };
+        assert_eq!(restore.host.as_deref(), Some("remote"));
+        assert!(restore.dry_run);
+
+        let restore_preview = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "offline-storage-restore-preview",
+            "--state-root",
+            "/state",
+            "--backup",
+            "/state/satelle.sqlite3.migration-v13-example.backup",
+        ])
+        .expect("parse internal storage restore preview");
+        assert!(matches!(
+            restore_preview.command,
+            Command::Host {
+                command: HostCommand::OfflineStorageRestorePreview(_)
+            }
+        ));
+
+        let completion_recovery = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "storage-completion-recovery",
+            "--host",
+            "remote",
+            "--operation",
+            "restore",
+            "--operation-id",
+            "storage-maintenance-exact",
+            "--no-input",
+            "--yes",
+        ])
+        .expect("parse controller-routed storage completion recovery");
+        let Command::Host {
+            command: HostCommand::StorageCompletionRecovery(completion_recovery),
+        } = completion_recovery.command
+        else {
+            panic!("expected storage completion recovery command");
+        };
+        assert_eq!(completion_recovery.host.as_deref(), Some("remote"));
+        assert_eq!(
+            completion_recovery.operation_id,
+            "storage-maintenance-exact"
+        );
+        assert!(completion_recovery.no_input);
+        assert!(completion_recovery.yes);
+
+        let cleanup = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "storage",
+            "backup",
+            "cleanup",
+            "--host",
+            "remote",
+            "--no-input",
+            "--yes",
+        ])
+        .expect("parse storage backup cleanup");
+        assert!(matches!(
+            cleanup.command,
+            Command::Host {
+                command: HostCommand::Storage {
+                    command: HostStorageCommand::Backup {
+                        command: HostStorageBackupCommand::Cleanup(_)
+                    }
+                }
+            }
+        ));
+
+        let reset = Cli::try_parse_from([
+            "satelle",
+            "host",
+            "store",
+            "reset",
+            "--host",
+            "remote",
+            "--delete-recordings",
+            "--no-input",
+            "--yes",
+        ])
+        .expect("parse store reset");
+        assert!(matches!(
+            reset.command,
+            Command::Host {
+                command: HostCommand::Store {
+                    command: HostStoreCommand::Reset(_)
+                }
+            }
+        ));
+    }
+}
+
+#[test]
+fn empty_remote_cleanup_plan_retains_interrupted_service_recovery() {
+    assert!(storage_backup_cleanup_actions(&[], false).is_empty());
+    assert_eq!(
+        storage_backup_cleanup_actions(&[], true),
+        ["restart and verify the unavailable Host API service"]
+    );
 }
 
 fn canonical_history_session_id(value: &str) -> Option<String> {
@@ -4218,87 +4540,90 @@ fn run_repair(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let host = config.resolve_host(command.host.as_deref())?;
-    let report = transport::plan_repair_upgrades(&host).map_err(failure)?;
-    let requires_consent = repair_plan_requires_consent(&report);
-    if command.no_input && !command.dry_run && !command.yes && requires_consent {
-        return Err(failure(SatelleError::input_required(
-            "repair needs --yes when --no-input is used for mutations",
-        )));
-    }
-
-    let apply_unavailable = !command.dry_run && requires_consent;
-    if apply_unavailable {
-        // Human output can retain the useful read-only plan before the typed
-        // failure. JSON commands must emit exactly one terminal object.
-        if !format.is_json() {
+    let mut mutation_consent = command.yes;
+    let mut report = transport::plan_repair_upgrades(
+        &host,
+        command.run.as_deref(),
+        mutation_consent && !command.dry_run,
+    )
+    .map_err(failure)?;
+    if command.dry_run {
+        report = report.into_dry_run();
+        if format.is_json() {
+            print_json(&report).map_err(failure)?;
+        } else {
             print!("{}", host_update::render_repair_upgrade_plan(&report));
         }
-        let mut error = SatelleError::not_implemented(concat!(
-            "repair upgrade apply belongs to the repair execution train. The plan was read-only; ",
-            "no Host state or Satelle sessions were changed."
-        ));
-        error.recovery_command = Some(format!(
-            "satelle repair --host {} --dry-run --json",
-            host.alias
-        ));
-        return Err(failure(error));
+        return Ok(());
     }
 
-    if format.is_json() {
-        print_json(&report).map_err(failure)?;
-    } else {
+    if !report.requires_mutation() {
+        if format.is_json() {
+            print_json(&report).map_err(failure)?;
+        } else {
+            print!("{}", host_update::render_repair_upgrade_plan(&report));
+        }
+        return Ok(());
+    }
+
+    if !format.is_json() {
         print!("{}", host_update::render_repair_upgrade_plan(&report));
     }
-    Ok(())
-}
-
-fn repair_plan_requires_consent(report: &satelle_core::host_update::RepairUpgradeReport) -> bool {
-    report.actions.iter().any(|action| {
-        action.disposition == satelle_core::host_update::RepairUpgradeDisposition::Required
-    })
-}
-
-#[cfg(test)]
-mod repair_consent_tests {
-    use super::*;
-    use satelle_core::host_update::{
-        HostUpdateTarget, HostUpdateVersionSource, RepairUpgradeAction, RepairUpgradeDisposition,
-        RepairUpgradeReport,
-    };
-
-    fn action(disposition: RepairUpgradeDisposition) -> RepairUpgradeAction {
-        RepairUpgradeAction {
-            target: HostUpdateTarget::HostDaemon,
-            current_version: Some("0.1.0".to_string()),
-            target_version: "0.1.0".to_string(),
-            compatibility_reason: None,
-            version_source: HostUpdateVersionSource::InvokingCliRelease,
-            disposition,
+    let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
+    if noninteractive && !command.yes {
+        let recovery_command = match command.run.as_deref() {
+            Some(run_id) => format!(
+                "satelle repair --host {} --run {} --no-input --yes --json",
+                shell_argument(&host.alias),
+                shell_argument(run_id)
+            ),
+            None => format!(
+                "satelle repair --host {} --no-input --yes --json",
+                shell_argument(&host.alias)
+            ),
+        };
+        return Err(failure(SatelleError::setup_consent_required(
+            &report.planned_actions,
+            recovery_command,
+        )));
+    }
+    if !command.yes {
+        let confirmed = cliclack::confirm("Apply these repair mutations?")
+            .initial_value(false)
+            .interact()
+            .map_err(|source| {
+                failure(setup_interaction_error(
+                    "could not read repair confirmation",
+                    source,
+                ))
+            })?;
+        if !confirmed {
+            report = report.cancelled();
+            if format.is_json() {
+                print_json(&report).map_err(failure)?;
+            } else {
+                println!("No changes applied.");
+            }
+            return Ok(());
         }
+        mutation_consent = true;
     }
 
-    #[test]
-    fn repair_consent_depends_on_the_planned_mutations() {
-        let read_only = RepairUpgradeReport::new(
-            "local-demo",
-            vec![
-                action(RepairUpgradeDisposition::NotNeeded),
-                action(RepairUpgradeDisposition::RecommendHostUpdate),
-            ],
-        );
-        assert!(!repair_plan_requires_consent(&read_only));
-
-        let manual_only = RepairUpgradeReport::new(
-            "local-demo",
-            vec![action(RepairUpgradeDisposition::ManualActionRequired)],
-        );
-        assert!(!repair_plan_requires_consent(&manual_only));
-
-        let mutating = RepairUpgradeReport::new(
-            "local-demo",
-            vec![action(RepairUpgradeDisposition::Required)],
-        );
-        assert!(repair_plan_requires_consent(&mutating));
+    // Consent applies to one exact live plan. Re-read every Host-owned input
+    // immediately before the first durable maintenance transition.
+    let revalidated =
+        transport::plan_repair_upgrades(&host, command.run.as_deref(), mutation_consent)
+            .map_err(failure)?;
+    if revalidated != report {
+        return Err(failure(SatelleError::state_conflict()));
+    }
+    report = transport::apply_repair_upgrades(&host, revalidated, command.run.as_deref())
+        .map_err(failure)?;
+    if format.is_json() {
+        print_json(&report).map_err(failure)
+    } else {
+        print!("{}", host_update::render_repair_upgrade_result(&report));
+        Ok(())
     }
 }
 
@@ -5864,7 +6189,18 @@ fn run_host(
         HostCommand::Update(command) => run_host_update(command, config, format),
         HostCommand::Cleanup(command) => run_host_cleanup(command, config, format),
         HostCommand::Sessions(command) => show_host_sessions(command, config, format),
-        HostCommand::Storage { command } => run_host_storage(command),
+        HostCommand::Storage { command } => run_host_storage(command, config, format),
+        HostCommand::Store { command } => run_host_store(command, config, format),
+        HostCommand::StorageCompletionRecovery(command) => {
+            run_host_storage_completion_recovery(command, config, format)
+        }
+        HostCommand::OfflineStorageMaintenance(command) => run_offline_storage_maintenance(command),
+        HostCommand::OfflineStorageRestorePreview(command) => {
+            run_offline_storage_restore_preview(command)
+        }
+        HostCommand::OfflineStorageBackupCleanupPlan(command) => {
+            run_offline_storage_backup_cleanup_plan(command)
+        }
     }
 }
 
@@ -6267,7 +6603,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.bootstrap_scope.is_some()
             || command.bootstrap_native_readiness_timeout_ms.is_some()
             || command.bootstrap_provider_smoke_timeout_ms.is_some()
-            || command.on_demand_idle_timeout_ms.is_some())
+            || command.on_demand_idle_timeout_ms.is_some()
+            || command.setup_ledger_retention_ms.is_none())
     {
         return Err(SatelleError::invalid_usage(
             "--launchd-service is an internal launchd input and cannot be combined with other internal or TLS Host start options",
@@ -6282,7 +6619,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.bootstrap_scope.is_some()
             || command.bootstrap_native_readiness_timeout_ms.is_some()
             || command.bootstrap_provider_smoke_timeout_ms.is_some()
-            || command.on_demand_idle_timeout_ms.is_some())
+            || command.on_demand_idle_timeout_ms.is_some()
+            || command.setup_ledger_retention_ms.is_some())
     {
         return Err(SatelleError::invalid_usage(
             "--service-config is an internal Windows service input and cannot be combined with ordinary Host start options",
@@ -6368,7 +6706,7 @@ fn start_host_daemon_with(
     ) -> HostService,
 ) -> Result<(), CliFailure> {
     validate_host_start_mode(&command).map_err(failure)?;
-    let service_path_overrides =
+    let (service_path_overrides, service_setup_ledger_retention_ms) =
         if let Some(_service_config_path) = command.service_config.as_deref() {
             #[cfg(not(windows))]
             return Err(failure(SatelleError::invalid_usage(
@@ -6382,12 +6720,18 @@ fn start_host_daemon_with(
                 apply_windows_service_environment(&service_config);
                 command.bind = service_config.bind().to_string();
                 command.foreground = true;
-                Some(path_overrides)
+                (
+                    Some(path_overrides),
+                    Some(service_config.setup_ledger_retention_ms()),
+                )
             }
         } else if command.launchd_service {
-            Some(daemon_path_overrides_from_process_environment())
+            (
+                Some(daemon_path_overrides_from_process_environment()),
+                command.setup_ledger_retention_ms,
+            )
         } else {
-            None
+            (None, None)
         };
     let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
         (true, Some(scope)) => Some(scope.api_scopes()),
@@ -6507,7 +6851,9 @@ fn start_host_daemon_with(
             service_path_overrides
                 .as_ref()
                 .expect("persistent service path overrides were checked"),
-        ),
+            service_setup_ledger_retention_ms.expect("persistent service retention was checked"),
+        )
+        .map_err(failure)?,
         (_, Some(token)) => {
             let mut host_config = satelle_core::SatelleConfig::defaults()
                 .hosts
@@ -6623,7 +6969,7 @@ fn start_host_daemon_with(
 }
 
 #[cfg(any(windows, test))]
-fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV1, CliFailure> {
+fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV2, CliFailure> {
     if !path.is_absolute() {
         return Err(failure(SatelleError::invalid_usage(
             "Windows Host service config path must be absolute",
@@ -6675,7 +7021,7 @@ mod windows_service_config_tests {
             log_dir: Some(PathBuf::from(r"C:\Users\owner\AppData\Local\Satelle\logs")),
             sources: BTreeMap::new(),
         };
-        let expected = WindowsServiceConfigV1::new("127.0.0.1:3001", &overrides)
+        let expected = WindowsServiceConfigV2::new("127.0.0.1:3001", &overrides, 3_600_000)
             .expect("build service config");
         write_owner_only_config(
             &path,
@@ -6693,6 +7039,7 @@ mod windows_service_config_tests {
             ["host", "start", "--foreground", "--bind", "127.0.0.1:3001"]
         );
         assert_eq!(observed.environment().len(), 5);
+        assert_eq!(observed.setup_ledger_retention_ms(), 3_600_000);
     }
 
     #[test]
@@ -6726,7 +7073,7 @@ mod windows_service_config_tests {
 }
 
 #[cfg(windows)]
-fn apply_windows_service_environment(config: &WindowsServiceConfigV1) {
+fn apply_windows_service_environment(config: &WindowsServiceConfigV2) {
     const PATH_OVERRIDES: [&str; 5] = [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -7261,6 +7608,7 @@ mod daemon_tls_watcher_tests {
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: None,
+            setup_ledger_retention_ms: None,
             service_config: None,
             output_args: OutputArgs::default(),
         }
@@ -7784,6 +8132,7 @@ mod bootstrap_startup_tests {
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: Some(75_000),
+            setup_ledger_retention_ms: None,
             service_config: None,
             output_args: OutputArgs::default(),
         };
@@ -8308,7 +8657,252 @@ mod host_update_consent_tests {
     }
 }
 
-fn run_host_storage(command: HostStorageCommand) -> Result<(), CliFailure> {
+fn confirm_storage_maintenance(
+    planned_actions: &[String],
+    recovery_command: String,
+    yes: bool,
+    no_input: bool,
+    format: OutputFormat,
+) -> Result<bool, CliFailure> {
+    if yes {
+        return Ok(true);
+    }
+    if no_input || format.is_json() || !io::stdin().is_terminal() {
+        return Err(failure(SatelleError::setup_consent_required(
+            planned_actions,
+            recovery_command,
+        )));
+    }
+    cliclack::confirm("Apply these Host storage mutations?")
+        .initial_value(false)
+        .interact()
+        .map_err(|source| {
+            failure(setup_interaction_error(
+                "could not read Host storage confirmation",
+                source,
+            ))
+        })
+}
+
+fn local_storage_state_root(host: &SelectedHost) -> Result<PathBuf, CliFailure> {
+    satelle_host::HostService::resolved_daemon_paths_for_host(&host.config)
+        .map(|paths| PathBuf::from(paths.state_root))
+        .map_err(failure)
+}
+
+#[cfg(test)]
+#[test]
+fn local_storage_state_root_uses_the_selected_hosts_resolved_daemon_home() {
+    let state =
+        satelle_host::test_support::TestStateDir::new().expect("create local storage path state");
+    let daemon_home = state.path().join("configured-daemon-home");
+    let mut config = satelle_core::SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .expect("the built-in local Host exists");
+    config.daemon_home = Some(daemon_home.clone());
+    let mut host = SelectedHost::from(("configured-local".to_string(), config));
+
+    assert_eq!(
+        daemon_home.join("state"),
+        local_storage_state_root(&host)
+            .ok()
+            .expect("resolve state under configured daemon home")
+    );
+
+    let explicit_state = state.path().join("explicit-state");
+    host.config.daemon_state_dir = Some(explicit_state.clone());
+    assert_eq!(
+        explicit_state,
+        local_storage_state_root(&host)
+            .ok()
+            .expect("prefer the explicit daemon state directory")
+    );
+}
+
+fn storage_maintenance_mutation_failure(
+    mut source: SatelleError,
+    recovery_command: &str,
+) -> SatelleError {
+    // The operator already consented to one exact storage mutation. Keep the
+    // source classification and evidence, but make its retry guidance point
+    // back to that exact operation instead of a generic storage diagnostic.
+    source.recovery_command = Some(recovery_command.to_string());
+    source
+}
+
+fn offline_storage_completion_recovery_command(
+    operation: OfflineStorageOperation,
+    host: &str,
+    operation_id: &str,
+    state_root: &Path,
+) -> String {
+    let operation = match operation {
+        OfflineStorageOperation::Restore => "restore",
+        OfflineStorageOperation::BackupCleanup => "backup-cleanup",
+        OfflineStorageOperation::StoreReset => "store-reset",
+    };
+    let mut command = format!(
+        "satelle host offline-storage-maintenance --operation {operation} --host {} --operation-id {} --state-root {}",
+        shell_argument(host),
+        shell_argument(operation_id),
+        shell_argument(&state_root.display().to_string()),
+    );
+    command.push_str(" --yes --reconcile-completion");
+    command
+}
+
+fn apply_local_offline_storage_maintenance<T>(
+    state_root: &Path,
+    action_id: &str,
+    action_label: &str,
+    recovery_command: &str,
+    completion_recovery_command: impl FnOnce(&str) -> String,
+    mutate: impl FnOnce() -> Result<T, SatelleError>,
+) -> Result<T, CliFailure> {
+    let operation_id = format!("storage-maintenance-{}", Uuid::now_v7());
+    satelle_host::HostService::start_offline_storage_maintenance(
+        state_root,
+        &operation_id,
+        action_id,
+        action_label,
+    )
+    .map_err(failure)?;
+    let result = match mutate() {
+        Ok(result) => result,
+        Err(source) => {
+            let _ = satelle_host::HostService::record_failed_offline_storage_maintenance(
+                state_root,
+                &operation_id,
+                action_id,
+            );
+            return Err(failure(storage_maintenance_mutation_failure(
+                source,
+                recovery_command,
+            )));
+        }
+    };
+    if let Err(source) = satelle_host::HostService::record_completed_offline_storage_maintenance(
+        state_root,
+        &operation_id,
+        action_id,
+        action_label,
+    ) {
+        let completion_recovery_command = completion_recovery_command(&operation_id);
+        return Err(failure(
+            SatelleError::storage_maintenance_partially_applied(
+                &[action_id.to_string()],
+                "record-storage-maintenance-ledger-completion",
+                &[],
+                completion_recovery_command,
+                source.to_string(),
+            ),
+        ));
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+#[test]
+fn local_storage_mutation_failure_keeps_source_evidence_and_exact_retry_command() {
+    let source = SatelleError::host_unreachable("local-demo");
+    let source_code = source.code;
+    let source_details = source.details.clone();
+    let retry = "satelle host storage backup cleanup --host local-demo --no-input --yes";
+
+    let error = storage_maintenance_mutation_failure(source, retry);
+
+    assert_eq!(error.code, source_code);
+    assert_eq!(error.details, source_details);
+    assert_eq!(error.recovery_command.as_deref(), Some(retry));
+}
+
+#[cfg(test)]
+#[test]
+fn storage_completion_recovery_command_preserves_operation_identity() {
+    assert_eq!(
+        offline_storage_completion_recovery_command(
+            OfflineStorageOperation::Restore,
+            "remote host",
+            "storage-maintenance-exact",
+            Path::new("/state root"),
+        ),
+        "satelle host offline-storage-maintenance --operation restore --host 'remote host' --operation-id storage-maintenance-exact --state-root '/state root' --yes --reconcile-completion"
+    );
+    assert_eq!(
+        offline_storage_completion_recovery_command(
+            OfflineStorageOperation::StoreReset,
+            "remote host",
+            "storage-maintenance-exact",
+            Path::new("/state root"),
+        ),
+        "satelle host offline-storage-maintenance --operation store-reset --host 'remote host' --operation-id storage-maintenance-exact --state-root '/state root' --yes --reconcile-completion"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn storage_completion_recovery_reconciles_the_retained_operation_without_restarting_it() {
+    let state = satelle_host::test_support::TestStateDir::new()
+        .expect("create offline maintenance recovery state");
+    let operation_id = "storage-maintenance-completion-recovery";
+    let action_id = "cleanup-storage-backups";
+    let action_label = "Delete older validated Host storage backups";
+    satelle_host::HostService::start_offline_storage_maintenance(
+        state.path(),
+        operation_id,
+        action_id,
+        action_label,
+    )
+    .expect("record the interrupted offline maintenance operation");
+
+    let completion_command = || OfflineStorageMaintenanceCommand {
+        operation: OfflineStorageOperation::BackupCleanup,
+        host: "local-demo".to_string(),
+        operation_id: operation_id.to_string(),
+        state_root: state.path().to_path_buf(),
+        backup: None,
+        delete_recordings: false,
+        approved_backup_file_names: Vec::new(),
+        yes: true,
+        reconcile_completion: true,
+    };
+    assert!(
+        run_offline_storage_maintenance(completion_command()).is_ok(),
+        "the retained exact operation must reconcile instead of starting again"
+    );
+    assert!(
+        run_offline_storage_maintenance(completion_command()).is_ok(),
+        "repeating exact completion recovery must be idempotent"
+    );
+}
+
+fn storage_backup_cleanup_actions(
+    eligible_backup_file_names: &[String],
+    service_recovery_required: bool,
+) -> Vec<String> {
+    let mut actions = eligible_backup_file_names
+        .iter()
+        .map(|name| format!("delete validated migration backup {name}"))
+        .collect::<Vec<_>>();
+    if service_recovery_required {
+        actions.push("restart and verify the unavailable Host API service".to_string());
+    }
+    actions
+}
+
+fn preview_local_storage_restore_before_consent(
+    state_root: &Path,
+    backup: &Path,
+) -> Result<(), CliFailure> {
+    satelle_host::HostService::preview_storage_restore(state_root, backup).map_err(failure)
+}
+
+fn run_host_storage(
+    command: HostStorageCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     match command {
         HostStorageCommand::Migrate(command) => {
             Err(failure(SatelleError::not_implemented(format!(
@@ -8316,6 +8910,687 @@ fn run_host_storage(command: HostStorageCommand) -> Result<(), CliFailure> {
                 command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)
             ))))
         }
+        HostStorageCommand::Restore(command) => {
+            let host = config.resolve_host(command.host.as_deref())?;
+            let local_state_root = (host.config.transport == TransportKind::Local)
+                .then(|| local_storage_state_root(&host))
+                .transpose()?;
+            if let Some(state_root) = &local_state_root {
+                preview_local_storage_restore_before_consent(state_root, &command.backup)?;
+            } else if command.dry_run {
+                transport::preview_ssh_storage_restore(&host, &command.backup).map_err(failure)?;
+            } else {
+                transport::preflight_ssh_storage_maintenance(&host).map_err(failure)?;
+            }
+            let planned_actions = vec![
+                "verify backup integrity and schema compatibility".to_string(),
+                "preserve the failed active store".to_string(),
+                "atomically activate the selected backup".to_string(),
+            ];
+            if command.dry_run {
+                return print_storage_plan(&host.alias, "restore", &planned_actions, format);
+            }
+            let recovery_command = format!(
+                "satelle host storage restore --host {} --backup {} --no-input --yes",
+                shell_argument(&host.alias),
+                shell_argument(&command.backup.display().to_string())
+            );
+            if !confirm_storage_maintenance(
+                &planned_actions,
+                recovery_command.clone(),
+                command.yes,
+                command.no_input,
+                format,
+            )? {
+                return print_storage_cancelled(&host.alias, "restore", format);
+            }
+            let activation = if let Some(state_root) = &local_state_root {
+                serde_json::to_value(apply_local_offline_storage_maintenance(
+                    state_root,
+                    "restore-storage-backup",
+                    "Restore the validated Host storage backup",
+                    &recovery_command,
+                    |operation_id| {
+                        offline_storage_completion_recovery_command(
+                            OfflineStorageOperation::Restore,
+                            &host.alias,
+                            operation_id,
+                            state_root,
+                        )
+                    },
+                    || {
+                        satelle_host::HostService::restore_storage_backup_offline(
+                            state_root,
+                            &command.backup,
+                        )
+                    },
+                )?)
+                .map_err(|error| {
+                    failure(SatelleError::invalid_usage(format!(
+                        "could not serialize storage restore result: {error}"
+                    )))
+                })?
+            } else {
+                let mut activation = transport::apply_ssh_storage_maintenance(
+                    &host,
+                    transport::SshStorageMaintenance::Restore,
+                    Some(&command.backup),
+                    false,
+                    &[],
+                    None,
+                )
+                .map_err(failure)?;
+                activation
+                    .as_object_mut()
+                    .ok_or_else(|| failure(SatelleError::state_conflict()))?
+                    .insert("api_service_restarted".to_string(), json!(true));
+                activation
+            };
+            print_storage_result(
+                &host.alias,
+                "restore",
+                activation,
+                true,
+                &["restore-storage-backup"],
+                format,
+            )
+        }
+        HostStorageCommand::Backup {
+            command: HostStorageBackupCommand::Cleanup(command),
+        } => {
+            let host = config.resolve_host(command.host.as_deref())?;
+            let local_state_root = (host.config.transport == TransportKind::Local)
+                .then(|| local_storage_state_root(&host))
+                .transpose()?;
+            let (cleanup_plan, service_recovery_required) =
+                if let Some(state_root) = &local_state_root {
+                    (
+                        satelle_host::HostService::plan_storage_backup_cleanup(state_root)
+                            .map_err(failure)?,
+                        false,
+                    )
+                } else {
+                    transport::plan_ssh_storage_backup_cleanup(&host).map_err(failure)?
+                };
+            let planned_actions = storage_backup_cleanup_actions(
+                &cleanup_plan.eligible_backup_file_names,
+                service_recovery_required,
+            );
+            if command.dry_run {
+                return print_storage_plan(&host.alias, "backup_cleanup", &planned_actions, format);
+            }
+            if planned_actions.is_empty() {
+                return print_storage_result(
+                    &host.alias,
+                    "backup_cleanup",
+                    json!({"removed_backup_file_names": []}),
+                    false,
+                    &[],
+                    format,
+                );
+            }
+            let recovery_command = format!(
+                "satelle host storage backup cleanup --host {} --no-input --yes",
+                shell_argument(&host.alias)
+            );
+            if !confirm_storage_maintenance(
+                &planned_actions,
+                recovery_command.clone(),
+                command.yes,
+                command.no_input,
+                format,
+            )? {
+                return print_storage_cancelled(&host.alias, "backup_cleanup", format);
+            }
+            let cleanup = if let Some(state_root) = &local_state_root {
+                let removed_backup_file_names = apply_local_offline_storage_maintenance(
+                    state_root,
+                    "cleanup-storage-backups",
+                    "Delete older validated Host storage backups",
+                    &recovery_command,
+                    |operation_id| {
+                        offline_storage_completion_recovery_command(
+                            OfflineStorageOperation::BackupCleanup,
+                            &host.alias,
+                            operation_id,
+                            state_root,
+                        )
+                    },
+                    || {
+                        satelle_host::HostService::cleanup_planned_storage_backups_offline(
+                            state_root,
+                            &cleanup_plan.eligible_backup_file_names,
+                            &recovery_command,
+                        )
+                    },
+                )?;
+                json!({"removed_backup_file_names": removed_backup_file_names})
+            } else {
+                transport::apply_ssh_storage_maintenance(
+                    &host,
+                    transport::SshStorageMaintenance::BackupCleanup,
+                    None,
+                    false,
+                    &cleanup_plan.eligible_backup_file_names,
+                    None,
+                )
+                .map_err(failure)?
+            };
+            let changed = cleanup
+                .get("removed_backup_file_names")
+                .and_then(Value::as_array)
+                .is_some_and(|removed| !removed.is_empty())
+                || service_recovery_required;
+            print_storage_result(
+                &host.alias,
+                "backup_cleanup",
+                cleanup,
+                changed,
+                &["cleanup-storage-backups"],
+                format,
+            )
+        }
+    }
+}
+
+fn run_host_store(
+    command: HostStoreCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    match command {
+        HostStoreCommand::Reset(command) => {
+            let host = config.resolve_host(command.host.as_deref())?;
+            let local_state_root = (host.config.transport == TransportKind::Local)
+                .then(|| local_storage_state_root(&host))
+                .transpose()?;
+            if local_state_root.is_none() {
+                transport::preflight_ssh_storage_maintenance(&host).map_err(failure)?;
+            }
+            let mut planned_actions = vec![
+                "delete Host metadata from the SQLite store".to_string(),
+                "preserve Host recordings".to_string(),
+            ];
+            if command.delete_recordings {
+                planned_actions[1] = "delete Host recordings explicitly".to_string();
+            }
+            if command.dry_run {
+                return print_storage_plan(&host.alias, "store_reset", &planned_actions, format);
+            }
+            let recovery_command = format!(
+                "satelle host store reset --host {}{} --no-input --yes",
+                shell_argument(&host.alias),
+                if command.delete_recordings {
+                    " --delete-recordings"
+                } else {
+                    ""
+                }
+            );
+            if !confirm_storage_maintenance(
+                &planned_actions,
+                recovery_command.clone(),
+                command.yes,
+                command.no_input,
+                format,
+            )? {
+                return print_storage_cancelled(&host.alias, "store_reset", format);
+            }
+            let reset = if let Some(state_root) = &local_state_root {
+                serde_json::to_value(apply_local_offline_storage_maintenance(
+                    state_root,
+                    "reset-host-store",
+                    "Reset Host metadata",
+                    &recovery_command,
+                    |operation_id| {
+                        offline_storage_completion_recovery_command(
+                            OfflineStorageOperation::StoreReset,
+                            &host.alias,
+                            operation_id,
+                            state_root,
+                        )
+                    },
+                    || {
+                        satelle_host::HostService::reset_store_metadata_offline(
+                            state_root,
+                            command.delete_recordings,
+                            &recovery_command,
+                        )
+                    },
+                )?)
+                .map_err(|error| {
+                    failure(SatelleError::invalid_usage(format!(
+                        "could not serialize store reset result: {error}"
+                    )))
+                })?
+            } else {
+                let mut reset = transport::apply_ssh_storage_maintenance(
+                    &host,
+                    transport::SshStorageMaintenance::StoreReset,
+                    None,
+                    command.delete_recordings,
+                    &[],
+                    None,
+                )
+                .map_err(failure)?;
+                reset
+                    .as_object_mut()
+                    .ok_or_else(|| failure(SatelleError::state_conflict()))?
+                    .insert("api_service_restarted".to_string(), json!(true));
+                reset
+            };
+            let changed = reset
+                .get("removed_metadata_file_names")
+                .and_then(Value::as_array)
+                .is_some_and(|removed| !removed.is_empty())
+                || reset
+                    .get("recordings_deleted")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            print_storage_result(
+                &host.alias,
+                "store_reset",
+                reset,
+                changed,
+                &["reset-host-store"],
+                format,
+            )
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn local_restore_preconsent_validation_is_read_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let state = satelle_host::test_support::TestStateDir::new()
+        .expect("create local restore preconsent state");
+    let backup = state
+        .path()
+        .join("satelle.sqlite3.migration-v12-0198a146-5ec2-7dd5-b51c-7d5e241e5890.backup");
+    std::fs::write(&backup, b"invalid sqlite backup").expect("write invalid backup");
+    let original_permissions = std::fs::metadata(state.path())
+        .expect("read original state permissions")
+        .permissions();
+    std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o500))
+        .expect("make state directory read-only");
+
+    let validation = preview_local_storage_restore_before_consent(state.path(), &backup);
+    let mode_after_validation = std::fs::metadata(state.path())
+        .expect("read state permissions after validation")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    std::fs::set_permissions(state.path(), original_permissions)
+        .expect("restore state directory permissions");
+    assert!(
+        validation.is_err(),
+        "the invalid backup must still fail preview validation"
+    );
+    assert_eq!(
+        0o500, mode_after_validation,
+        "preconsent validation must not prepare or stage in the state directory"
+    );
+}
+
+fn run_host_storage_completion_recovery(
+    command: HostStorageCompletionRecoveryCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    if !command.no_input || !command.yes {
+        return Err(failure(SatelleError::invalid_usage(
+            "storage completion recovery requires --no-input --yes",
+        )));
+    }
+    let host = config.resolve_host(command.host.as_deref())?;
+    let (maintenance, action_id, action_label) = match command.operation {
+        OfflineStorageOperation::Restore => (
+            transport::SshStorageMaintenance::Restore,
+            "restore-storage-backup",
+            "Restore the validated Host storage backup",
+        ),
+        OfflineStorageOperation::BackupCleanup => (
+            transport::SshStorageMaintenance::BackupCleanup,
+            "cleanup-storage-backups",
+            "Delete older validated Host storage backups",
+        ),
+        OfflineStorageOperation::StoreReset => (
+            transport::SshStorageMaintenance::StoreReset,
+            "reset-host-store",
+            "Reset Host metadata",
+        ),
+    };
+    let result = if host.config.transport == TransportKind::Local {
+        let state_root = local_storage_state_root(&host)?;
+        satelle_host::HostService::record_completed_offline_storage_maintenance(
+            &state_root,
+            &command.operation_id,
+            action_id,
+            action_label,
+        )
+        .map_err(failure)?;
+        json!({
+            "operation_id": command.operation_id,
+            "status": "completed",
+            "reconciled": true,
+        })
+    } else {
+        transport::apply_ssh_storage_maintenance(
+            &host,
+            maintenance,
+            None,
+            false,
+            &[],
+            Some(&command.operation_id),
+        )
+        .map_err(failure)?
+    };
+    if format.is_json() {
+        print_json(&result).map_err(failure)
+    } else {
+        println!(
+            "Reconciled storage maintenance operation {} on Host '{}'.",
+            command.operation_id, host.alias
+        );
+        Ok(())
+    }
+}
+
+fn run_offline_storage_maintenance(
+    command: OfflineStorageMaintenanceCommand,
+) -> Result<(), CliFailure> {
+    if !command.yes {
+        return Err(failure(SatelleError::invalid_usage(
+            "offline storage maintenance requires explicit --yes authorization",
+        )));
+    }
+    let (action_id, action_label) = match command.operation {
+        OfflineStorageOperation::Restore => (
+            "restore-storage-backup",
+            "Restore the validated Host storage backup",
+        ),
+        OfflineStorageOperation::BackupCleanup => (
+            "cleanup-storage-backups",
+            "Delete older validated Host storage backups",
+        ),
+        OfflineStorageOperation::StoreReset => ("reset-host-store", "Reset Host metadata"),
+    };
+    if command.reconcile_completion {
+        if command.backup.is_some()
+            || command.delete_recordings
+            || !command.approved_backup_file_names.is_empty()
+        {
+            return Err(failure(SatelleError::invalid_usage(
+                "offline storage completion recovery accepts only the exact operation identity",
+            )));
+        }
+        satelle_host::HostService::record_completed_offline_storage_maintenance(
+            &command.state_root,
+            &command.operation_id,
+            action_id,
+            action_label,
+        )
+        .map_err(failure)?;
+        return print_json(&json!({
+            "operation_id": command.operation_id,
+            "status": "completed",
+            "reconciled": true,
+        }))
+        .map_err(failure);
+    }
+    let backup = match command.operation {
+        OfflineStorageOperation::Restore => Some(command.backup.as_deref().ok_or_else(|| {
+            failure(SatelleError::invalid_usage(
+                "offline storage restore requires --backup",
+            ))
+        })?),
+        OfflineStorageOperation::BackupCleanup | OfflineStorageOperation::StoreReset => {
+            if command.backup.is_some() {
+                return Err(failure(SatelleError::invalid_usage(
+                    "only offline storage restore accepts --backup",
+                )));
+            }
+            None
+        }
+    };
+    if !matches!(command.operation, OfflineStorageOperation::BackupCleanup)
+        && !command.approved_backup_file_names.is_empty()
+    {
+        return Err(failure(SatelleError::invalid_usage(
+            "only offline backup cleanup accepts --approved-backup",
+        )));
+    }
+    let recovery_command = match command.operation {
+        OfflineStorageOperation::Restore => format!(
+            "satelle host storage restore --host {} --backup {} --no-input --yes",
+            shell_argument(&command.host),
+            shell_argument(
+                &backup
+                    .expect("validated restore backup")
+                    .display()
+                    .to_string()
+            )
+        ),
+        OfflineStorageOperation::BackupCleanup => format!(
+            "satelle host storage backup cleanup --host {} --no-input --yes",
+            shell_argument(&command.host)
+        ),
+        OfflineStorageOperation::StoreReset => format!(
+            "satelle host store reset --host {}{} --no-input --yes",
+            shell_argument(&command.host),
+            if command.delete_recordings {
+                " --delete-recordings"
+            } else {
+                ""
+            }
+        ),
+    };
+    satelle_host::HostService::start_offline_storage_maintenance(
+        &command.state_root,
+        &command.operation_id,
+        action_id,
+        action_label,
+    )
+    .map_err(failure)?;
+    let mutation = match command.operation {
+        OfflineStorageOperation::Restore => {
+            satelle_host::HostService::restore_storage_backup_offline(
+                &command.state_root,
+                backup.expect("validated restore backup"),
+            )
+            .and_then(|result| {
+                serde_json::to_value(result).map_err(|error| {
+                    SatelleError::invalid_usage(format!(
+                        "could not serialize storage restore result: {error}"
+                    ))
+                })
+            })
+        }
+        OfflineStorageOperation::BackupCleanup => {
+            satelle_host::HostService::cleanup_planned_storage_backups_offline(
+                &command.state_root,
+                &command.approved_backup_file_names,
+                &recovery_command,
+            )
+            .map(|removed_backup_file_names| {
+                json!({"removed_backup_file_names": removed_backup_file_names})
+            })
+        }
+        OfflineStorageOperation::StoreReset => {
+            satelle_host::HostService::reset_store_metadata_offline(
+                &command.state_root,
+                command.delete_recordings,
+                &recovery_command,
+            )
+            .and_then(|result| {
+                serde_json::to_value(result).map_err(|error| {
+                    SatelleError::invalid_usage(format!(
+                        "could not serialize store reset result: {error}"
+                    ))
+                })
+            })
+        }
+    };
+    let result = match mutation {
+        Ok(result) => result,
+        Err(source) => {
+            let _ = satelle_host::HostService::record_failed_offline_storage_maintenance(
+                &command.state_root,
+                &command.operation_id,
+                action_id,
+            );
+            let _ = print_json(&json!({"error": &source}));
+            return Err(failure(source));
+        }
+    };
+    if let Err(source) = satelle_host::HostService::record_completed_offline_storage_maintenance(
+        &command.state_root,
+        &command.operation_id,
+        action_id,
+        action_label,
+    ) {
+        let completion_recovery_command = offline_storage_completion_recovery_command(
+            command.operation,
+            &command.host,
+            &command.operation_id,
+            &command.state_root,
+        );
+        return Err(failure(
+            SatelleError::storage_maintenance_partially_applied(
+                &[action_id.to_string()],
+                "record-storage-maintenance-ledger-completion",
+                &[],
+                completion_recovery_command,
+                source.to_string(),
+            ),
+        ));
+    }
+    print_json(&result).map_err(failure)
+}
+
+fn run_offline_storage_backup_cleanup_plan(
+    command: OfflineStorageBackupCleanupPlanCommand,
+) -> Result<(), CliFailure> {
+    let plan = satelle_host::HostService::plan_storage_backup_cleanup(&command.state_root)
+        .map_err(failure)?;
+    print_json(&plan).map_err(failure)
+}
+
+fn run_offline_storage_restore_preview(
+    command: OfflineStorageRestorePreviewCommand,
+) -> Result<(), CliFailure> {
+    satelle_host::HostService::preview_storage_restore(&command.state_root, &command.backup)
+        .map_err(failure)?;
+    print_json(&json!({"valid": true})).map_err(failure)
+}
+
+#[cfg(test)]
+#[test]
+fn direct_offline_storage_mutation_requires_explicit_authorization() {
+    let state = satelle_host::test_support::TestStateDir::new()
+        .expect("create unauthorized offline maintenance state");
+    let operation_id = "unauthorized-offline-storage-maintenance";
+    let failure = run_offline_storage_maintenance(OfflineStorageMaintenanceCommand {
+        operation: OfflineStorageOperation::BackupCleanup,
+        host: "local-demo".to_string(),
+        operation_id: operation_id.to_string(),
+        state_root: state.path().to_path_buf(),
+        backup: None,
+        delete_recordings: false,
+        approved_backup_file_names: Vec::new(),
+        yes: false,
+        reconcile_completion: false,
+    })
+    .expect_err("reject a hidden offline mutation without explicit authorization");
+
+    assert_eq!(ErrorCode::InvalidUsage, failure.error.code);
+    assert!(
+        !state.path().join("satelle.sqlite3").exists(),
+        "authorization must be checked before the operation is persisted"
+    );
+}
+
+fn print_storage_plan(
+    host: &str,
+    operation: &str,
+    planned_actions: &[String],
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    if format.is_json() {
+        print_json(&json!({
+            "schema_version": "satelle.host.storage.v1",
+            "host": host,
+            "operation": operation,
+            "status": "planned",
+            "changed": false,
+            "planned_actions": planned_actions,
+            "applied_actions": [],
+            "cancellation_reason": null,
+            "result": null
+        }))
+        .map_err(failure)
+    } else {
+        println!("Host: {host}");
+        println!("Operation: {operation}");
+        for action in planned_actions {
+            println!("- {action}");
+        }
+        Ok(())
+    }
+}
+
+fn print_storage_cancelled(
+    host: &str,
+    operation: &str,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    if format.is_json() {
+        print_json(&json!({
+            "schema_version": "satelle.host.storage.v1",
+            "host": host,
+            "operation": operation,
+            "status": "cancelled",
+            "changed": false,
+            "planned_actions": [],
+            "applied_actions": [],
+            "cancellation_reason": "user_declined_confirmation",
+            "result": null
+        }))
+        .map_err(failure)
+    } else {
+        println!("No changes applied.");
+        Ok(())
+    }
+}
+
+fn print_storage_result(
+    host: &str,
+    operation: &str,
+    result: Value,
+    changed: bool,
+    applied_actions: &[&str],
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    if format.is_json() {
+        print_json(&json!({
+            "schema_version": "satelle.host.storage.v1",
+            "host": host,
+            "operation": operation,
+            "status": "applied",
+            "changed": changed,
+            "planned_actions": [],
+            "applied_actions": applied_actions,
+            "cancellation_reason": null,
+            "result": result
+        }))
+        .map_err(failure)
+    } else {
+        println!("Host: {host}");
+        println!("Operation: {operation}");
+        println!("Status: applied");
+        Ok(())
     }
 }
 

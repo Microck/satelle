@@ -30,6 +30,7 @@ const SUCCESS_MUTATION_PHASES: &[&str] = &[
     "persistent_service_start",
     "persistent_service_restart",
     "persistent_service_stop",
+    "offline_storage_maintenance",
 ];
 const RECOVERABLE_OPERATION_KINDS: &[&str] = &[
     "initial_setup",
@@ -37,6 +38,7 @@ const RECOVERABLE_OPERATION_KINDS: &[&str] = &[
     "host_binary_replacement",
     "service_stop",
     "service_restart",
+    "storage_maintenance",
 ];
 
 fn powershell_list(values: &[&str]) -> String {
@@ -58,6 +60,7 @@ pub(super) enum OperationKind {
     HostBinaryReplacement,
     ServiceStop,
     ServiceRestart,
+    StorageMaintenance,
 }
 
 impl OperationKind {
@@ -68,6 +71,7 @@ impl OperationKind {
             Self::HostBinaryReplacement => "host_binary_replacement",
             Self::ServiceStop => "service_stop",
             Self::ServiceRestart => "service_restart",
+            Self::StorageMaintenance => "storage_maintenance",
         }
     }
 }
@@ -209,7 +213,14 @@ function Retire-TerminalAttempt([string]$PriorPhase, [string]$PriorAttempt) {{
   if (-not $priorRequiresCommit -and -not $priorUsesSuccess) {{ return $false }}
   $startedName = 'execution_started.' + $PriorAttempt
   $retiringName = 'execution_retiring.' + $PriorAttempt
-  $terminalName = if ($priorRequiresCommit) {{ 'execution_committed.' + $PriorAttempt }} else {{ 'execution_succeeded.' + $PriorAttempt }}
+  $failedName = 'execution_failed.' + $PriorAttempt
+  $terminalName = if (Test-Path -LiteralPath (Join-Path $claimPath $failedName) -PathType Leaf) {{
+    $failedName
+  }} elseif ($priorRequiresCommit) {{
+    'execution_committed.' + $PriorAttempt
+  }} else {{
+    'execution_succeeded.' + $PriorAttempt
+  }}
   $launcherTerminalName = 'execution_succeeded.' + $PriorAttempt
   $allowedMarkers = @($startedName, $terminalName)
   if ($PriorPhase -ceq 'daemon_start') {{ $allowedMarkers += $launcherTerminalName }}
@@ -345,9 +356,14 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
       $executionCommitted = Test-Path -LiteralPath (Join-Path $item.FullName ('execution_committed.' + $mutationAttempt)) -PathType Leaf
       $requiresCommit = $mutationPhase -cin @({powershell_commit_required_phases})
       $expectedTerminalMarker = if ($requiresCommit) {{ 'execution_committed.' + $mutationAttempt }} else {{ 'execution_succeeded.' + $mutationAttempt }}
-      $expectedExecutionMarkers = @('execution_started.' + $mutationAttempt, 'execution_retiring.' + $mutationAttempt, $expectedTerminalMarker)
+      $expectedExecutionMarkers = @(
+        'execution_started.' + $mutationAttempt,
+        'execution_retiring.' + $mutationAttempt,
+        $expectedTerminalMarker,
+        'execution_failed.' + $mutationAttempt
+      )
       if ($mutationPhase -ceq 'daemon_start') {{
-        $expectedExecutionMarkers += @('execution_succeeded.' + $mutationAttempt, 'execution_failed.' + $mutationAttempt)
+        $expectedExecutionMarkers += @('execution_succeeded.' + $mutationAttempt)
       }}
       $unexpectedExecutionEvidence = @(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop | Where-Object {{
         $markerLike = $_.Name.StartsWith('execution_started.', [StringComparison]::Ordinal) -or
@@ -368,8 +384,10 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
         if (-not $validDaemonMarkerShape) {{ $unexpectedExecutionEvidence = $true }}
       }} else {{
         $validMarkerShape = ((-not $executionStarted) -and (-not $executionRetiring) -and
-          (-not $executionSucceeded) -and (-not $executionCommitted)) -or
-          ($executionStarted -xor $executionRetiring)
+          (-not $executionSucceeded) -and (-not $executionFailed) -and
+          (-not $executionCommitted)) -or
+          (($executionStarted -xor $executionRetiring) -and
+            (-not ($executionFailed -and ($executionSucceeded -or $executionCommitted))))
         if (-not $validMarkerShape) {{ $unexpectedExecutionEvidence = $true }}
       }}
     }}
@@ -457,9 +475,14 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
       $movedExecutionCommitted = Test-Path -LiteralPath (Join-Path $quarantinedClaim ('execution_committed.' + $movedMutationAttempt)) -PathType Leaf
       $movedRequiresCommit = $movedMutationPhase -cin @({powershell_commit_required_phases})
       $movedExpectedTerminalMarker = if ($movedRequiresCommit) {{ 'execution_committed.' + $movedMutationAttempt }} else {{ 'execution_succeeded.' + $movedMutationAttempt }}
-      $movedExpectedExecutionMarkers = @('execution_started.' + $movedMutationAttempt, 'execution_retiring.' + $movedMutationAttempt, $movedExpectedTerminalMarker)
+      $movedExpectedExecutionMarkers = @(
+        'execution_started.' + $movedMutationAttempt,
+        'execution_retiring.' + $movedMutationAttempt,
+        $movedExpectedTerminalMarker,
+        'execution_failed.' + $movedMutationAttempt
+      )
       if ($movedMutationPhase -ceq 'daemon_start') {{
-        $movedExpectedExecutionMarkers += @('execution_succeeded.' + $movedMutationAttempt, 'execution_failed.' + $movedMutationAttempt)
+        $movedExpectedExecutionMarkers += @('execution_succeeded.' + $movedMutationAttempt)
       }}
       $movedUnexpectedExecutionEvidence = @(Get-ChildItem -LiteralPath $quarantinedClaim -Force -ErrorAction Stop | Where-Object {{
         $markerLike = $_.Name.StartsWith('execution_started.', [StringComparison]::Ordinal) -or
@@ -480,8 +503,10 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
         if (-not $movedValidDaemonMarkerShape) {{ $movedUnexpectedExecutionEvidence = $true }}
       }} else {{
         $movedValidMarkerShape = ((-not $movedExecutionStarted) -and (-not $movedExecutionRetiring) -and
-          (-not $movedExecutionSucceeded) -and (-not $movedExecutionCommitted)) -or
-          ($movedExecutionStarted -xor $movedExecutionRetiring)
+          (-not $movedExecutionSucceeded) -and (-not $movedExecutionFailed) -and
+          (-not $movedExecutionCommitted)) -or
+          (($movedExecutionStarted -xor $movedExecutionRetiring) -and
+            (-not ($movedExecutionFailed -and ($movedExecutionSucceeded -or $movedExecutionCommitted))))
         if (-not $movedValidMarkerShape) {{ $movedUnexpectedExecutionEvidence = $true }}
       }}
     }}
@@ -676,6 +701,10 @@ retire_terminal_attempt() {{
     {posix_success_phases}) terminal_kind=execution_succeeded;;
     *) return 1;;
   esac
+  failed_path="$claim_path/execution_failed.$prior_attempt"
+  if [ -d "$failed_path" ] && [ ! -L "$failed_path" ]; then
+    terminal_kind=execution_failed
+  fi
   started_path="$claim_path/execution_started.$prior_attempt"
   retiring_path="$claim_path/execution_retiring.$prior_attempt"
   terminal_path="$claim_path/$terminal_kind.$prior_attempt"
@@ -858,8 +887,11 @@ for competitor in "$lock_root"/*; do
         "$competitor/execution_started.$mutation_attempt"|"$competitor/execution_retiring.$mutation_attempt"|"$expected_terminal_path")
           [ -d "$marker" ] && [ ! -L "$marker" ] || unexpected_execution_evidence=true
           ;;
-        "$competitor/execution_succeeded.$mutation_attempt"|"$competitor/execution_failed.$mutation_attempt")
+        "$competitor/execution_succeeded.$mutation_attempt")
           if [ "$mutation_phase" = daemon_start ] && [ -d "$marker" ] && [ ! -L "$marker" ]; then :; else unexpected_execution_evidence=true; fi
+          ;;
+        "$competitor/execution_failed.$mutation_attempt")
+          [ -d "$marker" ] && [ ! -L "$marker" ] || unexpected_execution_evidence=true
           ;;
         *) unexpected_execution_evidence=true;;
       esac
@@ -883,11 +915,15 @@ for competitor in "$lock_root"/*; do
     else
       valid_marker_shape=false
       if [ "$execution_started" = false ] && [ "$execution_retiring" = false ] &&
-         [ "$execution_succeeded" = false ] && [ "$execution_committed" = false ]; then
+         [ "$execution_succeeded" = false ] && [ "$execution_failed" = false ] &&
+         [ "$execution_committed" = false ]; then
         valid_marker_shape=true
       elif {{ [ "$execution_started" = true ] && [ "$execution_retiring" = false ]; }} ||
            {{ [ "$execution_started" = false ] && [ "$execution_retiring" = true ]; }}; then
-        valid_marker_shape=true
+        if ! {{ [ "$execution_failed" = true ] &&
+          {{ [ "$execution_succeeded" = true ] || [ "$execution_committed" = true ]; }}; }}; then
+          valid_marker_shape=true
+        fi
       fi
       [ "$valid_marker_shape" = true ] || unexpected_execution_evidence=true
     fi
@@ -1010,8 +1046,11 @@ for competitor in "$lock_root"/*; do
         "$quarantined_claim/execution_started.$moved_mutation_attempt"|"$quarantined_claim/execution_retiring.$moved_mutation_attempt"|"$moved_expected_terminal_path")
           [ -d "$marker" ] && [ ! -L "$marker" ] || moved_unexpected_execution_evidence=true
           ;;
-        "$quarantined_claim/execution_succeeded.$moved_mutation_attempt"|"$quarantined_claim/execution_failed.$moved_mutation_attempt")
+        "$quarantined_claim/execution_succeeded.$moved_mutation_attempt")
           if [ "$moved_mutation_phase" = daemon_start ] && [ -d "$marker" ] && [ ! -L "$marker" ]; then :; else moved_unexpected_execution_evidence=true; fi
+          ;;
+        "$quarantined_claim/execution_failed.$moved_mutation_attempt")
+          [ -d "$marker" ] && [ ! -L "$marker" ] || moved_unexpected_execution_evidence=true
           ;;
         *) moved_unexpected_execution_evidence=true;;
       esac
@@ -1035,11 +1074,15 @@ for competitor in "$lock_root"/*; do
     else
       moved_valid_marker_shape=false
       if [ "$moved_execution_started" = false ] && [ "$moved_execution_retiring" = false ] &&
-         [ "$moved_execution_succeeded" = false ] && [ "$moved_execution_committed" = false ]; then
+         [ "$moved_execution_succeeded" = false ] && [ "$moved_execution_failed" = false ] &&
+         [ "$moved_execution_committed" = false ]; then
         moved_valid_marker_shape=true
       elif {{ [ "$moved_execution_started" = true ] && [ "$moved_execution_retiring" = false ]; }} ||
            {{ [ "$moved_execution_started" = false ] && [ "$moved_execution_retiring" = true ]; }}; then
-        moved_valid_marker_shape=true
+        if ! {{ [ "$moved_execution_failed" = true ] &&
+          {{ [ "$moved_execution_succeeded" = true ] || [ "$moved_execution_committed" = true ]; }}; }}; then
+          moved_valid_marker_shape=true
+        fi
       fi
       [ "$moved_valid_marker_shape" = true ] || moved_unexpected_execution_evidence=true
     fi
@@ -1381,7 +1424,7 @@ mod tests {
         let script = request().windows_script();
         assert!(
             script.contains(
-                "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement', 'service_stop', 'service_restart')"
+                "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement', 'service_stop', 'service_restart', 'storage_maintenance')"
             )
         );
     }
@@ -1500,13 +1543,13 @@ mod tests {
             "$expectedTerminalMarker = if ($requiresCommit) { 'execution_committed.' + $mutationAttempt } else { 'execution_succeeded.' + $mutationAttempt }"
         ));
         assert!(script.contains(
-            "$expectedExecutionMarkers = @('execution_started.' + $mutationAttempt, 'execution_retiring.' + $mutationAttempt, $expectedTerminalMarker)"
+            "$expectedExecutionMarkers = @(\n        'execution_started.' + $mutationAttempt,\n        'execution_retiring.' + $mutationAttempt,\n        $expectedTerminalMarker,\n        'execution_failed.' + $mutationAttempt\n      )"
         ));
         assert!(script.contains(
             "$movedExpectedTerminalMarker = if ($movedRequiresCommit) { 'execution_committed.' + $movedMutationAttempt } else { 'execution_succeeded.' + $movedMutationAttempt }"
         ));
         assert!(script.contains(
-            "$movedExpectedExecutionMarkers = @('execution_started.' + $movedMutationAttempt, 'execution_retiring.' + $movedMutationAttempt, $movedExpectedTerminalMarker)"
+            "$movedExpectedExecutionMarkers = @(\n        'execution_started.' + $movedMutationAttempt,\n        'execution_retiring.' + $movedMutationAttempt,\n        $movedExpectedTerminalMarker,\n        'execution_failed.' + $movedMutationAttempt\n      )"
         ));
     }
 
@@ -2737,6 +2780,7 @@ mod tests {
                 "persistent_service_start",
                 "persistent_service_restart",
                 "persistent_service_stop",
+                "offline_storage_maintenance",
             ]
         );
         assert_eq!(
@@ -2747,6 +2791,7 @@ mod tests {
                 "host_binary_replacement",
                 "service_stop",
                 "service_restart",
+                "storage_maintenance",
             ]
         );
 
@@ -2761,10 +2806,10 @@ mod tests {
             assert_eq!(windows.matches(phase).count(), 2, "Windows {phase}");
         }
         assert!(posix.contains(
-            "case \"$claim_operation_kind\" in initial_setup|missing_daemon_repair|host_binary_replacement|service_stop|service_restart)"
+            "case \"$claim_operation_kind\" in initial_setup|missing_daemon_repair|host_binary_replacement|service_stop|service_restart|storage_maintenance)"
         ));
         assert!(windows.contains(
-            "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement', 'service_stop', 'service_restart')"
+            "$claimOperationKind -cnotin @('initial_setup', 'missing_daemon_repair', 'host_binary_replacement', 'service_stop', 'service_restart', 'storage_maintenance')"
         ));
     }
 
@@ -2836,6 +2881,41 @@ mod tests {
             recovered.exchange(RELEASE);
             assert!(recovered.close().success(), "{phase} stale recovery");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_offline_storage_attempt_can_advance_to_service_restart() {
+        let state_home = tempfile::tempdir().expect("temporary storage maintenance home");
+        let lock_root = state_home.path().join("satelle/bootstrap.lock");
+        let failed_attempt = "0123456789abcdef0123456789abcdef";
+        let restart_attempt = "fedcba9876543210fedcba9876543210";
+        let mut owner = RunningProtocol::start(&request(), state_home.path());
+        assert_ready_line(&owner.read_line());
+        owner.exchange(
+            &mutation_started_line("offline_storage_maintenance", failed_attempt).unwrap(),
+        );
+        let claim = only_claim(&lock_root);
+        fs::create_dir(claim.join(format!("execution_started.{failed_attempt}"))).unwrap();
+        fs::create_dir(claim.join(format!("execution_failed.{failed_attempt}"))).unwrap();
+
+        owner.exchange(
+            &mutation_started_line("persistent_service_restart", restart_attempt).unwrap(),
+        );
+
+        let advanced_claim = only_claim(&lock_root);
+        assert!(
+            !advanced_claim
+                .join(format!("execution_started.{failed_attempt}"))
+                .exists()
+        );
+        assert!(
+            !advanced_claim
+                .join(format!("execution_failed.{failed_attempt}"))
+                .exists()
+        );
+        owner.exchange(RELEASE);
+        assert!(owner.close().success());
     }
 
     #[test]

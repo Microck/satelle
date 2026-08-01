@@ -73,10 +73,11 @@ function generateReference(version) {
     if (visited.has(key)) continue;
     visited.add(key);
 
-    const help = runBinary([...commandPath, '--help']).trimEnd();
+    const rawHelp = runBinary([...commandPath, '--help']).trimEnd();
+    const help = rawHelp.replace(/[ \t]+$/gm, '');
     const label = ['satelle', ...commandPath].join(' ');
     commandSections.push(`## \`${label}\`\n\n\`\`\`text\n${help}\n\`\`\``);
-    for (const subcommand of parseSubcommands(help)) {
+    for (const subcommand of parseSubcommands(rawHelp)) {
       if (subcommand !== 'help') pending.push([...commandPath, subcommand]);
     }
   }
