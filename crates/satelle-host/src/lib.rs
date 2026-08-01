@@ -907,6 +907,13 @@ mod bootstrap_maintenance_tests {
             "Delete older validated Host storage backups",
         )
         .expect("reconcile cleanup completion in the same store");
+        HostService::record_completed_offline_storage_maintenance(
+            cleanup_state.path(),
+            "storage-cleanup-ledger",
+            "cleanup-storage-backups",
+            "Delete older validated Host storage backups",
+        )
+        .expect("repeat exact cleanup completion recovery");
         let cleanup = HostService::production_for_offline_storage(cleanup_state.path())
             .load_setup_run("storage-cleanup-ledger")
             .expect("load cleanup ledger")
@@ -1868,6 +1875,9 @@ impl HostService {
                 || existing.actions()[0].action_id() != action_id
             {
                 return Err(SatelleError::state_conflict());
+            }
+            if existing.status() == SetupRunStatus::Completed {
+                return Ok(());
             }
             let mut observer = OfflineStoragePostcondition {
                 action_id,

@@ -749,6 +749,9 @@ struct OfflineStorageMaintenanceCommand {
     backup: Option<PathBuf>,
     #[arg(long)]
     delete_recordings: bool,
+    /// Reconcile a mutation that already completed without repeating it.
+    #[arg(long)]
+    reconcile_completion: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -8587,6 +8590,7 @@ fn offline_storage_completion_recovery_command(
     if delete_recordings {
         command.push_str(" --delete-recordings");
     }
+    command.push_str(" --reconcile-completion");
     command
 }
 
@@ -8667,7 +8671,42 @@ fn storage_completion_recovery_command_preserves_operation_identity() {
             Some(Path::new("/state root/backup file")),
             false,
         ),
-        "satelle host offline-storage-maintenance --operation restore --host 'remote host' --operation-id storage-maintenance-exact --state-root '/state root' --backup '/state root/backup file'"
+        "satelle host offline-storage-maintenance --operation restore --host 'remote host' --operation-id storage-maintenance-exact --state-root '/state root' --backup '/state root/backup file' --reconcile-completion"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn storage_completion_recovery_reconciles_the_retained_operation_without_restarting_it() {
+    let state = satelle_host::test_support::TestStateDir::new()
+        .expect("create offline maintenance recovery state");
+    let operation_id = "storage-maintenance-completion-recovery";
+    let action_id = "cleanup-storage-backups";
+    let action_label = "Delete older validated Host storage backups";
+    satelle_host::HostService::start_offline_storage_maintenance(
+        state.path(),
+        operation_id,
+        action_id,
+        action_label,
+    )
+    .expect("record the interrupted offline maintenance operation");
+
+    let completion_command = || OfflineStorageMaintenanceCommand {
+        operation: OfflineStorageOperation::BackupCleanup,
+        host: "local-demo".to_string(),
+        operation_id: operation_id.to_string(),
+        state_root: state.path().to_path_buf(),
+        backup: None,
+        delete_recordings: false,
+        reconcile_completion: true,
+    };
+    assert!(
+        run_offline_storage_maintenance(completion_command()).is_ok(),
+        "the retained exact operation must reconcile instead of starting again"
+    );
+    assert!(
+        run_offline_storage_maintenance(completion_command()).is_ok(),
+        "repeating exact completion recovery must be idempotent"
     );
 }
 
@@ -9030,6 +9069,21 @@ fn run_offline_storage_maintenance(
             }
         ),
     };
+    if command.reconcile_completion {
+        satelle_host::HostService::record_completed_offline_storage_maintenance(
+            &command.state_root,
+            &command.operation_id,
+            action_id,
+            action_label,
+        )
+        .map_err(failure)?;
+        return print_json(&json!({
+            "operation_id": command.operation_id,
+            "status": "completed",
+            "reconciled": true,
+        }))
+        .map_err(failure);
+    }
     satelle_host::HostService::start_offline_storage_maintenance(
         &command.state_root,
         &command.operation_id,
