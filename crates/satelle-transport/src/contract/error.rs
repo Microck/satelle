@@ -141,6 +141,14 @@ mod tests {
             ApiErrorCode::YoloBlockedByNativeApproval.as_str(),
             "yolo-blocked-by-native-approval"
         );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::YoloNotSupported).unwrap(),
+            json!("yolo-not-supported")
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::YoloBlockedByNativeApproval).unwrap(),
+            json!("yolo-blocked-by-native-approval")
+        );
     }
 
     #[test]

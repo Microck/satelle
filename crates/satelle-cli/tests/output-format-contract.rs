@@ -256,6 +256,16 @@ fn profile_log_verbosity_obeys_flag_and_environment_precedence() {
         String::from_utf8_lossy(&configured.stderr).contains("Satelle diagnostics initialized")
     );
 
+    let environment_lowers_profile = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_LOG", "off")
+        .args(["--profile", "diagnostics", "paths"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(environment_lowers_profile.stderr.is_empty());
+
     let environment = satelle()
         .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_LOG", "satelle=debug")

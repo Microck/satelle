@@ -825,14 +825,11 @@ impl<'a> SessionExchange<'a> {
         if !self.request.auto_approves_callbacks() {
             return false;
         }
-        if id == self.turn_request_id() {
-            return true;
-        }
-        if id != 2 {
+        if id != 2 && id != self.turn_request_id() {
             return false;
         }
 
-        // A thread request can fail for unrelated runtime reasons. Only an
+        // Thread and Turn requests can fail for unrelated runtime reasons. Only an
         // invalid-params response that names a YOLO policy field confirms that
         // this control plane cannot honor the requested execution mode.
         let Some(error) = response.get("error").and_then(Value::as_object) else {

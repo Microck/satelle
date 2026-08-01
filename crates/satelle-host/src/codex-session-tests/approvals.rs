@@ -99,9 +99,16 @@ fn yolo_approves_only_the_pinned_callback_allowlist_for_the_current_turn() {
 
 #[test]
 fn yolo_turn_start_rejection_is_typed_as_unsupported_policy() {
-    let run = run_yolo_scenario("response-error", Duration::from_secs(3));
+    let run = run_yolo_scenario("turn-policy-response-error", Duration::from_secs(3));
 
     assert_eq!(run.result, Err(CodexSessionError::YoloNotSupported));
+}
+
+#[test]
+fn yolo_preserves_an_unrelated_turn_start_error() {
+    let run = run_yolo_scenario("response-error", Duration::from_secs(3));
+
+    assert_eq!(run.result, Err(CodexSessionError::ResponseError));
 }
 
 #[test]

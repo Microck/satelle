@@ -144,6 +144,10 @@ fn main() {
 
     match scenario.as_str() {
         "duplicate" => { send(&mut output, &thread_response); hang(); }
+        "turn-policy-response-error" => {
+            send(&mut output, r#"{"id":3,"error":{"code":-32602,"message":"unknown field sandboxPolicy"}}"#);
+            hang();
+        }
         "response-error" => {
             send(&mut output, r#"{"id":3,"error":{"code":-1,"message":"PRIVATE_RAW_CANARY"}}"#);
             hang();
