@@ -7202,6 +7202,43 @@ address = "operator@current.example"
             format!("satelle host update --host {expected_host}")
         );
     }
+
+    let prerelease = format!("{}-rc.1", env!("CARGO_PKG_VERSION"));
+    let mut command = Command::new(&installed_binary);
+    for name in [
+        "SATELLE_HOME",
+        "SATELLE_CONFIG_FILE",
+        "SATELLE_STATE_DIR",
+        "SATELLE_CACHE_DIR",
+        "SATELLE_LOG_DIR",
+        "SATELLE_HOST",
+        "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
+        TEST_SUPPORT_ADAPTER_ENV,
+    ] {
+        command.env_remove(name);
+    }
+    let output = command
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
+        .args([
+            "self",
+            "update",
+            "--dry-run",
+            "--version",
+            &prerelease,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(report["latest_compatible_version"], prerelease);
+    assert_eq!(
+        report["follow_up_host_update_command"],
+        serde_json::Value::Null
+    );
 }
 
 #[test]

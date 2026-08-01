@@ -8415,7 +8415,10 @@ fn run_self(
             let request = self_update::SelfUpdateRequest::current(
                 command.version,
                 command.dry_run,
-                if interactive_offer_candidate || command.update_remotes {
+                if interactive_offer_candidate
+                    || command.update_remotes
+                    || !remote_host_handoff_supported
+                {
                     None
                 } else {
                     follow_up_host.clone()
