@@ -74,7 +74,9 @@ own retention policies independently.
 Deletion is not cryptographic erasure. Deleted content can remain in SQLite
 pages, filesystem snapshots, backups, or storage managed outside Satelle.
 
-Host storage stays local to the remote Host unless the operator explicitly
-exports diagnostics or recordings. Satelle MVP does not add direct journald,
-Windows Event Log, or macOS unified logging sinks; those platform integrations
-are not required to preserve the authoritative SQLite log store.
+Host storage stays local to the remote Host. An explicit Session artifact
+export writes only the redacted plan, worklog, and Goal projection to the
+owner-only operator-selected client path. Satelle MVP does not implement
+diagnostic bundles, raw diagnostic exports, recordings, journald, Windows Event
+Log, or macOS unified logging sinks. None of those later features is required
+to preserve the authoritative SQLite log store.

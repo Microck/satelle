@@ -2161,6 +2161,8 @@ impl RuntimeEngine {
 
     fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifactSet, SatelleError> {
         self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
+        // Keep one storage guard for the full export so the Session, recovery
+        // subjects, and log pages all describe one coherent durable snapshot.
         let mut storage = self.lock_storage()?;
         let session = storage
             .load_session(session_id)
@@ -2184,16 +2186,10 @@ impl RuntimeEngine {
         .expect("writing to a String cannot fail");
         writeln!(plan, "## Turns\n").expect("writing to a String cannot fail");
 
-        let mut goal_ref = None;
         for (ordinal, turn) in session.turns().enumerate() {
             let subject = storage
                 .recovery_subject(session.id(), turn.id())
                 .map_err(model::storage_failure)?;
-            goal_ref = goal_ref.or_else(|| {
-                subject
-                    .upstream_goal_ref()
-                    .map(|value| value.as_str().to_string())
-            });
             let policy = turn.execution_policy();
             writeln!(plan, "### Turn {}\n", ordinal + 1).expect("writing to a String cannot fail");
             writeln!(plan, "- Turn ID: {}", turn.id()).expect("writing to a String cannot fail");
@@ -2291,12 +2287,8 @@ impl RuntimeEngine {
         let mut goal = String::new();
         writeln!(goal, "# Goal\n").expect("writing to a String cannot fail");
         writeln!(goal, "- Session ID: {}", session.id()).expect("writing to a String cannot fail");
-        writeln!(
-            goal,
-            "- Upstream Goal Reference: {}",
-            goal_ref.as_deref().unwrap_or("not recorded")
-        )
-        .expect("writing to a String cannot fail");
+        writeln!(goal, "- Upstream Goal Reference: not recorded")
+            .expect("writing to a String cannot fail");
 
         let mut worklog = String::new();
         writeln!(worklog, "# Worklog\n").expect("writing to a String cannot fail");

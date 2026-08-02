@@ -285,9 +285,13 @@ impl<'a> ConfigContext<'a> {
         .filter(|alias| resolved.config.hosts.contains_key(alias))
         .collect::<Vec<_>>();
         let [candidate] = candidates.as_slice() else {
-            return Err(failure(SatelleError::invalid_usage(format!(
+            let mut error = SatelleError::invalid_usage(format!(
                 "Session {session_id} cannot be mapped to exactly one configured Host; pass --host <alias>"
-            ))));
+            ));
+            error
+                .details
+                .insert("candidate_count".to_string(), json!(candidates.len()));
+            return Err(failure(error));
         };
         self.resolve_host(Some(candidate))
     }
@@ -11020,17 +11024,23 @@ fn persist_task_artifacts(
     })?;
     let requested_parent = requested_output.parent().unwrap_or_else(|| Path::new("."));
     let parent = requested_parent.canonicalize().map_err(|error| {
-        failure(SatelleError::invalid_usage(format!(
-            "task artifact output parent {} is unavailable: {error}",
-            requested_parent.display()
-        )))
+        failure(SatelleError::config_error(
+            format!(
+                "task artifact output parent {} is unavailable",
+                requested_parent.display()
+            ),
+            Some(error.to_string()),
+        ))
     })?;
     let output = parent.join(file_name);
     if output.try_exists().map_err(|error| {
-        failure(SatelleError::invalid_usage(format!(
-            "could not inspect task artifact destination {}: {error}",
-            output.display()
-        )))
+        failure(SatelleError::config_error(
+            format!(
+                "could not inspect task artifact destination {}",
+                output.display()
+            ),
+            Some(error.to_string()),
+        ))
     })? {
         return Err(failure(SatelleError::invalid_usage(format!(
             "task artifact destination {} already exists",
@@ -11039,19 +11049,23 @@ fn persist_task_artifacts(
     }
 
     let _parent_guard = open_owner_only_directory(&parent).map_err(|error| {
-        failure(SatelleError::invalid_usage(format!(
-            "task artifact output parent {} is not owner-only: {error}",
-            parent.display()
-        )))
+        failure(SatelleError::config_error(
+            format!(
+                "task artifact output parent {} is not owner-only",
+                parent.display()
+            ),
+            Some(error.to_string()),
+        ))
     })?;
     let staging_path = parent.join(format!(
         ".satelle-task-artifacts-{}",
         Uuid::now_v7().simple()
     ));
     let staging_guard = open_or_create_owner_only_directory(&staging_path).map_err(|error| {
-        failure(SatelleError::invalid_usage(format!(
-            "could not create owner-only task artifact staging directory: {error}"
-        )))
+        failure(SatelleError::config_error(
+            "could not create owner-only task artifact staging directory",
+            Some(error.to_string()),
+        ))
     })?;
     let mut staging_cleanup = TaskArtifactStagingCleanup::new(staging_path.clone());
     for (name, body) in [
@@ -11061,37 +11075,45 @@ fn persist_task_artifacts(
     ] {
         let path = staging_path.join(name);
         let mut file = open_new_owner_only_file(&path).map_err(|error| {
-            failure(SatelleError::invalid_usage(format!(
-                "could not create owner-only task artifact {name}: {error}"
-            )))
+            failure(SatelleError::config_error(
+                format!("could not create owner-only task artifact {name}"),
+                Some(error.to_string()),
+            ))
         })?;
         file.write_all(body).map_err(|error| {
-            failure(SatelleError::invalid_usage(format!(
-                "could not write task artifact {name}: {error}"
-            )))
+            failure(SatelleError::config_error(
+                format!("could not write task artifact {name}"),
+                Some(error.to_string()),
+            ))
         })?;
         file.flush().map_err(|error| {
-            failure(SatelleError::invalid_usage(format!(
-                "could not flush task artifact {name}: {error}"
-            )))
+            failure(SatelleError::config_error(
+                format!("could not flush task artifact {name}"),
+                Some(error.to_string()),
+            ))
         })?;
         file.sync_all().map_err(|error| {
-            failure(SatelleError::invalid_usage(format!(
-                "could not sync task artifact {name}: {error}"
-            )))
+            failure(SatelleError::config_error(
+                format!("could not sync task artifact {name}"),
+                Some(error.to_string()),
+            ))
         })?;
     }
     sync_owner_only_directory(&staging_path, &staging_guard).map_err(|error| {
-        failure(SatelleError::invalid_usage(format!(
-            "could not sync task artifact staging directory: {error}"
-        )))
+        failure(SatelleError::config_error(
+            "could not sync task artifact staging directory",
+            Some(error.to_string()),
+        ))
     })?;
     drop(staging_guard);
     publish_new_owner_only_directory(&staging_path, &output).map_err(|error| {
-        failure(SatelleError::invalid_usage(format!(
-            "could not publish task artifact destination {}: {error}",
-            output.display()
-        )))
+        failure(SatelleError::config_error(
+            format!(
+                "could not publish task artifact destination {}",
+                output.display()
+            ),
+            Some(error.to_string()),
+        ))
     })?;
     staging_cleanup.disarm();
     Ok(output)

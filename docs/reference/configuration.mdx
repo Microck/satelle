@@ -84,7 +84,9 @@ implicitly by a same-name profile.
 Diagnostic verbosity accepts `off`, `info`, `debug`, or `trace`. Precedence is
 `--log-verbosity`, then `SATELLE_LOG`, then profile and user configuration.
 JSON command output never includes diagnostic logs.
-Only a user-selected profile can change destructive retention.
+User Host configuration sets the retention baseline. A selected user-owned
+profile can override it. Project configuration cannot set destructive
+retention.
 
 ## Project configuration
 

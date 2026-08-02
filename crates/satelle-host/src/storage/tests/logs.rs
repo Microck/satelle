@@ -200,6 +200,30 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
         cursor_strings(&[3, 4])
     );
     assert!(!log_root.join("satelle-host.log.5").exists());
+
+    operator_log.release_handles_for_test();
+    drop(operator_log);
+    let twelfth = committed_host_log(
+        &mut storage,
+        at(0),
+        LogSource::HostDaemon,
+        LogSeverity::Warning,
+    );
+    let mut reduced =
+        OperatorLogSink::new(OperatorLogPolicy::for_test(log_root.clone(), threshold, 2));
+    assert!(matches!(
+        reduced.write_committed(&twelfth),
+        OperatorLogWriteOutcome::Written
+    ));
+    assert!(log_root.join("satelle-host.log.1").exists());
+    for generation in 2..=4 {
+        assert!(
+            !log_root
+                .join(format!("satelle-host.log.{generation}"))
+                .exists(),
+            "generation {generation} survived the reduced retention cap"
+        );
+    }
 }
 
 #[cfg(unix)]

@@ -2068,7 +2068,7 @@ fn task_artifacts_use_only_durable_redacted_session_state() {
     assert_eq!(
         artifacts.goal(),
         format!(
-            "# Goal\n\n- Session ID: {}\n- Upstream Goal Reference: {PRIVATE_UPSTREAM_GOAL_REF}\n",
+            "# Goal\n\n- Session ID: {}\n- Upstream Goal Reference: not recorded\n",
             session.session_id()
         )
     );
@@ -2088,6 +2088,7 @@ fn task_artifacts_use_only_durable_redacted_session_state() {
             raw_prompt,
             PRIVATE_UPSTREAM_THREAD_REF,
             PRIVATE_UPSTREAM_TURN_REF,
+            PRIVATE_UPSTREAM_GOAL_REF,
         ],
     );
 

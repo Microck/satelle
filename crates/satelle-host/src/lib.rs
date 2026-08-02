@@ -2753,14 +2753,22 @@ impl HostService {
         config.daemon_state_dir = overrides.state_dir.clone();
         config.daemon_cache_dir = overrides.cache_dir.clone();
         config.daemon_log_dir = overrides.log_dir.clone();
-        config.setup_ledger_retention = satelle_core::ExplicitDuration::parse(&format!(
-            "{}ms",
-            storage_policy.setup_ledger_retention_ms()
-        ));
-        config.session_metadata_retention = satelle_core::RetentionDuration::parse(&format!(
-            "{}h",
-            storage_policy.session_metadata_retention_hours()
-        ));
+        config.setup_ledger_retention = Some(
+            satelle_core::ExplicitDuration::parse(&format!(
+                "{}ms",
+                storage_policy.setup_ledger_retention_ms()
+            ))
+            .ok_or_else(|| {
+                SatelleError::config_error("invalid service setup-ledger retention", None)
+            })?,
+        );
+        config.session_metadata_retention = Some(
+            satelle_core::RetentionDuration::parse(&format!(
+                "{}h",
+                storage_policy.session_metadata_retention_hours()
+            ))
+            .ok_or_else(|| SatelleError::config_error("invalid service Session retention", None))?,
+        );
         config.operator_log_retained_files = Some(storage_policy.operator_log_retained_files());
         Ok(Self::production_for_host(&config))
     }

@@ -7266,14 +7266,14 @@ impl TransportClient for DirectTransport {
         self.client
             .read_session(session_id)
             .map(|response| response.session().clone())
-            .map_err(|error| direct_transport_error(&self.alias, error))
+            .map_err(|error| direct_session_resource_error(&self.alias, session_id, error))
     }
 
     fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifacts, SatelleError> {
         self.client
             .read_task_artifacts(session_id)
             .map(TaskArtifacts::from_response)
-            .map_err(|error| direct_transport_error(&self.alias, error))
+            .map_err(|error| direct_session_resource_error(&self.alias, session_id, error))
     }
 
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {
@@ -8161,6 +8161,21 @@ fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError 
         | DaemonClientError::ResponseContractViolation => {
             SatelleError::remote_api_error(host, "invalid-daemon-response")
         }
+    }
+}
+
+fn direct_session_resource_error(
+    host: &str,
+    session_id: &SessionId,
+    error: DaemonClientError,
+) -> SatelleError {
+    if matches!(
+        &error,
+        DaemonClientError::Api { error, .. } if error.code() == ApiErrorCode::SessionNotFound
+    ) {
+        SatelleError::session_not_found(session_id)
+    } else {
+        direct_transport_error(host, error)
     }
 }
 

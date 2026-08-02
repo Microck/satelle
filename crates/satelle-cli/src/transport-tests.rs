@@ -6139,6 +6139,36 @@ fn admission_failures_preserve_definitive_and_ambiguous_phases() {
 }
 
 #[test]
+fn direct_session_resource_reads_preserve_session_not_found_identity() {
+    let session_id = SessionId::new();
+    let api_error: satelle_transport::ApiError = serde_json::from_value(serde_json::json!({
+        "schema_version": "satelle.error.v1",
+        "request_id": satelle_transport::RequestId::new().to_string(),
+        "host_identity": "host-direct-test",
+        "code": "session-not-found",
+        "category": "not_found",
+        "retryable": false,
+        "message": "Session was not found",
+        "details": null,
+        "docs_url": null,
+        "suggested_commands": []
+    }))
+    .expect("deserialize Session-not-found API error");
+
+    let mapped = direct_session_resource_error(
+        "direct-test",
+        &session_id,
+        DaemonClientError::Api {
+            status: 404_u16.try_into().expect("404 is a valid HTTP status"),
+            error: Box::new(api_error),
+        },
+    );
+
+    assert_eq!(mapped.code, ErrorCode::SessionNotFound);
+    assert!(mapped.message.contains(session_id.as_str()));
+}
+
+#[test]
 fn stop_not_confirmed_api_details_are_validated_and_preserved() {
     let session_id = SessionId::new();
     let turn_id = TurnId::new();

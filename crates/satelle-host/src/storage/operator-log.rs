@@ -220,10 +220,19 @@ impl OperatorLogSink {
 
     fn ensure_open(&mut self) -> Result<(), OperatorLogFailureKind> {
         if self.directory.is_none() {
-            self.directory = Some(
-                open_or_create_owner_only_directory(&self.policy.root)
-                    .map_err(|_| OperatorLogFailureKind::BoundaryUnavailable)?,
-            );
+            let directory = open_or_create_owner_only_directory(&self.policy.root)
+                .map_err(|_| OperatorLogFailureKind::BoundaryUnavailable)?;
+
+            // A lower retention setting takes effect as soon as this process
+            // acquires the log boundary, even when the active file does not
+            // rotate during this run.
+            for generation in
+                self.policy.retained_files..=satelle_core::MAX_OPERATOR_LOG_RETAINED_FILES
+            {
+                remove_if_present(&self.rotated_path(generation))
+                    .map_err(|_| OperatorLogFailureKind::RotationFailed)?;
+            }
+            self.directory = Some(directory);
         }
         if self.file.is_none() {
             let mut file = open_or_create_owner_only_file(&self.current_path())
