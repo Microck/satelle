@@ -149,12 +149,12 @@ async fn capabilities_handshake_rejects_old_and_missing_clients() {
 
     let current = running
         .protected_request(Method::GET, "/v1/capabilities")
-        .header("Satelle-Protocol-Version", "13")
+        .header("Satelle-Protocol-Version", "14")
         .send()
         .await
         .expect("send capabilities request with current protocol version");
     assert_eq!(current.status(), StatusCode::OK);
-    assert_eq!(current.headers()["satelle-protocol-version"], "13");
+    assert_eq!(current.headers()["satelle-protocol-version"], "14");
 }
 
 #[tokio::test]
@@ -214,7 +214,7 @@ async fn assert_protocol_error(
             "details": {
                 "daemon_version": env!("CARGO_PKG_VERSION"),
                 "reason": reason,
-                "supported_versions": ["13"],
+                "supported_versions": ["14"],
                 "received_version": received_version,
             },
             "docs_url": null,

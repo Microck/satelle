@@ -12,7 +12,7 @@ use crate::contract::{
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
     ProviderSecretUploadEnvelope, RequestId, SessionResponse, SetupRepairPlanRequest,
     SetupRepairPlanResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
-    StopResponse, TurnRequest, provider_secret_upload_aad,
+    StopResponse, TaskArtifactsResponse, TurnRequest, provider_secret_upload_aad,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
@@ -746,6 +746,15 @@ impl DaemonClient {
         session_id: &SessionId,
     ) -> Result<SessionResponse, DaemonClientError> {
         let path = format!("/v1/sessions/{session_id}");
+        let (request, request_id) = self.protected_request(Method::GET, &path)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn read_task_artifacts(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<TaskArtifactsResponse, DaemonClientError> {
+        let path = format!("/v1/sessions/{session_id}/task-artifacts");
         let (request, request_id) = self.protected_request(Method::GET, &path)?;
         self.send_authenticated(request, request_id, StatusCode::OK)
     }

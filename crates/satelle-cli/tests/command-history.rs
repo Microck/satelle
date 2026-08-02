@@ -817,6 +817,37 @@ fn history_database_wait_does_not_inflate_command_duration() {
     );
 }
 
+#[test]
+fn successful_writer_prunes_command_history_older_than_seven_days() {
+    let fixture = Fixture::new();
+    fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .success();
+    fixture
+        .connection()
+        .execute(
+            "UPDATE command_history SET started_at = '2000-01-01T00:00:00.000000000Z'",
+            [],
+        )
+        .expect("age the existing redacted command-history row");
+
+    fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .success();
+
+    let rows = fixture
+        .connection()
+        .query_row("SELECT COUNT(*) FROM command_history", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count retained command-history rows");
+    assert_eq!(rows, 1);
+}
+
 #[cfg(unix)]
 #[test]
 fn concurrent_first_run_creates_one_secure_cache_root_without_losing_rows() {

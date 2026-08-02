@@ -1,8 +1,9 @@
 use super::{
     ConfigInterpolation, ErrorCode, ExplicitDuration, HostConfig, LogVerbosity,
-    PresentationOutputFormat, SatelleConfig, SatelleError, TimeoutConfig, UnknownConfigKey,
-    collect_interpolation_for_value, collect_unknown_keys_for_table, finish_interpolation_check,
-    interpolation_syntax, optional_non_empty_env,
+    MAX_OPERATOR_LOG_RETAINED_FILES, PresentationOutputFormat, RetentionDuration, SatelleConfig,
+    SatelleError, TimeoutConfig, UnknownConfigKey, collect_interpolation_for_value,
+    collect_unknown_keys_for_table, finish_interpolation_check, interpolation_syntax,
+    optional_non_empty_env,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +26,8 @@ const PROFILE_KEYS: &[&str] = &[
     "provider_smoke_failure_cache_ttl",
     "daemon_idle_timeout",
     "setup_ledger_retention",
+    "session_metadata_retention",
+    "operator_log_retained_files",
 ];
 const TIMEOUT_KEYS: &[&str] = &["native_readiness", "provider_smoke_test", "turn_execution"];
 
@@ -85,6 +88,8 @@ pub(super) struct ProfileConfig {
     provider_smoke_failure_cache_ttl: Option<ExplicitDuration>,
     daemon_idle_timeout: Option<ExplicitDuration>,
     setup_ledger_retention: Option<ExplicitDuration>,
+    session_metadata_retention: Option<RetentionDuration>,
+    operator_log_retained_files: Option<usize>,
 }
 
 impl ProfileConfig {
@@ -173,6 +178,14 @@ impl ProfileConfig {
         }
         if let Some(retention) = &self.setup_ledger_retention {
             host.setup_ledger_retention = Some(retention.clone());
+        }
+        if source.allows_user_policy() {
+            if let Some(retention) = &self.session_metadata_retention {
+                host.session_metadata_retention = Some(retention.clone());
+            }
+            if let Some(retained_files) = self.operator_log_retained_files {
+                host.operator_log_retained_files = Some(retained_files);
+            }
         }
         if source.allows_user_policy()
             && let Some(enabled) = self.experimental_provider_computer_use
@@ -418,6 +431,11 @@ fn reject_profile_interpolation(
         table.get("setup_ledger_retention"),
         &mut interpolations,
     );
+    collect_interpolation_for_value(
+        &format!("{profile_path}.session_metadata_retention"),
+        table.get("session_metadata_retention"),
+        &mut interpolations,
+    );
     if let Some(timeouts) = table.get("timeouts").and_then(toml::Value::as_table) {
         for key in TIMEOUT_KEYS {
             collect_interpolation_for_value(
@@ -474,6 +492,29 @@ fn reject_profile_duration_errors(
         };
         if super::setup_ledger_retention_duration(value).is_none() {
             return Err(SatelleError::duration_unit_required(path, &retention_path));
+        }
+    }
+    if let Some(value) = table.get("session_metadata_retention") {
+        let retention_path = format!("{profile_path}.session_metadata_retention");
+        let Some(value) = value.as_str() else {
+            return Err(SatelleError::duration_unit_required(path, &retention_path));
+        };
+        if RetentionDuration::parse(value).is_none() {
+            return Err(SatelleError::duration_unit_required(path, &retention_path));
+        }
+    }
+    if let Some(value) = table.get("operator_log_retained_files") {
+        let retained_files = value
+            .as_integer()
+            .and_then(|value| usize::try_from(value).ok());
+        if !matches!(retained_files, Some(1..=MAX_OPERATOR_LOG_RETAINED_FILES)) {
+            return Err(SatelleError::config_error(
+                format!(
+                    "config file {} value {profile_path}.operator_log_retained_files must be between 1 and {MAX_OPERATOR_LOG_RETAINED_FILES}",
+                    path.display()
+                ),
+                None,
+            ));
         }
     }
     let Some(timeouts) = table.get("timeouts").and_then(toml::Value::as_table) else {
@@ -733,5 +774,36 @@ mod timeout_profile_tests {
                 .milliseconds(),
             60 * 60 * 1_000
         );
+    }
+
+    #[test]
+    fn only_user_selected_profiles_override_destructive_retention() {
+        let profile: ProfileConfig = toml::from_str(
+            "session_metadata_retention = \"30d\"\noperator_log_retained_files = 12\n",
+        )
+        .expect("parse profile retention policy");
+
+        for source in [
+            ProfileSelectionSource::UserConfig,
+            ProfileSelectionSource::CliFlag,
+        ] {
+            let mut host = base_host();
+            profile.apply_to_host(super::super::LOCAL_DEMO_HOST, &mut host, source);
+            assert_eq!(
+                host.session_metadata_retention.as_ref().unwrap().hours(),
+                30 * 24
+            );
+            assert_eq!(host.operator_log_retained_files, Some(12));
+        }
+
+        for source in [
+            ProfileSelectionSource::ProjectConfig,
+            ProfileSelectionSource::Environment,
+        ] {
+            let mut host = base_host();
+            profile.apply_to_host(super::super::LOCAL_DEMO_HOST, &mut host, source);
+            assert!(host.session_metadata_retention.is_none());
+            assert!(host.operator_log_retained_files.is_none());
+        }
     }
 }

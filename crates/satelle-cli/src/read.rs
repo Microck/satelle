@@ -330,7 +330,7 @@ pub(super) fn status(
     config: ConfigContext<'_>,
 ) -> Result<(PublicSession, String), CliFailure> {
     let session_id = SessionId::from_str(session_id).map_err(|error| failure(error.into()))?;
-    let host = config.resolve_host(host)?;
+    let host = config.resolve_session_host(host, &session_id)?;
     status_for_host(&session_id, &host).map(|session| (session, host.alias))
 }
 

@@ -31,9 +31,10 @@ use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 #[cfg(any(windows, test))]
-use satelle_core::daemon_service::WindowsServiceConfigV2;
+use satelle_core::daemon_service::WindowsServiceConfigV3;
 use satelle_core::daemon_service::{
-    DaemonServicePlatform, PersistentServiceDecision, SetupModeSelection, SetupModeSource,
+    DaemonServicePlatform, PersistentHostStoragePolicy, PersistentServiceDecision,
+    SetupModeSelection, SetupModeSource,
 };
 use satelle_core::doctor::{DoctorScopeSelection, DoctorScopeSelectionError};
 use satelle_core::session::{
@@ -49,9 +50,10 @@ use satelle_core::{
     SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary,
     SetupReport, SetupRequiredInput, SetupSchemaVersion, SetupVerification, TransportKind,
     load_config, load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_desktop_session,
-    resolve_path_set, utc_now,
+    open_new_owner_only_file, open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    open_owner_only_directory, publish_new_owner_only_directory, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set,
+    sync_owner_only_directory, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, DoctorExecutionFailure, DoctorExecutionResult, HostService,
@@ -262,6 +264,33 @@ impl<'a> ConfigContext<'a> {
             .map(SelectedHost::from)
             .map_err(failure)
     }
+
+    fn resolve_session_host(
+        &self,
+        flag_host: Option<&str>,
+        session_id: &SessionId,
+    ) -> Result<SelectedHost, CliFailure> {
+        if flag_host.is_some() {
+            return self.resolve_host(flag_host);
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cache_root = resolve_path_set(&cwd).map_err(failure)?.cache_root;
+        let resolved = self.load()?;
+        let candidates = command_history::session_host_candidates(
+            &cache_root,
+            session_id,
+            OffsetDateTime::now_utc(),
+        )
+        .into_iter()
+        .filter(|alias| resolved.config.hosts.contains_key(alias))
+        .collect::<Vec<_>>();
+        let [candidate] = candidates.as_slice() else {
+            return Err(failure(SatelleError::invalid_usage(format!(
+                "Session {session_id} cannot be mapped to exactly one configured Host; pass --host <alias>"
+            ))));
+        };
+        self.resolve_host(Some(candidate))
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -288,6 +317,10 @@ enum Command {
     Steer(SteerCommand),
     Status(StatusCommand),
     Stop(StopCommand),
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     Logs(LogsCommand),
     Mcp {
         #[command(subcommand)]
@@ -588,6 +621,12 @@ struct HostStartCommand {
         requires = "launchd_service"
     )]
     setup_ledger_retention_ms: Option<u64>,
+    /// Internal resolved Session metadata retention for a persistent launchd service.
+    #[arg(long, hide = true, value_name = "HOURS", requires = "launchd_service")]
+    session_metadata_retention_hours: Option<u64>,
+    /// Internal resolved Operator Log File generation count for launchd.
+    #[arg(long, hide = true, value_name = "COUNT", requires = "launchd_service")]
+    operator_log_retained_files: Option<usize>,
     /// Internal owner-only configuration used by the per-user Windows task.
     #[arg(
         long,
@@ -1034,6 +1073,20 @@ struct StopCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum SessionCommand {
+    Export(SessionExportCommand),
+}
+
+#[derive(Args, Debug)]
+struct SessionExportCommand {
+    session_id: String,
+    #[arg(long)]
+    host: String,
+    #[arg(long)]
+    output: PathBuf,
+}
+
+#[derive(Subcommand, Debug)]
 enum SupportCommand {
     Bundle(SupportBundleCommand),
 }
@@ -1403,6 +1456,9 @@ fn execute_command(
         Command::Steer(command) => steer_prompt(command, config, output).map(Some),
         Command::Status(command) => show_status(command, config, output).map(|_| None),
         Command::Stop(command) => stop_session(command, config, output).map(|_| None),
+        Command::Session {
+            command: SessionCommand::Export(command),
+        } => export_task_artifacts(command, config).map(|_| None),
         Command::Logs(command) => show_logs(command, config, output).map(|_| None),
         Command::Mcp {
             command: McpCommand::Serve,
@@ -1525,6 +1581,13 @@ fn start_command_history(
         } if command.all
     );
     let target = history_target(command)?;
+    if target.session_id.is_some() && target.explicit_host.is_none() {
+        // An implicit Session operation may consult command history only to
+        // select one candidate Host. Recording that same operation would turn
+        // the read-only routing cache path into a write and could reinforce a
+        // stale mapping before Host-authoritative status is known.
+        return None;
+    }
     let environment_preference = command_history_environment_preference();
     if environment_preference == Some(false) {
         return None;
@@ -1725,6 +1788,14 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             family: "stop",
             selects_host: true,
             explicit_host: command.host.as_deref(),
+            session_id: canonical_history_session_id(&command.session_id),
+        },
+        Command::Session {
+            command: SessionCommand::Export(command),
+        } => HistoryTarget {
+            family: "session-export",
+            selects_host: true,
+            explicit_host: Some(&command.host),
             session_id: canonical_history_session_id(&command.session_id),
         },
         Command::Logs(command) => HistoryTarget {
@@ -2065,6 +2136,8 @@ mod history_target_tests {
                 bootstrap_provider_smoke_timeout_ms: None,
                 on_demand_idle_timeout_ms: None,
                 setup_ledger_retention_ms: None,
+                session_metadata_retention_hours: None,
+                operator_log_retained_files: None,
                 service_config: None,
                 output_args: OutputArgs::default(),
             }),
@@ -2196,6 +2269,10 @@ mod history_target_tests {
             "--launchd-service",
             "--setup-ledger-retention-ms",
             "3600000",
+            "--session-metadata-retention-hours",
+            "720",
+            "--operator-log-retained-files",
+            "12",
         ])
         .expect("parse internal launchd service start command");
         assert!(
@@ -2211,6 +2288,8 @@ mod history_target_tests {
         };
         assert!(command.launchd_service);
         assert_eq!(command.setup_ledger_retention_ms, Some(3_600_000));
+        assert_eq!(command.session_metadata_retention_hours, Some(720));
+        assert_eq!(command.operator_log_retained_files, Some(12));
         validate_host_start_mode(&command).expect("launchd service is a valid closed start mode");
     }
 
@@ -6662,7 +6741,9 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.bootstrap_native_readiness_timeout_ms.is_some()
             || command.bootstrap_provider_smoke_timeout_ms.is_some()
             || command.on_demand_idle_timeout_ms.is_some()
-            || command.setup_ledger_retention_ms.is_none())
+            || command.setup_ledger_retention_ms.is_none()
+            || command.session_metadata_retention_hours.is_none()
+            || command.operator_log_retained_files.is_none())
     {
         return Err(SatelleError::invalid_usage(
             "--launchd-service is an internal launchd input and cannot be combined with other internal or TLS Host start options",
@@ -6678,7 +6759,9 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.bootstrap_native_readiness_timeout_ms.is_some()
             || command.bootstrap_provider_smoke_timeout_ms.is_some()
             || command.on_demand_idle_timeout_ms.is_some()
-            || command.setup_ledger_retention_ms.is_some())
+            || command.setup_ledger_retention_ms.is_some()
+            || command.session_metadata_retention_hours.is_some()
+            || command.operator_log_retained_files.is_some())
     {
         return Err(SatelleError::invalid_usage(
             "--service-config is an internal Windows service input and cannot be combined with ordinary Host start options",
@@ -6737,6 +6820,40 @@ async fn bind_host_daemon(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonProcessNotice {
+    Startup(SocketAddr),
+    Shutdown,
+    Fatal,
+}
+
+fn write_daemon_process_notice(
+    writer: &mut impl Write,
+    notice: DaemonProcessNotice,
+) -> io::Result<()> {
+    match notice {
+        DaemonProcessNotice::Startup(address) => {
+            writeln!(writer, "satelle-host: startup: listening on {address}")
+        }
+        DaemonProcessNotice::Shutdown => {
+            writeln!(writer, "satelle-host: shutdown: Host Daemon stopped")
+        }
+        DaemonProcessNotice::Fatal => {
+            writeln!(
+                writer,
+                "satelle-host: fatal: Host Daemon stopped with an error"
+            )
+        }
+    }
+}
+
+fn emit_daemon_process_notice(notice: DaemonProcessNotice) {
+    // Service managers and containers capture stderr independently from the
+    // bootstrap JSON protocol on stdout. A closed diagnostic sink must never
+    // change daemon lifecycle behavior.
+    let _ = write_daemon_process_notice(&mut io::stderr().lock(), notice);
+}
+
 fn start_host_daemon(
     command: HostStartCommand,
     config: ConfigContext<'_>,
@@ -6764,7 +6881,7 @@ fn start_host_daemon_with(
     ) -> HostService,
 ) -> Result<(), CliFailure> {
     validate_host_start_mode(&command).map_err(failure)?;
-    let (service_path_overrides, service_setup_ledger_retention_ms) =
+    let (service_path_overrides, service_storage_policy) =
         if let Some(_service_config_path) = command.service_config.as_deref() {
             #[cfg(not(windows))]
             return Err(failure(SatelleError::invalid_usage(
@@ -6778,15 +6895,25 @@ fn start_host_daemon_with(
                 apply_windows_service_environment(&service_config);
                 command.bind = service_config.bind().to_string();
                 command.foreground = true;
-                (
-                    Some(path_overrides),
-                    Some(service_config.setup_ledger_retention_ms()),
-                )
+                (Some(path_overrides), Some(service_config.storage_policy()))
             }
         } else if command.launchd_service {
             (
                 Some(daemon_path_overrides_from_process_environment()),
-                command.setup_ledger_retention_ms,
+                Some(
+                    PersistentHostStoragePolicy::new(
+                        command
+                            .setup_ledger_retention_ms
+                            .expect("launchd setup-ledger retention was validated"),
+                        command
+                            .session_metadata_retention_hours
+                            .expect("launchd Session retention was validated"),
+                        command
+                            .operator_log_retained_files
+                            .expect("launchd Operator Log retention was validated"),
+                    )
+                    .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?,
+                ),
             )
         } else {
             (None, None)
@@ -6909,7 +7036,7 @@ fn start_host_daemon_with(
             service_path_overrides
                 .as_ref()
                 .expect("persistent service path overrides were checked"),
-            service_setup_ledger_retention_ms.expect("persistent service retention was checked"),
+            service_storage_policy.expect("persistent service storage policy was checked"),
         )
         .map_err(failure)?,
         (_, Some(token)) => {
@@ -7005,6 +7132,7 @@ fn start_host_daemon_with(
         } else {
             println!("Host Daemon listening on {}", server.local_addr());
         }
+        emit_daemon_process_notice(DaemonProcessNotice::Startup(server.local_addr()));
 
         let mut server_wait = Box::pin(server.wait());
         let result = if command.foreground {
@@ -7022,12 +7150,43 @@ fn start_host_daemon_with(
             server_wait.await.map_err(daemon_server_failure)
         };
         state_release_task.abort();
+        emit_daemon_process_notice(if result.is_ok() {
+            DaemonProcessNotice::Shutdown
+        } else {
+            DaemonProcessNotice::Fatal
+        });
         result
     })
 }
 
+#[cfg(test)]
+mod daemon_process_notice_tests {
+    use super::*;
+
+    #[test]
+    fn process_notices_are_stable_and_do_not_use_the_bootstrap_protocol() {
+        let mut notices = Vec::new();
+        for notice in [
+            DaemonProcessNotice::Startup("127.0.0.1:3001".parse().unwrap()),
+            DaemonProcessNotice::Shutdown,
+            DaemonProcessNotice::Fatal,
+        ] {
+            write_daemon_process_notice(&mut notices, notice).expect("write process notice");
+        }
+
+        assert_eq!(
+            String::from_utf8(notices).unwrap(),
+            concat!(
+                "satelle-host: startup: listening on 127.0.0.1:3001\n",
+                "satelle-host: shutdown: Host Daemon stopped\n",
+                "satelle-host: fatal: Host Daemon stopped with an error\n",
+            )
+        );
+    }
+}
+
 #[cfg(any(windows, test))]
-fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV2, CliFailure> {
+fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV3, CliFailure> {
     if !path.is_absolute() {
         return Err(failure(SatelleError::invalid_usage(
             "Windows Host service config path must be absolute",
@@ -7079,7 +7238,9 @@ mod windows_service_config_tests {
             log_dir: Some(PathBuf::from(r"C:\Users\owner\AppData\Local\Satelle\logs")),
             sources: BTreeMap::new(),
         };
-        let expected = WindowsServiceConfigV2::new("127.0.0.1:3001", &overrides, 3_600_000)
+        let storage_policy =
+            PersistentHostStoragePolicy::new(3_600_000, 30 * 24, 12).expect("build storage policy");
+        let expected = WindowsServiceConfigV3::new("127.0.0.1:3001", &overrides, storage_policy)
             .expect("build service config");
         write_owner_only_config(
             &path,
@@ -7097,7 +7258,7 @@ mod windows_service_config_tests {
             ["host", "start", "--foreground", "--bind", "127.0.0.1:3001"]
         );
         assert_eq!(observed.environment().len(), 5);
-        assert_eq!(observed.setup_ledger_retention_ms(), 3_600_000);
+        assert_eq!(observed.storage_policy(), storage_policy);
     }
 
     #[test]
@@ -7131,7 +7292,7 @@ mod windows_service_config_tests {
 }
 
 #[cfg(windows)]
-fn apply_windows_service_environment(config: &WindowsServiceConfigV2) {
+fn apply_windows_service_environment(config: &WindowsServiceConfigV3) {
     const PATH_OVERRIDES: [&str; 5] = [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -7681,6 +7842,8 @@ mod daemon_tls_watcher_tests {
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: None,
             setup_ledger_retention_ms: None,
+            session_metadata_retention_hours: None,
+            operator_log_retained_files: None,
             service_config: None,
             output_args: OutputArgs::default(),
         }
@@ -8205,6 +8368,8 @@ mod bootstrap_startup_tests {
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: Some(75_000),
             setup_ledger_retention_ms: None,
+            session_metadata_retention_hours: None,
+            operator_log_retained_files: None,
             service_config: None,
             output_args: OutputArgs::default(),
         };
@@ -10543,19 +10708,12 @@ fn steer_prompt(
         explicit_host_alias,
         SessionId::from_str(&command.session_id).map_err(|error| failure(error.into())),
     )?;
-    let config = report_not_admitted(
-        &mut event_output,
-        explicit_host_alias,
-        config_context.load(),
-    )?;
     let host = report_not_admitted(
         &mut event_output,
         explicit_host_alias,
-        config
-            .resolve_host_with_project_source(explicit_host_alias)
-            .map(SelectedHost::from)
-            .map_err(failure),
+        config_context.resolve_session_host(explicit_host_alias, &session_id),
     )?;
+    let config = report_not_admitted(&mut event_output, Some(&host.alias), config_context.load())?;
     let yolo_policy = resolve_yolo_policy(
         config,
         &host.alias,
@@ -10815,7 +10973,7 @@ fn stop_session(
     let json = format.is_json();
     let session_id =
         SessionId::from_str(&command.session_id).map_err(|error| failure(error.into()))?;
-    let host = config.resolve_host(command.host.as_deref())?;
+    let host = config.resolve_session_host(command.host.as_deref(), &session_id)?;
     let transport = transport_for(&host)?;
     let result = transport.stop(&session_id).map_err(failure)?;
 
@@ -10833,6 +10991,132 @@ fn stop_session(
             result.stopped_at().unwrap_or("not applicable")
         );
         Ok(())
+    }
+}
+
+fn export_task_artifacts(
+    command: SessionExportCommand,
+    config: ConfigContext<'_>,
+) -> Result<(), CliFailure> {
+    let session_id =
+        SessionId::from_str(&command.session_id).map_err(|error| failure(error.into()))?;
+    let host = config.resolve_host(Some(&command.host))?;
+    let artifacts = transport_for(&host)?
+        .task_artifacts(&session_id)
+        .map_err(failure)?;
+    let output = persist_task_artifacts(&command.output, &artifacts)?;
+    println!("Exported task artifacts: {}", output.display());
+    Ok(())
+}
+
+fn persist_task_artifacts(
+    requested_output: &Path,
+    artifacts: &transport::TaskArtifacts,
+) -> Result<PathBuf, CliFailure> {
+    let file_name = requested_output.file_name().ok_or_else(|| {
+        failure(SatelleError::invalid_usage(
+            "--output must name a new destination directory",
+        ))
+    })?;
+    let requested_parent = requested_output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = requested_parent.canonicalize().map_err(|error| {
+        failure(SatelleError::invalid_usage(format!(
+            "task artifact output parent {} is unavailable: {error}",
+            requested_parent.display()
+        )))
+    })?;
+    let output = parent.join(file_name);
+    if output.try_exists().map_err(|error| {
+        failure(SatelleError::invalid_usage(format!(
+            "could not inspect task artifact destination {}: {error}",
+            output.display()
+        )))
+    })? {
+        return Err(failure(SatelleError::invalid_usage(format!(
+            "task artifact destination {} already exists",
+            output.display()
+        ))));
+    }
+
+    let _parent_guard = open_owner_only_directory(&parent).map_err(|error| {
+        failure(SatelleError::invalid_usage(format!(
+            "task artifact output parent {} is not owner-only: {error}",
+            parent.display()
+        )))
+    })?;
+    let staging_path = parent.join(format!(
+        ".satelle-task-artifacts-{}",
+        Uuid::now_v7().simple()
+    ));
+    let staging_guard = open_or_create_owner_only_directory(&staging_path).map_err(|error| {
+        failure(SatelleError::invalid_usage(format!(
+            "could not create owner-only task artifact staging directory: {error}"
+        )))
+    })?;
+    let mut staging_cleanup = TaskArtifactStagingCleanup::new(staging_path.clone());
+    for (name, body) in [
+        ("plan.md", artifacts.plan.as_bytes()),
+        ("worklog.md", artifacts.worklog.as_bytes()),
+        ("goal.md", artifacts.goal.as_bytes()),
+    ] {
+        let path = staging_path.join(name);
+        let mut file = open_new_owner_only_file(&path).map_err(|error| {
+            failure(SatelleError::invalid_usage(format!(
+                "could not create owner-only task artifact {name}: {error}"
+            )))
+        })?;
+        file.write_all(body).map_err(|error| {
+            failure(SatelleError::invalid_usage(format!(
+                "could not write task artifact {name}: {error}"
+            )))
+        })?;
+        file.flush().map_err(|error| {
+            failure(SatelleError::invalid_usage(format!(
+                "could not flush task artifact {name}: {error}"
+            )))
+        })?;
+        file.sync_all().map_err(|error| {
+            failure(SatelleError::invalid_usage(format!(
+                "could not sync task artifact {name}: {error}"
+            )))
+        })?;
+    }
+    sync_owner_only_directory(&staging_path, &staging_guard).map_err(|error| {
+        failure(SatelleError::invalid_usage(format!(
+            "could not sync task artifact staging directory: {error}"
+        )))
+    })?;
+    drop(staging_guard);
+    publish_new_owner_only_directory(&staging_path, &output).map_err(|error| {
+        failure(SatelleError::invalid_usage(format!(
+            "could not publish task artifact destination {}: {error}",
+            output.display()
+        )))
+    })?;
+    staging_cleanup.disarm();
+    Ok(output)
+}
+
+struct TaskArtifactStagingCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TaskArtifactStagingCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TaskArtifactStagingCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 

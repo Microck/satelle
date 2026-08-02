@@ -1,7 +1,7 @@
 use crate::{CliFailure, SelectedHost, bootstrap_lock, failure, on_demand_idle_timeout};
 use satelle_core::daemon_service::{
-    DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentServiceDecision,
-    SetupModeSelection, WindowsServiceConfigV2, WindowsTaskDefinition,
+    DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentHostStoragePolicy,
+    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV3, WindowsTaskDefinition,
 };
 use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
@@ -346,8 +346,33 @@ pub(crate) trait TransportClient {
         request: &TurnRequest,
     ) -> Result<PublicSession, SatelleError>;
     fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError>;
+    fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifacts, SatelleError>;
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError>;
     fn logs(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError>;
+}
+
+pub(crate) struct TaskArtifacts {
+    pub(crate) plan: String,
+    pub(crate) worklog: String,
+    pub(crate) goal: String,
+}
+
+impl TaskArtifacts {
+    fn from_host(artifacts: satelle_host::TaskArtifactSet) -> Self {
+        Self {
+            plan: artifacts.plan().to_string(),
+            worklog: artifacts.worklog().to_string(),
+            goal: artifacts.goal().to_string(),
+        }
+    }
+
+    fn from_response(artifacts: satelle_transport::TaskArtifactsResponse) -> Self {
+        Self {
+            plan: artifacts.plan().to_string(),
+            worklog: artifacts.worklog().to_string(),
+            goal: artifacts.goal().to_string(),
+        }
+    }
 }
 
 pub(crate) struct RepairLedgerPlan {
@@ -947,6 +972,12 @@ impl TransportClient for LocalTransport {
         self.service.status(session_id)
     }
 
+    fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifacts, SatelleError> {
+        self.service
+            .task_artifacts(session_id)
+            .map(TaskArtifacts::from_host)
+    }
+
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {
         self.service.stop(session_id)
     }
@@ -1309,7 +1340,7 @@ fn coordinate_persistent_setup(
 enum PreparedPersistentService {
     Windows {
         task: Box<WindowsTaskDefinition>,
-        config: Box<WindowsServiceConfigV2>,
+        config: Box<WindowsServiceConfigV3>,
     },
     Launchd(ssh_bootstrap::LaunchdServiceDefinition),
 }
@@ -2424,7 +2455,7 @@ impl SshSetupTransport {
         daemon_path_overrides: &DaemonPathOverrides,
         remote: &ssh_bootstrap::PersistentServiceRemote<'_>,
     ) -> Result<PreparedPersistentService, SatelleError> {
-        let setup_ledger_retention_ms = resolved_setup_ledger_retention_ms(&self.host_config);
+        let storage_policy = PersistentHostStoragePolicy::from_host_config(&self.host_config);
         match target.service_platform() {
             DaemonServicePlatform::Windows => {
                 let task = remote
@@ -2433,10 +2464,10 @@ impl SshSetupTransport {
                         artifact,
                     )
                     .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
-                let config = WindowsServiceConfigV2::new(
+                let config = WindowsServiceConfigV3::new(
                     "127.0.0.1:3001",
                     daemon_path_overrides,
-                    setup_ledger_retention_ms,
+                    storage_policy,
                 )
                 .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
                 Ok(PreparedPersistentService::Windows {
@@ -2445,7 +2476,7 @@ impl SshSetupTransport {
                 })
             }
             DaemonServicePlatform::Macos => remote
-                .launchd_definition(artifact, daemon_path_overrides, setup_ledger_retention_ms)
+                .launchd_definition(artifact, daemon_path_overrides, storage_policy)
                 .map(PreparedPersistentService::Launchd)
                 .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error)),
             DaemonServicePlatform::Linux => Err(SatelleError::persistent_service_unsupported(
@@ -3177,11 +3208,10 @@ pub(crate) fn preflight_ssh_storage_maintenance(host: &SelectedHost) -> Result<(
     Ok(())
 }
 
-fn resolved_setup_ledger_retention_ms(config: &satelle_core::HostConfig) -> u64 {
-    config.setup_ledger_retention.as_ref().map_or(
-        satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
-        satelle_core::ExplicitDuration::milliseconds,
-    )
+fn resolved_persistent_storage_policy(
+    config: &satelle_core::HostConfig,
+) -> PersistentHostStoragePolicy {
+    PersistentHostStoragePolicy::from_host_config(config)
 }
 
 pub(crate) fn preview_ssh_storage_restore(
@@ -3220,7 +3250,7 @@ pub(crate) fn preview_ssh_storage_restore(
             &service_asset_path,
             host_id,
             &path_overrides,
-            resolved_setup_ledger_retention_ms(&host.config),
+            resolved_persistent_storage_policy(&host.config),
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
         .ok_or_else(SatelleError::state_conflict)?;
@@ -3280,7 +3310,7 @@ pub(crate) fn plan_ssh_storage_backup_cleanup(
             &service_asset_path,
             host_id,
             &path_overrides,
-            resolved_setup_ledger_retention_ms(&host.config),
+            resolved_persistent_storage_policy(&host.config),
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
         .ok_or_else(SatelleError::state_conflict)?;
@@ -3914,7 +3944,7 @@ fn inspect_host_maintenance(
                                 &destination,
                                 host_id,
                                 &expected_path_overrides,
-                                resolved_setup_ledger_retention_ms(&host.config),
+                                resolved_persistent_storage_policy(&host.config),
                             )
                             .map_err(|error| {
                                 map_ssh_daemon_bootstrap_error(&transport.alias, error)
@@ -6969,6 +6999,10 @@ impl TransportClient for SshSetupTransport {
         Err(self.unsupported("session status"))
     }
 
+    fn task_artifacts(&self, _session_id: &SessionId) -> Result<TaskArtifacts, SatelleError> {
+        Err(self.unsupported("task artifact export"))
+    }
+
     fn stop(&self, _session_id: &SessionId) -> Result<StopResult, SatelleError> {
         Err(self.unsupported("session stop"))
     }
@@ -7232,6 +7266,13 @@ impl TransportClient for DirectTransport {
         self.client
             .read_session(session_id)
             .map(|response| response.session().clone())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifacts, SatelleError> {
+        self.client
+            .read_task_artifacts(session_id)
+            .map(TaskArtifacts::from_response)
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 

@@ -50,7 +50,10 @@ use crate::storage::{
     ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan,
     SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
 };
-use crate::{ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery};
+use crate::{
+    ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery, LogSubject,
+    TaskArtifactSet,
+};
 use recovery::RecoveryQueue;
 pub(crate) use recovery::VerifiedSetupPostconditions;
 #[cfg(test)]
@@ -63,6 +66,7 @@ use satelle_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -70,6 +74,13 @@ use zeroize::Zeroizing;
 
 pub(crate) fn storage_failure(error: crate::storage::StorageError) -> SatelleError {
     model::storage_failure(error)
+}
+
+fn artifact_time(value: time::OffsetDateTime) -> Result<String, SatelleError> {
+    value
+        .to_offset(time::UtcOffset::UTC)
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|_| model::integrity_failure("stored task artifact time is invalid"))
 }
 
 #[cfg(test)]
@@ -615,7 +626,45 @@ pub(crate) struct RuntimeEngine {
     live_events: LiveEventHub,
     process_identity: ProcessIdentity,
     attachment_store: crate::attachment::AttachmentStore,
+    session_metadata_retention: time::Duration,
     setup_ledger_retention: time::Duration,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeStoragePolicy {
+    session_metadata_retention: time::Duration,
+    setup_ledger_retention: time::Duration,
+    operator_log_retained_files: usize,
+}
+
+impl RuntimeStoragePolicy {
+    pub(crate) fn from_host_config(config: &satelle_core::HostConfig) -> Self {
+        Self {
+            session_metadata_retention: config
+                .session_metadata_retention
+                .as_ref()
+                .map_or(crate::storage::DEFAULT_SESSION_RETENTION, |retention| {
+                    time::Duration::hours(retention.hours() as i64)
+                }),
+            setup_ledger_retention: config.setup_ledger_retention.as_ref().map_or(
+                crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
+                crate::duration_to_time,
+            ),
+            operator_log_retained_files: config
+                .operator_log_retained_files
+                .unwrap_or(satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES),
+        }
+    }
+}
+
+impl Default for RuntimeStoragePolicy {
+    fn default() -> Self {
+        Self {
+            session_metadata_retention: crate::storage::DEFAULT_SESSION_RETENTION,
+            setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
+            operator_log_retained_files: satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -643,6 +692,7 @@ impl RuntimeProviderPolicy {
 pub(crate) struct RuntimeSnapshot {
     host_identity: satelle_core::session::HostIdentityRef,
     storage: StorageSnapshot,
+    operator_log_health: crate::storage::OperatorLogSinkHealth,
 }
 
 impl RuntimeSnapshot {
@@ -661,6 +711,10 @@ impl RuntimeSnapshot {
     pub(crate) const fn recovery_pending_turn_count(&self) -> usize {
         self.storage.recovery_pending_turn_count()
     }
+
+    pub(crate) const fn operator_log_health(&self) -> crate::storage::OperatorLogSinkHealth {
+        self.operator_log_health
+    }
 }
 
 impl RuntimeEngine {
@@ -670,7 +724,7 @@ impl RuntimeEngine {
         adapter: Arc<dyn ComputerUseAdapter>,
         readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
         provider_policy: RuntimeProviderPolicy,
-        setup_ledger_retention: time::Duration,
+        storage_policy: RuntimeStoragePolicy,
         provider_smoke_fingerprinter: Option<
             crate::provider_auth::ProviderSmokeCredentialFingerprinter,
         >,
@@ -693,7 +747,8 @@ impl RuntimeEngine {
         let engine = Arc::new(Self {
             storage: Arc::new(Mutex::new(storage)),
             operator_log: Mutex::new(OperatorLogMirror::new(
-                OperatorLogPolicy::new(operator_log_root),
+                OperatorLogPolicy::new(operator_log_root)
+                    .with_retained_files(storage_policy.operator_log_retained_files),
                 mirrored_cursor,
             )),
             adapter,
@@ -705,7 +760,8 @@ impl RuntimeEngine {
             live_events: LiveEventHub::new(),
             process_identity,
             attachment_store,
-            setup_ledger_retention,
+            session_metadata_retention: storage_policy.session_metadata_retention,
+            setup_ledger_retention: storage_policy.setup_ledger_retention,
         });
         Ok(engine)
     }
@@ -1107,7 +1163,8 @@ impl RuntimeEngine {
             started_at,
             &command.identity,
             &self.process_identity,
-        )?;
+        )?
+        .with_readiness_ref(model::admission_readiness_ref(&readiness)?);
         let attachments = self.attachment_store.stage(command.attachments)?;
         let (outcome, provider_smoke_event) =
             command
@@ -1167,7 +1224,8 @@ impl RuntimeEngine {
             started_at,
             &command.identity,
             &self.process_identity,
-        )?;
+        )?
+        .with_readiness_ref(model::admission_readiness_ref(&readiness)?);
         let attachments = self.attachment_store.stage(command.attachments)?;
         let (outcome, provider_smoke_event) = command.cancellation.with_commit_gate(
             command.session_id.clone(),
@@ -2066,7 +2124,7 @@ impl RuntimeEngine {
                     };
                 let work = TurnWork {
                     session,
-                    subject: recovery_subject,
+                    subject: *recovery_subject,
                     _heartbeat: heartbeat,
                 };
                 let admitted = model::turn_outcome(&work.session, Vec::new());
@@ -2099,6 +2157,211 @@ impl RuntimeEngine {
             .map_err(model::storage_failure)?
             .ok_or_else(|| SatelleError::session_not_found(session_id))?;
         Ok(session.to_public())
+    }
+
+    fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifactSet, SatelleError> {
+        self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
+        let mut storage = self.lock_storage()?;
+        let session = storage
+            .load_session(session_id)
+            .map_err(model::storage_failure)?
+            .ok_or_else(|| SatelleError::session_not_found(session_id))?;
+
+        let mut plan = String::new();
+        writeln!(plan, "# Plan\n").expect("writing to a String cannot fail");
+        writeln!(plan, "- Session ID: {}", session.id()).expect("writing to a String cannot fail");
+        writeln!(
+            plan,
+            "- Host Identity: {}",
+            session.host_identity().as_str()
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            plan,
+            "- Desktop Binding: {}\n",
+            session.desktop_binding().as_str()
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(plan, "## Turns\n").expect("writing to a String cannot fail");
+
+        let mut goal_ref = None;
+        for (ordinal, turn) in session.turns().enumerate() {
+            let subject = storage
+                .recovery_subject(session.id(), turn.id())
+                .map_err(model::storage_failure)?;
+            goal_ref = goal_ref.or_else(|| {
+                subject
+                    .upstream_goal_ref()
+                    .map(|value| value.as_str().to_string())
+            });
+            let policy = turn.execution_policy();
+            writeln!(plan, "### Turn {}\n", ordinal + 1).expect("writing to a String cannot fail");
+            writeln!(plan, "- Turn ID: {}", turn.id()).expect("writing to a String cannot fail");
+            writeln!(plan, "- State: {}", turn.state().as_str())
+                .expect("writing to a String cannot fail");
+            writeln!(plan, "- Model: {}", policy.effective_model().as_str())
+                .expect("writing to a String cannot fail");
+            writeln!(plan, "- Provider: {}", policy.provider_binding().as_str())
+                .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Desktop Session: {}",
+                policy.desktop_target().session_id()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Approval Policy: {}",
+                policy.approval_policy().as_str()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Sandbox Policy: {}",
+                policy.sandbox_policy().as_str()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Turn Timeout Seconds: {}",
+                policy.timeout_policy().seconds()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Computer Use: {}",
+                policy.experimental_features().computer_use().as_str()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Provider Computer Use: {}",
+                policy
+                    .experimental_features()
+                    .provider_computer_use()
+                    .as_str()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(plan, "- Started At: {}", artifact_time(turn.started_at())?)
+                .expect("writing to a String cannot fail");
+            writeln!(plan, "- Updated At: {}", artifact_time(turn.updated_at())?)
+                .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Terminal At: {}",
+                turn.terminal_at()
+                    .map(artifact_time)
+                    .transpose()?
+                    .unwrap_or_else(|| "not recorded".to_string())
+            )
+            .expect("writing to a String cannot fail");
+            if let Some(readiness) = subject.admission_readiness() {
+                writeln!(
+                    plan,
+                    "- Native Readiness: result={}, observed_at={}, source={}",
+                    readiness.native_result_id(),
+                    artifact_time(readiness.native_observed_at())?,
+                    readiness.native_source()
+                )
+                .expect("writing to a String cannot fail");
+                match (
+                    readiness.provider_result_id(),
+                    readiness.provider_observed_at(),
+                    readiness.provider_source(),
+                ) {
+                    (Some(result_id), Some(observed_at), Some(source)) => {
+                        writeln!(
+                            plan,
+                            "- Provider Readiness: result={result_id}, observed_at={}, source={source}\n",
+                            artifact_time(observed_at)?
+                        )
+                        .expect("writing to a String cannot fail");
+                    }
+                    _ => writeln!(plan, "- Provider Readiness: not recorded\n")
+                        .expect("writing to a String cannot fail"),
+                }
+            } else {
+                writeln!(plan, "- Native Readiness: not recorded")
+                    .expect("writing to a String cannot fail");
+                writeln!(plan, "- Provider Readiness: not recorded\n")
+                    .expect("writing to a String cannot fail");
+            }
+        }
+
+        let mut goal = String::new();
+        writeln!(goal, "# Goal\n").expect("writing to a String cannot fail");
+        writeln!(goal, "- Session ID: {}", session.id()).expect("writing to a String cannot fail");
+        writeln!(
+            goal,
+            "- Upstream Goal Reference: {}",
+            goal_ref.as_deref().unwrap_or("not recorded")
+        )
+        .expect("writing to a String cannot fail");
+
+        let mut worklog = String::new();
+        writeln!(worklog, "# Worklog\n").expect("writing to a String cannot fail");
+        let mut cursor = None;
+        loop {
+            let query = LogPageQuery::forward(cursor, 10_000)
+                .expect("the artifact log page size is valid")
+                .with_session(session.id().clone());
+            let page = match storage.log_page(&query) {
+                Ok(page) => page,
+                Err(LogPageStorageError::Storage(error)) => {
+                    return Err(model::storage_failure(error));
+                }
+                Err(LogPageStorageError::CursorExpired { .. }) => {
+                    return Err(model::integrity_failure(
+                        "task artifact log pagination crossed the retention boundary",
+                    ));
+                }
+                Err(LogPageStorageError::CursorAhead) => {
+                    return Err(model::integrity_failure(
+                        "task artifact log pagination crossed the Host log tail",
+                    ));
+                }
+            };
+            for entry in page.entries() {
+                let turn_id = match entry.subject() {
+                    LogSubject::Turn { turn_id, .. } => turn_id.as_str(),
+                    LogSubject::Host => "host",
+                };
+                writeln!(
+                    worklog,
+                    "- {} [{}] source={} event={} turn={} cursor={}: {}",
+                    artifact_time(entry.timestamp())?,
+                    entry.severity().as_str(),
+                    entry.source().as_str(),
+                    entry.event().as_str(),
+                    turn_id,
+                    entry.cursor(),
+                    entry.event().message(),
+                )
+                .expect("writing to a String cannot fail");
+            }
+            if !page.truncated() {
+                break;
+            }
+            cursor = Some(page.next_cursor());
+        }
+        for turn in session.turns() {
+            if let Some(summary) = turn.safe_summary() {
+                writeln!(
+                    worklog,
+                    "- Turn {} terminal summary: {}",
+                    turn.id(),
+                    summary.as_str()
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+
+        Ok(TaskArtifactSet::new(
+            session.id().clone(),
+            plan,
+            worklog,
+            goal,
+        ))
     }
 
     fn log_page(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
@@ -2150,9 +2413,15 @@ impl RuntimeEngine {
     fn snapshot(&self) -> Result<RuntimeSnapshot, SatelleError> {
         self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
         let storage = self.lock_storage()?;
+        let operator_log_health = self
+            .operator_log
+            .lock()
+            .map_err(|_| model::integrity_failure("the operator log mirror lock was poisoned"))?
+            .health();
         Ok(RuntimeSnapshot {
             host_identity: storage.host_identity().map_err(model::storage_failure)?,
             storage: storage.snapshot().map_err(model::storage_failure)?,
+            operator_log_health,
         })
     }
 
@@ -2173,8 +2442,9 @@ impl RuntimeEngine {
         observed_at: time::OffsetDateTime,
     ) -> Result<(), SatelleError> {
         self.lock_storage()?
-            .prune_expired_session_metadata_with_setup_retention(
+            .prune_expired_session_metadata_with_retention(
                 observed_at,
+                self.session_metadata_retention,
                 self.setup_ledger_retention,
             )
             .map_err(model::storage_failure)
@@ -2227,7 +2497,7 @@ struct LazyRuntime {
     operator_log_root: Result<PathBuf, SatelleError>,
     engine: Option<Arc<RuntimeEngine>>,
     provider_policy: RuntimeProviderPolicy,
-    setup_ledger_retention: time::Duration,
+    storage_policy: RuntimeStoragePolicy,
     provider_smoke_fingerprinter:
         Option<crate::provider_auth::ProviderSmokeCredentialFingerprinter>,
 }
@@ -2635,7 +2905,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy: RuntimeProviderPolicy::default(),
-                setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
+                storage_policy: RuntimeStoragePolicy::default(),
                 provider_smoke_fingerprinter: None,
             })),
         }
@@ -2660,7 +2930,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy,
-                setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
+                storage_policy: RuntimeStoragePolicy::default(),
                 provider_smoke_fingerprinter: Some(
                     crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
                 ),
@@ -2692,7 +2962,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy,
-                setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
+                storage_policy: RuntimeStoragePolicy::default(),
                 provider_smoke_fingerprinter: Some(
                     crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
                 ),
@@ -2705,7 +2975,7 @@ impl RuntimeHandle {
         operator_log_root: Result<PathBuf, SatelleError>,
         adapter: ProductionComputerUseAdapter,
         provider_policy: RuntimeProviderPolicy,
-        setup_ledger_retention: time::Duration,
+        storage_policy: RuntimeStoragePolicy,
     ) -> Self {
         let provider_smoke_fingerprinter = adapter.provider_smoke_fingerprinter();
         let adapter = Arc::new(adapter);
@@ -2720,7 +2990,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy,
-                setup_ledger_retention,
+                storage_policy,
                 provider_smoke_fingerprinter: Some(provider_smoke_fingerprinter),
             })),
         }
@@ -2731,6 +3001,7 @@ impl RuntimeHandle {
         self.lazy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .storage_policy
             .setup_ledger_retention
     }
 
@@ -2757,7 +3028,7 @@ impl RuntimeHandle {
                 operator_log_root,
                 engine: None,
                 provider_policy: RuntimeProviderPolicy::default(),
-                setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
+                storage_policy: RuntimeStoragePolicy::default(),
                 provider_smoke_fingerprinter: Some(
                     crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
                 ),
@@ -3002,6 +3273,13 @@ impl RuntimeHandle {
 
     pub(crate) fn status(&self, session_id: SessionId) -> Result<PublicSession, SatelleError> {
         self.engine()?.status(&session_id)
+    }
+
+    pub(crate) fn task_artifacts(
+        &self,
+        session_id: SessionId,
+    ) -> Result<TaskArtifactSet, SatelleError> {
+        self.engine()?.task_artifacts(&session_id)
     }
 
     pub(crate) fn log_page(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
@@ -3883,7 +4161,7 @@ impl RuntimeHandle {
             Arc::clone(&self.adapter),
             self.readiness_probe_driver.clone(),
             lazy.provider_policy.clone(),
-            lazy.setup_ledger_retention,
+            lazy.storage_policy,
             lazy.provider_smoke_fingerprinter.clone(),
         )?;
         lazy.engine = Some(Arc::clone(&engine));

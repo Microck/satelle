@@ -327,11 +327,32 @@ pub enum ApprovalPolicy {
     Never,
 }
 
+impl ApprovalPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Untrusted => "untrusted",
+            Self::OnFailure => "on_failure",
+            Self::OnRequest => "on_request",
+            Self::Never => "never",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SandboxPolicy {
     ReadOnly,
     WorkspaceWrite,
     DangerFullAccess,
+}
+
+impl SandboxPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::DangerFullAccess => "danger_full_access",
+        }
+    }
 }
 
 /// Operator-selected execution posture for one Turn.
@@ -350,6 +371,15 @@ pub enum TurnExecutionMode {
 pub enum FeatureChoice {
     Disabled,
     Enabled,
+}
+
+impl FeatureChoice {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

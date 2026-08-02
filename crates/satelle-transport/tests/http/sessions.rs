@@ -6,7 +6,8 @@ use satelle_core::session::{SessionActivity, TurnExecutionMode};
 use satelle_test_contract::assert_privacy_canaries_absent;
 use satelle_transport::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ImageAttachment,
-    MAX_IMAGE_ATTACHMENT_BYTES, SessionResponse, StopRequest, StopResponse, TurnRequest,
+    MAX_IMAGE_ATTACHMENT_BYTES, SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse,
+    TurnRequest,
 };
 use sha2::Digest as _;
 
@@ -342,6 +343,86 @@ async fn session_routes_complete_the_durable_reconnect_journey() {
         stopped.result().outcome(),
         StopResultOutcome::AlreadyTerminal
     );
+}
+
+#[tokio::test]
+async fn task_artifact_read_is_closed_redacted_and_identity_pinned() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let prompt_canary = "PRIVATE_TASK_ARTIFACT_HTTP_PROMPT_CANARY";
+    let created: SessionResponse = running
+        .mutation("/v1/sessions", "task-artifact-export-session")
+        .json(&TurnRequest::new(prompt_canary))
+        .send()
+        .await
+        .expect("create task artifact Session")
+        .json()
+        .await
+        .expect("decode task artifact Session");
+    let session_id = created.session().session_id().clone();
+    wait_until_idle(&running, session_id.as_str()).await;
+    let path = format!("/v1/sessions/{session_id}/task-artifacts");
+
+    let response = running
+        .request(&path)
+        .send()
+        .await
+        .expect("read task artifact response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("read task artifact bytes");
+    assert_privacy_canaries_absent("task artifact HTTP response", &bytes, &[prompt_canary]);
+    let json: Value = serde_json::from_slice(&bytes).expect("parse task artifact response");
+    let keys = json
+        .as_object()
+        .expect("task artifact response is an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "goal",
+            "host_identity",
+            "plan",
+            "request_id",
+            "schema_version",
+            "session_id",
+            "worklog",
+        ])
+    );
+    assert_eq!(json["schema_version"], "satelle.task_artifacts.v1");
+    let artifacts: TaskArtifactsResponse =
+        serde_json::from_slice(&bytes).expect("decode task artifact contract");
+    assert_eq!(artifacts.host_identity(), running.host_identity);
+    assert_eq!(artifacts.session_id(), &session_id);
+    assert!(artifacts.plan().starts_with("# Plan\n\n"));
+    assert!(artifacts.worklog().starts_with("# Worklog\n\n"));
+    assert!(artifacts.goal().contains("not recorded"));
+
+    let mismatched = protected_at(
+        &reqwest::Client::new(),
+        Method::GET,
+        running.server.local_addr(),
+        &path,
+        &bearer(&running.token),
+        "unexpected-host",
+    )
+    .send()
+    .await
+    .expect("reject mismatched task artifact Host identity");
+    assert_api_error(mismatched, StatusCode::CONFLICT, "host-identity-mismatch").await;
+
+    let diagnostics_only = RunningServer::start(ApiScopes::DIAGNOSTICS_SENSITIVE).await;
+    let forbidden = diagnostics_only
+        .request(&path)
+        .send()
+        .await
+        .expect("reject task artifact read without read scope");
+    assert_api_error(
+        forbidden,
+        StatusCode::FORBIDDEN,
+        "authorization-insufficient-scope",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1102,6 +1183,11 @@ async fn daemon_client_drives_the_complete_session_control_contract() {
         assert_eq!(steered.session().session_id(), &session_id);
         assert_eq!(steered.session().turns().len(), 2);
         wait_until_idle_with_client(&client, &session_id);
+        let artifacts = client
+            .read_task_artifacts(&session_id)
+            .expect("read task artifacts through DaemonClient");
+        assert_eq!(artifacts.session_id(), &session_id);
+        assert!(artifacts.plan().contains("### Turn 2"));
 
         let stale = client
             .stop_session_for_turn(&session_id, &original_turn_id, STALE_STOP_KEY)
@@ -1139,7 +1225,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "13")
+        .header("Satelle-Protocol-Version", "14")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -1798,7 +1884,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "13")
+        request.header("Satelle-Protocol-Version", "14")
     } else {
         request
     }

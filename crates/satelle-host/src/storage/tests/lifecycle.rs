@@ -6,7 +6,15 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
     let (mut storage, recovery) = Storage::open(state.path()).expect("open storage");
     assert!(recovery.is_empty());
     let mut session = initial_session(&storage, SESSION_1, TURN_1, at(0));
-    let run = admission(IdempotentOperation::Run, "run-1", "request-run-1", at(0));
+    let run_readiness = AdmissionReadinessRef::new(
+        "native-readiness-1",
+        at(0),
+        "live",
+        Some(("provider-readiness-1", at(0), "refresh")),
+    )
+    .expect("construct initial admission readiness");
+    let run = admission(IdempotentOperation::Run, "run-1", "request-run-1", at(0))
+        .with_readiness_ref(run_readiness.clone());
 
     let admitted = storage
         .begin_session(&session, &run)
@@ -41,6 +49,13 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
         "thread-private-1",
         "turn-private-1",
     );
+    storage
+        .record_upstream_ref(
+            session.id(),
+            &turn_id(TURN_1),
+            &ObservedUpstreamRef::goal("goal-private-1").unwrap(),
+        )
+        .expect("record the durable Goal reference");
     session = storage
         .commit_lifecycle(
             session.id(),
@@ -51,12 +66,16 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
         )
         .expect("commit completion");
 
+    let follow_up_readiness =
+        AdmissionReadinessRef::new("native-readiness-2", at(3), "cache", None)
+            .expect("construct follow-up admission readiness");
     let steer = admission(
         IdempotentOperation::Steer,
         "steer-1",
         "request-steer-1",
         at(3),
-    );
+    )
+    .with_readiness_ref(follow_up_readiness.clone());
     let follow_up = storage
         .begin_follow_up(
             session.id(),
@@ -101,6 +120,29 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
         .expect("load Session")
         .expect("stored Session");
     assert_eq!(expected, restored.snapshot());
+    assert_eq!(restored.id(), &session_id(SESSION_1));
+    assert_eq!(restored.host_identity(), session.host_identity());
+    assert_eq!(
+        storage
+            .recovery_subject(restored.id(), &turn_id(TURN_1))
+            .expect("restore initial Turn metadata")
+            .admission_readiness(),
+        Some(&run_readiness)
+    );
+    let follow_up_subject = storage
+        .recovery_subject(restored.id(), &turn_id(TURN_2))
+        .expect("restore follow-up Turn metadata");
+    assert_eq!(
+        follow_up_subject.admission_readiness(),
+        Some(&follow_up_readiness)
+    );
+    assert_eq!(
+        follow_up_subject
+            .upstream_goal_ref()
+            .expect("restore Session Goal reference")
+            .as_str(),
+        "goal-private-1"
+    );
     assert_eq!(
         "desktop-session-1",
         restored

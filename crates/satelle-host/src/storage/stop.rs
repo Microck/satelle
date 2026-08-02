@@ -23,7 +23,7 @@ use time::OffsetDateTime;
 
 pub(crate) struct StopClaim {
     idempotency: IdempotencyInput,
-    recovery_subject: RecoverySubject,
+    recovery_subject: Box<RecoverySubject>,
 }
 
 pub(crate) struct StopAdmissionTarget {
@@ -273,7 +273,7 @@ impl Storage {
             let recovery_subject = load_recovery_subject(&transaction, &session, &turn_id)?;
             let claim = StopClaim {
                 idempotency: idempotency.clone(),
-                recovery_subject,
+                recovery_subject: Box::new(recovery_subject),
             };
             transaction
                 .commit()
@@ -345,7 +345,7 @@ impl Storage {
         )?;
         let claim = StopClaim {
             idempotency: idempotency.clone(),
-            recovery_subject,
+            recovery_subject: Box::new(recovery_subject),
         };
         transaction
             .commit()

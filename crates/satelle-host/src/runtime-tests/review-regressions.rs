@@ -603,7 +603,7 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
         execution_mode: satelle_core::session::TurnExecutionMode::Standard,
         work: super::super::worker::TurnWork {
             session,
-            subject: recovery_subject,
+            subject: *recovery_subject,
             _heartbeat: heartbeat,
         },
         provider_smoke_event: None,

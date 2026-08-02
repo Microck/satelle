@@ -86,7 +86,12 @@ fn production_service_reports_the_frozen_service_config_path_set() {
             state_dir: Some(configured_state_root.clone()),
             ..DaemonPathOverrides::default()
         },
-        3_600_000,
+        satelle_core::daemon_service::PersistentHostStoragePolicy::new(
+            3_600_000,
+            satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+            satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
+        )
+        .expect("valid persistent storage policy"),
     )
     .expect("valid persistent service configuration");
     let paths = service

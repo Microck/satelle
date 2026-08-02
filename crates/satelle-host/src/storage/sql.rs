@@ -1,14 +1,15 @@
 use super::codec::{
     approval_policy_token, feature_choice_integer, format_revision, format_time,
     format_turn_revision, idempotent_operation_token, load_required_session, log_event_token,
-    log_severity_token, log_source_token, safe_summary_token, sandbox_policy_token,
+    log_severity_token, log_source_token, parse_time, safe_summary_token, sandbox_policy_token,
     turn_idempotency_token, turn_state_token, unix_timestamp_nanos,
 };
 use super::logs::canonical_log;
 use super::{
-    IDEMPOTENCY_RETENTION, IdempotencyInput, IdempotentOperation, LeaseOwner, LogEvent,
-    LogSeverity, ObservedUpstreamRef, PrivateRequestToken, PrivateUpstreamRef, RecoverySubject,
-    SafeLogRecord, Storage, StorageError, StorageErrorKind, sqlite_error,
+    AdmissionReadinessRef, IDEMPOTENCY_RETENTION, IdempotencyInput, IdempotentOperation,
+    LeaseOwner, LogEvent, LogSeverity, ObservedUpstreamRef, PrivateRequestToken,
+    PrivateUpstreamRef, RecoverySubject, SafeLogRecord, Storage, StorageError, StorageErrorKind,
+    sqlite_error,
 };
 use crate::LogSubject;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -271,6 +272,29 @@ pub(super) fn insert_turn(
                 i64::from(policy.timeout_policy().seconds()),
                 feature_choice_integer(policy.experimental_features().computer_use()),
                 feature_choice_integer(policy.experimental_features().provider_computer_use()),
+            ],
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    Ok(())
+}
+
+pub(super) fn insert_admission_readiness(
+    transaction: &Transaction<'_>,
+    turn_id: &TurnId,
+    readiness: &AdmissionReadinessRef,
+) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "INSERT INTO turn_admission_readiness (turn_id, native_result_id, native_observed_at, native_source, provider_result_id, provider_observed_at, provider_source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                turn_id.as_str(),
+                readiness.native_result_id(),
+                format_time(readiness.native_observed_at())?,
+                readiness.native_source(),
+                readiness.provider_result_id(),
+                readiness.provider_observed_at().map(format_time).transpose()?,
+                readiness.provider_source(),
             ],
         )
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -587,25 +611,89 @@ pub(super) fn load_recovery_subject(
     session: &Session,
     turn_id: &TurnId,
 ) -> Result<RecoverySubject, StorageError> {
-    let turn = session
-        .turn(turn_id)
-        .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-    let (request_token, upstream_thread_ref, upstream_turn_ref, upstream_goal_ref): (
+    type StoredRecoverySubjectRefs = (
         String,
         Option<String>,
         Option<String>,
         Option<String>,
-    ) = connection
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    let turn = session
+        .turn(turn_id)
+        .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    let (
+        request_token,
+        upstream_thread_ref,
+        upstream_turn_ref,
+        upstream_goal_ref,
+        native_result_id,
+        native_observed_at,
+        native_source,
+        provider_result_id,
+        provider_observed_at,
+        provider_source,
+    ): StoredRecoverySubjectRefs = connection
         .query_row(
-            "SELECT t.request_token, s.upstream_thread_ref, t.upstream_turn_ref, s.upstream_goal_ref \
+            "SELECT t.request_token, s.upstream_thread_ref, t.upstream_turn_ref, s.upstream_goal_ref, \
+                    r.native_result_id, r.native_observed_at, r.native_source, \
+                    r.provider_result_id, r.provider_observed_at, r.provider_source \
              FROM turn_private_refs t \
              JOIN turns u ON u.turn_id = t.turn_id \
              JOIN session_private_refs s ON s.session_id = u.session_id \
+             LEFT JOIN turn_admission_readiness r ON r.turn_id = u.turn_id \
              WHERE u.session_id = ?1 AND u.turn_id = ?2",
             params![session.id().as_str(), turn_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
         )
         .map_err(|source| sqlite_error(StorageErrorKind::InvalidStoredState, source))?;
+    let admission_readiness = match (native_result_id, native_observed_at, native_source) {
+        (Some(result_id), Some(observed_at), Some(source)) => {
+            let provider = match (provider_result_id, provider_observed_at, provider_source) {
+                (Some(result_id), Some(observed_at), Some(source)) => {
+                    Some((result_id, parse_time(&observed_at)?, source))
+                }
+                (None, None, None) => None,
+                _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+            };
+            Some(AdmissionReadinessRef::new(
+                result_id,
+                parse_time(&observed_at)?,
+                &source,
+                provider.as_ref().map(|(result_id, observed_at, source)| {
+                    (result_id.as_str(), *observed_at, source.as_str())
+                }),
+            )?)
+        }
+        (None, None, None) => {
+            if provider_result_id.is_some()
+                || provider_observed_at.is_some()
+                || provider_source.is_some()
+            {
+                return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+            }
+            None
+        }
+        _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+    };
     Ok(RecoverySubject {
         session_id: session.id().clone(),
         turn_id: turn_id.clone(),
@@ -621,6 +709,7 @@ pub(super) fn load_recovery_subject(
             .transpose()?,
         upstream_turn_ref: upstream_turn_ref.map(PrivateUpstreamRef::new).transpose()?,
         upstream_goal_ref: upstream_goal_ref.map(PrivateUpstreamRef::new).transpose()?,
+        admission_readiness,
     })
 }
 

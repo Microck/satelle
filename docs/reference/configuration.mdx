@@ -29,6 +29,8 @@ daemon_idle_timeout = "10m"
 native_readiness_cache_ttl = "5m"
 provider_smoke_success_cache_ttl = "1440m"
 provider_smoke_failure_cache_ttl = "10m"
+session_metadata_retention = "30d"
+operator_log_retained_files = 12
 yolo = false
 
 [hosts.local-demo.timeouts]
@@ -40,7 +42,9 @@ Host fields include `transport`, `adapter`, `address`, `network`, `timeouts`,
 desktop selection, daemon path overrides, `setup_mode`, experimental-provider
 opt-in, daemon and readiness cache TTLs, Host-scoped `yolo`, project-selection
 permission, direct-transport identity and trust fields, and provider Secret
-Source descriptors.
+Source descriptors. `session_metadata_retention` accepts `h` or `d` values from
+7 days through 365 days. `operator_log_retained_files` keeps 1 through 100
+rotated 10 MiB files and does not change SQLite log retention.
 
 The duration parser requires explicit units such as `500ms`, `30s`, or `2m`.
 Configuration does not perform environment-variable interpolation.
@@ -60,6 +64,8 @@ provider_smoke_success_cache_ttl = "720m"
 provider_smoke_failure_cache_ttl = "5m"
 log_verbosity = "debug"
 trusted_profile = "maintenance"
+session_metadata_retention = "30d"
+operator_log_retained_files = 12
 yolo = false
 
 [profiles.work.timeouts]
@@ -78,6 +84,7 @@ implicitly by a same-name profile.
 Diagnostic verbosity accepts `off`, `info`, `debug`, or `trace`. Precedence is
 `--log-verbosity`, then `SATELLE_LOG`, then profile and user configuration.
 JSON command output never includes diagnostic logs.
+Only a user-selected profile can change destructive retention.
 
 ## Project configuration
 
@@ -98,7 +105,7 @@ native_readiness = "90s"
 The matching Host alias must already exist in user configuration and permit
 project selection. Project configuration cannot define addresses, TLS trust,
 tokens, desktop identity, daemon paths, Secret Sources, mutation consent,
-Trusted Profiles, or YOLO enablement.
+Trusted Profiles, destructive retention, or YOLO enablement.
 
 ## Inspect the result
 

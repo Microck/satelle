@@ -115,8 +115,29 @@ fn production_runtime_with_host_policy(
         Ok(state_root.join("logs")),
         adapter,
         RuntimeProviderPolicy::from_host_config(config),
-        crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
+        super::RuntimeStoragePolicy::from_host_config(config),
     )
+}
+
+#[test]
+fn host_retention_config_becomes_the_runtime_storage_policy() {
+    let mut config = satelle_core::SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .expect("the built-in local Host config exists");
+    config.session_metadata_retention =
+        Some(satelle_core::RetentionDuration::parse("30d").expect("parse session retention"));
+    config.operator_log_retained_files = Some(12);
+
+    let policy = super::RuntimeStoragePolicy::from_host_config(&config);
+
+    assert_eq!(policy.session_metadata_retention, time::Duration::days(30));
+    assert_eq!(policy.operator_log_retained_files, 12);
+    assert_eq!(
+        policy.setup_ledger_retention,
+        crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
+        "session and operator-log policy must not change setup-ledger retention",
+    );
 }
 
 #[cfg(unix)]
@@ -659,6 +680,13 @@ fn runtime_mirrors_only_committed_normalized_log_entries() {
     assert!(operator_log.contains(&format!("cursor={cursor}")));
     assert!(operator_log.contains("event=store_opened subject=host"));
     assert!(operator_log.contains("message=\"opened Host state store\""));
+    assert_eq!(
+        runtime
+            .snapshot()
+            .expect("read runtime sink health")
+            .operator_log_health(),
+        crate::storage::OperatorLogSinkHealth::Healthy
+    );
 }
 
 #[test]
@@ -2008,6 +2036,68 @@ fn adapter_persists_upstream_refs_before_waiting_and_stop_keeps_them_durable() {
     );
     assert_eq!(final_subject.upstream_turn_ref(), Some(&expected_turn_ref));
     assert_eq!(final_subject.upstream_goal_ref(), Some(&expected_goal_ref));
+}
+
+#[test]
+fn task_artifacts_use_only_durable_redacted_session_state() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = ReferencePersistingAdapter::default();
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+    let raw_prompt = "PRIVATE_TASK_ARTIFACT_PROMPT_CANARY";
+    let session = runtime
+        .run(RunCommand::detached(LOCAL_DEMO_HOST, raw_prompt))
+        .expect("detached work should be admitted")
+        .session;
+    if !adapter.references_recorded.wait_for(WAIT_LIMIT) {
+        adapter.execute_release.signal();
+        panic!("the adapter did not durably record its upstream references");
+    }
+
+    let artifacts = runtime
+        .task_artifacts(session.session_id().clone())
+        .expect("the Host should render task artifacts from SQLite");
+    assert_eq!(artifacts.session_id(), session.session_id());
+    assert!(artifacts.plan().starts_with("# Plan\n\n"));
+    assert!(
+        artifacts
+            .plan()
+            .contains("- Model: fake-model-v1\n- Provider: fake-provider-v1")
+    );
+    assert!(artifacts.plan().contains("- Native Readiness: result="));
+    assert!(artifacts.plan().contains(", source=live"));
+    assert_eq!(
+        artifacts.goal(),
+        format!(
+            "# Goal\n\n- Session ID: {}\n- Upstream Goal Reference: {PRIVATE_UPSTREAM_GOAL_REF}\n",
+            session.session_id()
+        )
+    );
+    assert!(artifacts.worklog().starts_with("# Worklog\n\n"));
+    assert!(artifacts.worklog().contains("event=session_started"));
+
+    let redacted = format!(
+        "{}\n{}\n{}",
+        artifacts.plan(),
+        artifacts.worklog(),
+        artifacts.goal()
+    );
+    assert_privacy_canaries_absent(
+        "task artifact bodies",
+        redacted.as_bytes(),
+        &[
+            raw_prompt,
+            PRIVATE_UPSTREAM_THREAD_REF,
+            PRIVATE_UPSTREAM_TURN_REF,
+        ],
+    );
+
+    runtime
+        .stop(StopCommand::new(session.session_id().clone()))
+        .expect("stop should consume the durable adapter references");
+    adapter.execute_release.signal();
+    runtime
+        .wait_for_background()
+        .expect("the losing execution worker should finish");
 }
 
 #[test]

@@ -1554,23 +1554,23 @@
 - the Host Daemon durably persists each newly observed upstream Codex thread or Turn identifier before the Codex adapter continues waiting for later upstream work @mvp @implemented
 - persisting an upstream Codex identifier does not change Session or Turn lifecycle state, state revisions, safe logs, idempotency outcomes, or Control Lease ownership @mvp @implemented
 - recording the same upstream Codex identifier again is idempotent, while recording a different identifier for the same Session or Turn fails closed without overwriting the original @mvp @implemented
-- satelle session records include enough host, readiness, provider, goal, and lifecycle metadata to survive transport changes without changing the public session identifier @spec @mvp
+- satelle session records include enough host, readiness, provider, goal, and lifecycle metadata to survive transport changes without changing the public session identifier @spec @mvp @implemented
 - satelle Host Daemon is the canonical store for session metadata because it owns the Codex thread, app-server lifecycle, Computer Use readiness, logs, and recovery state @mvp @implemented
-- satelle CLI may keep read-only convenience cache for recently used sessions but must refresh from the Host Daemon before reporting authoritative status @spec @mvp
+- satelle CLI may keep read-only convenience cache for recently used sessions but must refresh from the Host Daemon before reporting authoritative status @spec @mvp @implemented
 - satelle status reconnects to the session's remote host automatically when the local CLI has no active connection @spec @mvp @implemented
 - satelle status and logs are the MVP surfaces for later inspection after a user disconnects from a live event stream @implemented @mvp
 - satelle clients that reconnect after missing live Satelle Events read current session state and normalized logs instead of replaying missed events @spec @mvp @implemented
 - satelle status for SSH bootstrap hosts may restart the on-demand Host Daemon before reading stored remote session metadata @spec @mvp @implemented
 - satelle status reports a typed session-not-found error when the selected host cannot find the requested session metadata @implemented @mvp
 - a Session operation verifies that the requested Session belongs to the connected Host Identity @mvp @implemented
-- the local CLI uses its non-authoritative Session-to-Host cache only to select a candidate Host @spec @mvp
-- satelle requires --host when a Session identifier cannot be mapped to exactly one configured Host without probing unrelated Hosts @spec @mvp
+- the local CLI uses its non-authoritative Session-to-Host cache only to select a candidate Host @spec @mvp @implemented
+- satelle requires --host when a Session identifier cannot be mapped to exactly one configured Host without probing unrelated Hosts @spec @mvp @implemented
 - satelle remote host retains minimal session metadata for 7 days by default @implemented @mvp
-- satelle session metadata retention can be configured per host or profile @spec @mvp
+- satelle session metadata retention can be configured per host or profile @spec @mvp @implemented
 - session retention cleanup never deletes a nonterminal Session or Turn @implemented @mvp
 - session retention age begins when the Session's most recent Turn becomes terminal @implemented @mvp
-- expiration of Satelle metadata does not claim to delete Codex, provider, or operating-system records outside Satelle ownership @spec @mvp
-- satelle can export a redacted task artifact set containing plan.md, worklog.md, and goal.md for a selected session so another agent or human can audit what happened without replaying raw desktop content @spec @mvp
+- expiration of Satelle metadata does not claim to delete Codex, provider, or operating-system records outside Satelle ownership @spec @mvp @implemented
+- satelle can export a redacted task artifact set containing plan.md, worklog.md, and goal.md for a selected session so another agent or human can audit what happened without replaying raw desktop content @spec @mvp @implemented
 - label: satelle records local redacted command history for setup, repair, run, steer, status, stop, logs, doctor, host, config, and MCP installer commands when local state storage is available
   command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
   tags: [spec, mvp, implemented, ci]
@@ -1584,7 +1584,7 @@
 - label: satelle local aggregate stats summarize command counts, success and failure counts, last-used hosts, last-used profiles, and common typed error codes from redacted command history
   command: cargo test --locked -p satelle-cli --features test-support --test command-history aggregate_views_summarize_outcomes_targets_profiles_and_errors -- --exact
   tags: [spec, mvp, implemented, ci]
-- satelle local aggregate stats are diagnostic convenience data and are never treated as authoritative remote host state @spec @mvp
+- satelle local aggregate stats are diagnostic convenience data and are never treated as authoritative remote host state @spec @mvp @implemented
 - satelle exposes a top-level logs command in MVP @implemented @mvp
 - satelle logs is a read-only diagnostic command that never starts prompt execution, setup, repair, host update, service mutation, or configuration mutation @implemented @mvp
 - satelle logs reads authoritative Satelle Log Entries from the remote Host Daemon instead of relying on a local CLI cache @spec @mvp @implemented
@@ -1689,31 +1689,31 @@
 - Host Daemon state directories are accessible only to the daemon OS user and required operating-system service principals @spec @mvp @implemented
 - Satelle creates sensitive POSIX directories with mode 0700 and sensitive POSIX files with mode 0600 @spec @mvp @implemented
 - Satelle applies equivalent current-user restricted ACLs to sensitive Windows state @spec @mvp @implemented
-- SQLite database, WAL, SHM, token verifier, attachment staging, and sensitive export staging files inherit the same restricted access boundary @spec @mvp
-- Satelle Operator Log Files, local CLI state and cache, migration backups, setup recovery metadata, and recording artifacts inherit the same OS-user-private directory and file boundary @spec @mvp
+- SQLite database, WAL, SHM, token verifier, attachment staging, and sensitive export staging files inherit the same restricted access boundary @spec @mvp @implemented
+- Satelle Operator Log Files, local CLI state and cache, migration backups, setup recovery metadata, and recording artifacts inherit the same OS-user-private directory and file boundary @spec @mvp @implemented
 - Satelle refuses to use a sensitive state path that resolves through an unsafe writable directory boundary @spec @mvp @implemented
-- retention deletion does not claim cryptographic erasure from SQLite pages, filesystem snapshots, backups, or upstream services @spec @mvp
-- Satelle documents that Codex and model providers may retain data independently from Satelle-owned retention @spec @mvp
+- retention deletion does not claim cryptographic erasure from SQLite pages, filesystem snapshots, backups, or upstream services @spec @mvp @implemented
+- Satelle documents that Codex and model providers may retain data independently from Satelle-owned retention @spec @mvp @implemented
 - satelle local CLI cache stores only convenience data such as redacted command history, aggregate stats, AI client installer state, downloaded release metadata, and non-authoritative recent host summaries @spec @mvp @implemented
 - satelle local CLI cache root is configurable through SATELLE_CACHE_DIR @spec @mvp @implemented
-- satelle local CLI cache entries have explicit time-to-live or retention policies instead of persisting indefinitely by default @spec @mvp
-- satelle local CLI cache never stores provider credentials, raw prompts, screenshots, desktop recordings, full transcripts, raw Codex protocol payloads, or raw provider request and response bodies by default @spec @mvp
+- satelle local CLI cache entries have explicit time-to-live or retention policies instead of persisting indefinitely by default @spec @mvp @implemented
+- satelle local CLI cache never stores provider credentials, raw prompts, screenshots, desktop recordings, full transcripts, raw Codex protocol payloads, or raw provider request and response bodies by default @spec @mvp @implemented
 - satelle Host Daemon stores its SQLite database under the resolved Satelle local mutable state root @spec @mvp @implemented
 - satelle Host Daemon stores recording artifacts under a recordings directory inside the resolved Satelle local mutable state root by default @spec @mvp @implemented
-- satelle Host Daemon writes Satelle Operator Log Files by default when the resolved OS-native Satelle log directory is writable @spec @mvp
+- satelle Host Daemon writes Satelle Operator Log Files by default when the resolved OS-native Satelle log directory is writable @spec @mvp @implemented
 - satelle Satelle Operator Log Files are a best-effort local inspection mirror and are never authoritative for satelle logs, satelle status, recovery, retention, or support bundle collection @spec @mvp @implemented
 - satelle logs command reads Satelle Log Entries from SQLite through the Host Daemon API instead of parsing Satelle Operator Log Files @spec @mvp @implemented
 - satelle Satelle Operator Log Files contain human-readable redacted summaries derived from Satelle Log Entries instead of raw protocol payloads or raw subprocess streams @spec @mvp @implemented
 - satelle Satelle Operator Log Files do not include provider request bodies, provider response bodies, full prompts, screenshots, desktop recordings, full transcripts, raw setup stdout, raw setup stderr, raw repair stdout, or raw repair stderr by default @spec @mvp @implemented
 - satelle Satelle Operator Log Files rotate at 10 MiB and retain at most 5 files total per Host Daemon instance by default @spec @mvp @implemented
-- satelle Satelle Operator Log File retention can be configured per host or profile without changing SQLite log retention @spec @mvp
+- satelle Satelle Operator Log File retention can be configured per host or profile without changing SQLite log retention @spec @mvp @implemented
 - satelle Satelle Operator Log Files are stored under an OS-native Satelle log directory on the remote host instead of project directories @spec @mvp @implemented
 - satelle default Linux Satelle Operator Log File root is ${XDG_STATE_HOME:-$HOME/.local/state}/satelle/logs @spec @mvp @implemented
 - satelle default Windows Satelle Operator Log File root is the Local AppData Known Folder joined with Microck\Satelle\data\state\logs @spec @mvp @implemented
 - satelle default macOS Satelle Operator Log File root is $HOME/Library/Logs/dev.Microck.Satelle @spec @mvp @implemented
-- satelle Host Daemon continues running when Satelle Operator Log File writes fail while SQLite remains writable, and records the degraded log-file sink as a typed diagnostic finding @spec @mvp
-- satelle Host Daemon writes startup, shutdown, and fatal-error notices to stdout or stderr so service managers and containers can capture minimal process diagnostics @spec @mvp
-- satelle MVP does not require direct journald, Windows Event Log, or macOS unified logging API integration as a separate log sink @spec @mvp
+- satelle Host Daemon continues running when Satelle Operator Log File writes fail while SQLite remains writable, and records the degraded log-file sink as a typed diagnostic finding @spec @mvp @implemented
+- satelle Host Daemon writes startup, shutdown, and fatal-error notices to stdout or stderr so service managers and containers can capture minimal process diagnostics @spec @mvp @implemented
+- satelle MVP does not require direct journald, Windows Event Log, or macOS unified logging API integration as a separate log sink @spec @mvp @implemented
 - satelle later adds Platform-Native Log Sinks only as optional mirrors of redacted Satelle Log Entries @spec @later
 - satelle Satelle Platform-Native Log Sinks never replace the Host Daemon SQLite store, Satelle Operator Log Files, or the Host Daemon API as the authoritative source for satelle logs, status, recovery, retention, or support bundle collection @spec @later
 - satelle Satelle Platform-Native Log Sinks emit the same redacted summaries and default exclusions as Satelle Operator Log Files instead of raw protocol payloads, provider bodies, prompts, screenshots, transcripts, recordings, or raw setup and repair subprocess streams @spec @later
@@ -1837,8 +1837,8 @@
 - satelle host storage backup cleanup --host <alias> is the explicit command for deleting older eligible migration backups after a dry-run plan and mutation consent @spec @mvp @implemented
 - satelle destructive store reset is available only through an explicit host maintenance command @spec @mvp @implemented
 - satelle host store reset deletes metadata only by default and does not delete recordings unless the user explicitly requests recording deletion @spec @mvp @implemented
-- satelle does not use ad hoc JSON files as the canonical store for session metadata, readiness cache, provider smoke results, or log summaries @spec @mvp
-- satelle storage remains local to the remote host unless the user explicitly exports diagnostics or recordings @spec @mvp
+- satelle does not use ad hoc JSON files as the canonical store for session metadata, readiness cache, provider smoke results, or log summaries @spec @mvp @implemented
+- satelle storage remains local to the remote host unless the user explicitly exports diagnostics or recordings @spec @mvp @implemented
 
 # bridge
 

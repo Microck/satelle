@@ -5280,7 +5280,7 @@ fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance
         "details": {
             "daemon_version": "0.0.9",
             "reason": "unsupported",
-            "supported_versions": ["13"],
+            "supported_versions": ["14"],
             "received_version": "11",
         },
         "docs_url": null,

@@ -33,11 +33,10 @@ use self::open::DATABASE_FILE_NAME;
 #[cfg(all(test, unix))]
 use self::open::LOCK_FILE_NAME;
 use self::open::sqlite_error;
-#[cfg(test)]
-pub(crate) use self::operator_log::{
-    OperatorLogFailureKind, OperatorLogSink, OperatorLogWriteOutcome,
-};
+pub use self::operator_log::{OperatorLogFailureKind, OperatorLogSinkHealth};
 pub(crate) use self::operator_log::{OperatorLogMirror, OperatorLogPolicy};
+#[cfg(test)]
+pub(crate) use self::operator_log::{OperatorLogSink, OperatorLogWriteOutcome};
 pub(crate) use self::provider_secret_journal::{
     BeginProviderSecretProvisioning, PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
     PROVIDER_SECRET_PRIOR_HMAC_DOMAIN, ProviderSecretProvisioningJournal,
@@ -45,7 +44,7 @@ pub(crate) use self::provider_secret_journal::{
     ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay,
     provider_secret_file_paths,
 };
-pub(crate) use self::retention::DEFAULT_SETUP_LEDGER_RETENTION;
+pub(crate) use self::retention::{DEFAULT_SESSION_RETENTION, DEFAULT_SETUP_LEDGER_RETENTION};
 pub(crate) use self::setup_ledger::{
     MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,
 };
@@ -230,9 +229,9 @@ pub(crate) fn finish_completed_offline_storage_maintenance_if_present(
 }
 use self::sql::{
     StoredIdempotency, ensure_control_lease_available, ensure_no_pending_stop,
-    insert_control_lease, insert_idempotency, insert_initial_session, insert_safe_log,
-    insert_terminal_json_idempotency, insert_turn, load_recovery_subject, matching_idempotency,
-    merge_observed_reference, persist_lifecycle_mutation, require_operation,
+    insert_admission_readiness, insert_control_lease, insert_idempotency, insert_initial_session,
+    insert_safe_log, insert_terminal_json_idempotency, insert_turn, load_recovery_subject,
+    matching_idempotency, merge_observed_reference, persist_lifecycle_mutation, require_operation,
     synchronize_control_lease, update_session_row, update_turn_idempotency,
     validate_initial_session,
 };
@@ -428,10 +427,11 @@ mod ssh_identity_commit_tests {
         (12, "fnv1a64:a5672c42bd40d2a8"),
         (13, "fnv1a64:5db2b0aa00a5f745"),
         (14, "fnv1a64:fb04115e0082c148"),
+        (15, "fnv1a64:efae7b5838392fa8"),
     ];
-    const EXPECTED_SCHEMA_ROW_COUNT: usize = 69;
+    const EXPECTED_SCHEMA_ROW_COUNT: usize = 71;
     const EXPECTED_SCHEMA_SHA256: &str =
-        "e16065c8dd757275ff5085bb1a16e1edb9c27bb088af1ba0ae1a58fb52327f11";
+        "87bd4af01a35dd9f7f5aced198f5a447e2d26f8a23bb66ef3dd78bd6bfd366de";
 
     fn identity() -> HostIdentityRef {
         HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")
@@ -580,7 +580,7 @@ mod ssh_identity_commit_tests {
         let user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema user version");
-        assert_eq!(user_version, 14);
+        assert_eq!(user_version, 15);
 
         let schema = connection
             .prepare(
@@ -1124,6 +1124,7 @@ pub(crate) struct AdmissionContext {
     lease_owner: LeaseOwner,
     idempotency: IdempotencyInput,
     request_token: PrivateRequestToken,
+    readiness_ref: Option<AdmissionReadinessRef>,
 }
 
 impl AdmissionContext {
@@ -1136,7 +1137,13 @@ impl AdmissionContext {
             lease_owner,
             idempotency,
             request_token,
+            readiness_ref: None,
         }
+    }
+
+    pub(crate) fn with_readiness_ref(mut self, readiness_ref: AdmissionReadinessRef) -> Self {
+        self.readiness_ref = Some(readiness_ref);
+        self
     }
 
     pub(crate) fn lease_owner(&self) -> &LeaseOwner {
@@ -1146,6 +1153,80 @@ impl AdmissionContext {
     #[cfg(test)]
     pub(crate) fn idempotency(&self) -> &IdempotencyInput {
         &self.idempotency
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdmissionReadinessRef {
+    native_result_id: String,
+    native_observed_at: OffsetDateTime,
+    native_source: String,
+    provider: Option<AdmissionProviderReadinessRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AdmissionProviderReadinessRef {
+    result_id: String,
+    observed_at: OffsetDateTime,
+    source: String,
+}
+
+impl AdmissionReadinessRef {
+    pub(crate) fn new(
+        native_result_id: impl Into<String>,
+        native_observed_at: OffsetDateTime,
+        native_source: &str,
+        provider: Option<(&str, OffsetDateTime, &str)>,
+    ) -> Result<Self, StorageError> {
+        if !matches!(native_source, "cache" | "live") {
+            return Err(StorageError::new(StorageErrorKind::InvalidInput));
+        }
+        let provider = provider
+            .map(|(result_id, observed_at, source)| {
+                if !matches!(source, "cache" | "live" | "refresh") {
+                    return Err(StorageError::new(StorageErrorKind::InvalidInput));
+                }
+                Ok(AdmissionProviderReadinessRef {
+                    result_id: validated_private_reference(result_id.to_string())?,
+                    observed_at,
+                    source: source.to_string(),
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            native_result_id: validated_private_reference(native_result_id.into())?,
+            native_observed_at,
+            native_source: native_source.to_string(),
+            provider,
+        })
+    }
+
+    pub(crate) fn native_result_id(&self) -> &str {
+        &self.native_result_id
+    }
+
+    pub(crate) const fn native_observed_at(&self) -> OffsetDateTime {
+        self.native_observed_at
+    }
+
+    pub(crate) fn native_source(&self) -> &str {
+        &self.native_source
+    }
+
+    pub(crate) fn provider_result_id(&self) -> Option<&str> {
+        self.provider
+            .as_ref()
+            .map(|provider| provider.result_id.as_str())
+    }
+
+    pub(crate) fn provider_observed_at(&self) -> Option<OffsetDateTime> {
+        self.provider.as_ref().map(|provider| provider.observed_at)
+    }
+
+    pub(crate) fn provider_source(&self) -> Option<&str> {
+        self.provider
+            .as_ref()
+            .map(|provider| provider.source.as_str())
     }
 }
 
@@ -1266,6 +1347,7 @@ pub(crate) struct RecoverySubject {
     upstream_thread_ref: Option<PrivateUpstreamRef>,
     upstream_turn_ref: Option<PrivateUpstreamRef>,
     upstream_goal_ref: Option<PrivateUpstreamRef>,
+    admission_readiness: Option<AdmissionReadinessRef>,
 }
 
 impl RecoverySubject {
@@ -1304,6 +1386,10 @@ impl RecoverySubject {
     pub(crate) fn upstream_goal_ref(&self) -> Option<&PrivateUpstreamRef> {
         self.upstream_goal_ref.as_ref()
     }
+
+    pub(crate) fn admission_readiness(&self) -> Option<&AdmissionReadinessRef> {
+        self.admission_readiness.as_ref()
+    }
 }
 
 impl fmt::Debug for RecoverySubject {
@@ -1322,7 +1408,7 @@ impl fmt::Debug for RecoverySubject {
 pub(crate) enum AdmissionOutcome {
     Execute {
         session: Session,
-        recovery_subject: RecoverySubject,
+        recovery_subject: Box<RecoverySubject>,
     },
     InProgress(Session),
     Complete(Session),
@@ -2880,6 +2966,9 @@ impl Storage {
             session.desktop_binding(),
         )?;
         insert_initial_session(&transaction, session, &context.request_token)?;
+        if let Some(readiness) = &context.readiness_ref {
+            insert_admission_readiness(&transaction, &turn_id, readiness)?;
+        }
         insert_control_lease(&transaction, session, &turn_id, &context.lease_owner)?;
         insert_idempotency(
             &transaction,
@@ -2906,7 +2995,7 @@ impl Storage {
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         Ok(AdmissionOutcome::Execute {
             session: session.clone(),
-            recovery_subject,
+            recovery_subject: Box::new(recovery_subject),
         })
     }
 
@@ -2989,6 +3078,9 @@ impl Storage {
             turn,
             &context.request_token,
         )?;
+        if let Some(readiness) = &context.readiness_ref {
+            insert_admission_readiness(&transaction, &turn_id, readiness)?;
+        }
         insert_control_lease(&transaction, &session, &turn_id, &context.lease_owner)?;
         insert_idempotency(
             &transaction,
@@ -3015,7 +3107,7 @@ impl Storage {
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         Ok(AdmissionOutcome::Execute {
             session,
-            recovery_subject,
+            recovery_subject: Box::new(recovery_subject),
         })
     }
 

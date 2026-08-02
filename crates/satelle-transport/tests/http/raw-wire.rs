@@ -272,7 +272,7 @@ async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
             reqwest::Method::DELETE,
             "/v1/setup/provider-bindings/openai/review",
         )
-        .header("Satelle-Protocol-Version", "13")
+        .header("Satelle-Protocol-Version", "14")
         .header("Idempotency-Key", "provider-delete-trailer")
         .send()
         .await

@@ -1,5 +1,6 @@
 use super::*;
 use crate::DaemonLogEntry;
+use crate::storage::operator_log::{OperatorLogFailureKind, OperatorLogSinkHealth};
 use crate::{LogCursor, LogEvent, LogPageQuery, LogSeverity, LogSource};
 use std::fs;
 use std::path::Path;
@@ -260,6 +261,10 @@ fn operator_log_failures_are_coalesced_and_do_not_roll_back_sqlite() {
         first_outcome.failure_kind(),
         Some(OperatorLogFailureKind::BoundaryUnavailable)
     );
+    assert_eq!(
+        operator_log.health(),
+        OperatorLogSinkHealth::Degraded(OperatorLogFailureKind::BoundaryUnavailable)
+    );
     assert_sqlite_log_cursors(&storage, &[1]);
 
     let second = committed_host_log(
@@ -281,6 +286,7 @@ fn operator_log_failures_are_coalesced_and_do_not_roll_back_sqlite() {
         operator_log.write_committed(&third),
         OperatorLogWriteOutcome::Written
     ));
+    assert_eq!(operator_log.health(), OperatorLogSinkHealth::Healthy);
     assert_sqlite_log_cursors(&storage, &[1, 2, 3]);
     assert_eq!(
         operator_log_cursors(&unusable_log_root.join("satelle-host.log")),
