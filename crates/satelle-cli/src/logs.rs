@@ -102,10 +102,11 @@ pub(crate) struct LogReadRequest {
     pub(crate) level: Option<String>,
     pub(crate) follow: bool,
     pub(crate) no_reconnect: bool,
+    pub(crate) format: OutputFormat,
 }
 
-impl From<LogsCommand> for LogReadRequest {
-    fn from(command: LogsCommand) -> Self {
+impl LogReadRequest {
+    fn from_command(command: LogsCommand, format: OutputFormat) -> Self {
         Self {
             host: command.host,
             session: command.session,
@@ -116,11 +117,10 @@ impl From<LogsCommand> for LogReadRequest {
             level: command.level,
             follow: command.follow,
             no_reconnect: command.no_reconnect,
+            format,
         }
     }
-}
 
-impl LogReadRequest {
     fn follow_rerun_command(&self, host: &str, cursor: LogCursor) -> String {
         let mut command = format!("satelle logs --host {}", shell_argument(host));
         if let Some(session) = &self.session {
@@ -138,6 +138,9 @@ impl LogReadRequest {
         command.push_str(" --after ");
         command.push_str(&cursor.to_string());
         command.push_str(" --follow");
+        if self.format.is_json() {
+            command.push_str(" --json");
+        }
         if self.no_reconnect {
             command.push_str(" --no-reconnect");
         }
@@ -817,7 +820,7 @@ pub(crate) fn show_logs(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let request = LogReadRequest::from(command);
+    let request = LogReadRequest::from_command(command, format);
     let plan = LogReadPlan::resolve(&request)?;
     let host = match plan.session_id() {
         Some(session_id) => config
@@ -1086,6 +1089,7 @@ mod tests {
             level: None,
             follow: true,
             no_reconnect: false,
+            format: OutputFormat::Human,
         }
     }
 
@@ -1098,6 +1102,21 @@ mod tests {
                     .expect("valid opaque Log Cursor"),
             ),
             "satelle logs --host 'host alias; echo owned' --after slc1_0000000000000001 --follow"
+        );
+    }
+
+    #[test]
+    fn follow_rerun_command_preserves_json_output() {
+        let mut request = request();
+        request.format = OutputFormat::Json;
+
+        assert_eq!(
+            request.follow_rerun_command(
+                "remote",
+                serde_json::from_value(serde_json::json!("slc1_0000000000000001"))
+                    .expect("valid opaque Log Cursor"),
+            ),
+            "satelle logs --host remote --after slc1_0000000000000001 --follow --json"
         );
     }
 
