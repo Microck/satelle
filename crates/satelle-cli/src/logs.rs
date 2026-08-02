@@ -306,8 +306,15 @@ fn follow_logs(
         false,
         runtime,
     )?;
-    let (mut connection, mut query_cursor, mut last_delivered) =
-        plan.emit_follow_initial(connection, runtime, format, stdout)?;
+    let (mut connection, mut query_cursor, mut last_delivered) = plan
+        .emit_follow_initial(connection, runtime, format, stdout)
+        .map_err(|error| {
+            map_follow_identity_error(
+                error,
+                &expected_host_identity,
+                plan.session_id().map(SessionId::as_str),
+            )
+        })?;
     let mut stream_interruptions = 0;
 
     loop {
@@ -472,15 +479,11 @@ fn run_reconnect_attempt(
             Ok((connection, page))
         })();
         attempt.map_err(|error: SatelleError| {
-            if error.code == ErrorCode::HostIdentityMismatch {
-                SatelleError::logs_follow_identity_changed(
-                    &expected_host_identity,
-                    None,
-                    session_id.as_ref().map(SessionId::as_str),
-                )
-            } else {
-                error
-            }
+            map_follow_identity_error(
+                error,
+                &expected_host_identity,
+                session_id.as_ref().map(SessionId::as_str),
+            )
         })
     }) {
         Ok(FollowOperation::Completed(reconnected)) => Some(Ok(reconnected)),
@@ -604,7 +607,13 @@ fn validate_follow_connection(
     }
     if let Some(session_id) = session_id {
         let session = connection.session(session_id).map_err(|error| {
-            if reconnect && error.code == ErrorCode::SessionNotFound {
+            if error.code == ErrorCode::HostIdentityMismatch {
+                SatelleError::logs_follow_identity_changed(
+                    expected_host_identity.unwrap_or(&observed_host_identity),
+                    None,
+                    Some(session_id.as_str()),
+                )
+            } else if reconnect && error.code == ErrorCode::SessionNotFound {
                 SatelleError::logs_follow_identity_changed(
                     expected_host_identity.unwrap_or(&observed_host_identity),
                     Some(&observed_host_identity),
@@ -623,6 +632,18 @@ fn validate_follow_connection(
         }
     }
     Ok(observed_host_identity)
+}
+
+fn map_follow_identity_error(
+    error: SatelleError,
+    expected_host_identity: &str,
+    session_id: Option<&str>,
+) -> SatelleError {
+    if error.code == ErrorCode::HostIdentityMismatch {
+        SatelleError::logs_follow_identity_changed(expected_host_identity, None, session_id)
+    } else {
+        error
+    }
 }
 
 fn transient_follow_error(code: ErrorCode) -> bool {
@@ -1453,6 +1474,68 @@ mod tests {
             started_at.elapsed() < StdDuration::from_millis(500),
             "Ctrl-C waited for the stalled initial read"
         );
+    }
+
+    #[test]
+    fn initial_page_identity_failure_uses_the_typed_follow_error() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let factory = queued_connection_factory([Box::new(FakeFollowConnection::new(
+            "host-original",
+            [Err(SatelleError::host_identity_mismatch("remote"))],
+        )) as Box<dyn FollowConnection>]);
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Human,
+            &FakeFollowRuntime::new(None),
+            &factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut Vec::new(),
+            },
+        )
+        .expect_err("initial identity drift must use the follow error contract");
+
+        assert_eq!(error.code, ErrorCode::LogsFollowIdentityChanged);
+        assert_eq!(error.details["expected_host_identity"], "host-original");
+        assert_eq!(
+            error.details["observed_host_identity"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn initial_session_validation_identity_failure_uses_the_typed_follow_error() {
+        let session_id = SessionId::new();
+        let mut request = request();
+        request.session = Some(session_id.to_string());
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let factory = queued_connection_factory([
+            Box::new(SessionIdentityMismatchFollowConnection) as Box<dyn FollowConnection>,
+        ]);
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Human,
+            &FakeFollowRuntime::new(None),
+            &factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut Vec::new(),
+            },
+        )
+        .expect_err("initial Session identity drift must use the follow error contract");
+
+        assert_eq!(error.code, ErrorCode::LogsFollowIdentityChanged);
+        assert_eq!(error.details["expected_host_identity"], "host-original");
+        assert_eq!(error.details["session_id"], session_id.as_str());
     }
 
     #[test]
