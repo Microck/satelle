@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration as StdDuration, Instant, SystemTime};
 use time::format_description::well_known::Rfc3339;
@@ -159,7 +160,7 @@ struct LogReadPlan {
     position: LogPosition,
 }
 
-trait FollowConnection {
+trait FollowConnection: Send {
     fn host_identity(&self) -> Result<String, SatelleError>;
     fn session(
         &self,
@@ -167,6 +168,11 @@ trait FollowConnection {
     ) -> Result<satelle_core::session::PublicSession, SatelleError>;
     fn logs(&self, query: &LogPageQuery) -> Result<satelle_host::DaemonLogPage, SatelleError>;
 }
+
+type FollowConnectionFactory =
+    Arc<dyn Fn() -> Result<Box<dyn FollowConnection>, SatelleError> + Send + Sync>;
+type FollowReconnectResult =
+    Result<(Box<dyn FollowConnection>, satelle_host::DaemonLogPage), SatelleError>;
 
 struct TransportFollowConnection {
     transport: Box<dyn TransportClient>,
@@ -194,6 +200,9 @@ trait FollowRuntime {
     fn interrupted(&self) -> bool;
     fn sleep(&self, duration: StdDuration);
     fn jitter(&self, duration: StdDuration) -> StdDuration;
+    fn reconnect_budget(&self) -> StdDuration {
+        RECONNECT_BUDGET
+    }
 }
 
 struct ProcessFollowRuntime {
@@ -277,7 +286,7 @@ fn follow_logs(
     host_alias: &str,
     format: OutputFormat,
     runtime: &dyn FollowRuntime,
-    connection_factory: &mut dyn FnMut() -> Result<Box<dyn FollowConnection>, SatelleError>,
+    connection_factory: &FollowConnectionFactory,
     output: FollowOutput<'_>,
 ) -> Result<(), SatelleError> {
     let FollowOutput { stdout, stderr } = output;
@@ -368,54 +377,47 @@ fn follow_logs(
 fn reconnect_follow(
     target: &FollowTarget<'_>,
     runtime: &dyn FollowRuntime,
-    connection_factory: &mut dyn FnMut() -> Result<Box<dyn FollowConnection>, SatelleError>,
+    connection_factory: &FollowConnectionFactory,
     query_cursor: LogCursor,
     report_cursor: LogCursor,
     stream_interruptions: usize,
     stderr: &mut dyn Write,
 ) -> Result<(Box<dyn FollowConnection>, satelle_host::DaemonLogPage), SatelleError> {
-    let deadline = runtime.now() + RECONNECT_BUDGET;
+    let deadline = runtime.now() + runtime.reconnect_budget();
     let mut delay = RECONNECT_INITIAL_DELAY;
+    let exhausted = || {
+        follow_reconnect_exhausted(
+            target.request,
+            target.host_alias,
+            report_cursor,
+            stream_interruptions,
+        )
+    };
     loop {
         if runtime.interrupted() {
             return Err(SatelleError::interrupted_attached_command());
         }
         let now = runtime.now();
         if now >= deadline {
-            return Err(follow_reconnect_exhausted(
-                target.request,
-                target.host_alias,
-                report_cursor,
-                stream_interruptions,
-            ));
+            return Err(exhausted());
         }
         runtime.sleep(runtime.jitter(delay).min(deadline - now));
         if runtime.interrupted() {
             return Err(SatelleError::interrupted_attached_command());
         }
+        if runtime.now() >= deadline {
+            return Err(exhausted());
+        }
 
-        let attempt = connection_factory().and_then(|connection| {
-            validate_follow_connection(
-                connection.as_ref(),
-                Some(target.expected_host_identity),
-                target.plan.session_id(),
-                true,
-            )?;
-            let page = connection
-                .logs(&target.plan.follow_query(query_cursor))
-                .map_err(|error| {
-                    if error.code == ErrorCode::HostIdentityMismatch {
-                        SatelleError::logs_follow_identity_changed(
-                            target.expected_host_identity,
-                            None,
-                            target.plan.session_id().map(SessionId::as_str),
-                        )
-                    } else {
-                        error
-                    }
-                })?;
-            Ok((connection, page))
-        });
+        let Some(attempt) = run_reconnect_attempt(
+            Arc::clone(connection_factory),
+            target.expected_host_identity.to_string(),
+            target.plan.session_id().cloned(),
+            target.plan.follow_query(query_cursor),
+            deadline - runtime.now(),
+        ) else {
+            return Err(exhausted());
+        };
         match attempt {
             Ok(reconnected) => {
                 writeln!(
@@ -431,6 +433,43 @@ fn reconnect_follow(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn run_reconnect_attempt(
+    connection_factory: FollowConnectionFactory,
+    expected_host_identity: String,
+    session_id: Option<SessionId>,
+    query: LogPageQuery,
+    timeout: StdDuration,
+) -> Option<FollowReconnectResult> {
+    let (completed, completion) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("satelle-log-follow-reconnect".to_string())
+        .spawn(move || {
+            let attempt = connection_factory().and_then(|connection| {
+                validate_follow_connection(
+                    connection.as_ref(),
+                    Some(&expected_host_identity),
+                    session_id.as_ref(),
+                    true,
+                )?;
+                let page = connection.logs(&query).map_err(|error| {
+                    if error.code == ErrorCode::HostIdentityMismatch {
+                        SatelleError::logs_follow_identity_changed(
+                            &expected_host_identity,
+                            None,
+                            session_id.as_ref().map(SessionId::as_str),
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+                Ok((connection, page))
+            });
+            let _completed = completed.send(attempt);
+        })
+        .ok()?;
+    completion.recv_timeout(timeout).ok()
 }
 
 fn validate_follow_connection(
@@ -784,13 +823,14 @@ pub(crate) fn show_logs(
     };
     if request.follow {
         let runtime = ProcessFollowRuntime::new().map_err(failure)?;
-        let mut connection_factory = || {
-            transport_for(&host)
+        let follow_host = host.clone();
+        let connection_factory: FollowConnectionFactory = Arc::new(move || {
+            transport_for(&follow_host)
                 .map(|transport| {
                     Box::new(TransportFollowConnection { transport }) as Box<dyn FollowConnection>
                 })
                 .map_err(|failure| failure.error)
-        };
+        });
         let stdout = io::stdout();
         let stderr = io::stderr();
         let mut stdout = stdout.lock();
@@ -801,7 +841,7 @@ pub(crate) fn show_logs(
             &host.alias,
             format,
             &runtime,
-            &mut connection_factory,
+            &connection_factory,
             FollowOutput {
                 stdout: &mut stdout,
                 stderr: &mut stderr,
@@ -900,6 +940,7 @@ mod tests {
     use std::cell::Cell;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     struct FakeFollowConnection {
         host_identity: String,
@@ -941,11 +982,26 @@ mod tests {
         }
     }
 
+    fn queued_connection_factory(
+        connections: impl IntoIterator<Item = Box<dyn FollowConnection>>,
+    ) -> FollowConnectionFactory {
+        let connections = Mutex::new(connections.into_iter().collect::<VecDeque<_>>());
+        Arc::new(move || {
+            connections
+                .lock()
+                .expect("follow connection fixture lock")
+                .pop_front()
+                .ok_or_else(|| SatelleError::host_unreachable("remote"))
+        })
+    }
+
     struct FakeFollowRuntime {
         started_at: Instant,
         elapsed: Cell<StdDuration>,
         sleeps: Cell<usize>,
         interrupt_after_sleeps: Option<usize>,
+        jitter_override: Option<StdDuration>,
+        reconnect_budget: StdDuration,
     }
 
     impl FakeFollowRuntime {
@@ -955,7 +1011,19 @@ mod tests {
                 elapsed: Cell::new(StdDuration::ZERO),
                 sleeps: Cell::new(0),
                 interrupt_after_sleeps,
+                jitter_override: None,
+                reconnect_budget: RECONNECT_BUDGET,
             }
+        }
+
+        fn with_jitter_override(mut self, jitter: StdDuration) -> Self {
+            self.jitter_override = Some(jitter);
+            self
+        }
+
+        fn with_reconnect_budget(mut self, budget: StdDuration) -> Self {
+            self.reconnect_budget = budget;
+            self
         }
     }
 
@@ -975,7 +1043,11 @@ mod tests {
         }
 
         fn jitter(&self, duration: StdDuration) -> StdDuration {
-            duration
+            self.jitter_override.unwrap_or(duration)
+        }
+
+        fn reconnect_budget(&self) -> StdDuration {
+            self.reconnect_budget
         }
     }
 
@@ -1018,7 +1090,7 @@ mod tests {
         let request = request();
         let plan =
             LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
-        let mut connections = VecDeque::from(vec![
+        let factory = queued_connection_factory([
             Box::new(FakeFollowConnection::new(
                 "host-original",
                 [Ok(page(1)), Err(SatelleError::host_unreachable("remote"))],
@@ -1026,11 +1098,6 @@ mod tests {
             Box::new(FakeFollowConnection::new("host-original", [Ok(page(2))]))
                 as Box<dyn FollowConnection>,
         ]);
-        let mut factory = || {
-            connections
-                .pop_front()
-                .ok_or_else(|| SatelleError::host_unreachable("remote"))
-        };
         let runtime = FakeFollowRuntime::new(Some(2));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1041,7 +1108,7 @@ mod tests {
             "remote",
             OutputFormat::Json,
             &runtime,
-            &mut factory,
+            &factory,
             FollowOutput {
                 stdout: &mut stdout,
                 stderr: &mut stderr,
@@ -1068,7 +1135,7 @@ mod tests {
         let request = request();
         let plan =
             LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
-        let mut connections = VecDeque::from(vec![
+        let factory = queued_connection_factory([
             Box::new(FakeFollowConnection::new(
                 "host-original",
                 [Ok(page(1)), Err(SatelleError::host_unreachable("remote"))],
@@ -1078,11 +1145,6 @@ mod tests {
                 std::iter::empty::<Result<satelle_host::DaemonLogPage, SatelleError>>(),
             )) as Box<dyn FollowConnection>,
         ]);
-        let mut factory = || {
-            connections
-                .pop_front()
-                .ok_or_else(|| SatelleError::host_unreachable("remote"))
-        };
         let runtime = FakeFollowRuntime::new(None);
 
         let error = follow_logs(
@@ -1091,7 +1153,7 @@ mod tests {
             "remote",
             OutputFormat::Json,
             &runtime,
-            &mut factory,
+            &factory,
             FollowOutput {
                 stdout: &mut Vec::new(),
                 stderr: &mut Vec::new(),
@@ -1108,10 +1170,10 @@ mod tests {
         let request = request();
         let plan =
             LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
-        let factory_calls = Cell::new(0);
-        let mut factory = || {
-            let call = factory_calls.get();
-            factory_calls.set(call + 1);
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let reconnect_factory_calls = Arc::clone(&factory_calls);
+        let factory: FollowConnectionFactory = Arc::new(move || {
+            let call = reconnect_factory_calls.fetch_add(1, Ordering::Relaxed);
             let pages = if call == 0 {
                 vec![Ok(page(1)), Err(SatelleError::host_unreachable("remote"))]
             } else {
@@ -1119,7 +1181,7 @@ mod tests {
             };
             Ok(Box::new(FakeFollowConnection::new("host-original", pages))
                 as Box<dyn FollowConnection>)
-        };
+        });
         let runtime = FakeFollowRuntime::new(None);
 
         let error = follow_logs(
@@ -1128,7 +1190,7 @@ mod tests {
             "remote",
             OutputFormat::Json,
             &runtime,
-            &mut factory,
+            &factory,
             FollowOutput {
                 stdout: &mut Vec::new(),
                 stderr: &mut Vec::new(),
@@ -1148,20 +1210,97 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_deadline_reached_by_sleep_does_not_start_an_attempt() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let reconnect_factory_calls = Arc::clone(&factory_calls);
+        let factory: FollowConnectionFactory = Arc::new(move || {
+            let call = reconnect_factory_calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(
+                call, 0,
+                "an expired reconnect budget started another attempt"
+            );
+            Ok(Box::new(FakeFollowConnection::new(
+                "host-original",
+                [Ok(page(1)), Err(SatelleError::host_unreachable("remote"))],
+            )) as Box<dyn FollowConnection>)
+        });
+        let runtime = FakeFollowRuntime::new(None).with_jitter_override(RECONNECT_BUDGET);
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Json,
+            &runtime,
+            &factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut Vec::new(),
+            },
+        )
+        .expect_err("the attempt at the exact reconnect deadline is rejected");
+
+        assert_eq!(error.code, ErrorCode::LogsFollowReconnectExhausted);
+        assert_eq!(factory_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.elapsed.get(), RECONNECT_BUDGET);
+    }
+
+    #[test]
+    fn reconnect_attempt_is_bounded_by_the_remaining_budget() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let runtime = FakeFollowRuntime::new(None)
+            .with_jitter_override(StdDuration::from_millis(1))
+            .with_reconnect_budget(StdDuration::from_millis(100));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let reconnect_factory_calls = Arc::clone(&factory_calls);
+        let factory: FollowConnectionFactory = Arc::new(move || {
+            let call = reconnect_factory_calls.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                return Ok(Box::new(FakeFollowConnection::new(
+                    "host-original",
+                    [Ok(page(1)), Err(SatelleError::host_unreachable("remote"))],
+                )) as Box<dyn FollowConnection>);
+            }
+            thread::sleep(StdDuration::from_millis(200));
+            Ok(
+                Box::new(FakeFollowConnection::new("host-original", [Ok(page(2))]))
+                    as Box<dyn FollowConnection>,
+            )
+        });
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Json,
+            &runtime,
+            &factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut Vec::new(),
+            },
+        )
+        .expect_err("a stalled attempt reaches the reconnect deadline");
+
+        assert_eq!(error.code, ErrorCode::LogsFollowReconnectExhausted);
+        assert_eq!(factory_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn no_reconnect_returns_the_transport_failure_with_the_last_cursor() {
         let mut request = request();
         request.no_reconnect = true;
         let plan =
             LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
-        let mut connection = Some(Box::new(FakeFollowConnection::new(
+        let factory = queued_connection_factory([Box::new(FakeFollowConnection::new(
             "host-original",
             [Ok(page(1)), Err(SatelleError::host_unreachable("remote"))],
-        )) as Box<dyn FollowConnection>);
-        let mut factory = || {
-            connection
-                .take()
-                .ok_or_else(|| SatelleError::host_unreachable("remote"))
-        };
+        )) as Box<dyn FollowConnection>]);
         let runtime = FakeFollowRuntime::new(None);
         let mut stderr = Vec::new();
 
@@ -1171,7 +1310,7 @@ mod tests {
             "remote",
             OutputFormat::Json,
             &runtime,
-            &mut factory,
+            &factory,
             FollowOutput {
                 stdout: &mut Vec::new(),
                 stderr: &mut stderr,
@@ -1191,10 +1330,10 @@ mod tests {
         let request = request();
         let plan =
             LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
-        let factory_calls = Cell::new(0_u64);
-        let mut factory = || {
-            let call = factory_calls.get();
-            factory_calls.set(call + 1);
+        let factory_calls = Arc::new(AtomicU64::new(0));
+        let reconnect_factory_calls = Arc::clone(&factory_calls);
+        let factory: FollowConnectionFactory = Arc::new(move || {
+            let call = reconnect_factory_calls.fetch_add(1, Ordering::Relaxed);
             Ok(Box::new(FakeFollowConnection::new(
                 "host-original",
                 [
@@ -1202,7 +1341,7 @@ mod tests {
                     Err(SatelleError::host_unreachable("remote")),
                 ],
             )) as Box<dyn FollowConnection>)
-        };
+        });
         let runtime = FakeFollowRuntime::new(None);
 
         let error = follow_logs(
@@ -1211,7 +1350,7 @@ mod tests {
             "remote",
             OutputFormat::Json,
             &runtime,
-            &mut factory,
+            &factory,
             FollowOutput {
                 stdout: &mut Vec::new(),
                 stderr: &mut Vec::new(),
@@ -1220,7 +1359,7 @@ mod tests {
         .expect_err("the interruption cap is finite");
         assert_eq!(error.code, ErrorCode::LogsFollowReconnectExhausted);
         assert_eq!(error.details["stream_interruptions"], 10);
-        assert_eq!(factory_calls.get(), 10);
+        assert_eq!(factory_calls.load(Ordering::Relaxed), 10);
     }
 
     #[test]

@@ -3010,6 +3010,15 @@ impl RuntimeHandle {
             .setup_ledger_retention
     }
 
+    #[cfg(test)]
+    pub(crate) fn sqlite_log_retention_for_tests(&self) -> time::Duration {
+        self.lazy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .storage_policy
+            .sqlite_log_retention
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_with_readiness_probe_driver<A, D>(
         state_root: Result<PathBuf, SatelleError>,

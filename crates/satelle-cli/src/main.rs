@@ -179,7 +179,7 @@ struct ConfigContext<'a> {
     resolved: Arc<OnceLock<Result<ResolvedConfig, SatelleError>>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SelectedHost {
     alias: String,
     config: HostConfig,

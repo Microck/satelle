@@ -265,7 +265,7 @@ fn setup_provider_intent(
 
 /// The command surface is intentionally exhaustive. A new transport operation
 /// must be implemented or explicitly rejected by every backend.
-pub(crate) trait TransportClient {
+pub(crate) trait TransportClient: Send {
     fn log_target_identity(&self) -> Result<String, SatelleError>;
 
     fn supported_image_media_types(&self) -> Result<Vec<String>, SatelleError> {
