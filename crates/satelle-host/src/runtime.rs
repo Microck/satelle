@@ -106,7 +106,7 @@ enum ProviderDescriptorValidationReplay {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "status", content = "result", rename_all = "snake_case")]
 enum SetupVerificationReplay {
-    Completed(satelle_core::DoctorReport),
+    Completed(Box<satelle_core::DoctorReport>),
     Failed(SatelleError),
 }
 
@@ -3912,7 +3912,7 @@ impl RuntimeHandle {
             })
             .transpose()?
         {
-            Some(SetupVerificationReplay::Completed(result)) => Ok(Some(result)),
+            Some(SetupVerificationReplay::Completed(result)) => Ok(Some(*result)),
             Some(SetupVerificationReplay::Failed(error)) => Err(error),
             None => Ok(None),
         }
@@ -3929,9 +3929,9 @@ impl RuntimeHandle {
             identity,
             completed_at,
         )?;
-        let result_json = serde_json::to_string(&SetupVerificationReplay::Completed(
+        let result_json = serde_json::to_string(&SetupVerificationReplay::Completed(Box::new(
             result.clone(),
-        ))
+        )))
         .map_err(|_| {
             integrity_error("setup verification result could not be serialized for durable replay")
         })?;

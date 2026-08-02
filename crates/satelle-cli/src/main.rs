@@ -43,15 +43,17 @@ use satelle_core::session::{
 };
 use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
-    DoctorEventRecord, DoctorEventSchemaVersion, DoctorEventType, DoctorFixability, DoctorOptions,
-    DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig, HostSessionsReport,
-    LOCAL_DEMO_HOST, LogVerbosity, MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME,
-    ProfileField, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError,
-    SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary,
-    SetupReport, SetupRequiredInput, SetupSchemaVersion, SetupVerification, TransportKind,
-    load_config, load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
-    open_new_owner_only_file, open_or_create_owner_only_directory, open_or_create_owner_only_file,
-    open_owner_only_directory, publish_new_owner_only_directory, read_owner_controlled_config_file,
+    DoctorEventRecord, DoctorEventSchemaVersion, DoctorEventType, DoctorFinding,
+    DoctorFixDelegation, DoctorFixFlow, DoctorFixFlowStatus, DoctorFixOwner, DoctorFixPostcheck,
+    DoctorFixRequest, DoctorFixability, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode,
+    EventSource, EventType, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, LogVerbosity,
+    MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField, ProviderSecretSource,
+    RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
+    SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
+    SetupSchemaVersion, SetupVerification, TransportKind, load_config, load_config_for_profile,
+    load_config_without_profile, load_user_api_rate_limits, open_new_owner_only_file,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
+    publish_new_owner_only_directory, read_owner_controlled_config_file,
     read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set,
     sync_owner_only_directory, utc_now,
 };
@@ -253,6 +255,17 @@ impl<'a> ConfigContext<'a> {
         resolved.as_ref().map_err(|error| failure(error.clone()))
     }
 
+    /// Reuses the exact invocation profile selection while forcing config to
+    /// be read again after a delegated command may have changed it.
+    fn fresh(&self) -> Self {
+        Self {
+            flag_profile: self.flag_profile,
+            select_profile: self.select_profile,
+            profile_source: self.profile_source,
+            resolved: Arc::new(OnceLock::new()),
+        }
+    }
+
     fn mcp_install_profile(&self) -> Result<Option<satelle_core::SelectedProfile>, CliFailure> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         satelle_core::resolve_invocation_profile(&cwd, self.flag_profile).map_err(failure)
@@ -444,7 +457,15 @@ struct DoctorCommand {
     #[arg(long)]
     events: bool,
     #[arg(long)]
+    fix: bool,
+    #[arg(long, requires = "fix")]
+    dry_run: bool,
+    #[arg(long, requires = "fix")]
+    yes: bool,
+    #[arg(long)]
     no_input: bool,
+    #[arg(long)]
+    quiet: bool,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -1452,7 +1473,7 @@ fn execute_command(
         Command::Completions(command) => run_completions(command).map_err(failure).map(|_| None),
         Command::Setup(command) => run_setup(command, human_style, config, output).map(|_| None),
         Command::Repair(command) => run_repair(command, config, output).map(|_| None),
-        Command::Doctor(command) => run_doctor(command, config, output).map(|_| None),
+        Command::Doctor(command) => run_doctor(command, profile, config, output).map(|_| None),
         Command::Config { command } => run_config(command, config, output).map(|_| None),
         Command::Paths(command) => show_paths(command, config, output).map(|_| None),
         Command::Host { command } => run_host(command, config, output).map(|_| None),
@@ -1668,6 +1689,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             explicit_host: command.host.as_deref(),
             session_id: None,
         },
+        Command::Doctor(command) if command.dry_run => return None,
         Command::Doctor(command) => HistoryTarget {
             family: "doctor",
             selects_host: true,
@@ -4781,12 +4803,460 @@ mod repair_consent_tests {
     }
 }
 
+#[cfg(test)]
+mod doctor_fix_plan_tests {
+    use super::*;
+
+    fn repairable_finding(finding_id: &str, scope: &str) -> DoctorFinding {
+        DoctorFinding {
+            finding_id: finding_id.to_string(),
+            scope: scope.to_string(),
+            severity: "error".to_string(),
+            fixability: DoctorFixability::Repairable,
+            readiness_impact: "blocked".to_string(),
+            summary: "repairable test finding".to_string(),
+            evidence: Vec::new(),
+            recovery_command: None,
+        }
+    }
+
+    #[test]
+    fn repairable_findings_delegate_to_the_existing_command_owners() {
+        let findings = vec![
+            repairable_finding("provider.auth.missing", "provider"),
+            repairable_finding("phase0.handshake.missing_codex_runtime", "codex"),
+            repairable_finding("computer-use.native.refresh.failed", "computer-use"),
+        ];
+
+        let targets = doctor_fix_targets(&findings);
+
+        assert_eq!(
+            targets,
+            vec![
+                DoctorFixTarget::HostUpdateCodex,
+                DoctorFixTarget::Repair,
+                DoctorFixTarget::SetupProviderAuth,
+            ]
+        );
+    }
+
+    #[test]
+    fn nonrepairable_findings_never_enter_a_fix_plan() {
+        let mut finding = repairable_finding("provider.auth.manual", "provider");
+        finding.fixability = DoctorFixability::ManualActionRequired;
+
+        assert!(doctor_fix_targets(&[finding]).is_empty());
+    }
+
+    #[test]
+    fn unknown_repairable_scopes_never_guess_a_delegation_owner() {
+        let finding = repairable_finding("future.scope.repairable", "future-scope");
+
+        assert!(doctor_fix_targets(&[finding]).is_empty());
+    }
+
+    #[test]
+    fn delegated_noninteractive_apply_uses_the_target_commands_consent_flags() {
+        let arguments = DoctorFixTarget::SetupProviderAuth.arguments(
+            "office-mac",
+            Some("maintenance"),
+            false,
+            true,
+            true,
+            true,
+        );
+
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--profile", "maintenance"])
+        );
+        assert!(arguments.iter().any(|argument| argument == "--no-input"));
+        assert!(arguments.iter().any(|argument| argument == "--yes"));
+        assert!(arguments.iter().any(|argument| argument == "--json"));
+        assert!(!arguments.iter().any(|argument| argument == "--dry-run"));
+    }
+
+    #[test]
+    fn delegated_dry_run_is_noninteractive_without_mutation_consent() {
+        let arguments = DoctorFixTarget::SetupProviderAuth.arguments(
+            "office-mac",
+            None,
+            true,
+            false,
+            true,
+            true,
+        );
+
+        assert!(arguments.iter().any(|argument| argument == "--dry-run"));
+        assert!(arguments.iter().any(|argument| argument == "--no-input"));
+        assert!(!arguments.iter().any(|argument| argument == "--yes"));
+    }
+
+    #[test]
+    fn explicit_interactive_consent_is_forwarded_to_the_target_command() {
+        let arguments =
+            DoctorFixTarget::Repair.arguments("office-mac", None, false, true, false, false);
+
+        assert!(arguments.iter().any(|argument| argument == "--yes"));
+        assert!(!arguments.iter().any(|argument| argument == "--no-input"));
+    }
+
+    #[test]
+    fn delegated_fix_failures_use_the_remote_execution_exit_class() {
+        let error = doctor_fix_delegation_error(
+            "office-mac",
+            &["satelle repair --host office-mac".to_string()],
+            None,
+            None,
+        );
+
+        assert_eq!(error.code, ErrorCode::RemoteExecution);
+        assert_eq!(error.exit_code(), 74);
+    }
+
+    #[test]
+    fn normalized_cancellation_is_not_inferred_from_a_successful_exit_code() {
+        assert_eq!(
+            doctor_fix_delegation_status(true, &json!({"status": "cancelled"})),
+            DoctorFixDelegationStatus::Cancelled
+        );
+        assert_eq!(
+            doctor_fix_delegation_status(true, &json!({"status": "completed"})),
+            DoctorFixDelegationStatus::Completed
+        );
+        assert_eq!(
+            doctor_fix_delegation_status(true, &json!({"status": "input_required"})),
+            DoctorFixDelegationStatus::InputRequired
+        );
+    }
+
+    #[test]
+    fn apply_requires_the_revalidated_plan_to_match_the_confirmed_plan() {
+        let planned = DoctorFixDelegation {
+            owner: DoctorFixOwner::HostUpdate,
+            command: "satelle host update --dry-run".to_string(),
+            affected_scopes: vec!["codex".to_string()],
+            output: json!({"target_version": "1.2.3", "artifact_digest": "aa"}),
+        };
+        let same = DoctorFixDelegation {
+            command: "a new dry-run process".to_string(),
+            ..planned.clone()
+        };
+        let changed = DoctorFixDelegation {
+            output: json!({"target_version": "1.2.4", "artifact_digest": "bb"}),
+            ..same.clone()
+        };
+
+        assert!(doctor_fix_plan_matches(&planned, &same));
+        assert!(!doctor_fix_plan_matches(&planned, &changed));
+    }
+
+    #[test]
+    fn delegated_input_required_error_uses_target_recovery_without_apply_flags() {
+        let error =
+            doctor_fix_input_required_error("office-mac", DoctorFixTarget::SetupProviderAuth, None);
+        let recovery = error
+            .recovery_command
+            .as_deref()
+            .expect("input-required Doctor plans name the target owner");
+
+        assert_eq!(error.code, ErrorCode::InputRequired);
+        assert!(recovery.contains("setup --host office-mac --component provider-auth"));
+        assert!(!recovery.contains("--dry-run"));
+        assert!(!recovery.contains("--no-input"));
+        assert!(!recovery.contains("--yes"));
+    }
+
+    #[test]
+    fn doctor_fix_dry_run_is_excluded_from_command_history() {
+        let cli = Cli::try_parse_from(["satelle", "doctor", "--fix", "--dry-run"])
+            .expect("parse Doctor fix dry-run");
+
+        assert!(history_target(&cli.command).is_none());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DoctorFixTarget {
+    HostUpdateCodex,
+    Repair,
+    SetupProviderAuth,
+}
+
+impl DoctorFixTarget {
+    const fn owner(self) -> DoctorFixOwner {
+        match self {
+            Self::SetupProviderAuth => DoctorFixOwner::Setup,
+            Self::HostUpdateCodex => DoctorFixOwner::HostUpdate,
+            Self::Repair => DoctorFixOwner::Repair,
+        }
+    }
+
+    const fn affected_scope(self) -> &'static str {
+        match self {
+            Self::SetupProviderAuth => "provider",
+            Self::HostUpdateCodex => "codex",
+            Self::Repair => "computer-use",
+        }
+    }
+
+    fn arguments(
+        self,
+        host: &str,
+        profile: Option<&str>,
+        dry_run: bool,
+        yes: bool,
+        noninteractive: bool,
+        json: bool,
+    ) -> Vec<String> {
+        let mut arguments = Vec::new();
+        if let Some(profile) = profile {
+            arguments.extend(["--profile".to_string(), profile.to_string()]);
+        }
+        arguments.push("--error-format".to_string());
+        arguments.push("json".to_string());
+        match self {
+            Self::SetupProviderAuth => arguments.extend([
+                "setup".to_string(),
+                "--host".to_string(),
+                host.to_string(),
+                "--component".to_string(),
+                "provider-auth".to_string(),
+            ]),
+            Self::HostUpdateCodex => arguments.extend([
+                "host".to_string(),
+                "update".to_string(),
+                "--host".to_string(),
+                host.to_string(),
+                "--component".to_string(),
+                "codex".to_string(),
+            ]),
+            Self::Repair => {
+                arguments.extend(["repair".to_string(), "--host".to_string(), host.to_string()])
+            }
+        }
+        if dry_run {
+            arguments.push("--dry-run".to_string());
+        }
+        if noninteractive {
+            arguments.push("--no-input".to_string());
+        }
+        if yes && !dry_run {
+            arguments.push("--yes".to_string());
+        }
+        if json {
+            arguments.push("--json".to_string());
+        }
+        arguments
+    }
+}
+
+fn doctor_fix_targets(findings: &[DoctorFinding]) -> Vec<DoctorFixTarget> {
+    let mut targets = findings
+        .iter()
+        .filter(|finding| finding.fixability == DoctorFixability::Repairable)
+        .filter_map(|finding| match finding.scope.as_str() {
+            "provider" => Some(DoctorFixTarget::SetupProviderAuth),
+            "codex" => Some(DoctorFixTarget::HostUpdateCodex),
+            "computer-use" => Some(DoctorFixTarget::Repair),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+fn doctor_fix_command(arguments: &[String]) -> String {
+    std::iter::once("satelle".to_string())
+        .chain(arguments.iter().map(|argument| shell_argument(argument)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn doctor_fix_delegation_error(
+    host: &str,
+    failed_commands: &[String],
+    profile: Option<&str>,
+    source: Option<String>,
+) -> SatelleError {
+    SatelleError {
+        code: ErrorCode::RemoteExecution,
+        message: "a delegated Doctor fix command failed".to_string(),
+        recovery_command: Some(doctor_fix_recovery_command(host, profile)),
+        source_detail: source,
+        details: BTreeMap::from([
+            ("host".to_string(), json!(host)),
+            ("failed_commands".to_string(), json!(failed_commands)),
+        ]),
+    }
+}
+
+fn failed_doctor_fix_delegation(
+    target: DoctorFixTarget,
+    command: String,
+    error: &SatelleError,
+) -> DoctorFixDelegation {
+    DoctorFixDelegation {
+        owner: target.owner(),
+        command,
+        affected_scopes: vec![target.affected_scope().to_string()],
+        output: serde_json::to_value(error)
+            .expect("a typed delegated Doctor error always serializes"),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DoctorReportEmission {
+    events: bool,
+    json: bool,
+    quiet: bool,
+    findings_already_emitted: bool,
+}
+
+fn emit_failed_doctor_fix_report(
+    mut report: DoctorReport,
+    request: DoctorFixRequest,
+    delegations: Vec<DoctorFixDelegation>,
+    emission: DoctorReportEmission,
+    error: SatelleError,
+) -> Result<(), CliFailure> {
+    report.fix_flow = Some(DoctorFixFlow {
+        request,
+        status: DoctorFixFlowStatus::Failed,
+        delegations,
+        postcheck: None,
+    });
+    emit_doctor_report(report, emission, Some(error))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DoctorFixDelegationStatus {
+    Completed,
+    Cancelled,
+    InputRequired,
+    Failed,
+}
+
+fn doctor_fix_delegation_status(
+    process_succeeded: bool,
+    normalized: &Value,
+) -> DoctorFixDelegationStatus {
+    match normalized.get("status").and_then(Value::as_str) {
+        Some("cancelled") => DoctorFixDelegationStatus::Cancelled,
+        Some("input_required") => DoctorFixDelegationStatus::InputRequired,
+        _ if process_succeeded => DoctorFixDelegationStatus::Completed,
+        _ => DoctorFixDelegationStatus::Failed,
+    }
+}
+
+fn doctor_fix_plan_matches(
+    planned: &DoctorFixDelegation,
+    revalidated: &DoctorFixDelegation,
+) -> bool {
+    planned.owner == revalidated.owner
+        && planned.affected_scopes == revalidated.affected_scopes
+        && planned.output == revalidated.output
+}
+
+fn doctor_fix_input_required_error(
+    host: &str,
+    target: DoctorFixTarget,
+    profile: Option<&str>,
+) -> SatelleError {
+    let recovery_arguments = target.arguments(host, profile, false, false, false, false);
+    let mut error = SatelleError::input_required(
+        "the delegated Doctor fix plan requires input from the target command",
+    );
+    error.recovery_command = Some(doctor_fix_command(&recovery_arguments));
+    error
+}
+
+fn run_captured_doctor_fix_target(
+    target: DoctorFixTarget,
+    host: &str,
+    profile: Option<&str>,
+    dry_run: bool,
+    yes: bool,
+) -> Result<(DoctorFixDelegation, DoctorFixDelegationStatus), CliFailure> {
+    let arguments = target.arguments(host, profile, dry_run, yes, true, true);
+    let command = doctor_fix_command(&arguments);
+    let executable = std::env::current_exe().map_err(|source| {
+        failure(doctor_fix_delegation_error(
+            host,
+            std::slice::from_ref(&command),
+            profile,
+            Some(source.to_string()),
+        ))
+    })?;
+    let output = ProcessCommand::new(executable)
+        .args(&arguments)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|source| {
+            failure(doctor_fix_delegation_error(
+                host,
+                std::slice::from_ref(&command),
+                profile,
+                Some(source.to_string()),
+            ))
+        })?;
+    // Target commands emit normalized JSON on one stream. Failed target JSON
+    // remains structured data in the delegation instead of becoming a raw
+    // subprocess transcript in Doctor diagnostics.
+    let normalized: Value = if output.status.success() {
+        serde_json::from_slice(&output.stdout)
+    } else {
+        serde_json::from_slice(&output.stderr)
+    }
+    .map_err(|source| {
+        failure(doctor_fix_delegation_error(
+            host,
+            std::slice::from_ref(&command),
+            profile,
+            Some(source.to_string()),
+        ))
+    })?;
+    let status = doctor_fix_delegation_status(output.status.success(), &normalized);
+    Ok((
+        DoctorFixDelegation {
+            owner: target.owner(),
+            command,
+            affected_scopes: vec![target.affected_scope().to_string()],
+            output: normalized,
+        },
+        status,
+    ))
+}
+
+fn doctor_fix_recovery_command(host: &str, profile: Option<&str>) -> String {
+    let profile_selection = profile
+        .map(|profile| format!(" --profile {}", shell_argument(profile)))
+        .unwrap_or_default();
+    format!(
+        "satelle{profile_selection} doctor --host {} --fix --no-input --yes --json",
+        shell_argument(host)
+    )
+}
+
 fn run_doctor(
     command: DoctorCommand,
+    profile: Option<&str>,
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
+    if command.events && command.fix {
+        return Err(failure(SatelleError::output_mode_conflict(
+            "doctor --events cannot be combined with --fix",
+        )));
+    }
+    if command.refresh && command.fix && command.dry_run {
+        return Err(failure(SatelleError::invalid_usage(
+            "doctor --refresh cannot be combined with --fix --dry-run",
+        )));
+    }
     let scope_selection = validate_doctor_scope(&command.scope)?;
     let timeout = match command
         .timeout
@@ -4815,56 +5285,91 @@ fn run_doctor(
     let options = DoctorOptions::new(command.refresh, timeout)
         .map_err(failure)?
         .with_serial_probes(command.serial_probes);
-    let transport_probe = transport_doctor_probe(&scope_selection, &host.config);
+    let outcome = execute_doctor_diagnostics(
+        &host,
+        &scope_selection,
+        options,
+        resolved_config,
+        command.events,
+    )?;
+    finish_doctor_outcome(
+        outcome,
+        DoctorFinishContext {
+            command: &command,
+            profile,
+            config: &config,
+            resolved_config,
+            host: &host,
+            options,
+            scope_selection: &scope_selection,
+            json,
+        },
+    )
+}
+
+fn execute_doctor_diagnostics(
+    host: &SelectedHost,
+    scope_selection: &DoctorScopeSelection,
+    options: DoctorOptions,
+    resolved_config: &ResolvedConfig,
+    emit_events: bool,
+) -> Result<DoctorExecutionResult, CliFailure> {
+    let transport_probe = transport_doctor_probe(scope_selection, &host.config);
     let transport_only =
-        prepare_transport_only_doctor(&host.config, &scope_selection, options).map_err(failure)?;
+        prepare_transport_only_doctor(&host.config, scope_selection, options).map_err(failure)?;
     if let Some(prepared) = transport_only {
-        if command.events {
-            print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
+        if emit_events {
+            print_doctor_started_event(&host.alias, scope_selection).map_err(failure)?;
         }
-        let outcome = execute_transport_only_doctor(
+        return Ok(execute_transport_only_doctor(
             &host.alias,
-            &scope_selection,
+            scope_selection,
             &transport_probe,
             prepared,
         )
-        .map_err(DoctorExecutionFailure::from);
-        return finish_doctor_outcome(outcome, command.events, json, &host.alias, &scope_selection);
+        .map_err(DoctorExecutionFailure::from));
     }
-    let transport = transport_for(&host)?;
+
+    let transport = transport_for(host)?;
     let provider_intent = doctor_provider_intent(
         resolved_config,
         &host.config,
-        command.refresh,
+        options.refresh(),
         options.probe_timeout(),
     )
     .map_err(failure)?;
-    if command.events {
-        print_doctor_started_event(&host.alias, &scope_selection).map_err(failure)?;
+    if emit_events {
+        print_doctor_started_event(&host.alias, scope_selection).map_err(failure)?;
     }
-    let outcome = transport.doctor(
-        &scope_selection,
+    Ok(transport.doctor(
+        scope_selection,
         Arc::new(transport_probe),
         options,
         &provider_intent,
-    );
+    ))
+}
 
-    finish_doctor_outcome(outcome, command.events, json, &host.alias, &scope_selection)
+struct DoctorFinishContext<'a> {
+    command: &'a DoctorCommand,
+    profile: Option<&'a str>,
+    config: &'a ConfigContext<'a>,
+    resolved_config: &'a ResolvedConfig,
+    host: &'a SelectedHost,
+    options: DoctorOptions,
+    scope_selection: &'a DoctorScopeSelection,
+    json: bool,
 }
 
 fn finish_doctor_outcome(
     outcome: DoctorExecutionResult,
-    events: bool,
-    json: bool,
-    target: &str,
-    scope_selection: &DoctorScopeSelection,
+    context: DoctorFinishContext<'_>,
 ) -> Result<(), CliFailure> {
     match outcome {
-        Ok(report) => emit_doctor_report(report, events, json),
-        Err(failed) if events => {
+        Ok(report) => finish_doctor_report(report, &context),
+        Err(failed) if context.command.events => {
             print_doctor_failed_event(
-                target,
-                scope_selection,
+                &context.host.alias,
+                context.scope_selection,
                 2,
                 &failed.error,
                 &failed.partial_probe_results,
@@ -4876,24 +5381,384 @@ fn finish_doctor_outcome(
     }
 }
 
-fn emit_doctor_report(report: DoctorReport, events: bool, json: bool) -> Result<(), CliFailure> {
-    let readiness_error = if report.summary.ready {
+fn finish_doctor_report(
+    mut report: DoctorReport,
+    context: &DoctorFinishContext<'_>,
+) -> Result<(), CliFailure> {
+    let events = context.command.events;
+    let json = context.json;
+    let quiet = context.command.quiet;
+    let command = context.command;
+    let profile = context.profile;
+    let resolved_config = context.resolved_config;
+    let host = context.host;
+    let options = context.options;
+    let scope_selection = context.scope_selection;
+    let targets = doctor_fix_targets(&report.findings);
+    let interactive = !command.no_input && !json && !events && !quiet && io::stdin().is_terminal();
+    let prompt_for_fix = !command.fix && !targets.is_empty() && interactive;
+    let findings_already_emitted = interactive && !targets.is_empty();
+    let emission = DoctorReportEmission {
+        events,
+        json,
+        quiet,
+        findings_already_emitted,
+    };
+    if findings_already_emitted {
+        print_doctor_findings(&report);
+    }
+    let fix_requested = if prompt_for_fix {
+        cliclack::confirm("Build a fix plan for the repairable Doctor findings?")
+            .initial_value(false)
+            .interact()
+            .map_err(|source| {
+                failure(setup_interaction_error(
+                    "could not read Doctor fix offer",
+                    source,
+                ))
+            })?
+    } else {
+        command.fix
+    };
+    if !fix_requested {
+        return emit_doctor_report(report, emission, None);
+    }
+
+    let request = if command.dry_run {
+        DoctorFixRequest::DryRun
+    } else {
+        DoctorFixRequest::Apply
+    };
+    if targets.is_empty() {
+        report.fix_flow = Some(DoctorFixFlow {
+            request,
+            status: if command.dry_run {
+                DoctorFixFlowStatus::Planned
+            } else {
+                DoctorFixFlowStatus::Completed
+            },
+            delegations: Vec::new(),
+            postcheck: None,
+        });
+        return emit_doctor_report(report, emission, None);
+    }
+
+    let noninteractive = !interactive;
+    let mut planned_delegations = Vec::new();
+    let mut failed_plan_commands = Vec::new();
+    for target in &targets {
+        let outcome = run_captured_doctor_fix_target(*target, &host.alias, profile, true, false);
+        let (delegation, status) = match outcome {
+            Ok(outcome) => outcome,
+            Err(failed) => {
+                let command = doctor_fix_command(&target.arguments(
+                    &host.alias,
+                    profile,
+                    true,
+                    false,
+                    true,
+                    true,
+                ));
+                let error = failed.error;
+                planned_delegations.push(failed_doctor_fix_delegation(*target, command, &error));
+                return emit_failed_doctor_fix_report(
+                    report,
+                    request,
+                    planned_delegations,
+                    emission,
+                    error,
+                );
+            }
+        };
+        match status {
+            DoctorFixDelegationStatus::Completed => {}
+            DoctorFixDelegationStatus::InputRequired => {
+                let error = doctor_fix_input_required_error(&host.alias, *target, profile);
+                planned_delegations.push(delegation);
+                return emit_failed_doctor_fix_report(
+                    report,
+                    request,
+                    planned_delegations,
+                    emission,
+                    error,
+                );
+            }
+            DoctorFixDelegationStatus::Cancelled | DoctorFixDelegationStatus::Failed => {
+                failed_plan_commands.push(delegation.command.clone());
+            }
+        }
+        planned_delegations.push(delegation);
+    }
+    if !failed_plan_commands.is_empty() {
+        let error = doctor_fix_delegation_error(&host.alias, &failed_plan_commands, profile, None);
+        return emit_failed_doctor_fix_report(
+            report,
+            request,
+            planned_delegations,
+            emission,
+            error,
+        );
+    }
+    if command.dry_run {
+        report.fix_flow = Some(DoctorFixFlow {
+            request,
+            status: DoctorFixFlowStatus::Planned,
+            delegations: planned_delegations,
+            postcheck: None,
+        });
+        return emit_doctor_report(report, emission, None);
+    }
+
+    let trusted_consent = trusted_profile_allows_mutation(
+        resolved_config,
+        &host.alias,
+        MutationCommandFamily::DoctorFix,
+    );
+    if noninteractive && !command.yes && !trusted_consent {
+        let planned_actions = planned_delegations
+            .iter()
+            .map(|delegation| delegation.command.clone())
+            .collect::<Vec<_>>();
+        let error = SatelleError::doctor_fix_consent_required(
+            &planned_actions,
+            doctor_fix_recovery_command(&host.alias, profile),
+        );
+        report.fix_flow = Some(DoctorFixFlow {
+            request,
+            status: DoctorFixFlowStatus::Planned,
+            delegations: planned_delegations,
+            postcheck: None,
+        });
+        return emit_doctor_report(report, emission, Some(error));
+    }
+    if interactive {
+        print_doctor_fix_plans(&planned_delegations);
+        if !command.yes && !trusted_consent {
+            let confirmed = cliclack::confirm("Apply these Doctor fix plans?")
+                .initial_value(false)
+                .interact()
+                .map_err(|source| {
+                    failure(setup_interaction_error(
+                        "could not read Doctor fix confirmation",
+                        source,
+                    ))
+                })?;
+            if !confirmed {
+                report.fix_flow = Some(DoctorFixFlow {
+                    request,
+                    status: DoctorFixFlowStatus::Cancelled,
+                    delegations: planned_delegations,
+                    postcheck: None,
+                });
+                return emit_doctor_report(report, emission, None);
+            }
+        }
+    }
+
+    let mut delegations = Vec::new();
+    for (index, target) in targets.into_iter().enumerate() {
+        // Consent covers the normalized dry-run output, not merely the target
+        // command name. Rebuild that plan immediately before forwarding --yes
+        // so changed config, artifact identity, or Host state cannot widen the
+        // mutation after confirmation.
+        let revalidated = run_captured_doctor_fix_target(target, &host.alias, profile, true, false);
+        let (revalidated_delegation, revalidated_status) = match revalidated {
+            Ok(outcome) => outcome,
+            Err(failed) => {
+                let error = failed.error;
+                delegations.push(failed_doctor_fix_delegation(
+                    target,
+                    doctor_fix_command(&target.arguments(
+                        &host.alias,
+                        profile,
+                        true,
+                        false,
+                        true,
+                        true,
+                    )),
+                    &error,
+                ));
+                return emit_failed_doctor_fix_report(
+                    report,
+                    request,
+                    delegations,
+                    emission,
+                    error,
+                );
+            }
+        };
+        if revalidated_status != DoctorFixDelegationStatus::Completed
+            || !doctor_fix_plan_matches(&planned_delegations[index], &revalidated_delegation)
+        {
+            delegations.push(revalidated_delegation);
+            return emit_failed_doctor_fix_report(
+                report,
+                request,
+                delegations,
+                emission,
+                SatelleError::state_conflict(),
+            );
+        }
+
+        let outcome = run_captured_doctor_fix_target(target, &host.alias, profile, false, true);
+        let (delegation, status) = match outcome {
+            Ok(outcome) => outcome,
+            Err(failed) => {
+                let command = doctor_fix_command(&target.arguments(
+                    &host.alias,
+                    profile,
+                    false,
+                    true,
+                    true,
+                    true,
+                ));
+                let error = failed.error;
+                delegations.push(failed_doctor_fix_delegation(target, command, &error));
+                return emit_failed_doctor_fix_report(
+                    report,
+                    request,
+                    delegations,
+                    emission,
+                    error,
+                );
+            }
+        };
+        let command = delegation.command.clone();
+        delegations.push(delegation);
+        match status {
+            DoctorFixDelegationStatus::Completed => {}
+            DoctorFixDelegationStatus::Cancelled => {
+                report.fix_flow = Some(DoctorFixFlow {
+                    request,
+                    status: DoctorFixFlowStatus::Cancelled,
+                    delegations,
+                    postcheck: None,
+                });
+                return emit_doctor_report(report, emission, None);
+            }
+            DoctorFixDelegationStatus::InputRequired => {
+                let error = doctor_fix_input_required_error(&host.alias, target, profile);
+                return emit_failed_doctor_fix_report(
+                    report,
+                    request,
+                    delegations,
+                    emission,
+                    error,
+                );
+            }
+            DoctorFixDelegationStatus::Failed => {
+                let error = doctor_fix_delegation_error(&host.alias, &[command], profile, None);
+                return emit_failed_doctor_fix_report(
+                    report,
+                    request,
+                    delegations,
+                    emission,
+                    error,
+                );
+            }
+        }
+    }
+
+    let postcheck = (|| -> Result<DoctorExecutionResult, CliFailure> {
+        let refreshed_config_context = context.config.fresh();
+        let refreshed_config = refreshed_config_context.load()?;
+        let refreshed_host = SelectedHost::from(
+            refreshed_config
+                .resolve_host(Some(&host.alias))
+                .map_err(failure)?,
+        );
+        let postcheck_options =
+            DoctorOptions::new(scope_selection.supports_refresh(), options.probe_timeout())
+                .map_err(failure)?
+                .with_serial_probes(options.serial_probes());
+        execute_doctor_diagnostics(
+            &refreshed_host,
+            scope_selection,
+            postcheck_options,
+            refreshed_config,
+            false,
+        )
+    })();
+    let postcheck = match postcheck {
+        Ok(postcheck) => postcheck,
+        Err(failed) => {
+            return emit_failed_doctor_fix_report(
+                report,
+                request,
+                delegations,
+                emission,
+                failed.error,
+            );
+        }
+    };
+    let mut postcheck_report = match postcheck {
+        Ok(report) => report,
+        Err(failed) => {
+            // Retain the completed target-command records when the readiness
+            // postcheck itself fails. The typed postcheck error still owns the
+            // exit status, while the report makes partial progress inspectable.
+            return emit_failed_doctor_fix_report(
+                report,
+                request,
+                delegations,
+                emission,
+                failed.error,
+            );
+        }
+    };
+    let blocking_finding_ids = postcheck_report
+        .findings
+        .iter()
+        .filter(|finding| finding.readiness_impact == "blocked")
+        .map(|finding| finding.finding_id.clone())
+        .collect();
+    postcheck_report.fix_flow = Some(DoctorFixFlow {
+        request,
+        status: DoctorFixFlowStatus::Completed,
+        delegations,
+        postcheck: Some(DoctorFixPostcheck {
+            ready: postcheck_report.summary.ready,
+            blocking_finding_ids,
+        }),
+    });
+    emit_doctor_report(
+        postcheck_report,
+        DoctorReportEmission {
+            findings_already_emitted: false,
+            ..emission
+        },
+        None,
+    )
+}
+
+fn emit_doctor_report(
+    report: DoctorReport,
+    emission: DoctorReportEmission,
+    terminal_error: Option<SatelleError>,
+) -> Result<(), CliFailure> {
+    let readiness_error = if terminal_error.is_some() || report.summary.ready {
         None
     } else {
         Some(SatelleError::doctor_readiness_blockers_found(
             &report.recovery_commands,
         ))
     };
+    let terminal_error = terminal_error.or(readiness_error);
 
-    if events {
-        print_doctor_events(&report, readiness_error.as_ref()).map_err(failure)?;
-        if let Some(error) = readiness_error {
+    if emission.events {
+        print_doctor_events(&report, terminal_error.as_ref()).map_err(failure)?;
+        if let Some(error) = terminal_error {
             return Err(reported_failure(error));
         }
         Ok(())
-    } else if json {
+    } else if emission.json {
         print_json(&report).map_err(failure)?;
-        if let Some(error) = readiness_error {
+        if let Some(error) = terminal_error {
+            return Err(failure(error));
+        }
+        Ok(())
+    } else if emission.quiet {
+        if let Some(error) = terminal_error {
             return Err(failure(error));
         }
         Ok(())
@@ -4902,19 +5767,42 @@ fn emit_doctor_report(report: DoctorReport, events: bool, json: bool) -> Result<
         println!("Status: {}", report.status);
         println!("Ready: {}", report.summary.ready);
         println!("Scopes: {}", report.scopes.join(", "));
-        for finding in report.findings {
-            println!(
-                "[{}] {} ({})",
-                finding.severity, finding.summary, finding.fixability
-            );
-            for evidence in finding.evidence {
-                println!("  evidence: {evidence}");
+        if let Some(fix_flow) = &report.fix_flow {
+            println!("Fix flow: {}", fix_flow.status.as_str());
+            for delegation in &fix_flow.delegations {
+                println!("  delegated command: {}", delegation.command);
+                println!("  normalized result: {}", delegation.output);
+            }
+            if let Some(postcheck) = &fix_flow.postcheck {
+                println!("  postcheck ready: {}", postcheck.ready);
             }
         }
-        if let Some(error) = readiness_error {
+        if !emission.findings_already_emitted {
+            print_doctor_findings(&report);
+        }
+        if let Some(error) = terminal_error {
             return Err(failure(error));
         }
         Ok(())
+    }
+}
+
+fn print_doctor_findings(report: &DoctorReport) {
+    for finding in &report.findings {
+        println!(
+            "[{}] {} ({})",
+            finding.severity, finding.summary, finding.fixability
+        );
+        for evidence in &finding.evidence {
+            println!("  evidence: {evidence}");
+        }
+    }
+}
+
+fn print_doctor_fix_plans(delegations: &[DoctorFixDelegation]) {
+    for delegation in delegations {
+        println!("Fix plan: {}", delegation.command);
+        println!("  normalized plan: {}", delegation.output);
     }
 }
 
@@ -5177,6 +6065,7 @@ mod doctor_event_tests {
             recovery_commands: Vec::new(),
             changed: false,
             cache_updates: Vec::new(),
+            fix_flow: None,
         };
 
         let records = doctor_event_records(&report, None);

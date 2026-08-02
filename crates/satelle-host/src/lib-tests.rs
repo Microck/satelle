@@ -2097,6 +2097,8 @@ fn unrefreshed_provider_probe_keeps_unobserved_readiness_blocked() {
         })
     );
     assert!(!report.ready);
+    assert_eq!(report.summary.repairable_findings, 1);
+    assert_eq!(report.findings[0].fixability, DoctorFixability::Repairable);
 }
 
 #[test]
@@ -2837,6 +2839,44 @@ fn refresh_projection_preserves_worker_finish_timestamps() {
     assert_eq!(provider_not_required.started_at, "2026-07-29T21:00:04Z");
     assert_eq!(provider_not_required.finished_at, "2026-07-29T21:00:05Z");
     assert_eq!(provider_not_required.duration_ms, 1_000);
+}
+
+#[test]
+fn native_refresh_marks_only_repair_owned_failures_repairable() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    );
+
+    for (error, expected) in [
+        (
+            SatelleError::computer_use_not_ready(),
+            DoctorFixability::Repairable,
+        ),
+        (
+            SatelleError::native_readiness_timeout(),
+            DoctorFixability::Blocked,
+        ),
+        (SatelleError::storage_busy(), DoctorFixability::Blocked),
+    ] {
+        let mut report = production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
+        apply_native_refresh(
+            &mut report,
+            &Err(error),
+            "2026-07-29T21:00:00Z".to_string(),
+            "2026-07-29T21:00:01Z".to_string(),
+            Duration::from_secs(1),
+            true,
+        );
+
+        assert_eq!(report.findings[0].fixability, expected);
+    }
 }
 
 #[test]
