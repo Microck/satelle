@@ -6219,6 +6219,58 @@ fn direct_session_resource_reads_preserve_session_not_found_identity() {
 }
 
 #[test]
+fn direct_session_resource_reads_classify_a_dropped_body_as_reachability_loss() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind partial session response fixture");
+    let address = listener
+        .local_addr()
+        .expect("read partial session response address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept session client");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).expect("read session request");
+            assert_ne!(read, 0, "session request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let request = String::from_utf8(request).expect("session request headers should be UTF-8");
+        let request_id = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("satelle-request-id")
+                    .then(|| value.trim())
+            })
+            .expect("session request must carry a request ID");
+        let partial_body = r#"{"schema_version":"satelle.session.read.v1""#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nSatelle-Request-Id: {request_id}\r\nSatelle-Host-Identity: host-direct-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial_body}",
+            partial_body.len() + 100
+        )
+        .expect("write partial session response");
+        stream.flush().expect("flush partial session response");
+    });
+    let client = DaemonClient::loopback(
+        address,
+        ApiBearerToken::generate().expect("generate session fixture token"),
+        "host-direct-test",
+    )
+    .expect("construct session fixture client");
+    let session_id = SessionId::new();
+
+    let daemon_error = client
+        .read_session(&session_id)
+        .expect_err("the partial session response body must fail");
+    let error = direct_session_resource_error("direct-test", &session_id, daemon_error);
+    server
+        .join()
+        .expect("join partial session response fixture");
+
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+}
+
+#[test]
 fn stop_not_confirmed_api_details_are_validated_and_preserved() {
     let session_id = SessionId::new();
     let turn_id = TurnId::new();

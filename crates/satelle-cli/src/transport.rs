@@ -8188,13 +8188,14 @@ fn direct_session_resource_error(
     session_id: &SessionId,
     error: DaemonClientError,
 ) -> SatelleError {
-    if matches!(
-        &error,
-        DaemonClientError::Api { error, .. } if error.code() == ApiErrorCode::SessionNotFound
-    ) {
-        SatelleError::session_not_found(session_id)
-    } else {
-        direct_transport_error(host, error)
+    match error {
+        DaemonClientError::Api { error, .. } if error.code() == ApiErrorCode::SessionNotFound => {
+            SatelleError::session_not_found(session_id)
+        }
+        DaemonClientError::InvalidResponse(error) if response_connection_lost(&error) => {
+            SatelleError::host_unreachable(host)
+        }
+        error => direct_transport_error(host, error),
     }
 }
 
@@ -8212,14 +8213,14 @@ fn direct_logs_error(host: &str, error: DaemonClientError) -> SatelleError {
         DaemonClientError::Api { error, .. } if error.code() == ApiErrorCode::InvalidRequest => {
             SatelleError::invalid_usage("the Host rejected the logs query")
         }
-        DaemonClientError::InvalidResponse(error) if logs_response_connection_lost(&error) => {
+        DaemonClientError::InvalidResponse(error) if response_connection_lost(&error) => {
             SatelleError::host_unreachable(host)
         }
         error => direct_transport_error(host, error),
     }
 }
 
-fn logs_response_connection_lost(error: &reqwest::Error) -> bool {
+fn response_connection_lost(error: &reqwest::Error) -> bool {
     if error.is_body() || error.is_timeout() {
         return true;
     }
