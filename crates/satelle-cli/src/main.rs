@@ -11022,7 +11022,7 @@ fn persist_task_artifacts(
             "--output must name a new destination directory",
         ))
     })?;
-    let requested_parent = requested_output.parent().unwrap_or_else(|| Path::new("."));
+    let requested_parent = task_artifact_output_parent(requested_output);
     let parent = requested_parent.canonicalize().map_err(|error| {
         failure(SatelleError::config_error(
             format!(
@@ -11117,6 +11117,26 @@ fn persist_task_artifacts(
     })?;
     staging_cleanup.disarm();
     Ok(output)
+}
+
+fn task_artifact_output_parent(requested_output: &Path) -> &Path {
+    requested_output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(test)]
+mod task_artifact_output_tests {
+    use super::*;
+
+    #[test]
+    fn bare_relative_destination_uses_the_current_directory() {
+        assert_eq!(
+            task_artifact_output_parent(Path::new("task-artifacts")),
+            Path::new(".")
+        );
+    }
 }
 
 struct TaskArtifactStagingCleanup {
