@@ -44,14 +44,14 @@ use satelle_core::{
     BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
     DoctorEventRecord, DoctorEventSchemaVersion, DoctorEventType, DoctorFixability, DoctorOptions,
     DoctorReport, ERROR_RED, ErrorCode, EventSource, EventType, HostConfig, HostSessionsReport,
-    LOCAL_DEMO_HOST, MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
-    ProfileSelectionSource, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN,
-    SatelleError, SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode,
-    SetupReadinessSummary, SetupReport, SetupRequiredInput, SetupSchemaVersion, SetupVerification,
-    TransportKind, load_config, load_config_for_profile, load_config_without_profile,
-    load_user_api_rate_limits, open_or_create_owner_only_directory, open_or_create_owner_only_file,
-    open_owner_only_directory, read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set, utc_now,
+    LOCAL_DEMO_HOST, LogVerbosity, MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME,
+    ProfileField, ProviderSecretSource, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError,
+    SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary,
+    SetupReport, SetupRequiredInput, SetupSchemaVersion, SetupVerification, TransportKind,
+    load_config, load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file, resolve_desktop_session,
+    resolve_path_set, utc_now,
 };
 use satelle_host::{
     ApiBearerToken, DoctorExecutionFailure, DoctorExecutionResult, HostService,
@@ -110,6 +110,15 @@ struct Cli {
     #[arg(
         long,
         global = true,
+        value_enum,
+        value_name = "LEVEL",
+        help = "Set diagnostic log verbosity: off, info, debug, or trace"
+    )]
+    log_verbosity: Option<DiagnosticVerbosity>,
+
+    #[arg(
+        long,
+        global = true,
         value_name = "NAME",
         value_parser = clap::builder::NonEmptyStringValueParser::new(),
         help = "Apply a named user-level configuration profile"
@@ -128,6 +137,36 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DiagnosticVerbosity {
+    Off,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl DiagnosticVerbosity {
+    const fn level_filter(self) -> tracing_subscriber::filter::LevelFilter {
+        match self {
+            Self::Off => tracing_subscriber::filter::LevelFilter::OFF,
+            Self::Info => tracing_subscriber::filter::LevelFilter::INFO,
+            Self::Debug => tracing_subscriber::filter::LevelFilter::DEBUG,
+            Self::Trace => tracing_subscriber::filter::LevelFilter::TRACE,
+        }
+    }
+}
+
+impl From<LogVerbosity> for DiagnosticVerbosity {
+    fn from(value: LogVerbosity) -> Self {
+        match value {
+            LogVerbosity::Off => Self::Off,
+            LogVerbosity::Info => Self::Info,
+            LogVerbosity::Debug => Self::Debug,
+            LogVerbosity::Trace => Self::Trace,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1078,8 +1117,6 @@ fn main() -> ExitCode {
     };
     let mut error_format =
         ErrorFormat::resolve(cli.error_format, cli.command.requests_machine_errors());
-    install_diagnostics(&cli.command, error_format);
-
     match try_main(cli, &mut error_format) {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
@@ -1144,6 +1181,7 @@ fn try_main(cli: Cli, error_format: &mut ErrorFormat) -> Result<(), CliFailure> 
     let error_format_configured = cli.error_format.is_some();
     let Cli {
         no_color,
+        log_verbosity,
         profile,
         error_format: _,
         command,
@@ -1158,6 +1196,7 @@ fn try_main(cli: Cli, error_format: &mut ErrorFormat) -> Result<(), CliFailure> 
         config,
         error_format,
         error_format_configured,
+        log_verbosity,
     );
 
     if let Some(history) = history {
@@ -1295,6 +1334,7 @@ fn execute_command(
     config: ConfigContext<'_>,
     error_format: &mut ErrorFormat,
     error_format_configured: bool,
+    log_verbosity: Option<DiagnosticVerbosity>,
 ) -> Result<Option<SessionId>, CliFailure> {
     let early_lifecycle_host = explicit_lifecycle_json_host(&command).map(str::to_owned);
     let (output_args, event_output) = command.output_request();
@@ -1334,10 +1374,18 @@ fn execute_command(
         } else {
             ErrorFormat::Human
         };
-        // The configured presentation default is now known, so diagnostics and the terminal
-        // command error must use the same resolved format as successful output.
-        install_diagnostics(&command, *error_format);
     }
+    let configured_log_verbosity = config
+        .load()
+        .ok()
+        .and_then(|resolved| resolved.config.log_verbosity)
+        .map(DiagnosticVerbosity::from);
+    install_diagnostics(
+        &command,
+        *error_format,
+        log_verbosity,
+        configured_log_verbosity,
+    );
     let human_style = HumanStyle::detect(no_color);
 
     match command {
@@ -2630,19 +2678,13 @@ fn trusted_profile_allows_mutation(
     host_alias: &str,
     command_family: MutationCommandFamily,
 ) -> bool {
-    let Some(selected) = resolved.selected_profile.as_ref() else {
+    let Some(reference) = resolved.trusted_profile_reference() else {
         return false;
     };
-    if !matches!(
-        selected.source,
-        ProfileSelectionSource::CliFlag | ProfileSelectionSource::UserConfig
-    ) {
-        return false;
-    }
     resolved
         .config
         .trusted_profiles
-        .get(&selected.name)
+        .get(reference)
         .is_some_and(|trusted| {
             trusted.hosts.contains(host_alias) && trusted.command_families.contains(&command_family)
         })
@@ -4539,8 +4581,14 @@ fn run_repair(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let host = config.resolve_host(command.host.as_deref())?;
-    let mut mutation_consent = command.yes;
+    let resolved = config.load()?;
+    let host = resolved
+        .resolve_host_with_project_source(command.host.as_deref())
+        .map(SelectedHost::from)
+        .map_err(failure)?;
+    let trusted_consent =
+        trusted_profile_allows_mutation(resolved, &host.alias, MutationCommandFamily::Repair);
+    let mut mutation_consent = repair_consent_granted(command.yes, trusted_consent);
     let mut report = transport::plan_repair_upgrades(
         &host,
         command.run.as_deref(),
@@ -4570,7 +4618,7 @@ fn run_repair(
         print!("{}", host_update::render_repair_upgrade_plan(&report));
     }
     let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
-    if noninteractive && !command.yes {
+    if noninteractive && !mutation_consent {
         let recovery_command = match command.run.as_deref() {
             Some(run_id) => format!(
                 "satelle repair --host {} --run {} --no-input --yes --json",
@@ -4587,7 +4635,7 @@ fn run_repair(
             recovery_command,
         )));
     }
-    if !command.yes {
+    if !mutation_consent {
         let confirmed = cliclack::confirm("Apply these repair mutations?")
             .initial_value(false)
             .interact()
@@ -4624,6 +4672,22 @@ fn run_repair(
     } else {
         print!("{}", host_update::render_repair_upgrade_result(&report));
         Ok(())
+    }
+}
+
+const fn repair_consent_granted(command_yes: bool, trusted_profile: bool) -> bool {
+    command_yes || trusted_profile
+}
+
+#[cfg(test)]
+mod repair_consent_tests {
+    use super::*;
+
+    #[test]
+    fn trusted_profile_consent_satisfies_both_repair_confirmation_gates() {
+        assert!(repair_consent_granted(false, true));
+        assert!(repair_consent_granted(true, false));
+        assert!(!repair_consent_granted(false, false));
     }
 }
 
@@ -5775,12 +5839,6 @@ fn resolve_yolo_policy(
         return YoloPolicy {
             active,
             source: "user_config_host",
-        };
-    }
-    if let Some(active) = config.config.yolo {
-        return YoloPolicy {
-            active,
-            source: "user_config_global",
         };
     }
 
@@ -7131,24 +7189,38 @@ fn ssh_launch_readiness_timeouts(
     }
 }
 
-fn install_diagnostics(command: &Command, error_format: ErrorFormat) {
+fn install_diagnostics(
+    command: &Command,
+    error_format: ErrorFormat,
+    flag_verbosity: Option<DiagnosticVerbosity>,
+    configured_verbosity: Option<DiagnosticVerbosity>,
+) {
     if error_format == ErrorFormat::Json {
         return;
     }
-    let default_level = if matches!(
-        command,
-        Command::Host {
-            command: HostCommand::Start(_)
+    let default_verbosity = configured_verbosity.unwrap_or({
+        if matches!(
+            command,
+            Command::Host {
+                command: HostCommand::Start(_)
+            }
+        ) {
+            DiagnosticVerbosity::Info
+        } else {
+            DiagnosticVerbosity::Off
         }
-    ) {
-        tracing_subscriber::filter::LevelFilter::INFO
+    });
+    let builder = tracing_subscriber::EnvFilter::builder().with_default_directive(
+        flag_verbosity
+            .unwrap_or(default_verbosity)
+            .level_filter()
+            .into(),
+    );
+    let filter = if flag_verbosity.is_some() {
+        builder.parse_lossy("")
     } else {
-        tracing_subscriber::filter::LevelFilter::OFF
+        builder.with_env_var("SATELLE_LOG").from_env_lossy()
     };
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(default_level.into())
-        .with_env_var("SATELLE_LOG")
-        .from_env_lossy();
     let _subscriber_already_installed = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(true)
@@ -8655,6 +8727,25 @@ mod host_update_consent_tests {
             ]
         );
     }
+
+    #[test]
+    fn trusted_profile_consent_authorizes_the_self_update_remote_family() {
+        assert!(self_update_remote_consent_granted(
+            false,
+            Some("office"),
+            |host| host == "office"
+        ));
+        assert!(self_update_remote_consent_granted(
+            true,
+            Some("office"),
+            |_| false
+        ));
+        assert!(!self_update_remote_consent_granted(
+            false,
+            Some("lab"),
+            |host| host == "office"
+        ));
+    }
 }
 
 fn confirm_storage_maintenance(
@@ -9649,8 +9740,16 @@ fn run_self(
             let current_host = std::env::var("SATELLE_HOST")
                 .ok()
                 .filter(|host| !host.is_empty());
-            let remote_choices = match config.load() {
-                Ok(resolved) => self_update::remote_host_choices(
+            let resolved_config = match config.load() {
+                Ok(resolved) => Some(resolved),
+                Err(error) if command.update_remotes => return Err(error),
+                // Configured-Host discovery is optional for a local update. A
+                // broken Host config must not prevent installing a CLI that can
+                // understand or repair that config.
+                Err(_) => None,
+            };
+            let remote_choices = resolved_config.map_or_else(Vec::new, |resolved| {
+                self_update::remote_host_choices(
                     current_host.as_deref(),
                     resolved.config.default_host.as_deref(),
                     resolved
@@ -9659,13 +9758,8 @@ fn run_self(
                         .iter()
                         .filter(|(_, host)| host.transport != satelle_core::TransportKind::Local)
                         .map(|(alias, _)| alias.clone()),
-                ),
-                Err(error) if command.update_remotes => return Err(error),
-                // Configured-Host discovery is optional for a local update. A
-                // broken Host config must not prevent installing a CLI that can
-                // understand or repair that config.
-                Err(_) => Vec::new(),
-            };
+                )
+            });
             let follow_up_host =
                 self_update::selected_remote_host(&remote_choices).map(str::to_owned);
             if command.update_remotes && follow_up_host.is_none() {
@@ -9673,9 +9767,25 @@ fn run_self(
                     "--update-remotes could not resolve a current or configured default Host; explicit selectors belong to the packet 26 update train",
                 )));
             }
+            let remote_consent_granted = self_update_remote_consent_granted(
+                command.yes,
+                follow_up_host.as_deref(),
+                |host| {
+                    resolved_config.is_some_and(|resolved| {
+                        trusted_profile_allows_mutation(
+                            resolved,
+                            host,
+                            MutationCommandFamily::SelfUpdateRemotes,
+                        )
+                    })
+                },
+            );
 
             let stdin_is_terminal = io::stdin().is_terminal();
-            if command.update_remotes && (command.no_input || !stdin_is_terminal) && !command.yes {
+            if command.update_remotes
+                && (command.no_input || !stdin_is_terminal)
+                && !remote_consent_granted
+            {
                 return Err(failure(SatelleError::setup_consent_required(
                     &["update the selected configured remote Host".to_string()],
                     "satelle self update --update-remotes --no-input --yes".to_string(),
@@ -9728,6 +9838,19 @@ fn run_self(
             let Some(host) = selected_host else {
                 return Ok(());
             };
+            // Interactive selection may choose a Host other than the default.
+            // Recompute durable consent against that final Host so a Trusted
+            // Profile allowlist can never authorize a different handoff.
+            let remote_consent_granted =
+                self_update_remote_consent_granted(command.yes, Some(&host), |host| {
+                    resolved_config.is_some_and(|resolved| {
+                        trusted_profile_allows_mutation(
+                            resolved,
+                            host,
+                            MutationCommandFamily::SelfUpdateRemotes,
+                        )
+                    })
+                });
             run_self_update_remote_handoff(
                 report.installed_executable(),
                 config.flag_profile,
@@ -9735,10 +9858,18 @@ fn run_self(
                 no_color,
                 error_format,
                 command.no_input,
-                command.yes,
+                remote_consent_granted,
             )
         }
     }
+}
+
+fn self_update_remote_consent_granted(
+    command_yes: bool,
+    selected_host: Option<&str>,
+    trusted_profile_allows: impl FnOnce(&str) -> bool,
+) -> bool {
+    command_yes || selected_host.is_some_and(trusted_profile_allows)
 }
 
 fn self_update_remote_handoff_arguments(
@@ -10183,6 +10314,13 @@ fn run_prompt(
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
+    let yolo_policy = resolve_yolo_policy(
+        config,
+        &host.alias,
+        &host.config,
+        command.yolo,
+        command.no_yolo,
+    );
     let provider_selection = report_not_admitted(
         &mut event_output,
         Some(&host.alias),
@@ -10204,9 +10342,12 @@ fn run_prompt(
                         &host,
                         "run",
                         config,
-                        &provider_selection,
-                        None,
-                        command.refresh_provider_smoke_test,
+                        TurnPreflight {
+                            yolo_policy: &yolo_policy,
+                            provider_selection: &provider_selection,
+                            provider_validation: None,
+                            refresh_provider_smoke_test: command.refresh_provider_smoke_test,
+                        },
                     )
                     .map_err(failure)?;
                 event_output
@@ -10251,9 +10392,12 @@ fn run_prompt(
                         &host,
                         "run",
                         config,
-                        &provider_selection,
-                        None,
-                        command.refresh_provider_smoke_test,
+                        TurnPreflight {
+                            yolo_policy: &yolo_policy,
+                            provider_selection: &provider_selection,
+                            provider_validation: None,
+                            refresh_provider_smoke_test: command.refresh_provider_smoke_test,
+                        },
                     )
                     .map_err(failure)?;
                 event_output
@@ -10298,13 +10442,6 @@ fn run_prompt(
         load_image_attachments(&command.images, supported_image_media_types),
     )?;
     let effective_timeouts = effective_timeouts_json(&host.config, turn_execution_timeout_ms);
-    let yolo_policy = resolve_yolo_policy(
-        config,
-        &host.alias,
-        &host.config,
-        command.yolo,
-        command.no_yolo,
-    );
     let request = build_turn_request(
         prompt,
         yolo_policy.execution_mode(),
@@ -10334,9 +10471,12 @@ fn run_prompt(
             &host,
             "run",
             config,
-            &provider_selection,
-            Some(&provider_validation),
-            command.refresh_provider_smoke_test,
+            TurnPreflight {
+                yolo_policy: &yolo_policy,
+                provider_selection: &provider_selection,
+                provider_validation: Some(&provider_validation),
+                refresh_provider_smoke_test: command.refresh_provider_smoke_test,
+            },
         )
         .map_err(failure)?;
     let outcome = match transport.run(&request, command.detach_on_interrupt, &mut |event| {
@@ -10416,6 +10556,13 @@ fn steer_prompt(
             .map(SelectedHost::from)
             .map_err(failure),
     )?;
+    let yolo_policy = resolve_yolo_policy(
+        config,
+        &host.alias,
+        &host.config,
+        command.yolo,
+        command.no_yolo,
+    );
     let provider_selection = report_not_admitted(
         &mut event_output,
         Some(&host.alias),
@@ -10437,9 +10584,12 @@ fn steer_prompt(
                         &host,
                         "steer",
                         config,
-                        &provider_selection,
-                        None,
-                        command.refresh_provider_smoke_test,
+                        TurnPreflight {
+                            yolo_policy: &yolo_policy,
+                            provider_selection: &provider_selection,
+                            provider_validation: None,
+                            refresh_provider_smoke_test: command.refresh_provider_smoke_test,
+                        },
                     )
                     .map_err(failure)?;
                 event_output
@@ -10484,9 +10634,12 @@ fn steer_prompt(
                         &host,
                         "steer",
                         config,
-                        &provider_selection,
-                        None,
-                        command.refresh_provider_smoke_test,
+                        TurnPreflight {
+                            yolo_policy: &yolo_policy,
+                            provider_selection: &provider_selection,
+                            provider_validation: None,
+                            refresh_provider_smoke_test: command.refresh_provider_smoke_test,
+                        },
                     )
                     .map_err(failure)?;
                 event_output
@@ -10531,13 +10684,6 @@ fn steer_prompt(
         load_image_attachments(&command.images, supported_image_media_types),
     )?;
     let effective_timeouts = effective_timeouts_json(&host.config, turn_execution_timeout_ms);
-    let yolo_policy = resolve_yolo_policy(
-        config,
-        &host.alias,
-        &host.config,
-        command.yolo,
-        command.no_yolo,
-    );
     let request = build_turn_request(
         prompt,
         yolo_policy.execution_mode(),
@@ -10569,9 +10715,12 @@ fn steer_prompt(
             &host,
             "steer",
             config,
-            &provider_selection,
-            Some(&provider_validation),
-            command.refresh_provider_smoke_test,
+            TurnPreflight {
+                yolo_policy: &yolo_policy,
+                provider_selection: &provider_selection,
+                provider_validation: Some(&provider_validation),
+                refresh_provider_smoke_test: command.refresh_provider_smoke_test,
+            },
         )
         .map_err(failure)?;
     let outcome = match transport.steer(
@@ -10927,6 +11076,13 @@ struct TurnEventOutput {
     next_sequence: u64,
 }
 
+struct TurnPreflight<'a> {
+    yolo_policy: &'a YoloPolicy,
+    provider_selection: &'a ProviderSelection,
+    provider_validation: Option<&'a transport::ProviderDescriptorValidationReport>,
+    refresh_provider_smoke_test: bool,
+}
+
 impl TurnEventOutput {
     fn new(mode: EffectiveEventMode, verbose: bool) -> Self {
         Self {
@@ -10941,9 +11097,7 @@ impl TurnEventOutput {
         host: &SelectedHost,
         operation: &str,
         config: &ResolvedConfig,
-        provider_selection: &ProviderSelection,
-        provider_validation: Option<&transport::ProviderDescriptorValidationReport>,
-        refresh_provider_smoke_test: bool,
+        preflight: TurnPreflight<'_>,
     ) -> Result<(), SatelleError> {
         if self.mode == EffectiveEventMode::None {
             return Ok(());
@@ -10959,6 +11113,7 @@ impl TurnEventOutput {
                 "operation": operation,
                 "transport": host.config.transport,
                 "selected_profile": config.selected_profile.as_ref().map(|profile| &profile.name),
+                "yolo": yolo_state_json(preflight.yolo_policy),
                 "effective_timeouts": effective_timeouts_json(
                     &host.config,
                     configured_turn_execution_timeout_ms(&host.config),
@@ -10974,19 +11129,19 @@ impl TurnEventOutput {
                     "transport": config.transport_intent_from_project(&host.alias),
                     "output_format": config.output_format_from_project(),
                 },
-                "requested_model_alias": provider_selection.requested_model_alias,
-                "requested_provider_alias": provider_selection.requested_provider_alias,
-                "model_alias_from_project": provider_selection.model_alias_from_project,
-                "provider_alias_from_project": provider_selection.provider_alias_from_project,
-                "resolved_codex_model": provider_validation.map(|validation| validation.resolved_binding.model()),
-                "resolved_model_provider": provider_validation.map(|validation| validation.resolved_binding.model_provider()),
-                "provider_binding_source": provider_validation.map(|validation| validation.resolved_binding.source().as_str()),
+                "requested_model_alias": preflight.provider_selection.requested_model_alias,
+                "requested_provider_alias": preflight.provider_selection.requested_provider_alias,
+                "model_alias_from_project": preflight.provider_selection.model_alias_from_project,
+                "provider_alias_from_project": preflight.provider_selection.provider_alias_from_project,
+                "resolved_codex_model": preflight.provider_validation.map(|validation| validation.resolved_binding.model()),
+                "resolved_model_provider": preflight.provider_validation.map(|validation| validation.resolved_binding.model_provider()),
+                "provider_binding_source": preflight.provider_validation.map(|validation| validation.resolved_binding.source().as_str()),
                 "experimental_provider_computer_use": projected_experimental_provider_computer_use(
-                    provider_selection,
-                    provider_validation,
+                    preflight.provider_selection,
+                    preflight.provider_validation,
                 ),
-                "provider_smoke_test_status": provider_validation.map_or_else(
-                    || provider_selection.provider_smoke_status(refresh_provider_smoke_test),
+                "provider_smoke_test_status": preflight.provider_validation.map_or_else(
+                    || preflight.provider_selection.provider_smoke_status(preflight.refresh_provider_smoke_test),
                     |validation| validation.validation.outcome().as_str(),
                 ),
             }),

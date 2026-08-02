@@ -236,6 +236,82 @@ fn json_command_output_is_stable_when_diagnostic_verbosity_changes() {
 }
 
 #[test]
+fn profile_log_verbosity_obeys_flag_and_environment_precedence() {
+    let state = state_dir();
+    let config_file = state.path().join("config.toml");
+    test_file::write_user_controlled(
+        &config_file,
+        b"[profiles.diagnostics]\nlog_verbosity = \"debug\"\n",
+    )
+    .expect("write profile verbosity config");
+
+    let configured = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .args(["--profile", "diagnostics", "paths"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&configured.stderr).contains("Satelle diagnostics initialized")
+    );
+
+    let environment_lowers_profile = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_LOG", "off")
+        .args(["--profile", "diagnostics", "paths"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(environment_lowers_profile.stderr.is_empty());
+
+    let environment = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_LOG", "satelle=debug")
+        .args(["paths"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&environment.stderr).contains("Satelle diagnostics initialized")
+    );
+
+    let flag = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_LOG", "satelle=debug")
+        .args([
+            "--profile",
+            "diagnostics",
+            "--log-verbosity",
+            "off",
+            "paths",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(flag.stderr.is_empty());
+
+    let json = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .args([
+            "--profile",
+            "diagnostics",
+            "--log-verbosity",
+            "trace",
+            "paths",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(json.stderr.is_empty());
+}
+
+#[test]
 fn final_result_selectors_and_json_event_streams_report_typed_conflicts() {
     for format in ["human", "json"] {
         assert_output_conflict(&["paths", "--json", "--format", format], true);

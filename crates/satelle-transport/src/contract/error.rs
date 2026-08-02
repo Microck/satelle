@@ -26,6 +26,8 @@ pub enum ApiErrorCode {
     IncompatibleProtocol,
     IncompatibleControlPlane,
     ComputerUseNotReady,
+    YoloNotSupported,
+    YoloBlockedByNativeApproval,
     DesktopBindingRequired,
     DesktopSessionUnavailable,
     DesktopSessionAmbiguous,
@@ -76,6 +78,8 @@ impl ApiErrorCode {
             Self::IncompatibleProtocol => "incompatible-protocol",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
+            Self::YoloNotSupported => "yolo-not-supported",
+            Self::YoloBlockedByNativeApproval => "yolo-blocked-by-native-approval",
             Self::DesktopBindingRequired => "desktop-binding-required",
             Self::DesktopSessionUnavailable => "desktop-session-unavailable",
             Self::DesktopSessionAmbiguous => "desktop-session-ambiguous",
@@ -124,6 +128,26 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ApiErrorCode::IncompatibleControlPlane).unwrap(),
             json!("incompatible-control-plane")
+        );
+    }
+
+    #[test]
+    fn yolo_codes_have_exact_public_tokens() {
+        assert_eq!(
+            ApiErrorCode::YoloNotSupported.as_str(),
+            "yolo-not-supported"
+        );
+        assert_eq!(
+            ApiErrorCode::YoloBlockedByNativeApproval.as_str(),
+            "yolo-blocked-by-native-approval"
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::YoloNotSupported).unwrap(),
+            json!("yolo-not-supported")
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::YoloBlockedByNativeApproval).unwrap(),
+            json!("yolo-blocked-by-native-approval")
         );
     }
 

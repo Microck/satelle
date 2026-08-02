@@ -45,6 +45,10 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::ConfigInterpolationNotSupported
         | ErrorCode::UnknownTimeoutKey
         | ErrorCode::DurationUnitRequired
+        | ErrorCode::TrustedProfileHostAllowlistRequired
+        | ErrorCode::UnsupportedTrustedProfileHostScope
+        | ErrorCode::TrustedProfileCommandAllowlistRequired
+        | ErrorCode::UnsupportedTrustedProfileCommandScope
         | ErrorCode::UnsupportedConfigComposition
         | ErrorCode::ProjectDaemonPathOverrideNotAllowed
         | ErrorCode::ProjectDesktopBindingNotAllowed
@@ -226,6 +230,22 @@ fn failure(error: &SatelleError) -> ApiFailure {
             category: ApiErrorCategory::Readiness,
             retryable: false,
             message: "native Computer Use is not ready on this Host",
+            details: None,
+        },
+        ErrorCode::YoloNotSupported => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::YoloNotSupported,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Codex control plane cannot apply YOLO policy",
+            details: None,
+        },
+        ErrorCode::YoloBlockedByNativeApproval => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::YoloBlockedByNativeApproval,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "native Computer Use approval blocks YOLO execution",
             details: None,
         },
         ErrorCode::DoctorReadinessBlockersFound | ErrorCode::SetupVerificationFailed => ApiFailure {

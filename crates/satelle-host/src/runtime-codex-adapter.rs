@@ -1642,7 +1642,16 @@ fn key_has_denied_observation(key: &ReadinessCacheKey) -> bool {
 
 fn native_observation_blocker(key: &ReadinessCacheKey) -> Option<SatelleError> {
     key_has_denied_observation(key).then(|| {
-        native_readiness_manual_action_failure(key.os_permission_state(), key.app_approval_state())
+        if key.execution_policy().approval_policy() == ApprovalPolicy::Never
+            && key.execution_policy().sandbox_policy() == SandboxPolicy::DangerFullAccess
+        {
+            SatelleError::yolo_blocked_by_native_approval()
+        } else {
+            native_readiness_manual_action_failure(
+                key.os_permission_state(),
+                key.app_approval_state(),
+            )
+        }
     })
 }
 
@@ -1798,6 +1807,9 @@ fn preflight_cancellation_observation(result: &AdapterPreflight) -> StopObservat
 }
 
 fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
+    if error == CodexSessionError::YoloNotSupported {
+        return SatelleError::yolo_not_supported();
+    }
     let (code, reason) = match error {
         CodexSessionError::Timeout => (
             ErrorCode::ProviderSmokeTestTimeout,
@@ -1807,6 +1819,7 @@ fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
             ErrorCode::ExperimentalProviderNotValidated,
             "experimental_provider_not_validated",
         ),
+        CodexSessionError::YoloNotSupported => unreachable!(),
         CodexSessionError::Spawn => (
             ErrorCode::ComputerUseNotReady,
             "provider_smoke_spawn_failed",
@@ -2511,6 +2524,9 @@ fn finish_timed_turn_execution(
 }
 
 fn session_failure(error: CodexSessionError) -> SatelleError {
+    if error == CodexSessionError::YoloNotSupported {
+        return SatelleError::yolo_not_supported();
+    }
     let reason = match error {
         CodexSessionError::Spawn => "spawn_failed",
         CodexSessionError::Write => "write_failed",
@@ -2519,6 +2535,7 @@ fn session_failure(error: CodexSessionError) -> SatelleError {
         CodexSessionError::UnexpectedResponse => "unexpected_response",
         CodexSessionError::DuplicateResponse => "duplicate_response",
         CodexSessionError::ResponseError => "response_error",
+        CodexSessionError::YoloNotSupported => unreachable!(),
         CodexSessionError::ConflictingIdentity => "conflicting_identity",
         CodexSessionError::PrematureExit => "premature_exit",
         CodexSessionError::Timeout => "timeout",
@@ -2587,11 +2604,37 @@ mod tests {
         os_permission_state: ReadinessObservationState,
         app_approval_state: ReadinessObservationState,
     ) -> ReadinessCacheKey {
+        native_readiness_test_key_with_policy(
+            desktop_session_id,
+            os_permission_state,
+            app_approval_state,
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+        )
+    }
+
+    fn native_readiness_test_key_with_policy(
+        desktop_session_id: &str,
+        os_permission_state: ReadinessObservationState,
+        app_approval_state: ReadinessObservationState,
+        approval_policy: ApprovalPolicy,
+        sandbox_policy: SandboxPolicy,
+    ) -> ReadinessCacheKey {
         let desktop_binding = DesktopBindingRef::new("readiness-test-desktop").unwrap();
+        let mut policy = execution_policy_for(desktop_binding.as_str(), desktop_session_id);
+        policy = ExecutionPolicy::new(
+            policy.effective_model().clone(),
+            policy.provider_binding().clone(),
+            policy.desktop_target().clone(),
+            approval_policy,
+            sandbox_policy,
+            policy.timeout_policy(),
+            policy.experimental_features(),
+        );
         ReadinessCacheKey::new(
             NATIVE_ADAPTER,
             desktop_binding.clone(),
-            execution_policy_for(desktop_binding.as_str(), desktop_session_id),
+            policy,
             "0.144.0",
             "codex-native-0.144.0",
             None::<String>,
@@ -4056,6 +4099,44 @@ mod tests {
         assert_eq!(
             error.details["native_readiness"]["status"],
             "manual_action_required"
+        );
+    }
+
+    #[test]
+    fn denied_native_observation_is_typed_when_yolo_cannot_bypass_it() {
+        let key = native_readiness_test_key_with_policy(
+            "denied-yolo-session",
+            ReadinessObservationState::Granted,
+            ReadinessObservationState::Denied,
+            ApprovalPolicy::Never,
+            SandboxPolicy::DangerFullAccess,
+        );
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let evidence = key
+            .evidence(
+                "denied-yolo-readiness",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap();
+
+        let NativeProbeResult::Failed { error, .. } =
+            denied_native_probe_result(&key, &evidence).expect("denied YOLO readiness must fail")
+        else {
+            panic!("denied YOLO readiness must remain a retained failure");
+        };
+        assert_eq!(error.code, ErrorCode::YoloBlockedByNativeApproval);
+    }
+
+    #[test]
+    fn yolo_session_failures_keep_exact_public_error_codes() {
+        assert_eq!(
+            session_failure(CodexSessionError::YoloNotSupported).code,
+            ErrorCode::YoloNotSupported
+        );
+        assert_eq!(
+            provider_smoke_session_failure(CodexSessionError::YoloNotSupported).code,
+            ErrorCode::YoloNotSupported
         );
     }
 

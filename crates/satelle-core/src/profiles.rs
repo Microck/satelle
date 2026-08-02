@@ -1,8 +1,8 @@
 use super::{
-    ConfigInterpolation, ErrorCode, ExplicitDuration, HostConfig, SatelleConfig, SatelleError,
-    TimeoutConfig, UnknownConfigKey, collect_interpolation_for_value,
-    collect_unknown_keys_for_table, finish_interpolation_check, interpolation_syntax,
-    optional_non_empty_env,
+    ConfigInterpolation, ErrorCode, ExplicitDuration, HostConfig, LogVerbosity,
+    PresentationOutputFormat, SatelleConfig, SatelleError, TimeoutConfig, UnknownConfigKey,
+    collect_interpolation_for_value, collect_unknown_keys_for_table, finish_interpolation_check,
+    interpolation_syntax, optional_non_empty_env,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,6 +13,9 @@ const PROFILE_KEYS: &[&str] = &[
     "host",
     "model_alias",
     "provider_alias",
+    "output_format",
+    "log_verbosity",
+    "trusted_profile",
     "experimental_provider_computer_use",
     "experimental_provider_computer_use_by_provider",
     "yolo",
@@ -69,6 +72,9 @@ pub(super) struct ProfileConfig {
     host: Option<String>,
     model_alias: Option<String>,
     provider_alias: Option<String>,
+    output_format: Option<PresentationOutputFormat>,
+    log_verbosity: Option<LogVerbosity>,
+    trusted_profile: Option<String>,
     experimental_provider_computer_use: Option<bool>,
     #[serde(default)]
     experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
@@ -84,6 +90,10 @@ pub(super) struct ProfileConfig {
 impl ProfileConfig {
     pub(super) fn selected_host(&self) -> Option<&str> {
         self.host.as_deref()
+    }
+
+    pub(super) fn trusted_profile_reference(&self) -> Option<&str> {
+        self.trusted_profile.as_deref()
     }
 
     pub(super) fn alias_from_project(
@@ -116,6 +126,12 @@ impl ProfileConfig {
         }
         if let Some(provider_alias) = &self.provider_alias {
             config.provider_alias = Some(provider_alias.clone());
+        }
+        if let Some(output_format) = self.output_format {
+            config.output_format = Some(output_format);
+        }
+        if let Some(log_verbosity) = self.log_verbosity {
+            config.log_verbosity = Some(log_verbosity);
         }
         if source.allows_user_policy()
             && let Some(enabled) = self.experimental_provider_computer_use
@@ -346,6 +362,19 @@ fn validate_profile(path: &Path, name: &str, value: &toml::Value) -> Result<(), 
             None,
         ));
     }
+    if table
+        .get("trusted_profile")
+        .is_some_and(|value| value.as_str().is_none_or(str::is_empty))
+    {
+        return Err(SatelleError::config_error(
+            format!(
+                "config file {} profile '{}' trusted_profile must be a non-empty string",
+                path.display(),
+                name
+            ),
+            None,
+        ));
+    }
 
     reject_profile_interpolation(path, &profile_path, table)?;
     reject_profile_duration_errors(path, &profile_path, table)
@@ -357,7 +386,7 @@ fn reject_profile_interpolation(
     table: &toml::Table,
 ) -> Result<(), SatelleError> {
     let mut interpolations = Vec::<ConfigInterpolation>::new();
-    for key in ["host", "model_alias", "provider_alias"] {
+    for key in ["host", "model_alias", "provider_alias", "trusted_profile"] {
         collect_interpolation_for_value(
             &format!("{profile_path}.{key}"),
             table.get(key),

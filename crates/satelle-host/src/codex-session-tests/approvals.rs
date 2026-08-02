@@ -98,6 +98,27 @@ fn yolo_approves_only_the_pinned_callback_allowlist_for_the_current_turn() {
 }
 
 #[test]
+fn yolo_turn_start_rejection_is_typed_as_unsupported_policy() {
+    let run = run_yolo_scenario("turn-policy-response-error", Duration::from_secs(3));
+
+    assert_eq!(run.result, Err(CodexSessionError::YoloNotSupported));
+}
+
+#[test]
+fn yolo_preserves_an_unrelated_turn_start_error() {
+    let run = run_yolo_scenario("response-error", Duration::from_secs(3));
+
+    assert_eq!(run.result, Err(CodexSessionError::ResponseError));
+}
+
+#[test]
+fn yolo_thread_policy_rejection_is_typed_as_unsupported_policy() {
+    let run = run_yolo_scenario("thread-policy-response-error", Duration::from_secs(3));
+
+    assert_eq!(run.result, Err(CodexSessionError::YoloNotSupported));
+}
+
+#[test]
 fn yolo_rejects_permission_profiles_outside_the_pinned_schema() {
     for scenario in ["unsupported-permission", "malformed-permission"] {
         let run = run_yolo_scenario(scenario, Duration::from_secs(3));

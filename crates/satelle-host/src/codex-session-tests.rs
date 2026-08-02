@@ -98,6 +98,14 @@ fn main() {
         hang();
     }
     let thread_request = receive(&mut input, &log);
+    if scenario == "thread-policy-response-error" {
+        send(&mut output, r#"{"id":2,"error":{"code":-32602,"message":"unknown field approvalPolicy"}}"#);
+        hang();
+    }
+    if scenario == "thread-response-error" {
+        send(&mut output, r#"{"id":2,"error":{"code":-32000,"message":"thread service unavailable"}}"#);
+        hang();
+    }
     let thread_id = if thread_request.contains(r#""threadId":"thread-existing""#) {
         "thread-existing"
     } else {
@@ -136,6 +144,10 @@ fn main() {
 
     match scenario.as_str() {
         "duplicate" => { send(&mut output, &thread_response); hang(); }
+        "turn-policy-response-error" => {
+            send(&mut output, r#"{"id":3,"error":{"code":-32602,"message":"unknown field sandboxPolicy"}}"#);
+            hang();
+        }
         "response-error" => {
             send(&mut output, r#"{"id":3,"error":{"code":-1,"message":"PRIVATE_RAW_CANARY"}}"#);
             hang();
@@ -1099,6 +1111,7 @@ fn malformed_and_adversarial_messages_fail_closed() {
         ("unterminated", CodexSessionError::Timeout),
         ("eof", CodexSessionError::PrematureExit),
         ("response-error", CodexSessionError::ResponseError),
+        ("thread-response-error", CodexSessionError::ResponseError),
         ("timeout", CodexSessionError::Timeout),
     ] {
         // This table checks protocol classification, not process-start or pipe

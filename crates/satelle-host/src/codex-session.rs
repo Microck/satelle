@@ -216,6 +216,8 @@ pub(crate) enum CodexSessionError {
     DuplicateResponse,
     #[error("the private Codex app-server reported a protocol error")]
     ResponseError,
+    #[error("the private Codex app-server cannot honor YOLO policy")]
+    YoloNotSupported,
     #[error("the private Codex app-server reported conflicting session identity")]
     ConflictingIdentity,
     #[error("the private Codex app-server ended before the turn completed")]
@@ -710,6 +712,9 @@ impl<'a> SessionExchange<'a> {
             return Ok(());
         }
         if object.contains_key("error") {
+            if self.yolo_policy_rejected(id, object) {
+                return Err(CodexSessionError::YoloNotSupported);
+            }
             return Err(CodexSessionError::ResponseError);
         }
         let result = object
@@ -814,6 +819,32 @@ impl<'a> SessionExchange<'a> {
             | "item/completed" => Err(CodexSessionError::MalformedMessage),
             _ => Ok(()),
         }
+    }
+
+    fn yolo_policy_rejected(&self, id: usize, response: &Map<String, Value>) -> bool {
+        if !self.request.auto_approves_callbacks() {
+            return false;
+        }
+        if id != 2 && id != self.turn_request_id() {
+            return false;
+        }
+
+        // Thread and Turn requests can fail for unrelated runtime reasons. Only an
+        // invalid-params response that names a YOLO policy field confirms that
+        // this control plane cannot honor the requested execution mode.
+        let Some(error) = response.get("error").and_then(Value::as_object) else {
+            return false;
+        };
+        if error.get("code").and_then(Value::as_i64) != Some(-32602) {
+            return false;
+        }
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|message| {
+                message.contains("approvalpolicy") || message.contains("sandbox")
+            })
     }
 
     fn observe_thread(&mut self, observed: &str) -> Result<(), CodexSessionError> {
