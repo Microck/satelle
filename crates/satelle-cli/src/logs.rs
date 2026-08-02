@@ -1,6 +1,6 @@
 use super::output::{OutputArgs, OutputFormat};
 use super::transport::{TransportClient, transport_for};
-use super::{CliFailure, ConfigContext, failure, parse_duration_ms};
+use super::{CliFailure, ConfigContext, failure, parse_duration_ms, shell_argument};
 use clap::Args;
 use satelle_core::{ErrorCode, SatelleError, SessionId};
 use satelle_host::{DaemonLogEntry, LogCursor, LogPageQuery, LogSeverity, LogSource};
@@ -122,7 +122,7 @@ impl From<LogsCommand> for LogReadRequest {
 
 impl LogReadRequest {
     fn follow_rerun_command(&self, host: &str, cursor: LogCursor) -> String {
-        let mut command = format!("satelle logs --host {host}");
+        let mut command = format!("satelle logs --host {}", shell_argument(host));
         if let Some(session) = &self.session {
             command.push_str(" --session ");
             command.push_str(session);
@@ -1087,6 +1087,18 @@ mod tests {
             follow: true,
             no_reconnect: false,
         }
+    }
+
+    #[test]
+    fn follow_rerun_command_quotes_host_aliases() {
+        assert_eq!(
+            request().follow_rerun_command(
+                "host alias; echo owned",
+                serde_json::from_value(serde_json::json!("slc1_0000000000000001"))
+                    .expect("valid opaque Log Cursor"),
+            ),
+            "satelle logs --host 'host alias; echo owned' --after slc1_0000000000000001 --follow"
+        );
     }
 
     fn page(cursor: u64) -> satelle_host::DaemonLogPage {
