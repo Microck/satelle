@@ -95,16 +95,13 @@ impl Invocation {
 
 pub(super) struct InvocationStart {
     started_at: String,
-    started_at_time: OffsetDateTime,
     started: Instant,
 }
 
 impl InvocationStart {
     pub(super) fn capture() -> Self {
-        let started_at_time = OffsetDateTime::now_utc();
         Self {
-            started_at: format_started_at(started_at_time),
-            started_at_time,
+            started_at: format_started_at(OffsetDateTime::now_utc()),
             started: Instant::now(),
         }
     }
@@ -197,7 +194,6 @@ pub(super) struct Recorder {
     cache_root: PathBuf,
     invocation: Invocation,
     started_at: String,
-    started_at_time: OffsetDateTime,
     started: Instant,
 }
 
@@ -211,7 +207,6 @@ impl Recorder {
             cache_root,
             invocation,
             started_at: start.started_at,
-            started_at_time: start.started_at_time,
             started: start.started,
         }
     }
@@ -265,15 +260,6 @@ impl Recorder {
         // Windows scheduler contention.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
-        let retention_cutoff = self
-            .started_at_time
-            .checked_sub(COMMAND_HISTORY_RETENTION)
-            .ok_or(rusqlite::Error::InvalidQuery)?;
-        transaction.execute(
-            "DELETE FROM command_history WHERE started_at < ?1",
-            [format_started_at(retention_cutoff)],
-        )?;
-
         let session_id = final_session_id
             .map(ToString::to_string)
             .or(self.invocation.session_id);
@@ -298,6 +284,16 @@ impl Recorder {
                 error_code.map(|code| code.as_str()),
                 env!("CARGO_PKG_VERSION"),
             ],
+        )?;
+        // Prune from the writer transaction's wall-clock time, not the
+        // invocation start. Insert first so a command that ran past the
+        // retention window cannot leave its already-expired row behind.
+        let retention_cutoff = OffsetDateTime::now_utc()
+            .checked_sub(COMMAND_HISTORY_RETENTION)
+            .ok_or(rusqlite::Error::InvalidQuery)?;
+        transaction.execute(
+            "DELETE FROM command_history WHERE started_at < ?1",
+            [format_started_at(retention_cutoff)],
         )?;
         transaction.commit()?;
         Ok(())
@@ -492,7 +488,7 @@ mod tests {
     use rusqlite::Connection;
     use satelle_core::{ErrorCode, SessionId};
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use time::OffsetDateTime;
 
     #[test]
@@ -518,6 +514,32 @@ mod tests {
         );
 
         assert!(recorder.started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn persistence_drops_an_invocation_that_expired_while_running() {
+        let root = tempfile::tempdir().expect("create command history parent");
+        let cache_root = root.path().join("cache");
+        let started_at_time = OffsetDateTime::now_utc() - time::Duration::days(8);
+        let start = InvocationStart {
+            started_at: format_started_at(started_at_time),
+            started: Instant::now(),
+        };
+
+        Recorder::start(
+            cache_root.clone(),
+            Invocation::new("host-start", None, None, None),
+            start,
+        )
+        .finish(None, None)
+        .expect("persist long-running invocation");
+
+        let retained_count: i64 =
+            Connection::open(cache_root.join("command-history/command-history.sqlite3"))
+                .expect("open command history")
+                .query_row("SELECT COUNT(*) FROM command_history", [], |row| row.get(0))
+                .expect("count retained command history");
+        assert_eq!(retained_count, 0);
     }
 
     #[test]
