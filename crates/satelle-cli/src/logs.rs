@@ -515,6 +515,7 @@ fn transient_follow_error(code: ErrorCode) -> bool {
         ErrorCode::HostUnreachable
             | ErrorCode::HostDaemonUnreachable
             | ErrorCode::DirectDaemonUnreachable
+            | ErrorCode::SshBootstrapUnavailable
             | ErrorCode::RemoteExecution
     )
 }
