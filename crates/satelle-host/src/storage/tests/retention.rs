@@ -846,6 +846,7 @@ fn expiring_the_session_that_owns_all_logs_preserves_the_cursor_high_water() {
         .log_page(
             &LogPageQuery::forward(Some(LogCursor::from_position(delivered_cursor)), 10)
                 .expect("valid delivered cursor query"),
+            observed_at,
         )
         .expect("a delivered cursor must not become cursor-ahead");
     assert!(page.entries().is_empty());

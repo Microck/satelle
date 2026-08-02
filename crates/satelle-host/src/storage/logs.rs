@@ -188,8 +188,9 @@ impl Storage {
     pub(crate) fn log_page(
         &mut self,
         query: &LogPageQuery,
+        observed_at: OffsetDateTime,
     ) -> Result<DaemonLogPage, LogPageStorageError> {
-        self.prune_logs_if_needed(OffsetDateTime::now_utc())?;
+        self.prune_logs_if_needed(observed_at)?;
         let (expired_through, earliest_available, high_water) =
             log_retention_bounds(&self.connection)?;
         if query.mode() == LogPageMode::Forward

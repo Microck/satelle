@@ -2160,7 +2160,10 @@ impl RuntimeEngine {
     }
 
     fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifactSet, SatelleError> {
-        self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
+        // One export uses one retention boundary so a later page cannot expire
+        // a cursor that an earlier page in the same export already delivered.
+        let observed_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(observed_at)?;
         // Keep one storage guard for the full export so the Session, recovery
         // subjects, and log pages all describe one coherent durable snapshot.
         let mut storage = self.lock_storage()?;
@@ -2297,7 +2300,7 @@ impl RuntimeEngine {
             let query = LogPageQuery::forward(cursor, 10_000)
                 .expect("the artifact log page size is valid")
                 .with_session(session.id().clone());
-            let page = match storage.log_page(&query) {
+            let page = match storage.log_page(&query, observed_at) {
                 Ok(page) => page,
                 Err(LogPageStorageError::Storage(error)) => {
                     return Err(model::storage_failure(error));
@@ -2357,8 +2360,9 @@ impl RuntimeEngine {
     }
 
     fn log_page(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
-        self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
-        match self.lock_storage()?.log_page(query) {
+        let observed_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(observed_at)?;
+        match self.lock_storage()?.log_page(query, observed_at) {
             Ok(page) => Ok(page),
             Err(LogPageStorageError::Storage(error)) => Err(model::storage_failure(error)),
             Err(LogPageStorageError::CursorExpired {

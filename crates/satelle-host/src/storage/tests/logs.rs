@@ -388,7 +388,7 @@ fn log_pages_filter_before_limiting_and_resume_after_the_delivered_cursor() {
         .expect("append third log");
 
     let tail = storage
-        .log_page(&LogPageQuery::tail(2).expect("valid tail query"))
+        .log_page(&LogPageQuery::tail(2).expect("valid tail query"), now)
         .expect("read tail page");
     assert_eq!(
         tail.entries()
@@ -405,6 +405,7 @@ fn log_pages_filter_before_limiting_and_resume_after_the_delivered_cursor() {
             &LogPageQuery::forward(Some(LogCursor::from_position(first)), 1)
                 .expect("valid forward query")
                 .with_sources([LogSource::CodexAdapter]),
+            now,
         )
         .expect("read filtered forward page");
     assert_eq!(filtered.entries().len(), 1);
@@ -416,21 +417,66 @@ fn log_pages_filter_before_limiting_and_resume_after_the_delivered_cursor() {
         .log_page(
             &LogPageQuery::forward(Some(LogCursor::from_position(third + 1)), 1)
                 .expect("valid future-shaped query"),
+            now,
         )
         .expect_err("a cursor above the store high-water mark must be rejected");
     assert!(matches!(future, LogPageStorageError::CursorAhead));
 }
 
 #[test]
-fn log_pages_treat_future_since_values_as_an_empty_result() {
+fn log_pagination_can_hold_one_retention_boundary_across_pages() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
-    let cursor = storage
+    let observed_at = at(0) + time::Duration::days(7);
+    let first = storage
+        .append_safe_log(&host_log(at(0), LogSource::Storage, LogSeverity::Info))
+        .expect("append first boundary log");
+    let second = storage
+        .append_safe_log(&host_log(at(0), LogSource::Storage, LogSeverity::Info))
+        .expect("append second boundary log");
+    storage
         .append_safe_log(&host_log(
-            OffsetDateTime::now_utc(),
+            at(0) + time::Duration::nanoseconds(1),
             LogSource::Storage,
             LogSeverity::Info,
         ))
+        .expect("append retained log");
+
+    let first_page = storage
+        .log_page(
+            &LogPageQuery::forward(None, 1).expect("valid first page query"),
+            observed_at,
+        )
+        .expect("read first page at the export retention boundary");
+    assert_eq!(first_page.entries()[0].cursor().position(), first);
+    assert!(first_page.truncated());
+
+    let continued = storage
+        .log_page(
+            &LogPageQuery::forward(Some(first_page.next_cursor()), 1)
+                .expect("valid continuation query"),
+            observed_at,
+        )
+        .expect("continue at the same export retention boundary");
+    assert_eq!(continued.entries()[0].cursor().position(), second);
+
+    let crossed = storage
+        .log_page(
+            &LogPageQuery::forward(Some(first_page.next_cursor()), 1)
+                .expect("valid crossed-boundary query"),
+            observed_at + time::Duration::nanoseconds(1),
+        )
+        .expect_err("advancing the retention boundary expires the first page cursor");
+    assert!(matches!(crossed, LogPageStorageError::CursorExpired { .. }));
+}
+
+#[test]
+fn log_pages_treat_future_since_values_as_an_empty_result() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let now = OffsetDateTime::now_utc();
+    let cursor = storage
+        .append_safe_log(&host_log(now, LogSource::Storage, LogSeverity::Info))
         .expect("append current log");
     let future =
         OffsetDateTime::parse("2999-01-01T00:00:00Z", &Rfc3339).expect("future RFC 3339 timestamp");
@@ -440,6 +486,7 @@ fn log_pages_treat_future_since_values_as_an_empty_result() {
             &LogPageQuery::forward(None, 10)
                 .expect("valid forward query")
                 .with_since(future),
+            now,
         )
         .expect("a future lower bound is a valid empty query");
 
@@ -468,6 +515,7 @@ fn retention_expires_only_cursors_that_can_no_longer_resume_the_retained_prefix(
         .log_page(
             &LogPageQuery::forward(Some(LogCursor::from_position(0)), 10)
                 .expect("valid expired query"),
+            now,
         )
         .expect_err("origin cursor must expire after retained history advances");
     assert_eq!(expired_error.earliest_available_cursor(), Some(retained));
@@ -477,6 +525,7 @@ fn retention_expires_only_cursors_that_can_no_longer_resume_the_retained_prefix(
         .log_page(
             &LogPageQuery::forward(Some(LogCursor::from_position(expired)), 10)
                 .expect("valid boundary query"),
+            now,
         )
         .expect("the last expired cursor remains a valid resume boundary");
     assert_eq!(resumed.entries()[0].cursor().position(), retained);
@@ -621,7 +670,7 @@ fn appended_log_timestamps_cannot_move_backwards_behind_the_cursor_order() {
     assert_eq!(stored[1].record().recorded_at(), now);
 
     let page = storage
-        .log_page(&LogPageQuery::tail(10).expect("valid tail query"))
+        .log_page(&LogPageQuery::tail(10).expect("valid tail query"), now)
         .expect("read page after retention maintenance");
     assert_eq!(page.entries().len(), 2);
 }
@@ -671,16 +720,20 @@ fn persisted_log_rows_with_partial_subjects_are_rejected() {
 fn log_reads_enforce_retention_even_when_no_new_log_has_been_written() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let observed_at = OffsetDateTime::now_utc();
     let expired = storage
         .append_safe_log(&host_log(
-            OffsetDateTime::now_utc() - time::Duration::days(8),
+            observed_at - time::Duration::days(8),
             LogSource::Storage,
             LogSeverity::Info,
         ))
         .expect("append an old log");
 
     let page = storage
-        .log_page(&LogPageQuery::tail(10).expect("valid tail query"))
+        .log_page(
+            &LogPageQuery::tail(10).expect("valid tail query"),
+            observed_at,
+        )
         .expect("read after idle retention window");
     assert!(page.entries().is_empty());
     assert_eq!(page.next_cursor().position(), expired);
@@ -689,6 +742,7 @@ fn log_reads_enforce_retention_even_when_no_new_log_has_been_written() {
         .log_page(
             &LogPageQuery::forward(Some(LogCursor::from_position(0)), 10)
                 .expect("valid origin query"),
+            observed_at,
         )
         .expect_err("the pre-retention origin must be expired");
     assert_eq!(error.earliest_available_cursor(), None);
