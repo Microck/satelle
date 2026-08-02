@@ -497,25 +497,33 @@ impl LocalTransport {
                         })?;
                         return Err(match result {
                             Ok(outcome) => match cancellation.admitted_handle() {
-                                Some((_, turn_id)) => TurnAdmissionFailure::admitted(
+                                Some((_, turn_id)) => TurnAdmissionFailure::admitted_with_events(
                                     wait_error,
                                     outcome.session,
                                     turn_id,
+                                    outcome.events,
                                 ),
                                 None => TurnAdmissionFailure::admission_unknown(wait_error),
                             },
                             Err(TurnAdmissionFailure::NotAdmitted(_)) => {
                                 TurnAdmissionFailure::not_admitted(wait_error)
                             }
-                            Err(TurnAdmissionFailure::AdmissionUnknown(_)) => {
-                                TurnAdmissionFailure::admission_unknown(wait_error)
+                            Err(TurnAdmissionFailure::AdmissionUnknown { events, .. }) => {
+                                TurnAdmissionFailure::admission_unknown_with_events(
+                                    wait_error,
+                                    events,
+                                )
                             }
                             Err(TurnAdmissionFailure::Admitted {
-                                session, turn_id, ..
-                            }) => TurnAdmissionFailure::admitted(
+                                session,
+                                turn_id,
+                                events,
+                                ..
+                            }) => TurnAdmissionFailure::admitted_with_events(
                                 wait_error,
                                 *session,
                                 turn_id,
+                                events,
                             ),
                         });
                     }
@@ -533,32 +541,59 @@ impl LocalTransport {
                             Err(failure) => Err(local_interrupted_admission_failure(failure)),
                         };
                     };
-                    let interruption = if detach_on_interrupt {
-                        SatelleError::interrupted_attached_command()
-                    } else {
-                        match service.stop_expected_turn(&admitted_session_id, &turn_id) {
-                            Ok(_) => SatelleError::interrupted_attached_command(),
-                            Err(error) => unconfirmed_interrupt_error(
-                                &alias,
-                                &admitted_session_id,
-                                error,
-                            ),
-                        }
+                    let stop = service.stop_expected_turn(&admitted_session_id, &turn_id);
+                    let interruption = match &stop {
+                        Ok(_) => SatelleError::interrupted_attached_command(),
+                        Err(error) => unconfirmed_interrupt_error(
+                            &alias,
+                            &admitted_session_id,
+                            error.clone(),
+                        ),
                     };
-                    let session = service.status(&admitted_session_id).map_err(|status_error| {
-                        TurnAdmissionFailure::admission_unknown(
-                            interrupted_status_error(
-                                &alias,
-                                &admitted_session_id,
-                                interruption.clone(),
-                                status_error,
+                    if stop.is_ok() {
+                        let result = operation.await.map_err(|_| {
+                            TurnAdmissionFailure::admission_unknown(
+                                interrupted_admission_race_error(&alias),
+                            )
+                        })?;
+                        return Err(match result {
+                            Ok(outcome) => TurnAdmissionFailure::admitted_with_events(
+                                interruption,
+                                outcome.session,
+                                turn_id,
+                                outcome.events,
                             ),
+                            Err(TurnAdmissionFailure::Admitted {
+                                session,
+                                turn_id,
+                                events,
+                                ..
+                            }) => TurnAdmissionFailure::admitted_with_events(
+                                interruption,
+                                *session,
+                                turn_id,
+                                events,
+                            ),
+                            Err(failure) => failure,
+                        });
+                    }
+                    // Snapshot once before status so both the success and failure outcomes retain
+                    // the same events even if worker completion races this read.
+                    let events = cancellation.live_events();
+                    let session = service.status(&admitted_session_id).map_err(|status_error| {
+                        interrupted_status_failure(
+                            &alias,
+                            &admitted_session_id,
+                            interruption.clone(),
+                            status_error,
+                            events.clone(),
                         )
                     })?;
-                    Err(TurnAdmissionFailure::admitted(
+                    Err(TurnAdmissionFailure::admitted_with_events(
                         interruption,
                         session,
                         turn_id,
+                        events,
                     ))
                 }
                 result = &mut operation => result.map_err(|error| {
@@ -576,8 +611,11 @@ fn local_interrupted_admission_failure(failure: TurnAdmissionFailure) -> TurnAdm
         TurnAdmissionFailure::NotAdmitted(error) => {
             TurnAdmissionFailure::not_admitted(local_pre_admission_interruption(*error))
         }
-        TurnAdmissionFailure::AdmissionUnknown(error) => {
-            TurnAdmissionFailure::admission_unknown(local_pre_admission_interruption(*error))
+        TurnAdmissionFailure::AdmissionUnknown { error, events } => {
+            TurnAdmissionFailure::admission_unknown_with_events(
+                local_pre_admission_interruption(*error),
+                events,
+            )
         }
         failure @ TurnAdmissionFailure::Admitted { .. } => failure,
     }
@@ -612,12 +650,13 @@ fn unconfirmed_interrupt_error(
     error
 }
 
-fn interrupted_status_error(
+fn interrupted_status_failure(
     alias: &str,
     session_id: &SessionId,
     mut interruption: SatelleError,
     status_error: SatelleError,
-) -> SatelleError {
+    events: Vec<SatelleEvent>,
+) -> TurnAdmissionFailure {
     let status_command = format!("satelle status {session_id} --host {alias}");
     interruption.message = format!(
         "{}; status could not be read for Session {session_id}",
@@ -636,7 +675,7 @@ fn interrupted_status_error(
         "status_error_code".to_string(),
         serde_json::Value::String(status_error.code.as_str().to_string()),
     );
-    interruption
+    TurnAdmissionFailure::admission_unknown_with_events(interruption, events)
 }
 
 fn local_pre_admission_interruption(source: SatelleError) -> SatelleError {

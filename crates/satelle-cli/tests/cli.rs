@@ -2335,6 +2335,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     assert!(session["turns"][0]["terminal_at"].is_null());
 
     let status_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["status", &session_id, "--json"])
         .assert()
@@ -2345,6 +2346,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     assert_eq!(status["status"], "recovery_pending");
 
     let logs_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["logs", "--session", &session_id, "--json"])
         .assert()
@@ -2370,6 +2372,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     );
 
     let busy_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "run",
@@ -2388,6 +2391,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     assert_eq!(busy_error["details"]["active_session_id"], session_id);
 
     let busy_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "steer",
@@ -2404,12 +2408,14 @@ fn detach_returns_starting_session_without_event_streaming() {
     assert_eq!(busy_error["details"]["active_session_id"], session_id);
 
     satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["stop", &session_id, "--json"])
         .assert()
         .success();
 
     let steer_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
             "steer",

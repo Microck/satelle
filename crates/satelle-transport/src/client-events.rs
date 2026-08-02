@@ -225,7 +225,6 @@ impl DaemonEventStream {
         loop {
             tokio::select! {
                 biased;
-                output = &mut future => return (output, buffered_events, None),
                 event = self.next_event() => match event {
                     Ok(event) => {
                         if let Err(error) = buffer_admission_event(&mut buffered_events, event) {
@@ -243,6 +242,7 @@ impl DaemonEventStream {
                         return (output, buffered_events, Some(error));
                     }
                 },
+                output = &mut future => return (output, buffered_events, None),
             }
         }
     }
@@ -250,6 +250,33 @@ impl DaemonEventStream {
     pub async fn next_event(&mut self) -> Result<SatelleEvent, DaemonEventError> {
         self.next_event_with_timeout(EVENT_STREAM_IDLE_TIMEOUT)
             .await
+    }
+
+    /// Drains authenticated events until one absolute deadline expires.
+    ///
+    /// Interrupt handling uses this after its stop or detach decision so a live-only approval
+    /// already in flight from the daemon is not lost when the normal follow future is cancelled.
+    /// Callers must invoke this inside a Tokio runtime with its time driver enabled.
+    pub async fn drain_events_for(
+        &mut self,
+        max_wait: Duration,
+    ) -> Result<Vec<SatelleEvent>, DaemonEventError> {
+        let mut events = Vec::new();
+        let drain = async {
+            loop {
+                match self.next_event().await {
+                    Ok(event) => buffer_admission_event(&mut events, event)?,
+                    // Parsed events remain authenticated and ordered even when the next frame reveals
+                    // a disconnect. Return them before surfacing any later stream failure.
+                    Err(_) if !events.is_empty() => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        match tokio::time::timeout(max_wait, drain).await {
+            Ok(Ok(())) | Err(_) => Ok(events),
+            Ok(Err(error)) => Err(error),
+        }
     }
 
     async fn next_event_with_timeout(

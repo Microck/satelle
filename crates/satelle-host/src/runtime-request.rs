@@ -1,6 +1,6 @@
 use super::ProviderComputerUseIntent;
 use satelle_core::session::TurnExecutionMode;
-use satelle_core::{SessionId, TurnId};
+use satelle_core::{SatelleEvent, SatelleEventBody, SessionId, TurnId};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -25,7 +25,29 @@ pub struct AdmissionCancellation {
 struct AdmissionCancellationInner {
     commit: Mutex<()>,
     state: Mutex<AdmissionCancellationState>,
+    live_events: LocalLiveEventBuffer,
     deadline: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LocalLiveEventBuffer {
+    events: Arc<Mutex<Vec<SatelleEventBody>>>,
+}
+
+impl LocalLiveEventBuffer {
+    pub(crate) fn publish(&self, event: SatelleEventBody) {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event);
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<SatelleEventBody> {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 impl AdmissionCancellation {
@@ -34,6 +56,7 @@ impl AdmissionCancellation {
             inner: Arc::new(AdmissionCancellationInner {
                 commit: Mutex::new(()),
                 state: Mutex::new(AdmissionCancellationState::Open),
+                live_events: LocalLiveEventBuffer::default(),
                 deadline: None,
             }),
         }
@@ -44,6 +67,7 @@ impl AdmissionCancellation {
             inner: Arc::new(AdmissionCancellationInner {
                 commit: Mutex::new(()),
                 state: Mutex::new(AdmissionCancellationState::Open),
+                live_events: LocalLiveEventBuffer::default(),
                 deadline: Some(deadline),
             }),
         }
@@ -107,6 +131,27 @@ impl AdmissionCancellation {
             } => Some((session_id.clone(), turn_id.clone())),
             _ => None,
         }
+    }
+
+    pub(crate) fn live_event_buffer(&self) -> LocalLiveEventBuffer {
+        self.inner.live_events.clone()
+    }
+
+    /// Snapshots adapter events already published by this operation without waiting for the
+    /// operation to finish. Worker completion and local interruption are independent consumers,
+    /// so neither can remove events from the other's view.
+    pub fn live_events(&self) -> Vec<SatelleEvent> {
+        self.inner
+            .live_events
+            .snapshot()
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| {
+                event
+                    .with_seq(u64::try_from(index + 1).expect("event count fits in u64"))
+                    .expect("a positive local live-event sequence is valid")
+            })
+            .collect()
     }
 
     pub(crate) fn finish(&self, state: AdmissionCancellationState) {
@@ -469,6 +514,30 @@ mod admission_cancellation_tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn published_live_events_remain_visible_to_both_operation_consumers() {
+        let cancellation = AdmissionCancellation::new();
+        cancellation.live_event_buffer().publish(
+            SatelleEventBody::new(
+                satelle_core::EventType::ActionRequired,
+                satelle_core::EventSource::CodexAdapter,
+                time::OffsetDateTime::UNIX_EPOCH,
+                "host-a",
+                None,
+                "manual action required",
+                serde_json::json!({"status": "manual_action_required"}),
+            )
+            .expect("construct live approval event"),
+        );
+
+        assert_eq!(cancellation.live_events().len(), 1);
+        assert_eq!(
+            cancellation.live_events().len(),
+            1,
+            "worker completion and interruption both own an event view"
+        );
+    }
 
     #[test]
     fn cancellation_before_commit_prevents_the_storage_operation() {

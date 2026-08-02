@@ -1845,7 +1845,7 @@
 ## security
 - satelle does not store plaintext secrets in Satelle configuration files @spec @mvp @implemented
 - satelle delegates SSH keys, provider API keys, Codex authentication, and app-server tokens to existing secret stores or remote-host token files @spec @mvp @implemented
-- satelle MVP does not collect telemetry or send crash reports from the CLI or Host Daemon @spec @mvp
+- satelle MVP does not collect telemetry or send crash reports from the CLI or Host Daemon @spec @mvp @implemented
 - satelle later telemetry is an explicit opt-in feature with documented collection scope, redaction rules, retention policy, disable behavior, and exclusion rules for secrets, raw prompts, screenshots, desktop recordings, full transcripts, and provider request or response bodies @spec @later
 - satelle telemetry opt-in cannot be enabled by project-level configuration, install scripts, setup defaults, Host bootstrap, package-manager installation, --yes, or Satelle Trusted Profile mutation consent @spec @later
 - later telemetry exports OpenTelemetry Protocol over HTTP metrics and traces only to an Operator-configured endpoint and does not introduce a Satelle-hosted collection service @spec @later
@@ -1882,10 +1882,10 @@
 - every Host Daemon bearer token has a stable non-secret token id @spec @mvp @implemented
 - every Host Daemon bearer token has one or more read, control, admin, and diagnostics_sensitive scopes @spec @mvp @implemented
 - read scope authorizes readiness, status, Host session metadata, paths, and redacted logs @spec @mvp @implemented
-- control scope authorizes read operations plus run, steer, stop, and attachment upload @spec @mvp
-- admin scope authorizes control operations plus setup, repair, Host lifecycle, Host update, storage migration, token management, and destructive maintenance @spec @mvp
-- diagnostics_sensitive scope is required in addition to command-specific consent for Raw Diagnostic Export, recording, and Desktop Snapshot Export operations @spec @mvp
-- transport authorization never substitutes for mutation consent, provider-secret consent, raw-diagnostic consent, recording consent, desktop-snapshot consent, or YOLO selection @spec @mvp
+- control scope authorizes read operations plus run, steer, stop, and attachment upload @spec @mvp @implemented
+- admin scope authorizes control operations plus setup, repair, Host lifecycle, Host update, storage migration, token management, and destructive maintenance @spec @mvp @implemented
+- diagnostics_sensitive scope is required in addition to command-specific consent for Raw Diagnostic Export, recording, and Desktop Snapshot Export operations @spec @mvp @implemented
+- transport authorization never substitutes for mutation consent, provider-secret consent, raw-diagnostic consent, recording consent, desktop-snapshot consent, or YOLO selection @spec @mvp @implemented
 - a request with valid authentication but insufficient scope fails with a typed authorization-insufficient-scope error @spec @mvp @implemented
 - Host Daemon bearer tokens contain at least 256 bits of cryptographically random entropy @spec @mvp @implemented
 - the Host Daemon stores only a one-way token verifier and non-secret token metadata @spec @mvp @implemented
@@ -1921,24 +1921,24 @@
 - satelle mTLS does not replace bearer token authorization because mTLS authenticates the client connection while Satelle still needs application-layer operation scopes and audit metadata @spec @later
 - satelle later mutual TLS uses user-level client certificate, private-key, and CA descriptors with certificate rotation, revocation, service reload, expiry, trust-chain, and cross-platform storage diagnostics @spec @later
 - satelle later maps a verified client certificate identity into audit metadata while bearer-token scopes remain authoritative for application operations @spec @later
-- satelle Tailscale-backed direct transport still requires Satelle Host Daemon authentication and authorization because Tailscale reachability identity is not the Satelle operation permission model @spec @mvp
+- satelle Tailscale-backed direct transport still requires Satelle Host Daemon authentication and authorization because Tailscale reachability identity is not the Satelle operation permission model @spec @mvp @implemented
 - after explicit setup or trust acceptance, the CLI writes the observed stable Host Identity to expected_host_id in the user-level Host Binding @spec @mvp @implemented
 - any Host Binding with expected_host_id = null permits identity discovery only through explicit setup or trust acceptance and cannot start ordinary Session, log, or maintenance operations @spec @mvp @implemented
-- all communication after first trust requires the observed Host Identity to match the user-level Host Binding's expected_host_id @spec @mvp
-- after first trust, every authenticated HTTP request and WebSocket handshake includes the expected Host Identity through the Satelle-Expected-Host-Identity header, and the Host Daemon compares it before handling the operation or returning protected data @spec @contract @mvp
-- a Host Identity mismatch permits only the minimal liveness response and a typed identity-mismatch response containing the expected and observed non-secret identities plus recovery guidance; it returns no other Host, Session, log, readiness, capability, or mutation data @spec @mvp
-- satelle exposes satelle host trust --host <alias> as the explicit Host Identity trust operation for an unpinned or replaced Host Binding @spec @mvp
-- interactive Host trust displays the transport-authenticated endpoint, observed Host Identity, current expected_host_id, Host Alias, and Desktop Binding before asking for confirmation @spec @mvp
-- noninteractive Host trust requires --no-input --yes plus --expected-host-id <exact-id>; --yes alone never accepts a discovered Host Identity @spec @mvp
-- replacing a non-null expected_host_id additionally requires --replace and is never implied by setup, repair, host update, project configuration, a Trusted Profile, or ordinary --yes consent @spec @mvp
+- all communication after first trust requires the observed Host Identity to match the user-level Host Binding's expected_host_id @spec @mvp @implemented
+- after first trust, every authenticated HTTP request and WebSocket handshake includes the expected Host Identity through the Satelle-Expected-Host-Identity header, and the Host Daemon compares it before handling the operation or returning protected data @spec @contract @mvp @implemented
+- a Host Identity mismatch permits only the minimal liveness response and a typed identity-mismatch response containing the expected and observed non-secret identities plus recovery guidance; it returns no other Host, Session, log, readiness, capability, or mutation data @spec @mvp @implemented
+- satelle exposes satelle host trust --host <alias> as the explicit Host Identity trust operation for an unpinned or replaced Host Binding @spec @mvp @implemented
+- interactive Host trust displays the transport-authenticated endpoint, observed Host Identity, current expected_host_id, Host Alias, and Desktop Binding before asking for confirmation @spec @mvp @implemented
+- noninteractive Host trust requires --no-input --yes plus --expected-host-id <exact-id>; --yes alone never accepts a discovered Host Identity @spec @mvp @implemented
+- replacing a non-null expected_host_id additionally requires --replace and is never implied by setup, repair, host update, project configuration, a Trusted Profile, or ordinary --yes consent @spec @mvp @implemented
 - setup with expected_host_id = null performs the same Host trust confirmation after the Host Identity becomes reachable and before durable token issuance, provider-secret provisioning, or any subsequent daemon-owned mutation @spec @mvp @implemented
 - provider-secret provisioning refuses to transmit raw secret material until the observed Host Identity matches the newly pinned or previously configured expected_host_id @spec @mvp @implemented
-- satelle MVP does not require local user confirmation before starting a remote Computer Use run on a ready host @spec @mvp
-- satelle prompt execution never bypasses host readiness, native Computer Use readiness, or unsupported-capability checks @spec @mvp
-- satelle treats instructions visible in remote desktop content as untrusted content that cannot override the operator prompt, consent gates, host policy, YOLO policy, or configured safety boundaries @spec @mvp
-- satelle MVP does not implement Satelle-owned confirmation prompts for individual native Computer Use actions after a prompt turn starts @spec @mvp
-- satelle surfaces detected native Codex Computer Use app approvals, operating-system permission prompts, administrator authentication prompts, security prompts, and sensitive-action prompts as action_required events or manual-action-required blockers instead of replacing them with Satelle confirmations @spec @mvp
-- satelle does not auto-answer native Codex Computer Use app approvals, operating-system permission prompts, administrator authentication prompts, security prompts, or sensitive-action prompts unless Codex exposes the specific prompt as a documented app-server approval callback that Satelle is allowed to answer @spec @mvp
+- satelle MVP does not require local user confirmation before starting a remote Computer Use run on a ready host @spec @mvp @implemented
+- satelle prompt execution never bypasses host readiness, native Computer Use readiness, or unsupported-capability checks @spec @mvp @implemented
+- satelle treats instructions visible in remote desktop content as untrusted content that cannot override the operator prompt, consent gates, host policy, YOLO policy, or configured safety boundaries @spec @mvp @implemented
+- satelle MVP does not implement Satelle-owned confirmation prompts for individual native Computer Use actions after a prompt turn starts @spec @mvp @implemented
+- satelle surfaces detected native Codex Computer Use app approvals, operating-system permission prompts, administrator authentication prompts, security prompts, and sensitive-action prompts as action_required events or manual-action-required blockers instead of replacing them with Satelle confirmations @spec @mvp @implemented
+- satelle does not auto-answer native Codex Computer Use app approvals, operating-system permission prompts, administrator authentication prompts, security prompts, or sensitive-action prompts unless Codex exposes the specific prompt as a documented app-server approval callback that Satelle is allowed to answer @spec @mvp @implemented
 - satelle only adds Satelle-owned native action confirmation relay after MVP as an opt-in feature guarded by an explicit per-command flag and only when Codex exposes stable native Computer Use action events and accept or deny callbacks @spec @later
 - satelle later run and steer use --relay-native-actions as the exact per-command native action confirmation relay opt-in @spec @later
 - --relay-native-actions fails before Turn start with typed native-action-relay-not-supported when the Codex adapter does not advertise stable action request plus accept and deny callbacks @spec @later

@@ -1,5 +1,270 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+struct LivePublishingAdapter;
+
+#[derive(Clone, Copy)]
+struct LivePublishingFailingAdapter;
+
+impl ComputerUseAdapter for LivePublishingAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<super::super::AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(
+        &self,
+        request: super::super::ExecuteRequest<'_>,
+    ) -> Result<super::super::ExecuteResult, SatelleError> {
+        let subject = request.subject();
+        request.publish_live_event(
+            satelle_core::SatelleEventBody::new(
+                EventType::ActionRequired,
+                satelle_core::EventSource::CodexAdapter,
+                time::OffsetDateTime::UNIX_EPOCH,
+                request.host(),
+                Some(satelle_core::EventSubject::Turn {
+                    session_id: subject.session_id().clone(),
+                    turn_id: subject.turn_id().clone(),
+                    session_state_revision: request.committed_session_revision(),
+                    turn_state_revision: request.committed_turn_revision(),
+                }),
+                "manual action required",
+                serde_json::json!({"status": "manual_action_required"}),
+            )
+            .expect("construct live adapter event"),
+        );
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(
+        &self,
+        subject: super::super::AdapterSubject<'_>,
+    ) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: super::super::AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+impl ComputerUseAdapter for LivePublishingFailingAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<super::super::AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(
+        &self,
+        request: super::super::ExecuteRequest<'_>,
+    ) -> Result<super::super::ExecuteResult, SatelleError> {
+        let subject = request.subject();
+        request.publish_live_event(
+            satelle_core::SatelleEventBody::new(
+                EventType::ActionRequired,
+                satelle_core::EventSource::CodexAdapter,
+                time::OffsetDateTime::UNIX_EPOCH,
+                request.host(),
+                Some(satelle_core::EventSubject::Turn {
+                    session_id: subject.session_id().clone(),
+                    turn_id: subject.turn_id().clone(),
+                    session_state_revision: request.committed_session_revision(),
+                    turn_state_revision: request.committed_turn_revision(),
+                }),
+                "manual action required",
+                serde_json::json!({"status": "manual_action_required"}),
+            )
+            .expect("construct live adapter event"),
+        );
+        Err(SatelleError::remote_api_error(
+            LOCAL_DEMO_HOST,
+            "adapter-failed-after-approval",
+        ))
+    }
+
+    fn observe_stop(
+        &self,
+        subject: super::super::AdapterSubject<'_>,
+    ) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: super::super::AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[test]
+fn attached_runtime_outcome_includes_revision_bound_live_adapter_events() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), LivePublishingAdapter);
+
+    let outcome = runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_LIVE_EVENT_OUTCOME",
+        ))
+        .expect("attached execution should complete");
+    let event = outcome
+        .events
+        .iter()
+        .find(|event| event.event_type() == EventType::ActionRequired)
+        .expect("the attached outcome includes the live adapter event");
+    let turn = latest_turn(&outcome.session);
+
+    assert!(event.seq() > 0);
+    assert_eq!(event.session_id(), Some(outcome.session.session_id()));
+    assert_eq!(event.turn_id(), Some(turn.turn_id()));
+    let satelle_core::EventStateSubject::Turn {
+        session_state_revision,
+        turn_state_revision,
+    } = event
+        .state_subject()
+        .expect("the action event is revision-bound")
+    else {
+        panic!("the action event must identify a committed Turn");
+    };
+    assert_eq!(
+        session_state_revision.get() + 1,
+        outcome.session.session_state_revision().get()
+    );
+    assert_eq!(
+        turn_state_revision.get() + 1,
+        turn.turn_state_revision().get()
+    );
+}
+
+#[test]
+fn attached_adapter_failure_retains_already_published_live_events() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), LivePublishingFailingAdapter);
+
+    let failure = runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_LIVE_EVENT_FAILURE_OUTCOME",
+        ))
+        .expect_err("adapter failure should remain visible");
+
+    assert_eq!(
+        failure.phase(),
+        satelle_core::session::TurnAdmissionPhase::Admitted
+    );
+    let event = failure
+        .events()
+        .iter()
+        .find(|event| event.event_type() == EventType::ActionRequired)
+        .expect("the admitted failure retains its published live event");
+    assert!(event.seq() > 0);
+    assert_eq!(event.data()["status"], "manual_action_required");
+}
+
+#[test]
+fn terminal_commit_failure_retains_already_published_live_events() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = SubjectBlockingAdapter::with_live_event(false);
+    let deadlock_guard = DeadlockGuard::new([
+        adapter.session_ready.clone(),
+        adapter.execute_release.clone(),
+    ]);
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+    let run_runtime = runtime.clone();
+    let attached = std::thread::spawn(move || {
+        run_runtime.run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_TERMINAL_COMMIT_LIVE_EVENT",
+        ))
+    });
+    adapter.take_session();
+
+    runtime
+        .engine()
+        .expect("open runtime engine")
+        .lock_storage()
+        .expect("lock runtime storage")
+        .connection_for_test()
+        .execute_batch(
+            "CREATE TRIGGER reject_terminal_lifecycle_log \
+             BEFORE INSERT ON logs \
+             WHEN NEW.event_kind = 'turn_state_committed' \
+             BEGIN SELECT RAISE(ABORT, 'reject terminal test log'); END;",
+        )
+        .expect("install deterministic terminal-commit failure");
+    adapter.execute_release.signal();
+
+    let failure = attached
+        .join()
+        .expect("attached execution thread should not panic")
+        .expect_err("terminal commit failure should remain visible");
+    let event = failure
+        .events()
+        .iter()
+        .find(|event| event.event_type() == EventType::ActionRequired)
+        .expect("the admitted failure retains its published live event");
+    assert!(event.seq() > 0);
+    assert_eq!(event.data()["status"], "manual_action_required");
+    deadlock_guard.complete();
+}
+
+#[test]
+fn admission_replay_failure_retains_already_published_live_events() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = SubjectBlockingAdapter::with_live_event(false);
+    let deadlock_guard = DeadlockGuard::new([
+        adapter.session_ready.clone(),
+        adapter.execute_release.clone(),
+    ]);
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+    let run_runtime = runtime.clone();
+    let attached = std::thread::spawn(move || {
+        run_runtime.run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_ADMISSION_REPLAY_LIVE_EVENT",
+        ))
+    });
+    adapter.take_session();
+
+    runtime
+        .engine()
+        .expect("open runtime engine")
+        .lock_storage()
+        .expect("lock runtime storage")
+        .connection_for_test()
+        .execute_batch("ALTER TABLE turns RENAME TO turns_unavailable")
+        .expect("make terminal commit and admission replay unavailable");
+    adapter.execute_release.signal();
+
+    let failure = attached
+        .join()
+        .expect("attached execution thread should not panic")
+        .expect_err("storage failure should leave admission unknown");
+    assert_eq!(
+        failure.phase(),
+        satelle_core::session::TurnAdmissionPhase::AdmissionUnknown
+    );
+    let event = failure
+        .events()
+        .iter()
+        .find(|event| event.event_type() == EventType::ActionRequired)
+        .expect("the admission-unknown failure retains its published live event");
+    assert!(event.seq() > 0);
+    assert_eq!(event.data()["status"], "manual_action_required");
+    deadlock_guard.complete();
+}
+
 #[test]
 fn stable_run_replay_skips_repeated_adapter_preflight() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
@@ -338,6 +603,72 @@ fn controlled_execution_returns_only_after_the_durable_stop_winner() {
 }
 
 #[test]
+fn controlled_stop_preserves_live_events_for_the_attached_consumer() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = SubjectBlockingAdapter::with_live_event(true);
+    let deadlock_guard = DeadlockGuard::new([
+        adapter.session_ready.clone(),
+        adapter.execute_release.clone(),
+    ]);
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+    let run_runtime = runtime.clone();
+    let attached = std::thread::spawn(move || {
+        run_runtime.run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_CONTROLLED_STOP_LIVE_EVENT",
+        ))
+    });
+    let session_id = adapter.take_session();
+
+    runtime
+        .stop(StopCommand::new(session_id))
+        .expect("stop should become durable before controlled execution exits");
+    adapter.execute_release.signal();
+    let outcome = attached
+        .join()
+        .expect("attached execution thread should not panic")
+        .expect("controlled execution should return the stop winner");
+
+    assert_eq!(latest_turn_state(&outcome.session), TurnState::Stopped);
+    assert_eq!(outcome.events.len(), 1);
+    assert_eq!(outcome.events[0].event_type(), EventType::ActionRequired);
+    deadlock_guard.complete();
+}
+
+#[test]
+fn terminal_stop_race_preserves_live_events_but_discards_losing_result_events() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let adapter = SubjectBlockingAdapter::with_live_event(false);
+    let deadlock_guard = DeadlockGuard::new([
+        adapter.session_ready.clone(),
+        adapter.execute_release.clone(),
+    ]);
+    let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+    let run_runtime = runtime.clone();
+    let attached = std::thread::spawn(move || {
+        run_runtime.run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_TERMINAL_STOP_LIVE_EVENT",
+        ))
+    });
+    let session_id = adapter.take_session();
+
+    runtime
+        .stop(StopCommand::new(session_id))
+        .expect("stop should become durable before terminal execution exits");
+    adapter.execute_release.signal();
+    let outcome = attached
+        .join()
+        .expect("attached execution thread should not panic")
+        .expect("terminal execution should return the stop winner");
+
+    assert_eq!(latest_turn_state(&outcome.session), TurnState::Stopped);
+    assert_eq!(outcome.events.len(), 1);
+    assert_eq!(outcome.events[0].event_type(), EventType::ActionRequired);
+    deadlock_guard.complete();
+}
+
+#[test]
 fn cancellation_confirmed_worker_exit_does_not_block_new_turn_admission() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = BlockingExecutionAndStopAdapter::default();
@@ -610,6 +941,7 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
         resolved_provider_binding: None,
         resolved_provider_secret: None,
         attachments: crate::attachment::StagedAttachments::default(),
+        live_events: super::super::request::LocalLiveEventBuffer::default(),
     };
     let outcome = engine
         .execute(plan)
@@ -743,6 +1075,7 @@ struct SubjectBlockingAdapter {
     execute_release: Latch,
     execute_calls: Arc<AtomicUsize>,
     returns_controlled_stop: bool,
+    publishes_live_event: bool,
 }
 
 impl Default for SubjectBlockingAdapter {
@@ -753,6 +1086,7 @@ impl Default for SubjectBlockingAdapter {
             execute_release: Latch::default(),
             execute_calls: Arc::new(AtomicUsize::new(0)),
             returns_controlled_stop: false,
+            publishes_live_event: false,
         }
     }
 }
@@ -761,6 +1095,14 @@ impl SubjectBlockingAdapter {
     fn controlled_stop() -> Self {
         Self {
             returns_controlled_stop: true,
+            ..Self::default()
+        }
+    }
+
+    fn with_live_event(returns_controlled_stop: bool) -> Self {
+        Self {
+            returns_controlled_stop,
+            publishes_live_event: true,
             ..Self::default()
         }
     }
@@ -795,6 +1137,26 @@ impl ComputerUseAdapter for SubjectBlockingAdapter {
             .expect("subject slot lock should not be poisoned") =
             Some(request.subject().session_id().clone());
         self.session_ready.signal();
+        if self.publishes_live_event {
+            let subject = request.subject();
+            request.publish_live_event(
+                satelle_core::SatelleEventBody::new(
+                    EventType::ActionRequired,
+                    satelle_core::EventSource::CodexAdapter,
+                    time::OffsetDateTime::UNIX_EPOCH,
+                    request.host(),
+                    Some(satelle_core::EventSubject::Turn {
+                        session_id: subject.session_id().clone(),
+                        turn_id: subject.turn_id().clone(),
+                        session_state_revision: request.committed_session_revision(),
+                        turn_state_revision: request.committed_turn_revision(),
+                    }),
+                    "manual action required",
+                    serde_json::json!({"status": "manual_action_required"}),
+                )
+                .expect("construct live adapter event"),
+            );
+        }
         self.execute_release.wait();
         if self.returns_controlled_stop {
             return Ok(super::super::ExecuteResult::stopped_by_control());

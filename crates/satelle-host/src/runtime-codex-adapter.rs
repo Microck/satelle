@@ -20,14 +20,16 @@ use crate::{DEFAULT_MODEL_BINDING, DEFAULT_PROVIDER_BINDING, READINESS_CANCELLAT
 use command_group::{CommandGroup, GroupChild};
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
-    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, StopObservation,
-    TimeoutPolicy, TurnExecutionMode, TurnState, TurnTransition,
+    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy,
+    SessionStateRevision, StopObservation, TimeoutPolicy, TurnExecutionMode, TurnState,
+    TurnStateRevision, TurnTransition,
 };
 use satelle_core::{
-    ControlPlaneOperation, DesktopSelectionPolicy, ErrorCode, ProviderBindingAuthorization,
-    ProviderBindingSource, ResolvedProviderBinding, SatelleError, resolve_desktop_session_for,
+    ControlPlaneOperation, DesktopSelectionPolicy, ErrorCode, EventSource, EventSubject, EventType,
+    ProviderBindingAuthorization, ProviderBindingSource, ResolvedProviderBinding, SatelleError,
+    SatelleEventBody, SessionId, TurnId, resolve_desktop_session_for,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -39,6 +41,34 @@ use time::format_description::well_known::Rfc3339;
 
 const NATIVE_ADAPTER: &str = "codex-native-computer-use";
 const PROVIDER_CHILD_ID: &str = "satelle_runtime";
+
+fn native_approval_event(
+    host: &str,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+    session_state_revision: SessionStateRevision,
+    turn_state_revision: TurnStateRevision,
+) -> SatelleEventBody {
+    SatelleEventBody::new(
+        EventType::ActionRequired,
+        EventSource::CodexAdapter,
+        time::OffsetDateTime::now_utc(),
+        host,
+        Some(EventSubject::Turn {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            session_state_revision,
+            turn_state_revision,
+        }),
+        "native Codex approval requires manual action",
+        json!({
+            "kind": "native_codex_approval",
+            "status": "manual_action_required",
+            "decision": "declined",
+        }),
+    )
+    .expect("normalized native approval state produces a valid safe event")
+}
 
 #[derive(Debug)]
 struct ProviderSmokeAttemptFailure {
@@ -510,6 +540,7 @@ impl ProductionComputerUseAdapter {
                 deadline,
                 persist_thread_ref,
                 persist_turn_ref,
+                observe_native_approval: None,
                 control: None,
                 goal_set_supported: false,
                 image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -910,6 +941,7 @@ fn provider_smoke_session_request<'a>(
         deadline,
         persist_thread_ref,
         persist_turn_ref,
+        observe_native_approval: None,
         control: None,
         goal_set_supported: false,
         image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -2143,6 +2175,21 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                         *persistence_error.borrow_mut() = Some(error);
                     })
                 };
+                let mut native_approval_published = false;
+                let mut observe_native_approval = || {
+                    if native_approval_published {
+                        return;
+                    }
+                    native_approval_published = true;
+                    let subject = request.subject();
+                    request.publish_live_event(native_approval_event(
+                        subject.host_identity().as_str(),
+                        subject.session_id(),
+                        subject.turn_id(),
+                        request.committed_session_revision(),
+                        request.committed_turn_revision(),
+                    ));
+                };
                 let snapshot = crate::read_production_snapshot(&self.snapshot)?;
                 let goal_set_supported = snapshot.goal_set_supported();
                 let image_input_mode = snapshot.image_input_mode();
@@ -2175,6 +2222,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                         deadline,
                         persist_thread_ref: &mut persist_thread_ref,
                         persist_turn_ref: &mut persist_turn_ref,
+                        observe_native_approval: Some(&mut observe_native_approval),
                         control: Some(control),
                         goal_set_supported,
                         image_input_mode,
@@ -2572,6 +2620,43 @@ fn host_turn_timeout_ceiling() -> Result<TimeoutPolicy, SatelleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_approval_event_contains_only_normalized_manual_action_state() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+
+        let session_state_revision = SessionStateRevision::new(7).unwrap();
+        let turn_state_revision = TurnStateRevision::new(3).unwrap();
+        let event = native_approval_event(
+            "host-a",
+            &session_id,
+            &turn_id,
+            session_state_revision,
+            turn_state_revision,
+        );
+
+        assert_eq!(event.event_type(), EventType::ActionRequired);
+        assert_eq!(event.source(), EventSource::CodexAdapter);
+        assert_eq!(event.host(), "host-a");
+        assert_eq!(event.session_id(), Some(&session_id));
+        assert_eq!(event.turn_id(), Some(&turn_id));
+        assert_eq!(
+            event.state_subject(),
+            Some(&satelle_core::EventStateSubject::Turn {
+                session_state_revision,
+                turn_state_revision,
+            })
+        );
+        assert_eq!(
+            event.data(),
+            &json!({
+                "kind": "native_codex_approval",
+                "status": "manual_action_required",
+                "decision": "declined",
+            })
+        );
+    }
 
     struct ScopedEnvironmentVariable(String);
 

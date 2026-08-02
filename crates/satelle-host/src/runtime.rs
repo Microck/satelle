@@ -96,6 +96,35 @@ pub(crate) struct RuntimeTurnOutcome {
     pub(crate) events: Vec<SatelleEvent>,
 }
 
+#[derive(Debug)]
+pub(super) struct RuntimeTurnFailure {
+    error: Box<SatelleError>,
+    events: Vec<SatelleEvent>,
+}
+
+impl RuntimeTurnFailure {
+    pub(super) fn new(error: SatelleError, events: Vec<SatelleEvent>) -> Self {
+        Self {
+            error: Box::new(error),
+            events,
+        }
+    }
+}
+
+impl From<SatelleError> for RuntimeTurnFailure {
+    fn from(error: SatelleError) -> Self {
+        Self::new(error, Vec::new())
+    }
+}
+
+impl std::ops::Deref for RuntimeTurnFailure {
+    type Target = SatelleError;
+
+    fn deref(&self) -> &Self::Target {
+        &self.error
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "status", content = "result", rename_all = "snake_case")]
 enum ProviderDescriptorValidationReplay {
@@ -184,6 +213,7 @@ struct AdmissionExecution<'a> {
     resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
     resolved_provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
     attachments: crate::attachment::StagedAttachments,
+    live_events: request::LocalLiveEventBuffer,
 }
 
 /// The Host's closed resolution result for one exact model/provider pair.
@@ -1151,7 +1181,7 @@ impl RuntimeEngine {
         self: &Arc<Self>,
         command: RunCommand<'_>,
         readiness: AdapterReadiness,
-    ) -> Result<RuntimeTurnOutcome, SatelleError> {
+    ) -> Result<RuntimeTurnOutcome, RuntimeTurnFailure> {
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
         let started_at = time::OffsetDateTime::now_utc();
@@ -1202,6 +1232,7 @@ impl RuntimeEngine {
                 resolved_provider_binding: readiness.resolved_provider_binding().cloned(),
                 resolved_provider_secret: readiness.take_resolved_provider_secret(),
                 attachments,
+                live_events: command.cancellation.live_event_buffer(),
             },
             outcome,
             context.lease_owner().clone(),
@@ -1212,7 +1243,7 @@ impl RuntimeEngine {
         self: &Arc<Self>,
         command: SteerCommand<'_>,
         readiness: AdapterReadiness,
-    ) -> Result<RuntimeTurnOutcome, SatelleError> {
+    ) -> Result<RuntimeTurnOutcome, RuntimeTurnFailure> {
         // Preflight can outlive the retention observation made during replay
         // admission. Recheck at the authoritative Session load so a follow-up
         // cannot revive metadata that crossed the retention boundary meanwhile.
@@ -1272,6 +1303,7 @@ impl RuntimeEngine {
                 resolved_provider_binding: readiness.resolved_provider_binding().cloned(),
                 resolved_provider_secret: readiness.take_resolved_provider_secret(),
                 attachments,
+                live_events: command.cancellation.live_event_buffer(),
             },
             outcome,
             context.lease_owner().clone(),
@@ -2114,7 +2146,7 @@ impl RuntimeEngine {
         execution: AdmissionExecution<'_>,
         outcome: AdmissionOutcome,
         lease_owner: LeaseOwner,
-    ) -> Result<RuntimeTurnOutcome, SatelleError> {
+    ) -> Result<RuntimeTurnOutcome, RuntimeTurnFailure> {
         match outcome {
             AdmissionOutcome::InProgress(session) | AdmissionOutcome::Complete(session) => {
                 Ok(model::turn_outcome(&session, Vec::new()))
@@ -2128,7 +2160,7 @@ impl RuntimeEngine {
                         Ok(heartbeat) => heartbeat,
                         Err(error) => {
                             self.preserve_unknown_execution(&recovery_subject)?;
-                            return Err(heartbeat_start_failure(error));
+                            return Err(heartbeat_start_failure(error).into());
                         }
                     };
                 let work = TurnWork {
@@ -2146,6 +2178,7 @@ impl RuntimeEngine {
                     resolved_provider_binding: execution.resolved_provider_binding,
                     resolved_provider_secret: execution.resolved_provider_secret,
                     attachments: execution.attachments,
+                    live_events: execution.live_events,
                 };
                 match execution.dispatch_preference {
                     request::DispatchPreference::Inline => self.execute(plan),
@@ -3255,14 +3288,18 @@ impl RuntimeHandle {
         operation: IdempotentOperation,
         identity: &RequestIdentity,
         expected_session_id: Option<&SessionId>,
-        error: SatelleError,
+        failure: RuntimeTurnFailure,
     ) -> TurnAdmissionFailure {
+        let RuntimeTurnFailure { error, events } = failure;
         match engine.replay_admission(operation, identity, expected_session_id) {
-            Ok(Some(replay)) => {
-                TurnAdmissionFailure::admitted(error, replay.outcome.session, replay.turn_id)
-            }
-            Ok(None) => TurnAdmissionFailure::not_admitted(error),
-            Err(_) => TurnAdmissionFailure::admission_unknown(error),
+            Ok(Some(replay)) => TurnAdmissionFailure::admitted_with_events(
+                *error,
+                replay.outcome.session,
+                replay.turn_id,
+                events,
+            ),
+            Ok(None) => TurnAdmissionFailure::not_admitted(*error),
+            Err(_) => TurnAdmissionFailure::admission_unknown_with_events(*error, events),
         }
     }
 

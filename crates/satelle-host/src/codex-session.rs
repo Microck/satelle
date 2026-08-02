@@ -91,6 +91,7 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) deadline: Instant,
     pub(crate) persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
+    pub(crate) observe_native_approval: Option<&'a mut dyn FnMut()>,
     pub(crate) control: Option<CodexSessionControl>,
     pub(crate) goal_set_supported: bool,
     pub(crate) image_input_mode: crate::codex_capabilities::CodexImageInputMode,
@@ -449,6 +450,11 @@ struct SessionExchange<'a> {
     stop_committed: bool,
 }
 
+struct ServerResponse {
+    body: Value,
+    observe_native_approval: bool,
+}
+
 impl<'a> SessionExchange<'a> {
     fn new(
         request: CodexSessionRequest<'a>,
@@ -542,7 +548,12 @@ impl<'a> SessionExchange<'a> {
         match receiver.recv_timeout(wait) {
             Ok(ReadEvent::Line(line)) => {
                 if let Some(response) = self.consume_line(&line)? {
-                    writer.write(&response)?;
+                    writer.write(&response.body)?;
+                    if response.observe_native_approval
+                        && let Some(observer) = self.request.observe_native_approval.as_mut()
+                    {
+                        observer();
+                    }
                 }
                 self.poll_control(writer)?;
                 Ok(())
@@ -623,7 +634,7 @@ impl<'a> SessionExchange<'a> {
         Ok(CodexSessionTerminal::StoppedByControl)
     }
 
-    fn consume_line(&mut self, line: &[u8]) -> Result<Option<Value>, CodexSessionError> {
+    fn consume_line(&mut self, line: &[u8]) -> Result<Option<ServerResponse>, CodexSessionError> {
         let message: Value =
             serde_json::from_slice(line).map_err(|_| CodexSessionError::MalformedMessage)?;
         let object = message
@@ -641,7 +652,7 @@ impl<'a> SessionExchange<'a> {
     fn consume_server_request(
         &mut self,
         object: &Map<String, Value>,
-    ) -> Result<Value, CodexSessionError> {
+    ) -> Result<ServerResponse, CodexSessionError> {
         let id = object
             .get("id")
             .filter(|id| {
@@ -658,7 +669,10 @@ impl<'a> SessionExchange<'a> {
             self.thread_ref.as_deref(),
             self.turn_ref.as_deref(),
         )? {
-            return Ok(json!({"id": id, "result": result}));
+            return Ok(ServerResponse {
+                body: json!({"id": id, "result": result}),
+                observe_native_approval: !auto_approve,
+            });
         }
         if matches!(method, "item/tool/requestUserInput" | "item/tool/call") {
             let params = required_object(object, "params")?;
@@ -668,16 +682,22 @@ impl<'a> SessionExchange<'a> {
             "mcpServer/elicitation/request" => json!({"action": "decline"}),
             "item/tool/call" => json!({"contentItems": [], "success": false}),
             _ => {
-                return Ok(json!({
-                    "id": id,
-                    "error": {
-                        "code": -32601,
-                        "message": "server request is not supported by the Satelle adapter"
-                    }
-                }));
+                return Ok(ServerResponse {
+                    body: json!({
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": "server request is not supported by the Satelle adapter"
+                        }
+                    }),
+                    observe_native_approval: false,
+                });
             }
         };
-        Ok(json!({"id": id, "result": result}))
+        Ok(ServerResponse {
+            body: json!({"id": id, "result": result}),
+            observe_native_approval: false,
+        })
     }
 
     fn validate_server_request_correlation(

@@ -4,6 +4,7 @@ use super::*;
 fn server_requests_are_classified_correlated_and_declined_without_raw_payloads() {
     let run = run_scenario("server-requests", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.native_approval_requests, 5);
     assert_eq!(run.requests.len(), 12);
     assert_eq!(
         run.requests[4],
@@ -52,9 +53,23 @@ fn server_requests_are_classified_correlated_and_declined_without_raw_payloads()
 }
 
 #[test]
+fn approval_observation_matches_the_decline_write_outcome() {
+    let run = run_scenario("approval-write-failure", None, Duration::from_secs(3));
+
+    match run.result {
+        Err(CodexSessionError::Write) => assert_eq!(run.native_approval_requests, 0),
+        Err(CodexSessionError::PrematureExit) => assert_eq!(run.native_approval_requests, 1),
+        result => {
+            panic!("the fixture must fail at the decline write or the following read: {result:?}")
+        }
+    }
+}
+
+#[test]
 fn yolo_approves_only_the_pinned_callback_allowlist_for_the_current_turn() {
     let run = run_yolo_scenario("server-requests", Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.native_approval_requests, 0);
     assert_eq!(run.requests.len(), 12);
     assert_eq!(run.requests[2]["params"]["approvalPolicy"], "never");
     assert_eq!(run.requests[2]["params"]["sandbox"], "danger-full-access");

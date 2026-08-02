@@ -120,6 +120,10 @@ fn default_current_host_update_reports_skipped_targets_in_human_output() {
     let state = TestStateDir::new().expect("create secure temporary state directory");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env(
+            "SATELLE_CACHE_DIR",
+            state.path().join("command-history-cache"),
+        )
         .args(["host", "update", "--host", "local-demo"])
         .output()
         .expect("run default current Host update");

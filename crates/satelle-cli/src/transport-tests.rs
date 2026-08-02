@@ -761,6 +761,8 @@ struct InterruptLifecycleAdapter {
     execute_release: TestLatch,
     execute_finished: TestLatch,
     block_execute: Arc<AtomicBool>,
+    publish_live_event: Arc<AtomicBool>,
+    stop_unconfirmed: Arc<AtomicBool>,
     stop_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -771,6 +773,14 @@ impl InterruptLifecycleAdapter {
 
     fn block_execute(&self) {
         self.block_execute.store(true, Ordering::Release);
+    }
+
+    fn publish_live_event(&self) {
+        self.publish_live_event.store(true, Ordering::Release);
+    }
+
+    fn leave_stop_unconfirmed(&self) {
+        self.stop_unconfirmed.store(true, Ordering::Release);
     }
 }
 
@@ -787,7 +797,30 @@ impl ComputerUseAdapter for InterruptLifecycleAdapter {
         lifecycle_readiness()
     }
 
-    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        // This fixture publishes one event per explicit request. A stop can race
+        // with a second execution attempt, but that must not duplicate the event
+        // whose retention this test is proving.
+        if self.publish_live_event.swap(false, Ordering::AcqRel) {
+            let subject = request.subject();
+            request.publish_live_event(
+                SatelleEventBody::new(
+                    EventType::ActionRequired,
+                    EventSource::CodexAdapter,
+                    time::OffsetDateTime::UNIX_EPOCH,
+                    request.host(),
+                    Some(EventSubject::Turn {
+                        session_id: subject.session_id().clone(),
+                        turn_id: subject.turn_id().clone(),
+                        session_state_revision: request.committed_session_revision(),
+                        turn_state_revision: request.committed_turn_revision(),
+                    }),
+                    "manual action required",
+                    serde_json::json!({"status": "manual_action_required"}),
+                )
+                .expect("construct interrupt live event"),
+            );
+        }
         if self.block_execute.load(Ordering::Acquire) {
             self.execute_started.signal();
             self.execute_release.wait();
@@ -798,6 +831,9 @@ impl ComputerUseAdapter for InterruptLifecycleAdapter {
 
     fn observe_stop(&self, _subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
         self.stop_calls.fetch_add(1, Ordering::SeqCst);
+        if self.stop_unconfirmed.load(Ordering::Acquire) {
+            return Ok(StopObservation::UpstreamStillActive);
+        }
         self.execute_release.signal();
         Ok(StopObservation::CancellationConfirmed)
     }
@@ -3340,7 +3376,8 @@ fn handoff_transport_uncertainty_remains_recovery_pending_and_fenced() {
         let unavailable_address = unavailable_listener
             .local_addr()
             .expect("read unavailable handoff address");
-        drop(unavailable_listener);
+        // Keep the reservation alive so a parallel test cannot claim this port
+        // and turn transport uncertainty into an authentication response.
         let unavailable_client = DaemonClient::loopback_with_timeout(
             unavailable_address,
             ApiBearerToken::generate().expect("generate unavailable bootstrap token"),
@@ -4217,13 +4254,29 @@ fn local_interrupt_wait_failure_reconciles_the_spawned_operation() {
 
 #[test]
 fn local_interruption_preserves_admission_unknown_phase() {
-    let failure = local_interrupted_admission_failure(TurnAdmissionFailure::admission_unknown(
-        SatelleError::host_unreachable("local"),
-    ));
+    let event = SatelleEventBody::new(
+        EventType::ActionRequired,
+        EventSource::CodexAdapter,
+        time::OffsetDateTime::UNIX_EPOCH,
+        LOCAL_DEMO_HOST,
+        None,
+        "manual action required",
+        serde_json::json!({"status": "manual_action_required"}),
+    )
+    .expect("construct admission-unknown live event")
+    .with_seq(1)
+    .expect("sequence admission-unknown live event");
+    let failure =
+        local_interrupted_admission_failure(TurnAdmissionFailure::admission_unknown_with_events(
+            SatelleError::host_unreachable("local"),
+            vec![event],
+        ));
 
     assert_eq!(failure.phase(), TurnAdmissionPhase::AdmissionUnknown);
     assert_eq!(failure.error().code, ErrorCode::Interrupted);
     assert!(failure.durable_handles().is_none());
+    assert_eq!(failure.events().len(), 1);
+    assert_eq!(failure.events()[0].event_type(), EventType::ActionRequired);
 }
 
 #[test]
@@ -4231,6 +4284,7 @@ fn injected_interrupt_after_local_run_admission_confirms_stop_before_exit_130() 
     let state = TestStateDir::new().expect("temporary state directory");
     let adapter = InterruptLifecycleAdapter::default();
     adapter.block_execute();
+    adapter.publish_live_event();
     let service = HostService::with_adapter_for_tests_at(state.path(), adapter.clone())
         .expect("construct interrupt lifecycle Host");
     let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service.clone());
@@ -4261,6 +4315,8 @@ fn injected_interrupt_after_local_run_admission_confirms_stop_before_exit_130() 
     assert_eq!(failure.phase(), TurnAdmissionPhase::Admitted);
     assert_eq!(failure.error().code, ErrorCode::Interrupted);
     assert_eq!(failure.error().exit_code(), 130);
+    assert_eq!(failure.events().len(), 1);
+    assert_eq!(failure.events()[0].event_type(), EventType::ActionRequired);
     assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 1);
     let (session_id, _) = failure
         .durable_handles()
@@ -4276,6 +4332,67 @@ fn injected_interrupt_after_local_run_admission_confirms_stop_before_exit_130() 
             .expect("interrupted run has its Turn")
             .state()
             .is_terminal()
+    );
+}
+
+#[test]
+fn unconfirmed_local_stop_preserves_buffered_live_events_without_waiting_for_execution() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let adapter = InterruptLifecycleAdapter::default();
+    adapter.block_execute();
+    adapter.publish_live_event();
+    adapter.leave_stop_unconfirmed();
+    let service = HostService::with_adapter_for_tests_at(state.path(), adapter.clone())
+        .expect("construct interrupt lifecycle Host");
+    let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service);
+    let interrupt = TestInterrupt::default();
+    let command_interrupt = interrupt.clone();
+    let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+    let command = thread::spawn(move || {
+        let result = transport.attached_with_interrupt(
+            None,
+            TurnIntent::new(
+                "interrupt local run with unconfirmed stop",
+                satelle_core::session::TurnExecutionMode::Standard,
+            )
+            .expect("construct run intent"),
+            false,
+            &command_interrupt,
+        );
+        result_sender
+            .send(result)
+            .expect("test result receiver remains connected");
+    });
+    assert!(
+        adapter.execute_started.wait_for(Duration::from_secs(2)),
+        "execution must publish its live event before interruption"
+    );
+
+    interrupt.signal();
+    let failure = match result_receiver.recv_timeout(Duration::from_secs(2)) {
+        Ok(Err(failure)) => failure,
+        Ok(Ok(_)) => panic!("post-admission interruption must fail with exit 130"),
+        Err(error) => {
+            adapter.execute_release.signal();
+            command.join().expect("command thread must not panic");
+            panic!("unconfirmed stop waited for the blocked execution: {error}");
+        }
+    };
+    adapter.execute_release.signal();
+    command.join().expect("command thread must not panic");
+
+    assert_eq!(failure.phase(), TurnAdmissionPhase::Admitted);
+    assert_eq!(failure.error().code, ErrorCode::Interrupted);
+    assert_eq!(failure.error().exit_code(), 130);
+    assert_eq!(failure.events().len(), 1);
+    assert_eq!(failure.events()[0].event_type(), EventType::ActionRequired);
+    assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        failure
+            .error()
+            .recovery_command
+            .as_deref()
+            .is_some_and(|command| command.contains("satelle status"))
     );
 }
 
@@ -6477,13 +6594,29 @@ fn failed_local_status_preserves_interrupt_exit_and_session_recovery_command() {
         &session_id,
         SatelleError::host_unreachable("local-demo"),
     );
-    let error = interrupted_status_error(
+    let event = SatelleEventBody::new(
+        EventType::ActionRequired,
+        EventSource::CodexAdapter,
+        time::OffsetDateTime::UNIX_EPOCH,
+        LOCAL_DEMO_HOST,
+        None,
+        "manual action required",
+        serde_json::json!({"status": "manual_action_required"}),
+    )
+    .and_then(|body| body.with_seq(1))
+    .expect("construct retained status-failure event");
+    let failure = interrupted_status_failure(
         "local-demo",
         &session_id,
         interrupted,
         SatelleError::host_unreachable("local-demo"),
+        vec![event],
     );
+    let error = failure.error();
 
+    assert_eq!(failure.phase(), TurnAdmissionPhase::AdmissionUnknown);
+    assert_eq!(failure.events().len(), 1);
+    assert_eq!(failure.events()[0].event_type(), EventType::ActionRequired);
     assert_eq!(error.code, ErrorCode::Interrupted);
     assert_eq!(error.exit_code(), 130);
     assert!(error.message.contains(session_id.as_str()));

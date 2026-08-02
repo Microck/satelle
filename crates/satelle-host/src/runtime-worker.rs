@@ -1,6 +1,7 @@
 use super::RuntimeTurnOutcome;
-use super::adapter::{AdapterSubject, ExecuteRequest, UpstreamReference};
-use super::{RuntimeEngine, model};
+use super::adapter::{AdapterSubject, ExecuteHooks, ExecuteRequest, UpstreamReference};
+use super::request::LocalLiveEventBuffer;
+use super::{RuntimeEngine, RuntimeTurnFailure, model};
 use crate::storage::{
     LeaseOwner, MaintenanceLeaseCapability, ObservedUpstreamRef, RecoverySubject, StorageErrorKind,
 };
@@ -258,6 +259,7 @@ pub(super) struct ExecutionPlan {
     pub(super) resolved_provider_binding: Option<ResolvedProviderBinding>,
     pub(super) resolved_provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
     pub(super) attachments: crate::attachment::StagedAttachments,
+    pub(super) live_events: super::request::LocalLiveEventBuffer,
 }
 
 #[derive(Default)]
@@ -336,22 +338,25 @@ impl RuntimeEngine {
         }
     }
 
-    pub(super) fn execute(&self, plan: ExecutionPlan) -> Result<RuntimeTurnOutcome, SatelleError> {
+    pub(super) fn execute(
+        &self,
+        plan: ExecutionPlan,
+    ) -> Result<RuntimeTurnOutcome, RuntimeTurnFailure> {
         let subject = plan.work.subject.clone();
         match self.execute_once(plan) {
             Ok((outcome, None)) => Ok(outcome),
-            Ok((_, Some(error))) => Err(error),
-            Err(error) => {
-                self.preserve_unknown_execution(&subject)?;
-                Err(error)
-            }
+            Ok((outcome, Some(error))) => Err(RuntimeTurnFailure::new(error, outcome.events)),
+            Err(failure) => match self.preserve_unknown_execution(&subject) {
+                Ok(()) => Err(failure),
+                Err(error) => Err(RuntimeTurnFailure::new(error, failure.events)),
+            },
         }
     }
 
     fn execute_once(
         &self,
         mut plan: ExecutionPlan,
-    ) -> Result<(RuntimeTurnOutcome, Option<SatelleError>), SatelleError> {
+    ) -> Result<(RuntimeTurnOutcome, Option<SatelleError>), RuntimeTurnFailure> {
         let session_id = plan.work.subject.session_id().clone();
         let turn_id = plan.work.subject.turn_id().clone();
         let expected = model::expected_revisions(&plan.work.session, &turn_id)?;
@@ -371,6 +376,15 @@ impl RuntimeEngine {
         // The terminal storage compare-and-swap arbitrates with stop/recovery.
         let persist_upstream_ref =
             |reference| self.persist_upstream_ref(&plan.work.subject, reference);
+        // Live adapter state has two attached consumers. Remote transports
+        // receive it from the live hub while local attached commands receive
+        // the same body in their synchronous outcome. Each consumer assigns
+        // its own positive stream sequence.
+        let local_live_events = plan.live_events.clone();
+        let publish_live_event = |event: satelle_core::SatelleEventBody| {
+            local_live_events.publish(event.clone());
+            self.live_events.publish(event);
+        };
         let execution_policy = plan
             .work
             .session
@@ -378,59 +392,126 @@ impl RuntimeEngine {
             .ok_or_else(|| model::integrity_failure("the executing Turn is missing"))?
             .execution_policy();
         let resolved_provider_secret = plan.resolved_provider_secret.take();
-        let result = self.adapter.execute(
+        let result = match self.adapter.execute(
             ExecuteRequest::new(
                 &plan.host,
                 &plan.prompt,
                 plan.execution_mode,
                 execution_policy,
                 AdapterSubject::new(&plan.work.subject),
-                &persist_upstream_ref,
+                ExecuteHooks::new(
+                    &persist_upstream_ref,
+                    &publish_live_event,
+                    plan.work.session.session_state_revision(),
+                    plan.work
+                        .session
+                        .turn(&turn_id)
+                        .expect("the executing Turn was read above")
+                        .turn_state_revision(),
+                ),
                 plan.attachments.images(),
             )
             .with_resolved_provider_binding(plan.resolved_provider_binding.as_ref())
             .with_resolved_provider_secret(resolved_provider_secret),
-        )?;
-        let Some(transition) = result.transition() else {
-            let session = self
-                .lock_storage()?
-                .load_session(&session_id)
-                .map_err(model::storage_failure)?
-                .ok_or_else(|| SatelleError::session_not_found(&session_id))?;
-            let turn = session
-                .turn(&turn_id)
-                .ok_or_else(|| model::integrity_failure("the controlled Turn is missing"))?;
-            if turn.state() != satelle_core::session::TurnState::Stopped {
-                return Err(model::integrity_failure(
-                    "controlled execution returned before stop was durable",
-                ));
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                return runtime_failure_with_events(
+                    error,
+                    plan.provider_smoke_event.take(),
+                    &local_live_events,
+                );
             }
-            return Ok((model::turn_outcome(&session, Vec::new()), None));
+        };
+        let Some(transition) = result.transition() else {
+            let session = match self.lock_storage().and_then(|storage| {
+                storage
+                    .load_session(&session_id)
+                    .map_err(model::storage_failure)?
+                    .ok_or_else(|| SatelleError::session_not_found(&session_id))
+            }) {
+                Ok(session) => session,
+                Err(error) => {
+                    return runtime_failure_with_events(
+                        error,
+                        plan.provider_smoke_event.take(),
+                        &local_live_events,
+                    );
+                }
+            };
+            let Some(turn) = session.turn(&turn_id) else {
+                return runtime_failure_with_events(
+                    model::integrity_failure("the controlled Turn is missing"),
+                    plan.provider_smoke_event.take(),
+                    &local_live_events,
+                );
+            };
+            if turn.state() != satelle_core::session::TurnState::Stopped {
+                return runtime_failure_with_events(
+                    model::integrity_failure(
+                        "controlled execution returned before stop was durable",
+                    ),
+                    plan.provider_smoke_event.take(),
+                    &local_live_events,
+                );
+            }
+            let events = prepend_runtime_events(None, local_live_events.snapshot(), Vec::new())?;
+            return Ok((model::turn_outcome(&session, events), None));
         };
         if matches!(
             transition,
             TurnTransition::Running | TurnTransition::RecoveryPending
         ) {
-            return Err(model::integrity_failure(
-                "adapter execution did not produce a terminal outcome",
-            ));
+            return runtime_failure_with_events(
+                model::integrity_failure("adapter execution did not produce a terminal outcome"),
+                plan.provider_smoke_event.take(),
+                &local_live_events,
+            );
         }
-        let expected = model::expected_revisions(&plan.work.session, &turn_id)?;
-        let (session, execution_committed) = self.commit_or_terminal_winner(
+        let expected = match model::expected_revisions(&plan.work.session, &turn_id) {
+            Ok(expected) => expected,
+            Err(error) => {
+                return runtime_failure_with_events(
+                    error,
+                    plan.provider_smoke_event.take(),
+                    &local_live_events,
+                );
+            }
+        };
+        let (session, execution_committed) = match self.commit_or_terminal_winner(
             &session_id,
             &turn_id,
             expected,
             transition,
             model::monotonic_now(&plan.work.session),
-        )?;
+        ) {
+            Ok(committed) => committed,
+            Err(error) => {
+                return runtime_failure_with_events(
+                    error,
+                    plan.provider_smoke_event.take(),
+                    &local_live_events,
+                );
+            }
+        };
         let terminal_error = execution_committed
             .then(|| result.terminal_error().cloned())
             .flatten();
-        let events = if execution_committed {
-            prepend_provider_smoke_event(plan.provider_smoke_event, result.into_events())?
+        let result_events = if execution_committed {
+            result.into_events()
         } else {
             Vec::new()
         };
+        let provider_smoke_event = if execution_committed {
+            plan.provider_smoke_event
+        } else {
+            None
+        };
+        let events = prepend_runtime_events(
+            provider_smoke_event,
+            local_live_events.snapshot(),
+            result_events,
+        )?;
         Ok((model::turn_outcome(&session, events), terminal_error))
     }
 
@@ -525,14 +606,14 @@ impl RuntimeEngine {
     }
 }
 
-fn prepend_provider_smoke_event(
+fn prepend_runtime_events(
     provider_smoke_event: Option<satelle_core::SatelleEventBody>,
+    live_events: Vec<satelle_core::SatelleEventBody>,
     events: Vec<SatelleEvent>,
 ) -> Result<Vec<SatelleEvent>, SatelleError> {
-    let Some(provider_smoke_event) = provider_smoke_event else {
-        return Ok(events);
-    };
-    std::iter::once(provider_smoke_event)
+    provider_smoke_event
+        .into_iter()
+        .chain(live_events)
         .chain(events.into_iter().map(SatelleEvent::into_body))
         .enumerate()
         .map(|(index, body)| {
@@ -540,6 +621,15 @@ fn prepend_provider_smoke_event(
                 .map_err(|_| model::integrity_failure("runtime event sequence is invalid"))
         })
         .collect()
+}
+
+fn runtime_failure_with_events<T>(
+    error: SatelleError,
+    provider_smoke_event: Option<satelle_core::SatelleEventBody>,
+    live_events: &LocalLiveEventBuffer,
+) -> Result<T, RuntimeTurnFailure> {
+    let events = prepend_runtime_events(provider_smoke_event, live_events.snapshot(), Vec::new())?;
+    Err(RuntimeTurnFailure::new(error, events))
 }
 
 #[cfg(test)]
