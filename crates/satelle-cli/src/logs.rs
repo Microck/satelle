@@ -1052,7 +1052,11 @@ fn parse_log_since(value: &str) -> Result<OffsetDateTime, SatelleError> {
     }
 
     let millis = parse_duration_ms(value)?;
-    Ok(OffsetDateTime::now_utc() - Duration::milliseconds(millis.min(i64::MAX as u64) as i64))
+    OffsetDateTime::now_utc()
+        .checked_sub(Duration::milliseconds(millis.min(i64::MAX as u64) as i64))
+        .ok_or_else(|| {
+            SatelleError::invalid_usage("--since duration is outside the supported timestamp range")
+        })
 }
 
 fn log_output_error(error: io::Error) -> SatelleError {
@@ -1288,6 +1292,14 @@ mod tests {
             no_reconnect: false,
             format: OutputFormat::Human,
         }
+    }
+
+    #[test]
+    fn relative_since_outside_the_timestamp_range_is_a_typed_usage_error() {
+        let error = parse_log_since("9223372036854775807ms")
+            .expect_err("an unrepresentable relative timestamp must be rejected");
+
+        assert_eq!(error.code, ErrorCode::InvalidUsage);
     }
 
     #[test]
