@@ -757,16 +757,20 @@ fn log_reads_use_the_configured_sqlite_retention() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");
     storage.set_log_retention(time::Duration::days(30));
+    let observed_at = OffsetDateTime::now_utc();
     let retained = storage
         .append_safe_log(&host_log(
-            OffsetDateTime::now_utc() - time::Duration::days(8),
+            observed_at - time::Duration::days(8),
             LogSource::Storage,
             LogSeverity::Info,
         ))
         .expect("append a Log Entry inside configured retention");
 
     let page = storage
-        .log_page(&LogPageQuery::tail(10).expect("valid tail query"))
+        .log_page(
+            &LogPageQuery::tail(10).expect("valid tail query"),
+            observed_at,
+        )
         .expect("read with configured retention");
     assert_eq!(
         page.entries()
