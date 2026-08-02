@@ -25,7 +25,7 @@ use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver};
 #[cfg(target_os = "linux")]
 use std::thread::{self, JoinHandle};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 #[path = "support/test-file.rs"]
@@ -1118,7 +1118,7 @@ fn corrupt_sqlite_fails_closed_without_mutating_or_leaking_state() {
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
-        .args(["status", &session_id, "--json"])
+        .args(["status", &session_id, "--host", "local-demo", "--json"])
         .assert()
         .failure()
         .get_output()
@@ -2142,16 +2142,7 @@ fn logs_json_applies_tail_session_source_level_and_since_on_the_host() {
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_CACHE_DIR", &cache)
-        .args([
-            "logs",
-            "--session",
-            &session,
-            "--source",
-            "host_daemon",
-            "--tail",
-            "2",
-            "--json",
-        ])
+        .args(["logs", "--session", &session, "--tail", "2", "--json"])
         .assert()
         .success()
         .get_output()
@@ -2159,12 +2150,16 @@ fn logs_json_applies_tail_session_source_level_and_since_on_the_host() {
     assert!(output.stderr.is_empty());
     let entries = parse_json_lines(&output.stdout);
     assert_eq!(entries.len(), 2);
-    assert!(entries.iter().all(|entry| {
-        entry["source"] == "host_daemon" && entry["subject"]["session_id"] == session
-    }));
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["subject"]["session_id"] == session)
+    );
     assert_eq!(entries[0]["event"], "turn_state_committed");
+    assert_eq!(entries[0]["source"], "codex_adapter");
     assert_eq!(entries[0]["severity"], "info");
     assert_eq!(entries[1]["event"], "stop_confirmed");
+    assert_eq!(entries[1]["source"], "host_daemon");
     assert_eq!(entries[1]["severity"], "warn");
 
     let output = satelle()
@@ -2338,6 +2333,103 @@ fn logs_accepts_only_canonical_sources_and_severities() {
         let error = parse_json_output(&output.stderr);
         assert_eq!(error["code"], "invalid-usage");
     }
+}
+
+#[test]
+fn logs_help_exposes_follow_and_reconnect_controls() {
+    satelle()
+        .args(["logs", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("-f, --follow"))
+        .stdout(predicate::str::contains("--no-reconnect"));
+}
+
+#[cfg(unix)]
+#[test]
+fn logs_follow_waits_on_an_empty_page_and_ctrl_c_exits_130() {
+    let state = state_dir();
+    let (session, cache) = completed_log_session(&state);
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("satelle"));
+    for name in [
+        "SATELLE_HOME",
+        "SATELLE_CONFIG_FILE",
+        "SATELLE_STATE_DIR",
+        "SATELLE_CACHE_DIR",
+        "SATELLE_LOG_DIR",
+        "SATELLE_HOST",
+        "SATELLE_PROFILE",
+    ] {
+        command.env_remove(name);
+    }
+    let mut child = command
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
+        .args([
+            "logs",
+            "--host",
+            "local-demo",
+            "--session",
+            &session,
+            "--since",
+            "2099-01-01T00:00:00Z",
+            "--json",
+            "--follow",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn empty Log follow");
+
+    // An empty finite page is not end-of-stream in follow mode. Give the
+    // process several poll intervals to prove that it remains attached.
+    let attached_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < attached_deadline {
+        if child.try_wait().expect("poll empty Log follow").is_some() {
+            let output = child
+                .wait_with_output()
+                .expect("collect early Log follow failure");
+            panic!(
+                "empty Log follow exited before interruption: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("child PID is nonzero");
+    rustix::process::kill_process(pid, rustix::process::Signal::INT)
+        .expect("send SIGINT to empty Log follow");
+    let output = child
+        .wait_with_output()
+        .expect("reap interrupted empty Log follow");
+    assert_eq!(output.status.code(), Some(130));
+    assert!(output.stdout.is_empty());
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "interrupted");
+}
+
+#[test]
+fn logs_reports_a_typed_error_when_no_target_can_be_resolved() {
+    let state = state_dir();
+    let unknown_session = SessionId::new().to_string();
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", state.path().join("cache"))
+        .args(["logs", "--session", &unknown_session, "--json"])
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "logs-target-required");
+    assert_eq!(
+        error["suggested_commands"],
+        serde_json::json!(["pass --host <alias> or --session <session-id>"])
+    );
 }
 
 #[test]

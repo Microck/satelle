@@ -20,8 +20,6 @@ use satelle_core::session::{
 use satelle_core::{SessionId, TurnId};
 use time::OffsetDateTime;
 
-const DEFAULT_LOG_RETENTION: time::Duration = time::Duration::days(7);
-
 #[derive(Debug)]
 pub(super) struct StoredIdempotency {
     pub(super) request_digest: String,
@@ -86,16 +84,16 @@ pub(super) fn insert_safe_log(
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
     let cursor = u64::try_from(transaction.last_insert_rowid())
         .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-    prune_expired_logs(transaction, effective_at)?;
     Ok(cursor)
 }
 
 pub(super) fn prune_expired_logs(
     transaction: &Transaction<'_>,
     observed_at: OffsetDateTime,
+    retention: time::Duration,
 ) -> Result<(), StorageError> {
     let cutoff = observed_at
-        .checked_sub(DEFAULT_LOG_RETENTION)
+        .checked_sub(retention)
         .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
     let cutoff_nanos = unix_timestamp_nanos(cutoff)?;
     let first_retained = transaction
@@ -137,9 +135,10 @@ pub(super) fn prune_expired_logs(
 pub(super) fn logs_need_pruning(
     connection: &Connection,
     observed_at: OffsetDateTime,
+    retention: time::Duration,
 ) -> Result<bool, StorageError> {
     let cutoff = observed_at
-        .checked_sub(DEFAULT_LOG_RETENTION)
+        .checked_sub(retention)
         .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
     let cutoff_nanos = unix_timestamp_nanos(cutoff)?;
     connection

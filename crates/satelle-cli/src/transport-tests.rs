@@ -4440,13 +4440,14 @@ impl DirectFixture {
             .expect("construct event runtime");
         Self {
             service,
-            host_identity,
+            host_identity: host_identity.clone(),
             address,
             server: Some(server),
             server_runtime,
             transport: Some(DirectTransport {
                 alias: "direct-test".to_string(),
                 mode: "direct",
+                host_identity: host_identity.as_str().to_owned(),
                 client: Arc::new(client),
                 event_client,
                 event_runtime,
@@ -5769,6 +5770,55 @@ fn direct_logs_reject_contradictory_cursor_expiry_details() {
 }
 
 #[test]
+fn direct_logs_classify_a_dropped_response_body_as_transient_reachability_loss() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind partial logs response fixture");
+    let address = listener
+        .local_addr()
+        .expect("read partial response address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept logs client");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).expect("read logs request");
+            assert_ne!(read, 0, "logs request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let request = String::from_utf8(request).expect("logs request headers should be UTF-8");
+        let request_id = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("satelle-request-id")
+                    .then(|| value.trim())
+            })
+            .expect("logs request must carry a request ID");
+        let partial_body = r#"{"schema_version":"satelle.logs.page.v1""#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nSatelle-Request-Id: {request_id}\r\nSatelle-Host-Identity: host-direct-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial_body}",
+            partial_body.len() + 100
+        )
+        .expect("write partial logs response");
+        stream.flush().expect("flush partial logs response");
+    });
+    let client = DaemonClient::loopback(
+        address,
+        ApiBearerToken::generate().expect("generate logs fixture token"),
+        "host-direct-test",
+    )
+    .expect("construct logs fixture client");
+
+    let daemon_error = client
+        .logs(&LogPageQuery::tail(1).expect("valid logs query"))
+        .expect_err("the partial response body must fail");
+    let error = direct_logs_error("direct-test", daemon_error);
+    server.join().expect("join partial logs response fixture");
+
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+}
+
+#[test]
 fn direct_attached_run_and_steer_follow_committed_host_events() {
     let fixture = DirectFixture::start();
     let mut run_events = Vec::new();
@@ -6166,6 +6216,58 @@ fn direct_session_resource_reads_preserve_session_not_found_identity() {
 
     assert_eq!(mapped.code, ErrorCode::SessionNotFound);
     assert!(mapped.message.contains(session_id.as_str()));
+}
+
+#[test]
+fn direct_session_resource_reads_classify_a_dropped_body_as_reachability_loss() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind partial session response fixture");
+    let address = listener
+        .local_addr()
+        .expect("read partial session response address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept session client");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).expect("read session request");
+            assert_ne!(read, 0, "session request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let request = String::from_utf8(request).expect("session request headers should be UTF-8");
+        let request_id = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("satelle-request-id")
+                    .then(|| value.trim())
+            })
+            .expect("session request must carry a request ID");
+        let partial_body = r#"{"schema_version":"satelle.session.read.v1""#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nSatelle-Request-Id: {request_id}\r\nSatelle-Host-Identity: host-direct-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial_body}",
+            partial_body.len() + 100
+        )
+        .expect("write partial session response");
+        stream.flush().expect("flush partial session response");
+    });
+    let client = DaemonClient::loopback(
+        address,
+        ApiBearerToken::generate().expect("generate session fixture token"),
+        "host-direct-test",
+    )
+    .expect("construct session fixture client");
+    let session_id = SessionId::new();
+
+    let daemon_error = client
+        .read_session(&session_id)
+        .expect_err("the partial session response body must fail");
+    let error = direct_session_resource_error("direct-test", &session_id, daemon_error);
+    server
+        .join()
+        .expect("join partial session response fixture");
+
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
 }
 
 #[test]

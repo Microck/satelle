@@ -89,6 +89,7 @@ fn production_service_reports_the_frozen_service_config_path_set() {
         satelle_core::daemon_service::PersistentHostStoragePolicy::new(
             3_600_000,
             satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+            45 * 24,
             satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
         )
         .expect("valid persistent storage policy"),
@@ -109,6 +110,10 @@ fn production_service_reports_the_frozen_service_config_path_set() {
     assert_eq!(
         service.setup_ledger_retention_for_tests(),
         time::Duration::hours(1)
+    );
+    assert_eq!(
+        service.sqlite_log_retention_for_tests(),
+        time::Duration::days(45)
     );
 }
 

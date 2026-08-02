@@ -45,4 +45,15 @@ impl AuthenticatedResponseContract for LogsPageResponse {
     fn host_identity(&self) -> &str {
         self.host_identity()
     }
+
+    fn matches_host_identity(&self, expected_host_identity: &str) -> bool {
+        // Entries are flattened under this authenticated envelope, so each
+        // nested identity must remain bound to the Host that produced it.
+        self.host_identity() == expected_host_identity
+            && self
+                .page()
+                .entries()
+                .iter()
+                .all(|entry| entry.host_identity().as_str() == expected_host_identity)
+    }
 }

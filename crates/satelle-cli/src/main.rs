@@ -31,7 +31,7 @@ use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 #[cfg(any(windows, test))]
-use satelle_core::daemon_service::WindowsServiceConfigV3;
+use satelle_core::daemon_service::WindowsServiceConfigV4;
 use satelle_core::daemon_service::{
     DaemonServicePlatform, PersistentHostStoragePolicy, PersistentServiceDecision,
     SetupModeSelection, SetupModeSource,
@@ -179,7 +179,7 @@ struct ConfigContext<'a> {
     resolved: Arc<OnceLock<Result<ResolvedConfig, SatelleError>>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SelectedHost {
     alias: String,
     config: HostConfig,
@@ -628,6 +628,9 @@ struct HostStartCommand {
     /// Internal resolved Session metadata retention for a persistent launchd service.
     #[arg(long, hide = true, value_name = "HOURS", requires = "launchd_service")]
     session_metadata_retention_hours: Option<u64>,
+    /// Internal resolved SQLite Log Entry retention for a persistent launchd service.
+    #[arg(long, hide = true, value_name = "HOURS", requires = "launchd_service")]
+    sqlite_log_retention_hours: Option<u64>,
     /// Internal resolved Operator Log File generation count for launchd.
     #[arg(long, hide = true, value_name = "COUNT", requires = "launchd_service")]
     operator_log_retained_files: Option<usize>,
@@ -2141,6 +2144,7 @@ mod history_target_tests {
                 on_demand_idle_timeout_ms: None,
                 setup_ledger_retention_ms: None,
                 session_metadata_retention_hours: None,
+                sqlite_log_retention_hours: None,
                 operator_log_retained_files: None,
                 service_config: None,
                 output_args: OutputArgs::default(),
@@ -2275,6 +2279,8 @@ mod history_target_tests {
             "3600000",
             "--session-metadata-retention-hours",
             "720",
+            "--sqlite-log-retention-hours",
+            "1080",
             "--operator-log-retained-files",
             "12",
         ])
@@ -2293,6 +2299,7 @@ mod history_target_tests {
         assert!(command.launchd_service);
         assert_eq!(command.setup_ledger_retention_ms, Some(3_600_000));
         assert_eq!(command.session_metadata_retention_hours, Some(720));
+        assert_eq!(command.sqlite_log_retention_hours, Some(1080));
         assert_eq!(command.operator_log_retained_files, Some(12));
         validate_host_start_mode(&command).expect("launchd service is a valid closed start mode");
     }
@@ -6747,6 +6754,7 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.on_demand_idle_timeout_ms.is_some()
             || command.setup_ledger_retention_ms.is_none()
             || command.session_metadata_retention_hours.is_none()
+            || command.sqlite_log_retention_hours.is_none()
             || command.operator_log_retained_files.is_none())
     {
         return Err(SatelleError::invalid_usage(
@@ -6765,6 +6773,7 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.on_demand_idle_timeout_ms.is_some()
             || command.setup_ledger_retention_ms.is_some()
             || command.session_metadata_retention_hours.is_some()
+            || command.sqlite_log_retention_hours.is_some()
             || command.operator_log_retained_files.is_some())
     {
         return Err(SatelleError::invalid_usage(
@@ -6912,6 +6921,9 @@ fn start_host_daemon_with(
                         command
                             .session_metadata_retention_hours
                             .expect("launchd Session retention was validated"),
+                        command
+                            .sqlite_log_retention_hours
+                            .expect("launchd SQLite Log retention was validated"),
                         command
                             .operator_log_retained_files
                             .expect("launchd Operator Log retention was validated"),
@@ -7190,7 +7202,7 @@ mod daemon_process_notice_tests {
 }
 
 #[cfg(any(windows, test))]
-fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV3, CliFailure> {
+fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV4, CliFailure> {
     if !path.is_absolute() {
         return Err(failure(SatelleError::invalid_usage(
             "Windows Host service config path must be absolute",
@@ -7242,9 +7254,9 @@ mod windows_service_config_tests {
             log_dir: Some(PathBuf::from(r"C:\Users\owner\AppData\Local\Satelle\logs")),
             sources: BTreeMap::new(),
         };
-        let storage_policy =
-            PersistentHostStoragePolicy::new(3_600_000, 30 * 24, 12).expect("build storage policy");
-        let expected = WindowsServiceConfigV3::new("127.0.0.1:3001", &overrides, storage_policy)
+        let storage_policy = PersistentHostStoragePolicy::new(3_600_000, 30 * 24, 45 * 24, 12)
+            .expect("build storage policy");
+        let expected = WindowsServiceConfigV4::new("127.0.0.1:3001", &overrides, storage_policy)
             .expect("build service config");
         write_owner_only_config(
             &path,
@@ -7296,7 +7308,7 @@ mod windows_service_config_tests {
 }
 
 #[cfg(windows)]
-fn apply_windows_service_environment(config: &WindowsServiceConfigV3) {
+fn apply_windows_service_environment(config: &WindowsServiceConfigV4) {
     const PATH_OVERRIDES: [&str; 5] = [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -7847,6 +7859,7 @@ mod daemon_tls_watcher_tests {
             on_demand_idle_timeout_ms: None,
             setup_ledger_retention_ms: None,
             session_metadata_retention_hours: None,
+            sqlite_log_retention_hours: None,
             operator_log_retained_files: None,
             service_config: None,
             output_args: OutputArgs::default(),
@@ -8373,6 +8386,7 @@ mod bootstrap_startup_tests {
             on_demand_idle_timeout_ms: Some(75_000),
             setup_ledger_retention_ms: None,
             session_metadata_retention_hours: None,
+            sqlite_log_retention_hours: None,
             operator_log_retained_files: None,
             service_config: None,
             output_args: OutputArgs::default(),

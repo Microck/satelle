@@ -9,6 +9,8 @@ use time::format_description::well_known::Rfc3339;
 
 pub(crate) const DEFAULT_SESSION_RETENTION: time::Duration =
     time::Duration::hours(satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS as i64);
+pub(crate) const DEFAULT_LOG_RETENTION: time::Duration =
+    time::Duration::hours(satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS as i64);
 pub(crate) const DEFAULT_SETUP_LEDGER_RETENTION: time::Duration = time::Duration::milliseconds(
     satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS as i64,
 );
@@ -43,7 +45,11 @@ impl Storage {
         let session_cutoff = observed_at
             .checked_sub(session_retention)
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
-        let session_cutoff_nanos = unix_timestamp_nanos(session_cutoff)?;
+        let retained_log_cutoff_nanos = unix_timestamp_nanos(
+            observed_at
+                .checked_sub(self.log_retention)
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?,
+        )?;
         let setup_cutoff = observed_at
             .checked_sub(setup_ledger_retention)
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
@@ -52,9 +58,10 @@ impl Storage {
         if !retention_needs_pruning(
             &self.connection,
             session_cutoff,
-            session_cutoff_nanos,
+            retained_log_cutoff_nanos,
             setup_cutoff,
             observed_at,
+            self.log_retention,
         )? {
             return Ok(());
         }
@@ -62,11 +69,11 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        prune_expired_logs(&transaction, observed_at)?;
+        prune_expired_logs(&transaction, observed_at, self.log_retention)?;
         prune_expired_admission_cancellations(&transaction, observed_at)?;
         prune_expired_sessionless_idempotency(&transaction, observed_at)?;
         let candidates =
-            terminal_session_candidates(&transaction, session_cutoff, session_cutoff_nanos)?;
+            terminal_session_candidates(&transaction, session_cutoff, retained_log_cutoff_nanos)?;
 
         for session_id in candidates {
             if !idempotency_records_allow_deletion(&transaction, &session_id, observed_at)? {
@@ -87,11 +94,12 @@ impl Storage {
 fn retention_needs_pruning(
     connection: &Connection,
     session_cutoff: OffsetDateTime,
-    session_cutoff_nanos: i64,
+    retained_log_cutoff_nanos: i64,
     setup_cutoff: OffsetDateTime,
     observed_at: OffsetDateTime,
+    log_retention: time::Duration,
 ) -> Result<bool, StorageError> {
-    if logs_need_pruning(connection, observed_at)? {
+    if logs_need_pruning(connection, observed_at, log_retention)? {
         return Ok(true);
     }
     if admission_cancellations_need_pruning(connection, observed_at)? {
@@ -100,7 +108,8 @@ fn retention_needs_pruning(
     if !expired_sessionless_idempotency(connection, observed_at)?.is_empty() {
         return Ok(true);
     }
-    for session_id in terminal_session_candidates(connection, session_cutoff, session_cutoff_nanos)?
+    for session_id in
+        terminal_session_candidates(connection, session_cutoff, retained_log_cutoff_nanos)?
     {
         if idempotency_records_allow_deletion(connection, &session_id, observed_at)? {
             return Ok(true);

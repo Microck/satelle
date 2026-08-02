@@ -973,6 +973,7 @@ mod tests {
             daemon_idle_timeout: None,
             setup_ledger_retention: None,
             session_metadata_retention: None,
+            sqlite_log_retention: None,
             operator_log_retained_files: None,
             desktop_user: None,
             desktop_session_preference: None,

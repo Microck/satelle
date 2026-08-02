@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v3";
+pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v4";
 pub const DEFAULT_SETUP_LEDGER_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -482,6 +482,7 @@ pub fn render_launchd_user_plist(
             "<string>--bind</string><string>{}</string>",
             "<string>--setup-ledger-retention-ms</string><string>{}</string>",
             "<string>--session-metadata-retention-hours</string><string>{}</string>",
+            "<string>--sqlite-log-retention-hours</string><string>{}</string>",
             "<string>--operator-log-retained-files</string><string>{}</string>",
             "</array><key>EnvironmentVariables</key><dict>{}</dict>",
             "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
@@ -491,6 +492,7 @@ pub fn render_launchd_user_plist(
         xml_escape(&bind.to_string()),
         storage_policy.setup_ledger_retention_ms,
         storage_policy.session_metadata_retention_hours,
+        storage_policy.sqlite_log_retention_hours,
         storage_policy.operator_log_retained_files,
         environment
     ))
@@ -532,6 +534,7 @@ pub enum WindowsServiceDefinitionError {
 pub struct PersistentHostStoragePolicy {
     setup_ledger_retention_ms: u64,
     session_metadata_retention_hours: u64,
+    sqlite_log_retention_hours: u64,
     operator_log_retained_files: usize,
 }
 
@@ -546,6 +549,12 @@ impl PersistentHostStoragePolicy {
                 crate::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
                 |retention| retention.hours(),
             ),
+            sqlite_log_retention_hours: config
+                .sqlite_log_retention
+                .as_ref()
+                .map_or(crate::DEFAULT_SQLITE_LOG_RETENTION_HOURS, |retention| {
+                    retention.hours()
+                }),
             operator_log_retained_files: config
                 .operator_log_retained_files
                 .unwrap_or(crate::DEFAULT_OPERATOR_LOG_RETAINED_FILES),
@@ -555,11 +564,13 @@ impl PersistentHostStoragePolicy {
     pub fn new(
         setup_ledger_retention_ms: u64,
         session_metadata_retention_hours: u64,
+        sqlite_log_retention_hours: u64,
         operator_log_retained_files: usize,
     ) -> Result<Self, WindowsServiceDefinitionError> {
         let policy = Self {
             setup_ledger_retention_ms,
             session_metadata_retention_hours,
+            sqlite_log_retention_hours,
             operator_log_retained_files,
         };
         policy
@@ -580,6 +591,10 @@ impl PersistentHostStoragePolicy {
         self.operator_log_retained_files
     }
 
+    pub const fn sqlite_log_retention_hours(self) -> u64 {
+        self.sqlite_log_retention_hours
+    }
+
     fn validate(self) -> Result<(), &'static str> {
         validate_setup_ledger_retention_ms(self.setup_ledger_retention_ms)?;
         if !(crate::MIN_SESSION_METADATA_RETENTION_HOURS
@@ -587,6 +602,12 @@ impl PersistentHostStoragePolicy {
             .contains(&self.session_metadata_retention_hours)
         {
             return Err("invalid session metadata retention");
+        }
+        if !(crate::MIN_SESSION_METADATA_RETENTION_HOURS
+            ..=crate::MAX_SESSION_METADATA_RETENTION_HOURS)
+            .contains(&self.sqlite_log_retention_hours)
+        {
+            return Err("invalid SQLite Log Entry retention");
         }
         if !(1..=crate::MAX_OPERATOR_LOG_RETAINED_FILES).contains(&self.operator_log_retained_files)
         {
@@ -597,14 +618,14 @@ impl PersistentHostStoragePolicy {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct WindowsServiceConfigV3 {
+pub struct WindowsServiceConfigV4 {
     schema: String,
     daemon_arguments: Vec<String>,
     environment: BTreeMap<String, String>,
     storage_policy: PersistentHostStoragePolicy,
 }
 
-impl WindowsServiceConfigV3 {
+impl WindowsServiceConfigV4 {
     pub fn new(
         bind: &str,
         overrides: &DaemonPathOverrides,
@@ -720,7 +741,7 @@ impl WindowsServiceConfigV3 {
     }
 }
 
-impl<'de> Deserialize<'de> for WindowsServiceConfigV3 {
+impl<'de> Deserialize<'de> for WindowsServiceConfigV4 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -978,7 +999,7 @@ mod tests {
     }
 
     fn storage_policy() -> PersistentHostStoragePolicy {
-        PersistentHostStoragePolicy::new(3_600_000, 30 * 24, 12)
+        PersistentHostStoragePolicy::new(3_600_000, 30 * 24, 45 * 24, 12)
             .expect("valid persistent storage policy")
     }
 
@@ -1036,7 +1057,7 @@ mod tests {
             log_dir: Some(PathBuf::from(r"C:\Satelle\logs")),
             ..DaemonPathOverrides::default()
         };
-        let config = WindowsServiceConfigV3::new("127.0.0.1:3001", &overrides, storage_policy())
+        let config = WindowsServiceConfigV4::new("127.0.0.1:3001", &overrides, storage_policy())
             .expect("valid service config");
         assert_eq!(config.schema(), WINDOWS_SERVICE_CONFIG_SCHEMA);
         assert_eq!(
@@ -1081,7 +1102,7 @@ mod tests {
             "environment": {},
             "storage_policy": storage_policy()
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV3>(invalid_arguments).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV4>(invalid_arguments).is_err());
 
         let invalid_environment = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1089,7 +1110,7 @@ mod tests {
             "environment": {"PATH": "C:\\attacker"},
             "storage_policy": storage_policy()
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV3>(invalid_environment).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV4>(invalid_environment).is_err());
 
         let invalid_retention = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1098,10 +1119,11 @@ mod tests {
             "storage_policy": {
                 "setup_ledger_retention_ms": 0,
                 "session_metadata_retention_hours": 720,
+                "sqlite_log_retention_hours": 1080,
                 "operator_log_retained_files": 12
             }
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV3>(invalid_retention).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV4>(invalid_retention).is_err());
     }
 
     #[test]
@@ -1359,7 +1381,7 @@ mod tests {
             state_dir: Some(PathBuf::from(r"C:\Users\operator\Satelle\state")),
             ..DaemonPathOverrides::default()
         };
-        let config = WindowsServiceConfigV3::new("127.0.0.1:3001", &overrides, storage_policy())
+        let config = WindowsServiceConfigV4::new("127.0.0.1:3001", &overrides, storage_policy())
             .expect("valid Windows service config");
 
         assert_eq!(config.path_overrides(), overrides);

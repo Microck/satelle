@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 
 fn host_log(at: OffsetDateTime, source: LogSource, severity: LogSeverity) -> SafeLogRecord {
+    assert_eq!(source, LogSource::Storage);
     SafeLogRecord::new(
         at,
         source,
@@ -89,10 +90,13 @@ fn operator_log_formats_the_authoritative_normalized_entry_only() {
     assert!(matches!(outcome, OperatorLogWriteOutcome::Written));
     assert_eq!(
         fs::read_to_string(log_root.join("satelle-host.log")).expect("read operator log fixture"),
-        concat!(
-            "2026-01-02T03:04:01Z level=warn source=storage ",
-            "event=store_opened subject=host cursor=slc1_0000000000000002 ",
-            "message=\"opened Host state store\"\n",
+        format!(
+            concat!(
+                "2026-01-02T03:04:01Z level=warn host={} source=storage ",
+                "event=store_opened subject=host cursor=slc1_0000000000000002 ",
+                "redacted=true message=\"opened Host state store\"\n",
+            ),
+            normalized.host_identity().as_str(),
         )
     );
 }
@@ -109,7 +113,7 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
     let first = committed_host_log(
         &mut storage,
         at(0),
-        LogSource::HostDaemon,
+        LogSource::Storage,
         LogSeverity::Warning,
     );
     let probe_root = state.path().join("operator-log-probe");
@@ -132,7 +136,7 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
     let second = committed_host_log(
         &mut storage,
         at(0),
-        LogSource::HostDaemon,
+        LogSource::Storage,
         LogSeverity::Warning,
     );
     assert!(matches!(
@@ -150,7 +154,7 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
     let third = committed_host_log(
         &mut storage,
         at(0),
-        LogSource::HostDaemon,
+        LogSource::Storage,
         LogSeverity::Warning,
     );
     assert!(matches!(
@@ -170,7 +174,7 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
         let entry = committed_host_log(
             &mut storage,
             at(0),
-            LogSource::HostDaemon,
+            LogSource::Storage,
             LogSeverity::Warning,
         );
         assert!(matches!(
@@ -206,7 +210,7 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
     let twelfth = committed_host_log(
         &mut storage,
         at(0),
-        LogSource::HostDaemon,
+        LogSource::Storage,
         LogSeverity::Warning,
     );
     let mut reduced =
@@ -375,14 +379,14 @@ fn log_pages_filter_before_limiting_and_resume_after_the_delivered_cursor() {
     let second = storage
         .append_safe_log(&host_log(
             now + time::Duration::seconds(1),
-            LogSource::HostDaemon,
+            LogSource::Storage,
             LogSeverity::Warning,
         ))
         .expect("append second log");
     let third = storage
         .append_safe_log(&host_log(
             now + time::Duration::seconds(2),
-            LogSource::CodexAdapter,
+            LogSource::Storage,
             LogSeverity::Error,
         ))
         .expect("append third log");
@@ -404,7 +408,7 @@ fn log_pages_filter_before_limiting_and_resume_after_the_delivered_cursor() {
         .log_page(
             &LogPageQuery::forward(Some(LogCursor::from_position(first)), 1)
                 .expect("valid forward query")
-                .with_sources([LogSource::CodexAdapter]),
+                .with_minimum_severity(LogSeverity::Error),
             now,
         )
         .expect("read filtered forward page");
@@ -747,4 +751,63 @@ fn log_reads_enforce_retention_even_when_no_new_log_has_been_written() {
         .expect_err("the pre-retention origin must be expired");
     assert_eq!(error.earliest_available_cursor(), None);
     assert_eq!(error.resume_cursor(), Some(expired));
+}
+
+#[test]
+fn log_reads_use_the_configured_sqlite_retention() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage.set_log_retention(time::Duration::days(30));
+    let observed_at = OffsetDateTime::now_utc();
+    let retained = storage
+        .append_safe_log(&host_log(
+            observed_at - time::Duration::days(8),
+            LogSource::Storage,
+            LogSeverity::Info,
+        ))
+        .expect("append a Log Entry inside configured retention");
+
+    let page = storage
+        .log_page(
+            &LogPageQuery::tail(10).expect("valid tail query"),
+            observed_at,
+        )
+        .expect("read with configured retention");
+    assert_eq!(
+        page.entries()
+            .iter()
+            .map(|entry| entry.cursor().position())
+            .collect::<Vec<_>>(),
+        vec![retained]
+    );
+}
+
+#[test]
+fn failed_turns_persist_a_normalized_structured_error_without_raw_payloads() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    storage
+        .begin_session(
+            &session,
+            &admission(IdempotentOperation::Run, "run-log-error", "request", at(0)),
+        )
+        .expect("admit Session");
+    storage
+        .commit_lifecycle(
+            session.id(),
+            &turn_id(TURN_1),
+            revisions(&session, TURN_1),
+            TurnTransition::Failed,
+            at(1),
+        )
+        .expect("commit failed Turn");
+
+    let logs = storage.logs_after(None, 10).expect("read normalized logs");
+    let error = logs
+        .iter()
+        .find(|log| log.record().event() == LogEvent::StructuredExecutionError)
+        .expect("failed Turn should persist a structured error summary");
+    assert_eq!(error.record().source(), LogSource::CodexAdapter);
+    assert_eq!(error.record().severity(), LogSeverity::Error);
 }

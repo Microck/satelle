@@ -2769,6 +2769,15 @@ impl HostService {
             ))
             .ok_or_else(|| SatelleError::config_error("invalid service Session retention", None))?,
         );
+        config.sqlite_log_retention = Some(
+            satelle_core::RetentionDuration::parse(&format!(
+                "{}h",
+                storage_policy.sqlite_log_retention_hours()
+            ))
+            .ok_or_else(|| {
+                SatelleError::config_error("invalid service SQLite log retention", None)
+            })?,
+        );
         config.operator_log_retained_files = Some(storage_policy.operator_log_retained_files());
         Ok(Self::production_for_host(&config))
     }
@@ -2776,6 +2785,11 @@ impl HostService {
     #[cfg(test)]
     fn setup_ledger_retention_for_tests(&self) -> time::Duration {
         self.runtime.setup_ledger_retention_for_tests()
+    }
+
+    #[cfg(test)]
+    fn sqlite_log_retention_for_tests(&self) -> time::Duration {
+        self.runtime.sqlite_log_retention_for_tests()
     }
 
     /// Builds an on-demand Host whose only bootstrap credential is held in

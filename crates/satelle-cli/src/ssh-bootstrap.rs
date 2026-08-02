@@ -2553,7 +2553,7 @@ impl<'a> PersistentServiceRemote<'a> {
     pub(super) fn publish_windows_service_config(
         &mut self,
         task: &satelle_core::daemon_service::WindowsTaskDefinition,
-        config: &satelle_core::daemon_service::WindowsServiceConfigV3,
+        config: &satelle_core::daemon_service::WindowsServiceConfigV4,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
         let contents = serde_json::to_vec_pretty(config)
@@ -3629,7 +3629,7 @@ fn parse_service_path_overrides(
     output: &[u8],
 ) -> Result<DaemonPathOverrides, SshBootstrapError> {
     if target.is_windows() {
-        let config: satelle_core::daemon_service::WindowsServiceConfigV3 =
+        let config: satelle_core::daemon_service::WindowsServiceConfigV4 =
             serde_json::from_slice(output)
                 .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
         if config.bind() != "127.0.0.1:3001" {
@@ -3691,6 +3691,8 @@ fn parse_launchd_service_definition(
     const RETENTION_PREFIX: &str = "</string><string>--setup-ledger-retention-ms</string><string>";
     const SESSION_RETENTION_PREFIX: &str =
         "</string><string>--session-metadata-retention-hours</string><string>";
+    const SQLITE_LOG_RETENTION_PREFIX: &str =
+        "</string><string>--sqlite-log-retention-hours</string><string>";
     const OPERATOR_LOG_RETENTION_PREFIX: &str =
         "</string><string>--operator-log-retained-files</string><string>";
     const ENVIRONMENT_PREFIX: &str =
@@ -3723,9 +3725,12 @@ fn parse_launchd_service_definition(
     let (setup_ledger_retention_ms, body) = body
         .split_once(SESSION_RETENTION_PREFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
-    let (session_metadata_retention_hours, body) =
-        body.split_once(OPERATOR_LOG_RETENTION_PREFIX)
-            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let (session_metadata_retention_hours, body) = body
+        .split_once(SQLITE_LOG_RETENTION_PREFIX)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let (sqlite_log_retention_hours, body) = body
+        .split_once(OPERATOR_LOG_RETENTION_PREFIX)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
     let (operator_log_retained_files, body) = body
         .split_once(ENVIRONMENT_PREFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
@@ -3734,6 +3739,9 @@ fn parse_launchd_service_definition(
             .parse::<u64>()
             .map_err(|_| SshBootstrapError::InvalidServiceObservation)?,
         session_metadata_retention_hours
+            .parse::<u64>()
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?,
+        sqlite_log_retention_hours
             .parse::<u64>()
             .map_err(|_| SshBootstrapError::InvalidServiceObservation)?,
         operator_log_retained_files
@@ -4184,7 +4192,7 @@ impl RemoteUserDirectories {
                     "$config=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json; ",
                     "$task=Get-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name} ",
                     "-ErrorAction SilentlyContinue; ",
-                    "if ($config.schema -cne 'satelle.host-service.v3' -or $null -eq $task) {{ ",
+                    "if ($config.schema -cne 'satelle.host-service.v4' -or $null -eq $task) {{ ",
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "[xml]$xml=Export-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name}; ",
                     "$root=$xml.Task; ",
@@ -4274,11 +4282,11 @@ impl RemoteUserDirectories {
                 .ok_or(SshBootstrapError::InvalidServiceObservation)?;
             let config = config.strip_suffix('\r').unwrap_or(config);
             let Ok(config) = serde_json::from_str::<
-                satelle_core::daemon_service::WindowsServiceConfigV3,
+                satelle_core::daemon_service::WindowsServiceConfigV4,
             >(config) else {
                 return Ok(None);
             };
-            let expected = satelle_core::daemon_service::WindowsServiceConfigV3::new(
+            let expected = satelle_core::daemon_service::WindowsServiceConfigV4::new(
                 "127.0.0.1:3001",
                 expected_path_overrides,
                 expected_storage_policy,
@@ -5658,6 +5666,7 @@ mod tests {
         satelle_core::daemon_service::PersistentHostStoragePolicy::new(
             satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,
             satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+            satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
             satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
         )
         .expect("valid default persistent storage policy")
@@ -5931,6 +5940,7 @@ mod tests {
                     satelle_core::daemon_service::PersistentHostStoragePolicy::new(
                         3_600_000,
                         satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+                        satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
                         satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
                     )
                     .unwrap(),
@@ -6010,11 +6020,12 @@ mod tests {
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
                     "printf 'managed\\r\\n",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                    "{{\"schema\":\"satelle.host-service.v3\",",
+                    "{{\"schema\":\"satelle.host-service.v4\",",
                     "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                     "\"127.0.0.1:3001\"],\"environment\":{{}},",
                     "\"storage_policy\":{{\"setup_ledger_retention_ms\":2592000000,",
                     "\"session_metadata_retention_hours\":168,",
+                    "\"sqlite_log_retention_hours\":168,",
                     "\"operator_log_retained_files\":5}}}}\\r\\n",
                     "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
                     "win32-x64-msvc\\\\satelle-",
@@ -6056,6 +6067,7 @@ mod tests {
                     satelle_core::daemon_service::PersistentHostStoragePolicy::new(
                         3_600_000,
                         satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+                        satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
                         satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
                     )
                     .unwrap(),
@@ -6117,11 +6129,12 @@ mod tests {
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                "{\"schema\":\"satelle.host-service.v3\",",
+                "{\"schema\":\"satelle.host-service.v4\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                 "\"127.0.0.1:3002\"],\"environment\":{},",
                 "\"storage_policy\":{\"setup_ledger_retention_ms\":2592000000,",
                 "\"session_metadata_retention_hours\":168,",
+                "\"sqlite_log_retention_hours\":168,",
                 "\"operator_log_retained_files\":5}}\\r\\n",
                 "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
                 "win32-x64-msvc\\\\satelle-",
@@ -6148,12 +6161,13 @@ mod tests {
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                "{\"schema\":\"satelle.host-service.v3\",",
+                "{\"schema\":\"satelle.host-service.v4\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                 "\"127.0.0.1:3001\"],",
                 "\"environment\":{\"SATELLE_HOME\":\"C:\\\\\\\\Drifted\"},",
                 "\"storage_policy\":{\"setup_ledger_retention_ms\":2592000000,",
                 "\"session_metadata_retention_hours\":168,",
+                "\"sqlite_log_retention_hours\":168,",
                 "\"operator_log_retained_files\":5}}\\r\\n",
                 "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
                 "win32-x64-msvc\\\\satelle-",
@@ -6593,12 +6607,13 @@ mod tests {
     #[test]
     fn persistent_service_path_override_parsers_are_closed() {
         let windows = br#"{
-          "schema":"satelle.host-service.v3",
+          "schema":"satelle.host-service.v4",
           "daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],
           "environment":{"SATELLE_STATE_DIR":"C:\\Users\\operator\\AppData\\Local\\Satelle\\state"},
           "storage_policy":{
             "setup_ledger_retention_ms":3600000,
             "session_metadata_retention_hours":168,
+            "sqlite_log_retention_hours":168,
             "operator_log_retained_files":5
           }
         }"#;
@@ -6611,7 +6626,7 @@ mod tests {
         assert!(
             parse_service_path_overrides(
                 RemoteTarget::WindowsX64Msvc,
-                br#"{"schema":"satelle.host-service.v3","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"},"storage_policy":{"setup_ledger_retention_ms":3600000,"session_metadata_retention_hours":168,"operator_log_retained_files":5}}"#,
+                br#"{"schema":"satelle.host-service.v4","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"},"storage_policy":{"setup_ledger_retention_ms":3600000,"session_metadata_retention_hours":168,"sqlite_log_retention_hours":168,"operator_log_retained_files":5}}"#,
             )
             .is_err()
         );
@@ -6630,6 +6645,7 @@ mod tests {
             satelle_core::daemon_service::PersistentHostStoragePolicy::new(
                 3_600_000,
                 satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+                satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
                 satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
             )
             .unwrap(),
@@ -7931,6 +7947,7 @@ mod tests {
             provider_smoke_failure_cache_ttl: None,
             setup_ledger_retention: None,
             session_metadata_retention: None,
+            sqlite_log_retention: None,
             operator_log_retained_files: None,
             daemon_idle_timeout: None,
             desktop_user: None,

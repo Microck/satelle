@@ -352,6 +352,33 @@ fn configured_session_retention_changes_only_the_session_cutoff() {
 }
 
 #[test]
+fn shorter_session_retention_waits_for_the_independent_log_window() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let observed_at = at(40);
+    let terminal_at = observed_at - time::Duration::days(8);
+    storage.set_log_retention(time::Duration::days(30));
+    let session = terminal_session(
+        &mut storage,
+        SESSION_1,
+        TURN_1,
+        terminal_at - time::Duration::seconds(1),
+        terminal_at,
+    );
+
+    storage
+        .prune_expired_session_metadata_with_retention(
+            observed_at,
+            time::Duration::days(7),
+            super::super::retention::DEFAULT_SETUP_LEDGER_RETENTION,
+        )
+        .expect("retained logs must delay Session cleanup without a state conflict");
+
+    assert!(storage.load_session(session.id()).unwrap().is_some());
+    assert!(table_rows_for_session(&storage, "logs", session.id()) > 0);
+}
+
+#[test]
 fn setup_ledger_retention_preserves_recovery_work_and_unrelated_host_state() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");

@@ -111,6 +111,21 @@ fn terminal_session_round_trips_with_follow_up_and_exact_snapshot() {
         )
         .expect("complete follow-up");
     let expected = session.snapshot();
+    let normalized_events = storage
+        .logs_after(None, 20)
+        .expect("read normalized lifecycle summaries");
+    assert!(normalized_events.iter().any(|log| {
+        log.record().event() == LogEvent::NativeReadinessSummary
+            && log.record().source() == LogSource::HostDaemon
+    }));
+    assert!(normalized_events.iter().any(|log| {
+        log.record().event() == LogEvent::ProviderSmokeSummary
+            && log.record().source() == LogSource::CodexAdapter
+    }));
+    assert!(normalized_events.iter().any(|log| {
+        log.record().event() == LogEvent::TurnStateCommitted
+            && log.record().source() == LogSource::CodexAdapter
+    }));
     drop(storage);
 
     let (storage, recovery) = Storage::open(state.path()).expect("reopen storage");

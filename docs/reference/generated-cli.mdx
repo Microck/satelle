@@ -474,6 +474,8 @@ Options:
       --after <LOG_CURSOR>           Return entries strictly after this opaque cursor; conflicts with --since and --tail
       --source <SOURCE>              Include a source: host_daemon, storage, or codex_adapter; repeat to select multiple
       --level <SEVERITY>             Set minimum severity: info, warn, or error (default: info)
+  -f, --follow                       Continue streaming new matching Log Entries
+      --no-reconnect                 Fail on transport loss instead of reconnecting
       --format <FORMAT>              [possible values: human, json]
       --json                         Alias for --format json
   -h, --help                         Print help

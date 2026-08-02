@@ -1,4 +1,4 @@
-use satelle_core::session::{SessionStateRevision, TurnStateRevision};
+use satelle_core::session::{HostIdentityRef, SessionStateRevision, TurnStateRevision};
 use satelle_core::{SessionId, TurnId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
@@ -136,7 +136,10 @@ impl LogSeverity {
 pub enum LogEvent {
     SessionStarted,
     FollowUpStarted,
+    NativeReadinessSummary,
+    ProviderSmokeSummary,
     TurnStateCommitted,
+    StructuredExecutionError,
     StopConfirmed,
     StopNotConfirmed,
     RestartRecoveryPending,
@@ -148,7 +151,10 @@ impl LogEvent {
         match self {
             Self::SessionStarted => "session_started",
             Self::FollowUpStarted => "follow_up_started",
+            Self::NativeReadinessSummary => "native_readiness_summary",
+            Self::ProviderSmokeSummary => "provider_smoke_summary",
             Self::TurnStateCommitted => "turn_state_committed",
+            Self::StructuredExecutionError => "structured_execution_error",
             Self::StopConfirmed => "stop_confirmed",
             Self::StopNotConfirmed => "stop_not_confirmed",
             Self::RestartRecoveryPending => "restart_recovery_pending",
@@ -160,7 +166,10 @@ impl LogEvent {
         match self {
             Self::SessionStarted => "created Session",
             Self::FollowUpStarted => "admitted follow-up Turn",
+            Self::NativeReadinessSummary => "native Computer Use readiness passed",
+            Self::ProviderSmokeSummary => "provider smoke test passed",
             Self::TurnStateCommitted => "committed Turn state",
+            Self::StructuredExecutionError => "recorded a structured execution failure",
             Self::StopConfirmed => "confirmed stop request",
             Self::StopNotConfirmed => "stop request requires recovery",
             Self::RestartRecoveryPending => "Turn requires restart recovery",
@@ -170,6 +179,21 @@ impl LogEvent {
 
     pub(crate) const fn has_turn_subject(self) -> bool {
         !matches!(self, Self::StoreOpened)
+    }
+
+    pub(crate) const fn source(self) -> LogSource {
+        match self {
+            Self::SessionStarted
+            | Self::FollowUpStarted
+            | Self::NativeReadinessSummary
+            | Self::StopConfirmed
+            | Self::StopNotConfirmed
+            | Self::RestartRecoveryPending => LogSource::HostDaemon,
+            Self::ProviderSmokeSummary
+            | Self::TurnStateCommitted
+            | Self::StructuredExecutionError => LogSource::CodexAdapter,
+            Self::StoreOpened => LogSource::Storage,
+        }
     }
 }
 
@@ -244,6 +268,7 @@ impl<'de> Deserialize<'de> for Redacted {
 pub struct DaemonLogEntry {
     cursor: LogCursor,
     timestamp: OffsetDateTime,
+    host_identity: HostIdentityRef,
     source: LogSource,
     severity: LogSeverity,
     event: LogEvent,
@@ -254,6 +279,7 @@ impl DaemonLogEntry {
     pub(crate) fn from_parts(
         cursor: u64,
         timestamp: OffsetDateTime,
+        host_identity: HostIdentityRef,
         source: LogSource,
         severity: LogSeverity,
         event: LogEvent,
@@ -262,6 +288,7 @@ impl DaemonLogEntry {
         let entry = Self {
             cursor: LogCursor::from_position(cursor),
             timestamp,
+            host_identity,
             source,
             severity,
             event,
@@ -278,6 +305,9 @@ impl DaemonLogEntry {
         if self.event.has_turn_subject() != matches!(self.subject, LogSubject::Turn { .. }) {
             return Err("the Log Entry event contradicts its subject");
         }
+        if self.source != self.event.source() {
+            return Err("the Log Entry source contradicts its event");
+        }
         Ok(())
     }
 
@@ -287,6 +317,10 @@ impl DaemonLogEntry {
 
     pub const fn timestamp(&self) -> OffsetDateTime {
         self.timestamp
+    }
+
+    pub const fn host_identity(&self) -> &HostIdentityRef {
+        &self.host_identity
     }
 
     pub const fn source(&self) -> LogSource {
@@ -312,6 +346,7 @@ struct DaemonLogEntryRef<'a> {
     cursor: LogCursor,
     #[serde(with = "time::serde::rfc3339")]
     timestamp: OffsetDateTime,
+    host_identity: &'a str,
     source: LogSource,
     severity: LogSeverity,
     event: LogEvent,
@@ -329,6 +364,7 @@ impl Serialize for DaemonLogEntry {
             schema_version: LogEntrySchema,
             cursor: self.cursor,
             timestamp: self.timestamp,
+            host_identity: self.host_identity.as_str(),
             source: self.source,
             severity: self.severity,
             event: self.event,
@@ -348,6 +384,7 @@ struct DaemonLogEntryOwned {
     cursor: LogCursor,
     #[serde(with = "time::serde::rfc3339")]
     timestamp: OffsetDateTime,
+    host_identity: String,
     source: LogSource,
     severity: LogSeverity,
     event: LogEvent,
@@ -371,6 +408,8 @@ impl<'de> Deserialize<'de> for DaemonLogEntry {
         let entry = Self {
             cursor: wire.cursor,
             timestamp: wire.timestamp,
+            host_identity: HostIdentityRef::new(wire.host_identity)
+                .map_err(serde::de::Error::custom)?,
             source: wire.source,
             severity: wire.severity,
             event: wire.event,
@@ -515,6 +554,20 @@ impl LogPageQuery {
 
     pub const fn session_id(&self) -> Option<&SessionId> {
         self.session_id.as_ref()
+    }
+
+    /// Returns whether a normalized Log Entry satisfies every requested filter.
+    pub fn matches_entry(&self, entry: &DaemonLogEntry) -> bool {
+        let session_matches = self.session_id.as_ref().is_none_or(|requested_session| {
+            matches!(
+                entry.subject(),
+                LogSubject::Turn { session_id, .. } if session_id == requested_session
+            )
+        });
+        session_matches
+            && self.includes_source(entry.source())
+            && entry.severity() >= self.minimum_severity
+            && self.since.is_none_or(|since| entry.timestamp() >= since)
     }
 
     pub(crate) fn includes_source(&self, source: LogSource) -> bool {
@@ -730,6 +783,7 @@ mod tests {
         let entry = DaemonLogEntry::from_parts(
             2,
             OffsetDateTime::UNIX_EPOCH,
+            HostIdentityRef::new("host-log-test").unwrap(),
             LogSource::Storage,
             LogSeverity::Info,
             LogEvent::StoreOpened,
@@ -749,5 +803,51 @@ mod tests {
             "truncated": false
         });
         assert!(serde_json::from_value::<DaemonLogPage>(invalid_page).is_err());
+    }
+
+    #[test]
+    fn log_entry_deserialization_rejects_every_event_source_contradiction() {
+        let events = [
+            (LogEvent::SessionStarted, LogSource::HostDaemon),
+            (LogEvent::FollowUpStarted, LogSource::HostDaemon),
+            (LogEvent::NativeReadinessSummary, LogSource::HostDaemon),
+            (LogEvent::ProviderSmokeSummary, LogSource::CodexAdapter),
+            (LogEvent::TurnStateCommitted, LogSource::CodexAdapter),
+            (LogEvent::StructuredExecutionError, LogSource::CodexAdapter),
+            (LogEvent::StopConfirmed, LogSource::HostDaemon),
+            (LogEvent::StopNotConfirmed, LogSource::HostDaemon),
+            (LogEvent::RestartRecoveryPending, LogSource::HostDaemon),
+            (LogEvent::StoreOpened, LogSource::Storage),
+        ];
+        for (index, (event, source)) in events.into_iter().enumerate() {
+            let subject = if event.has_turn_subject() {
+                LogSubject::Turn {
+                    session_id: SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
+                        .unwrap(),
+                    turn_id: TurnId::parse("rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21").unwrap(),
+                    session_state_revision: SessionStateRevision::initial(),
+                    turn_state_revision: TurnStateRevision::initial(),
+                }
+            } else {
+                LogSubject::Host
+            };
+            let entry = DaemonLogEntry::from_parts(
+                u64::try_from(index + 1).unwrap(),
+                OffsetDateTime::UNIX_EPOCH,
+                HostIdentityRef::new("host-log-test").unwrap(),
+                source,
+                LogSeverity::Info,
+                event,
+                subject,
+            )
+            .unwrap();
+            let mut value = serde_json::to_value(&entry).unwrap();
+            value["source"] = serde_json::json!(if source == LogSource::Storage {
+                LogSource::HostDaemon.as_str()
+            } else {
+                LogSource::Storage.as_str()
+            });
+            assert!(serde_json::from_value::<DaemonLogEntry>(value).is_err());
+        }
     }
 }

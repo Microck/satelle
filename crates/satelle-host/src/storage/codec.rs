@@ -670,7 +670,10 @@ pub(super) fn log_event_token(value: LogEvent) -> &'static str {
     match value {
         LogEvent::SessionStarted => "session_started",
         LogEvent::FollowUpStarted => "follow_up_started",
+        LogEvent::NativeReadinessSummary => "native_readiness_summary",
+        LogEvent::ProviderSmokeSummary => "provider_smoke_summary",
         LogEvent::TurnStateCommitted => "turn_state_committed",
+        LogEvent::StructuredExecutionError => "structured_execution_error",
         LogEvent::StopConfirmed => "stop_confirmed",
         LogEvent::StopNotConfirmed => "stop_not_confirmed",
         LogEvent::RestartRecoveryPending => "restart_recovery_pending",
@@ -682,7 +685,10 @@ fn parse_log_event(value: &str) -> Result<LogEvent, StorageError> {
     match value {
         "session_started" => Ok(LogEvent::SessionStarted),
         "follow_up_started" => Ok(LogEvent::FollowUpStarted),
+        "native_readiness_summary" => Ok(LogEvent::NativeReadinessSummary),
+        "provider_smoke_summary" => Ok(LogEvent::ProviderSmokeSummary),
         "turn_state_committed" => Ok(LogEvent::TurnStateCommitted),
+        "structured_execution_error" => Ok(LogEvent::StructuredExecutionError),
         "stop_confirmed" => Ok(LogEvent::StopConfirmed),
         "stop_not_confirmed" => Ok(LogEvent::StopNotConfirmed),
         "restart_recovery_pending" => Ok(LogEvent::RestartRecoveryPending),

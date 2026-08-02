@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use super::control_plane::perform_handshake;
 use super::control_plane::{
     CodexImageInputMode, ControlPlaneAdmission, configure_app_server_command,
     probe_control_plane_with,
@@ -8,6 +10,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 const FIXTURE_MODE: &str = "SATELLE_CODEX_CONTROL_PLANE_FIXTURE";
 const FIXTURE_SCHEMA_DIR: &str = "SATELLE_CODEX_SCHEMA_FIXTURE_DIR";
@@ -320,24 +324,26 @@ fn production_stdio_timeout_terminates_stdout_inheriting_descendants() {
 #[test]
 fn production_stdio_deadline_survives_a_group_escaping_pipe_holder() {
     let fixture = compile_stdio_fixture();
-    let started = std::time::Instant::now();
+    let mut app_server = Command::new(fixture.executable());
+    app_server.arg("hang-with-escaped-descendant-exit");
+    let started = Instant::now();
 
-    let probe = run_production_stdio_fixture_with(
-        &fixture,
-        "hang-with-escaped-descendant-exit",
-        Duration::from_millis(100),
+    let handshake_completed = perform_handshake(
+        app_server,
+        fixture
+            .executable()
+            .parent()
+            .expect("the fixture executable must have a parent directory"),
+        Instant::now() + Duration::from_millis(100),
     );
 
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "an escaped stdout holder exceeded the hard protocol deadline"
     );
-    assert_eq!(
-        ControlPlaneAdmission::from_probe(probe)
-            .admit(ControlPlaneOperation::Run)
-            .expect_err("an incomplete escaped-child handshake must remain blocked")
-            .details["reason"],
-        serde_json::json!("handshake_unavailable")
+    assert!(
+        !handshake_completed,
+        "an incomplete escaped-child handshake must remain blocked"
     );
 }
 

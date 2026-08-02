@@ -25,7 +25,7 @@ use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use satelle_core::session::{EffectiveModelRef, ProviderBindingRef};
 use satelle_core::{DirectHostBinding, SessionId};
-use satelle_host::{ApiBearerToken, LogPageQuery};
+use satelle_host::{ApiBearerToken, LogPageMode, LogPageQuery};
 use serde::de::DeserializeOwned;
 use std::fmt;
 use std::io::{self, Read};
@@ -646,7 +646,8 @@ impl DaemonClient {
 
     pub fn logs(&self, query: &LogPageQuery) -> Result<LogsPageResponse, DaemonClientError> {
         let (request, request_id) = self.protected_request(Method::GET, "/v1/logs")?;
-        self.send_authenticated(request.query(query), request_id, StatusCode::OK)
+        let response = self.send_authenticated(request.query(query), request_id, StatusCode::OK)?;
+        validate_logs_response(query, response)
     }
 
     pub fn create_session(
@@ -881,6 +882,38 @@ impl DaemonClient {
     }
 }
 
+fn validate_logs_response(
+    query: &LogPageQuery,
+    response: LogsPageResponse,
+) -> Result<LogsPageResponse, DaemonClientError> {
+    let page = response.page();
+    // Deserialization proves strict entry order and that next_cursor does not
+    // precede the final entry. Bind the remaining page claims to this exact
+    // authenticated request before any entry or continuation can be exposed.
+    let cursor_is_bound = query.cursor().is_none_or(|requested_cursor| {
+        page.next_cursor() >= requested_cursor
+            && page
+                .entries()
+                .first()
+                .is_none_or(|entry| entry.cursor() > requested_cursor)
+    });
+    let continuation_is_exact = query.mode() != LogPageMode::Forward
+        || !page.truncated()
+        || page
+            .entries()
+            .last()
+            .is_some_and(|entry| page.next_cursor() == entry.cursor());
+    let filters_are_bound = page
+        .entries()
+        .iter()
+        .all(|entry| query.matches_entry(entry));
+    let size_is_bound = page.entries().len() <= query.limit();
+    if !cursor_is_bound || !continuation_is_exact || !filters_are_bound || !size_is_bound {
+        return Err(DaemonClientError::ResponseContractViolation);
+    }
+    Ok(response)
+}
+
 impl fmt::Debug for DaemonClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1101,7 +1134,7 @@ fn validate_response_context(
     if response.request_id() != request_id {
         return Err(DaemonClientError::ResponseRequestIdMismatch);
     }
-    if response.host_identity() != expected_host_identity {
+    if !response.matches_host_identity(expected_host_identity) {
         return Err(DaemonClientError::ResponseHostIdentityMismatch);
     }
     Ok(())
@@ -1113,6 +1146,7 @@ mod tests {
     use satelle_core::{
         ApiTokenSource, DirectHostBindingError, HostConfig, SatelleConfig, TransportKind,
     };
+    use satelle_host::LogCursor;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -1506,6 +1540,294 @@ mod tests {
             );
             server.join().expect("join capabilities response fixture");
         }
+    }
+
+    #[test]
+    fn logs_response_rejects_entry_from_another_host_identity() {
+        let request_id = RequestId::new();
+        let response = serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+            "schema_version": "satelle.logs.page.v1",
+            "request_id": request_id.as_str(),
+            "host_identity": "host-expected",
+            "entries": [{
+                "schema_version": "satelle.logs.entry.v1",
+                "cursor": "slc1_0000000000000001",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "host_identity": "host-other",
+                "source": "storage",
+                "severity": "info",
+                "event": "store_opened",
+                "subject": { "kind": "host" },
+                "message": "opened Host state store",
+                "redacted": true
+            }],
+            "next_cursor": "slc1_0000000000000001",
+            "truncated": false
+        }))
+        .expect("decode the contradictory log page fixture");
+
+        assert!(matches!(
+            validate_response_context(&response, &request_id, "host-expected"),
+            Err(DaemonClientError::ResponseHostIdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn logs_response_rejects_a_forward_page_that_rewinds_the_requested_cursor() {
+        let request_id = RequestId::new();
+        let requested_cursor =
+            LogCursor::parse("slc1_0000000000000002").expect("construct requested Log Cursor");
+        let query =
+            LogPageQuery::forward(Some(requested_cursor), 50).expect("construct forward Log query");
+        let stale_entry = serde_json::json!({
+                "schema_version": "satelle.logs.entry.v1",
+                "cursor": "slc1_0000000000000001",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "host_identity": "host-expected",
+                "source": "storage",
+                "severity": "info",
+                "event": "store_opened",
+                "subject": { "kind": "host" },
+                "message": "opened Host state store",
+                "redacted": true
+        });
+
+        for (entries, next_cursor) in [
+            (serde_json::json!([stale_entry]), "slc1_0000000000000002"),
+            (serde_json::json!([]), "slc1_0000000000000001"),
+        ] {
+            let response = serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+                "schema_version": "satelle.logs.page.v1",
+                "request_id": request_id.as_str(),
+                "host_identity": "host-expected",
+                "entries": entries,
+                "next_cursor": next_cursor,
+                "truncated": false
+            }))
+            .expect("decode the contradictory forward page fixture");
+
+            assert!(matches!(
+                validate_logs_response(&query, response),
+                Err(DaemonClientError::ResponseContractViolation)
+            ));
+        }
+    }
+
+    #[test]
+    fn logs_response_rejects_a_truncated_page_that_skips_its_continuation() {
+        let request_id = RequestId::new();
+        let requested_cursor =
+            LogCursor::parse("slc1_0000000000000002").expect("construct requested Log Cursor");
+        let query =
+            LogPageQuery::forward(Some(requested_cursor), 50).expect("construct forward Log query");
+        let entry = serde_json::json!({
+            "schema_version": "satelle.logs.entry.v1",
+            "cursor": "slc1_0000000000000003",
+            "timestamp": "1970-01-01T00:00:00Z",
+            "host_identity": "host-expected",
+            "source": "storage",
+            "severity": "info",
+            "event": "store_opened",
+            "subject": { "kind": "host" },
+            "message": "opened Host state store",
+            "redacted": true
+        });
+
+        for (entries, next_cursor) in [
+            (serde_json::json!([entry]), "slc1_0000000000000005"),
+            (serde_json::json!([]), "slc1_0000000000000002"),
+        ] {
+            let response = serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+                "schema_version": "satelle.logs.page.v1",
+                "request_id": request_id.as_str(),
+                "host_identity": "host-expected",
+                "entries": entries,
+                "next_cursor": next_cursor,
+                "truncated": true
+            }))
+            .expect("decode the contradictory truncated page fixture");
+
+            assert!(matches!(
+                validate_logs_response(&query, response),
+                Err(DaemonClientError::ResponseContractViolation)
+            ));
+        }
+    }
+
+    #[test]
+    fn logs_response_rejects_an_entry_outside_the_requested_session() {
+        let request_id = RequestId::new();
+        let requested_session = SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
+            .expect("construct requested Session ID");
+        let query = LogPageQuery::tail(50)
+            .expect("construct tail Log query")
+            .with_session(requested_session);
+        let response = serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+            "schema_version": "satelle.logs.page.v1",
+            "request_id": request_id.as_str(),
+            "host_identity": "host-expected",
+            "entries": [{
+                "schema_version": "satelle.logs.entry.v1",
+                "cursor": "slc1_0000000000000001",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "host_identity": "host-expected",
+                "source": "codex_adapter",
+                "severity": "info",
+                "event": "turn_state_committed",
+                "subject": {
+                    "kind": "turn",
+                    "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e12",
+                    "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
+                    "session_state_revision": 1,
+                    "turn_state_revision": 1
+                },
+                "message": "committed Turn state",
+                "redacted": true
+            }],
+            "next_cursor": "slc1_0000000000000001",
+            "truncated": false
+        }))
+        .expect("decode the cross-Session Log page fixture");
+
+        assert!(matches!(
+            validate_logs_response(&query, response),
+            Err(DaemonClientError::ResponseContractViolation)
+        ));
+    }
+
+    #[test]
+    fn logs_response_accepts_a_truncated_tail_page_at_the_host_high_water_cursor() {
+        let request_id = RequestId::new();
+        let requested_session = SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
+            .expect("construct requested Session ID");
+        let query = LogPageQuery::tail(1)
+            .expect("construct tail Log query")
+            .with_session(requested_session);
+        let response = serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+            "schema_version": "satelle.logs.page.v1",
+            "request_id": request_id.as_str(),
+            "host_identity": "host-expected",
+            "entries": [{
+                "schema_version": "satelle.logs.entry.v1",
+                "cursor": "slc1_0000000000000003",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "host_identity": "host-expected",
+                "source": "codex_adapter",
+                "severity": "info",
+                "event": "turn_state_committed",
+                "subject": {
+                    "kind": "turn",
+                    "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+                    "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
+                    "session_state_revision": 1,
+                    "turn_state_revision": 1
+                },
+                "message": "committed Turn state",
+                "redacted": true
+            }],
+            "next_cursor": "slc1_0000000000000005",
+            "truncated": true
+        }))
+        .expect("decode the valid truncated tail page fixture");
+
+        assert!(validate_logs_response(&query, response).is_ok());
+    }
+
+    #[test]
+    fn logs_response_rejects_entries_outside_requested_filters() {
+        let request_id = RequestId::new();
+        let requested_session = SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
+            .expect("construct requested Session ID");
+        let query = LogPageQuery::tail(50)
+            .expect("construct tail Log query")
+            .with_session(requested_session)
+            .with_sources([satelle_host::LogSource::CodexAdapter])
+            .with_minimum_severity(satelle_host::LogSeverity::Warning)
+            .with_since(time::OffsetDateTime::UNIX_EPOCH);
+        let valid_entry = serde_json::json!({
+            "schema_version": "satelle.logs.entry.v1",
+            "cursor": "slc1_0000000000000001",
+            "timestamp": "1970-01-01T00:00:01Z",
+            "host_identity": "host-expected",
+            "source": "codex_adapter",
+            "severity": "warn",
+            "event": "turn_state_committed",
+            "subject": {
+                "kind": "turn",
+                "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+                "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
+                "session_state_revision": 1,
+                "turn_state_revision": 1
+            },
+            "message": "committed Turn state",
+            "redacted": true
+        });
+        let response = |entry| {
+            serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+                "schema_version": "satelle.logs.page.v1",
+                "request_id": request_id.as_str(),
+                "host_identity": "host-expected",
+                "entries": [entry],
+                "next_cursor": "slc1_0000000000000001",
+                "truncated": false
+            }))
+            .expect("decode the filtered Log page fixture")
+        };
+        assert!(
+            validate_logs_response(&query, response(valid_entry.clone())).is_ok(),
+            "the exact requested predicate must remain valid"
+        );
+
+        let mut wrong_source = valid_entry.clone();
+        wrong_source["source"] = serde_json::json!("host_daemon");
+        wrong_source["event"] = serde_json::json!("native_readiness_summary");
+        wrong_source["message"] = serde_json::json!("native Computer Use readiness passed");
+        let mut wrong_severity = valid_entry.clone();
+        wrong_severity["severity"] = serde_json::json!("info");
+        let mut wrong_timestamp = valid_entry.clone();
+        wrong_timestamp["timestamp"] = serde_json::json!("1969-12-31T23:59:59Z");
+        for entry in [wrong_source, wrong_severity, wrong_timestamp] {
+            assert!(matches!(
+                validate_logs_response(&query, response(entry)),
+                Err(DaemonClientError::ResponseContractViolation)
+            ));
+        }
+    }
+
+    #[test]
+    fn logs_response_rejects_more_entries_than_the_requested_limit() {
+        let query = LogPageQuery::tail(1).expect("construct bounded tail Log query");
+        let entry = |cursor| {
+            serde_json::json!({
+                "schema_version": "satelle.logs.entry.v1",
+                "cursor": cursor,
+                "timestamp": "1970-01-01T00:00:00Z",
+                "host_identity": "host-expected",
+                "source": "storage",
+                "severity": "info",
+                "event": "store_opened",
+                "subject": { "kind": "host" },
+                "message": "opened Host state store",
+                "redacted": true
+            })
+        };
+        let response = serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+            "schema_version": "satelle.logs.page.v1",
+            "request_id": RequestId::new().as_str(),
+            "host_identity": "host-expected",
+            "entries": [
+                entry("slc1_0000000000000001"),
+                entry("slc1_0000000000000002")
+            ],
+            "next_cursor": "slc1_0000000000000002",
+            "truncated": false
+        }))
+        .expect("decode the oversized Log page fixture");
+
+        assert!(matches!(
+            validate_logs_response(&query, response),
+            Err(DaemonClientError::ResponseContractViolation)
+        ));
     }
 
     #[test]

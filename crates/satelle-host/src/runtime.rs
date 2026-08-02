@@ -633,6 +633,7 @@ pub(crate) struct RuntimeEngine {
 #[derive(Clone, Copy)]
 pub(crate) struct RuntimeStoragePolicy {
     session_metadata_retention: time::Duration,
+    sqlite_log_retention: time::Duration,
     setup_ledger_retention: time::Duration,
     operator_log_retained_files: usize,
 }
@@ -644,6 +645,12 @@ impl RuntimeStoragePolicy {
                 .session_metadata_retention
                 .as_ref()
                 .map_or(crate::storage::DEFAULT_SESSION_RETENTION, |retention| {
+                    time::Duration::hours(retention.hours() as i64)
+                }),
+            sqlite_log_retention: config
+                .sqlite_log_retention
+                .as_ref()
+                .map_or(crate::storage::DEFAULT_LOG_RETENTION, |retention| {
                     time::Duration::hours(retention.hours() as i64)
                 }),
             setup_ledger_retention: config.setup_ledger_retention.as_ref().map_or(
@@ -661,6 +668,7 @@ impl Default for RuntimeStoragePolicy {
     fn default() -> Self {
         Self {
             session_metadata_retention: crate::storage::DEFAULT_SESSION_RETENTION,
+            sqlite_log_retention: crate::storage::DEFAULT_LOG_RETENTION,
             setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
             operator_log_retained_files: satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
         }
@@ -731,8 +739,9 @@ impl RuntimeEngine {
     ) -> Result<Arc<Self>, SatelleError> {
         let process_identity =
             ProcessIdentity::current().map_err(model::process_identity_failure)?;
-        let storage =
+        let mut storage =
             Storage::open_without_restart_recovery(state_root).map_err(model::storage_failure)?;
+        storage.set_log_retention(storage_policy.sqlite_log_retention);
         if let Some(fingerprinter) = provider_smoke_fingerprinter {
             let key = storage
                 .provider_smoke_hmac_key()
@@ -2999,6 +3008,15 @@ impl RuntimeHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .storage_policy
             .setup_ledger_retention
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sqlite_log_retention_for_tests(&self) -> time::Duration {
+        self.lazy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .storage_policy
+            .sqlite_log_retention
     }
 
     #[cfg(any(test, feature = "test-support"))]

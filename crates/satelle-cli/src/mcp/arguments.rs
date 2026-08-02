@@ -1,4 +1,5 @@
 use super::super::logs::LogReadRequest;
+use super::super::output::OutputFormat;
 use rmcp::ErrorData as McpError;
 use rmcp::model::JsonObject;
 use satelle_core::SessionId;
@@ -102,6 +103,9 @@ impl LogsInput {
             after: self.after,
             source: self.source,
             level: self.level,
+            follow: false,
+            no_reconnect: false,
+            format: OutputFormat::Human,
         }
     }
 }

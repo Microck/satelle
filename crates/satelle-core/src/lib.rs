@@ -114,6 +114,7 @@ impl SatelleConfig {
                 daemon_idle_timeout: None,
                 setup_ledger_retention: None,
                 session_metadata_retention: None,
+                sqlite_log_retention: None,
                 operator_log_retained_files: None,
                 desktop_user: None,
                 desktop_session_preference: None,
@@ -300,6 +301,7 @@ pub struct HostConfig {
     pub daemon_idle_timeout: Option<ExplicitDuration>,
     pub setup_ledger_retention: Option<ExplicitDuration>,
     pub session_metadata_retention: Option<RetentionDuration>,
+    pub sqlite_log_retention: Option<RetentionDuration>,
     pub operator_log_retained_files: Option<usize>,
     pub desktop_user: Option<String>,
     pub desktop_session_preference: Option<DesktopSessionPreference>,
@@ -1646,6 +1648,7 @@ impl ExplicitDuration {
 }
 
 pub const DEFAULT_SESSION_METADATA_RETENTION_HOURS: u64 = 7 * 24;
+pub const DEFAULT_SQLITE_LOG_RETENTION_HOURS: u64 = 7 * 24;
 pub const MIN_SESSION_METADATA_RETENTION_HOURS: u64 = 7 * 24;
 pub const MAX_SESSION_METADATA_RETENTION_HOURS: u64 = 365 * 24;
 pub const DEFAULT_OPERATOR_LOG_RETAINED_FILES: usize = 5;
@@ -3234,6 +3237,7 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
             "daemon_idle_timeout",
             "setup_ledger_retention",
             "session_metadata_retention",
+            "sqlite_log_retention",
         ] {
             collect_interpolation_for_value(
                 &format!("{host_path}.{key}"),
@@ -3499,6 +3503,15 @@ fn reject_timeout_config_errors(path: &Path, value: &toml::Value) -> Result<(), 
         }
         if let Some(value) = host_table.get("session_metadata_retention") {
             let retention_path = format!("{host_path}.session_metadata_retention");
+            let Some(value) = value.as_str() else {
+                return Err(SatelleError::duration_unit_required(path, &retention_path));
+            };
+            if RetentionDuration::parse(value).is_none() {
+                return Err(SatelleError::duration_unit_required(path, &retention_path));
+            }
+        }
+        if let Some(value) = host_table.get("sqlite_log_retention") {
+            let retention_path = format!("{host_path}.sqlite_log_retention");
             let Some(value) = value.as_str() else {
                 return Err(SatelleError::duration_unit_required(path, &retention_path));
             };
@@ -3822,6 +3835,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "daemon_idle_timeout",
                     "setup_ledger_retention",
                     "session_metadata_retention",
+                    "sqlite_log_retention",
                     "operator_log_retained_files",
                     "desktop_user",
                     "desktop_session_preference",
@@ -4043,7 +4057,7 @@ mod session_metadata_retention_tests {
     fn host_retention_and_operator_log_count_validate_at_config_boundary() {
         let parsed = parse_user_config(
             Path::new("/test/config.toml"),
-            "[hosts.local-demo]\ntransport = \"local\"\nadapter = \"codex\"\nsession_metadata_retention = \"30d\"\noperator_log_retained_files = 12\n",
+            "[hosts.local-demo]\ntransport = \"local\"\nadapter = \"codex\"\nsession_metadata_retention = \"30d\"\nsqlite_log_retention = \"45d\"\noperator_log_retained_files = 12\n",
         )
         .expect("parse bounded retention policy");
         let host = parsed.config.hosts.get(LOCAL_DEMO_HOST).unwrap();
@@ -4052,9 +4066,11 @@ mod session_metadata_retention_tests {
             30 * 24
         );
         assert_eq!(host.operator_log_retained_files, Some(12));
+        assert_eq!(host.sqlite_log_retention.as_ref().unwrap().hours(), 45 * 24);
 
         for field in [
             "session_metadata_retention = \"60m\"",
+            "sqlite_log_retention = \"366d\"",
             "operator_log_retained_files = 0",
             "operator_log_retained_files = 101",
         ] {
@@ -4271,6 +4287,9 @@ pub enum ErrorCode {
     LogTailLimitExceeded,
     LogPositionConflict,
     LogsCursorExpired,
+    LogsTargetRequired,
+    LogsFollowIdentityChanged,
+    LogsFollowReconnectExhausted,
     CapacityExceeded,
     ConcurrencyLimitExceeded,
     ConcurrencyWithoutRemoteUpdate,
@@ -4409,6 +4428,9 @@ impl ErrorCode {
             Self::LogTailLimitExceeded => "log-tail-limit-exceeded",
             Self::LogPositionConflict => "log-position-conflict",
             Self::LogsCursorExpired => "logs-cursor-expired",
+            Self::LogsTargetRequired => "logs-target-required",
+            Self::LogsFollowIdentityChanged => "logs-follow-identity-changed",
+            Self::LogsFollowReconnectExhausted => "logs-follow-reconnect-exhausted",
             Self::CapacityExceeded => "capacity-exceeded",
             Self::ConcurrencyLimitExceeded => "concurrency-limit-exceeded",
             Self::ConcurrencyWithoutRemoteUpdate => "concurrency-without-remote-update",
@@ -4458,6 +4480,7 @@ impl ErrorCode {
             | Self::OutputModeConflict
             | Self::LogTailLimitExceeded
             | Self::LogPositionConflict
+            | Self::LogsTargetRequired
             | Self::ConcurrencyLimitExceeded
             | Self::ConcurrencyWithoutRemoteUpdate
             | Self::ComponentSelectionConflict
@@ -4517,7 +4540,8 @@ impl ErrorCode {
             | Self::HostDaemonUnreachable
             | Self::DirectDaemonUnreachable
             | Self::SshBootstrapUnavailable
-            | Self::ReleaseVerifierUnavailable => 69,
+            | Self::ReleaseVerifierUnavailable
+            | Self::LogsFollowReconnectExhausted => 69,
             Self::CertificateUntrusted
             | Self::CertificateHostnameMismatch
             | Self::CertificateExpired
@@ -4527,6 +4551,7 @@ impl ErrorCode {
             | Self::AuthenticationFailed
             | Self::AuthorizationInsufficientScope
             | Self::HostIdentityMismatch
+            | Self::LogsFollowIdentityChanged
             | Self::StoreInUse
             | Self::RemoteExecution
             | Self::HostUpdateRecoveryPending
@@ -5818,6 +5843,71 @@ impl SatelleError {
         }
     }
 
+    pub fn logs_target_required() -> Self {
+        Self {
+            code: ErrorCode::LogsTargetRequired,
+            message: "logs requires a resolvable Host or Session target".to_string(),
+            recovery_command: Some("pass --host <alias> or --session <session-id>".to_string()),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn logs_follow_identity_changed(
+        expected_host_identity: &str,
+        observed_host_identity: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert(
+            "expected_host_identity".to_string(),
+            Value::String(expected_host_identity.to_string()),
+        );
+        details.insert(
+            "observed_host_identity".to_string(),
+            observed_host_identity
+                .map_or(Value::Null, |identity| Value::String(identity.to_string())),
+        );
+        details.insert(
+            "session_id".to_string(),
+            session_id.map_or(Value::Null, |session| Value::String(session.to_string())),
+        );
+        Self {
+            code: ErrorCode::LogsFollowIdentityChanged,
+            message: "the reconnected log target no longer matches the original Host or Session"
+                .to_string(),
+            recovery_command: Some(
+                "verify the Host identity and Session owner before starting a new log follow"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn logs_follow_reconnect_exhausted(
+        last_delivered_cursor: &str,
+        stream_interruptions: usize,
+        rerun_command: &str,
+    ) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert(
+            "last_delivered_cursor".to_string(),
+            Value::String(last_delivered_cursor.to_string()),
+        );
+        details.insert(
+            "stream_interruptions".to_string(),
+            Value::from(stream_interruptions),
+        );
+        Self {
+            code: ErrorCode::LogsFollowReconnectExhausted,
+            message: "log follow reconnect budget was exhausted".to_string(),
+            recovery_command: Some(rerun_command.to_string()),
+            source_detail: None,
+            details,
+        }
+    }
+
     pub fn concurrency_limit_exceeded(value: u8) -> Self {
         let mut details = BTreeMap::new();
         details.insert("concurrency".to_string(), Value::from(value));
@@ -6933,6 +7023,60 @@ mod error_contract_tests {
             );
             assert_eq!(error.exit_code(), 64);
         }
+    }
+
+    #[test]
+    fn log_follow_errors_have_stable_typed_contracts() {
+        let target = SatelleError::logs_target_required();
+        assert_eq!(target.code, ErrorCode::LogsTargetRequired);
+        assert_eq!(target.code.as_str(), "logs-target-required");
+        assert_eq!(target.exit_code(), 64);
+        assert_eq!(
+            target.recovery_command.as_deref(),
+            Some("pass --host <alias> or --session <session-id>")
+        );
+
+        let identity = SatelleError::logs_follow_identity_changed(
+            "host-original",
+            Some("host-replacement"),
+            Some("0195f6d5-18da-7a80-8000-000000000003"),
+        );
+        assert_eq!(identity.code, ErrorCode::LogsFollowIdentityChanged);
+        assert_eq!(identity.code.as_str(), "logs-follow-identity-changed");
+        assert_eq!(identity.exit_code(), 74);
+        assert_eq!(
+            identity.details.get("expected_host_identity"),
+            Some(&serde_json::json!("host-original"))
+        );
+        assert_eq!(
+            identity.details.get("observed_host_identity"),
+            Some(&serde_json::json!("host-replacement"))
+        );
+        assert_eq!(
+            identity.details.get("session_id"),
+            Some(&serde_json::json!("0195f6d5-18da-7a80-8000-000000000003"))
+        );
+
+        let exhausted = SatelleError::logs_follow_reconnect_exhausted(
+            "slc1_0000000000000042",
+            10,
+            "satelle logs --host remote --after slc1_0000000000000042 --follow",
+        );
+        assert_eq!(exhausted.code, ErrorCode::LogsFollowReconnectExhausted);
+        assert_eq!(exhausted.code.as_str(), "logs-follow-reconnect-exhausted");
+        assert_eq!(exhausted.exit_code(), 69);
+        assert_eq!(
+            exhausted.details.get("last_delivered_cursor"),
+            Some(&serde_json::json!("slc1_0000000000000042"))
+        );
+        assert_eq!(
+            exhausted.details.get("stream_interruptions"),
+            Some(&serde_json::json!(10))
+        );
+        assert_eq!(
+            exhausted.recovery_command.as_deref(),
+            Some("satelle logs --host remote --after slc1_0000000000000042 --follow")
+        );
     }
 }
 
