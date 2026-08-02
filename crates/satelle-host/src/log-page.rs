@@ -538,6 +538,20 @@ impl LogPageQuery {
         self.session_id.as_ref()
     }
 
+    /// Returns whether a normalized Log Entry satisfies every requested filter.
+    pub fn matches_entry(&self, entry: &DaemonLogEntry) -> bool {
+        let session_matches = self.session_id.as_ref().is_none_or(|requested_session| {
+            matches!(
+                entry.subject(),
+                LogSubject::Turn { session_id, .. } if session_id == requested_session
+            )
+        });
+        session_matches
+            && self.includes_source(entry.source())
+            && entry.severity() >= self.minimum_severity
+            && self.since.is_none_or(|since| entry.timestamp() >= since)
+    }
+
     pub(crate) fn includes_source(&self, source: LogSource) -> bool {
         self.sources
             .as_ref()

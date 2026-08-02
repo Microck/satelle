@@ -25,7 +25,7 @@ use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use satelle_core::session::{EffectiveModelRef, ProviderBindingRef};
 use satelle_core::{DirectHostBinding, SessionId};
-use satelle_host::{ApiBearerToken, LogPageQuery, LogSubject};
+use satelle_host::{ApiBearerToken, LogPageMode, LogPageQuery};
 use serde::de::DeserializeOwned;
 use std::fmt;
 use std::io::{self, Read};
@@ -897,20 +897,17 @@ fn validate_logs_response(
                 .first()
                 .is_none_or(|entry| entry.cursor() > requested_cursor)
     });
-    let continuation_is_exact = !page.truncated()
+    let continuation_is_exact = query.mode() != LogPageMode::Forward
+        || !page.truncated()
         || page
             .entries()
             .last()
             .is_some_and(|entry| page.next_cursor() == entry.cursor());
-    let session_is_bound = query.session_id().is_none_or(|requested_session| {
-        page.entries().iter().all(|entry| {
-            matches!(
-                entry.subject(),
-                LogSubject::Turn { session_id, .. } if session_id == requested_session
-            )
-        })
-    });
-    if !cursor_is_bound || !continuation_is_exact || !session_is_bound {
+    let filters_are_bound = page
+        .entries()
+        .iter()
+        .all(|entry| query.matches_entry(entry));
+    if !cursor_is_bound || !continuation_is_exact || !filters_are_bound {
         return Err(DaemonClientError::ResponseContractViolation);
     }
     Ok(response)
@@ -1695,6 +1692,103 @@ mod tests {
             validate_logs_response(&query, response),
             Err(DaemonClientError::ResponseContractViolation)
         ));
+    }
+
+    #[test]
+    fn logs_response_accepts_a_truncated_tail_page_at_the_host_high_water_cursor() {
+        let request_id = RequestId::new();
+        let requested_session = SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
+            .expect("construct requested Session ID");
+        let query = LogPageQuery::tail(1)
+            .expect("construct tail Log query")
+            .with_session(requested_session);
+        let response = serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+            "schema_version": "satelle.logs.page.v1",
+            "request_id": request_id.as_str(),
+            "host_identity": "host-expected",
+            "entries": [{
+                "schema_version": "satelle.logs.entry.v1",
+                "cursor": "slc1_0000000000000003",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "host_identity": "host-expected",
+                "source": "codex_adapter",
+                "severity": "info",
+                "event": "turn_state_committed",
+                "subject": {
+                    "kind": "turn",
+                    "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+                    "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
+                    "session_state_revision": 1,
+                    "turn_state_revision": 1
+                },
+                "message": "committed Turn state",
+                "redacted": true
+            }],
+            "next_cursor": "slc1_0000000000000005",
+            "truncated": true
+        }))
+        .expect("decode the valid truncated tail page fixture");
+
+        assert!(validate_logs_response(&query, response).is_ok());
+    }
+
+    #[test]
+    fn logs_response_rejects_entries_outside_requested_filters() {
+        let request_id = RequestId::new();
+        let requested_session = SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
+            .expect("construct requested Session ID");
+        let query = LogPageQuery::tail(50)
+            .expect("construct tail Log query")
+            .with_session(requested_session)
+            .with_sources([satelle_host::LogSource::CodexAdapter])
+            .with_minimum_severity(satelle_host::LogSeverity::Warning)
+            .with_since(time::OffsetDateTime::UNIX_EPOCH);
+        let valid_entry = serde_json::json!({
+            "schema_version": "satelle.logs.entry.v1",
+            "cursor": "slc1_0000000000000001",
+            "timestamp": "1970-01-01T00:00:01Z",
+            "host_identity": "host-expected",
+            "source": "codex_adapter",
+            "severity": "warn",
+            "event": "turn_state_committed",
+            "subject": {
+                "kind": "turn",
+                "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+                "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
+                "session_state_revision": 1,
+                "turn_state_revision": 1
+            },
+            "message": "committed Turn state",
+            "redacted": true
+        });
+        let response = |entry| {
+            serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+                "schema_version": "satelle.logs.page.v1",
+                "request_id": request_id.as_str(),
+                "host_identity": "host-expected",
+                "entries": [entry],
+                "next_cursor": "slc1_0000000000000001",
+                "truncated": false
+            }))
+            .expect("decode the filtered Log page fixture")
+        };
+        assert!(
+            validate_logs_response(&query, response(valid_entry.clone())).is_ok(),
+            "the exact requested predicate must remain valid"
+        );
+
+        for (field, value) in [
+            ("source", serde_json::json!("storage")),
+            ("severity", serde_json::json!("info")),
+            ("timestamp", serde_json::json!("1969-12-31T23:59:59Z")),
+        ] {
+            let mut entry = valid_entry.clone();
+            entry[field] = value;
+            assert!(matches!(
+                validate_logs_response(&query, response(entry)),
+                Err(DaemonClientError::ResponseContractViolation)
+            ));
+        }
     }
 
     #[test]
