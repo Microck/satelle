@@ -430,7 +430,7 @@ mod ssh_identity_commit_tests {
         (13, "fnv1a64:5db2b0aa00a5f745"),
         (14, "fnv1a64:fb04115e0082c148"),
         (15, "fnv1a64:efae7b5838392fa8"),
-        (16, "fnv1a64:a44bc76a75f95988"),
+        (16, "fnv1a64:8478b3aeb5aaa616"),
     ];
     const EXPECTED_SCHEMA_ROW_COUNT: usize = 71;
     const EXPECTED_SCHEMA_SHA256: &str =

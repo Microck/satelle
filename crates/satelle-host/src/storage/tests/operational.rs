@@ -479,11 +479,43 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_sixteen() {
 }
 
 #[test]
-fn version_fifteen_logs_upgrade_without_cursor_or_row_loss() {
+fn version_fifteen_logs_upgrade_preserves_rows_and_normalizes_lifecycle_sources() {
     let state = TempDir::new().expect("temporary state directory");
-    let (storage, _) = Storage::open(state.path()).expect("open current storage");
+    let (mut storage, _) = Storage::open(state.path()).expect("open current storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    storage
+        .begin_session(
+            &session,
+            &admission(
+                IdempotentOperation::Run,
+                "migration-log-source",
+                "migration-log-source-request",
+                at(0),
+            ),
+        )
+        .expect("persist a lifecycle Log Entry");
     let connection = storage.connection_for_test();
     rebuild_logs_as_v15_fixture(connection);
+    assert_eq!(
+        1,
+        connection
+            .execute(
+                "INSERT INTO logs (
+                recorded_at, recorded_at_unix_nanos, source, severity, event_kind,
+                session_id, turn_id, session_state_revision, turn_state_revision, redacted
+             )
+             SELECT ?1, ?2, 'host_daemon', 'info', 'turn_state_committed',
+                    sessions.session_id, turns.turn_id,
+                    sessions.session_state_revision, turns.turn_state_revision, 1
+             FROM sessions
+             JOIN turns ON turns.session_id = sessions.session_id
+             WHERE sessions.session_id = ?3 AND turns.turn_id = ?4",
+                params![at(1).format(&Rfc3339).unwrap(), 1_i64, SESSION_1, TURN_1,],
+            )
+            .expect("insert a version fifteen lifecycle Log Entry"),
+        "the migration fixture must contain one legacy lifecycle Log Entry",
+    );
+    let lifecycle_cursor = connection.last_insert_rowid();
     connection
         .execute(
             "INSERT INTO logs (
@@ -494,6 +526,13 @@ fn version_fifteen_logs_upgrade_without_cursor_or_row_loss() {
         )
         .expect("insert a version fifteen Log Entry");
     let preserved_cursor = connection.last_insert_rowid();
+    let legacy_cursor_high_water = connection
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'logs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("load the version fifteen Log cursor high-water mark");
     connection
         .execute("DELETE FROM schema_migrations WHERE version = 16", [])
         .expect("remove version sixteen history");
@@ -511,6 +550,16 @@ fn version_fifteen_logs_upgrade_without_cursor_or_row_loss() {
     let connection = upgraded.connection_for_test();
     assert_eq!(16_i64, pragma_integer(connection, "user_version"));
     assert_eq!(
+        (lifecycle_cursor, "codex_adapter".to_string()),
+        connection
+            .query_row(
+                "SELECT log_cursor, source FROM logs WHERE log_cursor = ?1",
+                [lifecycle_cursor],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load the normalized lifecycle Log Entry")
+    );
+    assert_eq!(
         (preserved_cursor, "store_opened".to_string()),
         connection
             .query_row(
@@ -520,6 +569,14 @@ fn version_fifteen_logs_upgrade_without_cursor_or_row_loss() {
             )
             .expect("load the preserved Log Entry")
     );
+    let post_upgrade_cursor_high_water = connection
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'logs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("load the upgraded Log cursor high-water mark");
+    assert!(post_upgrade_cursor_high_water >= legacy_cursor_high_water);
     connection
         .execute(
             "INSERT INTO logs (
@@ -529,7 +586,10 @@ fn version_fifteen_logs_upgrade_without_cursor_or_row_loss() {
             params![at(2).format(&Rfc3339).unwrap(), 2_i64],
         )
         .expect("append after the version sixteen migration");
-    assert_eq!(preserved_cursor + 1, connection.last_insert_rowid());
+    assert_eq!(
+        post_upgrade_cursor_high_water + 1,
+        connection.last_insert_rowid()
+    );
 }
 
 #[test]

@@ -61,7 +61,12 @@ SELECT
     log_cursor,
     recorded_at,
     recorded_at_unix_nanos,
-    source,
+    -- Version 15 attributed every lifecycle write to the Host Daemon. The
+    -- normalized contract assigns adapter-observed Turn commits to Codex.
+    CASE event_kind
+        WHEN 'turn_state_committed' THEN 'codex_adapter'
+        ELSE source
+    END,
     severity,
     event_kind,
     session_id,

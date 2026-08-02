@@ -646,7 +646,8 @@ impl DaemonClient {
 
     pub fn logs(&self, query: &LogPageQuery) -> Result<LogsPageResponse, DaemonClientError> {
         let (request, request_id) = self.protected_request(Method::GET, "/v1/logs")?;
-        self.send_authenticated(request.query(query), request_id, StatusCode::OK)
+        let response = self.send_authenticated(request.query(query), request_id, StatusCode::OK)?;
+        validate_logs_response(query, response)
     }
 
     pub fn create_session(
@@ -881,6 +882,27 @@ impl DaemonClient {
     }
 }
 
+fn validate_logs_response(
+    query: &LogPageQuery,
+    response: LogsPageResponse,
+) -> Result<LogsPageResponse, DaemonClientError> {
+    let Some(requested_cursor) = query.cursor() else {
+        return Ok(response);
+    };
+    let page = response.page();
+    // Deserialization already proves strict order within the page. Bind its
+    // first entry and continuation cursor to this request before exposing it.
+    if page.next_cursor() < requested_cursor
+        || page
+            .entries()
+            .first()
+            .is_some_and(|entry| entry.cursor() <= requested_cursor)
+    {
+        return Err(DaemonClientError::ResponseContractViolation);
+    }
+    Ok(response)
+}
+
 impl fmt::Debug for DaemonClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1113,6 +1135,7 @@ mod tests {
     use satelle_core::{
         ApiTokenSource, DirectHostBindingError, HostConfig, SatelleConfig, TransportKind,
     };
+    use satelle_host::LogCursor;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -1536,6 +1559,47 @@ mod tests {
             validate_response_context(&response, &request_id, "host-expected"),
             Err(DaemonClientError::ResponseHostIdentityMismatch)
         ));
+    }
+
+    #[test]
+    fn logs_response_rejects_a_forward_page_that_rewinds_the_requested_cursor() {
+        let request_id = RequestId::new();
+        let requested_cursor =
+            LogCursor::parse("slc1_0000000000000002").expect("construct requested Log Cursor");
+        let query =
+            LogPageQuery::forward(Some(requested_cursor), 50).expect("construct forward Log query");
+        let stale_entry = serde_json::json!({
+                "schema_version": "satelle.logs.entry.v1",
+                "cursor": "slc1_0000000000000001",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "host_identity": "host-expected",
+                "source": "storage",
+                "severity": "info",
+                "event": "store_opened",
+                "subject": { "kind": "host" },
+                "message": "opened Host state store",
+                "redacted": true
+        });
+
+        for (entries, next_cursor) in [
+            (serde_json::json!([stale_entry]), "slc1_0000000000000002"),
+            (serde_json::json!([]), "slc1_0000000000000001"),
+        ] {
+            let response = serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+                "schema_version": "satelle.logs.page.v1",
+                "request_id": request_id.as_str(),
+                "host_identity": "host-expected",
+                "entries": entries,
+                "next_cursor": next_cursor,
+                "truncated": false
+            }))
+            .expect("decode the contradictory forward page fixture");
+
+            assert!(matches!(
+                validate_logs_response(&query, response),
+                Err(DaemonClientError::ResponseContractViolation)
+            ));
+        }
     }
 
     #[test]

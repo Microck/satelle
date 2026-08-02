@@ -506,7 +506,7 @@ fn run_follow_operation<T: Send + 'static>(
             let _completed = completed.send(operation());
         })
         .map_err(|error| {
-            SatelleError::config_error(
+            follow_runtime_error(
                 "could not start interruptible log follow I/O",
                 Some(error.to_string()),
             )
@@ -530,12 +530,22 @@ fn run_follow_operation<T: Send + 'static>(
             Ok(result) => return result.map(FollowOperation::Completed),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(SatelleError::config_error(
+                return Err(follow_runtime_error(
                     "interruptible log follow I/O stopped without a result",
                     None,
                 ));
             }
         }
+    }
+}
+
+fn follow_runtime_error(message: impl Into<String>, source_detail: Option<String>) -> SatelleError {
+    SatelleError {
+        code: ErrorCode::RemoteExecution,
+        message: message.into(),
+        recovery_command: None,
+        source_detail,
+        details: std::collections::BTreeMap::new(),
     }
 }
 
@@ -1300,6 +1310,20 @@ mod tests {
             .expect_err("an unrepresentable relative timestamp must be rejected");
 
         assert_eq!(error.code, ErrorCode::InvalidUsage);
+    }
+
+    #[test]
+    fn follow_worker_disconnect_is_a_runtime_error_without_config_recovery() {
+        let runtime = FakeFollowRuntime::new(None);
+        let error = match run_follow_operation::<()>(&runtime, None, || {
+            panic!("drop the worker result sender")
+        }) {
+            Err(error) => error,
+            Ok(_) => panic!("a panicked follow worker must fail closed"),
+        };
+
+        assert_eq!(error.code, ErrorCode::RemoteExecution);
+        assert_eq!(error.recovery_command, None);
     }
 
     #[test]
