@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 
 fn host_log(at: OffsetDateTime, source: LogSource, severity: LogSeverity) -> SafeLogRecord {
+    assert_eq!(source, LogSource::Storage);
     SafeLogRecord::new(
         at,
         source,
@@ -112,7 +113,7 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
     let first = committed_host_log(
         &mut storage,
         at(0),
-        LogSource::HostDaemon,
+        LogSource::Storage,
         LogSeverity::Warning,
     );
     let probe_root = state.path().join("operator-log-probe");
@@ -135,7 +136,7 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
     let second = committed_host_log(
         &mut storage,
         at(0),
-        LogSource::HostDaemon,
+        LogSource::Storage,
         LogSeverity::Warning,
     );
     assert!(matches!(
@@ -153,7 +154,7 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
     let third = committed_host_log(
         &mut storage,
         at(0),
-        LogSource::HostDaemon,
+        LogSource::Storage,
         LogSeverity::Warning,
     );
     assert!(matches!(
@@ -173,7 +174,7 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
         let entry = committed_host_log(
             &mut storage,
             at(0),
-            LogSource::HostDaemon,
+            LogSource::Storage,
             LogSeverity::Warning,
         );
         assert!(matches!(
@@ -209,7 +210,7 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
     let twelfth = committed_host_log(
         &mut storage,
         at(0),
-        LogSource::HostDaemon,
+        LogSource::Storage,
         LogSeverity::Warning,
     );
     let mut reduced =
@@ -378,14 +379,14 @@ fn log_pages_filter_before_limiting_and_resume_after_the_delivered_cursor() {
     let second = storage
         .append_safe_log(&host_log(
             now + time::Duration::seconds(1),
-            LogSource::HostDaemon,
+            LogSource::Storage,
             LogSeverity::Warning,
         ))
         .expect("append second log");
     let third = storage
         .append_safe_log(&host_log(
             now + time::Duration::seconds(2),
-            LogSource::CodexAdapter,
+            LogSource::Storage,
             LogSeverity::Error,
         ))
         .expect("append third log");
@@ -407,7 +408,7 @@ fn log_pages_filter_before_limiting_and_resume_after_the_delivered_cursor() {
         .log_page(
             &LogPageQuery::forward(Some(LogCursor::from_position(first)), 1)
                 .expect("valid forward query")
-                .with_sources([LogSource::CodexAdapter]),
+                .with_minimum_severity(LogSeverity::Error),
             now,
         )
         .expect("read filtered forward page");

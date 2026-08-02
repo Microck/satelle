@@ -79,23 +79,12 @@ pub(super) fn canonical_log(
     let turn = session
         .turn(turn_id)
         .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-    let source = match event {
-        LogEvent::TurnStateCommitted
-        | LogEvent::ProviderSmokeSummary
-        | LogEvent::StructuredExecutionError => LogSource::CodexAdapter,
-        LogEvent::SessionStarted
-        | LogEvent::FollowUpStarted
-        | LogEvent::NativeReadinessSummary
-        | LogEvent::StopConfirmed
-        | LogEvent::StopNotConfirmed
-        | LogEvent::RestartRecoveryPending => LogSource::HostDaemon,
-        LogEvent::StoreOpened => {
-            return Err(StorageError::new(StorageErrorKind::InvalidInput));
-        }
-    };
+    if event == LogEvent::StoreOpened {
+        return Err(StorageError::new(StorageErrorKind::InvalidInput));
+    }
     SafeLogRecord::new(
         recorded_at,
-        source,
+        event.source(),
         severity,
         event,
         LogSubject::Turn {

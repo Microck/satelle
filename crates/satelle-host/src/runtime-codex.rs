@@ -423,7 +423,11 @@ fn declares_method(value: &Value, expected: &str) -> bool {
         })
 }
 
-fn perform_handshake(mut command: Command, working_dir: &Path, deadline: Instant) -> bool {
+pub(super) fn perform_handshake(
+    mut command: Command,
+    working_dir: &Path,
+    deadline: Instant,
+) -> bool {
     if Instant::now() >= deadline {
         return false;
     }

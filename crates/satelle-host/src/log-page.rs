@@ -180,6 +180,21 @@ impl LogEvent {
     pub(crate) const fn has_turn_subject(self) -> bool {
         !matches!(self, Self::StoreOpened)
     }
+
+    pub(crate) const fn source(self) -> LogSource {
+        match self {
+            Self::SessionStarted
+            | Self::FollowUpStarted
+            | Self::NativeReadinessSummary
+            | Self::StopConfirmed
+            | Self::StopNotConfirmed
+            | Self::RestartRecoveryPending => LogSource::HostDaemon,
+            Self::ProviderSmokeSummary
+            | Self::TurnStateCommitted
+            | Self::StructuredExecutionError => LogSource::CodexAdapter,
+            Self::StoreOpened => LogSource::Storage,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -289,6 +304,9 @@ impl DaemonLogEntry {
         }
         if self.event.has_turn_subject() != matches!(self.subject, LogSubject::Turn { .. }) {
             return Err("the Log Entry event contradicts its subject");
+        }
+        if self.source != self.event.source() {
+            return Err("the Log Entry source contradicts its event");
         }
         Ok(())
     }
@@ -785,5 +803,51 @@ mod tests {
             "truncated": false
         });
         assert!(serde_json::from_value::<DaemonLogPage>(invalid_page).is_err());
+    }
+
+    #[test]
+    fn log_entry_deserialization_rejects_every_event_source_contradiction() {
+        let events = [
+            (LogEvent::SessionStarted, LogSource::HostDaemon),
+            (LogEvent::FollowUpStarted, LogSource::HostDaemon),
+            (LogEvent::NativeReadinessSummary, LogSource::HostDaemon),
+            (LogEvent::ProviderSmokeSummary, LogSource::CodexAdapter),
+            (LogEvent::TurnStateCommitted, LogSource::CodexAdapter),
+            (LogEvent::StructuredExecutionError, LogSource::CodexAdapter),
+            (LogEvent::StopConfirmed, LogSource::HostDaemon),
+            (LogEvent::StopNotConfirmed, LogSource::HostDaemon),
+            (LogEvent::RestartRecoveryPending, LogSource::HostDaemon),
+            (LogEvent::StoreOpened, LogSource::Storage),
+        ];
+        for (index, (event, source)) in events.into_iter().enumerate() {
+            let subject = if event.has_turn_subject() {
+                LogSubject::Turn {
+                    session_id: SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
+                        .unwrap(),
+                    turn_id: TurnId::parse("rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21").unwrap(),
+                    session_state_revision: SessionStateRevision::initial(),
+                    turn_state_revision: TurnStateRevision::initial(),
+                }
+            } else {
+                LogSubject::Host
+            };
+            let entry = DaemonLogEntry::from_parts(
+                u64::try_from(index + 1).unwrap(),
+                OffsetDateTime::UNIX_EPOCH,
+                HostIdentityRef::new("host-log-test").unwrap(),
+                source,
+                LogSeverity::Info,
+                event,
+                subject,
+            )
+            .unwrap();
+            let mut value = serde_json::to_value(&entry).unwrap();
+            value["source"] = serde_json::json!(if source == LogSource::Storage {
+                LogSource::HostDaemon.as_str()
+            } else {
+                LogSource::Storage.as_str()
+            });
+            assert!(serde_json::from_value::<DaemonLogEntry>(value).is_err());
+        }
     }
 }
