@@ -269,6 +269,24 @@ api_token = {{ kind = "file", path = {token_path} }}
             .unwrap()
             .contains("exactly one configured Host")
     );
+
+    let ambiguous_logs = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache_root)
+        .args(["logs", "--session", &session, "--json"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let ambiguous_logs_error = parse_json_output(&ambiguous_logs.stderr);
+    assert_eq!(ambiguous_logs_error["code"], "invalid-usage");
+    assert!(
+        ambiguous_logs_error["message"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one configured Host")
+    );
 }
 
 #[test]

@@ -333,6 +333,11 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
     );
     assert_table_columns(
         &storage,
+        "log_retention_state",
+        &["singleton", "expired_through_cursor"],
+    );
+    assert_table_columns(
+        &storage,
         "session_private_refs",
         &[
             "session_id",

@@ -5940,7 +5940,7 @@ mod tests {
                     satelle_core::daemon_service::PersistentHostStoragePolicy::new(
                         3_600_000,
                         satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
-                        satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+                        satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
                         satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
                     )
                     .unwrap(),
@@ -6067,7 +6067,7 @@ mod tests {
                     satelle_core::daemon_service::PersistentHostStoragePolicy::new(
                         3_600_000,
                         satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
-                        satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+                        satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
                         satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
                     )
                     .unwrap(),
@@ -6645,7 +6645,7 @@ mod tests {
             satelle_core::daemon_service::PersistentHostStoragePolicy::new(
                 3_600_000,
                 satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
-                satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+                satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
                 satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
             )
             .unwrap(),

@@ -560,7 +560,14 @@ fn logs_json_lines_use_the_exact_entry_v1_contract() {
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
-        .args(["logs", "--session", session, "--json"])
+        .args([
+            "logs",
+            "--host",
+            "local-demo",
+            "--session",
+            session,
+            "--json",
+        ])
         .assert()
         .success()
         .get_output()

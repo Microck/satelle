@@ -93,7 +93,7 @@ fn operator_log_formats_the_authoritative_normalized_entry_only() {
             concat!(
                 "2026-01-02T03:04:01Z level=warn host={} source=storage ",
                 "event=store_opened subject=host cursor=slc1_0000000000000002 ",
-                "message=\"opened Host state store\"\n",
+                "redacted=true message=\"opened Host state store\"\n",
             ),
             normalized.host_identity().as_str(),
         )

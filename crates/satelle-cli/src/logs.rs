@@ -218,9 +218,10 @@ impl ProcessFollowRuntime {
             .enable_all()
             .build()
             .map_err(|error| {
-                SatelleError::invalid_usage(format!(
-                    "could not initialize Ctrl-C handling: {error}"
-                ))
+                SatelleError::config_error(
+                    "could not initialize Ctrl-C handling",
+                    Some(error.to_string()),
+                )
             })?;
         thread::Builder::new()
             .name("satelle-logs-follow-interrupt".to_string())
@@ -230,7 +231,10 @@ impl ProcessFollowRuntime {
                 }
             })
             .map_err(|error| {
-                SatelleError::invalid_usage(format!("could not start Ctrl-C handling: {error}"))
+                SatelleError::config_error(
+                    "could not start Ctrl-C handling",
+                    Some(error.to_string()),
+                )
             })?;
         Ok(Self {
             interrupted,
@@ -405,7 +409,8 @@ fn reconnect_follow(
         if runtime.interrupted() {
             return Err(SatelleError::interrupted_attached_command());
         }
-        if runtime.now() >= deadline {
+        let attempt_started_at = runtime.now();
+        if attempt_started_at >= deadline {
             return Err(exhausted());
         }
 
@@ -414,7 +419,7 @@ fn reconnect_follow(
             target.expected_host_identity.to_string(),
             target.plan.session_id().cloned(),
             target.plan.follow_query(query_cursor),
-            deadline - runtime.now(),
+            deadline - attempt_started_at,
         ) else {
             return Err(exhausted());
         };
@@ -510,7 +515,6 @@ fn transient_follow_error(code: ErrorCode) -> bool {
         ErrorCode::HostUnreachable
             | ErrorCode::HostDaemonUnreachable
             | ErrorCode::DirectDaemonUnreachable
-            | ErrorCode::SshBootstrapUnavailable
             | ErrorCode::RemoteExecution
     )
 }
@@ -858,10 +862,9 @@ fn unresolved_log_target(
     failure: CliFailure,
 ) -> Result<super::SelectedHost, CliFailure> {
     if request.host.is_none()
-        && matches!(
-            failure.error.code,
-            ErrorCode::HostNotFound | ErrorCode::InvalidUsage
-        )
+        && (failure.error.code == ErrorCode::HostNotFound
+            || (failure.error.code == ErrorCode::InvalidUsage
+                && failure.error.details.get("candidate_count") == Some(&serde_json::json!(0))))
     {
         Err(super::failure(SatelleError::logs_target_required()))
     } else {

@@ -1118,7 +1118,7 @@ fn corrupt_sqlite_fails_closed_without_mutating_or_leaking_state() {
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
-        .args(["status", &session_id, "--json"])
+        .args(["status", &session_id, "--host", "local-demo", "--json"])
         .assert()
         .failure()
         .get_output()
@@ -2349,6 +2349,7 @@ fn logs_help_exposes_follow_and_reconnect_controls() {
 #[test]
 fn logs_follow_waits_on_an_empty_page_and_ctrl_c_exits_130() {
     let state = state_dir();
+    let cache = tempfile::tempdir().expect("create isolated command-history cache");
     let session = completed_log_session(&state);
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("satelle"));
     for name in [
@@ -2364,8 +2365,11 @@ fn logs_follow_waits_on_an_empty_page_and_ctrl_c_exits_130() {
     }
     let mut child = command
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", cache.path())
         .args([
             "logs",
+            "--host",
+            "local-demo",
             "--session",
             &session,
             "--since",
@@ -2382,10 +2386,16 @@ fn logs_follow_waits_on_an_empty_page_and_ctrl_c_exits_130() {
     // process several poll intervals to prove that it remains attached.
     let attached_deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < attached_deadline {
-        assert!(
-            child.try_wait().expect("poll empty Log follow").is_none(),
-            "empty Log follow exited before interruption"
-        );
+        if child.try_wait().expect("poll empty Log follow").is_some() {
+            let output = child
+                .wait_with_output()
+                .expect("collect early Log follow failure");
+            panic!(
+                "empty Log follow exited before interruption: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
 

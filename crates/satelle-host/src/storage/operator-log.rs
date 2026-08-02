@@ -322,7 +322,7 @@ fn format_entry(entry: &DaemonLogEntry) -> Result<String, OperatorLogFailureKind
         ),
     };
     Ok(format!(
-        "{timestamp} level={} host={} source={} event={} {subject} cursor={} message=\"{}\"\n",
+        "{timestamp} level={} host={} source={} event={} {subject} cursor={} redacted=true message=\"{}\"\n",
         entry.severity().as_str(),
         entry.host_identity().as_str(),
         entry.source().as_str(),

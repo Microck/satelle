@@ -45,7 +45,11 @@ impl Storage {
         let session_cutoff = observed_at
             .checked_sub(session_retention)
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
-        let session_cutoff_nanos = unix_timestamp_nanos(session_cutoff)?;
+        let retained_log_cutoff_nanos = unix_timestamp_nanos(
+            observed_at
+                .checked_sub(self.log_retention)
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?,
+        )?;
         let setup_cutoff = observed_at
             .checked_sub(setup_ledger_retention)
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
@@ -54,7 +58,7 @@ impl Storage {
         if !retention_needs_pruning(
             &self.connection,
             session_cutoff,
-            session_cutoff_nanos,
+            retained_log_cutoff_nanos,
             setup_cutoff,
             observed_at,
             self.log_retention,
@@ -69,7 +73,7 @@ impl Storage {
         prune_expired_admission_cancellations(&transaction, observed_at)?;
         prune_expired_sessionless_idempotency(&transaction, observed_at)?;
         let candidates =
-            terminal_session_candidates(&transaction, session_cutoff, session_cutoff_nanos)?;
+            terminal_session_candidates(&transaction, session_cutoff, retained_log_cutoff_nanos)?;
 
         for session_id in candidates {
             if !idempotency_records_allow_deletion(&transaction, &session_id, observed_at)? {
@@ -90,7 +94,7 @@ impl Storage {
 fn retention_needs_pruning(
     connection: &Connection,
     session_cutoff: OffsetDateTime,
-    session_cutoff_nanos: i64,
+    retained_log_cutoff_nanos: i64,
     setup_cutoff: OffsetDateTime,
     observed_at: OffsetDateTime,
     log_retention: time::Duration,
@@ -104,7 +108,8 @@ fn retention_needs_pruning(
     if !expired_sessionless_idempotency(connection, observed_at)?.is_empty() {
         return Ok(true);
     }
-    for session_id in terminal_session_candidates(connection, session_cutoff, session_cutoff_nanos)?
+    for session_id in
+        terminal_session_candidates(connection, session_cutoff, retained_log_cutoff_nanos)?
     {
         if idempotency_records_allow_deletion(connection, &session_id, observed_at)? {
             return Ok(true);

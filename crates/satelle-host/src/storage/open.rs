@@ -143,7 +143,7 @@ const MIGRATIONS: [Migration; 16] = [
         version: 16,
         sql: include_str!("0016_normalized_log_events.sql"),
         seeds_sensitive_state: false,
-        irreversible: false,
+        irreversible: true,
     },
 ];
 
