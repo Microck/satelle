@@ -289,6 +289,28 @@ struct FollowTarget<'a> {
     expected_host_identity: &'a str,
 }
 
+fn visit_forward_snapshot_pages(
+    snapshot: LogCursor,
+    mut cursor: Option<LogCursor>,
+    page_limit: usize,
+    mut fetch: impl FnMut(Option<LogCursor>, usize) -> Result<satelle_host::DaemonLogPage, SatelleError>,
+    mut visit: impl FnMut(&[DaemonLogEntry], LogCursor) -> Result<(), SatelleError>,
+) -> Result<(), SatelleError> {
+    loop {
+        let page = fetch(cursor, page_limit)?;
+        let reached_snapshot = !page.truncated()
+            || page
+                .entries()
+                .last()
+                .is_some_and(|entry| entry.cursor() >= snapshot);
+        visit(page.entries(), snapshot)?;
+        if reached_snapshot {
+            return Ok(());
+        }
+        cursor = Some(page.next_cursor());
+    }
+}
+
 fn follow_logs(
     plan: &LogReadPlan,
     request: &LogReadRequest,
@@ -780,14 +802,11 @@ impl LogReadPlan {
                 write_entries(page.entries(), None, format)
             }
             LogPosition::After(cursor) => {
-                let query = self.query(
-                    LogPageQuery::forward(Some(cursor), DEFAULT_LOG_PAGE_LIMIT)
-                        .expect("the default forward Log limit is valid"),
-                );
-                let page = transport.logs(&query)?;
-                write_entries(page.entries(), None, format)
+                self.emit_forward_snapshot(transport, Some(cursor), DEFAULT_LOG_PAGE_LIMIT, format)
             }
-            LogPosition::SinceAll => self.emit_since_snapshot(transport, format),
+            LogPosition::SinceAll => {
+                self.emit_forward_snapshot(transport, None, MAX_LOG_PAGE_LIMIT, format)
+            }
         }
     }
 
@@ -800,13 +819,11 @@ impl LogReadPlan {
                 Ok(transport.logs(&query)?.entries().to_vec())
             }
             LogPosition::After(cursor) => {
-                let query = self.query(
-                    LogPageQuery::forward(Some(cursor), DEFAULT_LOG_PAGE_LIMIT)
-                        .expect("the default forward Log limit is valid"),
-                );
-                Ok(transport.logs(&query)?.entries().to_vec())
+                self.read_forward_snapshot(transport, Some(cursor), DEFAULT_LOG_PAGE_LIMIT)
             }
-            LogPosition::SinceAll => self.read_since_snapshot(transport),
+            LogPosition::SinceAll => {
+                self.read_forward_snapshot(transport, None, MAX_LOG_PAGE_LIMIT)
+            }
         }
     }
 
@@ -901,12 +918,14 @@ impl LogReadPlan {
         )
     }
 
-    fn read_since_snapshot(
+    fn read_forward_snapshot(
         &self,
         transport: &dyn TransportClient,
+        cursor: Option<LogCursor>,
+        page_limit: usize,
     ) -> Result<Vec<DaemonLogEntry>, SatelleError> {
         let mut entries = Vec::new();
-        self.visit_since_snapshot(transport, |page, snapshot| {
+        self.visit_forward_snapshot(transport, cursor, page_limit, |page, snapshot| {
             entries.extend(
                 page.iter()
                     .take_while(|entry| entry.cursor() <= snapshot)
@@ -917,22 +936,26 @@ impl LogReadPlan {
         Ok(entries)
     }
 
-    fn emit_since_snapshot(
+    fn emit_forward_snapshot(
         &self,
         transport: &dyn TransportClient,
+        cursor: Option<LogCursor>,
+        page_limit: usize,
         format: OutputFormat,
     ) -> Result<(), SatelleError> {
-        self.visit_since_snapshot(transport, |entries, snapshot| {
+        self.visit_forward_snapshot(transport, cursor, page_limit, |entries, snapshot| {
             // Logs are record streams. If a later page fails, already-written complete records
             // remain valid stdout while the command reports failure on stderr and exits nonzero.
             write_entries(entries, Some(snapshot), format)
         })
     }
 
-    fn visit_since_snapshot(
+    fn visit_forward_snapshot(
         &self,
         transport: &dyn TransportClient,
-        mut visit: impl FnMut(&[DaemonLogEntry], LogCursor) -> Result<(), SatelleError>,
+        cursor: Option<LogCursor>,
+        page_limit: usize,
+        visit: impl FnMut(&[DaemonLogEntry], LogCursor) -> Result<(), SatelleError>,
     ) -> Result<(), SatelleError> {
         // Capture one Host high-water boundary before paging. New entries may arrive while this
         // finite command runs, but they belong to a later invocation and cannot extend this read.
@@ -941,25 +964,19 @@ impl LogReadPlan {
                 &self.query(LogPageQuery::tail(1).expect("the snapshot Log page limit is valid")),
             )?
             .next_cursor();
-        let mut cursor = None;
-
-        loop {
-            let query = self.query(
-                LogPageQuery::forward(cursor, MAX_LOG_PAGE_LIMIT)
-                    .expect("the maximum forward Log limit is valid"),
-            );
-            let page = transport.logs(&query)?;
-            let reached_snapshot = !page.truncated()
-                || page
-                    .entries()
-                    .last()
-                    .is_some_and(|entry| entry.cursor() >= snapshot);
-            visit(page.entries(), snapshot)?;
-            if reached_snapshot {
-                return Ok(());
-            }
-            cursor = Some(page.next_cursor());
-        }
+        visit_forward_snapshot_pages(
+            snapshot,
+            cursor,
+            page_limit,
+            |cursor, limit| {
+                let query = self.query(
+                    LogPageQuery::forward(cursor, limit)
+                        .expect("the validated forward Log limit is valid"),
+                );
+                transport.logs(&query)
+            },
+            visit,
+        )
     }
 }
 
@@ -1201,6 +1218,50 @@ mod tests {
         fn logs(&self, _query: &LogPageQuery) -> Result<satelle_host::DaemonLogPage, SatelleError> {
             panic!("Session scope validation must fail before logs are requested")
         }
+    }
+
+    #[test]
+    fn forward_snapshot_visits_every_page_after_the_start_cursor() {
+        let start = LogCursor::parse("slc1_0000000000000005").expect("valid start cursor");
+        let first_page_cursor =
+            LogCursor::parse("slc1_00000000000000c8").expect("valid first-page cursor");
+        let snapshot = LogCursor::parse("slc1_00000000000000cd").expect("valid snapshot cursor");
+        let mut pages = VecDeque::from([
+            serde_json::from_value::<satelle_host::DaemonLogPage>(serde_json::json!({
+                "entries": [],
+                "next_cursor": first_page_cursor,
+                "truncated": true
+            }))
+            .expect("the first forward page should decode"),
+            serde_json::from_value::<satelle_host::DaemonLogPage>(serde_json::json!({
+                "entries": [],
+                "next_cursor": snapshot,
+                "truncated": false
+            }))
+            .expect("the final forward page should decode"),
+        ]);
+        let mut requested_cursors = Vec::new();
+        let mut visited_pages = 0;
+
+        visit_forward_snapshot_pages(
+            snapshot,
+            Some(start),
+            DEFAULT_LOG_PAGE_LIMIT,
+            |cursor, limit| {
+                assert_eq!(limit, DEFAULT_LOG_PAGE_LIMIT);
+                requested_cursors.push(cursor);
+                Ok(pages.pop_front().expect("the paginator requested a page"))
+            },
+            |_, _| {
+                visited_pages += 1;
+                Ok(())
+            },
+        )
+        .expect("the finite forward read should reach its snapshot");
+
+        assert_eq!(requested_cursors, [Some(start), Some(first_page_cursor)]);
+        assert_eq!(visited_pages, 2);
+        assert!(pages.is_empty());
     }
 
     fn public_session(session_id: &SessionId) -> satelle_core::session::PublicSession {
