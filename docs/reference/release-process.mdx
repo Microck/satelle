@@ -1,0 +1,92 @@
+---
+title: Release process
+description: Prepare, validate, publish, and audit a Satelle release.
+---
+
+Satelle releases start with a reviewed release pull request and finish only
+after the tag workflow validates the whole binary and npm package graph. A
+pull request merge never publishes packages or creates a final GitHub release.
+
+## Release tooling boundaries
+
+[Tegami](https://tegami.fuma-nama.dev/getting-started) 1.2.5 is the preferred
+changelog and versioning tool. It runs on Node.js 24 as isolated repository
+tooling under `npm/release-tooling`; neither Tegami nor Node.js is a runtime
+dependency of the Rust CLI or Host Daemon.
+
+Run the non-mutating validation before preparing a release:
+
+```sh
+npm ci --prefix npm/release-tooling --ignore-scripts
+npm run dry-run --prefix npm/release-tooling
+```
+
+The report records the Node.js and Tegami versions, Cargo package discovery,
+the temporary fixture's generated files, version and dependency updates, and
+the registry targets skipped by the dry run. The Cargo plugin is configured to
+avoid a duplicate dependent bump because all Satelle crates inherit one shared
+workspace version. Cargo package discovery and version updates stay enabled,
+while crates.io publication is disabled for MVP.
+Satelle does not publish a crates.io crate.
+
+On the normal path, the release workflow runs Tegami's publication plan after
+the dry run passes. Tegami keeps crates.io disabled, then `release.yml` acts as
+the explicit hook that builds, signs, and publishes the binary and npm graph.
+This keeps the recoverable npm transaction outside Tegami without bypassing
+Tegami's changelog and version plan.
+
+If Tegami validation fails, the release pull request can select the manual release
+fallback by adding `npm/release-tooling/manual-release.json`. The reviewed file
+must use schema `satelle.manual-release-fallback.v1` and match the release
+version. It must also set `generatedChangesReviewed` to `true`, give a nonempty
+`reason`, and list the
+committed versioned Cargo `CHANGELOG.md` files. The tag workflow validates that
+record and those files before it uses the same signed artifact publication
+hook. Without that reviewed record, a Tegami failure stops publication.
+
+## Release pull request
+
+The release pull request must contain one reviewed version everywhere the
+release contract requires it: Rust workspace metadata, all eight npm package
+manifests, exact launcher dependency ranges, lockfiles, and Tegami changelog
+output. At least one committed Cargo package `CHANGELOG.md` must contain a
+heading for that exact version. Run the repository release checks without
+publishing:
+
+```sh
+node npm/scripts/release.cjs check
+npm test
+```
+
+The GitHub Actions pull request run builds all six Controller targets, packs
+all eight npm packages, validates native binary formats and archive roots,
+compares archive and npm executable digests, creates `SHA256SUMS`, runs npm
+publish dry runs, and exercises install, upgrade, smoke, and uninstall paths.
+
+## Signed release tag
+
+After the release pull request merges, an authorized releaser creates a signed
+annotated tag at that merged default-branch commit:
+
+```sh
+git tag -s vX.Y.Z -m "Satelle vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+The repository must have an active GitHub tag ruleset for `v*` that prevents
+unauthorized creation, updates, deletion, and force pushes. The workflow rejects
+an unsigned, lightweight, unverified, moved, version-mismatched, or wrong-target
+tag with `release-tag-not-trusted` before public publication.
+
+## External release gates
+
+Repository code cannot prove account and platform state. Before the first
+public release, an authorized maintainer must verify all of these outside the
+checkout:
+
+- The `v*` GitHub tag ruleset is active.
+- Each npm package identity exists and trusts `release.yml` for OIDC publish.
+- The security and legal language review covers remote desktop control, YOLO,
+  diagnostics, provider credentials, and user consent.
+- A real tag run accepts the signed protected tag and produces verified
+  attestations for all six release archives.

@@ -135,6 +135,9 @@ jobs:
       - name: Install npm workspace
         run: npm ci --ignore-scripts
 
+      - name: Install pinned Tegami release tooling
+        run: npm ci --prefix npm/release-tooling --ignore-scripts
+
       - name: Download target artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -157,6 +160,50 @@ jobs:
 
       - name: Validate native archives and create SHA256SUMS
         run: node npm/scripts/release.cjs validate-native-release-archives dist validated
+
+      - name: Validate Tegami Cargo release behavior
+        id: tegami
+        continue-on-error: true
+        env:
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+        shell: bash
+        run: |
+          error_log="$RUNNER_TEMP/tegami-validation.stderr"
+          set +e
+          npm run dry-run --prefix npm/release-tooling --silent \
+            > validated/tegami-validation.json \
+            2> "$error_log" && \
+            SATELLE_TEGAMI_RELEASE_VERSION="$RELEASE_VERSION" \
+              npm run tegami --prefix npm/release-tooling -- publish
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            node npm/scripts/release-tooling-gate.cjs record-failure \
+              "$error_log" \
+              validated/tegami-validation.json
+          fi
+          exit "$status"
+
+      - name: Select reviewed release orchestration
+        env:
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+          TEGAMI_OUTCOME: ${{ steps.tegami.outcome }}
+        run: |
+          node npm/scripts/release-tooling-gate.cjs select \
+            "$RELEASE_VERSION" \
+            "$TEGAMI_OUTCOME" \
+            validated/tegami-validation.json \
+            npm/release-tooling/manual-release.json \
+            validated/release-orchestration.json
+
+      - name: Verify committed Tegami changelog output
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          node npm/scripts/release-tooling-gate.cjs verify-changelogs \
+            "$RELEASE_VERSION" \
+            validated/tegami-changelog-validation.json
 
       - name: Complete validated npm publication set
         shell: bash
@@ -227,13 +274,49 @@ jobs:
           RELEASE_VERSION: ${{ needs.collect.outputs.version }}
         shell: bash
         run: |
-          test "$GITHUB_REF_NAME" = "v${RELEASE_VERSION}"
-          tag_ref=$(gh api "repos/${{ github.repository }}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.type + " " + .object.sha')
-          test "${tag_ref%% *}" = tag
+          release_tag_not_trusted() {
+            printf '{"code":"release-tag-not-trusted","message":"%s"}\n' "$1" >&2
+            exit 1
+          }
+
+          test "$GITHUB_REF_NAME" = "v${RELEASE_VERSION}" || \
+            release_tag_not_trusted "release tag does not match the validated version"
+          if ! tag_ref=$(gh api "repos/${{ github.repository }}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.type + " " + .object.sha'); then
+            release_tag_not_trusted "release tag ref cannot be resolved"
+          fi
+          test "${tag_ref%% *}" = tag || \
+            release_tag_not_trusted "release tag is not annotated"
           tag_digest=${tag_ref#* }
-          source_digest=$(gh api "repos/${{ github.repository }}/git/tags/$tag_digest" --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha')
-          test -n "$source_digest"
-          test "$source_digest" = "$GITHUB_SHA"
+          if ! source_digest=$(gh api "repos/${{ github.repository }}/git/tags/$tag_digest" --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha'); then
+            release_tag_not_trusted "annotated release tag cannot be resolved"
+          fi
+          test -n "$source_digest" || \
+            release_tag_not_trusted "release tag signature is not GitHub-verified"
+          if ! default_branch=$(gh api "repos/${{ github.repository }}" --jq .default_branch); then
+            release_tag_not_trusted "default branch cannot be resolved"
+          fi
+          if ! default_head=$(gh api "repos/${{ github.repository }}/git/ref/heads/$default_branch" --jq .object.sha); then
+            release_tag_not_trusted "default branch head cannot be resolved"
+          fi
+          if ! compare_status=$(gh api "repos/${{ github.repository }}/compare/${source_digest}...${default_head}" --jq .status); then
+            release_tag_not_trusted "release tag commit cannot be compared with the default branch"
+          fi
+          test "$source_digest" = "$GITHUB_SHA" || \
+            release_tag_not_trusted "release tag moved after the workflow started"
+          if [ "$compare_status" != identical ] && [ "$compare_status" != ahead ]; then
+            release_tag_not_trusted "release tag does not point at a commit on the default branch"
+          fi
+          if ! release_pr_count=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/${{ github.repository }}/commits/$source_digest/pulls" \
+            | jq \
+              --arg branch "$default_branch" \
+              --arg sha "$source_digest" \
+              '[.[] | select(.merged_at != null and .base.ref == $branch and .merge_commit_sha == $sha)] | length'); then
+            release_tag_not_trusted "release pull request provenance cannot be resolved"
+          fi
+          test "$release_pr_count" = 1 || \
+            release_tag_not_trusted "release tag commit was not produced by one merged release pull request"
           printf 'source-digest=%s\n' "$source_digest" >> "$GITHUB_OUTPUT"
 
       - name: Attest every native archive
@@ -491,13 +574,20 @@ jobs:
         shell: bash
         run: |
           gh release upload "$GITHUB_REF_NAME" \
+            validated/tegami-validation.json \
+            validated/tegami-changelog-validation.json \
+            validated/release-orchestration.json \
             validated/github/* \
             validated/npm/npm-artifacts.json \
             --clobber
           expected_assets=$(
             {
               find validated/github -maxdepth 1 -type f -printf '%f\n'
-              printf '%s\n' npm-artifacts.json
+              printf '%s\n' \
+                npm-artifacts.json \
+                release-orchestration.json \
+                tegami-changelog-validation.json \
+                tegami-validation.json
             } | LC_ALL=C sort
           )
           actual_assets=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | LC_ALL=C sort)
