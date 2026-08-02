@@ -451,14 +451,18 @@ fn run_reconnect_attempt(
     thread::Builder::new()
         .name("satelle-log-follow-reconnect".to_string())
         .spawn(move || {
-            let attempt = connection_factory().and_then(|connection| {
-                validate_follow_connection(
-                    connection.as_ref(),
-                    Some(&expected_host_identity),
-                    session_id.as_ref(),
-                    true,
-                )?;
-                let page = connection.logs(&query).map_err(|error| {
+            let attempt = connection_factory()
+                .and_then(|connection| {
+                    validate_follow_connection(
+                        connection.as_ref(),
+                        Some(&expected_host_identity),
+                        session_id.as_ref(),
+                        true,
+                    )?;
+                    let page = connection.logs(&query)?;
+                    Ok((connection, page))
+                })
+                .map_err(|error| {
                     if error.code == ErrorCode::HostIdentityMismatch {
                         SatelleError::logs_follow_identity_changed(
                             &expected_host_identity,
@@ -468,9 +472,7 @@ fn run_reconnect_attempt(
                     } else {
                         error
                     }
-                })?;
-                Ok((connection, page))
-            });
+                });
             let _completed = completed.send(attempt);
         })
         .ok()?;
@@ -950,6 +952,8 @@ mod tests {
         pages: Mutex<VecDeque<Result<satelle_host::DaemonLogPage, SatelleError>>>,
     }
 
+    struct SessionIdentityMismatchFollowConnection;
+
     impl FakeFollowConnection {
         fn new(
             host_identity: &str,
@@ -982,6 +986,23 @@ mod tests {
                 .expect("follow fixture queue lock")
                 .pop_front()
                 .expect("follow fixture has a response")
+        }
+    }
+
+    impl FollowConnection for SessionIdentityMismatchFollowConnection {
+        fn host_identity(&self) -> Result<String, SatelleError> {
+            Ok("host-original".to_string())
+        }
+
+        fn session(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<satelle_core::session::PublicSession, SatelleError> {
+            Err(SatelleError::host_identity_mismatch("remote"))
+        }
+
+        fn logs(&self, _query: &LogPageQuery) -> Result<satelle_host::DaemonLogPage, SatelleError> {
+            panic!("identity validation must fail before logs are requested")
         }
     }
 
@@ -1166,6 +1187,61 @@ mod tests {
         assert_eq!(error.code, ErrorCode::LogsFollowIdentityChanged);
         assert_eq!(error.details["expected_host_identity"], "host-original");
         assert_eq!(error.details["observed_host_identity"], "host-replacement");
+    }
+
+    #[test]
+    fn reconnect_maps_factory_identity_failures_to_the_follow_error() {
+        let session_id = SessionId::new();
+        let factory: FollowConnectionFactory =
+            Arc::new(|| Err(SatelleError::host_identity_mismatch("remote")));
+
+        let error = match run_reconnect_attempt(
+            factory,
+            "host-original".to_string(),
+            Some(session_id.clone()),
+            LogPageQuery::default(),
+            StdDuration::from_secs(1),
+        ) {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("the factory identity mismatch must be terminal"),
+            None => panic!("the reconnect attempt should finish"),
+        };
+
+        assert_eq!(error.code, ErrorCode::LogsFollowIdentityChanged);
+        assert_eq!(error.details["expected_host_identity"], "host-original");
+        assert_eq!(
+            error.details["observed_host_identity"],
+            serde_json::Value::Null
+        );
+        assert_eq!(error.details["session_id"], session_id.as_str());
+    }
+
+    #[test]
+    fn reconnect_maps_session_validation_identity_failures_to_the_follow_error() {
+        let session_id = SessionId::new();
+        let factory: FollowConnectionFactory = Arc::new(|| {
+            Ok(Box::new(SessionIdentityMismatchFollowConnection) as Box<dyn FollowConnection>)
+        });
+
+        let error = match run_reconnect_attempt(
+            factory,
+            "host-original".to_string(),
+            Some(session_id.clone()),
+            LogPageQuery::default(),
+            StdDuration::from_secs(1),
+        ) {
+            Some(Err(error)) => error,
+            Some(Ok(_)) => panic!("the Session identity mismatch must be terminal"),
+            None => panic!("the reconnect attempt should finish"),
+        };
+
+        assert_eq!(error.code, ErrorCode::LogsFollowIdentityChanged);
+        assert_eq!(error.details["expected_host_identity"], "host-original");
+        assert_eq!(
+            error.details["observed_host_identity"],
+            serde_json::Value::Null
+        );
+        assert_eq!(error.details["session_id"], session_id.as_str());
     }
 
     #[test]
