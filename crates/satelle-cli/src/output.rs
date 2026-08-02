@@ -126,6 +126,7 @@ impl Command {
             ),
             Self::Status(command) => (command.output_args, EventOutput::None),
             Self::Stop(command) => (command.output_args, EventOutput::None),
+            Self::Session { .. } => (OutputArgs::default(), EventOutput::None),
             Self::Logs(command) => (command.output_args, EventOutput::None),
             Self::Mcp {
                 command: super::McpCommand::Install(command),

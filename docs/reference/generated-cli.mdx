@@ -43,6 +43,7 @@ Commands:
   steer
   status
   stop
+  session
   logs
   mcp
   support
@@ -439,6 +440,23 @@ Options:
   -h, --help                   Print help
 ```
 
+## `satelle session`
+
+```text
+Usage: satelle session [OPTIONS] <COMMAND>
+
+Commands:
+  export
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
 ## `satelle logs`
 
 ```text
@@ -735,6 +753,24 @@ Options:
       --format <FORMAT>            [possible values: human, json]
       --json                       Alias for --format json
   -h, --help                       Print help
+```
+
+## `satelle session export`
+
+```text
+Usage: satelle session export [OPTIONS] --host <HOST> --output <OUTPUT> <SESSION_ID>
+
+Arguments:
+  <SESSION_ID>
+
+Options:
+      --host <HOST>
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --output <OUTPUT>
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
 ```
 
 ## `satelle mcp serve`

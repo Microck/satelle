@@ -12,7 +12,7 @@ use crate::contract::{
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
     ProviderSecretUploadEnvelope, RequestId, SessionResponse, SetupRepairPlanRequest,
     SetupRepairPlanResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
-    StopResponse, TurnRequest, provider_secret_upload_aad,
+    StopResponse, TaskArtifactsResponse, TurnRequest, provider_secret_upload_aad,
 };
 use crate::transport_tls::{
     ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
@@ -750,6 +750,22 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
+    pub fn read_task_artifacts(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<TaskArtifactsResponse, DaemonClientError> {
+        let path = format!("/v1/sessions/{session_id}/task-artifacts");
+        let (request, request_id) = self.protected_request(Method::GET, &path)?;
+        let response: TaskArtifactsResponse =
+            self.send_authenticated(request, request_id, StatusCode::OK)?;
+        // Bind the authenticated response body to the requested Session before
+        // any exported content can cross the transport boundary.
+        if response.session_id() != session_id {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        Ok(response)
+    }
+
     pub fn stop_session(
         &self,
         session_id: &SessionId,
@@ -1297,6 +1313,62 @@ mod tests {
         assert_eq!(response.host_identity(), "host-windows-11");
         assert_eq!(response.session_count(), 3);
         server.join().expect("join TLS server");
+    }
+
+    #[test]
+    fn task_artifact_read_rejects_response_for_another_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind artifact response fixture");
+        let address = listener
+            .local_addr()
+            .expect("read artifact response fixture address");
+        let token = ApiBearerToken::generate().expect("generate daemon token");
+        let requested_session = SessionId::new();
+        let requested_session_for_server = requested_session.clone();
+        let returned_session = SessionId::new();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept artifact client");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("read artifact request");
+                assert_ne!(read, 0, "artifact request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8(request).expect("request headers should be UTF-8");
+            assert!(request.starts_with(&format!(
+                "GET /v1/sessions/{requested_session_for_server}/task-artifacts HTTP/1.1\r\n"
+            )));
+            let request_id = header_value(&request, "satelle-request-id")
+                .expect("request must carry a request ID");
+            let body = serde_json::json!({
+                "schema_version": "satelle.task_artifacts.v1",
+                "request_id": request_id,
+                "host_identity": "host-artifact-test",
+                "session_id": returned_session,
+                "plan": "# Plan\n",
+                "worklog": "# Worklog\n",
+                "goal": "# Goal\n",
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write artifact response");
+            stream.flush().expect("flush artifact response");
+        });
+
+        let client = DaemonClient::loopback(address, token, "host-artifact-test")
+            .expect("construct artifact client");
+        let error = client
+            .read_task_artifacts(&requested_session)
+            .expect_err("another Session's artifacts must fail closed");
+        assert!(matches!(
+            error,
+            DaemonClientError::ResponseContractViolation
+        ));
+        server.join().expect("join artifact response fixture");
     }
 
     #[test]

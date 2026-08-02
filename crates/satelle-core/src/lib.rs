@@ -1,5 +1,5 @@
 use directories::ProjectDirs;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,10 +60,10 @@ pub use secure_file::{
     keyed_secret_comparison_digest, open_new_owner_only_file, open_or_create_owner_only_directory,
     open_or_create_owner_only_file, open_owner_only_directory,
     owner_only_secret_destination_exists, persist_new_owner_only_secret_file,
-    publish_owner_only_secret_file, read_bounded_regular_file_no_follow,
-    read_owner_controlled_config_file, read_owner_only_secret_config_file,
-    read_owner_only_secret_file, read_trusted_ca_bundle_file, rollback_owner_only_secret_file,
-    stage_owner_only_secret_file, sync_owner_only_directory,
+    publish_new_owner_only_directory, publish_owner_only_secret_file,
+    read_bounded_regular_file_no_follow, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    rollback_owner_only_secret_file, stage_owner_only_secret_file, sync_owner_only_directory,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";
@@ -113,6 +113,8 @@ impl SatelleConfig {
                 provider_smoke_failure_cache_ttl: None,
                 daemon_idle_timeout: None,
                 setup_ledger_retention: None,
+                session_metadata_retention: None,
+                operator_log_retained_files: None,
                 desktop_user: None,
                 desktop_session_preference: None,
                 desktop_session_native_selector: None,
@@ -297,6 +299,8 @@ pub struct HostConfig {
     pub provider_smoke_failure_cache_ttl: Option<ExplicitDuration>,
     pub daemon_idle_timeout: Option<ExplicitDuration>,
     pub setup_ledger_retention: Option<ExplicitDuration>,
+    pub session_metadata_retention: Option<RetentionDuration>,
+    pub operator_log_retained_files: Option<usize>,
     pub desktop_user: Option<String>,
     pub desktop_session_preference: Option<DesktopSessionPreference>,
     pub desktop_session_native_selector: Option<DesktopSessionNativeSelector>,
@@ -1638,6 +1642,71 @@ impl ExplicitDuration {
 
     pub fn milliseconds(&self) -> u64 {
         self.milliseconds
+    }
+}
+
+pub const DEFAULT_SESSION_METADATA_RETENTION_HOURS: u64 = 7 * 24;
+pub const MIN_SESSION_METADATA_RETENTION_HOURS: u64 = 7 * 24;
+pub const MAX_SESSION_METADATA_RETENTION_HOURS: u64 = 365 * 24;
+pub const DEFAULT_OPERATOR_LOG_RETAINED_FILES: usize = 5;
+pub const MAX_OPERATOR_LOG_RETAINED_FILES: usize = 100;
+
+/// Destructive Satelle-owned retention uses a deliberately narrow grammar.
+/// It does not share the broader timeout and cache-duration vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionDuration {
+    raw: String,
+    hours: u64,
+}
+
+impl RetentionDuration {
+    pub fn parse(value: &str) -> Option<Self> {
+        let (count, hours_per_unit) = value
+            .strip_suffix('h')
+            .map(|count| (count, 1))
+            .or_else(|| value.strip_suffix('d').map(|count| (count, 24)))?;
+        let count = count.parse::<u64>().ok()?;
+        let hours = count.checked_mul(hours_per_unit)?;
+        if !(MIN_SESSION_METADATA_RETENTION_HOURS..=MAX_SESSION_METADATA_RETENTION_HOURS)
+            .contains(&hours)
+        {
+            return None;
+        }
+        Some(Self {
+            raw: value.to_string(),
+            hours,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    pub const fn hours(&self) -> u64 {
+        self.hours
+    }
+}
+
+impl Serialize for RetentionDuration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.raw)
+    }
+}
+
+impl<'de> Deserialize<'de> for RetentionDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            serde::de::Error::custom(
+                "retention values require h or d units and must be between 7d and 365d",
+            )
+        })
     }
 }
 
@@ -3164,6 +3233,7 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
             "provider_smoke_failure_cache_ttl",
             "daemon_idle_timeout",
             "setup_ledger_retention",
+            "session_metadata_retention",
         ] {
             collect_interpolation_for_value(
                 &format!("{host_path}.{key}"),
@@ -3425,6 +3495,29 @@ fn reject_timeout_config_errors(path: &Path, value: &toml::Value) -> Result<(), 
             };
             if setup_ledger_retention_duration(value).is_none() {
                 return Err(SatelleError::duration_unit_required(path, &retention_path));
+            }
+        }
+        if let Some(value) = host_table.get("session_metadata_retention") {
+            let retention_path = format!("{host_path}.session_metadata_retention");
+            let Some(value) = value.as_str() else {
+                return Err(SatelleError::duration_unit_required(path, &retention_path));
+            };
+            if RetentionDuration::parse(value).is_none() {
+                return Err(SatelleError::duration_unit_required(path, &retention_path));
+            }
+        }
+        if let Some(value) = host_table.get("operator_log_retained_files") {
+            let retained_files = value
+                .as_integer()
+                .and_then(|value| usize::try_from(value).ok());
+            if !matches!(retained_files, Some(1..=MAX_OPERATOR_LOG_RETAINED_FILES)) {
+                return Err(SatelleError::config_error(
+                    format!(
+                        "config file {} value {host_path}.operator_log_retained_files must be between 1 and {MAX_OPERATOR_LOG_RETAINED_FILES}",
+                        path.display()
+                    ),
+                    None,
+                ));
             }
         }
         let Some(timeouts) = host_table.get("timeouts").and_then(toml::Value::as_table) else {
@@ -3728,6 +3821,8 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "provider_smoke_failure_cache_ttl",
                     "daemon_idle_timeout",
                     "setup_ledger_retention",
+                    "session_metadata_retention",
+                    "operator_log_retained_files",
                     "desktop_user",
                     "desktop_session_preference",
                     "desktop_session_native_selector",
@@ -3921,6 +4016,54 @@ mod setup_ledger_retention_duration_tests {
             setup_ledger_retention_duration(&exact_maximum).is_some(),
             "the exact timestamp-safe boundary remains valid"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_metadata_retention_tests {
+    use super::*;
+
+    #[test]
+    fn destructive_retention_has_its_own_bounded_hour_and_day_grammar() {
+        assert_eq!(RetentionDuration::parse("7d").unwrap().hours(), 7 * 24);
+        assert_eq!(
+            RetentionDuration::parse("365d").unwrap().hours(),
+            MAX_SESSION_METADATA_RETENTION_HOURS
+        );
+        for invalid in ["0h", "167h", "60m", "3600s", "366d", "1.5h", "1H"] {
+            assert!(RetentionDuration::parse(invalid).is_none(), "{invalid}");
+        }
+        assert!(
+            ExplicitDuration::parse("1h").is_none(),
+            "retention hours must not broaden the existing duration grammar"
+        );
+    }
+
+    #[test]
+    fn host_retention_and_operator_log_count_validate_at_config_boundary() {
+        let parsed = parse_user_config(
+            Path::new("/test/config.toml"),
+            "[hosts.local-demo]\ntransport = \"local\"\nadapter = \"codex\"\nsession_metadata_retention = \"30d\"\noperator_log_retained_files = 12\n",
+        )
+        .expect("parse bounded retention policy");
+        let host = parsed.config.hosts.get(LOCAL_DEMO_HOST).unwrap();
+        assert_eq!(
+            host.session_metadata_retention.as_ref().unwrap().hours(),
+            30 * 24
+        );
+        assert_eq!(host.operator_log_retained_files, Some(12));
+
+        for field in [
+            "session_metadata_retention = \"60m\"",
+            "operator_log_retained_files = 0",
+            "operator_log_retained_files = 101",
+        ] {
+            let raw = format!(
+                "[hosts.local-demo]\ntransport = \"local\"\nadapter = \"codex\"\n{field}\n"
+            );
+            parse_user_config(Path::new("/test/config.toml"), &raw)
+                .expect_err("reject an invalid destructive retention policy");
+        }
     }
 }
 

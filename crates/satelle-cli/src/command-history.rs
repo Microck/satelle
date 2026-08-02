@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use satelle_core::{
     ErrorCode, SecureFileError, SessionId, open_or_create_owner_only_directory,
-    open_or_create_owner_only_file,
+    open_or_create_owner_only_file, open_owner_only_directory,
 };
 #[cfg(not(unix))]
 use std::fs;
@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 const DATABASE_FILE_NAME: &str = "command-history.sqlite3";
 const DATABASE_DIRECTORY_NAME: &str = "command-history";
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+const COMMAND_HISTORY_RETENTION: time::Duration = time::Duration::days(7);
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS command_history (
@@ -122,6 +123,70 @@ fn format_started_at(timestamp: OffsetDateTime) -> String {
     )
 }
 
+/// Returns recent successful Host candidates without creating or updating the
+/// optional cache. Any missing, unsafe, corrupt, or stale cache is equivalent
+/// to no candidate, so the caller can require an explicit `--host`.
+pub(super) fn session_host_candidates(
+    cache_root: &Path,
+    session_id: &SessionId,
+    observed_at: OffsetDateTime,
+) -> Vec<String> {
+    read_session_host_candidates(cache_root, session_id, observed_at).unwrap_or_default()
+}
+
+fn read_session_host_candidates(
+    cache_root: &Path,
+    session_id: &SessionId,
+    observed_at: OffsetDateTime,
+) -> Option<Vec<String>> {
+    #[cfg(target_os = "macos")]
+    let resolved_cache_root = resolve_trusted_macos_aliases(cache_root).ok()?;
+    #[cfg(target_os = "macos")]
+    let cache_root = resolved_cache_root.as_path();
+    let database_directory = cache_root.join(DATABASE_DIRECTORY_NAME);
+    if !database_directory.try_exists().ok()? {
+        return Some(Vec::new());
+    }
+    let _database_directory_guard = open_owner_only_directory(&database_directory).ok()?;
+    let database_path = database_directory.join(DATABASE_FILE_NAME);
+    if !database_path.try_exists().ok()? {
+        return Some(Vec::new());
+    }
+    let connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .ok()?;
+    connection.busy_timeout(DATABASE_BUSY_TIMEOUT).ok()?;
+    let cutoff = observed_at.checked_sub(COMMAND_HISTORY_RETENTION)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT selected_host \
+             FROM command_history \
+             WHERE session_id = ?1 \
+               AND selected_host IS NOT NULL \
+               AND outcome_status = 'success' \
+               AND started_at >= ?2 \
+               AND started_at <= ?3 \
+             ORDER BY selected_host",
+        )
+        .ok()?;
+    statement
+        .query_map(
+            params![
+                session_id.to_string(),
+                format_started_at(cutoff),
+                format_started_at(observed_at)
+            ],
+            |row| row.get(0),
+        )
+        .ok()?
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+}
+
 /// Captures only redacted command metadata. The raw argument vector is never
 /// retained, so prompts, provider values, file contents, and secret sources
 /// cannot accidentally cross this persistence boundary.
@@ -195,7 +260,6 @@ impl Recorder {
         // Windows scheduler contention.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
-
         let session_id = final_session_id
             .map(ToString::to_string)
             .or(self.invocation.session_id);
@@ -221,6 +285,16 @@ impl Recorder {
                 env!("CARGO_PKG_VERSION"),
             ],
         )?;
+        // Prune from the writer transaction's wall-clock time, not the
+        // invocation start. Insert first so a command that ran past the
+        // retention window cannot leave its already-expired row behind.
+        let retention_cutoff = OffsetDateTime::now_utc()
+            .checked_sub(COMMAND_HISTORY_RETENTION)
+            .ok_or(rusqlite::Error::InvalidQuery)?;
+        transaction.execute(
+            "DELETE FROM command_history WHERE started_at < ?1",
+            [format_started_at(retention_cutoff)],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -245,7 +319,7 @@ fn prepare_cache_root(path: &Path) -> Result<PreparedCacheRoot, std::io::Error> 
     }
 
     #[cfg(target_os = "macos")]
-    let resolved_path = resolve_trusted_macos_aliases_for_creation(path)?;
+    let resolved_path = resolve_trusted_macos_aliases(path)?;
     #[cfg(target_os = "macos")]
     let path = resolved_path.as_path();
     #[cfg(not(target_os = "macos"))]
@@ -311,7 +385,7 @@ fn prepare_cache_root(path: &Path) -> Result<PreparedCacheRoot, std::io::Error> 
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_trusted_macos_aliases_for_creation(path: &Path) -> Result<PathBuf, std::io::Error> {
+fn resolve_trusted_macos_aliases(path: &Path) -> Result<PathBuf, std::io::Error> {
     use std::os::unix::fs::MetadataExt;
     use std::path::Component;
 
@@ -408,9 +482,13 @@ pub(super) enum HistoryWriteError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Invocation, InvocationStart, Recorder, format_started_at};
+    use super::{
+        Invocation, InvocationStart, Recorder, format_started_at, session_host_candidates,
+    };
+    use rusqlite::Connection;
+    use satelle_core::{ErrorCode, SessionId};
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use time::OffsetDateTime;
 
     #[test]
@@ -436,5 +514,83 @@ mod tests {
         );
 
         assert!(recorder.started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn persistence_drops_an_invocation_that_expired_while_running() {
+        let root = tempfile::tempdir().expect("create command history parent");
+        let cache_root = root.path().join("cache");
+        let started_at_time = OffsetDateTime::now_utc() - time::Duration::days(8);
+        let start = InvocationStart {
+            started_at: format_started_at(started_at_time),
+            started: Instant::now(),
+        };
+
+        Recorder::start(
+            cache_root.clone(),
+            Invocation::new("host-start", None, None, None),
+            start,
+        )
+        .finish(None, None)
+        .expect("persist long-running invocation");
+
+        let retained_count: i64 =
+            Connection::open(cache_root.join("command-history/command-history.sqlite3"))
+                .expect("open command history")
+                .query_row("SELECT COUNT(*) FROM command_history", [], |row| row.get(0))
+                .expect("count retained command history");
+        assert_eq!(retained_count, 0);
+    }
+
+    #[test]
+    fn candidate_lookup_is_read_only_recent_success_only_and_host_distinct() {
+        let root = tempfile::tempdir().expect("create candidate cache parent");
+        let cache_root = root.path().join("cache");
+        let session_id = SessionId::new();
+        let now = OffsetDateTime::now_utc();
+        assert!(session_host_candidates(&cache_root, &session_id, now).is_empty());
+        assert!(!cache_root.exists());
+
+        for host in ["alpha", "alpha", "beta"] {
+            Recorder::start(
+                cache_root.clone(),
+                Invocation::new(
+                    "status",
+                    Some(host.to_string()),
+                    None,
+                    Some(session_id.to_string()),
+                ),
+                InvocationStart::capture(),
+            )
+            .finish(None, None)
+            .expect("persist a successful candidate row");
+        }
+        Recorder::start(
+            cache_root.clone(),
+            Invocation::new(
+                "status",
+                Some("gamma".to_string()),
+                None,
+                Some(session_id.to_string()),
+            ),
+            InvocationStart::capture(),
+        )
+        .finish(None, Some(ErrorCode::InvalidUsage))
+        .expect("persist a failed non-candidate row");
+        assert_eq!(
+            session_host_candidates(&cache_root, &session_id, OffsetDateTime::now_utc()),
+            ["alpha".to_string(), "beta".to_string()]
+        );
+
+        Connection::open(cache_root.join("command-history/command-history.sqlite3"))
+            .expect("open candidate cache")
+            .execute(
+                "UPDATE command_history SET started_at = '2000-01-01T00:00:00.000000000Z'",
+                [],
+            )
+            .expect("age candidate rows");
+        assert!(
+            session_host_candidates(&cache_root, &session_id, OffsetDateTime::now_utc()).is_empty()
+        );
     }
 }

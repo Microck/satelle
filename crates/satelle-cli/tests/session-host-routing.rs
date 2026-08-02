@@ -1,4 +1,6 @@
 use assert_cmd::Command;
+use rusqlite::{Connection, params};
+use satelle_core::SessionId;
 use satelle_host::ApiBearerToken;
 use satelle_host::test_support::TestStateDir;
 use serde_json::Value;
@@ -173,6 +175,213 @@ api_token = {{ kind = "file", path = {token_path} }}
             .clone();
         assert_eq!(parse_json_output(&output.stderr)["code"], expected_code);
     }
+}
+
+#[test]
+fn implicit_session_host_uses_only_one_recent_cache_candidate() {
+    let state = state_dir();
+    let cache_root = state.path().join("cache");
+    let user_config = state.path().join("user-config.toml");
+    let token_file = state.path().join("remote.token");
+    let token = ApiBearerToken::generate().expect("generate remote API token");
+    write_user_config(&token_file, token.expose().as_str());
+    let token_path = toml::Value::String(token_file.to_string_lossy().into_owned()).to_string();
+    write_user_config(
+        &user_config,
+        format!(
+            r#"
+default_host = "remote"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[hosts.remote]
+transport = "direct"
+adapter = "fake"
+address = "https://127.0.0.1:9"
+expected_host_id = "host-must-not-be-probed"
+api_token = {{ kind = "file", path = {token_path} }}
+"#,
+        ),
+    );
+
+    let unknown = SessionId::new().to_string();
+    let absent = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache_root)
+        .args(["status", &unknown, "--json"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let absent_error = parse_json_output(&absent.stderr);
+    assert_eq!(absent_error["code"], "invalid-usage");
+    assert!(absent_error["message"].as_str().unwrap().contains("--host"));
+    assert!(!cache_root.exists(), "candidate lookup must stay read-only");
+
+    let run = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache_root)
+        .args(["run", "--host", "local-demo", "Create a cached Session"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let session = session_id(&run.stdout);
+    let implicit = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache_root)
+        .args(["status", &session, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(parse_json_output(&implicit.stdout)["host"], "local-demo");
+
+    let database = cache_root.join("command-history/command-history.sqlite3");
+    Connection::open(database)
+        .expect("open command-history cache")
+        .execute(
+            "INSERT INTO command_history (command_family, selected_host, selected_profile, session_id, started_at, duration_ms, outcome_status, error_code, cli_version) \
+             SELECT command_family, 'remote', selected_profile, session_id, started_at, duration_ms, outcome_status, error_code, cli_version \
+             FROM command_history WHERE session_id = ?1 AND selected_host = 'local-demo' LIMIT 1",
+            params![session],
+        )
+        .expect("add a second configured Host candidate");
+    let ambiguous = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache_root)
+        .args(["status", &session, "--json"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let ambiguous_error = parse_json_output(&ambiguous.stderr);
+    assert_eq!(ambiguous_error["code"], "invalid-usage");
+    assert!(
+        ambiguous_error["message"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one configured Host")
+    );
+}
+
+#[test]
+fn session_export_writes_exact_owner_only_redacted_artifacts_without_overwrite() {
+    let state = state_dir();
+    let user_config = state.path().join("user-config.toml");
+    write_user_config(
+        &user_config,
+        r#"
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+"#,
+    );
+    let prompt_canary = "PRIVATE_CLI_TASK_ARTIFACT_PROMPT_CANARY";
+    let run = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["run", "--host", "local-demo", prompt_canary])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let session = session_id(&run.stdout);
+    let output = state.path().join("task-artifacts");
+
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "session",
+            "export",
+            &session,
+            "--host",
+            "local-demo",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let mut names = fs::read_dir(&output)
+        .expect("read exported artifact directory")
+        .map(|entry| {
+            entry
+                .expect("read exported artifact entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["goal.md", "plan.md", "worklog.md"]);
+    for name in &names {
+        let body = fs::read_to_string(output.join(name)).expect("read exported artifact body");
+        assert!(!body.contains(prompt_canary));
+    }
+    assert!(
+        fs::read_to_string(output.join("plan.md"))
+            .unwrap()
+            .contains("- Model: fake-model-v1")
+    );
+    assert!(
+        fs::read_to_string(output.join("goal.md"))
+            .unwrap()
+            .contains("not recorded")
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for name in &names {
+            assert_eq!(
+                fs::metadata(output.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    let retained_plan = fs::read(output.join("plan.md")).expect("read retained plan");
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "session",
+            "export",
+            &session,
+            "--host",
+            "local-demo",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    assert_eq!(fs::read(output.join("plan.md")).unwrap(), retained_plan);
+    assert_eq!(
+        fs::read_dir(state.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".satelle-task-artifacts-")
+            })
+            .count(),
+        0
+    );
 }
 
 #[test]

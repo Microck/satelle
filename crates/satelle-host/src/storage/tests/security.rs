@@ -216,6 +216,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "setup_actions",
             "setup_runs",
             "sqlite_sequence",
+            "turn_admission_readiness",
             "turn_policies",
             "turn_private_refs",
             "turns",
@@ -360,6 +361,19 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "timeout_seconds",
             "computer_use_enabled",
             "provider_computer_use_enabled",
+        ],
+    );
+    assert_table_columns(
+        &storage,
+        "turn_admission_readiness",
+        &[
+            "turn_id",
+            "native_result_id",
+            "native_observed_at",
+            "native_source",
+            "provider_result_id",
+            "provider_observed_at",
+            "provider_source",
         ],
     );
     assert_table_columns(

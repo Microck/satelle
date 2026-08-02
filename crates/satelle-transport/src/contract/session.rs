@@ -10,6 +10,7 @@ use std::fmt;
 define_schema_token!(TurnRequestSchema, "satelle.api.v7");
 define_schema_token!(StopRequestSchema, "satelle.api.v1");
 define_schema_token!(SessionSchema, "satelle.session.v1");
+define_schema_token!(TaskArtifactsSchema, "satelle.task_artifacts.v1");
 define_schema_token!(SessionStopSchema, "satelle.session.stop.v1");
 define_schema_token!(AdmissionCancellationSchema, "satelle.admission.cancel.v1");
 
@@ -448,6 +449,75 @@ impl SessionResponse {
 }
 
 impl AuthenticatedResponseContract for SessionResponse {
+    fn request_id(&self) -> &RequestId {
+        self.request_id()
+    }
+
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
+}
+
+/// Closed authenticated export envelope. Each body is rendered from the
+/// Host's redacted SQLite projection and maps to one exact output filename.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskArtifactsResponse {
+    schema_version: TaskArtifactsSchema,
+    request_id: RequestId,
+    host_identity: String,
+    session_id: SessionId,
+    plan: String,
+    worklog: String,
+    goal: String,
+}
+
+impl TaskArtifactsResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        session_id: SessionId,
+        plan: String,
+        worklog: String,
+        goal: String,
+    ) -> Self {
+        Self {
+            schema_version: TaskArtifactsSchema,
+            request_id,
+            host_identity,
+            session_id,
+            plan,
+            worklog,
+            goal,
+        }
+    }
+
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn plan(&self) -> &str {
+        &self.plan
+    }
+
+    pub fn worklog(&self) -> &str {
+        &self.worklog
+    }
+
+    pub fn goal(&self) -> &str {
+        &self.goal
+    }
+}
+
+impl AuthenticatedResponseContract for TaskArtifactsResponse {
     fn request_id(&self) -> &RequestId {
         self.request_id()
     }

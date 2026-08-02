@@ -811,6 +811,8 @@ mod tests {
             provider_smoke_failure_cache_ttl: None,
             daemon_idle_timeout: None,
             setup_ledger_retention: None,
+            session_metadata_retention: None,
+            operator_log_retained_files: None,
             desktop_user: None,
             desktop_session_preference: None,
             desktop_session_native_selector: None,

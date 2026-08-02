@@ -63,3 +63,20 @@ desktop content.
 Support bundle export is not implemented. The absence of that command is not
 permission to archive the Host state directory. Suspected vulnerabilities use
 the private reporting process in the repository security policy.
+
+## Retention has a defined ownership boundary
+
+Satelle retention deletes only Satelle-owned metadata and files. It does not
+claim to delete Codex, model-provider, operating-system, backup, filesystem
+snapshot, or other upstream records. Codex and model providers can apply their
+own retention policies independently.
+
+Deletion is not cryptographic erasure. Deleted content can remain in SQLite
+pages, filesystem snapshots, backups, or storage managed outside Satelle.
+
+Host storage stays local to the remote Host. An explicit Session artifact
+export writes only the redacted plan, worklog, and Goal projection to the
+owner-only operator-selected client path. Satelle MVP does not implement
+diagnostic bundles, raw diagnostic exports, recordings, journald, Windows Event
+Log, or macOS unified logging sinks. None of those later features is required
+to preserve the authoritative SQLite log store.

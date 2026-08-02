@@ -88,11 +88,47 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, Weak};
 use std::time::{Duration, Instant};
 use storage::Storage;
 pub use storage::{
-    SetupActionPlan, SetupActionRecord, SetupActionSkipReason, SetupActionStatus,
-    SetupOperationKind, SetupRepairAction, SetupRepairDecision, SetupRepairPlan,
-    SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus,
+    OperatorLogFailureKind, OperatorLogSinkHealth, SetupActionPlan, SetupActionRecord,
+    SetupActionSkipReason, SetupActionStatus, SetupOperationKind, SetupRepairAction,
+    SetupRepairDecision, SetupRepairPlan, SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan,
+    SetupRunRecord, SetupRunStatus,
 };
 use zeroize::Zeroizing;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskArtifactSet {
+    session_id: SessionId,
+    plan: String,
+    worklog: String,
+    goal: String,
+}
+
+impl TaskArtifactSet {
+    pub(crate) fn new(session_id: SessionId, plan: String, worklog: String, goal: String) -> Self {
+        Self {
+            session_id,
+            plan,
+            worklog,
+            goal,
+        }
+    }
+
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn plan(&self) -> &str {
+        &self.plan
+    }
+
+    pub fn worklog(&self) -> &str {
+        &self.worklog
+    }
+
+    pub fn goal(&self) -> &str {
+        &self.goal
+    }
+}
 
 pub(crate) const DEFAULT_MODEL_BINDING: &str = "codex-default";
 pub(crate) const DEFAULT_PROVIDER_BINDING: &str = "codex-default";
@@ -2653,10 +2689,7 @@ impl HostService {
             .provider_smoke_failure_cache_ttl
             .as_ref()
             .map_or(DEFAULT_PROVIDER_SMOKE_FAILURE_TTL, duration_to_time);
-        let setup_ledger_retention = config
-            .setup_ledger_retention
-            .as_ref()
-            .map_or(storage::DEFAULT_SETUP_LEDGER_RETENTION, duration_to_time);
+        let storage_policy = runtime::RuntimeStoragePolicy::from_host_config(config);
         let policy = runtime::ProductionAdapterPolicy {
             native_readiness_timeout: timeout,
             native_readiness_ttl: ttl,
@@ -2676,7 +2709,7 @@ impl HostService {
                 operator_log_root,
                 adapter,
                 runtime::RuntimeProviderPolicy::from_host_config(config),
-                setup_ledger_retention,
+                storage_policy,
             ),
             operation_capacity: Arc::new(OperationCapacity::default()),
             turn_execution_timeout: configured_turn_execution_timeout(config),
@@ -2709,15 +2742,8 @@ impl HostService {
     /// its Satelle-owned launchd or Windows service configuration.
     pub fn production_for_service(
         overrides: &DaemonPathOverrides,
-        setup_ledger_retention_ms: u64,
+        storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
     ) -> Result<Self, SatelleError> {
-        if setup_ledger_retention_ms == 0
-            || setup_ledger_retention_ms > satelle_core::MAX_SETUP_LEDGER_RETENTION_MS
-        {
-            return Err(SatelleError::invalid_usage(
-                "persistent Host service setup-ledger retention is invalid",
-            ));
-        }
         let mut config = satelle_core::SatelleConfig::defaults()
             .hosts
             .remove(LOCAL_DEMO_HOST)
@@ -2727,8 +2753,23 @@ impl HostService {
         config.daemon_state_dir = overrides.state_dir.clone();
         config.daemon_cache_dir = overrides.cache_dir.clone();
         config.daemon_log_dir = overrides.log_dir.clone();
-        config.setup_ledger_retention =
-            satelle_core::ExplicitDuration::parse(&format!("{setup_ledger_retention_ms}ms"));
+        config.setup_ledger_retention = Some(
+            satelle_core::ExplicitDuration::parse(&format!(
+                "{}ms",
+                storage_policy.setup_ledger_retention_ms()
+            ))
+            .ok_or_else(|| {
+                SatelleError::config_error("invalid service setup-ledger retention", None)
+            })?,
+        );
+        config.session_metadata_retention = Some(
+            satelle_core::RetentionDuration::parse(&format!(
+                "{}h",
+                storage_policy.session_metadata_retention_hours()
+            ))
+            .ok_or_else(|| SatelleError::config_error("invalid service Session retention", None))?,
+        );
+        config.operator_log_retained_files = Some(storage_policy.operator_log_retained_files());
         Ok(Self::production_for_host(&config))
     }
 
@@ -3886,6 +3927,10 @@ impl HostService {
 
     pub fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
         self.runtime.status(session_id.clone())
+    }
+
+    pub fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifactSet, SatelleError> {
+        self.runtime.task_artifacts(session_id.clone())
     }
 
     pub fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {

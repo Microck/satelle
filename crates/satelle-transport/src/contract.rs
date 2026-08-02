@@ -28,7 +28,8 @@ pub(crate) use session::TurnRequestParts;
 pub use session::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ImageAttachment,
     MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL, MAX_IMAGE_ATTACHMENT_COUNT,
-    SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse, StopRequest, StopResponse, TurnRequest,
+    SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse,
+    TurnRequest,
 };
 pub use setup::{
     BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
@@ -48,10 +49,10 @@ pub(crate) use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v13 binds Host-update maintenance and selected-run recovery to the
-// exact release artifact accepted before mutation. The protocol remains a
-// hard cut because repair cannot safely infer an interrupted update target.
-pub(crate) const PROTOCOL_VERSION: &str = "13";
+// Protocol v14 adds the authenticated, identity-pinned task artifact read.
+// The protocol remains a hard cut because older peers cannot distinguish the
+// closed redacted export contract from arbitrary Host file access.
+pub(crate) const PROTOCOL_VERSION: &str = "14";
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -189,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v13_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "13");
+    fn protocol_version_is_the_v14_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "14");
     }
 }

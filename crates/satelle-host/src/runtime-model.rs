@@ -2,8 +2,9 @@ use super::RequestIdentity;
 use super::adapter::AdapterReadiness;
 use crate::process_identity::{ProcessIdentity, ProcessIdentityError};
 use crate::storage::{
-    AdmissionContext, IDEMPOTENCY_RETENTION, IdempotencyInput, IdempotentOperation, LeaseOwner,
-    PrivateRequestToken, RecoverySubject, StorageError, StorageErrorKind,
+    AdmissionContext, AdmissionReadinessRef, IDEMPOTENCY_RETENTION, IdempotencyInput,
+    IdempotentOperation, LeaseOwner, PrivateRequestToken, RecoverySubject, StorageError,
+    StorageErrorKind,
 };
 use satelle_core::session::{ExecutionPolicy, ExpectedRevisions, RetainedOwnership, Session};
 use satelle_core::{
@@ -66,6 +67,26 @@ pub(super) fn admission(
         idempotency,
         request_token,
     ))
+}
+
+pub(super) fn admission_readiness_ref(
+    readiness: &AdapterReadiness,
+) -> Result<AdmissionReadinessRef, SatelleError> {
+    let native = readiness.evidence();
+    let provider = readiness.provider_smoke_evidence();
+    AdmissionReadinessRef::new(
+        native.result_id(),
+        native.observed_at(),
+        native.source().as_str(),
+        provider.map(|provider| {
+            (
+                provider.result_id(),
+                provider.observed_at(),
+                provider.source().as_str(),
+            )
+        }),
+    )
+    .map_err(storage_failure)
 }
 
 pub(super) fn process_identity_failure(error: ProcessIdentityError) -> SatelleError {

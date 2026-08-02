@@ -283,7 +283,11 @@ fn configured_setup_ledger_retention_changes_only_the_ledger_cutoff() {
     );
 
     storage
-        .prune_expired_session_metadata_with_setup_retention(finished_at + retention, retention)
+        .prune_expired_session_metadata_with_retention(
+            finished_at + retention,
+            super::super::retention::DEFAULT_SESSION_RETENTION,
+            retention,
+        )
         .unwrap();
     assert_eq!(
         1,
@@ -291,14 +295,59 @@ fn configured_setup_ledger_retention_changes_only_the_ledger_cutoff() {
     );
 
     storage
-        .prune_expired_session_metadata_with_setup_retention(
+        .prune_expired_session_metadata_with_retention(
             finished_at + retention + time::Duration::nanoseconds(1),
+            super::super::retention::DEFAULT_SESSION_RETENTION,
             retention,
         )
         .unwrap();
     assert_eq!(
         0,
         setup_rows(&storage, "setup_runs", "configured-retention")
+    );
+}
+
+#[test]
+fn configured_session_retention_changes_only_the_session_cutoff() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let terminal_at = at(10);
+    let retention = time::Duration::days(8);
+    let session = terminal_session(
+        &mut storage,
+        SESSION_1,
+        TURN_1,
+        terminal_at - time::Duration::seconds(1),
+        terminal_at,
+    );
+    terminal_setup_run(
+        &mut storage,
+        "unrelated-setup-ledger",
+        SetupRunStatus::Completed,
+        terminal_at,
+    );
+
+    storage
+        .prune_expired_session_metadata_with_retention(
+            terminal_at + retention,
+            retention,
+            super::super::retention::DEFAULT_SETUP_LEDGER_RETENTION,
+        )
+        .unwrap();
+    assert!(storage.load_session(session.id()).unwrap().is_some());
+
+    storage
+        .prune_expired_session_metadata_with_retention(
+            terminal_at + retention + time::Duration::nanoseconds(1),
+            retention,
+            super::super::retention::DEFAULT_SETUP_LEDGER_RETENTION,
+        )
+        .unwrap();
+    assert!(storage.load_session(session.id()).unwrap().is_none());
+    assert_eq!(
+        1,
+        setup_rows(&storage, "setup_runs", "unrelated-setup-ledger"),
+        "session retention must not change setup-ledger retention",
     );
 }
 
@@ -797,6 +846,7 @@ fn expiring_the_session_that_owns_all_logs_preserves_the_cursor_high_water() {
         .log_page(
             &LogPageQuery::forward(Some(LogCursor::from_position(delivered_cursor)), 10)
                 .expect("valid delivered cursor query"),
+            observed_at,
         )
         .expect("a delivered cursor must not become cursor-ahead");
     assert!(page.entries().is_empty());

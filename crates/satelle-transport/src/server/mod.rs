@@ -843,6 +843,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         .route("/v1/host/paths", get(host_paths))
         .route("/v1/host/desktop-sessions", get(host_desktop_sessions))
         .route("/v1/sessions/{session_id}", get(sessions::get_session))
+        .route(
+            "/v1/sessions/{session_id}/task-artifacts",
+            get(sessions::get_task_artifacts),
+        )
         .route("/v1/events", get(events::get_events))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),

@@ -3,7 +3,7 @@ use super::auth::AuthorizedRequest;
 use super::{ApiFailure, DaemonState, api_error_response, authenticated_json_response, host_error};
 use crate::contract::{
     AdmissionCancellationResponse, ApiErrorCategory, ApiErrorCode, RequestId, SessionResponse,
-    StopRequest, StopResponse, TurnRequest, TurnRequestParts,
+    StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest, TurnRequestParts,
 };
 use axum::extract::{Extension, FromRequestParts, Path, State};
 use axum::http::request::Parts;
@@ -185,6 +185,35 @@ pub(super) async fn get_session(
             authorized.request_id().clone(),
             state.host_identity.clone(),
             session,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn get_task_artifacts(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    SessionPath(session_id): SessionPath,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let artifacts = match host_call(&state, &authorized, move || {
+        service.task_artifacts(&session_id)
+    })
+    .await
+    {
+        Ok(artifacts) => artifacts,
+        Err(response) => return response,
+    };
+    authenticated_json_response(
+        StatusCode::OK,
+        &TaskArtifactsResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            artifacts.session_id().clone(),
+            artifacts.plan().to_string(),
+            artifacts.worklog().to_string(),
+            artifacts.goal().to_string(),
         ),
         authorized.request_id(),
         &state.host_identity,

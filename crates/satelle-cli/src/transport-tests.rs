@@ -5280,7 +5280,7 @@ fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance
         "details": {
             "daemon_version": "0.0.9",
             "reason": "unsupported",
-            "supported_versions": ["13"],
+            "supported_versions": ["14"],
             "received_version": "11",
         },
         "docs_url": null,
@@ -6136,6 +6136,36 @@ fn admission_failures_preserve_definitive_and_ambiguous_phases() {
     );
     assert_eq!(api_failure.phase(), TurnAdmissionPhase::AdmissionUnknown);
     assert!(api_failure.durable_handles().is_none());
+}
+
+#[test]
+fn direct_session_resource_reads_preserve_session_not_found_identity() {
+    let session_id = SessionId::new();
+    let api_error: satelle_transport::ApiError = serde_json::from_value(serde_json::json!({
+        "schema_version": "satelle.error.v1",
+        "request_id": satelle_transport::RequestId::new().to_string(),
+        "host_identity": "host-direct-test",
+        "code": "session-not-found",
+        "category": "not_found",
+        "retryable": false,
+        "message": "Session was not found",
+        "details": null,
+        "docs_url": null,
+        "suggested_commands": []
+    }))
+    .expect("deserialize Session-not-found API error");
+
+    let mapped = direct_session_resource_error(
+        "direct-test",
+        &session_id,
+        DaemonClientError::Api {
+            status: 404_u16.try_into().expect("404 is a valid HTTP status"),
+            error: Box::new(api_error),
+        },
+    );
+
+    assert_eq!(mapped.code, ErrorCode::SessionNotFound);
+    assert!(mapped.message.contains(session_id.as_str()));
 }
 
 #[test]

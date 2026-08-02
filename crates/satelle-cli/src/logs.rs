@@ -182,6 +182,10 @@ impl LogReadPlan {
         })
     }
 
+    const fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
+    }
+
     fn query(&self, query: LogPageQuery) -> LogPageQuery {
         let mut query = query.with_minimum_severity(self.minimum_severity);
         if let Some(session_id) = &self.session_id {
@@ -309,7 +313,10 @@ pub(crate) fn show_logs(
 ) -> Result<(), CliFailure> {
     let request = LogReadRequest::from(command);
     let plan = LogReadPlan::resolve(&request)?;
-    let host = config.resolve_host(request.host.as_deref())?;
+    let host = match plan.session_id() {
+        Some(session_id) => config.resolve_session_host(request.host.as_deref(), session_id)?,
+        None => config.resolve_host(request.host.as_deref())?,
+    };
     let transport = transport_for(&host)?;
     plan.emit(transport.as_ref(), format).map_err(failure)
 }

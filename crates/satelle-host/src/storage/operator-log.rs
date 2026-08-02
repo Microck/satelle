@@ -10,7 +10,6 @@ use time::format_description::well_known::Rfc3339;
 
 const OPERATOR_LOG_FILE_NAME: &str = "satelle-host.log";
 const DEFAULT_ROTATION_BYTES: u64 = 10 * 1024 * 1024;
-const DEFAULT_RETAINED_FILES: usize = 5;
 const MIRROR_PAGE_SIZE: usize = 100;
 
 /// Runtime-owned cursor and sink for new authoritative log entries.
@@ -24,8 +23,13 @@ pub(crate) struct OperatorLogMirror {
 
 impl OperatorLogMirror {
     pub(crate) fn new(policy: OperatorLogPolicy, mirrored_cursor: u64) -> Self {
+        let mut sink = OperatorLogSink::new(policy);
+        // Reconcile the file cap at process start. A read-only daemon may not
+        // commit another log entry, so write-time reconciliation alone can
+        // leave generations above a newly reduced cap indefinitely.
+        sink.reconcile_retention();
         Self {
-            sink: OperatorLogSink::new(policy),
+            sink,
             mirrored_cursor,
         }
     }
@@ -44,7 +48,7 @@ impl OperatorLogMirror {
                 // never depend on retrying a local inspection artifact.
                 match self.sink.write_committed(&entry) {
                     OperatorLogWriteOutcome::Failure(kind) => {
-                        let _failure_kind = kind;
+                        debug_assert_eq!(self.sink.health(), OperatorLogSinkHealth::Degraded(kind));
                     }
                     OperatorLogWriteOutcome::Written
                     | OperatorLogWriteOutcome::FailureCoalesced => {}
@@ -55,6 +59,10 @@ impl OperatorLogMirror {
                 return;
             }
         }
+    }
+
+    pub(crate) const fn health(&self) -> OperatorLogSinkHealth {
+        self.sink.health()
     }
 }
 
@@ -73,8 +81,13 @@ impl OperatorLogPolicy {
         Self {
             root,
             rotation_bytes: DEFAULT_ROTATION_BYTES,
-            retained_files: DEFAULT_RETAINED_FILES,
+            retained_files: satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
         }
+    }
+
+    pub(crate) fn with_retained_files(mut self, retained_files: usize) -> Self {
+        self.retained_files = retained_files;
+        self
     }
 
     #[cfg(test)]
@@ -100,11 +113,17 @@ impl OperatorLogPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OperatorLogFailureKind {
+pub enum OperatorLogFailureKind {
     BoundaryUnavailable,
     FormatFailed,
     RotationFailed,
     WriteFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperatorLogSinkHealth {
+    Healthy,
+    Degraded(OperatorLogFailureKind),
 }
 
 #[derive(Debug)]
@@ -133,7 +152,7 @@ pub(crate) struct OperatorLogSink {
     // The write handle must close before its pinned directory boundary.
     file: Option<File>,
     directory: Option<OwnerOnlyDirectory>,
-    failure_active: bool,
+    active_failure: Option<OperatorLogFailureKind>,
 }
 
 impl OperatorLogSink {
@@ -142,7 +161,14 @@ impl OperatorLogSink {
             policy,
             file: None,
             directory: None,
-            failure_active: false,
+            active_failure: None,
+        }
+    }
+
+    fn reconcile_retention(&mut self) {
+        match self.ensure_directory() {
+            Ok(()) => self.active_failure = None,
+            Err(kind) => self.active_failure = Some(kind),
         }
     }
 
@@ -152,21 +178,28 @@ impl OperatorLogSink {
     pub(crate) fn write_committed(&mut self, entry: &DaemonLogEntry) -> OperatorLogWriteOutcome {
         match self.try_write_committed(entry) {
             Ok(()) => {
-                self.failure_active = false;
+                self.active_failure = None;
                 OperatorLogWriteOutcome::Written
             }
             Err(kind) => {
                 // Reopen from the pinned owner-only boundary on the next
                 // record. Only the first failure in one uninterrupted outage
-                // is surfaced for conversion into the existing Doctor model.
+                // changes the typed health observed by the Doctor owner.
                 self.file = None;
-                if self.failure_active {
+                if self.active_failure.is_some() {
                     OperatorLogWriteOutcome::FailureCoalesced
                 } else {
-                    self.failure_active = true;
+                    self.active_failure = Some(kind);
                     OperatorLogWriteOutcome::Failure(kind)
                 }
             }
+        }
+    }
+
+    pub(crate) const fn health(&self) -> OperatorLogSinkHealth {
+        match self.active_failure {
+            Some(kind) => OperatorLogSinkHealth::Degraded(kind),
+            None => OperatorLogSinkHealth::Healthy,
         }
     }
 
@@ -198,18 +231,32 @@ impl OperatorLogSink {
     }
 
     fn ensure_open(&mut self) -> Result<(), OperatorLogFailureKind> {
-        if self.directory.is_none() {
-            self.directory = Some(
-                open_or_create_owner_only_directory(&self.policy.root)
-                    .map_err(|_| OperatorLogFailureKind::BoundaryUnavailable)?,
-            );
-        }
+        self.ensure_directory()?;
         if self.file.is_none() {
             let mut file = open_or_create_owner_only_file(&self.current_path())
                 .map_err(|_| OperatorLogFailureKind::BoundaryUnavailable)?;
             file.seek(SeekFrom::End(0))
                 .map_err(|_| OperatorLogFailureKind::WriteFailed)?;
             self.file = Some(file);
+        }
+        Ok(())
+    }
+
+    fn ensure_directory(&mut self) -> Result<(), OperatorLogFailureKind> {
+        if self.directory.is_none() {
+            let directory = open_or_create_owner_only_directory(&self.policy.root)
+                .map_err(|_| OperatorLogFailureKind::BoundaryUnavailable)?;
+
+            // A lower retention setting takes effect as soon as this process
+            // acquires the log boundary, even when the active file does not
+            // rotate during this run.
+            for generation in
+                self.policy.retained_files..=satelle_core::MAX_OPERATOR_LOG_RETAINED_FILES
+            {
+                remove_if_present(&self.rotated_path(generation))
+                    .map_err(|_| OperatorLogFailureKind::RotationFailed)?;
+            }
+            self.directory = Some(directory);
         }
         Ok(())
     }

@@ -879,6 +879,41 @@ fn constant_time_digest_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
         == 0
 }
 
+/// Atomically publishes one new owner-only sibling directory without
+/// replacing an existing destination.
+pub fn publish_new_owner_only_directory(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), SecureFileError> {
+    let parent = source
+        .parent()
+        .filter(|parent| Some(*parent) == destination.parent())
+        .ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let directory = open_owner_only_directory(parent)?;
+    // Validate the complete staging boundary before dropping its handle for
+    // Windows rename semantics. The pinned parent still owns both names.
+    drop(open_owner_only_directory(source)?);
+    match move_sibling_file_without_replace(source, destination, &directory)? {
+        NoReplaceMoveOutcome::Moved => {
+            if let Err(error) = sync_owner_only_directory(parent, &directory) {
+                return match move_sibling_file_without_replace(destination, source, &directory)? {
+                    NoReplaceMoveOutcome::Moved => {
+                        sync_owner_only_directory(parent, &directory)?;
+                        Err(error)
+                    }
+                    NoReplaceMoveOutcome::SourceMissing
+                    | NoReplaceMoveOutcome::DestinationOccupied => {
+                        Err(SecureFileError::RollbackFailed)
+                    }
+                };
+            }
+            Ok(())
+        }
+        NoReplaceMoveOutcome::DestinationOccupied => Err(SecureFileError::OverwriteRequired),
+        NoReplaceMoveOutcome::SourceMissing => Err(SecureFileError::UnsafeOrUnavailable),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SecretArtifactKind {
     Missing,
