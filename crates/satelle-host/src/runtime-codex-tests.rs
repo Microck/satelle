@@ -1,5 +1,7 @@
+#[cfg(unix)]
+use super::control_plane::perform_handshake;
 use super::control_plane::{
-    CodexImageInputMode, ControlPlaneAdmission, configure_app_server_command, perform_handshake,
+    CodexImageInputMode, ControlPlaneAdmission, configure_app_server_command,
     probe_control_plane_with,
 };
 use satelle_core::{ControlPlaneCapability, ControlPlaneOperation, ErrorCode};
@@ -7,7 +9,9 @@ use serde_json::json;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 const FIXTURE_MODE: &str = "SATELLE_CODEX_CONTROL_PLANE_FIXTURE";
 const FIXTURE_SCHEMA_DIR: &str = "SATELLE_CODEX_SCHEMA_FIXTURE_DIR";
