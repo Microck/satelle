@@ -101,6 +101,8 @@ fn daemon_reconnect_restores_current_state_and_cursor_logs_without_event_replay(
             .collect::<Vec<_>>(),
         [
             LogEvent::FollowUpStarted,
+            LogEvent::NativeReadinessSummary,
+            LogEvent::ProviderSmokeSummary,
             LogEvent::TurnStateCommitted,
             LogEvent::TurnStateCommitted,
         ]
