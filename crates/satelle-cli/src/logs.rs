@@ -516,7 +516,6 @@ fn transient_follow_error(code: ErrorCode) -> bool {
             | ErrorCode::HostDaemonUnreachable
             | ErrorCode::DirectDaemonUnreachable
             | ErrorCode::SshBootstrapUnavailable
-            | ErrorCode::RemoteExecution
     )
 }
 
@@ -1167,6 +1166,47 @@ mod tests {
         assert_eq!(error.code, ErrorCode::LogsFollowIdentityChanged);
         assert_eq!(error.details["expected_host_identity"], "host-original");
         assert_eq!(error.details["observed_host_identity"], "host-replacement");
+    }
+
+    #[test]
+    fn daemon_api_failures_remain_terminal_during_follow() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let observed_factory_calls = Arc::clone(&factory_calls);
+        let factory: FollowConnectionFactory = Arc::new(move || {
+            observed_factory_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(FakeFollowConnection::new(
+                "host-original",
+                [
+                    Ok(page(1)),
+                    Err(SatelleError::remote_api_error(
+                        "remote",
+                        "storage-integrity-failed",
+                    )),
+                ],
+            )) as Box<dyn FollowConnection>)
+        });
+        let runtime = FakeFollowRuntime::new(None);
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Json,
+            &runtime,
+            &factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut Vec::new(),
+            },
+        )
+        .expect_err("a daemon API rejection is terminal");
+
+        assert_eq!(error.code, ErrorCode::RemoteExecution);
+        assert_eq!(factory_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.sleeps.get(), 0, "a terminal API error cannot retry");
     }
 
     #[test]
