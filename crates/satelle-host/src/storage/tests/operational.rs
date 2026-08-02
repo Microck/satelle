@@ -368,23 +368,24 @@ fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
                 expires_at
             );
 
+            DROP TABLE turn_admission_readiness;
             DROP TABLE authorized_provider_bindings;
             DROP TABLE provider_smoke_hmac_key;
             ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
             ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
-            DELETE FROM schema_migrations WHERE version IN (12, 13, 14);
+            DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15);
             PRAGMA user_version = 11;",
         )
         .expect("restore the exact version eleven storage schema");
 }
 
 #[test]
-fn operational_evidence_schema_is_migrated_atomically_to_version_fourteen() {
+fn operational_evidence_schema_is_migrated_atomically_to_version_fifteen() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(14_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(15_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -395,7 +396,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_fourteen() {
     assert_eq!(
         vec![
             1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64, 11_i64, 12_i64,
-            13_i64, 14_i64,
+            13_i64, 14_i64, 15_i64,
         ],
         versions
     );
@@ -417,6 +418,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_fourteen() {
         "logs",
         "authorized_provider_bindings",
         "provider_secret_provisioning_journal",
+        "turn_admission_readiness",
     ] {
         let exists: bool = connection
             .query_row(
@@ -485,7 +487,7 @@ fn version_eleven_provider_smoke_rows_upgrade_to_credential_scoped_cache() {
     let mut upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade the version eleven store");
     assert_eq!(
-        14_i64,
+        15_i64,
         pragma_integer(upgraded.connection_for_test(), "user_version")
     );
     let credential_columns: i64 = upgraded
@@ -578,7 +580,8 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE authorized_provider_bindings;
+            "DROP TABLE turn_admission_readiness;
+             DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
              ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
              ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;",
@@ -587,7 +590,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     storage
         .connection_for_test()
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14)",
+            "DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15)",
             [],
         )
         .expect("remove version eleven and twelve history");
@@ -600,7 +603,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     let upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade populated version ten storage");
     let connection = upgraded.connection_for_test();
-    assert_eq!(14_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(15_i64, pragma_integer(connection, "user_version"));
     assert_eq!(
         ("run".to_string(), "in_progress".to_string()),
         connection
@@ -778,13 +781,13 @@ fn newer_schema_history_is_rejected_without_downgrade() {
         .connection_for_test()
         .execute(
             "INSERT INTO schema_migrations (version, checksum, applied_at)
-             VALUES (15, ?1, '2026-07-21T00:00:00Z')",
+             VALUES (16, ?1, '2026-07-21T00:00:00Z')",
             ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
         )
         .expect("insert future migration");
     storage
         .connection_for_test()
-        .pragma_update(None, "user_version", 15)
+        .pragma_update(None, "user_version", 16)
         .expect("mark future schema");
     drop(storage);
 
@@ -795,7 +798,7 @@ fn newer_schema_history_is_rejected_without_downgrade() {
     assert_eq!(error.kind(), StorageErrorKind::MigrationIntegrity);
     let connection = Connection::open(state.path().join(DATABASE_FILE_NAME))
         .expect("future database remains readable");
-    assert_eq!(pragma_integer(&connection, "user_version"), 15);
+    assert_eq!(pragma_integer(&connection, "user_version"), 16);
 }
 
 #[test]
@@ -821,7 +824,8 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE admission_cancellations;
+            "DROP TABLE turn_admission_readiness;
+             DROP TABLE admission_cancellations;
              DROP INDEX one_session_per_upstream_goal_ref;
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
@@ -830,7 +834,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              DROP TABLE provider_smoke_hmac_key;
              ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
              ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
-             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14);
+             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15);
              PRAGMA user_version = 7;",
         )
         .expect("recreate the version seven token schema");
@@ -838,7 +842,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
 
     let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
     assert_eq!(
-        14_i64,
+        15_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
     let token_state: String = storage
@@ -2085,7 +2089,8 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE admission_cancellations;
+            "DROP TABLE turn_admission_readiness;
+             DROP TABLE admission_cancellations;
              DROP TABLE setup_actions;
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
@@ -2096,7 +2101,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              ALTER TABLE api_tokens DROP COLUMN token_state;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -2105,7 +2110,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        14_i64,
+        15_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -2190,7 +2195,8 @@ fn assert_version_one_corruption_rejected_before_migration(
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE admission_cancellations;
+            "DROP TABLE turn_admission_readiness;
+             DROP TABLE admission_cancellations;
              DROP TABLE setup_actions;
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
@@ -2203,7 +2209,7 @@ fn assert_version_one_corruption_rejected_before_migration(
              DROP INDEX idempotency_operation_identity;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -2257,7 +2263,8 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP TABLE admission_cancellations;
+            "DROP TABLE turn_admission_readiness;
+             DROP TABLE admission_cancellations;
              DROP TABLE setup_actions;
              DROP TABLE setup_runs;
              DROP TABLE native_readiness_results;
@@ -2270,7 +2277,7 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              DROP INDEX idempotency_operation_identity;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');

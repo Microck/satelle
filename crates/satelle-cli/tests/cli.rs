@@ -351,9 +351,11 @@ fn session_id(stdout: &[u8]) -> String {
         .to_string()
 }
 
-fn completed_log_session(state: &TestStateDir) -> String {
+fn completed_log_session(state: &TestStateDir) -> (String, std::path::PathBuf) {
+    let cache = state.path().join("command-history-cache");
     let run_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["run", "--host", "local-demo", "Open the browser"])
         .assert()
         .success()
@@ -362,15 +364,17 @@ fn completed_log_session(state: &TestStateDir) -> String {
     let session = session_id(&run_output.stdout);
     satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["steer", &session, "Continue"])
         .assert()
         .success();
     satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["stop", &session])
         .assert()
         .success();
-    session
+    (session, cache)
 }
 
 fn combined_output(output: &assert_cmd::assert::Assert) -> String {
@@ -554,7 +558,7 @@ fn production_status_and_stop_do_not_read_or_mutate_demo_state() {
     for command in ["status", "stop"] {
         let output = production_satelle()
             .env("SATELLE_STATE_DIR", state.path())
-            .args([command, &session_id, "--json"])
+            .args([command, &session_id, "--host", "local-demo", "--json"])
             .assert()
             .code(66)
             .get_output()
@@ -1456,6 +1460,8 @@ fn events_json_emits_newline_delimited_satelle_events() {
         .args([
             "steer",
             &session_id,
+            "--host",
+            "local-demo",
             "--events",
             "json",
             "Continue from the same event stream",
@@ -1530,6 +1536,8 @@ api_token = {{ kind = "file", path = {token_path} }}
             vec![
                 "steer".to_string(),
                 SessionId::new().to_string(),
+                "--host".to_string(),
+                "remote".to_string(),
                 "--events".to_string(),
                 "json".to_string(),
                 "Continue".to_string(),
@@ -1903,7 +1911,15 @@ fn explicit_events_override_quiet_mode_for_run_and_steer() {
     satelle()
         .env("SATELLE_STATE_DIR", state.path())
         .args([
-            "steer", session, "--quiet", "--events", "human", "--json", "Continue",
+            "steer",
+            session,
+            "--host",
+            "local-demo",
+            "--quiet",
+            "--events",
+            "human",
+            "--json",
+            "Continue",
         ])
         .assert()
         .success()
@@ -2121,10 +2137,11 @@ fn detach_returns_starting_session_without_event_streaming() {
 #[test]
 fn logs_json_applies_tail_session_source_level_and_since_on_the_host() {
     let state = state_dir();
-    let session = completed_log_session(&state);
+    let (session, cache) = completed_log_session(&state);
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "logs",
             "--session",
@@ -2152,6 +2169,7 @@ fn logs_json_applies_tail_session_source_level_and_since_on_the_host() {
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "logs",
             "--source",
@@ -2174,6 +2192,7 @@ fn logs_json_applies_tail_session_source_level_and_since_on_the_host() {
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["logs", "--session", &session, "--level", "warn", "--json"])
         .assert()
         .success()
@@ -2185,6 +2204,7 @@ fn logs_json_applies_tail_session_source_level_and_since_on_the_host() {
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["logs", "--session", &session, "--since", "30m", "--json"])
         .assert()
         .success()
@@ -2194,6 +2214,7 @@ fn logs_json_applies_tail_session_source_level_and_since_on_the_host() {
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "logs",
             "--session",
@@ -2223,10 +2244,11 @@ fn logs_json_applies_tail_session_source_level_and_since_on_the_host() {
 #[test]
 fn logs_after_resumes_strictly_after_the_opaque_cursor() {
     let state = state_dir();
-    let session = completed_log_session(&state);
+    let (session, cache) = completed_log_session(&state);
 
     let initial = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["logs", "--session", &session, "--tail", "2", "--json"])
         .assert()
         .success()
@@ -2240,6 +2262,7 @@ fn logs_after_resumes_strictly_after_the_opaque_cursor() {
 
     let resumed = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["logs", "--session", &session, "--after", cursor, "--json"])
         .assert()
         .success()
@@ -5170,8 +5193,14 @@ fn local_demo_outputs_do_not_include_old_product_name() {
     let session = session_id(&run.get_output().stdout);
     for args in [
         vec!["doctor", "--host", "local-demo"],
-        vec!["steer", &session, "Continue from the same session"],
-        vec!["status", &session],
+        vec![
+            "steer",
+            &session,
+            "--host",
+            "local-demo",
+            "Continue from the same session",
+        ],
+        vec!["status", &session, "--host", "local-demo"],
         vec!["logs", "--host", "local-demo"],
     ] {
         let assertion = satelle()
