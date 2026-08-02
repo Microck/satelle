@@ -142,6 +142,10 @@ fn read_session_host_candidates(
     session_id: &SessionId,
     observed_at: OffsetDateTime,
 ) -> Option<Vec<String>> {
+    #[cfg(target_os = "macos")]
+    let resolved_cache_root = resolve_trusted_macos_aliases(cache_root).ok()?;
+    #[cfg(target_os = "macos")]
+    let cache_root = resolved_cache_root.as_path();
     let database_directory = cache_root.join(DATABASE_DIRECTORY_NAME);
     if !database_directory.try_exists().ok()? {
         return Some(Vec::new());
@@ -319,7 +323,7 @@ fn prepare_cache_root(path: &Path) -> Result<PreparedCacheRoot, std::io::Error> 
     }
 
     #[cfg(target_os = "macos")]
-    let resolved_path = resolve_trusted_macos_aliases_for_creation(path)?;
+    let resolved_path = resolve_trusted_macos_aliases(path)?;
     #[cfg(target_os = "macos")]
     let path = resolved_path.as_path();
     #[cfg(not(target_os = "macos"))]
@@ -385,7 +389,7 @@ fn prepare_cache_root(path: &Path) -> Result<PreparedCacheRoot, std::io::Error> 
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_trusted_macos_aliases_for_creation(path: &Path) -> Result<PathBuf, std::io::Error> {
+fn resolve_trusted_macos_aliases(path: &Path) -> Result<PathBuf, std::io::Error> {
     use std::os::unix::fs::MetadataExt;
     use std::path::Component;
 

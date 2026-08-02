@@ -226,6 +226,38 @@ fn operator_log_rotates_only_above_the_threshold_and_retains_newest_generations(
     }
 }
 
+#[test]
+fn operator_log_mirror_applies_reduced_retention_without_a_new_record() {
+    let state = TempDir::new().expect("temporary state directory");
+    let log_root = state.path().join("operator-logs");
+    drop(
+        satelle_core::open_or_create_owner_only_directory(&log_root)
+            .expect("create owner-only operator log root"),
+    );
+    fs::write(log_root.join("satelle-host.log"), b"current").expect("write current operator log");
+    for generation in 1..=4 {
+        fs::write(
+            log_root.join(format!("satelle-host.log.{generation}")),
+            format!("generation {generation}"),
+        )
+        .expect("write rotated operator log");
+    }
+
+    let mirror = OperatorLogMirror::new(OperatorLogPolicy::for_test(log_root.clone(), 1, 2), 0);
+
+    assert_eq!(mirror.health(), OperatorLogSinkHealth::Healthy);
+    assert!(log_root.join("satelle-host.log").exists());
+    assert!(log_root.join("satelle-host.log.1").exists());
+    for generation in 2..=4 {
+        assert!(
+            !log_root
+                .join(format!("satelle-host.log.{generation}"))
+                .exists(),
+            "generation {generation} survived startup with the reduced retention cap"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn operator_log_directory_and_rotated_files_are_owner_only() {

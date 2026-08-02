@@ -5653,6 +5653,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    #[cfg(unix)]
     fn persistent_storage_policy() -> satelle_core::daemon_service::PersistentHostStoragePolicy {
         satelle_core::daemon_service::PersistentHostStoragePolicy::new(
             satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS,

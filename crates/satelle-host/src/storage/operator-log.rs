@@ -23,8 +23,13 @@ pub(crate) struct OperatorLogMirror {
 
 impl OperatorLogMirror {
     pub(crate) fn new(policy: OperatorLogPolicy, mirrored_cursor: u64) -> Self {
+        let mut sink = OperatorLogSink::new(policy);
+        // Reconcile the file cap at process start. A read-only daemon may not
+        // commit another log entry, so write-time reconciliation alone can
+        // leave generations above a newly reduced cap indefinitely.
+        sink.reconcile_retention();
         Self {
-            sink: OperatorLogSink::new(policy),
+            sink,
             mirrored_cursor,
         }
     }
@@ -160,6 +165,13 @@ impl OperatorLogSink {
         }
     }
 
+    fn reconcile_retention(&mut self) {
+        match self.ensure_directory() {
+            Ok(()) => self.active_failure = None,
+            Err(kind) => self.active_failure = Some(kind),
+        }
+    }
+
     /// Mirrors the authoritative entry loaded after its SQLite commit.
     /// A sink failure is returned as data and must never become a recursive log
     /// entry or change the authoritative commit result.
@@ -219,6 +231,18 @@ impl OperatorLogSink {
     }
 
     fn ensure_open(&mut self) -> Result<(), OperatorLogFailureKind> {
+        self.ensure_directory()?;
+        if self.file.is_none() {
+            let mut file = open_or_create_owner_only_file(&self.current_path())
+                .map_err(|_| OperatorLogFailureKind::BoundaryUnavailable)?;
+            file.seek(SeekFrom::End(0))
+                .map_err(|_| OperatorLogFailureKind::WriteFailed)?;
+            self.file = Some(file);
+        }
+        Ok(())
+    }
+
+    fn ensure_directory(&mut self) -> Result<(), OperatorLogFailureKind> {
         if self.directory.is_none() {
             let directory = open_or_create_owner_only_directory(&self.policy.root)
                 .map_err(|_| OperatorLogFailureKind::BoundaryUnavailable)?;
@@ -233,13 +257,6 @@ impl OperatorLogSink {
                     .map_err(|_| OperatorLogFailureKind::RotationFailed)?;
             }
             self.directory = Some(directory);
-        }
-        if self.file.is_none() {
-            let mut file = open_or_create_owner_only_file(&self.current_path())
-                .map_err(|_| OperatorLogFailureKind::BoundaryUnavailable)?;
-            file.seek(SeekFrom::End(0))
-                .map_err(|_| OperatorLogFailureKind::WriteFailed)?;
-            self.file = Some(file);
         }
         Ok(())
     }
