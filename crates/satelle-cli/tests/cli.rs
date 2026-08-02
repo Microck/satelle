@@ -2349,8 +2349,7 @@ fn logs_help_exposes_follow_and_reconnect_controls() {
 #[test]
 fn logs_follow_waits_on_an_empty_page_and_ctrl_c_exits_130() {
     let state = state_dir();
-    let cache = tempfile::tempdir().expect("create isolated command-history cache");
-    let session = completed_log_session(&state);
+    let (session, cache) = completed_log_session(&state);
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("satelle"));
     for name in [
         "SATELLE_HOME",
@@ -2365,7 +2364,7 @@ fn logs_follow_waits_on_an_empty_page_and_ctrl_c_exits_130() {
     }
     let mut child = command
         .env("SATELLE_STATE_DIR", state.path())
-        .env("SATELLE_CACHE_DIR", cache.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "logs",
             "--host",
