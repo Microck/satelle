@@ -190,40 +190,26 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.match(workflow, /npm publish[^\n]*--dry-run/);
   assert.match(
     workflow,
-    /publish:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[collect, attest, lifecycle\]/,
+    /publish-candidates:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[collect, draft-release\]/,
   );
   assert.match(
     workflow,
-    /publish:\n[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?id-token: write/,
+    /publish-candidates:\n[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?id-token: write/,
   );
   assert.match(
     workflow,
-    /Install trusted publishing npm[\s\S]*?npm install --global npm@11\.5\.1[\s\S]*?test "\$\(npm --version\)" = "11\.5\.1"/,
+    /Install OIDC-capable npm CLI[\s\S]*?npm install --global npm@11\.5\.1[\s\S]*?test "\$\(npm --version\)" = "11\.5\.1"/,
   );
-  assert.match(
-    workflow,
-    /npm publish "\$package" --provenance --access public --tag "rc-v\$RELEASE_VERSION"/,
-  );
-  assert.match(workflow, /npm view "\$package_name@\$RELEASE_VERSION" dist\.integrity --json/);
-  assert.match(workflow, /published package integrity does not match the validated artifact/);
-  assert.doesNotMatch(workflow, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
-  assert.match(workflow, /gh release create "\$GITHUB_REF_NAME" --draft/);
+  assert.match(workflow, /npm-candidate-publication\.cjs advance/);
+  const candidateJob = workflow.match(
+    /^  publish-candidates:[\s\S]*?(?=^  validate-registry-candidates:)/m,
+  )?.[0];
+  assert.ok(candidateJob, "candidate publication job is missing");
+  assert.doesNotMatch(candidateJob, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
+  assert.match(workflow, /gh release create "\$GITHUB_REF_NAME"[\s\S]*?--draft/);
   assert.match(workflow, /gh release upload "\$GITHUB_REF_NAME"/);
   assert.match(workflow, /release asset set does not match the validated artifact set/);
-  assert.doesNotMatch(workflow, /gh release edit "\$GITHUB_REF_NAME" --draft=false --latest/);
-  assert.match(
-    workflow,
-    /Keep the GitHub release draft until recoverable npm promotion is available/,
-  );
-  assert.ok(
-    workflow.indexOf(
-      'npm publish "$package" --provenance --access public --tag "rc-v$RELEASE_VERSION"',
-    ) <
-      workflow.indexOf(
-        "- name: Keep the GitHub release draft until recoverable npm promotion is available",
-      ),
-    "the release must remain a draft after every candidate package is published",
-  );
+  assert.match(workflow, /gh release edit "\$GITHUB_REF_NAME"[^\n]*--draft=false --latest/);
   assert.doesNotMatch(workflow, /^\s+(?:validated|dist)\/npm-.*\.tgz \\?$/m);
   assert.match(workflow, /\.\/dist\/npm-satelle-scoped\.tgz/);
   assert.match(workflow, /\.\/dist\/npm-satelle-unscoped\.tgz/);
@@ -259,7 +245,7 @@ test("release workflow validates six targets and publishes only a fully verified
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
   ) ?? [];
-  assert.equal(checkoutUses.length, 5);
+  assert.equal(checkoutUses.length, 7);
   assert.equal(hardenedCheckoutUses.length, checkoutUses.length);
 });
 
