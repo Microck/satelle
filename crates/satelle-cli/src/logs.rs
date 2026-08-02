@@ -297,11 +297,22 @@ fn follow_logs(
     output: FollowOutput<'_>,
 ) -> Result<(), SatelleError> {
     let FollowOutput { stdout, stderr } = output;
-    let mut connection = connection_factory()?;
+    let connection = connection_factory();
+    if runtime.interrupted() {
+        return Err(SatelleError::interrupted_attached_command());
+    }
+    let mut connection = connection?;
     let expected_host_identity =
-        validate_follow_connection(connection.as_ref(), None, plan.session_id(), false)?;
-    let (mut query_cursor, mut last_delivered) =
-        plan.emit_follow_initial(connection.as_ref(), format, stdout)?;
+        validate_follow_connection(connection.as_ref(), None, plan.session_id(), false);
+    if runtime.interrupted() {
+        return Err(SatelleError::interrupted_attached_command());
+    }
+    let expected_host_identity = expected_host_identity?;
+    let initial_page = plan.emit_follow_initial(connection.as_ref(), format, stdout);
+    if runtime.interrupted() {
+        return Err(SatelleError::interrupted_attached_command());
+    }
+    let (mut query_cursor, mut last_delivered) = initial_page?;
     let mut stream_interruptions = 0;
 
     loop {
@@ -948,11 +959,13 @@ mod tests {
     use std::cell::Cell;
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     struct FakeFollowConnection {
         host_identity: String,
         pages: Mutex<VecDeque<Result<satelle_host::DaemonLogPage, SatelleError>>>,
+        interrupt_on_log: Option<(Arc<AtomicBool>, usize)>,
+        log_calls: AtomicUsize,
     }
 
     struct SessionIdentityMismatchFollowConnection;
@@ -965,7 +978,14 @@ mod tests {
             Self {
                 host_identity: host_identity.to_string(),
                 pages: Mutex::new(pages.into_iter().collect()),
+                interrupt_on_log: None,
+                log_calls: AtomicUsize::new(0),
             }
+        }
+
+        fn with_interrupt_on_log(mut self, call: usize, interrupted: Arc<AtomicBool>) -> Self {
+            self.interrupt_on_log = Some((interrupted, call));
+            self
         }
     }
 
@@ -984,6 +1004,12 @@ mod tests {
         }
 
         fn logs(&self, _query: &LogPageQuery) -> Result<satelle_host::DaemonLogPage, SatelleError> {
+            let call = self.log_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some((interrupted, interrupt_call)) = &self.interrupt_on_log
+                && call == *interrupt_call
+            {
+                interrupted.store(true, Ordering::Release);
+            }
             self.pages
                 .lock()
                 .expect("follow fixture queue lock")
@@ -1029,6 +1055,7 @@ mod tests {
         interrupt_after_sleeps: Option<usize>,
         jitter_override: Option<StdDuration>,
         reconnect_budget: StdDuration,
+        external_interrupt: Option<Arc<AtomicBool>>,
     }
 
     impl FakeFollowRuntime {
@@ -1040,6 +1067,7 @@ mod tests {
                 interrupt_after_sleeps,
                 jitter_override: None,
                 reconnect_budget: RECONNECT_BUDGET,
+                external_interrupt: None,
             }
         }
 
@@ -1052,6 +1080,11 @@ mod tests {
             self.reconnect_budget = budget;
             self
         }
+
+        fn with_interrupt_flag(mut self, interrupted: Arc<AtomicBool>) -> Self {
+            self.external_interrupt = Some(interrupted);
+            self
+        }
     }
 
     impl FollowRuntime for FakeFollowRuntime {
@@ -1060,8 +1093,12 @@ mod tests {
         }
 
         fn interrupted(&self) -> bool {
-            self.interrupt_after_sleeps
-                .is_some_and(|limit| self.sleeps.get() >= limit)
+            self.external_interrupt
+                .as_ref()
+                .is_some_and(|interrupted| interrupted.load(Ordering::Acquire))
+                || self
+                    .interrupt_after_sleeps
+                    .is_some_and(|limit| self.sleeps.get() >= limit)
         }
 
         fn sleep(&self, duration: StdDuration) {
@@ -1183,6 +1220,70 @@ mod tests {
         let notices = String::from_utf8(stderr).unwrap();
         assert!(notices.contains("reconnecting after interruption 1/10"));
         assert!(notices.contains("resuming after cursor=slc1_0000000000000001"));
+    }
+
+    #[test]
+    fn interrupt_during_initial_read_wins_over_the_transport_failure() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let connection = FakeFollowConnection::new(
+            "host-original",
+            [Err(SatelleError::host_unreachable("remote"))],
+        )
+        .with_interrupt_on_log(1, Arc::clone(&interrupted));
+        let factory =
+            queued_connection_factory([Box::new(connection) as Box<dyn FollowConnection>]);
+        let runtime = FakeFollowRuntime::new(None).with_interrupt_flag(interrupted);
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Human,
+            &runtime,
+            &factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut Vec::new(),
+            },
+        )
+        .expect_err("Ctrl-C must take precedence over the interrupted initial read");
+
+        assert_eq!(error.code, ErrorCode::Interrupted);
+    }
+
+    #[test]
+    fn interrupt_during_poll_read_wins_over_the_transport_failure() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let connection = FakeFollowConnection::new(
+            "host-original",
+            [Ok(page(1)), Err(SatelleError::host_unreachable("remote"))],
+        )
+        .with_interrupt_on_log(2, Arc::clone(&interrupted));
+        let factory =
+            queued_connection_factory([Box::new(connection) as Box<dyn FollowConnection>]);
+        let runtime = FakeFollowRuntime::new(None).with_interrupt_flag(interrupted);
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Human,
+            &runtime,
+            &factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut Vec::new(),
+            },
+        )
+        .expect_err("Ctrl-C must take precedence over the interrupted poll read");
+
+        assert_eq!(error.code, ErrorCode::Interrupted);
     }
 
     #[test]

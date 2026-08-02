@@ -101,6 +101,10 @@ pub(super) use define_schema_token;
 pub(crate) trait AuthenticatedResponseContract {
     fn request_id(&self) -> &RequestId;
     fn host_identity(&self) -> &str;
+
+    fn matches_host_identity(&self, expected_host_identity: &str) -> bool {
+        self.host_identity() == expected_host_identity
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

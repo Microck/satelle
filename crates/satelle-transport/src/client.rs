@@ -1101,7 +1101,7 @@ fn validate_response_context(
     if response.request_id() != request_id {
         return Err(DaemonClientError::ResponseRequestIdMismatch);
     }
-    if response.host_identity() != expected_host_identity {
+    if !response.matches_host_identity(expected_host_identity) {
         return Err(DaemonClientError::ResponseHostIdentityMismatch);
     }
     Ok(())
@@ -1506,6 +1506,36 @@ mod tests {
             );
             server.join().expect("join capabilities response fixture");
         }
+    }
+
+    #[test]
+    fn logs_response_rejects_entry_from_another_host_identity() {
+        let request_id = RequestId::new();
+        let response = serde_json::from_value::<LogsPageResponse>(serde_json::json!({
+            "schema_version": "satelle.logs.page.v1",
+            "request_id": request_id.as_str(),
+            "host_identity": "host-expected",
+            "entries": [{
+                "schema_version": "satelle.logs.entry.v1",
+                "cursor": "slc1_0000000000000001",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "host_identity": "host-other",
+                "source": "storage",
+                "severity": "info",
+                "event": "store_opened",
+                "subject": { "kind": "host" },
+                "message": "opened Host state store",
+                "redacted": true
+            }],
+            "next_cursor": "slc1_0000000000000001",
+            "truncated": false
+        }))
+        .expect("decode the contradictory log page fixture");
+
+        assert!(matches!(
+            validate_response_context(&response, &request_id, "host-expected"),
+            Err(DaemonClientError::ResponseHostIdentityMismatch)
+        ));
     }
 
     #[test]

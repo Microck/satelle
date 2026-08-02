@@ -8212,8 +8212,40 @@ fn direct_logs_error(host: &str, error: DaemonClientError) -> SatelleError {
         DaemonClientError::Api { error, .. } if error.code() == ApiErrorCode::InvalidRequest => {
             SatelleError::invalid_usage("the Host rejected the logs query")
         }
+        DaemonClientError::InvalidResponse(error) if logs_response_connection_lost(&error) => {
+            SatelleError::host_unreachable(host)
+        }
         error => direct_transport_error(host, error),
     }
+}
+
+fn logs_response_connection_lost(error: &reqwest::Error) -> bool {
+    if error.is_body() || error.is_timeout() {
+        return true;
+    }
+
+    // reqwest classifies an incomplete declared body as a decode error, but
+    // its source chain retains the connection-level I/O failure. Keep JSON
+    // and schema decode failures terminal while allowing body loss to reconnect.
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                )
+            })
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 // Cursor expiry is the one API failure whose details are required to resume
