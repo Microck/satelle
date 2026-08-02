@@ -4440,13 +4440,14 @@ impl DirectFixture {
             .expect("construct event runtime");
         Self {
             service,
-            host_identity,
+            host_identity: host_identity.clone(),
             address,
             server: Some(server),
             server_runtime,
             transport: Some(DirectTransport {
                 alias: "direct-test".to_string(),
                 mode: "direct",
+                host_identity: host_identity.as_str().to_owned(),
                 client: Arc::new(client),
                 event_client,
                 event_runtime,

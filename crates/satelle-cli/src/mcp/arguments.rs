@@ -102,6 +102,8 @@ impl LogsInput {
             after: self.after,
             source: self.source,
             level: self.level,
+            follow: false,
+            no_reconnect: false,
         }
     }
 }

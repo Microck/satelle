@@ -1,7 +1,7 @@
 use crate::{CliFailure, SelectedHost, bootstrap_lock, failure, on_demand_idle_timeout};
 use satelle_core::daemon_service::{
     DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentHostStoragePolicy,
-    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV3, WindowsTaskDefinition,
+    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV4, WindowsTaskDefinition,
 };
 use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
@@ -266,6 +266,8 @@ fn setup_provider_intent(
 /// The command surface is intentionally exhaustive. A new transport operation
 /// must be implemented or explicitly rejected by every backend.
 pub(crate) trait TransportClient {
+    fn log_target_identity(&self) -> Result<String, SatelleError>;
+
     fn supported_image_media_types(&self) -> Result<Vec<String>, SatelleError> {
         Ok(Vec::new())
     }
@@ -657,6 +659,12 @@ fn interrupted_admission_race_error(alias: &str) -> SatelleError {
 }
 
 impl TransportClient for LocalTransport {
+    fn log_target_identity(&self) -> Result<String, SatelleError> {
+        self.service
+            .daemon_runtime_status()
+            .map(|status| status.host_identity().to_string())
+    }
+
     fn supported_image_media_types(&self) -> Result<Vec<String>, SatelleError> {
         let capabilities = self.service.daemon_runtime_capabilities()?;
         Ok(if capabilities.image_attachments() {
@@ -1191,6 +1199,7 @@ fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, 
 struct DirectTransport {
     alias: String,
     mode: &'static str,
+    host_identity: String,
     client: Arc<DaemonClient>,
     event_client: DaemonEventClient,
     event_runtime: tokio::runtime::Runtime,
@@ -1340,7 +1349,7 @@ fn coordinate_persistent_setup(
 enum PreparedPersistentService {
     Windows {
         task: Box<WindowsTaskDefinition>,
-        config: Box<WindowsServiceConfigV3>,
+        config: Box<WindowsServiceConfigV4>,
     },
     Launchd(ssh_bootstrap::LaunchdServiceDefinition),
 }
@@ -2464,7 +2473,7 @@ impl SshSetupTransport {
                         artifact,
                     )
                     .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
-                let config = WindowsServiceConfigV3::new(
+                let config = WindowsServiceConfigV4::new(
                     "127.0.0.1:3001",
                     daemon_path_overrides,
                     storage_policy,
@@ -6748,6 +6757,10 @@ fn setup_token_lock_error(path: &Path, error: impl std::fmt::Display) -> Satelle
 }
 
 impl TransportClient for SshSetupTransport {
+    fn log_target_identity(&self) -> Result<String, SatelleError> {
+        Ok(self.binding.expected_host_identity().to_string())
+    }
+
     fn setup(
         &self,
         dry_run: bool,
@@ -7013,6 +7026,10 @@ impl TransportClient for SshSetupTransport {
 }
 
 impl TransportClient for DirectTransport {
+    fn log_target_identity(&self) -> Result<String, SatelleError> {
+        Ok(self.host_identity.clone())
+    }
+
     fn supported_image_media_types(&self) -> Result<Vec<String>, SatelleError> {
         Ok(self
             .client
@@ -7321,6 +7338,7 @@ fn direct_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError
     Ok(DirectTransport {
         alias: host.alias.clone(),
         mode: "direct",
+        host_identity: binding.expected_host_identity().to_string(),
         client,
         event_client,
         event_runtime,
@@ -7437,6 +7455,7 @@ fn ssh_transport(
     Ok(DirectTransport {
         alias: host.alias.clone(),
         mode: "ssh",
+        host_identity: expected_host_identity,
         client,
         event_client,
         event_runtime,

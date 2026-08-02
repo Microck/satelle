@@ -47,9 +47,9 @@
 - a Satelle Doctor Finding is a diagnostic result with a scope, severity, fixability, readiness impact, summary, evidence, and optional recovery command @mvp @implemented
 - a Satelle Doctor Probe is an individual diagnostic check with a stable probe id, scope, dependencies, resource locks, timeout, and cache policy @mvp @implemented
 - a Satelle Doctor Event is a diagnostic-stream record with its own versioned schema and is distinct from a lifecycle Satelle Event @mvp @implemented
-- a Satelle Log Entry is a normalized redacted Host Daemon-owned diagnostic record with timestamp, source, severity, Host, optional Session id, message, structured fields, and redaction metadata @spec @mvp
+- a Satelle Log Entry is a normalized redacted Host Daemon-owned diagnostic record with timestamp, source, severity, Host, optional Session id, message, structured fields, and redaction metadata @spec @mvp @implemented
 - a Satelle Log Cursor is an opaque durable position used to resume normalized log delivery without acting as a Satelle Event replay cursor @mvp @implemented
-- a Satelle Operator Log File is a rotating plain-text mirror of redacted Satelle Log Entries for local inspection on the remote Host, not an authoritative store @spec @mvp
+- a Satelle Operator Log File is a rotating plain-text mirror of redacted Satelle Log Entries for local inspection on the remote Host, not an authoritative store @spec @mvp @implemented
 - a Satelle Diagnostic Bundle is a redacted local archive for support and debugging that can include selected Host Daemon metadata, Doctor Findings, setup ledger summaries, recent Satelle Log Entries, and export metadata @spec @later
 - a Satelle Raw Diagnostic Export is a user-requested local diagnostic artifact that may include data excluded from normal Satelle diagnostics while preserving explicit consent, redaction, retention, and audit boundaries @spec @later
 - a Satelle Desktop Snapshot Export is a user-requested local artifact that captures the current visible desktop for one selected Host Identity and Desktop Binding at invocation time and never represents historical Session imagery @spec @later
@@ -843,9 +843,9 @@
 - GET /v1/logs returns schema_version satelle.logs.page.v1 in one flat envelope containing request_id, host_identity, entries, next_cursor, and truncated @spec @contract @mvp @implemented
 - a satelle.logs.page.v1 next_cursor is the last delivered Log Cursor when a forward page is truncated and otherwise advances to the Host-captured log high-water cursor even when no entry matches the filters @spec @contract @mvp @implemented
 - a satelle.logs.page.v1 truncated value is true when tail mode omitted older matching entries or forward mode has newer matching entries beyond the returned page @spec @contract @mvp @implemented
-- satelle.logs.entry.v1 contains exactly schema_version, cursor, timestamp, source, severity, event, subject, message, and redacted; redacted is always true @spec @contract @mvp @implemented
+- satelle.logs.entry.v1 contains exactly schema_version, cursor, timestamp, host_identity, source, severity, event, subject, message, and redacted; redacted is always true @spec @contract @mvp @implemented
 - satelle.logs.entry.v1 subject is either a host subject containing only kind host or a turn subject containing kind turn plus session_id, turn_id, session_state_revision, and turn_state_revision @spec @contract @mvp @implemented
-- satelle.logs.entry.v1 source tokens are host_daemon, storage, and codex_adapter; severity tokens are info, warn, and error; current event tokens are session_started, follow_up_started, turn_state_committed, stop_confirmed, stop_not_confirmed, restart_recovery_pending, and store_opened @spec @contract @mvp @implemented
+- satelle.logs.entry.v1 source tokens are host_daemon, storage, and codex_adapter; severity tokens are info, warn, and error; current event tokens are session_started, follow_up_started, native_readiness_summary, provider_smoke_summary, turn_state_committed, structured_execution_error, stop_confirmed, stop_not_confirmed, restart_recovery_pending, and store_opened @spec @contract @mvp @implemented
 - logs-cursor-expired uses HTTP 410 and schema_version satelle.error.v1; details.earliest_available_cursor contains the first retained entry cursor or null, while details.resume_cursor contains the exclusive cursor boundary that returns that first retained entry without skipping it @spec @contract @mvp @implemented
 - POST /v1/sessions, POST /v1/sessions/{session_id}/turns, and GET /v1/sessions/{session_id} return the exact response schema token satelle.session.v1 and one flat envelope containing request_id, host_identity, and the canonical PublicSession fields @spec @contract @mvp @implemented
 - POST /v1/sessions and POST /v1/sessions/{session_id}/turns return HTTP 202 only after durable asynchronous Turn admission, while GET /v1/sessions/{session_id} returns HTTP 200 @spec @contract @mvp @implemented
@@ -1591,13 +1591,13 @@
 - satelle logs targets the resolved current or default host when no host or session selector is provided @implemented @mvp
 - satelle logs supports --host <alias> to read host-scoped logs for a configured remote host @spec @mvp @implemented
 - satelle logs supports --session <session_id> to read logs scoped to one Satelle session @implemented @mvp
-- satelle logs reports a typed logs-target-required error when no host, default host, current host, or session selector can be resolved @spec @mvp
+- satelle logs reports a typed logs-target-required error when no host, default host, current host, or session selector can be resolved @spec @mvp @implemented
 - satelle logs for SSH bootstrap hosts may restart the on-demand Host Daemon before reading stored normalized logs @spec @mvp @implemented
 - satelle logs supports --tail <n> to limit output to the most recent n matching log entries @implemented @mvp
 - satelle logs defaults to --tail 200 when neither --tail nor --since is provided @implemented @mvp
 - satelle logs accepts --tail values from 1 through 10000 and reports a typed log-tail-limit-exceeded usage error for larger values @implemented @mvp
 - satelle logs supports --since <duration-or-rfc3339> to show only matching log entries at or after the requested time @implemented @mvp
-- satelle logs supports -f and --follow to continue streaming new matching log entries after the initial result set @spec @mvp
+- satelle logs supports -f and --follow to continue streaming new matching log entries after the initial result set @spec @mvp @implemented
 - satelle logs supports repeatable --source <host_daemon|storage|codex_adapter> filters @spec @mvp @implemented
 - satelle logs without --source includes all MVP log sources that pass the default redaction policy @implemented @mvp
 - satelle logs supports --level <info|warn|error> as a minimum severity filter @spec @mvp @implemented
@@ -1606,26 +1606,26 @@
 - satelle logs uses stdout as the data output contract instead of adding file destination flags in MVP @implemented @mvp
 - satelle logs human output writes log entries to stdout and diagnostics or command errors to stderr @implemented @mvp
 - satelle logs --json emits the initial matching set as one LF-terminated satelle.logs.entry.v1 JSON record per entry without a top-level wrapper @spec @contract @mvp @implemented
-- satelle logs --json without --follow exits 0 with empty stdout when no entries match, while satelle logs --json --follow remains attached waiting for later matching entries until interrupted or failed @spec @contract @mvp
+- satelle logs --json without --follow exits 0 with empty stdout when no entries match, while satelle logs --json --follow remains attached waiting for later matching entries until interrupted or failed @spec @contract @mvp @implemented
 - satelle logs JSON records use the exact satelle.logs.entry.v1 fields defined by the Host Daemon contract and add no CLI-only wrapper, target, or structured-fields properties @spec @contract @mvp @implemented
 - satelle logs supports --after <log_cursor> to return entries strictly after one previously delivered Log Cursor @spec @mvp @implemented
 - satelle logs reports a typed log-position-conflict usage error when --after is combined with --since or an explicit --tail @spec @mvp @implemented
-- satelle logs --json --follow continues the same newline-delimited satelle.logs.entry.v1 record stream after the initial matching set @spec @contract @mvp
-- satelle logs --follow exits 130 when interrupted by Ctrl-C and does not treat the interrupt as a remote host failure @spec @mvp
-- satelle logs --follow automatically attempts to reconnect when the log stream ends because of transient transport loss or Host Daemon restart @spec @mvp
-- satelle logs --follow resumes after reconnect by querying stored Satelle Log Entries newer than the last delivered log cursor instead of replaying missed live Satelle Events @spec @mvp
-- satelle logs --follow validates target host identity and session scope before resuming after reconnect @spec @mvp
-- satelle logs --follow stops reconnecting and reports a typed logs-follow-identity-changed error when the reconnected host identity or requested session scope does not match the original target @spec @mvp
-- satelle logs --follow uses a default reconnect budget of 60 seconds per stream interruption @spec @mvp
-- satelle logs --follow stops after 10 stream interruptions in one command and reports a typed logs-follow-reconnect-exhausted error @spec @mvp
-- satelle logs --follow reconnect backoff starts at 250 milliseconds and caps at 5 seconds with jitter @spec @mvp
-- satelle logs --follow does not retry forever after the reconnect budget or interruption cap is exhausted @spec @mvp
-- satelle logs --follow reports a typed logs-follow-reconnect-exhausted error with the last delivered log cursor and a rerun command when reconnection fails within the budget @spec @mvp
-- satelle logs --follow writes reconnect notices and reconnect failures to stderr while preserving stdout for log entries or JSON log-entry objects @spec @mvp
-- satelle logs --json --follow does not emit reconnect control records to stdout in MVP @spec @mvp
-- satelle logs --follow supports --no-reconnect to fail immediately on stream loss after reporting the last delivered log cursor @spec @mvp
-- satelle logs show Satelle daemon events and normalized Codex event summaries by default @spec @mvp
-- satelle MVP logs command exposes normalized daemon events, session lifecycle changes, readiness summaries, provider smoke-test summaries, and structured errors instead of raw protocol payloads @spec @mvp
+- satelle logs --json --follow continues the same newline-delimited satelle.logs.entry.v1 record stream after the initial matching set @spec @contract @mvp @implemented
+- satelle logs --follow exits 130 when interrupted by Ctrl-C and does not treat the interrupt as a remote host failure @spec @mvp @implemented
+- satelle logs --follow automatically attempts to reconnect when the log stream ends because of transient transport loss or Host Daemon restart @spec @mvp @implemented
+- satelle logs --follow resumes after reconnect by querying stored Satelle Log Entries newer than the last delivered log cursor instead of replaying missed live Satelle Events @spec @mvp @implemented
+- satelle logs --follow validates target host identity and session scope before resuming after reconnect @spec @mvp @implemented
+- satelle logs --follow stops reconnecting and reports a typed logs-follow-identity-changed error when the reconnected host identity or requested session scope does not match the original target @spec @mvp @implemented
+- satelle logs --follow uses a default reconnect budget of 60 seconds per stream interruption @spec @mvp @implemented
+- satelle logs --follow stops after 10 stream interruptions in one command and reports a typed logs-follow-reconnect-exhausted error @spec @mvp @implemented
+- satelle logs --follow reconnect backoff starts at 250 milliseconds and caps at 5 seconds with jitter @spec @mvp @implemented
+- satelle logs --follow does not retry forever after the reconnect budget or interruption cap is exhausted @spec @mvp @implemented
+- satelle logs --follow reports a typed logs-follow-reconnect-exhausted error with the last delivered log cursor and a rerun command when reconnection fails within the budget @spec @mvp @implemented
+- satelle logs --follow writes reconnect notices and reconnect failures to stderr while preserving stdout for log entries or JSON log-entry objects @spec @mvp @implemented
+- satelle logs --json --follow does not emit reconnect control records to stdout in MVP @spec @mvp @implemented
+- satelle logs --follow supports --no-reconnect to fail immediately on stream loss after reporting the last delivered log cursor @spec @mvp @implemented
+- satelle logs show Satelle daemon events and normalized Codex event summaries by default @spec @mvp @implemented
+- satelle MVP logs command exposes normalized daemon events, session lifecycle changes, readiness summaries, provider smoke-test summaries, and structured errors instead of raw protocol payloads @spec @mvp @implemented
 - satelle logs do not expose raw Codex app-server protocol messages by default @implemented @mvp
 - satelle MVP logs command does not expose raw Codex app-server protocol messages, provider request or response bodies, full prompts, screenshots, desktop recordings, or full transcripts by default @implemented @mvp
 - satelle later raw protocol diagnostics are implemented only as a command-specific Raw Diagnostic Export that explicitly selects raw Codex app-server protocol messages or provider request and response bodies for one Session or command scope @spec @later
@@ -1634,7 +1634,7 @@
 - satelle raw protocol diagnostic exports do not make raw Codex app-server protocol messages, provider request bodies, provider response bodies, full prompts, screenshots, desktop recordings, or full transcripts available through satelle logs, status, doctor, diagnostic bundles, Satelle Events, Satelle Operator Log Files, or setup action ledger summaries @spec @later
 - satelle stores minimal lifecycle metadata and structured errors by default instead of persisting desktop screenshots or full event transcripts @mvp @implemented
 - satelle does not persist full Satelle Event streams by default @mvp @implemented
-- satelle MVP does not provide session recording modes, screenshot recording, full event transcript recording, desktop recording, or host-level recording defaults @spec @mvp
+- satelle MVP does not provide session recording modes, screenshot recording, full event transcript recording, desktop recording, or host-level recording defaults @spec @mvp @implemented
 - satelle MVP normal status, logs, run, and steer commands do not capture, display, persist, or export desktop snapshot imagery by default @implemented @mvp
 - satelle later exposes satelle desktop snapshot --host <alias> --output <path> as the only Desktop Snapshot Export command @spec @later
 - satelle desktop snapshot JSON v1 uses schema_version satelle.desktop.snapshot.v1 and includes source Host, Host Identity, Desktop Binding, output path, artifact format, artifact byte size, redaction metadata, and created_at @spec @contract @later
@@ -1720,10 +1720,10 @@
 - satelle Host Daemon continues running when a Satelle Platform-Native Log Sink fails while SQLite remains writable, and records the degraded platform-native log sink as a typed diagnostic finding @spec @later
 - satelle Satelle Platform-Native Log Sink retention and query behavior are treated as operating-system-managed mirror behavior and do not change SQLite Satelle Log Entry retention, Satelle Operator Log File retention, or satelle logs output semantics @spec @later
 - satelle SQLite Satelle Log Entries are retained for 7 days by default @spec @mvp @implemented
-- satelle SQLite Satelle Log Entry retention can be configured per host or profile @spec @mvp
+- satelle SQLite Satelle Log Entry retention can be configured per host or profile @spec @mvp @implemented
 - each persisted Satelle Log Entry receives a monotonic Log Cursor in its Host Daemon store @spec @mvp @implemented
 - logs pagination resumes strictly after the last delivered Log Cursor @spec @mvp @implemented
-- logs follow reconnection uses a Log Cursor instead of timestamp alone @spec @mvp
+- logs follow reconnection uses a Log Cursor instead of timestamp alone @spec @mvp @implemented
 - a Log Cursor older than retained log history reports a typed logs-cursor-expired error and identifies the earliest available cursor @spec @mvp @implemented
 - label: satelle stores the Satelle Setup Action Ledger in the remote Host Daemon SQLite store instead of storing it only on the local CLI machine
   command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact

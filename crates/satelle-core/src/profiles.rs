@@ -27,6 +27,7 @@ const PROFILE_KEYS: &[&str] = &[
     "daemon_idle_timeout",
     "setup_ledger_retention",
     "session_metadata_retention",
+    "sqlite_log_retention",
     "operator_log_retained_files",
 ];
 const TIMEOUT_KEYS: &[&str] = &["native_readiness", "provider_smoke_test", "turn_execution"];
@@ -89,6 +90,7 @@ pub(super) struct ProfileConfig {
     daemon_idle_timeout: Option<ExplicitDuration>,
     setup_ledger_retention: Option<ExplicitDuration>,
     session_metadata_retention: Option<RetentionDuration>,
+    sqlite_log_retention: Option<RetentionDuration>,
     operator_log_retained_files: Option<usize>,
 }
 
@@ -182,6 +184,9 @@ impl ProfileConfig {
         if source.allows_user_policy() {
             if let Some(retention) = &self.session_metadata_retention {
                 host.session_metadata_retention = Some(retention.clone());
+            }
+            if let Some(retention) = &self.sqlite_log_retention {
+                host.sqlite_log_retention = Some(retention.clone());
             }
             if let Some(retained_files) = self.operator_log_retained_files {
                 host.operator_log_retained_files = Some(retained_files);
@@ -436,6 +441,11 @@ fn reject_profile_interpolation(
         table.get("session_metadata_retention"),
         &mut interpolations,
     );
+    collect_interpolation_for_value(
+        &format!("{profile_path}.sqlite_log_retention"),
+        table.get("sqlite_log_retention"),
+        &mut interpolations,
+    );
     if let Some(timeouts) = table.get("timeouts").and_then(toml::Value::as_table) {
         for key in TIMEOUT_KEYS {
             collect_interpolation_for_value(
@@ -496,6 +506,15 @@ fn reject_profile_duration_errors(
     }
     if let Some(value) = table.get("session_metadata_retention") {
         let retention_path = format!("{profile_path}.session_metadata_retention");
+        let Some(value) = value.as_str() else {
+            return Err(SatelleError::duration_unit_required(path, &retention_path));
+        };
+        if RetentionDuration::parse(value).is_none() {
+            return Err(SatelleError::duration_unit_required(path, &retention_path));
+        }
+    }
+    if let Some(value) = table.get("sqlite_log_retention") {
+        let retention_path = format!("{profile_path}.sqlite_log_retention");
         let Some(value) = value.as_str() else {
             return Err(SatelleError::duration_unit_required(path, &retention_path));
         };
@@ -779,7 +798,7 @@ mod timeout_profile_tests {
     #[test]
     fn only_user_selected_profiles_override_destructive_retention() {
         let profile: ProfileConfig = toml::from_str(
-            "session_metadata_retention = \"30d\"\noperator_log_retained_files = 12\n",
+            "session_metadata_retention = \"30d\"\nsqlite_log_retention = \"45d\"\noperator_log_retained_files = 12\n",
         )
         .expect("parse profile retention policy");
 
@@ -794,6 +813,7 @@ mod timeout_profile_tests {
                 30 * 24
             );
             assert_eq!(host.operator_log_retained_files, Some(12));
+            assert_eq!(host.sqlite_log_retention.as_ref().unwrap().hours(), 45 * 24);
         }
 
         for source in [
@@ -803,6 +823,7 @@ mod timeout_profile_tests {
             let mut host = base_host();
             profile.apply_to_host(super::super::LOCAL_DEMO_HOST, &mut host, source);
             assert!(host.session_metadata_retention.is_none());
+            assert!(host.sqlite_log_retention.is_none());
             assert!(host.operator_log_retained_files.is_none());
         }
     }

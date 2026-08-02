@@ -44,7 +44,9 @@ pub(crate) use self::provider_secret_journal::{
     ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay,
     provider_secret_file_paths,
 };
-pub(crate) use self::retention::{DEFAULT_SESSION_RETENTION, DEFAULT_SETUP_LEDGER_RETENTION};
+pub(crate) use self::retention::{
+    DEFAULT_LOG_RETENTION, DEFAULT_SESSION_RETENTION, DEFAULT_SETUP_LEDGER_RETENTION,
+};
 pub(crate) use self::setup_ledger::{
     MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,
 };
@@ -1621,6 +1623,7 @@ pub(crate) struct Storage {
     // Field order is a drop invariant: SQLite must close every delegated file
     // before the ownership lock and pinned state directory are released.
     connection: Connection,
+    log_retention: time::Duration,
     _ownership_lock: open::OwnershipLock,
     _state_directory: open::StateDirectory,
 }
@@ -1638,9 +1641,14 @@ impl Storage {
         auth::validate_sensitive_state(&connection)?;
         Ok(Self {
             connection,
+            log_retention: DEFAULT_LOG_RETENTION,
             _ownership_lock: ownership_lock,
             _state_directory: state_directory,
         })
+    }
+
+    pub(crate) fn set_log_retention(&mut self, retention: time::Duration) {
+        self.log_retention = retention;
     }
 
     pub(crate) fn has_existing_state(state_root: &Path) -> Result<bool, StorageError> {
@@ -1698,6 +1706,7 @@ impl Storage {
             })?;
         let mut storage = Self {
             connection,
+            log_retention: DEFAULT_LOG_RETENTION,
             _ownership_lock: ownership_lock,
             _state_directory: state_directory,
         };
@@ -2989,6 +2998,30 @@ impl Storage {
                 session.updated_at(),
             )?,
         )?;
+        if let Some(readiness) = &context.readiness_ref {
+            insert_safe_log(
+                &transaction,
+                &canonical_log(
+                    LogEvent::NativeReadinessSummary,
+                    LogSeverity::Info,
+                    session,
+                    &turn_id,
+                    session.updated_at(),
+                )?,
+            )?;
+            if readiness.provider_result_id().is_some() {
+                insert_safe_log(
+                    &transaction,
+                    &canonical_log(
+                        LogEvent::ProviderSmokeSummary,
+                        LogSeverity::Info,
+                        session,
+                        &turn_id,
+                        session.updated_at(),
+                    )?,
+                )?;
+            }
+        }
         let recovery_subject = load_recovery_subject(&transaction, session, &turn_id)?;
         transaction
             .commit()
@@ -3101,6 +3134,30 @@ impl Storage {
                 session.updated_at(),
             )?,
         )?;
+        if let Some(readiness) = &context.readiness_ref {
+            insert_safe_log(
+                &transaction,
+                &canonical_log(
+                    LogEvent::NativeReadinessSummary,
+                    LogSeverity::Info,
+                    &session,
+                    &turn_id,
+                    session.updated_at(),
+                )?,
+            )?;
+            if readiness.provider_result_id().is_some() {
+                insert_safe_log(
+                    &transaction,
+                    &canonical_log(
+                        LogEvent::ProviderSmokeSummary,
+                        LogSeverity::Info,
+                        &session,
+                        &turn_id,
+                        session.updated_at(),
+                    )?,
+                )?;
+            }
+        }
         let recovery_subject = load_recovery_subject(&transaction, &session, &turn_id)?;
         transaction
             .commit()
@@ -3119,6 +3176,10 @@ impl Storage {
         transition: TurnTransition,
         at: OffsetDateTime,
     ) -> Result<Session, StorageError> {
+        let structured_execution_error = matches!(
+            &transition,
+            TurnTransition::Blocked | TurnTransition::Failed | TurnTransition::RecoveryFailed
+        );
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3149,6 +3210,18 @@ impl Storage {
                 session.updated_at(),
             )?,
         )?;
+        if structured_execution_error {
+            insert_safe_log(
+                &transaction,
+                &canonical_log(
+                    LogEvent::StructuredExecutionError,
+                    LogSeverity::Error,
+                    &session,
+                    turn_id,
+                    session.updated_at(),
+                )?,
+            )?;
+        }
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;

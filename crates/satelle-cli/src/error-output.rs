@@ -344,7 +344,8 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         },
         ErrorCode::HostUnreachable
         | ErrorCode::HostDaemonUnreachable
-        | ErrorCode::DirectDaemonUnreachable => ErrorContract {
+        | ErrorCode::DirectDaemonUnreachable
+        | ErrorCode::LogsFollowReconnectExhausted => ErrorContract {
             category: ErrorCategory::RemoteExecution,
             retryable: true,
             outcome: "The Host could not be reached.",
@@ -414,6 +415,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::OutputModeConflict
         | ErrorCode::LogTailLimitExceeded
         | ErrorCode::LogPositionConflict
+        | ErrorCode::LogsTargetRequired
         | ErrorCode::ConcurrencyLimitExceeded
         | ErrorCode::ConcurrencyWithoutRemoteUpdate
         | ErrorCode::ComponentSelectionConflict
@@ -462,7 +464,8 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::CertificateExpired
         | ErrorCode::TlsVersionUnsupported
         | ErrorCode::TlsHandshakeFailed
-        | ErrorCode::HostIdentityMismatch => ErrorContract {
+        | ErrorCode::HostIdentityMismatch
+        | ErrorCode::LogsFollowIdentityChanged => ErrorContract {
             category: ErrorCategory::RemoteExecution,
             retryable: false,
             outcome: "The Host identity or secure connection was not accepted.",

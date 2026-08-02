@@ -2,15 +2,24 @@ use super::output::{OutputArgs, OutputFormat};
 use super::transport::{TransportClient, transport_for};
 use super::{CliFailure, ConfigContext, failure, parse_duration_ms};
 use clap::Args;
-use satelle_core::{SatelleError, SessionId};
+use satelle_core::{ErrorCode, SatelleError, SessionId};
 use satelle_host::{DaemonLogEntry, LogCursor, LogPageQuery, LogSeverity, LogSource};
 use std::io::{self, Write};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
 const DEFAULT_LOG_PAGE_LIMIT: usize = 200;
 const MAX_LOG_PAGE_LIMIT: usize = 10_000;
+const FOLLOW_IDLE_INTERVAL: StdDuration = StdDuration::from_millis(250);
+const RECONNECT_BUDGET: StdDuration = StdDuration::from_secs(60);
+const RECONNECT_INITIAL_DELAY: StdDuration = StdDuration::from_millis(250);
+const RECONNECT_MAX_DELAY: StdDuration = StdDuration::from_secs(5);
+const MAX_STREAM_INTERRUPTS: usize = 10;
 
 #[derive(Args, Debug)]
 pub(crate) struct LogsCommand {
@@ -56,6 +65,18 @@ pub(crate) struct LogsCommand {
         help = "Set minimum severity: info, warn, or error (default: info)"
     )]
     level: Option<String>,
+    #[arg(
+        short = 'f',
+        long,
+        help = "Continue streaming new matching Log Entries"
+    )]
+    follow: bool,
+    #[arg(
+        long,
+        requires = "follow",
+        help = "Fail on transport loss instead of reconnecting"
+    )]
+    no_reconnect: bool,
     #[command(flatten)]
     pub(crate) output_args: OutputArgs,
 }
@@ -78,6 +99,8 @@ pub(crate) struct LogReadRequest {
     pub(crate) after: Option<String>,
     pub(crate) source: Vec<String>,
     pub(crate) level: Option<String>,
+    pub(crate) follow: bool,
+    pub(crate) no_reconnect: bool,
 }
 
 impl From<LogsCommand> for LogReadRequest {
@@ -90,7 +113,34 @@ impl From<LogsCommand> for LogReadRequest {
             after: command.after,
             source: command.source,
             level: command.level,
+            follow: command.follow,
+            no_reconnect: command.no_reconnect,
         }
+    }
+}
+
+impl LogReadRequest {
+    fn follow_rerun_command(&self, host: &str, cursor: LogCursor) -> String {
+        let mut command = format!("satelle logs --host {host}");
+        if let Some(session) = &self.session {
+            command.push_str(" --session ");
+            command.push_str(session);
+        }
+        for source in &self.source {
+            command.push_str(" --source ");
+            command.push_str(source);
+        }
+        if let Some(level) = &self.level {
+            command.push_str(" --level ");
+            command.push_str(level);
+        }
+        command.push_str(" --after ");
+        command.push_str(&cursor.to_string());
+        command.push_str(" --follow");
+        if self.no_reconnect {
+            command.push_str(" --no-reconnect");
+        }
+        command
     }
 }
 
@@ -107,6 +157,342 @@ struct LogReadPlan {
     minimum_severity: LogSeverity,
     since: Option<OffsetDateTime>,
     position: LogPosition,
+}
+
+trait FollowConnection {
+    fn host_identity(&self) -> Result<String, SatelleError>;
+    fn session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<satelle_core::session::PublicSession, SatelleError>;
+    fn logs(&self, query: &LogPageQuery) -> Result<satelle_host::DaemonLogPage, SatelleError>;
+}
+
+struct TransportFollowConnection {
+    transport: Box<dyn TransportClient>,
+}
+
+impl FollowConnection for TransportFollowConnection {
+    fn host_identity(&self) -> Result<String, SatelleError> {
+        self.transport.log_target_identity()
+    }
+
+    fn session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<satelle_core::session::PublicSession, SatelleError> {
+        self.transport.status(session_id)
+    }
+
+    fn logs(&self, query: &LogPageQuery) -> Result<satelle_host::DaemonLogPage, SatelleError> {
+        self.transport.logs(query)
+    }
+}
+
+trait FollowRuntime {
+    fn now(&self) -> Instant;
+    fn interrupted(&self) -> bool;
+    fn sleep(&self, duration: StdDuration);
+    fn jitter(&self, duration: StdDuration) -> StdDuration;
+}
+
+struct ProcessFollowRuntime {
+    interrupted: Arc<AtomicBool>,
+    jitter_sequence: AtomicU64,
+}
+
+impl ProcessFollowRuntime {
+    fn new() -> Result<Self, SatelleError> {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let signal_interrupted = Arc::clone(&interrupted);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                SatelleError::invalid_usage(format!(
+                    "could not initialize Ctrl-C handling: {error}"
+                ))
+            })?;
+        thread::Builder::new()
+            .name("satelle-logs-follow-interrupt".to_string())
+            .spawn(move || {
+                if runtime.block_on(tokio::signal::ctrl_c()).is_ok() {
+                    signal_interrupted.store(true, Ordering::Release);
+                }
+            })
+            .map_err(|error| {
+                SatelleError::invalid_usage(format!("could not start Ctrl-C handling: {error}"))
+            })?;
+        Ok(Self {
+            interrupted,
+            jitter_sequence: AtomicU64::new(0),
+        })
+    }
+}
+
+impl FollowRuntime for ProcessFollowRuntime {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
+    }
+
+    fn sleep(&self, duration: StdDuration) {
+        let deadline = Instant::now() + duration;
+        while !self.interrupted() {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            thread::sleep((deadline - now).min(StdDuration::from_millis(50)));
+        }
+    }
+
+    fn jitter(&self, duration: StdDuration) -> StdDuration {
+        let sequence = self.jitter_sequence.fetch_add(1, Ordering::Relaxed);
+        let sample = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(sequence, |time| time.as_nanos() as u64 ^ sequence);
+        jittered_delay(duration, sample)
+    }
+}
+
+struct FollowOutput<'a> {
+    stdout: &'a mut dyn Write,
+    stderr: &'a mut dyn Write,
+}
+
+struct FollowTarget<'a> {
+    plan: &'a LogReadPlan,
+    request: &'a LogReadRequest,
+    host_alias: &'a str,
+    expected_host_identity: &'a str,
+}
+
+fn follow_logs(
+    plan: &LogReadPlan,
+    request: &LogReadRequest,
+    host_alias: &str,
+    format: OutputFormat,
+    runtime: &dyn FollowRuntime,
+    connection_factory: &mut dyn FnMut() -> Result<Box<dyn FollowConnection>, SatelleError>,
+    output: FollowOutput<'_>,
+) -> Result<(), SatelleError> {
+    let FollowOutput { stdout, stderr } = output;
+    let mut connection = connection_factory()?;
+    let expected_host_identity =
+        validate_follow_connection(connection.as_ref(), None, plan.session_id(), false)?;
+    let (mut query_cursor, mut last_delivered) =
+        plan.emit_follow_initial(connection.as_ref(), format, stdout)?;
+    let mut stream_interruptions = 0;
+
+    loop {
+        if runtime.interrupted() {
+            return Err(SatelleError::interrupted_attached_command());
+        }
+        let query = plan.follow_query(query_cursor);
+        match connection.logs(&query) {
+            Ok(page) => {
+                write_entries_to(page.entries(), None, format, stdout)?;
+                if let Some(entry) = page.entries().last() {
+                    last_delivered = Some(entry.cursor());
+                }
+                query_cursor = page.next_cursor();
+                if !page.truncated() {
+                    runtime.sleep(FOLLOW_IDLE_INTERVAL);
+                }
+            }
+            Err(error) if transient_follow_error(error.code) => {
+                stream_interruptions += 1;
+                let report_cursor = last_delivered.unwrap_or(query_cursor);
+                if request.no_reconnect {
+                    writeln!(
+                        stderr,
+                        "log follow stopped after transport loss; last cursor={report_cursor}"
+                    )
+                    .map_err(log_output_error)?;
+                    return Err(error);
+                }
+                if stream_interruptions >= MAX_STREAM_INTERRUPTS {
+                    return Err(follow_reconnect_exhausted(
+                        request,
+                        host_alias,
+                        report_cursor,
+                        stream_interruptions,
+                    ));
+                }
+                writeln!(
+                    stderr,
+                    "log follow reconnecting after interruption {stream_interruptions}/{MAX_STREAM_INTERRUPTS}; last cursor={report_cursor}"
+                )
+                .map_err(log_output_error)?;
+                let target = FollowTarget {
+                    plan,
+                    request,
+                    host_alias,
+                    expected_host_identity: &expected_host_identity,
+                };
+                let (reconnected, page) = reconnect_follow(
+                    &target,
+                    runtime,
+                    connection_factory,
+                    query_cursor,
+                    report_cursor,
+                    stream_interruptions,
+                    stderr,
+                )?;
+                connection = reconnected;
+                write_entries_to(page.entries(), None, format, stdout)?;
+                if let Some(entry) = page.entries().last() {
+                    last_delivered = Some(entry.cursor());
+                }
+                query_cursor = page.next_cursor();
+                if !page.truncated() {
+                    runtime.sleep(FOLLOW_IDLE_INTERVAL);
+                }
+            }
+            Err(error) if error.code == ErrorCode::HostIdentityMismatch => {
+                return Err(SatelleError::logs_follow_identity_changed(
+                    &expected_host_identity,
+                    None,
+                    plan.session_id().map(SessionId::as_str),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn reconnect_follow(
+    target: &FollowTarget<'_>,
+    runtime: &dyn FollowRuntime,
+    connection_factory: &mut dyn FnMut() -> Result<Box<dyn FollowConnection>, SatelleError>,
+    query_cursor: LogCursor,
+    report_cursor: LogCursor,
+    stream_interruptions: usize,
+    stderr: &mut dyn Write,
+) -> Result<(Box<dyn FollowConnection>, satelle_host::DaemonLogPage), SatelleError> {
+    let deadline = runtime.now() + RECONNECT_BUDGET;
+    let mut delay = RECONNECT_INITIAL_DELAY;
+    loop {
+        if runtime.interrupted() {
+            return Err(SatelleError::interrupted_attached_command());
+        }
+        let now = runtime.now();
+        if now >= deadline {
+            return Err(follow_reconnect_exhausted(
+                target.request,
+                target.host_alias,
+                report_cursor,
+                stream_interruptions,
+            ));
+        }
+        runtime.sleep(runtime.jitter(delay).min(deadline - now));
+        if runtime.interrupted() {
+            return Err(SatelleError::interrupted_attached_command());
+        }
+
+        let attempt = connection_factory().and_then(|connection| {
+            validate_follow_connection(
+                connection.as_ref(),
+                Some(target.expected_host_identity),
+                target.plan.session_id(),
+                true,
+            )?;
+            let page = connection
+                .logs(&target.plan.follow_query(query_cursor))
+                .map_err(|error| {
+                    if error.code == ErrorCode::HostIdentityMismatch {
+                        SatelleError::logs_follow_identity_changed(
+                            target.expected_host_identity,
+                            None,
+                            target.plan.session_id().map(SessionId::as_str),
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            Ok((connection, page))
+        });
+        match attempt {
+            Ok(reconnected) => {
+                writeln!(
+                    stderr,
+                    "log follow reconnected; resuming after cursor={query_cursor}"
+                )
+                .map_err(log_output_error)?;
+                return Ok(reconnected);
+            }
+            Err(error) if transient_follow_error(error.code) => {
+                delay = delay.saturating_mul(2).min(RECONNECT_MAX_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn validate_follow_connection(
+    connection: &dyn FollowConnection,
+    expected_host_identity: Option<&str>,
+    session_id: Option<&SessionId>,
+    reconnect: bool,
+) -> Result<String, SatelleError> {
+    let observed_host_identity = connection.host_identity()?;
+    if let Some(expected) = expected_host_identity
+        && observed_host_identity != expected
+    {
+        return Err(SatelleError::logs_follow_identity_changed(
+            expected,
+            Some(&observed_host_identity),
+            session_id.map(SessionId::as_str),
+        ));
+    }
+    if let Some(session_id) = session_id {
+        connection.session(session_id).map_err(|error| {
+            if reconnect && error.code == ErrorCode::SessionNotFound {
+                SatelleError::logs_follow_identity_changed(
+                    expected_host_identity.unwrap_or(&observed_host_identity),
+                    Some(&observed_host_identity),
+                    Some(session_id.as_str()),
+                )
+            } else {
+                error
+            }
+        })?;
+    }
+    Ok(observed_host_identity)
+}
+
+fn transient_follow_error(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::HostUnreachable
+            | ErrorCode::HostDaemonUnreachable
+            | ErrorCode::DirectDaemonUnreachable
+            | ErrorCode::SshBootstrapUnavailable
+            | ErrorCode::RemoteExecution
+    )
+}
+
+fn follow_reconnect_exhausted(
+    request: &LogReadRequest,
+    host_alias: &str,
+    cursor: LogCursor,
+    stream_interruptions: usize,
+) -> SatelleError {
+    SatelleError::logs_follow_reconnect_exhausted(
+        &cursor.to_string(),
+        stream_interruptions,
+        &request.follow_rerun_command(host_alias, cursor),
+    )
+}
+
+fn jittered_delay(duration: StdDuration, sample: u64) -> StdDuration {
+    let basis_points = 8_000_u128 + u128::from(sample % 4_001);
+    let nanos = duration.as_nanos().saturating_mul(basis_points) / 10_000;
+    StdDuration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64).min(RECONNECT_MAX_DELAY)
 }
 
 impl LogReadPlan {
@@ -244,6 +630,81 @@ impl LogReadPlan {
         }
     }
 
+    fn emit_follow_initial(
+        &self,
+        connection: &dyn FollowConnection,
+        format: OutputFormat,
+        stdout: &mut dyn Write,
+    ) -> Result<(LogCursor, Option<LogCursor>), SatelleError> {
+        match self.position {
+            LogPosition::Tail(limit) => {
+                let page = connection.logs(&self.query(
+                    LogPageQuery::tail(limit).expect("the validated tail Log limit is valid"),
+                ))?;
+                write_entries_to(page.entries(), None, format, stdout)?;
+                Ok((
+                    page.next_cursor(),
+                    page.entries().last().map(DaemonLogEntry::cursor),
+                ))
+            }
+            LogPosition::After(cursor) => {
+                let page = connection.logs(
+                    &self.query(
+                        LogPageQuery::forward(Some(cursor), DEFAULT_LOG_PAGE_LIMIT)
+                            .expect("the default forward Log limit is valid"),
+                    ),
+                )?;
+                write_entries_to(page.entries(), None, format, stdout)?;
+                Ok((
+                    page.next_cursor(),
+                    page.entries().last().map(DaemonLogEntry::cursor),
+                ))
+            }
+            LogPosition::SinceAll => {
+                let snapshot = connection
+                    .logs(&self.query(
+                        LogPageQuery::tail(1).expect("the snapshot Log page limit is valid"),
+                    ))?
+                    .next_cursor();
+                let mut cursor = None;
+                let mut last_delivered = None;
+                loop {
+                    let page = connection.logs(
+                        &self.query(
+                            LogPageQuery::forward(cursor, MAX_LOG_PAGE_LIMIT)
+                                .expect("the maximum forward Log limit is valid"),
+                        ),
+                    )?;
+                    let reached_snapshot = !page.truncated()
+                        || page
+                            .entries()
+                            .last()
+                            .is_some_and(|entry| entry.cursor() >= snapshot);
+                    write_entries_to(page.entries(), Some(snapshot), format, stdout)?;
+                    if let Some(entry) = page
+                        .entries()
+                        .iter()
+                        .take_while(|entry| entry.cursor() <= snapshot)
+                        .last()
+                    {
+                        last_delivered = Some(entry.cursor());
+                    }
+                    if reached_snapshot {
+                        return Ok((snapshot, last_delivered));
+                    }
+                    cursor = Some(page.next_cursor());
+                }
+            }
+        }
+    }
+
+    fn follow_query(&self, cursor: LogCursor) -> LogPageQuery {
+        self.query(
+            LogPageQuery::forward(Some(cursor), DEFAULT_LOG_PAGE_LIMIT)
+                .expect("the default forward Log limit is valid"),
+        )
+    }
+
     fn read_since_snapshot(
         &self,
         transport: &dyn TransportClient,
@@ -314,11 +775,58 @@ pub(crate) fn show_logs(
     let request = LogReadRequest::from(command);
     let plan = LogReadPlan::resolve(&request)?;
     let host = match plan.session_id() {
-        Some(session_id) => config.resolve_session_host(request.host.as_deref(), session_id)?,
-        None => config.resolve_host(request.host.as_deref())?,
+        Some(session_id) => config
+            .resolve_session_host(request.host.as_deref(), session_id)
+            .or_else(|failure| unresolved_log_target(&request, failure))?,
+        None => config
+            .resolve_host(request.host.as_deref())
+            .or_else(|failure| unresolved_log_target(&request, failure))?,
     };
+    if request.follow {
+        let runtime = ProcessFollowRuntime::new().map_err(failure)?;
+        let mut connection_factory = || {
+            transport_for(&host)
+                .map(|transport| {
+                    Box::new(TransportFollowConnection { transport }) as Box<dyn FollowConnection>
+                })
+                .map_err(|failure| failure.error)
+        };
+        let stdout = io::stdout();
+        let stderr = io::stderr();
+        let mut stdout = stdout.lock();
+        let mut stderr = stderr.lock();
+        return follow_logs(
+            &plan,
+            &request,
+            &host.alias,
+            format,
+            &runtime,
+            &mut connection_factory,
+            FollowOutput {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+        )
+        .map_err(failure);
+    }
     let transport = transport_for(&host)?;
     plan.emit(transport.as_ref(), format).map_err(failure)
+}
+
+fn unresolved_log_target(
+    request: &LogReadRequest,
+    failure: CliFailure,
+) -> Result<super::SelectedHost, CliFailure> {
+    if request.host.is_none()
+        && matches!(
+            failure.error.code,
+            ErrorCode::HostNotFound | ErrorCode::InvalidUsage
+        )
+    {
+        Err(super::failure(SatelleError::logs_target_required()))
+    } else {
+        Err(failure)
+    }
 }
 
 pub(crate) fn read_logs_for_host(
@@ -336,12 +844,21 @@ fn write_entries(
     format: OutputFormat,
 ) -> Result<(), SatelleError> {
     let mut stdout = io::stdout().lock();
+    write_entries_to(entries, through, format, &mut stdout)
+}
+
+fn write_entries_to(
+    entries: &[DaemonLogEntry],
+    through: Option<LogCursor>,
+    format: OutputFormat,
+    stdout: &mut dyn Write,
+) -> Result<(), SatelleError> {
     for entry in entries
         .iter()
         .take_while(|entry| through.is_none_or(|cursor| entry.cursor() <= cursor))
     {
         if format.is_json() {
-            serde_json::to_writer(&mut stdout, entry)
+            serde_json::to_writer(&mut *stdout, entry)
                 .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
             writeln!(stdout).map_err(log_output_error)?;
         } else {
@@ -375,4 +892,345 @@ fn parse_log_since(value: &str) -> Result<OffsetDateTime, SatelleError> {
 
 fn log_output_error(error: io::Error) -> SatelleError {
     SatelleError::invalid_usage(format!("could not write log output: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct FakeFollowConnection {
+        host_identity: String,
+        pages: Mutex<VecDeque<Result<satelle_host::DaemonLogPage, SatelleError>>>,
+    }
+
+    impl FakeFollowConnection {
+        fn new(
+            host_identity: &str,
+            pages: impl IntoIterator<Item = Result<satelle_host::DaemonLogPage, SatelleError>>,
+        ) -> Self {
+            Self {
+                host_identity: host_identity.to_string(),
+                pages: Mutex::new(pages.into_iter().collect()),
+            }
+        }
+    }
+
+    impl FollowConnection for FakeFollowConnection {
+        fn host_identity(&self) -> Result<String, SatelleError> {
+            Ok(self.host_identity.clone())
+        }
+
+        fn session(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<satelle_core::session::PublicSession, SatelleError> {
+            Err(SatelleError::not_implemented(
+                "the no-Session follow fixture does not load Sessions",
+            ))
+        }
+
+        fn logs(&self, _query: &LogPageQuery) -> Result<satelle_host::DaemonLogPage, SatelleError> {
+            self.pages
+                .lock()
+                .expect("follow fixture queue lock")
+                .pop_front()
+                .expect("follow fixture has a response")
+        }
+    }
+
+    struct FakeFollowRuntime {
+        started_at: Instant,
+        elapsed: Cell<StdDuration>,
+        sleeps: Cell<usize>,
+        interrupt_after_sleeps: Option<usize>,
+    }
+
+    impl FakeFollowRuntime {
+        fn new(interrupt_after_sleeps: Option<usize>) -> Self {
+            Self {
+                started_at: Instant::now(),
+                elapsed: Cell::new(StdDuration::ZERO),
+                sleeps: Cell::new(0),
+                interrupt_after_sleeps,
+            }
+        }
+    }
+
+    impl FollowRuntime for FakeFollowRuntime {
+        fn now(&self) -> Instant {
+            self.started_at + self.elapsed.get()
+        }
+
+        fn interrupted(&self) -> bool {
+            self.interrupt_after_sleeps
+                .is_some_and(|limit| self.sleeps.get() >= limit)
+        }
+
+        fn sleep(&self, duration: StdDuration) {
+            self.elapsed.set(self.elapsed.get() + duration);
+            self.sleeps.set(self.sleeps.get() + 1);
+        }
+
+        fn jitter(&self, duration: StdDuration) -> StdDuration {
+            duration
+        }
+    }
+
+    fn request() -> LogReadRequest {
+        LogReadRequest {
+            host: Some("remote".to_string()),
+            session: None,
+            tail: Some(1),
+            since: None,
+            after: None,
+            source: Vec::new(),
+            level: None,
+            follow: true,
+            no_reconnect: false,
+        }
+    }
+
+    fn page(cursor: u64) -> satelle_host::DaemonLogPage {
+        serde_json::from_value(serde_json::json!({
+            "entries": [{
+                "schema_version": "satelle.logs.entry.v1",
+                "cursor": format!("slc1_{cursor:016x}"),
+                "timestamp": "2026-08-02T00:00:00Z",
+                "host_identity": "host-original",
+                "source": "storage",
+                "severity": "info",
+                "event": "store_opened",
+                "subject": {"kind": "host"},
+                "message": "opened Host state store",
+                "redacted": true
+            }],
+            "next_cursor": format!("slc1_{cursor:016x}"),
+            "truncated": false
+        }))
+        .expect("valid normalized Log page fixture")
+    }
+
+    #[test]
+    fn reconnect_resumes_the_same_ndjson_stream_from_the_stored_cursor() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let mut connections = VecDeque::from(vec![
+            Box::new(FakeFollowConnection::new(
+                "host-original",
+                [Ok(page(1)), Err(SatelleError::host_unreachable("remote"))],
+            )) as Box<dyn FollowConnection>,
+            Box::new(FakeFollowConnection::new("host-original", [Ok(page(2))]))
+                as Box<dyn FollowConnection>,
+        ]);
+        let mut factory = || {
+            connections
+                .pop_front()
+                .ok_or_else(|| SatelleError::host_unreachable("remote"))
+        };
+        let runtime = FakeFollowRuntime::new(Some(2));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Json,
+            &runtime,
+            &mut factory,
+            FollowOutput {
+                stdout: &mut stdout,
+                stderr: &mut stderr,
+            },
+        )
+        .expect_err("the fixture interrupts after the resumed page");
+
+        assert_eq!(error.code, ErrorCode::Interrupted);
+        let records = String::from_utf8(stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["cursor"], "slc1_0000000000000001");
+        assert_eq!(records[1]["cursor"], "slc1_0000000000000002");
+        let notices = String::from_utf8(stderr).unwrap();
+        assert!(notices.contains("reconnecting after interruption 1/10"));
+        assert!(notices.contains("resuming after cursor=slc1_0000000000000001"));
+    }
+
+    #[test]
+    fn reconnect_rejects_a_changed_host_identity_before_resuming() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let mut connections = VecDeque::from(vec![
+            Box::new(FakeFollowConnection::new(
+                "host-original",
+                [Ok(page(1)), Err(SatelleError::host_unreachable("remote"))],
+            )) as Box<dyn FollowConnection>,
+            Box::new(FakeFollowConnection::new(
+                "host-replacement",
+                std::iter::empty::<Result<satelle_host::DaemonLogPage, SatelleError>>(),
+            )) as Box<dyn FollowConnection>,
+        ]);
+        let mut factory = || {
+            connections
+                .pop_front()
+                .ok_or_else(|| SatelleError::host_unreachable("remote"))
+        };
+        let runtime = FakeFollowRuntime::new(None);
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Json,
+            &runtime,
+            &mut factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut Vec::new(),
+            },
+        )
+        .expect_err("identity drift is terminal");
+        assert_eq!(error.code, ErrorCode::LogsFollowIdentityChanged);
+        assert_eq!(error.details["expected_host_identity"], "host-original");
+        assert_eq!(error.details["observed_host_identity"], "host-replacement");
+    }
+
+    #[test]
+    fn reconnect_budget_is_finite_and_reports_the_resume_command() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let factory_calls = Cell::new(0);
+        let mut factory = || {
+            let call = factory_calls.get();
+            factory_calls.set(call + 1);
+            let pages = if call == 0 {
+                vec![Ok(page(1)), Err(SatelleError::host_unreachable("remote"))]
+            } else {
+                vec![Err(SatelleError::host_unreachable("remote"))]
+            };
+            Ok(Box::new(FakeFollowConnection::new("host-original", pages))
+                as Box<dyn FollowConnection>)
+        };
+        let runtime = FakeFollowRuntime::new(None);
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Json,
+            &runtime,
+            &mut factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut Vec::new(),
+            },
+        )
+        .expect_err("the per-interruption reconnect budget is finite");
+        assert_eq!(error.code, ErrorCode::LogsFollowReconnectExhausted);
+        assert_eq!(
+            error.details["last_delivered_cursor"],
+            "slc1_0000000000000001"
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some("satelle logs --host remote --after slc1_0000000000000001 --follow")
+        );
+        assert!(runtime.elapsed.get() >= RECONNECT_BUDGET);
+    }
+
+    #[test]
+    fn no_reconnect_returns_the_transport_failure_with_the_last_cursor() {
+        let mut request = request();
+        request.no_reconnect = true;
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let mut connection = Some(Box::new(FakeFollowConnection::new(
+            "host-original",
+            [Ok(page(1)), Err(SatelleError::host_unreachable("remote"))],
+        )) as Box<dyn FollowConnection>);
+        let mut factory = || {
+            connection
+                .take()
+                .ok_or_else(|| SatelleError::host_unreachable("remote"))
+        };
+        let runtime = FakeFollowRuntime::new(None);
+        let mut stderr = Vec::new();
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Json,
+            &runtime,
+            &mut factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut stderr,
+            },
+        )
+        .expect_err("--no-reconnect returns the first transport loss");
+        assert_eq!(error.code, ErrorCode::HostUnreachable);
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("last cursor=slc1_0000000000000001")
+        );
+    }
+
+    #[test]
+    fn the_tenth_stream_interruption_is_terminal() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let factory_calls = Cell::new(0_u64);
+        let mut factory = || {
+            let call = factory_calls.get();
+            factory_calls.set(call + 1);
+            Ok(Box::new(FakeFollowConnection::new(
+                "host-original",
+                [
+                    Ok(page(call + 1)),
+                    Err(SatelleError::host_unreachable("remote")),
+                ],
+            )) as Box<dyn FollowConnection>)
+        };
+        let runtime = FakeFollowRuntime::new(None);
+
+        let error = follow_logs(
+            &plan,
+            &request,
+            "remote",
+            OutputFormat::Json,
+            &runtime,
+            &mut factory,
+            FollowOutput {
+                stdout: &mut Vec::new(),
+                stderr: &mut Vec::new(),
+            },
+        )
+        .expect_err("the interruption cap is finite");
+        assert_eq!(error.code, ErrorCode::LogsFollowReconnectExhausted);
+        assert_eq!(error.details["stream_interruptions"], 10);
+        assert_eq!(factory_calls.get(), 10);
+    }
+
+    #[test]
+    fn reconnect_jitter_stays_within_the_bounded_twenty_percent_window() {
+        let delay = StdDuration::from_secs(1);
+        assert_eq!(jittered_delay(delay, 0), StdDuration::from_millis(800));
+        assert_eq!(
+            jittered_delay(delay, 4_000),
+            StdDuration::from_millis(1_200)
+        );
+        assert!(jittered_delay(RECONNECT_MAX_DELAY, 4_000) <= RECONNECT_MAX_DELAY);
+    }
 }

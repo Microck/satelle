@@ -9,6 +9,8 @@ use time::format_description::well_known::Rfc3339;
 
 pub(crate) const DEFAULT_SESSION_RETENTION: time::Duration =
     time::Duration::hours(satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS as i64);
+pub(crate) const DEFAULT_LOG_RETENTION: time::Duration =
+    time::Duration::hours(satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS as i64);
 pub(crate) const DEFAULT_SETUP_LEDGER_RETENTION: time::Duration = time::Duration::milliseconds(
     satelle_core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS as i64,
 );
@@ -55,6 +57,7 @@ impl Storage {
             session_cutoff_nanos,
             setup_cutoff,
             observed_at,
+            self.log_retention,
         )? {
             return Ok(());
         }
@@ -62,7 +65,7 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        prune_expired_logs(&transaction, observed_at)?;
+        prune_expired_logs(&transaction, observed_at, self.log_retention)?;
         prune_expired_admission_cancellations(&transaction, observed_at)?;
         prune_expired_sessionless_idempotency(&transaction, observed_at)?;
         let candidates =
@@ -90,8 +93,9 @@ fn retention_needs_pruning(
     session_cutoff_nanos: i64,
     setup_cutoff: OffsetDateTime,
     observed_at: OffsetDateTime,
+    log_retention: time::Duration,
 ) -> Result<bool, StorageError> {
-    if logs_need_pruning(connection, observed_at)? {
+    if logs_need_pruning(connection, observed_at, log_retention)? {
         return Ok(true);
     }
     if admission_cancellations_need_pruning(connection, observed_at)? {

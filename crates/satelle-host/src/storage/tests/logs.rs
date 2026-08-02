@@ -89,10 +89,13 @@ fn operator_log_formats_the_authoritative_normalized_entry_only() {
     assert!(matches!(outcome, OperatorLogWriteOutcome::Written));
     assert_eq!(
         fs::read_to_string(log_root.join("satelle-host.log")).expect("read operator log fixture"),
-        concat!(
-            "2026-01-02T03:04:01Z level=warn source=storage ",
-            "event=store_opened subject=host cursor=slc1_0000000000000002 ",
-            "message=\"opened Host state store\"\n",
+        format!(
+            concat!(
+                "2026-01-02T03:04:01Z level=warn host={} source=storage ",
+                "event=store_opened subject=host cursor=slc1_0000000000000002 ",
+                "message=\"opened Host state store\"\n",
+            ),
+            normalized.host_identity().as_str(),
         )
     );
 }
@@ -747,4 +750,59 @@ fn log_reads_enforce_retention_even_when_no_new_log_has_been_written() {
         .expect_err("the pre-retention origin must be expired");
     assert_eq!(error.earliest_available_cursor(), None);
     assert_eq!(error.resume_cursor(), Some(expired));
+}
+
+#[test]
+fn log_reads_use_the_configured_sqlite_retention() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage.set_log_retention(time::Duration::days(30));
+    let retained = storage
+        .append_safe_log(&host_log(
+            OffsetDateTime::now_utc() - time::Duration::days(8),
+            LogSource::Storage,
+            LogSeverity::Info,
+        ))
+        .expect("append a Log Entry inside configured retention");
+
+    let page = storage
+        .log_page(&LogPageQuery::tail(10).expect("valid tail query"))
+        .expect("read with configured retention");
+    assert_eq!(
+        page.entries()
+            .iter()
+            .map(|entry| entry.cursor().position())
+            .collect::<Vec<_>>(),
+        vec![retained]
+    );
+}
+
+#[test]
+fn failed_turns_persist_a_normalized_structured_error_without_raw_payloads() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    storage
+        .begin_session(
+            &session,
+            &admission(IdempotentOperation::Run, "run-log-error", "request", at(0)),
+        )
+        .expect("admit Session");
+    storage
+        .commit_lifecycle(
+            session.id(),
+            &turn_id(TURN_1),
+            revisions(&session, TURN_1),
+            TurnTransition::Failed,
+            at(1),
+        )
+        .expect("commit failed Turn");
+
+    let logs = storage.logs_after(None, 10).expect("read normalized logs");
+    let error = logs
+        .iter()
+        .find(|log| log.record().event() == LogEvent::StructuredExecutionError)
+        .expect("failed Turn should persist a structured error summary");
+    assert_eq!(error.record().source(), LogSource::CodexAdapter);
+    assert_eq!(error.record().severity(), LogSeverity::Error);
 }

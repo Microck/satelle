@@ -572,6 +572,7 @@ fn logs_json_lines_use_the_exact_entry_v1_contract() {
     let expected_fields = [
         "cursor",
         "event",
+        "host_identity",
         "message",
         "redacted",
         "schema_version",

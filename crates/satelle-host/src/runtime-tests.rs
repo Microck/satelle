@@ -127,11 +127,14 @@ fn host_retention_config_becomes_the_runtime_storage_policy() {
         .expect("the built-in local Host config exists");
     config.session_metadata_retention =
         Some(satelle_core::RetentionDuration::parse("30d").expect("parse session retention"));
+    config.sqlite_log_retention =
+        Some(satelle_core::RetentionDuration::parse("45d").expect("parse Log retention"));
     config.operator_log_retained_files = Some(12);
 
     let policy = super::RuntimeStoragePolicy::from_host_config(&config);
 
     assert_eq!(policy.session_metadata_retention, time::Duration::days(30));
+    assert_eq!(policy.sqlite_log_retention, time::Duration::days(45));
     assert_eq!(policy.operator_log_retained_files, 12);
     assert_eq!(
         policy.setup_ledger_retention,

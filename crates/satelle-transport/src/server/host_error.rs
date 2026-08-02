@@ -425,6 +425,11 @@ fn failure(error: &SatelleError) -> ApiFailure {
         // Process interruption is a Controller-local process-exit contract.
         // If it crosses the Host boundary, expose no extra API surface.
         | ErrorCode::Interrupted
+        // Log targeting and follow recovery are also Controller-local. The
+        // Host API exposes finite pages, not the CLI's polling lifecycle.
+        | ErrorCode::LogsTargetRequired
+        | ErrorCode::LogsFollowIdentityChanged
+        | ErrorCode::LogsFollowReconnectExhausted
         | ErrorCode::SshHostKeyVerificationRequired => ApiFailure {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: ApiErrorCode::InternalError,

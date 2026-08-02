@@ -79,9 +79,23 @@ pub(super) fn canonical_log(
     let turn = session
         .turn(turn_id)
         .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+    let source = match event {
+        LogEvent::TurnStateCommitted
+        | LogEvent::ProviderSmokeSummary
+        | LogEvent::StructuredExecutionError => LogSource::CodexAdapter,
+        LogEvent::SessionStarted
+        | LogEvent::FollowUpStarted
+        | LogEvent::NativeReadinessSummary
+        | LogEvent::StopConfirmed
+        | LogEvent::StopNotConfirmed
+        | LogEvent::RestartRecoveryPending => LogSource::HostDaemon,
+        LogEvent::StoreOpened => {
+            return Err(StorageError::new(StorageErrorKind::InvalidInput));
+        }
+    };
     SafeLogRecord::new(
         recorded_at,
-        LogSource::HostDaemon,
+        source,
         severity,
         event,
         LogSubject::Turn {
@@ -140,7 +154,7 @@ impl Storage {
         if stored.len() != 1 || stored[0].cursor != cursor {
             return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
-        stored_page_entry(stored.remove(0))
+        stored_page_entry(stored.remove(0), self.host_identity()?)
     }
 
     pub(crate) fn latest_log_cursor(&self) -> Result<u64, StorageError> {
@@ -160,11 +174,12 @@ impl Storage {
     ) -> Result<Vec<(u64, DaemonLogEntry)>, StorageError> {
         let query = LogPageQuery::forward(Some(LogCursor::from_position(cursor)), limit)
             .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
+        let host_identity = self.host_identity()?;
         load_log_page_records(&self.connection, &query, limit)?
             .into_iter()
             .map(|stored| {
                 let cursor = stored.cursor;
-                stored_page_entry(stored).map(|entry| (cursor, entry))
+                stored_page_entry(stored, host_identity.clone()).map(|entry| (cursor, entry))
             })
             .collect()
     }
@@ -219,9 +234,10 @@ impl Storage {
         if query.mode() == LogPageMode::Tail {
             stored.reverse();
         }
+        let host_identity = self.host_identity()?;
         let entries = stored
             .into_iter()
-            .map(stored_page_entry)
+            .map(|stored| stored_page_entry(stored, host_identity.clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let next_cursor = if query.mode() == LogPageMode::Forward && truncated {
             entries.last().map_or_else(
@@ -235,25 +251,29 @@ impl Storage {
     }
 
     fn prune_logs_if_needed(&mut self, observed_at: OffsetDateTime) -> Result<(), StorageError> {
-        if !logs_need_pruning(&self.connection, observed_at)? {
+        if !logs_need_pruning(&self.connection, observed_at, self.log_retention)? {
             return Ok(());
         }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        prune_expired_logs(&transaction, observed_at)?;
+        prune_expired_logs(&transaction, observed_at, self.log_retention)?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
     }
 }
 
-fn stored_page_entry(stored: StoredLogRecord) -> Result<DaemonLogEntry, StorageError> {
+fn stored_page_entry(
+    stored: StoredLogRecord,
+    host_identity: satelle_core::session::HostIdentityRef,
+) -> Result<DaemonLogEntry, StorageError> {
     let record = stored.record;
     DaemonLogEntry::from_parts(
         stored.cursor,
         record.recorded_at,
+        host_identity,
         record.source,
         record.severity,
         record.event,

@@ -30,6 +30,7 @@ native_readiness_cache_ttl = "5m"
 provider_smoke_success_cache_ttl = "1440m"
 provider_smoke_failure_cache_ttl = "10m"
 session_metadata_retention = "30d"
+sqlite_log_retention = "45d"
 operator_log_retained_files = 12
 yolo = false
 
@@ -42,9 +43,10 @@ Host fields include `transport`, `adapter`, `address`, `network`, `timeouts`,
 desktop selection, daemon path overrides, `setup_mode`, experimental-provider
 opt-in, daemon and readiness cache TTLs, Host-scoped `yolo`, project-selection
 permission, direct-transport identity and trust fields, and provider Secret
-Source descriptors. `session_metadata_retention` accepts `h` or `d` values from
-7 days through 365 days. `operator_log_retained_files` keeps 1 through 100
-rotated 10 MiB files and does not change SQLite log retention.
+Source descriptors. `session_metadata_retention` and `sqlite_log_retention`
+accept `h` or `d` values from 7 days through 365 days. They are independent.
+`operator_log_retained_files` keeps 1 through 100 rotated 10 MiB files and does
+not change SQLite log retention.
 
 The duration parser requires explicit units such as `500ms`, `30s`, or `2m`.
 Configuration does not perform environment-variable interpolation.
@@ -65,6 +67,7 @@ provider_smoke_failure_cache_ttl = "5m"
 log_verbosity = "debug"
 trusted_profile = "maintenance"
 session_metadata_retention = "30d"
+sqlite_log_retention = "45d"
 operator_log_retained_files = 12
 yolo = false
 

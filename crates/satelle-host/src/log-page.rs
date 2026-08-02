@@ -1,4 +1,4 @@
-use satelle_core::session::{SessionStateRevision, TurnStateRevision};
+use satelle_core::session::{HostIdentityRef, SessionStateRevision, TurnStateRevision};
 use satelle_core::{SessionId, TurnId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
@@ -136,7 +136,10 @@ impl LogSeverity {
 pub enum LogEvent {
     SessionStarted,
     FollowUpStarted,
+    NativeReadinessSummary,
+    ProviderSmokeSummary,
     TurnStateCommitted,
+    StructuredExecutionError,
     StopConfirmed,
     StopNotConfirmed,
     RestartRecoveryPending,
@@ -148,7 +151,10 @@ impl LogEvent {
         match self {
             Self::SessionStarted => "session_started",
             Self::FollowUpStarted => "follow_up_started",
+            Self::NativeReadinessSummary => "native_readiness_summary",
+            Self::ProviderSmokeSummary => "provider_smoke_summary",
             Self::TurnStateCommitted => "turn_state_committed",
+            Self::StructuredExecutionError => "structured_execution_error",
             Self::StopConfirmed => "stop_confirmed",
             Self::StopNotConfirmed => "stop_not_confirmed",
             Self::RestartRecoveryPending => "restart_recovery_pending",
@@ -160,7 +166,10 @@ impl LogEvent {
         match self {
             Self::SessionStarted => "created Session",
             Self::FollowUpStarted => "admitted follow-up Turn",
+            Self::NativeReadinessSummary => "native Computer Use readiness passed",
+            Self::ProviderSmokeSummary => "provider smoke test passed",
             Self::TurnStateCommitted => "committed Turn state",
+            Self::StructuredExecutionError => "recorded a structured execution failure",
             Self::StopConfirmed => "confirmed stop request",
             Self::StopNotConfirmed => "stop request requires recovery",
             Self::RestartRecoveryPending => "Turn requires restart recovery",
@@ -244,6 +253,7 @@ impl<'de> Deserialize<'de> for Redacted {
 pub struct DaemonLogEntry {
     cursor: LogCursor,
     timestamp: OffsetDateTime,
+    host_identity: HostIdentityRef,
     source: LogSource,
     severity: LogSeverity,
     event: LogEvent,
@@ -254,6 +264,7 @@ impl DaemonLogEntry {
     pub(crate) fn from_parts(
         cursor: u64,
         timestamp: OffsetDateTime,
+        host_identity: HostIdentityRef,
         source: LogSource,
         severity: LogSeverity,
         event: LogEvent,
@@ -262,6 +273,7 @@ impl DaemonLogEntry {
         let entry = Self {
             cursor: LogCursor::from_position(cursor),
             timestamp,
+            host_identity,
             source,
             severity,
             event,
@@ -289,6 +301,10 @@ impl DaemonLogEntry {
         self.timestamp
     }
 
+    pub const fn host_identity(&self) -> &HostIdentityRef {
+        &self.host_identity
+    }
+
     pub const fn source(&self) -> LogSource {
         self.source
     }
@@ -312,6 +328,7 @@ struct DaemonLogEntryRef<'a> {
     cursor: LogCursor,
     #[serde(with = "time::serde::rfc3339")]
     timestamp: OffsetDateTime,
+    host_identity: &'a str,
     source: LogSource,
     severity: LogSeverity,
     event: LogEvent,
@@ -329,6 +346,7 @@ impl Serialize for DaemonLogEntry {
             schema_version: LogEntrySchema,
             cursor: self.cursor,
             timestamp: self.timestamp,
+            host_identity: self.host_identity.as_str(),
             source: self.source,
             severity: self.severity,
             event: self.event,
@@ -348,6 +366,7 @@ struct DaemonLogEntryOwned {
     cursor: LogCursor,
     #[serde(with = "time::serde::rfc3339")]
     timestamp: OffsetDateTime,
+    host_identity: String,
     source: LogSource,
     severity: LogSeverity,
     event: LogEvent,
@@ -371,6 +390,8 @@ impl<'de> Deserialize<'de> for DaemonLogEntry {
         let entry = Self {
             cursor: wire.cursor,
             timestamp: wire.timestamp,
+            host_identity: HostIdentityRef::new(wire.host_identity)
+                .map_err(serde::de::Error::custom)?,
             source: wire.source,
             severity: wire.severity,
             event: wire.event,
@@ -730,6 +751,7 @@ mod tests {
         let entry = DaemonLogEntry::from_parts(
             2,
             OffsetDateTime::UNIX_EPOCH,
+            HostIdentityRef::new("host-log-test").unwrap(),
             LogSource::Storage,
             LogSeverity::Info,
             LogEvent::StoreOpened,
