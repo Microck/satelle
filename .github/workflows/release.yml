@@ -18,20 +18,21 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Non-publishing release diagnostic or rollback recovery
+        description: Non-publishing release diagnostic or recovery
         required: true
         type: choice
         default: diagnostics
         options:
           - diagnostics
+          - candidate-tag-repair
           - rollback
       version:
-        description: Existing release version for rollback recovery
+        description: Existing release version for recovery
         required: false
         type: string
 
 concurrency:
-  group: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.operation == 'rollback')) && 'satelle-npm-release-writer' || format('release-candidate-{0}', github.ref) }}
+  group: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.operation != 'diagnostics')) && 'satelle-npm-release-writer' || format('release-candidate-{0}', github.ref) }}
   cancel-in-progress: false
 
 permissions:
@@ -188,12 +189,12 @@ jobs:
             > validated/tegami-validation.json \
             2> "$error_log" && \
             SATELLE_TEGAMI_RELEASE_VERSION="$RELEASE_VERSION" \
-              npm run tegami --prefix npm/release-tooling -- publish
+              npm run tegami --prefix npm/release-tooling -- publish \
+              >> "$error_log" 2>&1
           status=$?
           set -e
           if [ "$status" -ne 0 ]; then
             node npm/scripts/release-tooling-gate.cjs record-failure \
-              "$error_log" \
               validated/tegami-validation.json
           fi
           exit "$status"
@@ -263,6 +264,10 @@ jobs:
       attestations: write
       contents: read
       id-token: write
+      pull-requests: read
+    outputs:
+      source-digest: ${{ steps.tag.outputs.source-digest }}
+      tag-digest: ${{ steps.tag.outputs.tag-digest }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -332,6 +337,7 @@ jobs:
           test "$release_pr_count" = 1 || \
             release_tag_not_trusted "release tag commit was not produced by one merged release pull request"
           printf 'source-digest=%s\n' "$source_digest" >> "$GITHUB_OUTPUT"
+          printf 'tag-digest=%s\n' "$tag_digest" >> "$GITHUB_OUTPUT"
 
       - name: Attest every native archive
         id: provenance
@@ -570,11 +576,22 @@ jobs:
                 tegami-validation.json
             } | LC_ALL=C sort
           )
-          actual_assets=$(gh release view "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json assets \
-            --jq '.assets[].name | select((startswith("npm-candidate-") or startswith("npm-promotion-")) | not)' \
-            | LC_ALL=C sort)
+          version_pattern=${RELEASE_VERSION//./\\.}
+          candidate_pattern="^npm-candidate-v${version_pattern}-[0-9]+-[0-9]+-[0-9]+\\.json$"
+          promotion_pattern="^npm-promotion-v${version_pattern}-[0-9]+-[0-9]+-[0-9]+\\.json$"
+          actual_assets=$(
+            gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name' \
+              | while IFS= read -r asset_name; do
+                  if [[ "$asset_name" =~ $candidate_pattern || "$asset_name" =~ $promotion_pattern ]]; then
+                    continue
+                  fi
+                  printf '%s\n' "$asset_name"
+                done \
+              | LC_ALL=C sort
+          )
           if [ "$actual_assets" != "$expected_assets" ]; then
             printf '%s\n' "release asset set does not match the validated artifact set" >&2
             exit 1
@@ -583,7 +600,7 @@ jobs:
   publish-candidates:
     name: Publish immutable npm candidates
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [collect, draft-release]
+    needs: [attest, collect, draft-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -618,14 +635,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.attest.outputs.source-digest }}
+          EXPECTED_TAG_DIGEST: ${{ needs.attest.outputs.tag-digest }}
         shell: bash
         run: |
+          release_tag_not_trusted() {
+            printf '{"code":"release-tag-not-trusted","message":"%s"}\n' "$1" >&2
+            exit 1
+          }
+          recheck_release_tag() {
+            current_tag_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+              --jq 'select(.object.type == "tag") | .object.sha') || \
+              release_tag_not_trusted "release tag ref cannot be resolved"
+            test -n "$current_tag_digest" && test "$current_tag_digest" = "$EXPECTED_TAG_DIGEST" || \
+              release_tag_not_trusted "release tag object moved after attestation"
+            current_source_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/tags/$EXPECTED_TAG_DIGEST" \
+              --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha') || \
+              release_tag_not_trusted "annotated release tag cannot be resolved"
+            test -n "$current_source_digest" && test "$current_source_digest" = "$EXPECTED_SOURCE_DIGEST" || \
+              release_tag_not_trusted "release tag source changed after attestation"
+            is_draft=$(gh release view \
+              "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft) || \
+              release_tag_not_trusted "GitHub release cannot be resolved"
+            test "$is_draft" = true || \
+              release_tag_not_trusted "GitHub release is no longer draft"
+          }
+
           record="$RUNNER_TEMP/npm-candidate-publication.json"
           checkpoint() {
             sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).sequence))' "$record")
             snapshot="$RUNNER_TEMP/npm-candidate-v${RELEASE_VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${sequence}.json"
             cp "$record" "$snapshot"
-            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "$snapshot"
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$snapshot"
           }
           node npm/scripts/npm-candidate-publication.cjs create \
             "$RELEASE_VERSION" \
@@ -633,8 +679,22 @@ jobs:
             "$record"
           checkpoint
           trap 'checkpoint' ERR
+          max_advances=$(node -e 'process.stdout.write(String(require(process.argv[1]).packages.length))' "$record")
+          advances=0
           while [ "$(node -e 'process.stdout.write(require(process.argv[1]).status)' "$record")" != complete ]; do
+            before_sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).sequence))' "$record")
+            recheck_release_tag
             node npm/scripts/npm-candidate-publication.cjs advance "$record" validated/npm
+            after_sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).sequence))' "$record")
+            test "$after_sequence" -gt "$before_sequence" || {
+              echo "candidate publication sequence did not advance" >&2
+              exit 1
+            }
+            advances=$((advances + 1))
+            test "$advances" -le "$max_advances" || {
+              echo "candidate publication exceeded its package count" >&2
+              exit 1
+            }
             checkpoint
           done
           trap - ERR
@@ -701,7 +761,7 @@ jobs:
               node -e 'require("fs").writeFileSync(process.argv[1], "{\"private\":true}\n")' "$install_root/package.json"
               case "$manager" in
                 npm) npm install --prefix "$install_root" --include=optional --ignore-scripts --no-audit --no-fund "$package_spec" ;;
-                pnpm) pnpm --dir "$install_root" add --ignore-scripts "$package_spec" ;;
+                pnpm) pnpm --dir "$install_root" --minimum-release-age=0 add --ignore-scripts "$package_spec" ;;
                 bun) bun --cwd "$install_root" add --ignore-scripts "$package_spec" ;;
               esac
               smoke "$install_root/node_modules/.bin/satelle"
@@ -711,7 +771,7 @@ jobs:
   promote-and-publish:
     name: Promote npm graph and publish GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [collect, draft-release, validate-registry-candidates]
+    needs: [attest, collect, draft-release, validate-registry-candidates]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -742,20 +802,53 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
+          SATELLE_PROMOTION_RECORD_KEY: ${{ secrets.NPM_PROMOTION_RECORD_KEY }}
           RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.attest.outputs.source-digest }}
+          EXPECTED_TAG_DIGEST: ${{ needs.attest.outputs.tag-digest }}
         shell: bash
         run: |
+          release_tag_not_trusted() {
+            printf '{"code":"release-tag-not-trusted","message":"%s"}\n' "$1" >&2
+            exit 1
+          }
+          recheck_release_tag() {
+            current_tag_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+              --jq 'select(.object.type == "tag") | .object.sha') || \
+              release_tag_not_trusted "release tag ref cannot be resolved"
+            test -n "$current_tag_digest" && test "$current_tag_digest" = "$EXPECTED_TAG_DIGEST" || \
+              release_tag_not_trusted "release tag object moved after attestation"
+            current_source_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/tags/$EXPECTED_TAG_DIGEST" \
+              --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha') || \
+              release_tag_not_trusted "annotated release tag cannot be resolved"
+            test -n "$current_source_digest" && test "$current_source_digest" = "$EXPECTED_SOURCE_DIGEST" || \
+              release_tag_not_trusted "release tag source changed after attestation"
+            is_draft=$(gh release view \
+              "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft) || \
+              release_tag_not_trusted "GitHub release cannot be resolved"
+            test "$is_draft" = true || \
+              release_tag_not_trusted "GitHub release is no longer draft"
+          }
+
           records="$RUNNER_TEMP/promotion-records"
           record="$RUNNER_TEMP/npm-promotion.json"
+          asset_ids="$RUNNER_TEMP/npm-promotion-asset-ids"
           mkdir -p "$records"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | .assets[] | select(.name | startswith("npm-promotion-")) | .id' \
+            > "$asset_ids"
           while read -r asset_id; do
             [ -n "$asset_id" ] || continue
             gh api \
               -H 'Accept: application/octet-stream' \
               "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
               > "$records/${asset_id}.json"
-          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | .assets[] | select(.name | startswith("npm-promotion-")) | .id')
+          done < "$asset_ids"
 
           current=$(node npm/scripts/npm-promotion.cjs audit-records "$records" "$RELEASE_VERSION")
           current_file=$(printf '%s' "$current" | node -e '
@@ -772,39 +865,299 @@ jobs:
           fi
 
           checkpoint() {
-            sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).sequence))' "$record")
+            sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).record.sequence))' "$record")
             snapshot="$RUNNER_TEMP/npm-promotion-v${RELEASE_VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${sequence}.json"
             cp "$record" "$snapshot"
-            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "$snapshot"
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$snapshot"
           }
           checkpoint
           trap 'checkpoint' ERR
-          while [ "$(node -e 'process.stdout.write(require(process.argv[1]).status)' "$record")" != complete ]; do
+          max_advances=$(node -e 'process.stdout.write(String(require(process.argv[1]).record.packages.length))' "$record")
+          advances=0
+          while [ "$(node -e 'process.stdout.write(require(process.argv[1]).record.status)' "$record")" != complete ]; do
+            before_sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).record.sequence))' "$record")
+            recheck_release_tag
             node npm/scripts/npm-promotion.cjs advance "$record"
+            after_sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).record.sequence))' "$record")
+            test "$after_sequence" -gt "$before_sequence" || {
+              echo "npm promotion sequence did not advance" >&2
+              exit 1
+            }
+            advances=$((advances + 1))
+            test "$advances" -le "$max_advances" || {
+              echo "npm promotion exceeded its package count" >&2
+              exit 1
+            }
             checkpoint
           done
           trap - ERR
           node npm/scripts/npm-promotion.cjs verify-complete "$record"
 
-      - name: Publish the fully promoted GitHub release
+      - name: Recheck signed tag and publish the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          SATELLE_PROMOTION_RECORD_KEY: ${{ secrets.NPM_PROMOTION_RECORD_KEY }}
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.attest.outputs.source-digest }}
+          EXPECTED_TAG_DIGEST: ${{ needs.attest.outputs.tag-digest }}
+        shell: bash
+        run: |
+          release_tag_not_trusted() {
+            printf '{"code":"release-tag-not-trusted","message":"%s"}\n' "$1" >&2
+            exit 1
+          }
+          recheck_release_tag() {
+            current_tag_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+              --jq 'select(.object.type == "tag") | .object.sha') || \
+              release_tag_not_trusted "release tag ref cannot be resolved"
+            test -n "$current_tag_digest" && test "$current_tag_digest" = "$EXPECTED_TAG_DIGEST" || \
+              release_tag_not_trusted "release tag object moved after attestation"
+            current_source_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/tags/$EXPECTED_TAG_DIGEST" \
+              --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha') || \
+              release_tag_not_trusted "annotated release tag cannot be resolved"
+            test -n "$current_source_digest" && test "$current_source_digest" = "$EXPECTED_SOURCE_DIGEST" || \
+              release_tag_not_trusted "release tag source changed after attestation"
+          }
+
+          release_asset_invalid() {
+            printf '{"code":"release-asset-invalid","message":"%s"}\n' "$1" >&2
+            exit 1
+          }
+          require_immutable_releases() {
+            immutable_releases=$(gh api \
+              "repos/$GITHUB_REPOSITORY/immutable-releases" \
+              --jq .enabled) || \
+              release_asset_invalid "immutable release policy cannot be resolved"
+            test "$immutable_releases" = true || \
+              release_asset_invalid "immutable releases are not enabled"
+          }
+          recheck_release_tag
+          require_immutable_releases
+          downloaded="$RUNNER_TEMP/final-release-assets"
+          records="$RUNNER_TEMP/final-promotion-records"
+          expected_names="$RUNNER_TEMP/expected-release-asset-names"
+          expected_manifest="$RUNNER_TEMP/expected-release-assets.sha256"
+          candidate_ids="$RUNNER_TEMP/candidate-asset-ids"
+          verified_assets="$RUNNER_TEMP/verified-release-assets"
+          current_assets="$RUNNER_TEMP/current-release-assets"
+          mkdir -p "$downloaded" "$records"
+          : > "$expected_names"
+          : > "$expected_manifest"
+          : > "$candidate_ids"
+          : > "$verified_assets"
+
+          static_files=(
+            validated/tegami-validation.json
+            validated/tegami-changelog-validation.json
+            validated/release-orchestration.json
+            validated/github/*
+            validated/npm/npm-artifacts.json
+          )
+          for file in "${static_files[@]}"; do
+            asset_name=$(basename "$file")
+            digest=$(sha256sum "$file" | cut -d ' ' -f1)
+            printf '%s\n' "$asset_name" >> "$expected_names"
+            printf '%s  %s\n' "$digest" "$asset_name" >> "$expected_manifest"
+          done
+          LC_ALL=C sort -o "$expected_names" "$expected_names"
+
+          version_pattern=${RELEASE_VERSION//./\\.}
+          candidate_pattern="^npm-candidate-v${version_pattern}-[0-9]+-[0-9]+-[0-9]+\\.json$"
+          promotion_pattern="^npm-promotion-v${version_pattern}-[0-9]+-[0-9]+-[0-9]+\\.json$"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.assets[] | [.id, .name] | @tsv' \
+            | while IFS=$'\t' read -r asset_id asset_name; do
+                if grep -Fqx "$asset_name" "$expected_names"; then
+                  gh api \
+                    -H 'Accept: application/octet-stream' \
+                    "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+                    > "$downloaded/$asset_name"
+                  printf '%s\t%s\n' "$asset_id" "$asset_name" >> "$verified_assets"
+                elif [[ "$asset_name" =~ $candidate_pattern ]]; then
+                  printf '%s\n' "$asset_id" >> "$candidate_ids"
+                elif [[ "$asset_name" =~ $promotion_pattern ]]; then
+                  gh api \
+                    -H 'Accept: application/octet-stream' \
+                    "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+                    > "$records/$asset_name"
+                  printf '%s\t%s\n' "$asset_id" "$asset_name" >> "$verified_assets"
+                else
+                  release_asset_invalid "release contains unrecognized asset $asset_name"
+                fi
+              done
+
+          (cd "$downloaded" && sha256sum --check "$expected_manifest") || \
+            release_asset_invalid "release asset digest does not match the validated candidate"
+          current=$(node npm/scripts/npm-promotion.cjs audit-records "$records" "$RELEASE_VERSION")
+          current_file=$(printf '%s' "$current" | node -e '
+            const value = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            process.stdout.write(value?.fileName ?? "");
+          ')
+          test -n "$current_file" || \
+            release_asset_invalid "release is missing its authenticated npm promotion record"
+          node npm/scripts/npm-promotion.cjs verify-complete "$records/$current_file"
+
+          while read -r asset_id; do
+            [ -n "$asset_id" ] || continue
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done < "$candidate_ids"
+          LC_ALL=C sort -o "$verified_assets" "$verified_assets"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq '.assets[] | [.id, .name] | @tsv' \
+            | LC_ALL=C sort > "$current_assets"
+          cmp -s "$current_assets" "$verified_assets" || \
+            release_asset_invalid "release asset set changed during final verification"
+          require_immutable_releases
+          recheck_release_tag
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+  authorize-recovery-tag:
+    name: Authorize signed tag recovery
+    if: github.event_name == 'workflow_dispatch' && inputs.operation != 'diagnostics'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      source-digest: ${{ steps.tag.outputs.source-digest }}
+      tag-digest: ${{ steps.tag.outputs.tag-digest }}
+    steps:
+      - name: Resolve verified signed recovery tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          release_tag_not_trusted() {
+            printf '{"code":"release-tag-not-trusted","message":"%s"}\n' "$1" >&2
+            exit 1
+          }
+
+          printf '%s' "$RELEASE_VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || \
+            release_tag_not_trusted "recovery version is invalid"
+          if ! tag_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$RELEASE_VERSION" --jq '.object.type + " " + .object.sha'); then
+            release_tag_not_trusted "release tag ref cannot be resolved"
+          fi
+          test "${tag_ref%% *}" = tag || \
+            release_tag_not_trusted "release tag is not annotated"
+          tag_digest=${tag_ref#* }
+          if ! source_digest=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_digest" --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha'); then
+            release_tag_not_trusted "annotated release tag cannot be resolved"
+          fi
+          test -n "$source_digest" || \
+            release_tag_not_trusted "release tag signature is not GitHub-verified"
+          if ! default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch); then
+            release_tag_not_trusted "default branch cannot be resolved"
+          fi
+          if ! default_head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$default_branch" --jq .object.sha); then
+            release_tag_not_trusted "default branch head cannot be resolved"
+          fi
+          test "$GITHUB_REF" = "refs/heads/$default_branch" || \
+            release_tag_not_trusted "release recovery must be dispatched from the default branch"
+          test "$GITHUB_SHA" = "$default_head" || \
+            release_tag_not_trusted "default branch moved after recovery started"
+          if ! compare_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/${source_digest}...${default_head}" --jq .status); then
+            release_tag_not_trusted "release tag commit cannot be compared with the default branch"
+          fi
+          if [ "$compare_status" != identical ] && [ "$compare_status" != ahead ]; then
+            release_tag_not_trusted "release tag does not point at a commit on the default branch"
+          fi
+          if ! release_pr_count=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/$GITHUB_REPOSITORY/commits/$source_digest/pulls" \
+            | jq \
+              --arg branch "$default_branch" \
+              --arg sha "$source_digest" \
+              '[.[] | select(.merged_at != null and .base.ref == $branch and .merge_commit_sha == $sha)] | length'); then
+            release_tag_not_trusted "release pull request provenance cannot be resolved"
+          fi
+          test "$release_pr_count" = 1 || \
+            release_tag_not_trusted "release tag commit was not produced by one merged release pull request"
+          printf 'source-digest=%s\n' "$source_digest" >> "$GITHUB_OUTPUT"
+          printf 'tag-digest=%s\n' "$tag_digest" >> "$GITHUB_OUTPUT"
+
+  repair-candidate-tags:
+    name: Repair missing npm candidate tags
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'candidate-tag-repair'
+    needs: authorize-recovery-tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      SATELLE_RELEASE_RECOVERY: "1"
+      SATELLE_RELEASE_RECOVERY_TAG: v${{ inputs.version }}
+    steps:
+      - name: Check out matching release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.authorize-recovery-tag.outputs.source-digest }}
+
+      - name: Install Node.js for npm dist-tag recovery
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install pinned npm CLI
+        run: npm install --global npm@11.5.1
+
+      - name: Download validated npm manifest from draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          printf '%s' "$RELEASE_VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          tag="v${RELEASE_VERSION}"
+          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          mkdir -p validated/npm
+          gh release download "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern npm-artifacts.json \
+            --dir validated/npm
+
+      - name: Repair candidate dist-tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          VERIFIED_SOURCE_DIGEST: ${{ needs.authorize-recovery-tag.outputs.source-digest }}
+          VERIFIED_TAG_DIGEST: ${{ needs.authorize-recovery-tag.outputs.tag-digest }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$VERIFIED_SOURCE_DIGEST"
+          current_tag_digest=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v${RELEASE_VERSION}" --jq .object.sha)
+          test "$current_tag_digest" = "$VERIFIED_TAG_DIGEST"
+          current_source_digest=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$current_tag_digest" \
+            --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha')
+          test "$current_source_digest" = "$VERIFIED_SOURCE_DIGEST"
+          node npm/scripts/npm-candidate-publication.cjs repair-tags \
+            "$RELEASE_VERSION" \
+            validated/npm/npm-artifacts.json
 
   rollback-promotion:
     name: Roll back an incomplete npm promotion
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'rollback'
+    needs: authorize-recovery-tag
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: write
     env:
       SATELLE_RELEASE_RECOVERY: "1"
+      SATELLE_RELEASE_RECOVERY_TAG: v${{ inputs.version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          ref: ${{ needs.authorize-recovery-tag.outputs.source-digest }}
 
       - name: Install Node.js for npm dist-tag recovery
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -820,23 +1173,56 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
+          SATELLE_PROMOTION_RECORD_KEY: ${{ secrets.NPM_PROMOTION_RECORD_KEY }}
           RELEASE_VERSION: ${{ inputs.version }}
+          VERIFIED_SOURCE_DIGEST: ${{ needs.authorize-recovery-tag.outputs.source-digest }}
+          VERIFIED_TAG_DIGEST: ${{ needs.authorize-recovery-tag.outputs.tag-digest }}
         shell: bash
         run: |
           printf '%s' "$RELEASE_VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
           tag="v${RELEASE_VERSION}"
-          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          test "$(git rev-parse HEAD)" = "$VERIFIED_SOURCE_DIGEST"
+          recovery_not_authorized() {
+            printf '{"code":"release-recovery-not-authorized","message":"%s"}\n' "$1" >&2
+            exit 1
+          }
+          recheck_recovery_authorization() {
+            current_tag_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" \
+              --jq 'select(.object.type == "tag") | .object.sha') || \
+              recovery_not_authorized "release tag ref cannot be resolved"
+            test -n "$current_tag_digest" && test "$current_tag_digest" = "$VERIFIED_TAG_DIGEST" || \
+              recovery_not_authorized "release tag object moved after recovery authorization"
+            current_source_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/tags/$VERIFIED_TAG_DIGEST" \
+              --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha') || \
+              recovery_not_authorized "annotated release tag cannot be resolved"
+            test -n "$current_source_digest" && test "$current_source_digest" = "$VERIFIED_SOURCE_DIGEST" || \
+              recovery_not_authorized "release tag source changed after recovery authorization"
+            is_draft=$(gh release view \
+              "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft) || \
+              recovery_not_authorized "GitHub release cannot be resolved"
+            test "$is_draft" = true || \
+              recovery_not_authorized "GitHub release is no longer draft"
+          }
+          recheck_recovery_authorization
           records="$RUNNER_TEMP/promotion-records"
           record="$RUNNER_TEMP/npm-promotion.json"
+          asset_ids="$RUNNER_TEMP/npm-promotion-asset-ids"
           mkdir -p "$records"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == true) | .assets[] | select(.name | startswith("npm-promotion-")) | .id' \
+            > "$asset_ids"
           while read -r asset_id; do
             [ -n "$asset_id" ] || continue
             gh api \
               -H 'Accept: application/octet-stream' \
               "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
               > "$records/${asset_id}.json"
-          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | .assets[] | select(.name | startswith("npm-promotion-")) | .id')
+          done < "$asset_ids"
           current=$(node npm/scripts/npm-promotion.cjs audit-records "$records" "$RELEASE_VERSION")
           current_file=$(printf '%s' "$current" | node -e '
             const value = JSON.parse(require("fs").readFileSync(0, "utf8"));
@@ -847,15 +1233,29 @@ jobs:
           node npm/scripts/npm-promotion.cjs abort "$record"
 
           checkpoint() {
-            sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).sequence))' "$record")
+            sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).record.sequence))' "$record")
             snapshot="$RUNNER_TEMP/npm-promotion-v${RELEASE_VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${sequence}.json"
             cp "$record" "$snapshot"
-            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "$snapshot"
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber "$snapshot"
           }
           checkpoint
           trap 'checkpoint' ERR
-          while [ "$(node -e 'process.stdout.write(require(process.argv[1]).status)' "$record")" != rolled_back ]; do
+          max_advances=$(node -e 'process.stdout.write(String(require(process.argv[1]).record.packages.length))' "$record")
+          advances=0
+          while [ "$(node -e 'process.stdout.write(require(process.argv[1]).record.status)' "$record")" != rolled_back ]; do
+            before_sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).record.sequence))' "$record")
+            recheck_recovery_authorization
             node npm/scripts/npm-promotion.cjs advance "$record"
+            after_sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).record.sequence))' "$record")
+            test "$after_sequence" -gt "$before_sequence" || {
+              echo "npm rollback sequence did not advance" >&2
+              exit 1
+            }
+            advances=$((advances + 1))
+            test "$advances" -le "$max_advances" || {
+              echo "npm rollback exceeded its package count" >&2
+              exit 1
+            }
             checkpoint
           done
           trap - ERR

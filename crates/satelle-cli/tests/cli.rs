@@ -2121,7 +2121,7 @@ fn events_json_reports_output_conflict_when_explicit_host_is_already_known() {
 }
 
 #[test]
-fn run_help_has_events_modes_without_a_watch_option() {
+fn run_and_steer_help_explain_events_and_yolo_authority() {
     for command in ["run", "steer"] {
         let output = satelle()
             .args([command, "--help"])
@@ -2146,6 +2146,9 @@ fn run_help_has_events_modes_without_a_watch_option() {
         assert!(stdout.contains("human"));
         assert!(stdout.contains("json"));
         assert!(stdout.contains("none"));
+        assert!(stdout.contains("approval policy never"));
+        assert!(stdout.contains("sandbox policy danger-full-access"));
+        assert!(stdout.contains("native app or operating-system prompts"));
     }
 
     let output = satelle()
@@ -2157,6 +2160,20 @@ fn run_help_has_events_modes_without_a_watch_option() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(!stdout.contains("--watch"));
+}
+
+#[test]
+fn support_bundle_help_marks_the_command_unavailable() {
+    let output = satelle()
+        .args(["support", "bundle", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("Unavailable in this release"));
+    assert!(stdout.contains("support bundle export is not implemented"));
 }
 
 #[test]

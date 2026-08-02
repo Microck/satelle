@@ -39,7 +39,11 @@ function verifyChangelogs(version, expectedFiles = changelogFiles()) {
   const matching = expectedFiles.filter((filePath) => {
     if (!existsSync(filePath)) return false;
     const contents = readFileSync(filePath, "utf8");
-    return new RegExp(`^##? \\[*v?${version.replaceAll(".", "\\.")}\\]?\\b`, "m").test(contents);
+    const escapedVersion = version.replaceAll(".", "\\.");
+    return new RegExp(
+      `^##? (?:\\[v?${escapedVersion}\\]|v?${escapedVersion})(?![0-9A-Za-z.+-])`,
+      "m",
+    ).test(contents);
   });
   if (matching.length === 0) {
     fail(`no committed Tegami changelog output describes release ${version}`);
@@ -100,12 +104,14 @@ function selectOrchestration(version, tegamiOutcome, validationPath, fallbackPat
   };
 }
 
-function recordFailure(errorPath, outputPath) {
-  const message = readFileSync(errorPath, "utf8").trim();
+function recordFailure(outputPath) {
+  // This record becomes a public release asset. Keep subprocess output only in the
+  // private workflow capture because npm tooling can echo registry credentials.
   writeJson(outputPath, {
     schemaVersion: "satelle.tegami-validation.v1",
     status: "failed",
-    message: message || "Tegami validation failed without stderr output",
+    reason: "tegami-validation-command-failed",
+    message: "Tegami validation failed; rerun it in a trusted environment",
   });
 }
 
@@ -122,7 +128,7 @@ function runCli() {
       files,
     });
   } else if (command === "record-failure") {
-    recordFailure(args[0], args[1]);
+    recordFailure(args[0]);
   } else {
     fail(`unknown release tooling gate command ${command ?? ""}`);
   }
@@ -140,4 +146,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { selectOrchestration, verifyChangelogs };
+module.exports = { recordFailure, selectOrchestration, verifyChangelogs };

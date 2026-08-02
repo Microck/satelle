@@ -2,6 +2,7 @@
 "use strict";
 
 const { execFileSync } = require("node:child_process");
+const { createHmac, timingSafeEqual } = require("node:crypto");
 const {
   existsSync,
   mkdtempSync,
@@ -22,6 +23,7 @@ const promotionStatuses = new Set([
   "rolled_back",
   "conflicted",
 ]);
+const checkpointSchemaVersion = "satelle.npm-promotion.checkpoint.v1";
 
 class PromotionError extends Error {
   constructor(code, message) {
@@ -111,6 +113,77 @@ function validatePromotionRecord(record) {
     fail("promotion-record-invalid", "npm promotion record mode and status disagree");
   }
   return record;
+}
+
+function promotionRecordSigningKey() {
+  const signingKey = process.env.SATELLE_PROMOTION_RECORD_KEY;
+  if (typeof signingKey !== "string" || signingKey.length === 0) {
+    fail(
+      "promotion-record-authentication-required",
+      "SATELLE_PROMOTION_RECORD_KEY is required for durable npm promotion checkpoints",
+    );
+  }
+  return signingKey;
+}
+
+function promotionRecordMac(record, signingKey) {
+  return createHmac("sha256", signingKey)
+    .update(`${checkpointSchemaVersion}\0`)
+    .update(JSON.stringify(record))
+    .digest("hex");
+}
+
+function sealPromotionRecord(record, signingKey) {
+  validatePromotionRecord(record);
+  if (typeof signingKey !== "string" || signingKey.length === 0) {
+    fail("promotion-record-authentication-required", "promotion checkpoint signing key is missing");
+  }
+  const sealedRecord = structuredClone(record);
+  return {
+    schemaVersion: checkpointSchemaVersion,
+    record: sealedRecord,
+    authentication: {
+      algorithm: "hmac-sha256",
+      value: promotionRecordMac(sealedRecord, signingKey),
+    },
+  };
+}
+
+function openPromotionRecord(envelope, signingKey) {
+  if (
+    envelope?.schemaVersion !== checkpointSchemaVersion ||
+    envelope.authentication?.algorithm !== "hmac-sha256" ||
+    !/^[0-9a-f]{64}$/.test(envelope.authentication?.value ?? "") ||
+    typeof envelope.record !== "object" ||
+    envelope.record === null
+  ) {
+    fail("promotion-record-authentication-invalid", "npm promotion checkpoint is not authenticated");
+  }
+  const expected = Buffer.from(promotionRecordMac(envelope.record, signingKey), "hex");
+  const actual = Buffer.from(envelope.authentication.value, "hex");
+  if (!timingSafeEqual(actual, expected)) {
+    fail("promotion-record-authentication-invalid", "npm promotion checkpoint authentication failed");
+  }
+  return validatePromotionRecord(envelope.record);
+}
+
+function assertPromotionPackageGraph(record, expectedPackageNames) {
+  const packageNames = record.packages.map(({ name }) => name);
+  if (
+    packageNames.length !== expectedPackageNames.length ||
+    packageNames.some((name, index) => name !== expectedPackageNames[index])
+  ) {
+    fail(
+      "promotion-record-graph-mismatch",
+      "npm promotion checkpoint package graph differs from the signed release source",
+    );
+  }
+  return record;
+}
+
+function canonicalPublicationOrder(version) {
+  const { createReleaseContext } = require("./release.cjs");
+  return createReleaseContext(path.resolve(__dirname, "../..")).check(`v${version}`).publicationOrder;
 }
 
 function pendingEntry(record) {
@@ -252,17 +325,17 @@ function conflictedRecord(record, error) {
   return next;
 }
 
-function readRecord(filePath) {
-  return validatePromotionRecord(JSON.parse(readFileSync(filePath, "utf8")));
+function readRecord(filePath, signingKey = promotionRecordSigningKey()) {
+  return openPromotionRecord(JSON.parse(readFileSync(filePath, "utf8")), signingKey);
 }
 
-function writeRecord(filePath, record) {
+function writeRecord(filePath, record, signingKey = promotionRecordSigningKey()) {
   validatePromotionRecord(record);
   const destination = path.resolve(filePath);
   const temporaryRoot = mkdtempSync(path.join(path.dirname(destination), ".promotion-"));
   const temporaryPath = path.join(temporaryRoot, path.basename(destination));
   try {
-    writeFileSync(temporaryPath, `${JSON.stringify(record, null, 2)}\n`, {
+    writeFileSync(temporaryPath, `${JSON.stringify(sealPromotionRecord(record, signingKey), null, 2)}\n`, {
       flag: "wx",
       mode: 0o600,
     });
@@ -281,13 +354,55 @@ function npmJson(argumentsList) {
   return output === "" ? null : JSON.parse(output);
 }
 
+function assertExclusiveRegistryWriter(packageName, identity, collaborators) {
+  if (
+    typeof identity !== "string" ||
+    identity.length === 0 ||
+    collaborators === null ||
+    typeof collaborators !== "object" ||
+    Array.isArray(collaborators)
+  ) {
+    fail(
+      "promotion-writer-access-conflict",
+      `${packageName} registry writer access could not be verified`,
+    );
+  }
+  const writers = Object.entries(collaborators)
+    .filter(([, access]) => access === "write" || access === "read-write")
+    .map(([name]) => name);
+  if (writers.length !== 1 || writers[0] !== identity) {
+    fail(
+      "promotion-writer-access-conflict",
+      `${packageName} must grant write access only to the authenticated maintenance identity`,
+    );
+  }
+  return identity;
+}
+
+function verifyExclusiveRegistryWriter(packageName) {
+  const identity = npmJson(["whoami"]);
+  const collaborators = npmJson(["access", "list", "collaborators", packageName]);
+  return assertExclusiveRegistryWriter(packageName, identity, collaborators);
+}
+
+function promotionTagValue(distTags, tag) {
+  if (distTags === null) return null;
+  if (typeof distTags !== "object" || Array.isArray(distTags)) {
+    fail("promotion-command-failed", "npm returned invalid dist-tags");
+  }
+  return distTags[tag] ?? null;
+}
+
+function readDistTag(packageName, tag) {
+  return promotionTagValue(npmJson(["view", packageName, "dist-tags"]), tag);
+}
+
 function readLatest(packageName) {
-  const value = npmJson(["view", packageName, "dist-tags.latest"]);
-  return value === undefined ? null : value;
+  return readDistTag(packageName, "latest");
 }
 
 function readCandidate(packageName, candidateTag) {
-  return npmJson(["view", packageName, `dist-tags.${candidateTag}`]);
+  return readDistTag(packageName, candidateTag);
 }
 
 function readAllLatest(record) {
@@ -300,7 +415,8 @@ function requireReleaseAutomation(version, { recovery = false } = {}) {
   const recoveryRun =
     recovery &&
     process.env.GITHUB_EVENT_NAME === "workflow_dispatch" &&
-    process.env.SATELLE_RELEASE_RECOVERY === "1";
+    process.env.SATELLE_RELEASE_RECOVERY === "1" &&
+    process.env.SATELLE_RELEASE_RECOVERY_TAG === `v${version}`;
   if (
     process.env.GITHUB_ACTIONS !== "true" ||
     process.env.GITHUB_REPOSITORY !== "Microck/satelle" ||
@@ -364,10 +480,14 @@ function createRecordFromRegistry(version, recordPath, manifestPath) {
 
 function advanceRecord(recordPath) {
   let record = readRecord(recordPath);
+  assertPromotionPackageGraph(record, canonicalPublicationOrder(record.version));
   requireReleaseAutomation(record.version, { recovery: record.mode === "rollback" });
   const entry = pendingEntry(record);
   if (!entry) return record;
   try {
+    // npm has no supported conditional dist-tag update. Requiring the token to
+    // be the package's only writer makes the registry mutation single-writer.
+    verifyExclusiveRegistryWriter(entry.name);
     const operation = planRegistryOperation(record, readLatest(entry.name));
     if (operation.type === "set_latest") {
       execFileSync("npm", ["dist-tag", "add", `${entry.name}@${operation.version}`, "latest"], {
@@ -404,18 +524,23 @@ function advanceRecord(recordPath) {
   }
 }
 
-function auditRecords(directory, currentVersion) {
+function auditRecords(directory, currentVersion, options = {}) {
+  const signingKey = options.signingKey ?? promotionRecordSigningKey();
+  const expectedPackageNames = options.expectedPackageNames ?? canonicalPublicationOrder(currentVersion);
   const latestByVersion = new Map();
   for (const fileName of require("node:fs").readdirSync(directory)) {
     if (!fileName.endsWith(".json")) continue;
     let record;
     try {
-      record = readRecord(path.join(directory, fileName));
+      record = readRecord(path.join(directory, fileName), signingKey);
     } catch (error) {
       fail(
-        "promotion-record-invalid",
+        error instanceof PromotionError ? error.code : "promotion-record-invalid",
         `${fileName} is not a valid npm promotion checkpoint: ${error.message}`,
       );
+    }
+    if (record.version === currentVersion) {
+      assertPromotionPackageGraph(record, expectedPackageNames);
     }
     const previous = latestByVersion.get(record.version);
     if (!previous || record.sequence > previous.record.sequence) {
@@ -454,6 +579,7 @@ function runCli() {
     output = advanceRecord(argumentsList[0]);
   } else if (command === "abort") {
     let record = readRecord(argumentsList[0]);
+    assertPromotionPackageGraph(record, canonicalPublicationOrder(record.version));
     requireReleaseAutomation(record.version, { recovery: true });
     record = beginRollback(record);
     writeRecord(argumentsList[0], record);
@@ -462,6 +588,7 @@ function runCli() {
     output = auditRecords(argumentsList[0], argumentsList[1]);
   } else if (command === "verify-complete") {
     const record = readRecord(argumentsList[0]);
+    assertPromotionPackageGraph(record, canonicalPublicationOrder(record.version));
     requireReleaseAutomation(record.version);
     output = verifyCompleteRecord(record, readAllLatest(record));
   } else if (command === "status") {
@@ -484,10 +611,14 @@ if (require.main === module) {
 
 module.exports = {
   PromotionError,
+  assertExclusiveRegistryWriter,
   auditRecords,
   beginRollback,
   checkpointOperation,
   createPromotionRecord,
   planRegistryOperation,
+  promotionTagValue,
+  readCandidate,
+  sealPromotionRecord,
   verifyCompleteRecord,
 };

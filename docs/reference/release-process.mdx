@@ -76,7 +76,11 @@ git push origin vX.Y.Z
 The repository must have an active GitHub tag ruleset for `v*` that prevents
 unauthorized creation, updates, deletion, and force pushes. The workflow rejects
 an unsigned, lightweight, unverified, moved, version-mismatched, or wrong-target
-tag with `release-tag-not-trusted` before public publication.
+tag with `release-tag-not-trusted` before public publication. Immutable releases
+must also be enabled. The final publication step fails closed when that setting is
+disabled, rechecks the signed tag at the publication boundary, and relies on the
+authorized release writer not mutating the draft between the final asset read and
+GitHub's immutable publication transition.
 
 ## Candidate publication and validation
 
@@ -93,7 +97,10 @@ order:
 Every package first uses the non-default `rc-vX.Y.Z` tag. The workflow records
 each immutable publication outside the runner. A retry verifies the registry
 version and integrity against `npm-artifacts.json`; it never republishes
-different bytes under an existing version and never moves the signed tag.
+different bytes under an existing version and never moves the signed tag. If
+an immutable version exists without its candidate tag, publication fails with
+`candidate-registry-tag-mismatch` instead of exposing the dist-tag token to the
+OIDC publishing step.
 
 All six Controller runners then clean-install both launcher identities with
 npm, pnpm, and Bun. Each installation must pass `satelle --version` and
@@ -106,6 +113,11 @@ npm OIDC currently authorizes package publication but not `npm dist-tag`.
 Configure `NPM_DIST_TAG_TOKEN` as a narrowly scoped release secret that can
 change dist-tags for the eight Satelle package identities. Do not grant it
 package publication rights beyond what npm requires for dist-tag maintenance.
+Issue it to a dedicated npm automation identity, keep that credential only in
+the GitHub Actions secret, and do not use that identity for interactive npm
+maintenance.
+Configure `NPM_PROMOTION_RECORD_KEY` as a separate stable random secret for
+checkpoint authentication. Do not reuse the npm token as this key.
 
 The workflow snapshots every prior `latest` value into an append-only promotion
 checkpoint before changing any tag. Draft asset validation permits only the
@@ -114,14 +126,54 @@ retry can load its prior state. One non-cancelling repository-wide
 concurrency group serializes promotion and rollback across all versions. After
 each package, a new checkpoint is attached to the draft release.
 
+Every checkpoint is authenticated with a domain-separated HMAC derived from
+the dedicated checkpoint key. A retry verifies that authentication
+and requires the exact dependency-ordered package graph from the signed release
+source before accepting the record. Replacing a draft-release asset therefore
+fails before any npm command can use its package names or prior tag values. Do
+not rotate `NPM_PROMOTION_RECORD_KEY` while any draft release retains promotion
+checkpoints. An emergency rotation intentionally makes those checkpoints fail
+closed and requires manual recovery. Rotating `NPM_DIST_TAG_TOKEN` does not
+invalidate checkpoint authentication.
+
 A retry re-reads npm. It accepts only the recorded prior state as pending or
 the candidate version as complete. Any other value raises
 `promotion-state-conflict` and is not overwritten. Immediately before
-completion, the workflow re-reads all eight `latest` tags and requires every
-one to equal the candidate. It repeats that full read even when recovery loads
-an already complete record. Only then does it publish the GitHub release.
+every promotion write, the workflow also requires the GitHub release to remain
+draft. Immediately before completion, it re-reads all eight `latest` tags and
+requires every one to equal the candidate. It repeats that full read even when
+recovery loads an already complete record. Only then does it publish the GitHub
+release.
 
-## Rollback recovery
+npm does not expose a supported conditional dist-tag update. Before each
+promotion or rollback write, Satelle therefore authenticates the maintenance
+token with `npm whoami` and requires `npm access list collaborators` to show
+that identity as the target package's only read-write collaborator. Any other
+writer fails with `promotion-writer-access-conflict` before the tag write.
+Read-only collaborators do not block release. The signed tag object and peeled
+source commit are also rechecked before each promotion write and again in the
+same step that makes the GitHub release public.
+
+## Candidate tag recovery
+
+Recovery must be dispatched from the current default-branch head. Before either
+recovery job checks out code or receives the npm maintenance token, the workflow
+resolves the annotated tag, verifies its GitHub signature, default-branch
+ancestry, and merged release pull request, then checks out the verified commit
+digest. Immediately before every candidate dist-tag write, it rechecks the tag
+object, peeled source commit, and draft release state so moved tags and published
+releases fail closed.
+
+If an immutable candidate exists without `rc-vX.Y.Z`, dispatch the Release
+workflow with operation `candidate-tag-repair` and the existing `X.Y.Z`
+version. The recovery job checks out the matching signed tag, requires the
+GitHub release to remain draft, verifies each existing package against the
+validated integrity manifest, and repairs only missing candidate tags. Rerun
+the signed-tag workflow after recovery to resume publication and validation. A
+candidate tag that already points to another version is a conflict: recovery
+does not overwrite it, and the GitHub release remains draft.
+
+## Promotion rollback
 
 If promotion must be aborted while the GitHub release is still draft, dispatch
 the Release workflow with operation `rollback` and the existing `X.Y.Z`
@@ -132,9 +184,11 @@ was previously absent.
 Rollback retries treat the candidate value as pending, the prior value as
 complete, and every other value as a conflict. A rolled-back, incomplete,
 conflicted, or rollback-mode record never permits the GitHub release to leave
-draft state. Rollback scans promotion records across every GitHub release and
-refuses to start while another version is nonterminal. Recovery does not move
-the signed tag or republish package bytes.
+draft state. Rollback scans promotion records across every draft GitHub release and
+refuses to start while another version is nonterminal. Immediately before each
+restoration write, recovery revalidates the signed tag object, peeled source
+commit, and draft release state. Recovery does not move the signed tag or
+republish package bytes.
 
 ## External release gates
 
@@ -143,8 +197,12 @@ public release, an authorized maintainer must verify all of these outside the
 checkout:
 
 - The `v*` GitHub tag ruleset is active.
+- Immutable releases are enabled for the repository.
 - Each npm package identity exists and trusts `release.yml` for OIDC publish.
 - `NPM_DIST_TAG_TOKEN` has the minimum working dist-tag scope.
+- The token identity is the sole read-write collaborator on all eight npm
+  packages; human and team access is read-only during promotion and recovery.
+- `NPM_PROMOTION_RECORD_KEY` contains a separate stable random value.
 - The security and legal language review covers remote desktop control, YOLO,
   diagnostics, provider credentials, and user consent.
 - A real tag run produces and verifies attestations, publishes all candidates,

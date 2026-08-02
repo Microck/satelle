@@ -24,7 +24,7 @@ const { createReleaseContext } = require(path.join(
   "scripts",
   "release.cjs",
 ));
-const { verifyChangelogs } = require(path.join(
+const { recordFailure, verifyChangelogs } = require(path.join(
   repositoryRoot,
   "npm",
   "scripts",
@@ -190,7 +190,7 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.match(workflow, /npm publish[^\n]*--dry-run/);
   assert.match(
     workflow,
-    /publish-candidates:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[collect, draft-release\]/,
+    /publish-candidates:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[attest, collect, draft-release\]/,
   );
   assert.match(
     workflow,
@@ -206,10 +206,37 @@ test("release workflow validates six targets and publishes only a fully verified
   )?.[0];
   assert.ok(candidateJob, "candidate publication job is missing");
   assert.doesNotMatch(candidateJob, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
+  assert.match(
+    candidateJob,
+    /EXPECTED_SOURCE_DIGEST: \$\{\{ needs\.attest\.outputs\.source-digest \}\}/,
+  );
+  assert.match(
+    candidateJob,
+    /EXPECTED_TAG_DIGEST: \$\{\{ needs\.attest\.outputs\.tag-digest \}\}/,
+  );
+  assert.match(
+    candidateJob,
+    /recheck_release_tag[\s\S]*git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*gh release view[\s\S]*--jq \.isDraft[\s\S]*while [\s\S]*recheck_release_tag[\s\S]*npm-candidate-publication\.cjs advance/,
+  );
   assert.match(workflow, /gh release create "\$GITHUB_REF_NAME"[\s\S]*?--draft/);
   assert.match(workflow, /gh release upload "\$GITHUB_REF_NAME"/);
   assert.match(workflow, /release asset set does not match the validated artifact set/);
+  assert.match(workflow, /candidate_pattern=.*npm-candidate-v.*\[0-9\]\+/);
+  assert.match(workflow, /promotion_pattern=.*npm-promotion-v.*\[0-9\]\+/);
+  assert.match(workflow, /sha256sum --check/);
   assert.match(workflow, /gh release edit "\$GITHUB_REF_NAME"[^\n]*--draft=false --latest/);
+  assert.match(
+    workflow,
+    /pnpm --dir "\$install_root" --minimum-release-age=0 add --ignore-scripts "\$package_spec"/,
+  );
+  assert.match(
+    workflow,
+    /repos\/\$GITHUB_REPOSITORY\/immutable-releases[\s\S]*?immutable releases are not enabled/,
+  );
+  assert.match(
+    workflow,
+    /cmp -s "\$current_assets" "\$verified_assets"[\s\S]*?recheck_release_tag\n\s+gh release edit "\$GITHUB_REF_NAME"/,
+  );
   assert.doesNotMatch(workflow, /^\s+(?:validated|dist)\/npm-.*\.tgz \\?$/m);
   assert.match(workflow, /\.\/dist\/npm-satelle-scoped\.tgz/);
   assert.match(workflow, /\.\/dist\/npm-satelle-unscoped\.tgz/);
@@ -221,7 +248,14 @@ test("release workflow validates six targets and publishes only a fully verified
     /attest:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[collect, lifecycle\]/,
   );
   assert.match(workflow, /test "\$source_digest" = "\$GITHUB_SHA"/);
-  assert.match(workflow, /permissions:\n\s+attestations: write\n\s+contents: read\n\s+id-token: write/);
+  assert.match(
+    workflow,
+    /attest:\n[\s\S]*?permissions:\n\s+attestations: write\n\s+contents: read\n\s+id-token: write\n\s+pull-requests: read/,
+  );
+  assert.match(
+    workflow,
+    /authorize-recovery-tag:\n[\s\S]*?permissions:\n\s+contents: read\n\s+pull-requests: read/,
+  );
   assert.match(workflow, /scripts\/install\.sh" --version/);
   assert.match(workflow, /: > "\$policy_log"/);
   assert.match(workflow, /installer upgrade failed/);
@@ -245,7 +279,7 @@ test("release workflow validates six targets and publishes only a fully verified
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
   ) ?? [];
-  assert.equal(checkoutUses.length, 7);
+  assert.equal(checkoutUses.length, 8);
   assert.equal(hardenedCheckoutUses.length, checkoutUses.length);
 });
 
@@ -307,6 +341,7 @@ test("packet 27 gates release publication on Tegami and typed signed-tag trust",
 
   assert.match(releaseProcess, /release pull request/i);
   assert.match(releaseProcess, /active GitHub tag ruleset for `v\*`/);
+  assert.match(releaseProcess, /Immutable releases are enabled/);
   assert.match(releaseProcess, /security and legal language review/i);
   assert.match(releaseProcess, /manual release/i);
   assert.match(releaseProcess, /does not publish a crates\.io crate/i);
@@ -366,6 +401,51 @@ test("release tooling gate binds committed changelog output to the release versi
   assert.throws(
     () => verifyChangelogs("1.2.4", [changelog]),
     /no committed Tegami changelog output describes release 1\.2\.4/,
+  );
+  writeFileSync(changelog, "# Changelog\n\n## 1.2.3-rc.1\n\n- Prerelease.\n");
+  assert.throws(
+    () => verifyChangelogs("1.2.3", [changelog]),
+    /no committed Tegami changelog output describes release 1\.2\.3/,
+  );
+  writeFileSync(changelog, "# Changelog\n\n## [1.2.3]unexpected\n\n- Invalid heading.\n");
+  assert.throws(
+    () => verifyChangelogs("1.2.3", [changelog]),
+    /no committed Tegami changelog output describes release 1\.2\.3/,
+  );
+});
+
+test("release tooling failure records never publish raw subprocess stderr", (context) => {
+  const root = mkdtempSync(path.join(tmpdir(), "satelle-tegami-failure-"));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const errorPath = path.join(root, "stderr.log");
+  const outputPath = path.join(root, "validation.json");
+  writeFileSync(
+    errorPath,
+    "npm ERR! Authorization: Bearer secret-token\n//registry.npmjs.org/:_authToken=other-secret\n",
+  );
+
+  recordFailure(outputPath);
+  const serialized = readFileSync(outputPath, "utf8");
+  const record = JSON.parse(serialized);
+  assert.deepEqual(record, {
+    schemaVersion: "satelle.tegami-validation.v1",
+    status: "failed",
+    reason: "tegami-validation-command-failed",
+    message: "Tegami validation failed; rerun it in a trusted environment",
+  });
+  assert.doesNotMatch(serialized, /secret-token|other-secret|_authToken|Bearer/);
+
+  const releaseWorkflow = readFileSync(
+    path.join(repositoryRoot, ".github", "workflows", "release.yml"),
+    "utf8",
+  ).replaceAll("\r\n", "\n");
+  assert.match(
+    releaseWorkflow,
+    /npm run tegami --prefix npm\/release-tooling -- publish \\\n+\s+>> "\$error_log" 2>&1/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /release-tooling-gate\.cjs record-failure \\\n+\s+validated\/tegami-validation\.json/,
   );
 });
 

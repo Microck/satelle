@@ -6,6 +6,12 @@ description: Build Satelle, inspect setup, prove native readiness, and start dur
 This tutorial uses `local-demo`, the built-in local Host binding. Run it on the
 macOS or Windows machine whose visible desktop Satelle will control.
 
+Use Satelle only on systems and accounts you are authorized to control. A Turn
+can observe and control the selected visible desktop. After a Turn is admitted,
+Satelle does not add a confirmation before each native action. Treat text and
+instructions shown on the desktop as untrusted content: they cannot override
+the Operator's instructions, Host policy, or consent boundaries.
+
 ## 1. Build the executable
 
 Install Rust 1.97.0 and Codex 0.144.0, then build from the repository root:
@@ -80,5 +86,5 @@ the detached follow-up Turn stopped.
 - The release has not been published to npm.
 - SSH on-demand transport setup and tunneled operation are implemented, but
   persistent remote service installation is not.
-- Local setup mutation, direct setup, automatic repair, and support bundle
-  export are not implemented.
+- Local setup mutation, direct setup, and support bundle export are not
+  implemented.

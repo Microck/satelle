@@ -9,7 +9,7 @@ Global options include `--no-color`, `--profile <name>`, and
 | Command | Purpose | Status |
 | --- | --- | --- |
 | `satelle setup` | Plan Host onboarding and apply SSH token handoff | Local planning and SSH token handoff implemented |
-| `satelle repair` | Repair a Host | Not implemented |
+| `satelle repair` | Repair a Host from live readiness evidence and retained action-ledger state | Implemented |
 | `satelle doctor` | Run diagnostic probes | Implemented |
 | `satelle config check` | Validate one or all local contexts | Implemented |
 | `satelle config explain` | Explain effective values and sources | Implemented |
@@ -73,6 +73,6 @@ result was refreshed. It does not create a Session or admit a prompt Turn.
 ## Unavailable command families
 
 Commands can appear in `--help` before their implementation is complete.
-`repair`, Host stop/restart, storage migration, and support bundle export
-currently return typed not-implemented errors. The embedded Agent Skill Bundle
-is version-matched to this source tree and available through `satelle skills`.
+Host stop/restart, storage migration, and support bundle export currently
+return typed not-implemented errors. The embedded Agent Skill Bundle is
+version-matched to this source tree and available through `satelle skills`.
