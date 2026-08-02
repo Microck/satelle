@@ -16,6 +16,7 @@ use time::{Duration, OffsetDateTime};
 
 const DEFAULT_LOG_PAGE_LIMIT: usize = 200;
 const MAX_LOG_PAGE_LIMIT: usize = 10_000;
+const INTERRUPT_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
 const FOLLOW_IDLE_INTERVAL: StdDuration = StdDuration::from_millis(250);
 const RECONNECT_BUDGET: StdDuration = StdDuration::from_secs(60);
 const RECONNECT_INITIAL_DELAY: StdDuration = StdDuration::from_millis(250);
@@ -262,7 +263,7 @@ impl FollowRuntime for ProcessFollowRuntime {
             if now >= deadline {
                 return;
             }
-            thread::sleep((deadline - now).min(StdDuration::from_millis(50)));
+            thread::sleep((deadline - now).min(INTERRUPT_POLL_INTERVAL));
         }
     }
 
@@ -434,6 +435,7 @@ fn reconnect_follow(
             target.plan.session_id().cloned(),
             target.plan.follow_query(query_cursor),
             deadline - attempt_started_at,
+            runtime,
         ) else {
             return Err(exhausted());
         };
@@ -460,6 +462,7 @@ fn run_reconnect_attempt(
     session_id: Option<SessionId>,
     query: LogPageQuery,
     timeout: StdDuration,
+    runtime: &dyn FollowRuntime,
 ) -> Option<FollowReconnectResult> {
     let (completed, completion) = mpsc::sync_channel(1);
     thread::Builder::new()
@@ -490,7 +493,21 @@ fn run_reconnect_attempt(
             let _completed = completed.send(attempt);
         })
         .ok()?;
-    completion.recv_timeout(timeout).ok()
+    let receive_deadline = Instant::now() + timeout;
+    loop {
+        if runtime.interrupted() {
+            return Some(Err(SatelleError::interrupted_attached_command()));
+        }
+        let remaining = receive_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match completion.recv_timeout(remaining.min(INTERRUPT_POLL_INTERVAL)) {
+            Ok(attempt) => return Some(attempt),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
 }
 
 fn validate_follow_connection(
@@ -510,7 +527,7 @@ fn validate_follow_connection(
         ));
     }
     if let Some(session_id) = session_id {
-        connection.session(session_id).map_err(|error| {
+        let session = connection.session(session_id).map_err(|error| {
             if reconnect && error.code == ErrorCode::SessionNotFound {
                 SatelleError::logs_follow_identity_changed(
                     expected_host_identity.unwrap_or(&observed_host_identity),
@@ -521,6 +538,13 @@ fn validate_follow_connection(
                 error
             }
         })?;
+        if session.session_id() != session_id {
+            return Err(SatelleError::logs_follow_identity_changed(
+                expected_host_identity.unwrap_or(&observed_host_identity),
+                Some(&observed_host_identity),
+                Some(session_id.as_str()),
+            ));
+        }
     }
     Ok(observed_host_identity)
 }
@@ -970,6 +994,10 @@ mod tests {
 
     struct SessionIdentityMismatchFollowConnection;
 
+    struct SessionScopeMismatchFollowConnection {
+        returned_session: satelle_core::session::PublicSession,
+    }
+
     impl FakeFollowConnection {
         fn new(
             host_identity: &str,
@@ -1033,6 +1061,50 @@ mod tests {
         fn logs(&self, _query: &LogPageQuery) -> Result<satelle_host::DaemonLogPage, SatelleError> {
             panic!("identity validation must fail before logs are requested")
         }
+    }
+
+    impl FollowConnection for SessionScopeMismatchFollowConnection {
+        fn host_identity(&self) -> Result<String, SatelleError> {
+            Ok("host-original".to_string())
+        }
+
+        fn session(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<satelle_core::session::PublicSession, SatelleError> {
+            Ok(self.returned_session.clone())
+        }
+
+        fn logs(&self, _query: &LogPageQuery) -> Result<satelle_host::DaemonLogPage, SatelleError> {
+            panic!("Session scope validation must fail before logs are requested")
+        }
+    }
+
+    fn public_session(session_id: &SessionId) -> satelle_core::session::PublicSession {
+        let turn_id = satelle_core::TurnId::new();
+        serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "display_name": null,
+            "session_state_revision": 1,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "activity": {
+                "state": "starting",
+                "turn_id": turn_id,
+                "turn_state_revision": 1
+            },
+            "turns": [{
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "turn_state_revision": 1,
+                "state": "starting",
+                "started_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "terminal_at": null,
+                "safe_summary": null
+            }]
+        }))
+        .expect("construct a coherent public Session fixture")
     }
 
     fn queued_connection_factory(
@@ -1333,6 +1405,7 @@ mod tests {
             Some(session_id.clone()),
             LogPageQuery::default(),
             StdDuration::from_secs(1),
+            &FakeFollowRuntime::new(None),
         ) {
             Some(Err(error)) => error,
             Some(Ok(_)) => panic!("the factory identity mismatch must be terminal"),
@@ -1361,6 +1434,7 @@ mod tests {
             Some(session_id.clone()),
             LogPageQuery::default(),
             StdDuration::from_secs(1),
+            &FakeFollowRuntime::new(None),
         ) {
             Some(Err(error)) => error,
             Some(Ok(_)) => panic!("the Session identity mismatch must be terminal"),
@@ -1374,6 +1448,70 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(error.details["session_id"], session_id.as_str());
+    }
+
+    #[test]
+    fn reconnect_rejects_a_session_response_for_another_session() {
+        let expected_session_id = SessionId::new();
+        let returned_session_id = SessionId::new();
+        let connection = SessionScopeMismatchFollowConnection {
+            returned_session: public_session(&returned_session_id),
+        };
+
+        let error = validate_follow_connection(
+            &connection,
+            Some("host-original"),
+            Some(&expected_session_id),
+            true,
+        )
+        .expect_err("a contradictory nested Session ID must stop reconnect");
+
+        assert_eq!(error.code, ErrorCode::LogsFollowIdentityChanged);
+        assert_eq!(error.details["expected_host_identity"], "host-original");
+        assert_eq!(error.details["observed_host_identity"], "host-original");
+        assert_eq!(error.details["session_id"], expected_session_id.as_str());
+    }
+
+    #[test]
+    fn interrupt_while_reconnect_attempt_is_pending_returns_promptly() {
+        let request = request();
+        let plan =
+            LogReadPlan::resolve(&request).unwrap_or_else(|_| panic!("resolve follow request"));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let factory_interrupt = Arc::clone(&interrupted);
+        let factory: FollowConnectionFactory = Arc::new(move || {
+            factory_interrupt.store(true, Ordering::Release);
+            thread::sleep(StdDuration::from_secs(2));
+            Err(SatelleError::host_unreachable("remote"))
+        });
+        let runtime = FakeFollowRuntime::new(None).with_interrupt_flag(interrupted);
+        let target = FollowTarget {
+            plan: &plan,
+            request: &request,
+            host_alias: "remote",
+            expected_host_identity: "host-original",
+        };
+        let cursor = page(1).next_cursor();
+        let started_at = Instant::now();
+
+        let error = match reconnect_follow(
+            &target,
+            &runtime,
+            &factory,
+            cursor,
+            cursor,
+            1,
+            &mut Vec::new(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("Ctrl-C must stop a pending reconnect attempt"),
+        };
+
+        assert_eq!(error.code, ErrorCode::Interrupted);
+        assert!(
+            started_at.elapsed() < StdDuration::from_millis(500),
+            "Ctrl-C waited for the pending transport attempt"
+        );
     }
 
     #[test]
