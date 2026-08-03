@@ -24,6 +24,12 @@ const { createReleaseContext } = require(path.join(
   "scripts",
   "release.cjs",
 ));
+const { recordFailure, verifyChangelogs } = require(path.join(
+  repositoryRoot,
+  "npm",
+  "scripts",
+  "release-tooling-gate.cjs",
+));
 
 function sha256(filePath) {
   return createHash("sha256").update(readFileSync(filePath)).digest("hex");
@@ -184,39 +190,52 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.match(workflow, /npm publish[^\n]*--dry-run/);
   assert.match(
     workflow,
-    /publish:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[collect, attest, lifecycle\]/,
+    /publish-candidates:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[attest, collect, draft-release\]/,
   );
   assert.match(
     workflow,
-    /publish:\n[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?id-token: write/,
+    /publish-candidates:\n[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?id-token: write/,
   );
   assert.match(
     workflow,
-    /Install trusted publishing npm[\s\S]*?npm install --global npm@11\.5\.1[\s\S]*?test "\$\(npm --version\)" = "11\.5\.1"/,
+    /Install OIDC-capable npm CLI[\s\S]*?npm install --global npm@11\.5\.1[\s\S]*?test "\$\(npm --version\)" = "11\.5\.1"/,
+  );
+  assert.match(workflow, /npm-candidate-publication\.cjs advance/);
+  const candidateJob = workflow.match(
+    /^  publish-candidates:[\s\S]*?(?=^  validate-registry-candidates:)/m,
+  )?.[0];
+  assert.ok(candidateJob, "candidate publication job is missing");
+  assert.doesNotMatch(candidateJob, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
+  assert.match(
+    candidateJob,
+    /EXPECTED_SOURCE_DIGEST: \$\{\{ needs\.attest\.outputs\.source-digest \}\}/,
   );
   assert.match(
-    workflow,
-    /npm publish "\$package" --provenance --access public --tag "rc-v\$RELEASE_VERSION"/,
+    candidateJob,
+    /EXPECTED_TAG_DIGEST: \$\{\{ needs\.attest\.outputs\.tag-digest \}\}/,
   );
-  assert.match(workflow, /npm view "\$package_name@\$RELEASE_VERSION" dist\.integrity --json/);
-  assert.match(workflow, /published package integrity does not match the validated artifact/);
-  assert.doesNotMatch(workflow, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
-  assert.match(workflow, /gh release create "\$GITHUB_REF_NAME" --draft/);
+  assert.match(
+    candidateJob,
+    /recheck_release_tag[\s\S]*git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*gh release view[\s\S]*--jq \.isDraft[\s\S]*while [\s\S]*recheck_release_tag[\s\S]*npm-candidate-publication\.cjs advance/,
+  );
+  assert.match(workflow, /gh release create "\$GITHUB_REF_NAME"[\s\S]*?--draft/);
   assert.match(workflow, /gh release upload "\$GITHUB_REF_NAME"/);
   assert.match(workflow, /release asset set does not match the validated artifact set/);
-  assert.doesNotMatch(workflow, /gh release edit "\$GITHUB_REF_NAME" --draft=false --latest/);
+  assert.match(workflow, /candidate_pattern=.*npm-candidate-v.*\[0-9\]\+/);
+  assert.match(workflow, /promotion_pattern=.*npm-promotion-v.*\[0-9\]\+/);
+  assert.match(workflow, /sha256sum --check/);
+  assert.match(workflow, /gh release edit "\$GITHUB_REF_NAME"[^\n]*--draft=false --latest/);
   assert.match(
     workflow,
-    /Keep the GitHub release draft until recoverable npm promotion is available/,
+    /pnpm --dir "\$install_root" --minimum-release-age=0 add --ignore-scripts "\$package_spec"/,
   );
-  assert.ok(
-    workflow.indexOf(
-      'npm publish "$package" --provenance --access public --tag "rc-v$RELEASE_VERSION"',
-    ) <
-      workflow.indexOf(
-        "- name: Keep the GitHub release draft until recoverable npm promotion is available",
-      ),
-    "the release must remain a draft after every candidate package is published",
+  assert.match(
+    workflow,
+    /repos\/\$GITHUB_REPOSITORY\/immutable-releases[\s\S]*?immutable releases are not enabled/,
+  );
+  assert.match(
+    workflow,
+    /cmp -s "\$current_assets" "\$verified_assets"[\s\S]*?recheck_release_tag\n\s+gh release edit "\$GITHUB_REF_NAME"/,
   );
   assert.doesNotMatch(workflow, /^\s+(?:validated|dist)\/npm-.*\.tgz \\?$/m);
   assert.match(workflow, /\.\/dist\/npm-satelle-scoped\.tgz/);
@@ -229,7 +248,14 @@ test("release workflow validates six targets and publishes only a fully verified
     /attest:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[collect, lifecycle\]/,
   );
   assert.match(workflow, /test "\$source_digest" = "\$GITHUB_SHA"/);
-  assert.match(workflow, /permissions:\n\s+attestations: write\n\s+contents: read\n\s+id-token: write/);
+  assert.match(
+    workflow,
+    /attest:\n[\s\S]*?permissions:\n\s+attestations: write\n\s+contents: read\n\s+id-token: write\n\s+pull-requests: read/,
+  );
+  assert.match(
+    workflow,
+    /authorize-recovery-tag:\n[\s\S]*?permissions:\n\s+contents: read\n\s+pull-requests: read/,
+  );
   assert.match(workflow, /scripts\/install\.sh" --version/);
   assert.match(workflow, /: > "\$policy_log"/);
   assert.match(workflow, /installer upgrade failed/);
@@ -253,8 +279,174 @@ test("release workflow validates six targets and publishes only a fully verified
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
   ) ?? [];
-  assert.equal(checkoutUses.length, 5);
+  assert.equal(checkoutUses.length, 8);
   assert.equal(hardenedCheckoutUses.length, checkoutUses.length);
+});
+
+test("packet 27 gates release publication on Tegami and typed signed-tag trust", () => {
+  const workflow = readFileSync(
+    path.join(repositoryRoot, ".github", "workflows", "release.yml"),
+    "utf8",
+  ).replaceAll("\r\n", "\n");
+  const toolingRoot = path.join(repositoryRoot, "npm", "release-tooling");
+  const toolingPackage = JSON.parse(
+    readFileSync(path.join(toolingRoot, "package.json"), "utf8"),
+  );
+  const tegamiSource = readFileSync(path.join(toolingRoot, "tegami.mts"), "utf8");
+  const dryRunSource = readFileSync(path.join(toolingRoot, "dry-run.mts"), "utf8");
+  const releaseProcess = readFileSync(
+    path.join(repositoryRoot, "docs", "reference", "release-process.mdx"),
+    "utf8",
+  );
+
+  assert.equal(toolingPackage.engines.node, ">=24");
+  assert.equal(toolingPackage.dependencies.tegami, "1.2.5");
+  assert.match(tegamiSource, /cargo\(/);
+  assert.match(tegamiSource, /pkg\.manager === "cargo"\) return false/);
+  assert.match(dryRunSource, /satelle\.tegami-validation\.v1/);
+  for (const field of [
+    "nodeVersion",
+    "tegamiVersion",
+    "cargoPlugin",
+    "changelogGeneration",
+    "generatedFiles",
+    "skippedPublishTargets",
+  ]) {
+    assert.match(dryRunSource, new RegExp(`\\b${field}\\b`));
+  }
+
+  assert.match(workflow, /npm ci --prefix npm\/release-tooling --ignore-scripts/);
+  assert.match(workflow, /npm run dry-run --prefix npm\/release-tooling/);
+  assert.match(workflow, /npm run tegami --prefix npm\/release-tooling -- publish/);
+  assert.match(workflow, /validated\/tegami-validation\.json/);
+  assert.match(workflow, /release-tooling-gate\.cjs select/);
+  assert.match(workflow, /npm\/release-tooling\/manual-release\.json/);
+  assert.match(workflow, /release-tooling-gate\.cjs verify-changelogs/);
+  assert.match(workflow, /validated\/release-orchestration\.json/);
+  assert.match(workflow, /validated\/tegami-changelog-validation\.json/);
+  const tagTrustStep = workflow.match(
+    /      - name: Resolve verified signed tag[\s\S]*?(?=\n      - name:)/,
+  )?.[0];
+  assert.ok(tagTrustStep, "signed-tag trust step is missing");
+  assert.match(tagTrustStep, /release_tag_not_trusted\(\)/);
+  assert.ok(
+    (tagTrustStep.match(/release_tag_not_trusted/g) ?? []).length >= 7,
+    "every release-tag rejection must use the typed error",
+  );
+  assert.match(tagTrustStep, /git\/ref\/heads\/\$default_branch/);
+  assert.match(tagTrustStep, /compare\/\$\{source_digest\}\.\.\.\$\{default_head\}/);
+  assert.match(tagTrustStep, /commits\/\$source_digest\/pulls/);
+  assert.match(tagTrustStep, /\.merge_commit_sha == \$sha/);
+  assert.match(tagTrustStep, /release pull request provenance cannot be resolved/);
+
+  assert.match(releaseProcess, /release pull request/i);
+  assert.match(releaseProcess, /active GitHub tag ruleset for `v\*`/);
+  assert.match(releaseProcess, /Immutable releases are enabled/);
+  assert.match(releaseProcess, /security and legal language review/i);
+  assert.match(releaseProcess, /manual release/i);
+  assert.match(releaseProcess, /does not publish a crates\.io crate/i);
+});
+
+test("release tooling gate selects Tegami and fails closed without reviewed fallback", (context) => {
+  const root = mkdtempSync(path.join(tmpdir(), "satelle-release-tooling-gate-"));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const validation = path.join(root, "validation.json");
+  const output = path.join(root, "orchestration.json");
+  const missingFallback = path.join(root, "manual-release.json");
+  const gate = path.join(repositoryRoot, "npm", "scripts", "release-tooling-gate.cjs");
+  writeFileSync(validation, `${JSON.stringify({
+    schemaVersion: "satelle.tegami-validation.v1",
+    tegamiVersion: "1.2.5",
+    cargoPlugin: { changelogGeneration: "1.0.0 -> 1.0.1" },
+  })}\n`);
+
+  execFileSync(process.execPath, [
+    gate,
+    "select",
+    "1.2.3",
+    "success",
+    validation,
+    missingFallback,
+    output,
+  ]);
+  assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), {
+    schemaVersion: "satelle.release-orchestration.v1",
+    version: "1.2.3",
+    mode: "tegami",
+    tegamiVersion: "1.2.5",
+  });
+
+  const fallback = spawnSync(process.execPath, [
+    gate,
+    "select",
+    "1.2.3",
+    "failure",
+    validation,
+    missingFallback,
+    output,
+  ], { encoding: "utf8" });
+  assert.equal(fallback.status, 1);
+  assert.equal(JSON.parse(fallback.stderr).code, "release-tooling-gate-failed");
+});
+
+test("release tooling gate binds committed changelog output to the release version", (context) => {
+  const root = mkdtempSync(path.join(tmpdir(), "satelle-tegami-changelog-"));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const changelog = path.join(root, "CHANGELOG.md");
+  writeFileSync(changelog, "# Changelog\n\n## 1.2.3\n\n- Initial release.\n");
+
+  assert.deepEqual(verifyChangelogs("1.2.3", [changelog]), [
+    path.relative(repositoryRoot, changelog).split(path.sep).join("/"),
+  ]);
+  assert.throws(
+    () => verifyChangelogs("1.2.4", [changelog]),
+    /no committed Tegami changelog output describes release 1\.2\.4/,
+  );
+  writeFileSync(changelog, "# Changelog\n\n## 1.2.3-rc.1\n\n- Prerelease.\n");
+  assert.throws(
+    () => verifyChangelogs("1.2.3", [changelog]),
+    /no committed Tegami changelog output describes release 1\.2\.3/,
+  );
+  writeFileSync(changelog, "# Changelog\n\n## [1.2.3]unexpected\n\n- Invalid heading.\n");
+  assert.throws(
+    () => verifyChangelogs("1.2.3", [changelog]),
+    /no committed Tegami changelog output describes release 1\.2\.3/,
+  );
+});
+
+test("release tooling failure records never publish raw subprocess stderr", (context) => {
+  const root = mkdtempSync(path.join(tmpdir(), "satelle-tegami-failure-"));
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+  const errorPath = path.join(root, "stderr.log");
+  const outputPath = path.join(root, "validation.json");
+  writeFileSync(
+    errorPath,
+    "npm ERR! Authorization: Bearer secret-token\n//registry.npmjs.org/:_authToken=other-secret\n",
+  );
+
+  recordFailure(outputPath);
+  const serialized = readFileSync(outputPath, "utf8");
+  const record = JSON.parse(serialized);
+  assert.deepEqual(record, {
+    schemaVersion: "satelle.tegami-validation.v1",
+    status: "failed",
+    reason: "tegami-validation-command-failed",
+    message: "Tegami validation failed; rerun it in a trusted environment",
+  });
+  assert.doesNotMatch(serialized, /secret-token|other-secret|_authToken|Bearer/);
+
+  const releaseWorkflow = readFileSync(
+    path.join(repositoryRoot, ".github", "workflows", "release.yml"),
+    "utf8",
+  ).replaceAll("\r\n", "\n");
+  assert.match(
+    releaseWorkflow,
+    /npm run tegami --prefix npm\/release-tooling -- publish \\\n+\s+>> "\$error_log" 2>&1/,
+  );
+  assert.match(
+    releaseWorkflow,
+    /release-tooling-gate\.cjs record-failure \\\n+\s+validated\/tegami-validation\.json/,
+  );
 });
 
 test("Unix installer bounds network commands and releases its lock on TERM", {

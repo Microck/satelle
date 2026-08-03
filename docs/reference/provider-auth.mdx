@@ -39,6 +39,20 @@ kind = "host-store"
 name = "openai-production"
 ```
 
+## Interactive File provisioning
+
+Host-resolved Secret Sources are the normal path. The only raw-secret exception
+is interactive setup for a File descriptor. In a human terminal, setup shows
+the exact Host alias and destination path, disables terminal echo while reading
+the value, and asks for confirmation immediately before authenticated
+transmission to that Host.
+
+`--yes`, Trusted Profiles, JSON output, and `--no-input` cannot authorize this
+flow. The secret value is not accepted through command arguments or
+configuration and must not appear in logs, support artifacts, or agent
+conversation. A declined or failed replacement preserves the prior authorized
+Host value.
+
 Run a noninteractive setup plan to discover missing input without exposing a
 secret:
 

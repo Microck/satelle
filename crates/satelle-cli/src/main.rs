@@ -1051,7 +1051,7 @@ struct RunCommand {
     #[arg(
         long,
         conflicts_with = "no_yolo",
-        help = "Enable YOLO mode for this command; Codex-controlled approvals may be auto-accepted when supported"
+        help = "Enable YOLO for this Turn with approval policy never and sandbox policy danger-full-access; native app or operating-system prompts remain human decisions"
     )]
     yolo: bool,
     #[arg(long, help = "Disable YOLO mode for this command")]
@@ -1123,7 +1123,7 @@ struct SteerCommand {
     #[arg(
         long,
         conflicts_with = "no_yolo",
-        help = "Enable YOLO mode for this command; Codex-controlled approvals may be auto-accepted when supported"
+        help = "Enable YOLO for this Turn with approval policy never and sandbox policy danger-full-access; native app or operating-system prompts remain human decisions"
     )]
     yolo: bool,
     #[arg(long, help = "Disable YOLO mode for this command")]
@@ -1194,6 +1194,7 @@ enum SupportCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(about = "Unavailable in this release: support bundle export is not implemented")]
 struct SupportBundleCommand {
     #[arg(long)]
     host: Option<String>,

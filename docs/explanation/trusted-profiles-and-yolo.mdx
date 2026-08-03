@@ -23,16 +23,23 @@ Project configuration and `SATELLE_PROFILE` selection cannot activate YOLO.
 An explicitly selected user profile may activate it only when that profile
 binds the policy to an exact Host alias.
 
-## Trusted Profiles are planned mutation consent
+## Trusted Profiles grant scoped mutation consent
 
-The intended Trusted Profile model grants noninteractive mutation consent only
-for explicit Host aliases and explicit mutation command families. It does not
-grant wildcard, all-host, project-host, or future-command authority.
+Trusted Profiles grant noninteractive mutation consent only for the explicit
+Host aliases and mutation command families declared in user configuration.
+They do not grant wildcard, all-host, project-host, or future-command
+authority. Selecting a normal profile does not select a same-name Trusted
+Profile unless that user-owned profile names it explicitly.
 
-**Current status:** Trusted Profile schema and consent enforcement are not
-implemented in this release. Do not add guessed Trusted Profile TOML. Use
-interactive confirmation or the explicit per-command `--yes` boundary after
-reviewing the mutation plan.
+Trusted Profile schema and consent enforcement are implemented. A grant remains
+active until the user edits or removes it and has no automatic expiry in this
+release. Review the exact Host and command-family scope before selecting one.
+See the [configuration reference](/docs/reference/configuration#named-profiles)
+for the canonical TOML shape.
+
+A Trusted Profile cannot authorize raw provider-secret entry or replacement.
+It also cannot authorize YOLO, a different Host, or a mutation command family
+that the grant does not name.
 
 This distinction is deliberate: selecting a profile, choosing a Host, enabling
 YOLO, or approving one Codex callback must never silently authorize Host
