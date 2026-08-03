@@ -2992,25 +2992,39 @@ impl HostService {
         let includes_native_scope = scope_selection.contains(DoctorScope::ComputerUse);
         let has_provider_selection =
             provider_intent.model().is_some() || provider_intent.provider().is_some();
-        let should_resolve_provider = includes_provider_scope && has_provider_selection;
-        let mut provider_auth_evidence = if should_resolve_provider {
-            let evidence = match self.resolve_provider_binding(host, provider_intent)? {
-                ProviderBindingResolution::Ready(binding) => match binding.auth_source() {
-                    Some(source) => (
-                        provider_auth::diagnose_provider_secret(Some(source), None, false),
+        let should_resolve_provider =
+            includes_provider_scope && (has_provider_selection || options.refresh());
+        // An implicit Codex default can resolve to a non-OpenAI provider or
+        // custom endpoint. Enter the provider readiness phase so the adapter
+        // can classify the resolved binding before Doctor reports that no
+        // provider smoke is required.
+        let provider_probe_required = should_resolve_provider
+            && (provider_intent.provider_probe_required() || !has_provider_selection);
+        let resolve_provider_auth = || {
+            Ok::<_, SatelleError>(
+                match self.resolve_provider_binding(host, provider_intent)? {
+                    ProviderBindingResolution::Ready(binding) => match binding.auth_source() {
+                        Some(source) => (
+                            provider_auth::diagnose_provider_secret(Some(source), None, false),
+                            satelle_core::ProviderAuthObservationSource::Deferred,
+                        ),
+                        None => (
+                            satelle_core::ProviderAuthValidationOutcome::Resolved,
+                            satelle_core::ProviderAuthObservationSource::Cached,
+                        ),
+                    },
+                    ProviderBindingResolution::MissingDescriptor { .. } => (
+                        satelle_core::ProviderAuthValidationOutcome::MissingDescriptor,
                         satelle_core::ProviderAuthObservationSource::Deferred,
                     ),
-                    None => (
-                        satelle_core::ProviderAuthValidationOutcome::Resolved,
-                        satelle_core::ProviderAuthObservationSource::Cached,
-                    ),
                 },
-                ProviderBindingResolution::MissingDescriptor { .. } => (
-                    satelle_core::ProviderAuthValidationOutcome::MissingDescriptor,
-                    satelle_core::ProviderAuthObservationSource::Deferred,
-                ),
-            };
-            Some(evidence)
+            )
+        };
+        // Explicit selections can diagnose authorization immediately. Keep
+        // implicit resolution behind successful native proof so that native
+        // failure retains setup verification precedence.
+        let mut provider_auth_evidence = if should_resolve_provider && has_provider_selection {
+            Some(resolve_provider_auth()?)
         } else {
             None
         };
@@ -3028,17 +3042,15 @@ impl HostService {
                 report.changed = false;
                 report.cache_updates.clear();
             }
-            let provider_refresh_allowed = provider_auth_evidence.is_some_and(|outcome| {
+            let provider_resolution_allows_native = provider_auth_evidence.is_none_or(|outcome| {
                 !matches!(
                     outcome.0,
                     satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
                         | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
                 )
             });
-            let provider_probe_required =
-                should_resolve_provider && provider_intent.provider_probe_required();
-            let should_run_native_phase =
-                includes_native_scope || (provider_refresh_allowed && provider_probe_required);
+            let should_run_native_phase = includes_native_scope
+                || (provider_resolution_allows_native && provider_probe_required);
             let native_only_intent = ProviderComputerUseIntent::host_default();
             let native_intent = if scope_selection.scopes() == [DoctorScope::ComputerUse] {
                 &native_only_intent
@@ -3064,6 +3076,19 @@ impl HostService {
                 );
                 native_evidence = native_refresh.ok();
             }
+            if should_resolve_provider
+                && provider_auth_evidence.is_none()
+                && (!provider_probe_required || native_evidence.is_some())
+            {
+                provider_auth_evidence = Some(resolve_provider_auth()?);
+            }
+            let provider_refresh_allowed = provider_auth_evidence.is_some_and(|outcome| {
+                !matches!(
+                    outcome.0,
+                    satelle_core::ProviderAuthValidationOutcome::MissingDescriptor
+                        | satelle_core::ProviderAuthValidationOutcome::UnsupportedDescriptorKind
+                )
+            });
             if should_resolve_provider && provider_refresh_allowed {
                 let deferred_outcome =
                     provider_auth_evidence.expect("provider scopes always diagnose provider auth");
@@ -3147,12 +3172,7 @@ impl HostService {
         host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<DoctorReport, SatelleError> {
-        let raw_scopes =
-            if provider_intent.model().is_some() || provider_intent.provider().is_some() {
-                Vec::new()
-            } else {
-                vec!["computer-use".to_string()]
-            };
+        let raw_scopes = Vec::new();
         let scope_selection = DoctorScopeSelection::parse(&raw_scopes)
             .expect("setup verification uses supported Doctor scopes");
         let mut report = self
@@ -4812,9 +4832,13 @@ fn production_doctor_with_provider_intent(
     let includes_provider_scope = scope_selection.contains(DoctorScope::Provider);
     let has_provider_selection =
         provider_intent.model().is_some() || provider_intent.provider().is_some();
-    let should_resolve_provider = includes_provider_scope && has_provider_selection;
-    let provider_probe_required =
-        should_resolve_provider && provider_intent.provider_probe_required();
+    let should_resolve_provider =
+        includes_provider_scope && (has_provider_selection || options.refresh());
+    // Implicit Codex defaults are resolved by the Host adapter. Their provider
+    // policy is unknown until that resolution, so schedule the existing
+    // provider phase and let the adapter decide whether live smoke is needed.
+    let provider_probe_required = should_resolve_provider
+        && (provider_intent.provider_probe_required() || !has_provider_selection);
     let readiness_probe_timeouts = service.runtime.readiness_probe_timeouts();
 
     // Phase 0 is an atomic capability observation. Keep it as one real probe,
@@ -4839,7 +4863,11 @@ fn production_doctor_with_provider_intent(
         probes.push(DoctorProbe {
             probe_id: "provider-auth".to_string(),
             scope: DoctorScope::Provider.as_str().to_string(),
-            dependencies: Vec::new(),
+            dependencies: if provider_probe_required && !has_provider_selection {
+                vec![DoctorScope::ComputerUse.as_str().to_string()]
+            } else {
+                Vec::new()
+            },
             resource_locks: Default::default(),
             timeout: options.effective_probe_timeout(),
             cache_policy: DoctorProbeCachePolicy::Reuse,
@@ -6338,6 +6366,14 @@ fn production_doctor_probes(
             let configured_timeout = match scope {
                 DoctorScope::ComputerUse => readiness_probe_timeouts.0,
                 DoctorScope::Provider => readiness_probe_timeouts.1,
+                // Native readiness consumes the same atomic Phase 0 snapshot
+                // as its hidden Codex prerequisite. Give that prerequisite
+                // the native budget so cold runtime integrity checks cannot
+                // exhaust the generic diagnostic timeout before the native
+                // probe starts.
+                DoctorScope::Codex if scopes.contains(&DoctorScope::ComputerUse) => {
+                    readiness_probe_timeouts.0
+                }
                 DoctorScope::Codex | DoctorScope::Config | DoctorScope::Transport => {
                     DoctorOptions::DEFAULT_PROBE_TIMEOUT
                 }
@@ -6986,11 +7022,21 @@ mod packet17_doctor_tests {
         };
 
         assert_eq!(timeout(DoctorScope::ComputerUse.as_str()), native_timeout);
+        assert_eq!(timeout(DoctorScope::Codex.as_str()), native_timeout);
         assert_eq!(timeout(DoctorScope::Provider.as_str()), provider_timeout);
         assert_eq!(
             timeout(DoctorScope::Transport.as_str()),
             DoctorOptions::DEFAULT_PROBE_TIMEOUT
         );
+
+        let codex_only = production_doctor_probes(
+            &[DoctorScope::Codex],
+            None,
+            false,
+            (native_timeout, provider_timeout),
+            true,
+        );
+        assert_eq!(codex_only[0].timeout, DoctorOptions::DEFAULT_PROBE_TIMEOUT);
     }
 
     #[test]

@@ -2,8 +2,8 @@ use base64::Engine;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -13,6 +13,131 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONNECTION_TIMEOUT: Duration = Duration::from_millis(250);
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+const CLICK_OBSERVED: u8 = 1;
+const DRAG_OBSERVED: u8 = 2;
+const NATIVE_ACTION_RECEIPT_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone)]
+pub(crate) struct NativeActionEvidence {
+    state: Arc<(Mutex<NativeActionState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct NativeActionState {
+    expected_script: Option<String>,
+    active_item: Option<String>,
+    observed_actions: u8,
+    invalidated: bool,
+}
+
+impl NativeActionEvidence {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(NativeActionState::default()), Condvar::new())),
+        }
+    }
+
+    fn reset(&self) {
+        let (state, _) = &*self.state;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.expected_script = None;
+        state.active_item = None;
+        state.observed_actions = 0;
+        state.invalidated = false;
+    }
+
+    pub(crate) fn expect_script(&self, script: &str) {
+        let (state, _) = &*self.state;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.expected_script = Some(script.to_string());
+    }
+
+    fn wait_for(&self, action: NativeAction) -> bool {
+        let required = match action {
+            NativeAction::Click => CLICK_OBSERVED,
+            NativeAction::Drag => DRAG_OBSERVED,
+        };
+        let (state, changed) = &*self.state;
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut state, _) = changed
+            .wait_timeout_while(state, NATIVE_ACTION_RECEIPT_TIMEOUT, |state| {
+                state.active_item.is_none() && !state.invalidated
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.invalidated || state.active_item.is_none() {
+            return false;
+        }
+        state.observed_actions |= required;
+        true
+    }
+
+    pub(crate) fn observe_app_server_item(&self, method: &str, item: &serde_json::Value) {
+        let Some(item) = item.as_object() else {
+            return;
+        };
+        let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let script = item
+            .get("arguments")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|arguments| arguments.get("code"))
+            .and_then(serde_json::Value::as_str);
+        let (state, changed) = &*self.state;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_mcp_tool_call =
+            item.get("type").and_then(serde_json::Value::as_str) == Some("mcpToolCall");
+        let trusted_call = is_mcp_tool_call
+            && item.get("server").and_then(serde_json::Value::as_str) == Some("node_repl")
+            && item.get("tool").and_then(serde_json::Value::as_str) == Some("js")
+            && script == state.expected_script.as_deref();
+        match method {
+            "item/started"
+                if trusted_call
+                    && item.get("status").and_then(serde_json::Value::as_str)
+                        == Some("inProgress")
+                    && state.active_item.is_none()
+                    && !state.invalidated =>
+            {
+                state.active_item = Some(id.to_string());
+                changed.notify_all();
+            }
+            "item/completed"
+                if trusted_call
+                    && state.active_item.as_deref() == Some(id)
+                    && item.get("status").and_then(serde_json::Value::as_str)
+                        == Some("completed") => {}
+            "item/started" | "item/completed" if is_mcp_tool_call => {
+                // Native readiness permits one exact tool call. Any other MCP
+                // item can stage effects that make later callbacks untrustworthy.
+                state.invalidated = true;
+                state.active_item = None;
+                state.observed_actions = 0;
+                changed.notify_all();
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn completed(&self) -> bool {
+        let (state, _) = &*self.state;
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.invalidated
+            && state.active_item.is_some()
+            && state.observed_actions & (CLICK_OBSERVED | DRAG_OBSERVED)
+                == CLICK_OBSERVED | DRAG_OBSERVED
+    }
+}
 
 /// Owns one loopback-only provider capability probe. Dropping the owner
 /// cancels and joins the server thread, so no probe listener can survive its
@@ -21,9 +146,113 @@ pub(crate) struct ProviderProbeSurface {
     page_url: String,
     deadline: Instant,
     shutdown: Arc<AtomicBool>,
+    observed_actions: Arc<AtomicU8>,
+    requirements: ProbeRequirements,
     cancellation: Option<crate::runtime::AdmissionCancellation>,
     completion: mpsc::Receiver<Result<(), ProviderProbeError>>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy)]
+enum ProbeRequirements {
+    DragOnly,
+    ClickAndDrag,
+}
+
+struct ProbeServerControl<'a> {
+    deadline: Instant,
+    shutdown: &'a AtomicBool,
+    observed_actions: &'a AtomicU8,
+    cancellation: Option<&'a crate::runtime::AdmissionCancellation>,
+    requirements: ProbeRequirements,
+    native_gesture_evidence: NativeGestureEvidence,
+}
+
+enum NativeGestureEvidence {
+    NotRequired,
+    Native {
+        evidence: NativeActionEvidence,
+        #[cfg(windows)]
+        previous_input_tick: Option<u32>,
+    },
+    Unavailable,
+}
+
+#[derive(Clone, Copy)]
+enum NativeAction {
+    Click,
+    Drag,
+}
+
+impl NativeGestureEvidence {
+    fn new(requirements: ProbeRequirements, evidence: Option<NativeActionEvidence>) -> Self {
+        if matches!(requirements, ProbeRequirements::DragOnly) {
+            return Self::NotRequired;
+        }
+        match evidence {
+            Some(evidence) => Self::Native {
+                evidence,
+                #[cfg(windows)]
+                previous_input_tick: windows_last_input_tick(),
+            },
+            None => Self::Unavailable,
+        }
+    }
+
+    fn accept(&mut self, action: NativeAction) -> bool {
+        match self {
+            Self::NotRequired => true,
+            Self::Native {
+                evidence,
+                #[cfg(windows)]
+                previous_input_tick,
+            } => {
+                if !evidence.wait_for(action) {
+                    return false;
+                }
+                #[cfg(windows)]
+                let Some(previous_tick) = *previous_input_tick else {
+                    return false;
+                };
+                #[cfg(windows)]
+                let Some(current) = windows_last_input_tick() else {
+                    return false;
+                };
+                #[cfg(windows)]
+                let accepted = counter_advanced(previous_tick, current);
+                #[cfg(windows)]
+                if accepted {
+                    *previous_input_tick = Some(current);
+                }
+                #[cfg(windows)]
+                {
+                    accepted
+                }
+                #[cfg(not(windows))]
+                {
+                    true
+                }
+            }
+            Self::Unavailable => false,
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn counter_advanced(previous: u32, current: u32) -> bool {
+    let delta = current.wrapping_sub(previous);
+    delta != 0 && delta < (1_u32 << 31)
+}
+
+#[cfg(windows)]
+fn windows_last_input_tick() -> Option<u32> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+    let mut info = LASTINPUTINFO {
+        cbSize: u32::try_from(std::mem::size_of::<LASTINPUTINFO>()).ok()?,
+        dwTime: 0,
+    };
+    (unsafe { GetLastInputInfo(&mut info) } != 0).then_some(info.dwTime)
 }
 
 #[derive(Debug, Error)]
@@ -36,6 +265,10 @@ pub(crate) enum ProviderProbeError {
     InvalidRequest,
     #[error("the provider probe timed out")]
     TimedOut,
+    #[error("the native click callback was not observed")]
+    NativeClickNotObserved,
+    #[error("the native drag callback was not observed")]
+    NativeDragNotObserved,
     #[error("the provider probe was cancelled")]
     Cancelled,
     #[error("the provider probe listener failed")]
@@ -62,6 +295,43 @@ impl ProviderProbeSurface {
         deadline: Instant,
         cancellation: Option<crate::runtime::AdmissionCancellation>,
     ) -> Result<Self, ProviderProbeError> {
+        Self::start_with_requirements(deadline, cancellation, ProbeRequirements::DragOnly, None)
+    }
+
+    /// Starts the independent native action proof. The same private loopback
+    /// capability is used, but completion requires both a click and a drag.
+    #[cfg(test)]
+    pub(crate) fn start_native_with_control(
+        deadline: Instant,
+        cancellation: Option<crate::runtime::AdmissionCancellation>,
+    ) -> Result<Self, ProviderProbeError> {
+        Self::start_with_requirements(
+            deadline,
+            cancellation,
+            ProbeRequirements::ClickAndDrag,
+            None,
+        )
+    }
+
+    pub(crate) fn start_native_with_evidence(
+        deadline: Instant,
+        cancellation: Option<crate::runtime::AdmissionCancellation>,
+        evidence: NativeActionEvidence,
+    ) -> Result<Self, ProviderProbeError> {
+        Self::start_with_requirements(
+            deadline,
+            cancellation,
+            ProbeRequirements::ClickAndDrag,
+            Some(evidence),
+        )
+    }
+
+    fn start_with_requirements(
+        deadline: Instant,
+        cancellation: Option<crate::runtime::AdmissionCancellation>,
+        requirements: ProbeRequirements,
+        native_action_evidence: Option<NativeActionEvidence>,
+    ) -> Result<Self, ProviderProbeError> {
         if Instant::now() >= deadline {
             return Err(ProviderProbeError::TimedOut);
         }
@@ -83,11 +353,18 @@ impl ProviderProbeSurface {
         }
         let port = address.port();
         let nonce = random_token(32)?;
+        if let Some(evidence) = native_action_evidence.as_ref() {
+            evidence.reset();
+        }
         let capability = random_token(32)?;
         let page_url = format!("http://127.0.0.1:{port}/probe/{capability}");
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
+        let observed_actions = Arc::new(AtomicU8::new(0));
+        let worker_observed_actions = Arc::clone(&observed_actions);
         let worker_cancellation = cancellation.clone();
+        let native_gesture_evidence =
+            NativeGestureEvidence::new(requirements, native_action_evidence);
         let (sender, completion) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("satelle-provider-probe".to_string())
@@ -96,9 +373,14 @@ impl ProviderProbeSurface {
                     listener,
                     nonce,
                     capability,
-                    deadline,
-                    &worker_shutdown,
-                    worker_cancellation.as_ref(),
+                    ProbeServerControl {
+                        deadline,
+                        shutdown: &worker_shutdown,
+                        observed_actions: &worker_observed_actions,
+                        cancellation: worker_cancellation.as_ref(),
+                        requirements,
+                        native_gesture_evidence,
+                    },
                 );
                 let _ = sender.send(outcome);
             })
@@ -108,6 +390,8 @@ impl ProviderProbeSurface {
             page_url,
             deadline,
             shutdown,
+            observed_actions,
+            requirements,
             cancellation,
             completion,
             worker: Some(worker),
@@ -122,6 +406,22 @@ impl ProviderProbeSurface {
     /// terminal text or process exit status cannot satisfy this check.
     pub(crate) fn wait_for_completion(mut self) -> Result<(), ProviderProbeError> {
         let outcome = loop {
+            if probe_requirements_satisfied(
+                self.requirements,
+                self.observed_actions.load(Ordering::Acquire),
+            ) {
+                break Ok(());
+            }
+            // A callback that completed before cancellation is durable proof.
+            // Consume it first so session timeout cleanup cannot overwrite an
+            // already-observed click-and-drag success.
+            match self.completion.try_recv() {
+                Ok(outcome) => break outcome,
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    break Err(ProviderProbeError::WorkerStopped);
+                }
+            }
             if self
                 .cancellation
                 .as_ref()
@@ -131,7 +431,10 @@ impl ProviderProbeSurface {
             }
             let remaining = self.deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                break Err(ProviderProbeError::TimedOut);
+                break Err(probe_timeout_error(
+                    self.requirements,
+                    self.observed_actions.load(Ordering::Acquire),
+                ));
             }
             match self.completion.recv_timeout(POLL_INTERVAL.min(remaining)) {
                 Ok(outcome) => break outcome,
@@ -164,13 +467,20 @@ fn serve_probe(
     listener: TcpListener,
     nonce: String,
     capability: String,
-    deadline: Instant,
-    shutdown: &AtomicBool,
-    cancellation: Option<&crate::runtime::AdmissionCancellation>,
+    control: ProbeServerControl<'_>,
 ) -> Result<(), ProviderProbeError> {
+    let ProbeServerControl {
+        deadline,
+        shutdown,
+        observed_actions,
+        cancellation,
+        requirements,
+        mut native_gesture_evidence,
+    } = control;
     let page_target = format!("/probe/{capability}");
     let completion_target = format!("/complete/{capability}");
-    let completion_body = format!("nonce={nonce}&action=drag");
+    let click_body = format!("nonce={nonce}&action=click");
+    let drag_body = format!("nonce={nonce}&action=drag");
     let expected_host = listener
         .local_addr()
         .map_err(ProviderProbeError::Io)?
@@ -182,7 +492,10 @@ fn serve_probe(
             return Err(ProviderProbeError::Cancelled);
         }
         if Instant::now() >= deadline {
-            return Err(ProviderProbeError::TimedOut);
+            return Err(probe_timeout_error(
+                requirements,
+                observed_actions.load(Ordering::Acquire),
+            ));
         }
 
         match listener.accept() {
@@ -204,7 +517,10 @@ fn serve_probe(
                                 return Err(ProviderProbeError::Cancelled);
                             }
                             if Instant::now() >= deadline {
-                                return Err(ProviderProbeError::TimedOut);
+                                return Err(probe_timeout_error(
+                                    requirements,
+                                    observed_actions.load(Ordering::Acquire),
+                                ));
                             }
                             let _ = write_response(
                                 &mut stream,
@@ -227,7 +543,7 @@ fn serve_probe(
                     && request.host.as_deref() == Some(expected_host.as_str())
                     && request.origin.is_none()
                 {
-                    write_page(&mut stream, &nonce, &completion_target)?;
+                    write_page(&mut stream, &nonce, &completion_target, requirements)?;
                 } else if request.method == "POST"
                     && request.target == completion_target
                     && request.headers_valid
@@ -236,10 +552,34 @@ fn serve_probe(
                     && request.origin.as_deref() == Some(expected_origin.as_str())
                     && request.content_type.as_deref() == Some(FORM_CONTENT_TYPE)
                     && request.content_length == Some(request.body.len())
-                    && request.body == completion_body.as_bytes()
+                    && match requirements {
+                        ProbeRequirements::DragOnly => request.body == drag_body.as_bytes(),
+                        ProbeRequirements::ClickAndDrag => {
+                            request.body == click_body.as_bytes()
+                                || request.body == drag_body.as_bytes()
+                        }
+                    }
+                    && native_gesture_evidence.accept(if request.body == click_body.as_bytes() {
+                        NativeAction::Click
+                    } else {
+                        NativeAction::Drag
+                    })
                 {
+                    if request.body == click_body.as_bytes() {
+                        observed_actions.fetch_or(CLICK_OBSERVED, Ordering::AcqRel);
+                    } else {
+                        observed_actions.fetch_or(DRAG_OBSERVED, Ordering::AcqRel);
+                    }
+                    let completed = probe_requirements_satisfied(
+                        requirements,
+                        observed_actions.load(Ordering::Acquire),
+                    );
+                    // A 204 acknowledges a callback only after its observation
+                    // is durable, so later cancellation cannot overtake it.
                     write_response(&mut stream, "204 No Content", "text/plain", "")?;
-                    return Ok(());
+                    if completed {
+                        return Ok(());
+                    }
                 } else if request.target == completion_target {
                     let _ = write_response(
                         &mut stream,
@@ -264,6 +604,30 @@ fn serve_probe(
             }
             Err(error) => return Err(ProviderProbeError::Io(error)),
         }
+    }
+}
+
+fn probe_requirements_satisfied(requirements: ProbeRequirements, observed_actions: u8) -> bool {
+    match requirements {
+        ProbeRequirements::DragOnly => observed_actions & DRAG_OBSERVED != 0,
+        ProbeRequirements::ClickAndDrag => {
+            observed_actions & (CLICK_OBSERVED | DRAG_OBSERVED) == (CLICK_OBSERVED | DRAG_OBSERVED)
+        }
+    }
+}
+
+fn probe_timeout_error(
+    requirements: ProbeRequirements,
+    observed_actions: u8,
+) -> ProviderProbeError {
+    match (requirements, observed_actions) {
+        (ProbeRequirements::ClickAndDrag, CLICK_OBSERVED) => {
+            ProviderProbeError::NativeDragNotObserved
+        }
+        (ProbeRequirements::ClickAndDrag, DRAG_OBSERVED) => {
+            ProviderProbeError::NativeClickNotObserved
+        }
+        _ => ProviderProbeError::TimedOut,
     }
 }
 
@@ -457,9 +821,20 @@ fn write_page(
     stream: &mut TcpStream,
     nonce: &str,
     completion_target: &str,
+    requirements: ProbeRequirements,
 ) -> Result<(), ProviderProbeError> {
+    let click_control = match requirements {
+        ProbeRequirements::DragOnly => String::new(),
+        ProbeRequirements::ClickAndDrag => format!(
+            "<button id=confirm type=button>Click to confirm</button><script>document.querySelector('#confirm').addEventListener('click',event=>{{if(!event.isTrusted)return;event.currentTarget.textContent='Click event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',body:'nonce={nonce}&action=click'}});}});</script>"
+        ),
+    };
+    let title = match requirements {
+        ProbeRequirements::DragOnly => "Satelle provider probe",
+        ProbeRequirements::ClickAndDrag => "Satelle native readiness probe",
+    };
     let body = format!(
-        "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><link rel=icon href=data:,><title>Satelle provider probe</title><main><p>Nonce: <strong>{nonce}</strong></p><div id=source draggable=true>Drag this marker</div><div id=target>Drop here</div></main><script>const source=document.querySelector('#source');const target=document.querySelector('#target');source.addEventListener('dragstart',event=>event.dataTransfer.setData('text/plain','satelle'));target.addEventListener('dragover',event=>event.preventDefault());target.addEventListener('drop',event=>{{event.preventDefault();if(event.dataTransfer.getData('text/plain')==='satelle')fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',body:'nonce={nonce}&action=drag'}});}});</script>"
+        "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><link rel=icon href=data:,><title>{title}</title><style>main{{font:24px sans-serif;padding:40px}}button,#source,#target{{display:block;box-sizing:border-box;width:320px;min-height:80px;margin:24px 0;padding:24px;border:3px solid #222;background:#fff;color:#111;text-align:center}}#source{{cursor:grab}}#target{{margin-left:420px;background:#eee}}</style><main><p>Nonce: <strong>{nonce}</strong></p>{click_control}<div id=source draggable=true>Drag from here</div><div id=target>Drop here</div></main><script>const source=document.querySelector('#source');const target=document.querySelector('#target');let dragStart=null;let dragSent=false;let sourceDragStarted=false;const completeDrag=()=>{{if(dragSent)return;dragSent=true;target.textContent='Drag event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',body:'nonce={nonce}&action=drag'}});}};const rememberStart=event=>{{if(!event.isTrusted)return;dragStart={{x:event.clientX,y:event.clientY}};}};const movedFromSource=event=>dragStart&&Math.hypot(event.clientX-dragStart.x,event.clientY-dragStart.y)>100;const completeAt=event=>{{if(!event.isTrusted)return;const end=document.elementFromPoint(event.clientX,event.clientY);if(movedFromSource(event)&&end?.closest('#target'))completeDrag();dragStart=null;}};source.addEventListener('mousedown',rememberStart);source.addEventListener('pointerdown',rememberStart);document.addEventListener('mouseup',completeAt);document.addEventListener('pointerup',completeAt);source.addEventListener('dragstart',event=>{{if(!event.isTrusted)return;sourceDragStarted=true;dragStart??={{x:event.clientX,y:event.clientY}};event.dataTransfer.setData('text/plain','satelle');}});source.addEventListener('dragend',completeAt);target.addEventListener('mousemove',event=>{{if(!event.isTrusted)return;if(event.buttons&1&&movedFromSource(event))completeDrag();}});target.addEventListener('pointermove',event=>{{if(!event.isTrusted)return;if(event.buttons&1&&movedFromSource(event))completeDrag();}});target.addEventListener('dragover',event=>{{if(!event.isTrusted)return;event.preventDefault();if(sourceDragStarted)completeDrag();}});target.addEventListener('drop',event=>{{if(!event.isTrusted)return;event.preventDefault();if(sourceDragStarted)completeDrag();}});</script>"
     );
     write_response(stream, "200 OK", "text/html; charset=utf-8", &body)
 }
@@ -472,7 +847,7 @@ fn write_response(
 ) -> Result<(), ProviderProbeError> {
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; img-src data:; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; img-src data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
     .map_err(ProviderProbeError::Io)
@@ -481,6 +856,122 @@ fn write_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_receipts_require_the_exact_successful_tool_call() {
+        let evidence = NativeActionEvidence::new();
+        evidence.reset();
+        evidence.expect_script("probe-nonce exact script");
+        let started = serde_json::json!({
+            "id": "item-1",
+            "type": "mcpToolCall",
+            "server": "node_repl",
+            "tool": "js",
+            "arguments": {"code": "probe-nonce exact script"},
+            "status": "inProgress"
+        });
+        evidence.observe_app_server_item("item/started", &started);
+
+        assert!(evidence.wait_for(NativeAction::Click));
+        assert!(evidence.wait_for(NativeAction::Drag));
+        assert!(evidence.completed());
+
+        let completed = serde_json::json!({
+            "id": "item-1",
+            "type": "mcpToolCall",
+            "server": "node_repl",
+            "tool": "js",
+            "arguments": {"code": "probe-nonce exact script"},
+            "status": "completed",
+            "result": {"content": [{"type": "text", "text": "ok"}]},
+            "error": null
+        });
+        evidence.observe_app_server_item("item/completed", &completed);
+        assert!(evidence.completed());
+    }
+
+    #[test]
+    fn native_receipts_reject_changed_tool_calls() {
+        let evidence = NativeActionEvidence::new();
+        evidence.reset();
+        evidence.expect_script("probe-nonce exact script");
+        evidence.observe_app_server_item(
+            "item/started",
+            &serde_json::json!({
+                "id": "item-1",
+                "type": "mcpToolCall",
+                "server": "node_repl",
+                "tool": "js",
+                "arguments": {"code": "probe-nonce exact script; void import(\"node:\" + \"http\")"},
+                "status": "inProgress"
+            }),
+        );
+        assert!(!evidence.wait_for(NativeAction::Click));
+        assert!(!evidence.completed());
+    }
+
+    #[test]
+    fn native_receipts_reject_a_failed_exact_tool_call() {
+        let evidence = NativeActionEvidence::new();
+        evidence.reset();
+        evidence.expect_script("probe-nonce exact script");
+        let started = serde_json::json!({
+            "id": "item-1",
+            "type": "mcpToolCall",
+            "server": "node_repl",
+            "tool": "js",
+            "arguments": {"code": "probe-nonce exact script"},
+            "status": "inProgress"
+        });
+        evidence.observe_app_server_item("item/started", &started);
+        assert!(evidence.wait_for(NativeAction::Click));
+        assert!(evidence.wait_for(NativeAction::Drag));
+
+        let failed = serde_json::json!({
+            "id": "item-1",
+            "type": "mcpToolCall",
+            "server": "node_repl",
+            "tool": "js",
+            "arguments": {"code": "probe-nonce exact script"},
+            "status": "failed",
+            "error": null
+        });
+        evidence.observe_app_server_item("item/completed", &failed);
+
+        assert!(!evidence.completed());
+    }
+
+    #[test]
+    fn native_receipts_reject_an_exact_call_after_a_changed_tool_call() {
+        let evidence = NativeActionEvidence::new();
+        evidence.reset();
+        evidence.expect_script("probe-nonce exact script");
+        evidence.observe_app_server_item(
+            "item/started",
+            &serde_json::json!({
+                "id": "item-untrusted",
+                "type": "mcpToolCall",
+                "server": "node_repl",
+                "tool": "js",
+                "arguments": {"code": "schedule forged callbacks"},
+                "status": "inProgress"
+            }),
+        );
+        evidence.observe_app_server_item(
+            "item/started",
+            &serde_json::json!({
+                "id": "item-exact",
+                "type": "mcpToolCall",
+                "server": "node_repl",
+                "tool": "js",
+                "arguments": {"code": "probe-nonce exact script"},
+                "status": "inProgress"
+            }),
+        );
+
+        assert!(!evidence.wait_for(NativeAction::Click));
+        assert!(!evidence.completed());
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum InvalidCallbackCase {
@@ -578,6 +1069,85 @@ mod tests {
         assert!(callback.starts_with("HTTP/1.1 204 No Content"));
         probe.wait_for_completion().unwrap();
         assert!(TcpStream::connect(address).is_err());
+    }
+
+    #[test]
+    fn native_page_rejects_direct_callbacks_without_os_input_evidence() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let probe = ProviderProbeSurface::start_native_with_control(deadline, None).unwrap();
+        let page_url = probe.page_url().to_string();
+        let (address, page_target) = split_local_url(&page_url);
+        let page = get_page(&address, &page_target);
+
+        assert!(page.contains("Satelle native readiness probe"));
+        assert!(page.contains("<button id=confirm type=button>Click to confirm</button>"));
+        assert!(page.contains("#source,#target"));
+        assert!(page.contains("Drag from here"));
+        assert!(page.contains("Drop here"));
+        assert!(page.contains("Math.hypot(event.clientX-dragStart.x"));
+        assert!(page.contains("document.elementFromPoint(event.clientX,event.clientY)"));
+        assert!(page.contains("sourceDragStarted"));
+        assert!(page.contains("source.addEventListener('pointerdown',rememberStart)"));
+        assert!(page.contains("document.addEventListener('pointerup',completeAt)"));
+        assert!(page.contains("dragStart??={x:event.clientX,y:event.clientY}"));
+        assert!(page.contains("if(sourceDragStarted)completeDrag()"));
+        assert!(page.contains("const movedFromSource=event=>dragStart&&Math.hypot"));
+        assert!(page.contains("event.buttons&1&&movedFromSource(event)"));
+        assert!(page.contains("source.addEventListener('dragend'"));
+        assert!(page.contains("end?.closest('#target')"));
+        assert!(page.contains("event.buttons&1"));
+        assert!(page.contains("Click event observed"));
+        assert!(page.contains("Drag event observed"));
+        assert!(page.contains("if(!event.isTrusted)return"));
+
+        let nonce = between(&page, "Nonce: <strong>", "</strong>");
+        let completion_target = between(&page, "fetch('", "'");
+        let callback = |action| {
+            let body = format!("nonce={nonce}&action={action}");
+            exchange(
+                &address,
+                &format!(
+                    "POST {completion_target} HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nContent-Type: {FORM_CONTENT_TYPE}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+
+        assert!(callback("click").starts_with("HTTP/1.1 404 Not Found"));
+        assert!(matches!(
+            probe.wait_for_completion(),
+            Err(ProviderProbeError::InvalidRequest)
+        ));
+        assert!(TcpStream::connect(address).is_err());
+    }
+
+    #[test]
+    fn native_timeout_identifies_the_missing_drag_callback() {
+        assert!(matches!(
+            probe_timeout_error(ProbeRequirements::ClickAndDrag, CLICK_OBSERVED),
+            ProviderProbeError::NativeDragNotObserved
+        ));
+    }
+
+    #[test]
+    fn native_cancellation_reports_cancellation() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let cancellation = crate::runtime::AdmissionCancellation::with_deadline(deadline);
+        let probe =
+            ProviderProbeSurface::start_native_with_control(deadline, Some(cancellation.clone()))
+                .unwrap();
+        cancellation.request();
+        assert!(matches!(
+            probe.wait_for_completion(),
+            Err(ProviderProbeError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn input_counter_comparison_handles_wraparound_and_rejects_stale_values() {
+        assert!(counter_advanced(u32::MAX - 1, 1));
+        assert!(!counter_advanced(42, 42));
+        assert!(!counter_advanced(42, 41));
     }
 
     #[test]

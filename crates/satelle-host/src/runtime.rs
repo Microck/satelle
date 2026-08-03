@@ -23,7 +23,9 @@ pub use adapter::{
     ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
     ReadinessEvidence, ReadinessObservationState, RecoveryObservation,
 };
-pub(crate) use adapter::{NativeProbeResult, ReadinessProbeDriver, ReadinessSource};
+pub(crate) use adapter::{
+    AdmittedAppApproval, NativeProbeResult, ReadinessProbeDriver, ReadinessSource,
+};
 pub(crate) use codex_adapter::{
     ProductionAdapterPolicy, ProductionComputerUseAdapter, validate_provider_endpoint,
 };
@@ -208,6 +210,7 @@ struct AdmissionExecution<'a> {
     host: &'a str,
     prompt: &'a str,
     execution_mode: satelle_core::session::TurnExecutionMode,
+    admitted_app_approval: AdmittedAppApproval,
     dispatch_preference: request::DispatchPreference,
     provider_smoke_event: Option<satelle_core::SatelleEventBody>,
     resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
@@ -1227,6 +1230,7 @@ impl RuntimeEngine {
                 host: command.host,
                 prompt: command.prompt,
                 execution_mode: command.execution_mode,
+                admitted_app_approval: readiness.admitted_app_approval().clone(),
                 dispatch_preference: command.dispatch,
                 provider_smoke_event,
                 resolved_provider_binding: readiness.resolved_provider_binding().cloned(),
@@ -1298,6 +1302,7 @@ impl RuntimeEngine {
                 host: LOCAL_DEMO_HOST,
                 prompt: command.prompt,
                 execution_mode: command.execution_mode,
+                admitted_app_approval: readiness.admitted_app_approval().clone(),
                 dispatch_preference: command.dispatch,
                 provider_smoke_event,
                 resolved_provider_binding: readiness.resolved_provider_binding().cloned(),
@@ -2173,6 +2178,7 @@ impl RuntimeEngine {
                     host: execution.host.to_string(),
                     prompt: execution.prompt.to_string(),
                     execution_mode: execution.execution_mode,
+                    admitted_app_approval: execution.admitted_app_approval,
                     work,
                     provider_smoke_event: execution.provider_smoke_event,
                     resolved_provider_binding: execution.resolved_provider_binding,

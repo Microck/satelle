@@ -3,6 +3,7 @@ use base64::Engine as _;
 use satelle_core::session::StopObservation;
 use satelle_core::session::TurnExecutionMode;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
@@ -92,6 +93,9 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) observe_native_approval: Option<&'a mut dyn FnMut()>,
+    pub(crate) native_action_evidence: Option<crate::provider_probe::NativeActionEvidence>,
+    pub(crate) expected_mcp_server_name: &'a str,
+    pub(crate) computer_use_allowed_app_ids: &'a BTreeSet<String>,
     pub(crate) control: Option<CodexSessionControl>,
     pub(crate) goal_set_supported: bool,
     pub(crate) image_input_mode: crate::codex_capabilities::CodexImageInputMode,
@@ -271,7 +275,15 @@ impl CodexSessionFailure {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn run_codex_session(
+    command: Command,
+    request: CodexSessionRequest<'_>,
+) -> Result<CodexSessionTerminal, CodexSessionFailure> {
+    run_codex_session_bound(command, request)
+}
+
+fn run_codex_session_bound(
     mut command: Command,
     request: CodexSessionRequest<'_>,
 ) -> Result<CodexSessionTerminal, CodexSessionFailure> {
@@ -401,7 +413,7 @@ pub(crate) fn run_codex_session_with_timeout_cancellation(
         }
     });
 
-    let result = run_codex_session(command, request);
+    let result = run_codex_session_bound(command, request);
     let _ = finished_sender.send(());
     let cancellation = watchdog
         .join()
@@ -436,9 +448,12 @@ pub(crate) fn read_codex_turn(
 
 struct SessionExchange<'a> {
     request: CodexSessionRequest<'a>,
-    responses: [bool; 6],
+    responses: [bool; 8],
     thread_ref: Option<String>,
     thread_observed: bool,
+    expected_mcp_ready: bool,
+    mcp_inventory_dispatch_attempted: bool,
+    plugin_inventory_dispatch_attempted: bool,
     turn_ref: Option<String>,
     turn_dispatch_attempted: bool,
     goal_dispatch_attempted: bool,
@@ -463,8 +478,11 @@ impl<'a> SessionExchange<'a> {
         Self {
             thread_ref: request.existing_thread_ref.map(str::to_owned),
             request,
-            responses: [false; 6],
+            responses: [false; 8],
             thread_observed: false,
+            expected_mcp_ready: false,
+            mcp_inventory_dispatch_attempted: false,
+            plugin_inventory_dispatch_attempted: false,
             turn_ref: None,
             turn_dispatch_attempted: false,
             goal_dispatch_attempted: false,
@@ -503,6 +521,19 @@ impl<'a> SessionExchange<'a> {
             }
             if !self.controlled_stop
                 && self.thread_observed
+                && self.expected_mcp_ready
+                && !self.mcp_inventory_dispatch_attempted
+            {
+                self.write_mcp_inventory_request(writer)?;
+            }
+            if !self.controlled_stop
+                && self.responses[6]
+                && !self.plugin_inventory_dispatch_attempted
+            {
+                self.write_plugin_inventory_request(writer)?;
+            }
+            if !self.controlled_stop
+                && self.responses[7]
                 && self.goal_required()
                 && !self.goal_dispatch_attempted
             {
@@ -511,6 +542,7 @@ impl<'a> SessionExchange<'a> {
             if !self.controlled_stop
                 && !self.turn_dispatch_attempted
                 && self.thread_observed
+                && self.responses[7]
                 && (!self.goal_required() || self.responses[3])
             {
                 self.write_turn_request(writer)?;
@@ -662,6 +694,18 @@ impl<'a> SessionExchange<'a> {
             .clone();
         let method = required_string(object, "method")?;
         let auto_approve = self.request.auto_approves_callbacks();
+        if method == "mcpServer/elicitation/request" {
+            let (result, authorized) = codex_approval::computer_use_elicitation_result(
+                object,
+                self.request.computer_use_allowed_app_ids,
+                self.thread_ref.as_deref(),
+                self.turn_ref.as_deref(),
+            )?;
+            return Ok(ServerResponse {
+                body: json!({"id": id, "result": result}),
+                observe_native_approval: !authorized,
+            });
+        }
         if let Some(result) = codex_approval::approval_result(
             method,
             object,
@@ -679,7 +723,6 @@ impl<'a> SessionExchange<'a> {
             self.validate_server_request_correlation(params)?;
         }
         let result = match method {
-            "mcpServer/elicitation/request" => json!({"action": "decline"}),
             "item/tool/call" => json!({"contentItems": [], "success": false}),
             _ => {
                 return Ok(ServerResponse {
@@ -718,7 +761,7 @@ impl<'a> SessionExchange<'a> {
             .get("id")
             .and_then(Value::as_u64)
             .and_then(|id| usize::try_from(id).ok())
-            .filter(|id| (1..=5).contains(id))
+            .filter(|id| (1..=7).contains(id))
             .ok_or(CodexSessionError::UnexpectedResponse)?;
         if self.responses[id] {
             return Err(CodexSessionError::DuplicateResponse);
@@ -747,6 +790,12 @@ impl<'a> SessionExchange<'a> {
                 let thread_ref = nested_id(result, "thread")?;
                 self.observe_thread(thread_ref)?;
             }
+            6 if self.mcp_inventory_dispatch_attempted => {
+                self.validate_mcp_inventory(result)?;
+            }
+            7 if self.plugin_inventory_dispatch_attempted => {
+                self.validate_plugin_inventory(result)?;
+            }
             3 if self.goal_dispatch_attempted => {
                 let goal = result
                     .get("goal")
@@ -755,6 +804,9 @@ impl<'a> SessionExchange<'a> {
                 self.correlate_thread(required_string(goal, "threadId")?)?;
                 if required_string(goal, "objective")? != self.request.prompt {
                     return Err(CodexSessionError::ConflictingIdentity);
+                }
+                if required_string(goal, "status")? != "paused" {
+                    return Err(CodexSessionError::MalformedMessage);
                 }
             }
             3 if self.turn_dispatch_attempted && !self.goal_required() => {
@@ -768,6 +820,67 @@ impl<'a> SessionExchange<'a> {
             _ => return Err(CodexSessionError::UnexpectedResponse),
         }
         self.responses[id] = true;
+        Ok(())
+    }
+
+    fn validate_mcp_inventory(&self, result: &Map<String, Value>) -> Result<(), CodexSessionError> {
+        if result.get("nextCursor") != Some(&Value::Null) {
+            return Err(CodexSessionError::MalformedMessage);
+        }
+        let servers = result
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or(CodexSessionError::MalformedMessage)?;
+        let mut expected_count = 0;
+        for server in servers {
+            let server = server
+                .as_object()
+                .ok_or(CodexSessionError::MalformedMessage)?;
+            let name = required_string(server, "name")?;
+            if name == self.request.expected_mcp_server_name {
+                expected_count += 1;
+                continue;
+            }
+            let active = server
+                .get("serverInfo")
+                .is_some_and(|value| !value.is_null())
+                || server
+                    .get("tools")
+                    .and_then(Value::as_object)
+                    .is_some_and(|tools| !tools.is_empty())
+                || server.get("authStatus").and_then(Value::as_str) != Some("unsupported");
+            if active {
+                return Err(CodexSessionError::ConflictingIdentity);
+            }
+        }
+        if expected_count != 1 {
+            return Err(CodexSessionError::ConflictingIdentity);
+        }
+        Ok(())
+    }
+
+    fn validate_plugin_inventory(
+        &self,
+        result: &Map<String, Value>,
+    ) -> Result<(), CodexSessionError> {
+        let load_errors = result
+            .get("marketplaceLoadErrors")
+            .and_then(Value::as_array)
+            .ok_or(CodexSessionError::MalformedMessage)?;
+        if !load_errors.is_empty() {
+            return Err(CodexSessionError::ConflictingIdentity);
+        }
+        let marketplaces = result
+            .get("marketplaces")
+            .and_then(Value::as_array)
+            .ok_or(CodexSessionError::MalformedMessage)?;
+        let featured = result
+            .get("featuredPluginIds")
+            .and_then(Value::as_array)
+            .ok_or(CodexSessionError::MalformedMessage)?;
+        if !marketplaces.is_empty() || !featured.is_empty() {
+            return Err(CodexSessionError::ConflictingIdentity);
+        }
         Ok(())
     }
 
@@ -796,6 +909,22 @@ impl<'a> SessionExchange<'a> {
             .and_then(Value::as_str)
             .ok_or(CodexSessionError::MalformedMessage)?;
         match method {
+            "mcpServer/startupStatus/updated" => {
+                let params = required_object(object, "params")?;
+                self.correlate_thread(required_string(params, "threadId")?)?;
+                if required_string(params, "name")? != self.request.expected_mcp_server_name {
+                    return Err(CodexSessionError::ConflictingIdentity);
+                }
+                match required_string(params, "status")? {
+                    "starting" => Ok(()),
+                    "ready" => {
+                        self.expected_mcp_ready = true;
+                        Ok(())
+                    }
+                    "failed" | "cancelled" => Err(CodexSessionError::ConflictingIdentity),
+                    _ => Err(CodexSessionError::MalformedMessage),
+                }
+            }
             "thread/started" if self.responses[1] => {
                 let params = required_object(object, "params")?;
                 self.observe_thread(nested_id(params, "thread")?)
@@ -833,7 +962,15 @@ impl<'a> SessionExchange<'a> {
                 Ok(())
             }
             "item/started" | "item/completed" if self.turn_dispatch_attempted => {
-                self.validate_item_correlation(object)
+                self.validate_item_correlation(object)?;
+                if let Some(evidence) = self.request.native_action_evidence.as_ref() {
+                    let params = required_object(object, "params")?;
+                    let item = params
+                        .get("item")
+                        .ok_or(CodexSessionError::MalformedMessage)?;
+                    evidence.observe_app_server_item(method, item);
+                }
+                Ok(())
             }
             "thread/started" | "turn/started" | "turn/completed" | "item/started"
             | "item/completed" => Err(CodexSessionError::MalformedMessage),
@@ -948,6 +1085,45 @@ impl<'a> SessionExchange<'a> {
         writer.write(&json!({"id": 2, "method": method, "params": params}))
     }
 
+    fn write_mcp_inventory_request(
+        &mut self,
+        writer: &ProtocolWriter,
+    ) -> Result<(), CodexSessionError> {
+        let thread_ref = self.thread_ref.as_deref().ok_or(CodexSessionError::Write)?;
+        writer.write_after_queue(
+            &json!({
+                "id": 6,
+                "method": "mcpServerStatus/list",
+                "params": {
+                    "threadId": thread_ref,
+                    "cursor": null,
+                    "limit": 100,
+                    "detail": "toolsAndAuthOnly"
+                }
+            }),
+            || self.mcp_inventory_dispatch_attempted = true,
+        )
+    }
+
+    fn write_plugin_inventory_request(
+        &mut self,
+        writer: &ProtocolWriter,
+    ) -> Result<(), CodexSessionError> {
+        let working_directory = self
+            .request
+            .working_directory
+            .to_str()
+            .ok_or(CodexSessionError::Write)?;
+        writer.write_after_queue(
+            &json!({
+                "id": 7,
+                "method": "plugin/list",
+                "params": {"cwds": [working_directory]}
+            }),
+            || self.plugin_inventory_dispatch_attempted = true,
+        )
+    }
+
     fn write_turn_request(&mut self, writer: &ProtocolWriter) -> Result<(), CodexSessionError> {
         let thread_ref = self.thread_ref.as_deref().ok_or(CodexSessionError::Write)?;
         let mut input = vec![json!({"type": "text", "text": self.request.prompt})];
@@ -1009,7 +1185,14 @@ impl<'a> SessionExchange<'a> {
             &json!({
                 "id": 3,
                 "method": "thread/goal/set",
-                "params": {"threadId": thread_ref, "objective": self.request.prompt}
+                // A newly active upstream Goal starts its own continuation Turn.
+                // Keep Goal state as lifecycle metadata so the explicit
+                // turn/start request remains the sole owner of this Turn.
+                "params": {
+                    "threadId": thread_ref,
+                    "objective": self.request.prompt,
+                    "status": "paused"
+                }
             }),
             || self.goal_dispatch_attempted = true,
         )

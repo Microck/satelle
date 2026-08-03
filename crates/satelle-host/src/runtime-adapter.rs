@@ -8,6 +8,7 @@ use satelle_core::{
     ControlPlaneOperation, ErrorCode, SatelleError, SatelleEvent, SessionId, TurnId,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 /// Alias-only provider intent from the Controller. The Host runtime attaches
@@ -135,11 +136,38 @@ pub struct AdapterReadiness {
     desktop_binding: DesktopBindingRef,
     execution_policy: ExecutionPolicy,
     evidence: ReadinessEvidence,
+    admitted_app_approval: AdmittedAppApproval,
     provider_smoke_evidence: Option<ProviderSmokeEvidence>,
     resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
     prepared_provider_secret: Option<PreparedProviderSecret>,
     source: ReadinessSource,
     checks: Vec<NativeReadinessCheck>,
+}
+
+/// The exact app policy admitted by one readiness result. Keep the fingerprint
+/// and allowlist together so execution cannot validate one snapshot and use
+/// another when it answers a Codex app-selection elicitation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdmittedAppApproval {
+    fingerprint: String,
+    allowed_app_ids: BTreeSet<String>,
+}
+
+impl AdmittedAppApproval {
+    fn new(fingerprint: &str, allowed_app_ids: BTreeSet<String>) -> Self {
+        Self {
+            fingerprint: fingerprint.to_string(),
+            allowed_app_ids,
+        }
+    }
+
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(crate) fn allowed_app_ids(&self) -> &BTreeSet<String> {
+        &self.allowed_app_ids
+    }
 }
 
 /// One preflight's provider credential, shared only across clones of that
@@ -897,6 +925,8 @@ impl AdapterReadiness {
             return Err(EvidenceError::InconsistentPolicy);
         }
         let source = evidence.source();
+        let admitted_app_approval =
+            AdmittedAppApproval::new(evidence.app_approval_fingerprint(), BTreeSet::new());
         Ok(Self {
             ready: true,
             adapter,
@@ -904,6 +934,7 @@ impl AdapterReadiness {
             desktop_binding,
             execution_policy,
             evidence,
+            admitted_app_approval,
             provider_smoke_evidence,
             resolved_provider_binding,
             prepared_provider_secret: None,
@@ -933,6 +964,12 @@ impl AdapterReadiness {
         self
     }
 
+    pub(crate) fn with_admitted_app_approval(mut self, allowed_app_ids: BTreeSet<String>) -> Self {
+        self.admitted_app_approval =
+            AdmittedAppApproval::new(self.evidence.app_approval_fingerprint(), allowed_app_ids);
+        self
+    }
+
     pub const fn is_ready(&self) -> bool {
         self.ready
     }
@@ -955,6 +992,10 @@ impl AdapterReadiness {
 
     pub(crate) fn evidence(&self) -> &ReadinessEvidence {
         &self.evidence
+    }
+
+    pub(crate) fn admitted_app_approval(&self) -> &AdmittedAppApproval {
+        &self.admitted_app_approval
     }
 
     pub(crate) fn provider_smoke_evidence(&self) -> Option<&ProviderSmokeEvidence> {
@@ -1131,6 +1172,38 @@ mod evidence_tests {
                 None,
             )
             .unwrap_err()
+        );
+    }
+
+    #[test]
+    fn readiness_keeps_the_app_fingerprint_and_allowlist_as_one_snapshot() {
+        let desktop = DesktopBindingRef::new("desktop-app-snapshot").unwrap();
+        let policy = policy(desktop.clone(), FeatureChoice::Disabled);
+        let evidence = readiness_evidence();
+        let allowed_app_ids = BTreeSet::from([
+            "com.example.paint".to_string(),
+            "com.example.terminal".to_string(),
+        ]);
+
+        let readiness = AdapterReadiness::ready(
+            "test",
+            "ready",
+            desktop,
+            policy,
+            evidence.clone(),
+            None,
+            None,
+        )
+        .map(|readiness| readiness.with_admitted_app_approval(allowed_app_ids.clone()))
+        .unwrap();
+
+        assert_eq!(
+            readiness.admitted_app_approval().fingerprint(),
+            evidence.app_approval_fingerprint()
+        );
+        assert_eq!(
+            readiness.admitted_app_approval().allowed_app_ids(),
+            &allowed_app_ids
         );
     }
 
@@ -1443,6 +1516,7 @@ pub struct ExecuteRequest<'a> {
     prompt: &'a str,
     execution_mode: satelle_core::session::TurnExecutionMode,
     execution_policy: &'a ExecutionPolicy,
+    admitted_app_approval: Option<&'a AdmittedAppApproval>,
     resolved_provider_binding: Option<&'a satelle_core::ResolvedProviderBinding>,
     resolved_provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
     subject: AdapterSubject<'a>,
@@ -1488,6 +1562,7 @@ impl<'a> ExecuteRequest<'a> {
             prompt,
             execution_mode,
             execution_policy,
+            admitted_app_approval: None,
             resolved_provider_binding: None,
             resolved_provider_secret: None,
             subject,
@@ -1536,6 +1611,18 @@ impl<'a> ExecuteRequest<'a> {
 
     pub const fn execution_policy(&self) -> &'a ExecutionPolicy {
         self.execution_policy
+    }
+
+    pub(super) const fn with_admitted_app_approval(
+        mut self,
+        admitted_app_approval: &'a AdmittedAppApproval,
+    ) -> Self {
+        self.admitted_app_approval = Some(admitted_app_approval);
+        self
+    }
+
+    pub(crate) const fn admitted_app_approval(&self) -> Option<&'a AdmittedAppApproval> {
+        self.admitted_app_approval
     }
 
     pub const fn resolved_provider_binding(

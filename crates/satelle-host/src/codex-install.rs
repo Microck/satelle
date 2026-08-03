@@ -73,21 +73,29 @@ impl VerifiedCodexRuntime {
         &self.binary_path
     }
 
-    #[cfg(test)]
     pub(crate) fn codex_home(&self) -> &Path {
         &self.codex_home
     }
 
     pub(crate) fn command(&self) -> Result<Command, SatelleError> {
+        let [command] = self.commands()?;
+        Ok(command)
+    }
+
+    /// Verifies the immutable runtime once immediately before constructing an
+    /// atomic batch of child commands that belong to the same probe.
+    pub(crate) fn commands<const COUNT: usize>(&self) -> Result<[Command; COUNT], SatelleError> {
         verify_runtime_identity(
             &self.codex_home,
             &self.package_root,
             &self.binary_path,
             &self.binary_sha256,
         )?;
-        let mut command = Command::new(&self.binary_path);
-        command.env("CODEX_HOME", &self.codex_home);
-        Ok(command)
+        Ok(std::array::from_fn(|_| {
+            let mut command = Command::new(&self.binary_path);
+            command.env("CODEX_HOME", &self.codex_home);
+            command
+        }))
     }
 }
 
@@ -467,6 +475,13 @@ mod tests {
         assert_eq!(command.get_program(), fixture.binary_path);
         assert!(command.get_envs().any(|(key, value)| {
             key == "CODEX_HOME" && value == Some(fixture.codex_home.as_os_str())
+        }));
+        let commands = runtime.commands::<3>().expect("verified command batch");
+        assert!(commands.iter().all(|command| {
+            command.get_program() == fixture.binary_path
+                && command.get_envs().any(|(key, value)| {
+                    key == "CODEX_HOME" && value == Some(fixture.codex_home.as_os_str())
+                })
         }));
     }
 

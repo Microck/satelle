@@ -1,7 +1,8 @@
 use command_group::{CommandGroup, GroupChild};
 use satelle_core::ControlPlaneFailureReason;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -14,7 +15,9 @@ use std::time::{Duration, Instant};
 #[path = "runtime-codex.rs"]
 mod control_plane;
 pub(crate) use control_plane::{
-    CodexImageInputMode, ControlPlaneAdmission, installed_app_server_command,
+    CodexImageInputMode, ControlPlaneAdmission, NativeComputerUseActionPath,
+    VerifiedComputerUseAppServer, installed_computer_use_app_server,
+    installed_read_only_app_server_command,
 };
 
 #[cfg(test)]
@@ -29,6 +32,111 @@ const APP_POLICY_LINE_LIMIT: u64 = 2 * 1024 * 1024;
 const APP_POLICY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const APP_POLICY_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const LEGACY_APP_POLICY_LIMIT: u64 = 64 * 1024;
+const CURRENT_APP_POLICY_LIMIT: u64 = 1024 * 1024;
+const MACOS_APP_APPROVAL_LIMIT: u64 = 1024 * 1024;
+const MACOS_COMPUTER_USE_GROUP: &str = "2DC432GLL2.com.openai.sky.CUAService";
+
+/// Loads the exact current native Computer Use decisions for one app-server
+/// run. Identifiers stay in process memory and never enter capability evidence,
+/// diagnostics, persistence, or public events.
+pub(crate) fn configured_computer_use_allowed_app_ids() -> BTreeSet<String> {
+    let Ok(runtime) = crate::codex_install::admit_managed_codex_for_current_process() else {
+        return BTreeSet::new();
+    };
+    match std::env::consts::OS {
+        "windows" => {
+            let path = runtime.codex_home().join("config.toml");
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                return BTreeSet::new();
+            };
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > CURRENT_APP_POLICY_LIMIT
+            {
+                return BTreeSet::new();
+            }
+            let Ok(contents) = std::fs::read_to_string(path) else {
+                return BTreeSet::new();
+            };
+            computer_use_allowed_app_ids_from_config(&contents).unwrap_or_default()
+        }
+        "macos" => directories::BaseDirs::new()
+            .map(|directories| macos_computer_use_allowed_app_ids(directories.home_dir()))
+            .unwrap_or_default(),
+        _ => BTreeSet::new(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct MacosPersistentAppApprovals {
+    approved_bundle_identifiers: Vec<String>,
+}
+
+fn macos_computer_use_allowed_app_ids(home: &Path) -> BTreeSet<String> {
+    let group_root = home
+        .join("Library")
+        .join("Group Containers")
+        .join(MACOS_COMPUTER_USE_GROUP);
+    let Ok(group_metadata) = std::fs::symlink_metadata(&group_root) else {
+        return BTreeSet::new();
+    };
+    if !group_metadata.is_dir() || group_metadata.file_type().is_symlink() {
+        return BTreeSet::new();
+    }
+    let approval_path = Path::new("Library")
+        .join("Application Support")
+        .join("Software")
+        .join("ComputerUseAppApprovals.json");
+    let path = group_root.join(&approval_path);
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return BTreeSet::new();
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MACOS_APP_APPROVAL_LIMIT
+    {
+        return BTreeSet::new();
+    }
+    let Some((canonical_group_root, canonical_path)) = std::fs::canonicalize(&group_root)
+        .ok()
+        .zip(std::fs::canonicalize(&path).ok())
+    else {
+        return BTreeSet::new();
+    };
+    if canonical_path != canonical_group_root.join(approval_path) {
+        return BTreeSet::new();
+    }
+    let Ok(contents) = std::fs::read_to_string(canonical_path) else {
+        return BTreeSet::new();
+    };
+    serde_json::from_str::<MacosPersistentAppApprovals>(&contents)
+        .map(|approvals| {
+            approvals
+                .approved_bundle_identifiers
+                .into_iter()
+                .filter(|identifier| !identifier.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn computer_use_allowed_app_ids_from_config(contents: &str) -> Option<BTreeSet<String>> {
+    let config = toml::from_str::<toml::Value>(contents).ok()?;
+    Some(
+        config
+            .get("computer_use")
+            .and_then(|value| value.get("windows"))
+            .and_then(|value| value.get("always_allowed_app_ids"))
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .filter(|app_id| !app_id.is_empty())
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>(),
+    )
+}
 
 /// Exact Codex release whose stable schema and native-host behavior define the
 /// Phase 0 compatibility contract. Later patches require fresh acceptance.
@@ -707,13 +815,10 @@ fn probe_windows_app_policy(
     runtime: &crate::codex_install::VerifiedCodexRuntime,
     timeout: Duration,
 ) -> EvidenceSurface {
-    let Ok(command) = runtime
-        .command()
-        .map(control_plane::configure_app_server_command)
-    else {
+    let Ok(verified_app_server) = control_plane::verified_app_server_command(runtime) else {
         return EvidenceSurface::Incomplete;
     };
-    probe_windows_app_policy_with(command, timeout)
+    probe_windows_app_policy_with(verified_app_server.command, timeout)
 }
 
 fn probe_windows_app_policy_with(mut command: Command, timeout: Duration) -> EvidenceSurface {
@@ -1492,6 +1597,15 @@ fn read_version_output(
         match bounded.read_to_end(&mut output) {
             Ok(_) => return Ok(output),
             Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                // A managed Codex helper can escape the command group while
+                // retaining stdout. The successful leader and exact parsed
+                // version line are the evidence; pipe EOF adds no authority.
+                if matches!(
+                    parse_codex_version_output(&output),
+                    CodexVersionEvidence::Detected { .. }
+                ) {
+                    return Ok(output);
+                }
                 thread::sleep(VERSION_PROBE_POLL_INTERVAL);
             }
             Err(error) => return Err(error),

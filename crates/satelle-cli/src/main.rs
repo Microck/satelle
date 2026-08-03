@@ -101,6 +101,7 @@ const SSH_STATE_RELEASE_REQUESTER_LOCK: &str = "ssh-state-release.requester.lock
 const STATE_OWNERSHIP_LOCK: &str = "satelle.sqlite3.lock";
 const STATE_RELEASE_TIMEOUT: Duration = Duration::from_secs(20);
 const STATE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MACOS_NATIVE_BRIDGE_LAUNCHER: &str = "__satelle-launch-macos-native-bridge";
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use zeroize::Zeroizing;
@@ -1257,6 +1258,12 @@ fn main() -> ExitCode {
         print_error(&error, format);
         return process_exit_code(&error);
     }
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == MACOS_NATIVE_BRIDGE_LAUNCHER)
+    {
+        return run_authenticated_macos_native_bridge(&args[2..]);
+    }
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(error) if !error.use_stderr() => {
@@ -1282,6 +1289,320 @@ fn main() -> ExitCode {
             process_exit_code(&failure.error)
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn run_authenticated_macos_native_bridge(arguments: &[std::ffi::OsString]) -> ExitCode {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some((expected_launcher_cdhash, arguments)) = arguments.split_first() else {
+        return ExitCode::from(64);
+    };
+    if !authenticate_and_consume_private_macos_launcher(expected_launcher_cdhash) {
+        return ExitCode::from(74);
+    }
+    let Some((path, expected_cdhash, bridge_arguments)) =
+        arguments.split_first().and_then(|(path, remainder)| {
+            remainder
+                .split_first()
+                .map(|(cdhash, bridge_arguments)| (path, cdhash, bridge_arguments))
+        })
+    else {
+        return ExitCode::from(64);
+    };
+    let expected_cdhash = expected_cdhash.to_string_lossy();
+    if expected_cdhash.len() != 40 || !expected_cdhash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return ExitCode::from(64);
+    }
+    let Ok(path) = CString::new(path.as_bytes()) else {
+        return ExitCode::from(64);
+    };
+    let mut argv = Vec::with_capacity(bridge_arguments.len() + 1);
+    argv.push(path.clone());
+    for argument in bridge_arguments {
+        let Ok(argument) = CString::new(argument.as_bytes()) else {
+            return ExitCode::from(64);
+        };
+        argv.push(argument);
+    }
+    let mut argv_pointers = argv
+        .iter()
+        .map(|argument| argument.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    argv_pointers.push(std::ptr::null_mut());
+
+    // The trusted MCP binding owns the complete child environment. Do not
+    // leak unrelated Host credentials into the privileged native bridge.
+    let mut environment = Vec::new();
+    for name in [
+        "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS",
+        "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S",
+        "SKY_CUA_SERVICE_PATH",
+        "BROWSER_USE_CODEX_APP_VERSION",
+        "NODE_REPL_TRUSTED_CODE_PATHS",
+        "NODE_REPL_NODE_MODULE_DIRS",
+        "NODE_REPL_NODE_PATH",
+        "BROWSER_USE_AVAILABLE_BACKENDS",
+        "CODEX_HOME",
+        "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER",
+        "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME",
+        "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE",
+        "BROWSER_USE_CODEX_APP_BUILD_FLAVOR",
+        "CODEX_CLI_PATH",
+    ] {
+        let Some(value) = std::env::var_os(name) else {
+            return ExitCode::from(74);
+        };
+        let mut assignment = name.as_bytes().to_vec();
+        assignment.push(b'=');
+        assignment.extend_from_slice(value.as_bytes());
+        let Ok(assignment) = CString::new(assignment) else {
+            return ExitCode::from(74);
+        };
+        environment.push(assignment);
+    }
+    for name in [
+        "HOME", "TMPDIR", "PATH", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL",
+    ] {
+        let Some(value) = std::env::var_os(name) else {
+            continue;
+        };
+        let mut assignment = name.as_bytes().to_vec();
+        assignment.push(b'=');
+        assignment.extend_from_slice(value.as_bytes());
+        let Ok(assignment) = CString::new(assignment) else {
+            return ExitCode::from(74);
+        };
+        environment.push(assignment);
+    }
+    let mut environment_pointers = environment
+        .iter()
+        .map(|assignment| assignment.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    environment_pointers.push(std::ptr::null_mut());
+
+    let Ok(launcher_pid) = libc::pid_t::try_from(std::process::id()) else {
+        return ExitCode::from(74);
+    };
+    if !start_macos_native_bridge_verifier(launcher_pid, expected_cdhash.as_ref()) {
+        return ExitCode::from(74);
+    }
+    let mut attributes: libc::posix_spawnattr_t = std::ptr::null_mut();
+    // SAFETY: The attributes and C strings remain live through posix_spawn.
+    // SETEXEC preserves this PID and its Codex parent. START_SUSPENDED lets
+    // the independent verifier authenticate the exact image before it runs.
+    let spawn_error = unsafe {
+        let init_error = libc::posix_spawnattr_init(&mut attributes);
+        if init_error != 0 {
+            init_error
+        } else {
+            let flags = libc::POSIX_SPAWN_SETEXEC | libc::POSIX_SPAWN_START_SUSPENDED;
+            let flags_error =
+                libc::posix_spawnattr_setflags(&mut attributes, flags as libc::c_short);
+            let spawn_error = if flags_error == 0 {
+                libc::posix_spawn(
+                    std::ptr::null_mut(),
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    &attributes,
+                    argv_pointers.as_ptr(),
+                    environment_pointers.as_ptr(),
+                )
+            } else {
+                flags_error
+            };
+            libc::posix_spawnattr_destroy(&mut attributes);
+            spawn_error
+        }
+    };
+    // A successful SETEXEC never returns. Exit immediately on failure so the
+    // verifier cannot mistake this launcher for the admitted bridge.
+    unsafe { libc::_exit(if spawn_error == 0 { 0 } else { 74 }) }
+}
+
+#[cfg(target_os = "macos")]
+fn authenticate_and_consume_private_macos_launcher(expected_cdhash: &std::ffi::OsStr) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let expected_cdhash = expected_cdhash.to_string_lossy();
+    if expected_cdhash.len() != 40 || !expected_cdhash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let pid_argument = format!("+{}", std::process::id());
+    let identity_matches = ProcessCommand::new("/usr/bin/codesign")
+        .args(["-dvvv", pid_argument.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == format!("CDHash={expected_cdhash}"))
+        });
+    let signature_valid = identity_matches
+        && ProcessCommand::new("/usr/bin/codesign")
+            .args(["-v", pid_argument.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+    if !signature_valid {
+        return false;
+    }
+
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(directory) = executable.parent() else {
+        return false;
+    };
+    let private_launcher_path = executable.file_name().is_some_and(|name| name == "satelle")
+        && directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("satelle-native-launcher-"))
+        && directory
+            .parent()
+            .and_then(|parent| fs::canonicalize(parent).ok())
+            == fs::canonicalize("/tmp").ok();
+    let owner = unsafe { libc::geteuid() };
+    let protected_files = fs::symlink_metadata(&executable).is_ok_and(|metadata| {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == owner
+            && metadata.mode() & 0o077 == 0
+    }) && fs::symlink_metadata(directory).is_ok_and(|metadata| {
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == owner
+            && metadata.mode() & 0o077 == 0
+    });
+    private_launcher_path && protected_files && fs::remove_file(&executable).is_ok()
+}
+
+#[cfg(target_os = "macos")]
+fn start_macos_native_bridge_verifier(launcher_pid: libc::pid_t, expected_cdhash: &str) -> bool {
+    // Double-fork so the short verifier cannot remain a zombie child of the
+    // long-running native MCP process that replaces this launcher.
+    let first_child = unsafe { libc::fork() };
+    if first_child < 0 {
+        return false;
+    }
+    if first_child == 0 {
+        let verifier = unsafe { libc::fork() };
+        if verifier == 0 {
+            verify_and_resume_macos_native_bridge(launcher_pid, expected_cdhash);
+        }
+        unsafe { libc::_exit(if verifier < 0 { 74 } else { 0 }) }
+    }
+    let mut status = 0;
+    // SAFETY: first_child is the intermediate child created above.
+    unsafe {
+        libc::waitpid(first_child, &mut status, 0) == first_child
+            && libc::WIFEXITED(status)
+            && libc::WEXITSTATUS(status) == 0
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_and_resume_macos_native_bridge(launcher_pid: libc::pid_t, expected_cdhash: &str) -> ! {
+    let pid_argument = format!("+{launcher_pid}");
+    let Some(deadline) = Instant::now().checked_add(Duration::from_secs(2)) else {
+        unsafe {
+            libc::kill(launcher_pid, libc::SIGKILL);
+            libc::_exit(74);
+        }
+    };
+    while Instant::now() < deadline {
+        let code_identity =
+            bounded_codesign_output(&["-dvvv", pid_argument.as_str()], deadline, true);
+        let exact_identity = code_identity.is_some_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .any(|line| line == format!("CDHash={expected_cdhash}"))
+        });
+        if exact_identity {
+            let signature_valid =
+                bounded_codesign_output(&["-v", pid_argument.as_str()], deadline, false)
+                    .is_some_and(|output| output.status.success());
+            // SAFETY: launcher_pid still names the suspended in-place image.
+            unsafe {
+                libc::kill(
+                    launcher_pid,
+                    if signature_valid {
+                        libc::SIGCONT
+                    } else {
+                        libc::SIGKILL
+                    },
+                );
+                libc::_exit(if signature_valid { 0 } else { 74 });
+            }
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
+    // The image never became the exact admitted bridge.
+    unsafe {
+        libc::kill(launcher_pid, libc::SIGKILL);
+        libc::_exit(74);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bounded_codesign_output(
+    arguments: &[&str],
+    deadline: Instant,
+    capture_stderr: bool,
+) -> Option<std::process::Output> {
+    let mut command = ProcessCommand::new("/usr/bin/codesign");
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(if capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let mut child = command.spawn().ok()?;
+    loop {
+        if let Some(status) = child.try_wait().ok()? {
+            let mut stderr = Vec::new();
+            if let Some(mut stream) = child.stderr.take() {
+                stream.read_to_end(&mut stderr).ok()?;
+            }
+            return Some(std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_authenticated_macos_native_bridge(_arguments: &[std::ffi::OsString]) -> ExitCode {
+    ExitCode::from(74)
 }
 
 fn process_has_disallowed_bearer_token(args: &[std::ffi::OsString]) -> bool {
@@ -1452,15 +1773,15 @@ fn preflight_setup_before_history(
     if host.config.transport != satelle_core::TransportKind::Local {
         return Ok(());
     }
-    if command.verify {
-        let path_rebind = !daemon_path_overrides.entries().is_empty();
-        let (host_setup_components, _) =
-            partition_setup_components(&setup_components, false, path_rebind);
-        let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
-            && tailscale_serve::applies_to(&host.config);
-        if host_setup_components.is_empty() || tailscale_serve_setup {
-            return Ok(());
-        }
+    // A production local Host has no Satelle-owned installer yet, but
+    // `setup --verify` is still a live, read-only acceptance operation for an
+    // Operator-prepared Host. Let it reach the Host verifier without
+    // misclassifying the checks as an unsupported setup mutation.
+    if local_setup_verification_only(
+        command,
+        host.config.transport == satelle_core::TransportKind::Local,
+    ) {
+        return Ok(());
     }
 
     let setup_mode = if command.persistent {
@@ -1481,6 +1802,22 @@ fn uses_production_local_setup_backend() -> bool {
 #[cfg(not(feature = "test-support"))]
 fn uses_production_local_setup_backend() -> bool {
     true
+}
+
+fn local_setup_verification_only(command: &SetupCommand, local_host: bool) -> bool {
+    command.verify
+        && !command.dry_run
+        && local_host
+        && uses_production_local_setup_backend()
+        && command.component.is_empty()
+        && !command.on_demand
+        && !command.persistent
+        && command.daemon_home.is_none()
+        && command.daemon_config_file.is_none()
+        && command.daemon_state_dir.is_none()
+        && command.daemon_cache_dir.is_none()
+        && command.daemon_log_dir.is_none()
+        && command.expected_host_id.is_none()
 }
 
 fn execute_command(
@@ -3122,6 +3459,10 @@ fn run_setup(
     let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
         && (host.config.expected_host_id.is_none() || path_rebind);
     let setup_components = setup_components(&command.component).map_err(failure)?;
+    let local_verification_only = local_setup_verification_only(
+        &command,
+        host.config.transport == satelle_core::TransportKind::Local,
+    );
     let native_affecting_setup = setup_components.iter().any(|component| {
         matches!(
             component.as_str(),
@@ -3222,6 +3563,12 @@ fn run_setup(
         .map_err(failure)?
     };
     report.setup_components.clone_from(&setup_components);
+    if local_verification_only {
+        // The setup report is used only to carry the live verification result.
+        // Operator-managed prerequisites are inspected, not installed or
+        // rewritten by this command.
+        report.mutation_planned = false;
+    }
     add_setup_component_plan(&mut report);
     if command.verify {
         add_setup_verification_plan(&mut report, &verification_checks);
@@ -3255,6 +3602,7 @@ fn run_setup(
     }
     let mut desktop_selection = None;
     if desktop_setup
+        && !local_verification_only
         && !command.dry_run
         && report.required_input.is_empty()
         && (host.config.transport != satelle_core::TransportKind::Ssh || !first_ssh_trust)
@@ -3277,6 +3625,7 @@ fn run_setup(
             report.mutation_planned = true;
         }
     } else if desktop_setup
+        && !local_verification_only
         && !command.dry_run
         && report.required_input.is_empty()
         && host.config.transport == satelle_core::TransportKind::Ssh
@@ -3299,7 +3648,11 @@ fn run_setup(
     let native_readiness_invalidation_planned =
         native_affecting_setup && report.mutation_planned && !first_ssh_trust;
 
-    if provider_auth_setup && !command.dry_run && report.required_input.is_empty() {
+    if provider_auth_setup
+        && !local_verification_only
+        && !command.dry_run
+        && report.required_input.is_empty()
+    {
         let provider_aliases = match (
             provider_selection.requested_model_alias.as_deref(),
             provider_selection.requested_provider_alias.as_deref(),

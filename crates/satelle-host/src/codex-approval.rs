@@ -2,7 +2,8 @@ use super::CodexSessionError;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 /// Validates the pinned Codex 0.144.0 approval payload before selecting a
@@ -79,6 +80,109 @@ pub(super) fn approval_result(
         _ => return Ok(None),
     };
     Ok(Some(result))
+}
+
+/// Accepts only the pinned Computer Use app prompt whose app identifier is
+/// already present in the user's canonical always-allowed table. Every other
+/// MCP elicitation remains a manual-action blocker.
+pub(super) fn computer_use_elicitation_result(
+    object: &Map<String, Value>,
+    allowed_app_ids: &BTreeSet<String>,
+    expected_thread: Option<&str>,
+    expected_turn: Option<&str>,
+) -> Result<(Value, bool), CodexSessionError> {
+    let params = object
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or(CodexSessionError::MalformedMessage)?;
+    let thread_id = required_value_string(params, "threadId")?;
+    correlate_thread(expected_thread, thread_id)?;
+    let turn_matches = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .zip(expected_turn)
+        .is_some_and(|(observed, expected)| observed == expected);
+    if params.get("turnId").is_some_and(|turn| !turn.is_null()) && !turn_matches {
+        return Err(CodexSessionError::ConflictingIdentity);
+    }
+
+    let turn_correlated = params.get("turnId").is_none_or(Value::is_null) || turn_matches;
+    let authorized = turn_correlated && exact_computer_use_app_prompt(params, allowed_app_ids);
+    Ok((
+        json!({"action": if authorized { "accept" } else { "decline" }}),
+        authorized,
+    ))
+}
+
+fn exact_computer_use_app_prompt(
+    params: &Map<String, Value>,
+    allowed_app_ids: &BTreeSet<String>,
+) -> bool {
+    const REQUIRED_PARAM_KEYS: [&str; 6] = [
+        "_meta",
+        "message",
+        "mode",
+        "requestedSchema",
+        "serverName",
+        "threadId",
+    ];
+    if !matches!(params.len(), 6 | 7)
+        || !REQUIRED_PARAM_KEYS
+            .iter()
+            .all(|key| params.contains_key(*key))
+        || (params.len() == 7 && !params.contains_key("turnId"))
+        || !matches!(
+            params.get("serverName").and_then(Value::as_str),
+            Some("node_repl" | "computer-use")
+        )
+        || !matches!(
+            params.get("mode").and_then(Value::as_str),
+            Some("form" | "openai/form")
+        )
+    {
+        return false;
+    }
+    let Some(metadata) = params.get("_meta").and_then(Value::as_object) else {
+        return false;
+    };
+    if metadata.get("connector_id").and_then(Value::as_str) != Some("computer-use") {
+        return false;
+    }
+    let Some(tool_params) = metadata.get("tool_params").and_then(Value::as_object) else {
+        return false;
+    };
+    if tool_params.len() != 1 {
+        return false;
+    }
+    let Some(app_id) = tool_params.get("app").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(display) = metadata
+        .get("tool_params_display")
+        .and_then(Value::as_array)
+        .filter(|display| display.len() == 1)
+        .and_then(|display| display[0].as_object())
+    else {
+        return false;
+    };
+    let display_value = display.get("value").and_then(Value::as_str);
+    display_value.is_some()
+        && params.get("message").and_then(Value::as_str)
+            == display_value
+                .map(|value| format!("Allow Codex to use {value}?"))
+                .as_deref()
+        && allowed_app_ids.contains(app_id)
+}
+
+fn required_value_string<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+) -> Result<&'a str, CodexSessionError> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(CodexSessionError::MalformedMessage)
 }
 
 fn decode_params<T: DeserializeOwned>(object: &Map<String, Value>) -> Result<T, CodexSessionError> {
@@ -387,6 +491,139 @@ enum ParsedCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn computer_use_app_prompt(app_id: &str) -> Value {
+        json!({
+            "params": {
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "connector_id": "computer-use",
+                    "connector_name": "Computer Use",
+                    "persist": ["session", "always"],
+                    "riskLevel": "low",
+                    "tool_params": {"app": app_id},
+                    "tool_params_display": [{
+                        "name": "app",
+                        "display_name": "App",
+                        "value": "Firefox"
+                    }]
+                },
+                "message": "Allow Codex to use Firefox?",
+                "mode": "openai/form",
+                "requestedSchema": {},
+                "serverName": "node_repl",
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        })
+    }
+
+    #[test]
+    fn exact_preapproved_computer_use_app_elicitation_is_accepted() {
+        let mut request = computer_use_app_prompt("firefox.exe");
+        let allowed = BTreeSet::from(["firefox.exe".to_string()]);
+
+        assert_eq!(
+            computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &allowed,
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            Ok((json!({"action": "accept"}), true))
+        );
+        request["params"]["_meta"]["riskLevel"] = json!("high");
+        assert_eq!(
+            computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &allowed,
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            Ok((json!({"action": "accept"}), true)),
+            "risk presentation must not override an exact prior app decision"
+        );
+    }
+
+    #[test]
+    fn exact_preapproved_macos_computer_use_elicitation_is_accepted() {
+        let mut request = computer_use_app_prompt("com.apple.Safari");
+        request["params"]["serverName"] = json!("computer-use");
+        request["params"]["_meta"]["tool_params_display"][0]["value"] = json!("Safari");
+        request["params"]["message"] = json!("Allow Codex to use Safari?");
+
+        assert_eq!(
+            computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &BTreeSet::from(["com.apple.Safari".to_string()]),
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            Ok((json!({"action": "accept"}), true))
+        );
+    }
+
+    #[test]
+    fn documented_nullable_turn_and_opaque_metadata_preserve_preapproval() {
+        let mut request = computer_use_app_prompt("Firefox");
+        request["params"]["turnId"] = Value::Null;
+        request["params"]["mode"] = json!("form");
+        request["params"]["_meta"]
+            .as_object_mut()
+            .unwrap()
+            .remove("riskLevel");
+        request["params"]["_meta"]["protocol_annotation"] = json!("opaque");
+        let allowed = BTreeSet::from(["Firefox".to_string()]);
+
+        assert_eq!(
+            computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &allowed,
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            Ok((json!({"action": "accept"}), true))
+        );
+    }
+
+    #[test]
+    fn computer_use_elicitation_declines_unlisted_or_changed_authority() {
+        let allowed = BTreeSet::from(["firefox.exe".to_string()]);
+        for request in [
+            computer_use_app_prompt("other.exe"),
+            {
+                let mut request = computer_use_app_prompt("firefox.exe");
+                request["params"]["_meta"]["connector_id"] = json!("other-connector");
+                request
+            },
+            {
+                let mut request = computer_use_app_prompt("firefox.exe");
+                request["params"]["_meta"]["tool_params"]["sensitiveAction"] =
+                    json!("delete files");
+                request
+            },
+            {
+                let mut request = computer_use_app_prompt("firefox.exe");
+                request["params"]["undocumentedAuthority"] = json!(true);
+                request
+            },
+            {
+                let mut request = computer_use_app_prompt("firefox.exe");
+                request["params"]["message"] = json!("Allow a different action?");
+                request
+            },
+        ] {
+            assert_eq!(
+                computer_use_elicitation_result(
+                    request.as_object().unwrap(),
+                    &allowed,
+                    Some("thread-1"),
+                    Some("turn-1"),
+                ),
+                Ok((json!({"action": "decline"}), false))
+            );
+        }
+    }
 
     #[test]
     fn every_allowlisted_callback_rejects_a_missing_required_field() {

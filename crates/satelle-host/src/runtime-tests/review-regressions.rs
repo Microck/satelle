@@ -932,6 +932,7 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
         host: LOCAL_DEMO_HOST.to_string(),
         prompt: "PRIVATE_STOP_BEFORE_RUNNING".to_string(),
         execution_mode: satelle_core::session::TurnExecutionMode::Standard,
+        admitted_app_approval: readiness.admitted_app_approval().clone(),
         work: super::super::worker::TurnWork {
             session,
             subject: *recovery_subject,

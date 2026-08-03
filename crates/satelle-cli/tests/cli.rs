@@ -58,6 +58,29 @@ fn production_satelle() -> Command {
     command
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_native_bridge_launcher_rejects_a_reusable_install_path() {
+    let bridge = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl";
+    let mut exact = production_satelle();
+    let launcher_identity = std::process::Command::new("/usr/bin/codesign")
+        .arg("-dvvv")
+        .arg(exact.get_program())
+        .output()
+        .expect("inspect Satelle code identity");
+    assert!(launcher_identity.status.success());
+    let launcher_cdhash = String::from_utf8_lossy(&launcher_identity.stderr)
+        .lines()
+        .find_map(|line| line.strip_prefix("CDHash="))
+        .expect("Satelle CDHash")
+        .to_string();
+    exact
+        .arg("__satelle-launch-macos-native-bridge")
+        .arg(launcher_cdhash)
+        .args([bridge, "fccc86027f96363299379fa64814147a555b3f49", "--help"]);
+    exact.assert().code(74);
+}
+
 #[test]
 fn bundled_skills_are_versioned_discoverable_and_materialized_byte_exact() {
     let home = TestStateDir::new().expect("secure temporary Satelle home");
@@ -1729,6 +1752,8 @@ fn run_and_steer_accept_prompt_file_and_stdin_sources() {
         .args([
             "steer",
             &session,
+            "--host",
+            "local-demo",
             "--prompt-file",
             steer_prompt_file.to_str().unwrap(),
             "--json",
@@ -3048,7 +3073,7 @@ adapter = "codex"
 }
 
 #[test]
-fn production_setup_verify_rejects_unsupported_local_host_mutation_before_state_is_touched() {
+fn production_setup_verify_runs_existing_local_host_checks_without_setup_mutation() {
     let sandbox = state_dir();
     let operator_home = sandbox.path().join("operator/home");
     let operator_config_file = operator_home.join("config/config.toml");
@@ -3073,42 +3098,87 @@ adapter = "codex"
     )
     .expect("production config should be written");
 
-    for (description, arguments) in [
+    let config_before = fs::read(&operator_config_file).expect("production config should be read");
+    let output = production_satelle()
+        .env("SATELLE_HOME", &operator_home)
+        .env("SATELLE_CONFIG_FILE", &operator_config_file)
+        .env("SATELLE_STATE_DIR", &operator_state_dir)
+        .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+        .env("SATELLE_LOG_DIR", &operator_log_dir)
+        .args(["setup", "--verify", "--no-input", "--json"])
+        .assert()
+        .code(75)
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "setup-verification-failed");
+    assert_eq!(error["details"]["changed"], false);
+    assert_eq!(error["details"]["verification"]["result"]["ready"], false);
+    assert_eq!(
+        fs::read(&operator_config_file).expect("production config should remain readable"),
+        config_before,
+        "verification must not rewrite the configured Host Binding"
+    );
+}
+
+#[test]
+fn production_setup_verify_does_not_discard_explicit_local_mutation_intent() {
+    let sandbox = state_dir();
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created");
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+"#,
+    )
+    .expect("production config should be written");
+
+    for (description, extra_arguments) in [
         (
-            "satelle setup --verify with the default local Host plan",
-            vec!["setup", "--verify", "--yes", "--json"],
+            "an explicit setup component",
+            vec!["--component", "computer-use"],
         ),
         (
-            "satelle setup --verify with an explicit local Host component",
-            vec![
-                "setup",
-                "--verify",
-                "--component",
-                "host",
-                "--yes",
-                "--json",
-            ],
+            "an explicit daemon path",
+            vec!["--daemon-home", "/operator/managed/satelle"],
         ),
+        ("an explicit service mode", vec!["--persistent"]),
     ] {
         let output = assert_directory_tree_unchanged(description, sandbox.path(), || {
             production_satelle()
                 .env("SATELLE_HOME", &operator_home)
                 .env("SATELLE_CONFIG_FILE", &operator_config_file)
-                .env("SATELLE_STATE_DIR", &operator_state_dir)
-                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
-                .env("SATELLE_LOG_DIR", &operator_log_dir)
-                .args(arguments)
+                .args(
+                    ["setup", "--verify", "--no-input", "--yes", "--json"]
+                        .into_iter()
+                        .chain(extra_arguments.iter().copied()),
+                )
                 .assert()
                 .code(70)
                 .get_output()
                 .clone()
         });
+
         let error = parse_json_output(&output.stderr);
-        assert_eq!(error["code"], "not-implemented");
+        assert_eq!(error["code"], "not-implemented", "{description}");
         assert!(
             error["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("setup mutations are not supported"))
+                .is_some_and(|message| message.contains("setup mutations are not supported")),
+            "{description}"
         );
     }
 }
@@ -3736,7 +3806,7 @@ fn setup_verify_dry_run_plans_checks_without_probing_or_mutating() {
 }
 
 #[test]
-fn setup_verify_runs_live_fake_readiness_and_records_the_cache_update() {
+fn setup_verify_runs_live_fake_native_and_provider_readiness() {
     let state = state_dir();
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -3762,7 +3832,7 @@ fn setup_verify_runs_live_fake_readiness_and_records_the_cache_update() {
     assert_eq!(verification["result"]["ready"], true);
     assert_eq!(
         verification["cache_updates"],
-        serde_json::json!(["local-demo-readiness"])
+        serde_json::json!(["local-demo-readiness", "provider_smoke"])
     );
     assert_eq!(report["native_computer_use_readiness"], "ready");
 }
@@ -8924,9 +8994,14 @@ struct ProviderSecretPtyProcess {
 }
 
 #[cfg(target_os = "linux")]
+const PTY_INTERACTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(target_os = "linux")]
 impl ProviderSecretPtyProcess {
     fn wait_for_after(&mut self, fragment: &str, start: usize) -> usize {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Broad nextest runs can saturate the runner before the child gets CPU.
+        // Keep the interaction bounded without making scheduler delay a failure.
+        let deadline = Instant::now() + PTY_INTERACTION_TIMEOUT;
         loop {
             if let Some(offset) = self.stdout[start..]
                 .windows(fragment.len())
@@ -8975,7 +9050,7 @@ impl ProviderSecretPtyProcess {
             .map_err(|error| error.to_string())?;
         let (ready_sender, ready_receiver) = mpsc::channel();
         let (shutdown_sender, shutdown_receiver) = mpsc::channel();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + PTY_INTERACTION_TIMEOUT;
         let watcher = thread::spawn(move || {
             loop {
                 match tcgetattr(&slave) {

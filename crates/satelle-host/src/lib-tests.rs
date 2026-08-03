@@ -1572,126 +1572,112 @@ impl ComputerUseAdapter for FailingExecutionAdapter {
 }
 
 #[test]
-fn unsupported_or_unproven_production_execution_is_blocked_without_state_admission() {
-    for (name, evidence, control_plane_admission) in [
-        (
-            "unsupported-linux-host",
-            Phase0CapabilityEvidence {
-                codex_version: CodexVersionEvidence::Detected {
-                    version: REQUIRED_CODEX_VERSION,
-                },
-                host_platform: HostPlatform::Linux,
-                capabilities: CapabilityMatrix::unproven(),
+fn unsupported_production_execution_is_blocked_without_state_admission() {
+    let (name, evidence, control_plane_admission) = (
+        "unsupported-linux-host",
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: REQUIRED_CODEX_VERSION,
             },
-            codex_capabilities::ControlPlaneAdmission::not_applicable(),
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        codex_capabilities::ControlPlaneAdmission::not_applicable(),
+    );
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let mut production_snapshot = capability_snapshot(evidence, 7);
+    production_snapshot.control_plane_admission = control_plane_admission;
+    let snapshot = Arc::new(RwLock::new(production_snapshot));
+    let adapter = ProductionComputerUseAdapter::new(
+        Arc::clone(&snapshot),
+        Ok(state.path().join("codex-app-server-work")),
+    );
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(
+            &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::Production {
+            snapshot,
+            daemon_paths: Box::new(test_daemon_paths(&state)),
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let session_id = SessionId::new();
+
+    let assert_blocked_error = |operation: &str, error: &SatelleError| {
+        assert_eq!(error.code, ErrorCode::ComputerUseNotReady);
+        assert!(
+            error.details.is_empty(),
+            "{name} {operation} must remain a native readiness failure"
+        );
+
+        let serialized =
+            serde_json::to_string(error).expect("closed capability blocker must serialize");
+        assert!(!serialized.contains("PRIVATE_PRODUCTION_PROMPT"));
+        assert!(!serialized.contains("fake"));
+    };
+
+    for (operation, failure) in [
+        (
+            "run",
+            service
+                .run(LOCAL_DEMO_HOST, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
+                .expect_err("attached run must be blocked"),
         ),
         (
-            "supported-windows-host-with-unproven-native-readiness",
-            Phase0CapabilityEvidence {
-                codex_version: CodexVersionEvidence::Detected {
-                    version: REQUIRED_CODEX_VERSION,
-                },
-                host_platform: HostPlatform::Windows,
-                capabilities: CapabilityMatrix::unproven(),
-            },
-            codex_capabilities::ControlPlaneAdmission::not_applicable(),
+            "steer",
+            service
+                .steer(&session_id, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
+                .expect_err("attached steer must be blocked before session lookup"),
         ),
     ] {
-        let state = TestStateDir::new().expect("temporary state directory should exist");
-        let mut production_snapshot = capability_snapshot(evidence, 7);
-        production_snapshot.control_plane_admission = control_plane_admission;
-        let snapshot = Arc::new(RwLock::new(production_snapshot));
-        let adapter = ProductionComputerUseAdapter::new(
-            Arc::clone(&snapshot),
-            Ok(state.path().join("codex-app-server-work")),
-        );
-        let service = HostService {
-            runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
-            operation_capacity: Arc::new(OperationCapacity::default()),
-            turn_execution_timeout: crate::configured_turn_execution_timeout(
-                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
-            ),
-            mode: HostMode::Production {
-                snapshot,
-                daemon_paths: Box::new(test_daemon_paths(&state)),
-            },
-            bootstrap_auth: None,
-            bootstrap_maintenance: Arc::new(Mutex::new(None)),
-            doctor_tasks: DoctorTaskRegistry::new(),
-        };
-        let session_id = SessionId::new();
-
-        let assert_blocked_error = |operation: &str, error: &SatelleError| {
-            assert_eq!(error.code, ErrorCode::ComputerUseNotReady);
-            assert!(
-                error.details.is_empty(),
-                "{name} {operation} must remain a native readiness failure"
-            );
-
-            let serialized =
-                serde_json::to_string(error).expect("closed capability blocker must serialize");
-            assert!(!serialized.contains("PRIVATE_PRODUCTION_PROMPT"));
-            assert!(!serialized.contains("fake"));
-        };
-
-        for (operation, failure) in [
-            (
-                "run",
-                service
-                    .run(LOCAL_DEMO_HOST, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
-                    .expect_err("attached run must be blocked"),
-            ),
-            (
-                "steer",
-                service
-                    .steer(&session_id, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
-                    .expect_err("attached steer must be blocked before session lookup"),
-            ),
-        ] {
-            assert!(matches!(failure, TurnAdmissionFailure::NotAdmitted(_)));
-            assert_blocked_error(operation, failure.error());
-        }
-
-        for (operation, error) in [
-            (
-                "run",
-                service
-                    .run_detached(LOCAL_DEMO_HOST, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
-                    .expect_err("detached run must be blocked"),
-            ),
-            (
-                "steer",
-                service
-                    .steer_detached(&session_id, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
-                    .expect_err("detached steer must be blocked before session lookup"),
-            ),
-        ] {
-            assert_blocked_error(operation, &error);
-        }
-
-        let stop_error = service
-            .stop(&session_id)
-            .expect_err("stop should remain available without adapter readiness");
-        assert_eq!(stop_error.code, ErrorCode::SessionNotFound);
-
-        let status_error = service
-            .status(&session_id)
-            .expect_err("read-only status should open storage without adapter readiness");
-        assert_eq!(status_error.code, ErrorCode::SessionNotFound);
-
-        let runtime_status = service
-            .daemon_runtime_status()
-            .expect("blocked production execution must leave runtime status readable");
-        assert_eq!(
-            (
-                runtime_status.session_count(),
-                runtime_status.active_turn_count(),
-                runtime_status.recovery_pending_turn_count(),
-            ),
-            (0, 0, 0),
-            "{name} must not durably admit a Session or Turn"
-        );
+        assert!(matches!(failure, TurnAdmissionFailure::NotAdmitted(_)));
+        assert_blocked_error(operation, failure.error());
     }
+
+    for (operation, error) in [
+        (
+            "run",
+            service
+                .run_detached(LOCAL_DEMO_HOST, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
+                .expect_err("detached run must be blocked"),
+        ),
+        (
+            "steer",
+            service
+                .steer_detached(&session_id, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
+                .expect_err("detached steer must be blocked before session lookup"),
+        ),
+    ] {
+        assert_blocked_error(operation, &error);
+    }
+
+    let stop_error = service
+        .stop(&session_id)
+        .expect_err("stop should remain available without adapter readiness");
+    assert_eq!(stop_error.code, ErrorCode::SessionNotFound);
+
+    let status_error = service
+        .status(&session_id)
+        .expect_err("read-only status should open storage without adapter readiness");
+    assert_eq!(status_error.code, ErrorCode::SessionNotFound);
+
+    let runtime_status = service
+        .daemon_runtime_status()
+        .expect("blocked production execution must leave runtime status readable");
+    assert_eq!(
+        (
+            runtime_status.session_count(),
+            runtime_status.active_turn_count(),
+            runtime_status.recovery_pending_turn_count(),
+        ),
+        (0, 0, 0),
+        "{name} must not durably admit a Session or Turn"
+    );
 }
 
 #[test]
@@ -1867,24 +1853,6 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     };
     let clone = service.clone();
 
-    let initial_error = service
-        .run(
-            LOCAL_DEMO_HOST,
-            &turn_intent("PRIVATE_BEFORE_CONTROL_PLANE_REFRESH"),
-        )
-        .expect_err("the supported snapshot should reach the native execution blocker");
-    assert!(matches!(
-        initial_error,
-        TurnAdmissionFailure::NotAdmitted(_)
-    ));
-    assert_eq!(initial_error.error().code, ErrorCode::ComputerUseNotReady);
-    assert!(
-        service
-            .daemon_runtime_capabilities()
-            .unwrap()
-            .codex_runtime()
-    );
-
     let mut refreshed = capability_snapshot(
         Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Missing,
@@ -1913,7 +1881,6 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
         refreshed_error.error().code,
         ErrorCode::IncompatibleControlPlane
     );
-    assert!(!clone.daemon_runtime_capabilities().unwrap().codex_runtime());
     let sessions = clone
         .host_sessions(LOCAL_DEMO_HOST, false)
         .expect("desktop discovery must remain available for readiness diagnosis");
@@ -2765,6 +2732,43 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
         probe.probe_id == "provider.smoke.refresh" && probe.cache_status == "refreshed"
     }));
     assert_eq!(service.host_status().unwrap().sessions, 0);
+}
+
+#[test]
+fn setup_verification_probes_implicit_provider_defaults_before_reporting_ready() {
+    let state = crate::TestStateDir::new().expect("temporary state directory");
+    let config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    let service = HostService {
+        runtime: RuntimeHandle::new_with_readiness_probe_driver(
+            Ok(state.path().to_path_buf()),
+            DoctorRefreshAdapter,
+            DoctorRefreshAdapter,
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+
+    let report = service
+        .verify_setup(LOCAL_DEMO_HOST, &ProviderComputerUseIntent::host_default())
+        .expect("implicit provider defaults must complete live setup verification");
+
+    assert!(report.ready);
+    assert!(
+        report
+            .cache_updates
+            .iter()
+            .any(|update| update == "provider_smoke"),
+        "setup verification must probe a runtime-resolved provider default"
+    );
+    assert!(report.probe_results.iter().any(|probe| {
+        probe.probe_id == "provider.smoke.refresh" && probe.cache_status == "refreshed"
+    }));
 }
 
 #[test]

@@ -2518,8 +2518,10 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "command-group",
+ "directories",
  "getrandom 0.4.3",
  "hmac",
+ "libc",
  "rusqlite",
  "rustix",
  "satelle-core",
@@ -2532,6 +2534,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "toml",
  "tracing",
  "url",
  "uuid",

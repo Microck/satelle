@@ -2212,11 +2212,13 @@ fn delete_exact_staged_restore(
     journal: &RestoreActivationJournal,
 ) -> Result<(), StorageError> {
     match open_private_leaf_identity(state_directory, &journal.staged_file_name)? {
-        Some(identity) if identity == journal.staged_token.backup_identity => {
-            if !remove_private_leaf_checked(state_directory, &journal.staged_file_name, identity)? {
-                return Err(StorageError::new(StorageErrorKind::StateConflict));
-            }
-        }
+        Some(identity)
+            if identity == journal.staged_token.backup_identity
+                && remove_private_leaf_checked(
+                    state_directory,
+                    &journal.staged_file_name,
+                    identity,
+                )? => {}
         None => {}
         Some(_) => return Err(StorageError::new(StorageErrorKind::StateConflict)),
     }
