@@ -20,6 +20,7 @@ use std::time::Duration;
 pub(super) const MAX_EVENT_RECONNECTS: usize = 3;
 const MAX_RECONCILIATION_ATTEMPTS: usize = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const INTERRUPTED_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const RECONCILIATION_LOG_LIMIT: usize = 10_000;
 
 impl DirectTransport {
@@ -180,12 +181,33 @@ impl DirectTransport {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn follow_turn(
         &self,
         mut stream: DaemonEventStream,
         admitted: PublicSession,
         buffered_events: Vec<SatelleEvent>,
         initial_connection_error: Option<DaemonEventError>,
+        on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
+    ) -> Result<AttachedTurnOutcome, SatelleError> {
+        let mut buffered_events = VecDeque::from(buffered_events);
+        let mut initial_connection_error = initial_connection_error;
+        self.follow_turn_with_state(
+            &mut stream,
+            admitted,
+            &mut buffered_events,
+            &mut initial_connection_error,
+            on_event,
+        )
+        .await
+    }
+
+    async fn follow_turn_with_state(
+        &self,
+        stream: &mut DaemonEventStream,
+        admitted: PublicSession,
+        buffered_events: &mut VecDeque<SatelleEvent>,
+        initial_connection_error: &mut Option<DaemonEventError>,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, SatelleError> {
         let session_id = admitted.session_id().clone();
@@ -199,9 +221,6 @@ impl DirectTransport {
         let mut previous_stream_sequence = 0_u64;
         let mut reconnect_attempts = 0_usize;
         let mut provider_smoke = None;
-        let mut buffered_events = VecDeque::from(buffered_events);
-        let mut initial_connection_error = initial_connection_error;
-
         loop {
             let next_event = match buffered_events.pop_front() {
                 Some(event) => Ok(event),
@@ -237,7 +256,11 @@ impl DirectTransport {
                             .await?
                         {
                             if let Some(revision) = event_revision
-                                && highest_event_revision.is_none_or(|highest| revision > highest)
+                                && event_revision_is_deliverable(
+                                    event.event_type(),
+                                    revision,
+                                    highest_event_revision,
+                                )
                             {
                                 let terminal = event.event_type().is_terminal();
                                 if terminal {
@@ -263,11 +286,17 @@ impl DirectTransport {
                     let Some(revision) = event_revision else {
                         continue;
                     };
-                    if highest_event_revision.is_some_and(|highest| revision <= highest) {
+                    if !event_revision_is_deliverable(
+                        event.event_type(),
+                        revision,
+                        highest_event_revision,
+                    ) {
                         continue;
                     }
                     let terminal = event.event_type().is_terminal();
-                    highest_event_revision = Some(revision);
+                    if highest_event_revision.is_none_or(|highest| revision > highest) {
+                        highest_event_revision = Some(revision);
+                    }
                     if terminal {
                         let session = self
                             .reconcile(&session_id, &turn_id, Some(revision))
@@ -304,7 +333,7 @@ impl DirectTransport {
                             Ok(replacement) => {
                                 // Subscribe before reading status because event streams are live-only.
                                 // The replacement socket buffers a terminal commit that races this GET.
-                                stream = replacement;
+                                *stream = replacement;
                                 previous_stream_sequence = 0;
                                 if let Some(session) = self
                                     .reconcile_retaining_stream(
@@ -362,6 +391,24 @@ impl DirectTransport {
         }
     }
 
+    async fn take_interrupted_approval_events(
+        stream: &mut DaemonEventStream,
+        buffered_events: &mut VecDeque<SatelleEvent>,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> Vec<SatelleEvent> {
+        let mut pending = buffered_events.drain(..).collect::<Vec<_>>();
+        // A malformed or disconnected stream cannot contribute trusted events. The already
+        // classified interruption remains authoritative, while valid in-flight events stay visible.
+        if let Ok(mut ready) = stream
+            .drain_events_for(INTERRUPTED_EVENT_DRAIN_TIMEOUT)
+            .await
+        {
+            pending.append(&mut ready);
+        }
+        interrupted_approval_events(pending, session_id, turn_id)
+    }
+
     pub(super) async fn run_attached(
         &self,
         request: &TurnRequest,
@@ -404,7 +451,7 @@ impl DirectTransport {
         let cancellation_request = request.clone();
         let idempotency_key = Self::idempotency_key();
         let cancellation_key = idempotency_key.clone();
-        let (admitted, buffered_events, initial_connection_error) = stream
+        let (admitted, buffered_events, mut initial_connection_error) = stream
             .buffer_events_until(async {
                 let admission = self.blocking_admission_http(
                     move |client| {
@@ -448,6 +495,7 @@ impl DirectTransport {
                 }
             })
             .await;
+        let mut buffered_events = VecDeque::from(buffered_events);
         let (admitted, interruption) = admitted?;
         let admitted = match (admitted, interruption.as_ref()) {
             (Ok(admitted), _) => admitted,
@@ -455,7 +503,13 @@ impl DirectTransport {
                 if cancelled.outcome() == AdmissionCancellationOutcome::Admitted =>
             {
                 return Err(self
-                    .interrupted_replayed_admission(cancelled, None, detach_on_interrupt)
+                    .interrupted_replayed_admission(
+                        cancelled,
+                        None,
+                        detach_on_interrupt,
+                        &mut stream,
+                        &mut buffered_events,
+                    )
                     .await);
             }
             (Err(_), Some(Ok(cancelled))) => {
@@ -481,38 +535,56 @@ impl DirectTransport {
             let error = self
                 .interrupt_admitted(&admitted, &turn_id, detach_on_interrupt)
                 .await;
-            return Err(TurnAdmissionFailure::admitted(
+            let events = Self::take_interrupted_approval_events(
+                &mut stream,
+                &mut buffered_events,
+                admitted_snapshot.session_id(),
+                &turn_id,
+            )
+            .await;
+            return Err(TurnAdmissionFailure::admitted_with_events(
                 error,
                 admitted_snapshot,
                 turn_id,
+                events,
             ));
         }
-        let following = self.follow_turn(
-            stream,
-            admitted,
-            buffered_events,
-            initial_connection_error,
-            on_event,
-        );
-        tokio::pin!(following);
-        tokio::select! {
-            biased;
-            signal = interrupt.wait() => {
-                signal.map_err(|_| TurnAdmissionFailure::admitted(
-                    SatelleError::host_unreachable(&self.alias),
-                    admitted_snapshot.clone(),
-                    turn_id.clone(),
-                ))?;
-                let error = self.interrupt_admitted(
-                    &admitted_snapshot,
-                    &turn_id,
-                    detach_on_interrupt,
-                ).await;
-                Err(TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
+        let signal = {
+            let following = self.follow_turn_with_state(
+                &mut stream,
+                admitted,
+                &mut buffered_events,
+                &mut initial_connection_error,
+                on_event,
+            );
+            tokio::pin!(following);
+            tokio::select! {
+                biased;
+                outcome = &mut following => return outcome.map_err(|error| {
+                    TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id)
+                }),
+                signal = interrupt.wait() => signal,
             }
-            outcome = &mut following => outcome
-                .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id)),
-        }
+        };
+        let error = if signal.is_ok() {
+            self.interrupt_admitted(&admitted_snapshot, &turn_id, detach_on_interrupt)
+                .await
+        } else {
+            SatelleError::host_unreachable(&self.alias)
+        };
+        let events = Self::take_interrupted_approval_events(
+            &mut stream,
+            &mut buffered_events,
+            admitted_snapshot.session_id(),
+            &turn_id,
+        )
+        .await;
+        Err(TurnAdmissionFailure::admitted_with_events(
+            error,
+            admitted_snapshot,
+            turn_id,
+            events,
+        ))
     }
 
     pub(super) async fn steer_attached(
@@ -570,7 +642,7 @@ impl DirectTransport {
         let idempotency_key = Self::idempotency_key();
         let cancellation_key = idempotency_key.clone();
         let cancellation_session_id = session_id.clone();
-        let (admitted, buffered_events, initial_connection_error) = stream
+        let (admitted, buffered_events, mut initial_connection_error) = stream
             .buffer_events_until(async {
                 let admission = self.blocking_admission_http(
                     move |client| {
@@ -609,6 +681,7 @@ impl DirectTransport {
                 }
             })
             .await;
+        let mut buffered_events = VecDeque::from(buffered_events);
         let (admitted, interruption) = admitted?;
         let admitted = match (admitted, interruption.as_ref()) {
             (Ok(admitted), _) => admitted,
@@ -620,6 +693,8 @@ impl DirectTransport {
                         cancelled,
                         Some(session_id),
                         detach_on_interrupt,
+                        &mut stream,
+                        &mut buffered_events,
                     )
                     .await);
             }
@@ -651,38 +726,56 @@ impl DirectTransport {
             let error = self
                 .interrupt_admitted(&admitted, &turn_id, detach_on_interrupt)
                 .await;
-            return Err(TurnAdmissionFailure::admitted(
+            let events = Self::take_interrupted_approval_events(
+                &mut stream,
+                &mut buffered_events,
+                admitted_snapshot.session_id(),
+                &turn_id,
+            )
+            .await;
+            return Err(TurnAdmissionFailure::admitted_with_events(
                 error,
                 admitted_snapshot,
                 turn_id,
+                events,
             ));
         }
-        let following = self.follow_turn(
-            stream,
-            admitted,
-            buffered_events,
-            initial_connection_error,
-            on_event,
-        );
-        tokio::pin!(following);
-        tokio::select! {
-            biased;
-            signal = interrupt.wait() => {
-                signal.map_err(|_| TurnAdmissionFailure::admitted(
-                    SatelleError::host_unreachable(&self.alias),
-                    admitted_snapshot.clone(),
-                    turn_id.clone(),
-                ))?;
-                let error = self.interrupt_admitted(
-                    &admitted_snapshot,
-                    &turn_id,
-                    detach_on_interrupt,
-                ).await;
-                Err(TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id))
+        let signal = {
+            let following = self.follow_turn_with_state(
+                &mut stream,
+                admitted,
+                &mut buffered_events,
+                &mut initial_connection_error,
+                on_event,
+            );
+            tokio::pin!(following);
+            tokio::select! {
+                biased;
+                outcome = &mut following => return outcome.map_err(|error| {
+                    TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id)
+                }),
+                signal = interrupt.wait() => signal,
             }
-            outcome = &mut following => outcome
-                .map_err(|error| TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id)),
-        }
+        };
+        let error = if signal.is_ok() {
+            self.interrupt_admitted(&admitted_snapshot, &turn_id, detach_on_interrupt)
+                .await
+        } else {
+            SatelleError::host_unreachable(&self.alias)
+        };
+        let events = Self::take_interrupted_approval_events(
+            &mut stream,
+            &mut buffered_events,
+            admitted_snapshot.session_id(),
+            &turn_id,
+        )
+        .await;
+        Err(TurnAdmissionFailure::admitted_with_events(
+            error,
+            admitted_snapshot,
+            turn_id,
+            events,
+        ))
     }
 
     async fn interrupted_replayed_admission(
@@ -690,6 +783,8 @@ impl DirectTransport {
         response: &AdmissionCancellationResponse,
         expected_session_id: Option<&SessionId>,
         detach_on_interrupt: bool,
+        stream: &mut DaemonEventStream,
+        buffered_events: &mut VecDeque<SatelleEvent>,
     ) -> TurnAdmissionFailure {
         let session_id = response
             .session_id()
@@ -712,6 +807,9 @@ impl DirectTransport {
         } else {
             self.interrupt_admitted_ids(&session_id, &turn_id).await
         };
+        let events =
+            Self::take_interrupted_approval_events(stream, buffered_events, &session_id, &turn_id)
+                .await;
         let read_session_id = session_id.clone();
         let session = match self
             .blocking_http(move |client| client.read_session(&read_session_id))
@@ -720,8 +818,9 @@ impl DirectTransport {
         {
             Ok(session) => session,
             Err(error) => {
-                return TurnAdmissionFailure::admission_unknown(
+                return TurnAdmissionFailure::admission_unknown_with_events(
                     interrupted_admission_with_session(&self.alias, &session_id, error),
+                    events,
                 );
             }
         };
@@ -731,13 +830,16 @@ impl DirectTransport {
                 .iter()
                 .any(|turn| turn.turn_id() == &turn_id)
         {
-            return TurnAdmissionFailure::admission_unknown(interrupted_admission_with_session(
-                &self.alias,
-                &session_id,
-                self.invalid_response(),
-            ));
+            return TurnAdmissionFailure::admission_unknown_with_events(
+                interrupted_admission_with_session(
+                    &self.alias,
+                    &session_id,
+                    self.invalid_response(),
+                ),
+                events,
+            );
         }
-        TurnAdmissionFailure::admitted(interruption, session, turn_id)
+        TurnAdmissionFailure::admitted_with_events(interruption, session, turn_id, events)
     }
 
     async fn interrupt_admitted(
@@ -775,6 +877,21 @@ impl DirectTransport {
             Err(stop_error) => unconfirmed_interrupt_error(&self.alias, &session_id, stop_error),
         }
     }
+}
+
+fn interrupted_approval_events(
+    events: Vec<SatelleEvent>,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+) -> Vec<SatelleEvent> {
+    events
+        .into_iter()
+        .filter(|event| {
+            event.event_type() == EventType::ActionRequired
+                && event.session_id() == Some(session_id)
+                && event.turn_id() == Some(turn_id)
+        })
+        .collect()
 }
 
 fn pre_admission_interruption_error(outcome: Option<AdmissionCancellationOutcome>) -> SatelleError {
@@ -840,6 +957,18 @@ fn target_event_revision(
     }
 }
 
+// Turn revisions order committed state, while stream-local sequences order distinct live events.
+// An approval observation can therefore follow TurnProgress at the same committed revision.
+fn event_revision_is_deliverable(
+    event_type: EventType,
+    revision: TurnStateRevision,
+    highest_revision: Option<TurnStateRevision>,
+) -> bool {
+    highest_revision.is_none_or(|highest| {
+        revision > highest || (revision == highest && event_type == EventType::ActionRequired)
+    })
+}
+
 fn terminal_event_type(state: TurnState) -> Option<EventType> {
     match state {
         TurnState::Completed => Some(EventType::TurnCompleted),
@@ -861,6 +990,84 @@ pub(super) fn reconciliation_error_allows_retry(error: &SatelleError) -> bool {
 #[cfg(test)]
 mod interrupt_output_tests {
     use super::*;
+
+    #[test]
+    fn revision_bound_action_event_participates_in_attached_turn_ordering() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let turn_state_revision = TurnStateRevision::new(2).unwrap();
+        let event = SatelleEventBody::new(
+            EventType::ActionRequired,
+            EventSource::CodexAdapter,
+            time::OffsetDateTime::UNIX_EPOCH,
+            "host-a",
+            Some(EventSubject::Turn {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                session_state_revision: satelle_core::session::SessionStateRevision::new(3)
+                    .unwrap(),
+                turn_state_revision,
+            }),
+            "manual action required",
+            serde_json::json!({"status": "manual_action_required"}),
+        )
+        .and_then(|body| body.with_seq(1))
+        .expect("construct revision-bound action event");
+
+        assert_eq!(
+            target_event_revision(&event, &session_id, &turn_id),
+            Some(turn_state_revision)
+        );
+    }
+
+    #[test]
+    fn same_revision_action_event_remains_deliverable_after_progress() {
+        let revision = TurnStateRevision::new(2).unwrap();
+
+        assert!(event_revision_is_deliverable(
+            EventType::ActionRequired,
+            revision,
+            Some(revision)
+        ));
+        assert!(!event_revision_is_deliverable(
+            EventType::TurnProgress,
+            revision,
+            Some(revision)
+        ));
+    }
+
+    #[test]
+    fn interrupted_approval_filter_retains_only_the_exact_turn() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let other_turn_id = TurnId::new();
+        let approval = |turn_id: TurnId, sequence| {
+            SatelleEventBody::new(
+                EventType::ActionRequired,
+                EventSource::CodexAdapter,
+                time::OffsetDateTime::UNIX_EPOCH,
+                "host-a",
+                Some(EventSubject::Turn {
+                    session_id: session_id.clone(),
+                    turn_id,
+                    session_state_revision: satelle_core::session::SessionStateRevision::new(3)
+                        .unwrap(),
+                    turn_state_revision: TurnStateRevision::new(2).unwrap(),
+                }),
+                "manual action required",
+                serde_json::json!({"status": "manual_action_required"}),
+            )
+            .and_then(|body| body.with_seq(sequence))
+            .expect("construct approval event")
+        };
+        let exact = approval(turn_id.clone(), 1);
+        let unrelated = approval(other_turn_id, 2);
+
+        assert_eq!(
+            interrupted_approval_events(vec![unrelated, exact.clone()], &session_id, &turn_id),
+            vec![exact]
+        );
+    }
 
     #[test]
     fn unconfirmed_stop_preserves_interrupt_exit_and_recovery_details() {

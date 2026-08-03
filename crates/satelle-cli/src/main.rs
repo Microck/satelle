@@ -11556,6 +11556,11 @@ fn run_prompt(
     }) {
         Ok(outcome) => outcome,
         Err(attached_failure) => {
+            for event in attached_failure.events() {
+                event_output
+                    .emit(&host.alias, event.clone())
+                    .map_err(failure)?;
+            }
             let history_session_id = attached_failure
                 .durable_handles()
                 .map(|(session_id, _)| Box::new(session_id.clone()));
@@ -11796,6 +11801,11 @@ fn steer_prompt(
     ) {
         Ok(outcome) => outcome,
         Err(attached_failure) => {
+            for event in attached_failure.events() {
+                event_output
+                    .emit(&host.alias, event.clone())
+                    .map_err(failure)?;
+            }
             let history_session_id = attached_failure
                 .durable_handles()
                 .map(|(session_id, _)| Box::new(session_id.clone()));

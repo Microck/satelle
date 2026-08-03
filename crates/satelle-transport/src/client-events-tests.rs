@@ -249,6 +249,154 @@ async fn post_handshake_silence_is_a_recoverable_stream_timeout() {
 }
 
 #[tokio::test]
+async fn ready_event_drain_returns_an_event_available_on_the_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind event peer");
+    let address = listener.local_addr().expect("read event peer address");
+    let (release_server, await_release_server) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept event client");
+        let mut socket =
+            tokio_tungstenite::tungstenite::accept(stream).expect("accept WebSocket handshake");
+        let message = socket.read().expect("read subscription");
+        let subscribe: SubscribeRequest = serde_json::from_str(
+            message
+                .to_text()
+                .expect("subscription should be a text message"),
+        )
+        .expect("decode subscription");
+        let acknowledgement = SubscribedResponse::new(
+            subscribe.request_id().clone(),
+            "host-loopback".to_string(),
+            subscribe.subscriptions().to_vec(),
+        );
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&acknowledgement)
+                    .expect("encode acknowledgement")
+                    .into(),
+            ))
+            .expect("send subscription acknowledgement");
+        let event = SatelleEventBody::new(
+            EventType::ActionRequired,
+            EventSource::CodexAdapter,
+            time::OffsetDateTime::UNIX_EPOCH,
+            "host-loopback",
+            None,
+            "manual action required",
+            serde_json::json!({"status": "manual_action_required"}),
+        )
+        .and_then(|body| body.with_seq(1))
+        .expect("construct ready event");
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&event)
+                    .expect("encode ready event")
+                    .into(),
+            ))
+            .expect("send ready event");
+        await_release_server
+            .recv()
+            .expect("keep the ready event stream open");
+    });
+    let client = DaemonEventClient::loopback(
+        address,
+        ApiBearerToken::generate().expect("generate token"),
+        "host-loopback",
+    )
+    .expect("construct loopback event client");
+    let mut stream = client
+        .connect_events(vec![EventSubscription::Host])
+        .await
+        .expect("complete event subscription");
+    let events = tokio::time::timeout(
+        Duration::from_secs(2),
+        stream.drain_events_for(Duration::from_millis(100)),
+    )
+    .await
+    .expect("the bounded drain completes")
+    .expect("drain authenticated ready event");
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type(), EventType::ActionRequired);
+    release_server.send(()).expect("release event peer");
+    server.join().expect("join event peer");
+}
+
+#[tokio::test]
+async fn bounded_event_drain_waits_for_a_frame_already_in_flight() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind event peer");
+    let address = listener.local_addr().expect("read event peer address");
+    let (send_event, await_send_event) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept event client");
+        let mut socket =
+            tokio_tungstenite::tungstenite::accept(stream).expect("accept WebSocket handshake");
+        let message = socket.read().expect("read subscription");
+        let subscribe: SubscribeRequest = serde_json::from_str(
+            message
+                .to_text()
+                .expect("subscription should be a text message"),
+        )
+        .expect("decode subscription");
+        let acknowledgement = SubscribedResponse::new(
+            subscribe.request_id().clone(),
+            "host-loopback".to_string(),
+            subscribe.subscriptions().to_vec(),
+        );
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&acknowledgement)
+                    .expect("encode acknowledgement")
+                    .into(),
+            ))
+            .expect("send subscription acknowledgement");
+
+        await_send_event
+            .recv()
+            .expect("wait until the bounded drain has started");
+        let event = SatelleEventBody::new(
+            EventType::ActionRequired,
+            EventSource::CodexAdapter,
+            time::OffsetDateTime::UNIX_EPOCH,
+            "host-loopback",
+            None,
+            "manual action required",
+            serde_json::json!({"status": "manual_action_required"}),
+        )
+        .and_then(|body| body.with_seq(1))
+        .expect("construct delayed event");
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&event)
+                    .expect("encode delayed event")
+                    .into(),
+            ))
+            .expect("send delayed event");
+    });
+    let client = DaemonEventClient::loopback(
+        address,
+        ApiBearerToken::generate().expect("generate token"),
+        "host-loopback",
+    )
+    .expect("construct loopback event client");
+    let mut stream = client
+        .connect_events(vec![EventSubscription::Host])
+        .await
+        .expect("complete event subscription");
+
+    let release = async move {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        send_event.send(()).expect("release delayed event");
+    };
+    let (events, ()) = tokio::join!(stream.drain_events_for(Duration::from_millis(200)), release);
+    let events = events.expect("drain authenticated delayed event");
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type(), EventType::ActionRequired);
+    server.join().expect("join event peer");
+}
+
+#[tokio::test]
 async fn pending_operation_buffers_events_services_heartbeats_and_retains_disconnect() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind event peer");
     let address = listener.local_addr().expect("read event peer address");

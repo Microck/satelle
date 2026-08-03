@@ -1446,8 +1446,31 @@ pub struct ExecuteRequest<'a> {
     resolved_provider_binding: Option<&'a satelle_core::ResolvedProviderBinding>,
     resolved_provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
     subject: AdapterSubject<'a>,
-    persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
+    hooks: ExecuteHooks<'a>,
     attachments: &'a [crate::attachment::StagedImage],
+}
+
+pub(super) struct ExecuteHooks<'a> {
+    persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
+    publish_live_event: &'a dyn Fn(satelle_core::SatelleEventBody),
+    committed_session_revision: SessionStateRevision,
+    committed_turn_revision: TurnStateRevision,
+}
+
+impl<'a> ExecuteHooks<'a> {
+    pub(super) const fn new(
+        persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
+        publish_live_event: &'a dyn Fn(satelle_core::SatelleEventBody),
+        committed_session_revision: SessionStateRevision,
+        committed_turn_revision: TurnStateRevision,
+    ) -> Self {
+        Self {
+            persist_upstream_ref,
+            publish_live_event,
+            committed_session_revision,
+            committed_turn_revision,
+        }
+    }
 }
 
 impl<'a> ExecuteRequest<'a> {
@@ -1457,7 +1480,7 @@ impl<'a> ExecuteRequest<'a> {
         execution_mode: satelle_core::session::TurnExecutionMode,
         execution_policy: &'a ExecutionPolicy,
         subject: AdapterSubject<'a>,
-        persist_upstream_ref: &'a dyn Fn(UpstreamReference) -> Result<(), SatelleError>,
+        hooks: ExecuteHooks<'a>,
         attachments: &'a [crate::attachment::StagedImage],
     ) -> Self {
         Self {
@@ -1468,7 +1491,7 @@ impl<'a> ExecuteRequest<'a> {
             resolved_provider_binding: None,
             resolved_provider_secret: None,
             subject,
-            persist_upstream_ref,
+            hooks,
             attachments,
         }
     }
@@ -1539,20 +1562,36 @@ impl<'a> ExecuteRequest<'a> {
         self.subject
     }
 
+    /// Returns the revisions committed by the runtime before adapter I/O began.
+    pub const fn committed_session_revision(&self) -> SessionStateRevision {
+        self.hooks.committed_session_revision
+    }
+
+    /// Returns the Turn revision committed by the runtime before adapter I/O began.
+    pub const fn committed_turn_revision(&self) -> TurnStateRevision {
+        self.hooks.committed_turn_revision
+    }
+
     /// Commits the Codex thread identity before the adapter waits for any
     /// later response or notification that depends on it.
     pub fn persist_upstream_thread_ref(&self, value: &str) -> Result<(), SatelleError> {
-        (self.persist_upstream_ref)(UpstreamReference::Thread(value.to_string()))
+        (self.hooks.persist_upstream_ref)(UpstreamReference::Thread(value.to_string()))
     }
 
     /// Commits the Codex Turn identity before the adapter waits for terminal
     /// completion, cancellation, or recovery evidence.
     pub fn persist_upstream_turn_ref(&self, value: &str) -> Result<(), SatelleError> {
-        (self.persist_upstream_ref)(UpstreamReference::Turn(value.to_string()))
+        (self.hooks.persist_upstream_ref)(UpstreamReference::Turn(value.to_string()))
     }
 
     pub fn persist_upstream_goal_ref(&self, value: &str) -> Result<(), SatelleError> {
-        (self.persist_upstream_ref)(UpstreamReference::Goal(value.to_string()))
+        (self.hooks.persist_upstream_ref)(UpstreamReference::Goal(value.to_string()))
+    }
+
+    /// Publishes normalized live-only adapter state without persisting private
+    /// callback payloads in Session storage or the event history.
+    pub fn publish_live_event(&self, event: satelle_core::SatelleEventBody) {
+        (self.hooks.publish_live_event)(event);
     }
 }
 

@@ -32,11 +32,15 @@ impl TurnAdmissionPhase {
 #[derive(Debug)]
 pub enum TurnAdmissionFailure {
     NotAdmitted(Box<crate::SatelleError>),
-    AdmissionUnknown(Box<crate::SatelleError>),
+    AdmissionUnknown {
+        error: Box<crate::SatelleError>,
+        events: Vec<crate::SatelleEvent>,
+    },
     Admitted {
         error: Box<crate::SatelleError>,
         session: Box<PublicSession>,
         turn_id: TurnId,
+        events: Vec<crate::SatelleEvent>,
     },
 }
 
@@ -44,22 +48,24 @@ impl TurnAdmissionFailure {
     pub fn phase(&self) -> TurnAdmissionPhase {
         match self {
             Self::NotAdmitted(_) => TurnAdmissionPhase::NotAdmitted,
-            Self::AdmissionUnknown(_) => TurnAdmissionPhase::AdmissionUnknown,
+            Self::AdmissionUnknown { .. } => TurnAdmissionPhase::AdmissionUnknown,
             Self::Admitted { .. } => TurnAdmissionPhase::Admitted,
         }
     }
 
     pub fn error(&self) -> &crate::SatelleError {
         match self {
-            Self::NotAdmitted(error) | Self::AdmissionUnknown(error) => error,
-            Self::Admitted { error, .. } => error,
+            Self::NotAdmitted(error)
+            | Self::AdmissionUnknown { error, .. }
+            | Self::Admitted { error, .. } => error,
         }
     }
 
     pub fn into_error(self) -> crate::SatelleError {
         match self {
-            Self::NotAdmitted(error) | Self::AdmissionUnknown(error) => *error,
-            Self::Admitted { error, .. } => *error,
+            Self::NotAdmitted(error)
+            | Self::AdmissionUnknown { error, .. }
+            | Self::Admitted { error, .. } => *error,
         }
     }
 
@@ -68,7 +74,17 @@ impl TurnAdmissionFailure {
             Self::Admitted {
                 session, turn_id, ..
             } => Some((session.session_id(), turn_id)),
-            Self::NotAdmitted(_) | Self::AdmissionUnknown(_) => None,
+            Self::NotAdmitted(_) | Self::AdmissionUnknown { .. } => None,
+        }
+    }
+
+    /// Returns live-only events that were published before Turn admission or
+    /// execution failed. Callers must deliver these before reporting the
+    /// failure so attached and remote subscribers observe the same event set.
+    pub fn events(&self) -> &[crate::SatelleEvent] {
+        match self {
+            Self::AdmissionUnknown { events, .. } | Self::Admitted { events, .. } => events,
+            Self::NotAdmitted(_) => &[],
         }
     }
 
@@ -77,14 +93,34 @@ impl TurnAdmissionFailure {
     }
 
     pub fn admission_unknown(error: crate::SatelleError) -> Self {
-        Self::AdmissionUnknown(Box::new(error))
+        Self::admission_unknown_with_events(error, Vec::new())
+    }
+
+    pub fn admission_unknown_with_events(
+        error: crate::SatelleError,
+        events: Vec<crate::SatelleEvent>,
+    ) -> Self {
+        Self::AdmissionUnknown {
+            error: Box::new(error),
+            events,
+        }
     }
 
     pub fn admitted(error: crate::SatelleError, session: PublicSession, turn_id: TurnId) -> Self {
+        Self::admitted_with_events(error, session, turn_id, Vec::new())
+    }
+
+    pub fn admitted_with_events(
+        error: crate::SatelleError,
+        session: PublicSession,
+        turn_id: TurnId,
+        events: Vec<crate::SatelleEvent>,
+    ) -> Self {
         Self::Admitted {
             error: Box::new(error),
             session: Box::new(session),
             turn_id,
+            events,
         }
     }
 }
@@ -1698,11 +1734,29 @@ mod tests {
         assert_eq!(not_admitted.phase(), TurnAdmissionPhase::NotAdmitted);
         assert!(not_admitted.durable_handles().is_none());
 
-        let unknown = TurnAdmissionFailure::admission_unknown(
+        let event = crate::SatelleEventBody::new(
+            crate::EventType::ActionRequired,
+            crate::EventSource::CodexAdapter,
+            OffsetDateTime::UNIX_EPOCH,
+            "host-test",
+            None,
+            "manual action required",
+            serde_json::json!({"status": "manual_action_required"}),
+        )
+        .unwrap()
+        .with_seq(1)
+        .unwrap();
+        let unknown = TurnAdmissionFailure::admission_unknown_with_events(
             crate::SatelleError::host_unreachable("host-test"),
+            vec![event],
         );
         assert_eq!(unknown.phase(), TurnAdmissionPhase::AdmissionUnknown);
         assert!(unknown.durable_handles().is_none());
+        assert_eq!(unknown.events().len(), 1);
+        assert_eq!(
+            unknown.events()[0].event_type(),
+            crate::EventType::ActionRequired
+        );
 
         for (phase, token) in [
             (TurnAdmissionPhase::NotAdmitted, "not_admitted"),

@@ -161,6 +161,10 @@ fn main() {
         send(&mut output, r#"{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}"#);
     }
     wait_for(&turn_marker);
+    if scenario == "approval-write-failure" {
+        send(&mut output, &format!(r#"{{"id":"approval-write-failure","method":"item/commandExecution/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"additionalPermissions":{{"fileSystem":{{"entries":[]}}}},"availableDecisions":["accept","decline"]}}}}"#));
+        std::process::exit(0);
+    }
     if scenario == "controlled-interrupt" {
         let interrupt = receive(&mut input, &log);
         assert!(interrupt.contains(r#""id":4"#));
@@ -351,6 +355,7 @@ struct ScenarioResult {
     requests: Vec<Value>,
     persisted_threads: Vec<String>,
     persisted_turns: Vec<String>,
+    native_approval_requests: usize,
     child_working_directory: PathBuf,
     staged_image_path: Option<PathBuf>,
     _fixture: CompiledFixture,
@@ -487,6 +492,8 @@ fn run_scenario_with_options(
         touch(&turn_marker);
         Ok(())
     };
+    let mut native_approval_requests = 0;
+    let mut observe_native_approval = || native_approval_requests += 1;
     let uses_local_image = matches!(scenario, "local-image" | "timeout-local-image");
     let staged = if uses_local_image {
         let bytes = b"\x89PNG\r\n\x1a\nfixture";
@@ -529,6 +536,7 @@ fn run_scenario_with_options(
             deadline: Instant::now() + timeout,
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
+            observe_native_approval: Some(&mut observe_native_approval),
             control: None,
             goal_set_supported: scenario == "goal",
             image_input_mode: if uses_local_image {
@@ -558,6 +566,7 @@ fn run_scenario_with_options(
         requests,
         persisted_threads,
         persisted_turns,
+        native_approval_requests,
         child_working_directory: PathBuf::from(
             std::fs::read_to_string(cwd_log_path).expect("child working-directory record"),
         ),
@@ -676,6 +685,7 @@ fn provider_child_overrides_are_process_scoped_and_secret_safe() {
             deadline: Instant::now() + Duration::from_secs(3),
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
+            observe_native_approval: None,
             control: None,
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -783,6 +793,7 @@ fn builtin_openai_provider_secret_is_process_scoped_and_shell_excluded() {
             deadline: Instant::now() + Duration::from_secs(3),
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
+            observe_native_approval: None,
             control: None,
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -950,6 +961,7 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
                 deadline,
                 persist_thread_ref: &mut persist_thread,
                 persist_turn_ref: &mut persist_turn,
+                observe_native_approval: None,
                 control: Some(session_control),
                 goal_set_supported: false,
                 image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -1022,6 +1034,7 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
             deadline: timeout_deadline,
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
+            observe_native_approval: None,
             control: Some(registered_control.clone()),
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
