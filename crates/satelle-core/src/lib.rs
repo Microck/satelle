@@ -4293,6 +4293,8 @@ pub enum ErrorCode {
     CapacityExceeded,
     ConcurrencyLimitExceeded,
     ConcurrencyWithoutRemoteUpdate,
+    NoRemoteHostSelected,
+    RemoteUpdatePartialFailure,
     ComponentSelectionConflict,
     UnsupportedUpdateComponent,
     HostBinaryNewerThanCli,
@@ -4434,6 +4436,8 @@ impl ErrorCode {
             Self::CapacityExceeded => "capacity-exceeded",
             Self::ConcurrencyLimitExceeded => "concurrency-limit-exceeded",
             Self::ConcurrencyWithoutRemoteUpdate => "concurrency-without-remote-update",
+            Self::NoRemoteHostSelected => "no-remote-host-selected",
+            Self::RemoteUpdatePartialFailure => "remote-update-partial-failure",
             Self::ComponentSelectionConflict => "component-selection-conflict",
             Self::UnsupportedUpdateComponent => "unsupported-update-component",
             Self::HostBinaryNewerThanCli => "host-binary-newer-than-cli",
@@ -4483,6 +4487,7 @@ impl ErrorCode {
             | Self::LogsTargetRequired
             | Self::ConcurrencyLimitExceeded
             | Self::ConcurrencyWithoutRemoteUpdate
+            | Self::NoRemoteHostSelected
             | Self::ComponentSelectionConflict
             | Self::UnsupportedUpdateComponent
             | Self::SelfUpdateManagedInstall
@@ -4554,6 +4559,7 @@ impl ErrorCode {
             | Self::LogsFollowIdentityChanged
             | Self::StoreInUse
             | Self::RemoteExecution
+            | Self::RemoteUpdatePartialFailure
             | Self::HostUpdateRecoveryPending
             | Self::HostUpdatePartiallyApplied
             | Self::HostUpdatePostcheckFailed
@@ -5950,6 +5956,80 @@ impl SatelleError {
         }
     }
 
+    pub fn no_remote_host_selected(configured_remote_host_count: usize) -> Self {
+        Self {
+            code: ErrorCode::NoRemoteHostSelected,
+            message: "--update-remotes could not select a configured remote Host".to_string(),
+            recovery_command: Some(
+                "pass one or more --host <alias> selectors or use --all-remotes".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "configured_remote_host_count".to_string(),
+                Value::from(configured_remote_host_count),
+            )]),
+        }
+    }
+
+    pub fn remote_update_partial_failure(
+        failed_hosts: &[String],
+        recovery_commands: &[String],
+        local_update_changed: bool,
+    ) -> Self {
+        let (message, local_update) = if local_update_changed {
+            (
+                "the local CLI update succeeded, but one or more remote Host updates failed",
+                "succeeded",
+            )
+        } else {
+            (
+                "the local CLI was already at the selected version, but one or more remote Host updates failed",
+                "unchanged",
+            )
+        };
+        Self {
+            code: ErrorCode::RemoteUpdatePartialFailure,
+            message: message.to_string(),
+            recovery_command: recovery_commands.first().cloned(),
+            source_detail: None,
+            details: BTreeMap::from([
+                (
+                    "local_update".to_string(),
+                    Value::String(local_update.to_string()),
+                ),
+                ("failed_hosts".to_string(), serde_json::json!(failed_hosts)),
+                (
+                    "recovery_commands".to_string(),
+                    serde_json::json!(recovery_commands),
+                ),
+            ]),
+        }
+    }
+
+    pub fn remote_update_preview_failure(
+        failed_hosts: &[String],
+        recovery_commands: &[String],
+    ) -> Self {
+        Self {
+            code: ErrorCode::RemoteExecution,
+            message: "one or more remote Host update previews failed; no local or remote updates were applied"
+                .to_string(),
+            recovery_command: recovery_commands.first().cloned(),
+            source_detail: None,
+            details: BTreeMap::from([
+                (
+                    "local_update".to_string(),
+                    Value::String("not_applied".to_string()),
+                ),
+                ("failed_hosts".to_string(), serde_json::json!(failed_hosts)),
+                (
+                    "recovery_commands".to_string(),
+                    serde_json::json!(recovery_commands),
+                ),
+            ]),
+        }
+    }
+
     pub fn component_selection_conflict() -> Self {
         Self {
             code: ErrorCode::ComponentSelectionConflict,
@@ -6743,11 +6823,13 @@ mod error_contract_tests {
     fn canonical_broad_exit_classes_cover_security_storage_and_internal_errors() {
         for (code, expected) in [
             (ErrorCode::InvalidUsage, 64),
+            (ErrorCode::NoRemoteHostSelected, 64),
             (ErrorCode::ConfigError, 66),
             (ErrorCode::HostUnreachable, 69),
             (ErrorCode::NotImplemented, 70),
             (ErrorCode::CompletionInstallFailed, 73),
             (ErrorCode::RemoteExecution, 74),
+            (ErrorCode::RemoteUpdatePartialFailure, 74),
             (ErrorCode::HostUpdateRecoveryPending, 74),
             (ErrorCode::HostUpdatePartiallyApplied, 74),
             (ErrorCode::HostUpdatePostcheckFailed, 74),
@@ -6783,6 +6865,68 @@ mod error_contract_tests {
                 code.as_str()
             );
         }
+    }
+
+    #[test]
+    fn remote_update_partial_failure_preserves_local_success_and_recovery() {
+        let error = SatelleError::remote_update_partial_failure(
+            &["office".to_string(), "lab".to_string()],
+            &[
+                "satelle repair --host office".to_string(),
+                "satelle repair --host lab".to_string(),
+            ],
+            true,
+        );
+
+        assert_eq!(error.code, ErrorCode::RemoteUpdatePartialFailure);
+        assert_eq!(error.exit_code(), 74);
+        for (code, token) in [
+            (ErrorCode::NoRemoteHostSelected, "no-remote-host-selected"),
+            (
+                ErrorCode::RemoteUpdatePartialFailure,
+                "remote-update-partial-failure",
+            ),
+        ] {
+            assert_eq!(code.as_str(), token);
+            assert_eq!(
+                serde_json::to_value(code).expect("serialize remote update error code"),
+                serde_json::json!(token)
+            );
+        }
+        assert_eq!(error.details["local_update"], "succeeded");
+        assert_eq!(
+            error.details["failed_hosts"],
+            serde_json::json!(["office", "lab"])
+        );
+        assert_eq!(
+            error.details["recovery_commands"],
+            serde_json::json!(["satelle repair --host office", "satelle repair --host lab"])
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some("satelle repair --host office")
+        );
+
+        let unchanged_error = SatelleError::remote_update_partial_failure(
+            &["office".to_string()],
+            &["satelle repair --host office".to_string()],
+            false,
+        );
+        assert_eq!(unchanged_error.details["local_update"], "unchanged");
+        assert!(
+            unchanged_error
+                .message
+                .contains("already at the selected version")
+        );
+
+        let preview_error = SatelleError::remote_update_preview_failure(
+            &["office".to_string()],
+            &["satelle doctor --host office".to_string()],
+        );
+        assert_eq!(preview_error.code, ErrorCode::RemoteExecution);
+        assert_eq!(preview_error.exit_code(), 74);
+        assert_eq!(preview_error.details["local_update"], "not_applied");
+        assert!(preview_error.message.contains("no local or remote updates"));
     }
 
     #[test]
