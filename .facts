@@ -76,9 +76,9 @@
 - a Satelle Host-Resolved Secret Source is a Secret Source descriptor containing only a non-secret lookup reference and resolved by the target Host Daemon on the machine running the selected provider binding @spec @mvp @implemented
 - a Satelle File Secret Source is a Secret Source whose value is a path to a file containing secret material on the machine resolving that provider authentication binding @spec @mvp @implemented
 - a Satelle Provider Binding maps requested model and provider intent to a concrete upstream model, provider endpoint, and Host-Resolved Secret Source @spec @mvp @implemented
-- a Satelle MCP Server is a local stdio JSON-RPC bridge exposing selected Satelle control surfaces as tools for AI Clients @spec @mvp
-- a Satelle AI Client Install Target is a supported AI client configuration destination that can be updated to call Satelle through MCP @spec @mvp
-- a Satelle Agent Skill Bundle is a versioned set of Satelle-owned SKILL.md guides for AI agents setting up, using, and recovering Satelle @spec @mvp
+- a Satelle MCP Server is a local stdio JSON-RPC bridge exposing selected Satelle control surfaces as tools for AI Clients @spec @mvp @implemented
+- a Satelle AI Client Install Target is a supported AI client configuration destination that can be updated to call Satelle through MCP @spec @mvp @implemented
+- a Satelle Agent Skill Bundle is a versioned set of Satelle-owned SKILL.md guides for AI agents setting up, using, and recovering Satelle @spec @mvp @implemented
 - a Satelle Automation Workflow is a user-requested batch, watch, notify, or REPL flow that coordinates Satelle commands without changing underlying authority and safety rules @spec @later
 - label: a Satelle Command History Entry is a local redacted record of one Satelle command invocation, outcome, duration, target, and stable command family
   command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
@@ -87,17 +87,17 @@
 # brand
 - Satelle is the canonical product name for the remote computer-use bridge @implemented @mvp
 - satelle is the canonical local CLI executable name @implemented @mvp
-- Satelle name selection accepts the known online availability caveat that satelle has an existing AI-agent-adjacent GitHub repository collision and still treats Satelle as the chosen MVP product identity @spec @mvp
+- Satelle name selection accepts the known online availability caveat that satelle has an existing AI-agent-adjacent GitHub repository collision and still treats Satelle as the chosen MVP product identity @spec @mvp @implemented
 - Satelle's brand metaphor is satellite-adjacent remote presence, command uplink, telemetry downlink, and visible remote operation rather than generic remote desktop administration @implemented @mvp
 - Satelle's Beacon Coral palette is the selected MVP brand palette rather than a placeholder palette @implemented @mvp
 - Satelle's primary brand color is Beacon Coral #FF5E5B / oklch(0.693 0.197 24.774) @implemented @mvp
 - Satelle's default dark brand surface is Orbit Ink #0F0D17 / oklch(0.167 0.021 293.174) @implemented @mvp
 - Satelle's primary light text color is Platinum #D6D8E0 / oklch(0.883 0.011 274.878) @implemented @mvp
 - Satelle's secondary accent color is Relay Rose #FF8FB1 / oklch(0.779 0.139 1.409) @implemented @mvp
-- Satelle cliclack prompts use Beacon Coral for prompt glyphs, active selections, and primary brand emphasis @spec @mvp
-- Satelle cliclack prompts use Relay Rose only for sparse highlights so normal CLI screens do not become one-note pink @spec @mvp
-- Satelle cliclack prompts use #A6E22E / oklch(0.841 0.204 127.286) for success states and #FF4D6D / oklch(0.679 0.213 14.719) for error or cancel states @spec @mvp
-- Satelle color output respects terminal no-color and dumb-terminal conventions by falling back to plain text without changing command behavior @spec @mvp
+- Satelle cliclack prompts use Beacon Coral for prompt glyphs, active selections, and primary brand emphasis @spec @mvp @implemented
+- Satelle cliclack prompts use Relay Rose only for sparse highlights so normal CLI screens do not become one-note pink @spec @mvp @implemented
+- Satelle cliclack prompts use #A6E22E / oklch(0.841 0.204 127.286) for success states and #FF4D6D / oklch(0.679 0.213 14.719) for error or cancel states @spec @mvp @implemented
+- Satelle color output respects terminal no-color and dumb-terminal conventions by falling back to plain text without changing command behavior @spec @mvp @implemented
 
 # cli
 
@@ -927,8 +927,8 @@
 - satelle MCP host_status omits outputSchema and structuredContent until the host status command payload has a schema_version @spec @contract @mvp @implemented
 - satelle MCP host_sessions inputSchema has no required fields and permits only an optional non-empty string host @spec @contract @mvp @implemented
 - satelle MCP host_sessions always uses no-bootstrap behavior and never initiates SSH bootstrap when the configured direct Host connection is unavailable @spec @contract @mvp @implemented
-- satelle MCP stdio server exposes mutating tools for run, steer, stop, setup, repair, host update, and host lifecycle only when explicit MCP mutating-tool enablement is configured @spec @mvp
-- satelle MCP mutating tools preserve the same consent, --yes, YOLO, Trusted Profile, host-busy, readiness, and provider smoke-test rules as equivalent CLI commands @spec @mvp
+- satelle MCP stdio server exposes mutating tools for run, steer, stop, setup, repair, host update, and host lifecycle only when explicit MCP mutating-tool enablement is configured @spec @mvp @implemented
+- satelle MCP mutating tools preserve the same consent, --yes, YOLO, Trusted Profile, host-busy, readiness, and provider smoke-test rules as equivalent CLI commands @spec @mvp @implemented
 - id: wq0
   label: each non-stream satelle MCP read-only tool whose canonical Satelle success result has a defined schema_version publishes an outputSchema whose top-level oneOf contains exactly that canonical success schema and the direct satelle.error.v1 schema, and every returned structuredContent conforms to one of those branches
   tags: [spec, contract, mvp, implemented]
@@ -2275,20 +2275,20 @@
 - satelle repository README states project status, supported platforms, implemented release surface, security model, development commands, and the shortest successful-use example @spec @mvp @implemented
 - satelle public repository includes the license file matching the workspace package metadata before preview publication @spec @mvp @implemented
 - satelle public repository includes a security policy describing vulnerability reporting and sensitive diagnostic handling before preview publication @spec @mvp @implemented
-- satelle ships a Satelle Agent Skill Bundle as embedded SKILL.md content for AI agents that need to set up, operate, or recover Satelle @spec @mvp
-- satelle Agent Skill Bundle contains separate setup, use, recover, and router skills instead of one sprawling skill covering every Satelle workflow @spec @mvp
-- satelle embedded skills are Satelle-owned product guidance and not a general-purpose user skill registry, plugin marketplace, or arbitrary skill execution system @spec @mvp
-- satelle exposes satelle skills list, satelle skills get <name>, and satelle skills path <name> so AI clients can discover or install bundled Satelle skills without scraping documentation pages @spec @mvp
-- satelle bundled setup skill guides AI agents through safe noninteractive setup planning, secret-source descriptor handling, consent boundaries, and readiness verification @spec @mvp
-- satelle bundled use skill guides AI agents through run, steer, status, logs, stop, event modes, output formats, and session continuation rules @spec @mvp
-- satelle bundled recover skill guides AI agents through doctor, config check, logs, setup repair, and host update without guessing at remote state @spec @mvp
+- satelle ships a Satelle Agent Skill Bundle as embedded SKILL.md content for AI agents that need to set up, operate, or recover Satelle @spec @mvp @implemented
+- satelle Agent Skill Bundle contains separate setup, use, recover, and router skills instead of one sprawling skill covering every Satelle workflow @spec @mvp @implemented
+- satelle embedded skills are Satelle-owned product guidance and not a general-purpose user skill registry, plugin marketplace, or arbitrary skill execution system @spec @mvp @implemented
+- satelle exposes satelle skills list, satelle skills get <name>, and satelle skills path <name> so AI clients can discover or install bundled Satelle skills without scraping documentation pages @spec @mvp @implemented
+- satelle bundled setup skill guides AI agents through safe noninteractive setup planning, secret-source descriptor handling, consent boundaries, and readiness verification @spec @mvp @implemented
+- satelle bundled use skill guides AI agents through run, steer, status, logs, stop, event modes, output formats, and session continuation rules @spec @mvp @implemented
+- satelle bundled recover skill guides AI agents through doctor, config check, logs, setup repair, and host update without guessing at remote state @spec @mvp @implemented
 - satelle later extends the bundled recover skill with support bundle escalation when the matching CLI release supports diagnostic bundles @spec @later
-- satelle bundled router skill names the setup, use, and recover skills and routes agents to the smallest skill that covers the current Satelle task @spec @mvp
-- satelle bundled skills are versioned with the Satelle CLI release and document the CLI behavior for that same release instead of floating independently from the binary @spec @mvp
-- satelle skills list and satelle skills get report the Agent Skill Bundle release version @spec @mvp
-- satelle release validation proves embedded Agent Skill Bundle bytes match the release source copies byte for byte @spec @mvp
-- satelle release validation smoke-tests every bundled skill command example against the matching release binary @spec @mvp
-- satelle bundled skills do not include user secrets, host-specific configuration, prompts, session transcripts, screenshots, or generated diagnostic artifacts @spec @mvp
+- satelle bundled router skill names the setup, use, and recover skills and routes agents to the smallest skill that covers the current Satelle task @spec @mvp @implemented
+- satelle bundled skills are versioned with the Satelle CLI release and document the CLI behavior for that same release instead of floating independently from the binary @spec @mvp @implemented
+- satelle skills list and satelle skills get report the Agent Skill Bundle release version @spec @mvp @implemented
+- satelle release validation proves embedded Agent Skill Bundle bytes match the release source copies byte for byte @spec @mvp @implemented
+- satelle release validation smoke-tests every bundled skill command example against the matching release binary @spec @mvp @implemented
+- satelle bundled skills do not include user secrets, host-specific configuration, prompts, session transcripts, screenshots, or generated diagnostic artifacts @spec @mvp @implemented
 - satelle Fumadocs setup is not a prerequisite for the first Rust CLI and Host Daemon skeleton implementation @spec @mvp @implemented
 - satelle Fumadocs setup happens after the first Rust CLI and Host Daemon skeleton establishes stable top-level commands, configuration surfaces, and setup flow names @spec @mvp @implemented
 - satelle Fumadocs setup happens before public MVP release hardening so documentation, CLI help output, and .facts can be reviewed together before publishing @spec @mvp @implemented

@@ -17,13 +17,16 @@ mod output;
 mod read;
 #[path = "self-update.rs"]
 mod self_update;
+mod skills;
 mod tailscale;
 #[path = "tailscale-serve.rs"]
 mod tailscale_serve;
 mod transport;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use cliclack::{Theme, ThemeState};
 use completions::{CompletionsCommand, run_completions};
+use console::Style;
 use error_output::{ErrorFormat, parser_error, print_error, process_exit_code};
 use host_trust::{
     HostTrustReport, persist_desktop_selection, persist_host_identity,
@@ -44,7 +47,7 @@ use satelle_core::session::{
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
 };
 use satelle_core::{
-    BEACON_CORAL, CLI_NAME, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
+    BEACON_CORAL, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
     DoctorEventRecord, DoctorEventSchemaVersion, DoctorEventType, DoctorFinding,
     DoctorFixDelegation, DoctorFixFlow, DoctorFixFlowStatus, DoctorFixOwner, DoctorFixPostcheck,
     DoctorFixRequest, DoctorFixability, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode,
@@ -341,6 +344,10 @@ enum Command {
         command: SessionCommand,
     },
     Logs(LogsCommand),
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
@@ -353,8 +360,17 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum McpCommand {
-    Serve,
+    Serve(McpServeCommand),
     Install(McpInstallCommand),
+}
+
+#[derive(Args, Debug)]
+struct McpServeCommand {
+    #[arg(
+        long,
+        help = "Expose mutating MCP tools that retain the equivalent CLI consent and safety rules"
+    )]
+    enable_mutations: bool,
 }
 
 #[derive(Args, Debug)]
@@ -374,6 +390,31 @@ struct McpInstallCommand {
     satelle_path: Option<PathBuf>,
     #[arg(long)]
     dry_run: bool,
+    #[arg(
+        long,
+        help = "Configure the MCP server with explicitly enabled mutating tools"
+    )]
+    enable_mutations: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillsCommand {
+    List(SkillsOutputCommand),
+    Get(SkillNameCommand),
+    Path(SkillNameCommand),
+}
+
+#[derive(Args, Debug)]
+struct SkillsOutputCommand {
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Args, Debug)]
+struct SkillNameCommand {
+    name: String,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -1501,10 +1542,11 @@ fn execute_command(
         configured_log_verbosity,
     );
     let human_style = HumanStyle::detect(no_color);
+    human_style.install();
 
     match command {
         Command::Completions(command) => run_completions(command).map_err(failure).map(|_| None),
-        Command::Setup(command) => run_setup(command, human_style, config, output).map(|_| None),
+        Command::Setup(command) => run_setup(command, config, output).map(|_| None),
         Command::Repair(command) => run_repair(command, config, output).map(|_| None),
         Command::Doctor(command) => run_doctor(command, profile, config, output).map(|_| None),
         Command::Config { command } => run_config(command, config, output).map(|_| None),
@@ -1521,9 +1563,10 @@ fn execute_command(
             command: SessionCommand::Export(command),
         } => export_task_artifacts(command, config).map(|_| None),
         Command::Logs(command) => show_logs(command, config, output).map(|_| None),
+        Command::Skills { command } => skills::run(command).map(|_| None),
         Command::Mcp {
-            command: McpCommand::Serve,
-        } => mcp::serve(profile).map(|_| None),
+            command: McpCommand::Serve(command),
+        } => mcp::serve(profile, command.enable_mutations).map(|_| None),
         Command::Mcp {
             command: McpCommand::Install(command),
         } => run_mcp_install(command, profile, &config, output).map(|_| None),
@@ -1542,6 +1585,7 @@ fn mcp_install_request(
         satelle_path: command.satelle_path,
         profile: profile.map(str::to_owned),
         dry_run: command.dry_run,
+        enable_mutations: command.enable_mutations,
     }
 }
 
@@ -1879,6 +1923,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         },
         Command::Completions(_)
         | Command::Paths(_)
+        | Command::Skills { .. }
         | Command::SelfCtl { .. }
         | Command::Support { .. } => return None,
     };
@@ -2002,6 +2047,7 @@ mod mcp_install_cli_tests {
             server_name: "satelle".to_string(),
             satelle_path: None,
             dry_run: false,
+            enable_mutations: false,
             output_args: OutputArgs::default(),
         };
 
@@ -2030,6 +2076,7 @@ mod mcp_install_cli_tests {
             "--satelle-path",
             "/opt/satelle/bin/satelle",
             "--dry-run",
+            "--enable-mutations",
         ]);
 
         assert_eq!(
@@ -2046,6 +2093,7 @@ mod mcp_install_cli_tests {
             Some(PathBuf::from("/opt/satelle/bin/satelle"))
         );
         assert!(command.dry_run);
+        assert!(command.enable_mutations);
     }
 
     #[test]
@@ -2057,6 +2105,7 @@ mod mcp_install_cli_tests {
         assert_eq!(command.server_name, "satelle");
         assert_eq!(command.satelle_path, None);
         assert!(!command.dry_run);
+        assert!(!command.enable_mutations);
     }
 
     #[test]
@@ -3034,7 +3083,6 @@ fn resolve_setup_desktop_selection(
 
 fn run_setup(
     command: SetupCommand,
-    style: HumanStyle,
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
@@ -3384,7 +3432,6 @@ fn run_setup(
         }
         if !command.yes && !trusted_consent {
             prompted_for_consent = true;
-            let _color_enabled = style.color_enabled();
             cliclack::intro(format!("{PRODUCT_NAME} setup")).map_err(|source| {
                 failure(SatelleError {
                     code: ErrorCode::InvalidUsage,
@@ -14064,23 +14111,174 @@ mod admitted_session_failure_tests {
 
 #[derive(Clone, Copy)]
 struct HumanStyle {
-    color: bool,
+    stdout_color: bool,
+    stderr_color: bool,
 }
 
 impl HumanStyle {
     fn detect(no_color_flag: bool) -> Self {
-        let color = !no_color_flag
-            && std::env::var_os("NO_COLOR").is_none()
-            && std::env::var("TERM")
-                .map(|term| term != "dumb")
-                .unwrap_or(true);
-
-        let _palette = (BEACON_CORAL, RELAY_ROSE, SUCCESS_GREEN, ERROR_RED, CLI_NAME);
-
-        Self { color }
+        Self::for_terminals(
+            no_color_flag,
+            std::env::var_os("NO_COLOR").is_some(),
+            std::env::var("TERM").ok().as_deref(),
+            io::stdout().is_terminal(),
+            io::stderr().is_terminal(),
+        )
     }
 
-    fn color_enabled(&self) -> bool {
-        self.color
+    fn for_terminals(
+        no_color_flag: bool,
+        no_color_environment: bool,
+        term: Option<&str>,
+        stdout_is_terminal: bool,
+        stderr_is_terminal: bool,
+    ) -> Self {
+        Self {
+            stdout_color: terminal_color_enabled(
+                no_color_flag,
+                no_color_environment,
+                term,
+                stdout_is_terminal,
+            ),
+            stderr_color: terminal_color_enabled(
+                no_color_flag,
+                no_color_environment,
+                term,
+                stderr_is_terminal,
+            ),
+        }
+    }
+
+    fn install(self) {
+        console::set_colors_enabled(self.stdout_color);
+        console::set_colors_enabled_stderr(self.stderr_color);
+        cliclack::set_theme(SatelleTheme);
+    }
+}
+
+fn terminal_color_enabled(
+    no_color_flag: bool,
+    no_color_environment: bool,
+    term: Option<&str>,
+    stream_is_terminal: bool,
+) -> bool {
+    !no_color_flag && !no_color_environment && !matches!(term, Some("dumb")) && stream_is_terminal
+}
+
+struct SatelleTheme;
+
+impl Theme for SatelleTheme {
+    fn bar_color(&self, state: &ThemeState) -> Style {
+        match state {
+            ThemeState::Active => beacon_coral(),
+            ThemeState::Submit => relay_rose().dim(),
+            ThemeState::Cancel | ThemeState::Error(_) => error_red(),
+        }
+    }
+
+    fn state_symbol_color(&self, state: &ThemeState) -> Style {
+        match state {
+            ThemeState::Active => beacon_coral(),
+            ThemeState::Submit => success_green(),
+            ThemeState::Cancel | ThemeState::Error(_) => error_red(),
+        }
+    }
+
+    fn radio_symbol(&self, state: &ThemeState, selected: bool) -> String {
+        match (state, selected) {
+            (ThemeState::Active, true) => beacon_coral().apply_to(">").to_string(),
+            (ThemeState::Active, false) => {
+                Style::new().for_stderr().dim().apply_to(" ").to_string()
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn active_symbol(&self) -> String {
+        beacon_coral().apply_to(">").to_string()
+    }
+
+    fn submit_symbol(&self) -> String {
+        success_green().apply_to("+").to_string()
+    }
+
+    fn info_symbol(&self) -> String {
+        relay_rose().apply_to("i").to_string()
+    }
+
+    fn error_symbol(&self) -> String {
+        error_red().apply_to("x").to_string()
+    }
+}
+
+const fn beacon_coral() -> Style {
+    brand_style(BEACON_CORAL)
+}
+
+const fn relay_rose() -> Style {
+    brand_style(RELAY_ROSE)
+}
+
+const fn success_green() -> Style {
+    brand_style(SUCCESS_GREEN)
+}
+
+const fn error_red() -> Style {
+    brand_style(ERROR_RED)
+}
+
+const fn brand_style(hex: &str) -> Style {
+    let bytes = hex.as_bytes();
+    Style::new()
+        .true_color(
+            hex_byte(bytes[1], bytes[2]),
+            hex_byte(bytes[3], bytes[4]),
+            hex_byte(bytes[5], bytes[6]),
+        )
+        .for_stderr()
+}
+
+const fn hex_byte(high: u8, low: u8) -> u8 {
+    hex_nibble(high) * 16 + hex_nibble(low)
+}
+
+const fn hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'A'..=b'F' => value - b'A' + 10,
+        _ => panic!("brand color constants must use uppercase hexadecimal"),
+    }
+}
+
+#[cfg(test)]
+mod human_style_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_color_gate_honors_every_plain_text_convention() {
+        assert!(terminal_color_enabled(
+            false,
+            false,
+            Some("xterm-256color"),
+            true
+        ));
+        assert!(!terminal_color_enabled(
+            true,
+            false,
+            Some("xterm-256color"),
+            true
+        ));
+        assert!(!terminal_color_enabled(
+            false,
+            true,
+            Some("xterm-256color"),
+            true
+        ));
+        assert!(!terminal_color_enabled(false, false, Some("dumb"), true));
+        assert!(!terminal_color_enabled(false, false, None, false));
+
+        let split = HumanStyle::for_terminals(false, false, Some("xterm-256color"), false, true);
+        assert!(!split.stdout_color);
+        assert!(split.stderr_color);
     }
 }

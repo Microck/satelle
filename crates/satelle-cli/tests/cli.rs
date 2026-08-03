@@ -59,6 +59,91 @@ fn production_satelle() -> Command {
 }
 
 #[test]
+fn bundled_skills_are_versioned_discoverable_and_materialized_byte_exact() {
+    let home = TestStateDir::new().expect("secure temporary Satelle home");
+    let list = satelle()
+        .env("SATELLE_HOME", home.path())
+        .args(["skills", "list", "--json"])
+        .output()
+        .expect("list bundled skills");
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let list: Value = serde_json::from_slice(&list.stdout).expect("skills list JSON");
+    assert_eq!(list["bundle_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        list["skills"]
+            .as_array()
+            .expect("skills array")
+            .iter()
+            .map(|skill| skill["name"].as_str().expect("skill name"))
+            .collect::<Vec<_>>(),
+        ["satelle", "satelle-setup", "satelle-use", "satelle-recover"]
+    );
+
+    let source = fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("skills/satelle/SKILL.md"),
+    )
+    .expect("read release skill source");
+    let get = satelle()
+        .env("SATELLE_HOME", home.path())
+        .args(["skills", "get", "satelle", "--format", "json"])
+        .output()
+        .expect("get bundled skill");
+    assert!(
+        get.status.success(),
+        "{}",
+        String::from_utf8_lossy(&get.stderr)
+    );
+    let get: Value = serde_json::from_slice(&get.stdout).expect("skills get JSON");
+    assert_eq!(get["bundle_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        get["content"].as_str().expect("skill content").as_bytes(),
+        source
+    );
+
+    let path = satelle()
+        .env("SATELLE_HOME", home.path())
+        .args(["skills", "path", "satelle", "--json"])
+        .output()
+        .expect("materialize bundled skill");
+    assert!(
+        path.status.success(),
+        "{}",
+        String::from_utf8_lossy(&path.stderr)
+    );
+    let path: Value = serde_json::from_slice(&path.stdout).expect("skills path JSON");
+    assert_eq!(path["bundle_version"], env!("CARGO_PKG_VERSION"));
+    let materialized = std::path::Path::new(path["path"].as_str().expect("skill path"));
+    assert_eq!(
+        fs::read(materialized).expect("read materialized skill"),
+        source
+    );
+    assert!(materialized.starts_with(home.path().join("cache/skills")));
+
+    let conflict = satelle()
+        .env("SATELLE_HOME", home.path())
+        .args([
+            "skills",
+            "list",
+            "--format",
+            "human",
+            "--json",
+            "--error-format",
+            "json",
+        ])
+        .output()
+        .expect("reject conflicting skill output selectors");
+    assert_eq!(conflict.status.code(), Some(64));
+    let conflict: Value = serde_json::from_slice(&conflict.stderr).expect("typed conflict JSON");
+    assert_eq!(conflict["code"], "output-mode-conflict");
+}
+
+#[test]
 fn bearer_tokens_are_rejected_in_process_arguments_and_environment() {
     let token = ApiBearerToken::generate().expect("generate bearer token");
     let exposed = token.expose();

@@ -128,11 +128,12 @@ impl Command {
             Self::Stop(command) => (command.output_args, EventOutput::None),
             Self::Session { .. } => (OutputArgs::default(), EventOutput::None),
             Self::Logs(command) => (command.output_args, EventOutput::None),
+            Self::Skills { command } => command.output_request(),
             Self::Mcp {
                 command: super::McpCommand::Install(command),
             } => (command.output_args, EventOutput::None),
             Self::Mcp {
-                command: super::McpCommand::Serve,
+                command: super::McpCommand::Serve(_),
             } => (OutputArgs::default(), EventOutput::None),
             Self::Support { command } => command.output_request(),
         }
@@ -197,6 +198,16 @@ impl ConfigCommand {
             Self::Check(command) => (command.output_args, EventOutput::None),
             Self::Explain(command) => (command.output_args, EventOutput::None),
         }
+    }
+}
+
+impl super::SkillsCommand {
+    const fn output_request(&self) -> (OutputArgs, EventOutput) {
+        let output = match self {
+            Self::List(command) => command.output_args,
+            Self::Get(command) | Self::Path(command) => command.output_args,
+        };
+        (output, EventOutput::None)
     }
 }
 

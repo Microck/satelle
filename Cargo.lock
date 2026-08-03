@@ -2456,6 +2456,7 @@ dependencies = [
  "clap_complete",
  "cliclack",
  "command-group",
+ "console",
  "flate2",
  "jsonschema",
  "libc",

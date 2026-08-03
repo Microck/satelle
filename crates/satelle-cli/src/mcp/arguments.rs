@@ -117,14 +117,250 @@ pub(super) struct DoctorInput {
     pub(super) scope: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RunInput {
+    pub(super) prompt: String,
+    pub(super) host: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) provider: Option<String>,
+    #[serde(default)]
+    pub(super) detach: bool,
+    #[serde(default)]
+    pub(super) yolo: bool,
+    #[serde(default)]
+    pub(super) no_yolo: bool,
+    #[serde(default)]
+    pub(super) experimental_provider_computer_use: bool,
+    #[serde(default)]
+    pub(super) refresh_provider_smoke_test: bool,
+    pub(super) timeout: Option<String>,
+    #[serde(default)]
+    pub(super) images: Vec<String>,
+}
+
+impl RunInput {
+    pub(super) fn validate(&self) -> Result<(), McpError> {
+        validate_prompt_fields(
+            &self.prompt,
+            self.host.as_deref(),
+            self.model.as_deref(),
+            self.provider.as_deref(),
+            self.timeout.as_deref(),
+            &self.images,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SteerInput {
+    pub(super) session_id: String,
+    pub(super) prompt: String,
+    pub(super) host: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) provider: Option<String>,
+    #[serde(default)]
+    pub(super) detach: bool,
+    #[serde(default)]
+    pub(super) yolo: bool,
+    #[serde(default)]
+    pub(super) no_yolo: bool,
+    #[serde(default)]
+    pub(super) experimental_provider_computer_use: bool,
+    #[serde(default)]
+    pub(super) refresh_provider_smoke_test: bool,
+    pub(super) timeout: Option<String>,
+    #[serde(default)]
+    pub(super) images: Vec<String>,
+}
+
+impl SteerInput {
+    pub(super) fn validate(&self) -> Result<(), McpError> {
+        validate_session_id(&self.session_id)?;
+        validate_prompt_fields(
+            &self.prompt,
+            self.host.as_deref(),
+            self.model.as_deref(),
+            self.provider.as_deref(),
+            self.timeout.as_deref(),
+            &self.images,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StopInput {
+    pub(super) session_id: String,
+    pub(super) host: Option<String>,
+}
+
+impl StopInput {
+    pub(super) fn validate(&self) -> Result<(), McpError> {
+        validate_session_id(&self.session_id)?;
+        validate_host(self.host.as_deref())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SetupInput {
+    pub(super) host: Option<String>,
+    #[serde(default)]
+    pub(super) dry_run: bool,
+    #[serde(default)]
+    pub(super) verify: bool,
+    #[serde(default)]
+    pub(super) on_demand: bool,
+    #[serde(default)]
+    pub(super) persistent: bool,
+    #[serde(default)]
+    pub(super) components: Vec<String>,
+    #[serde(default)]
+    pub(super) yes: bool,
+    #[serde(default = "default_true")]
+    pub(super) no_input: bool,
+    pub(super) expected_host_id: Option<String>,
+}
+
+impl SetupInput {
+    pub(super) fn validate(&self) -> Result<(), McpError> {
+        validate_host(self.host.as_deref())?;
+        validate_non_empty_items("components", &self.components)?;
+        validate_optional_non_empty("expected_host_id", self.expected_host_id.as_deref())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RepairInput {
+    pub(super) host: Option<String>,
+    pub(super) run: Option<String>,
+    #[serde(default)]
+    pub(super) dry_run: bool,
+    #[serde(default)]
+    pub(super) yes: bool,
+    #[serde(default = "default_true")]
+    pub(super) no_input: bool,
+}
+
+impl RepairInput {
+    pub(super) fn validate(&self) -> Result<(), McpError> {
+        validate_host(self.host.as_deref())?;
+        validate_optional_non_empty("run", self.run.as_deref())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HostUpdateInput {
+    pub(super) host: Option<String>,
+    #[serde(default)]
+    pub(super) components: Vec<String>,
+    #[serde(default)]
+    pub(super) dry_run: bool,
+    #[serde(default)]
+    pub(super) yes: bool,
+    #[serde(default = "default_true")]
+    pub(super) no_input: bool,
+}
+
+impl HostUpdateInput {
+    pub(super) fn validate(&self) -> Result<(), McpError> {
+        validate_host(self.host.as_deref())?;
+        validate_non_empty_items("components", &self.components)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HostLifecycleInput {
+    pub(super) action: HostLifecycleAction,
+    pub(super) host: Option<String>,
+    #[serde(default)]
+    pub(super) yes: bool,
+    #[serde(default = "default_true")]
+    pub(super) no_input: bool,
+}
+
+impl HostLifecycleInput {
+    pub(super) fn validate(&self) -> Result<(), McpError> {
+        validate_host(self.host.as_deref())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum HostLifecycleAction {
+    Stop,
+    Restart,
+}
+
+impl HostLifecycleAction {
+    pub(super) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 pub(super) fn decode<T: DeserializeOwned>(arguments: JsonObject) -> Result<T, McpError> {
     serde_json::from_value(Value::Object(arguments))
         .map_err(|error| invalid_params(format!("invalid tool arguments: {error}")))
 }
 
 pub(super) fn validate_host(host: Option<&str>) -> Result<(), McpError> {
-    if host.is_some_and(str::is_empty) {
-        return Err(invalid_params("host must be non-empty"));
+    validate_optional_non_empty("host", host)
+}
+
+fn validate_prompt_fields(
+    prompt: &str,
+    host: Option<&str>,
+    model: Option<&str>,
+    provider: Option<&str>,
+    timeout: Option<&str>,
+    images: &[String],
+) -> Result<(), McpError> {
+    validate_non_empty("prompt", prompt)?;
+    validate_host(host)?;
+    validate_optional_non_empty("model", model)?;
+    validate_optional_non_empty("provider", provider)?;
+    validate_optional_non_empty("timeout", timeout)?;
+    validate_non_empty_items("images", images)?;
+    if images.len() > 2 {
+        return Err(invalid_params("images must contain at most 2 items"));
+    }
+    Ok(())
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), McpError> {
+    SessionId::from_str(session_id).map_err(|error| invalid_params(error.to_string()))?;
+    Ok(())
+}
+
+fn validate_optional_non_empty(name: &str, value: Option<&str>) -> Result<(), McpError> {
+    if let Some(value) = value {
+        validate_non_empty(name, value)?;
+    }
+    Ok(())
+}
+
+fn validate_non_empty(name: &str, value: &str) -> Result<(), McpError> {
+    if value.is_empty() {
+        return Err(invalid_params(format!("{name} must be non-empty")));
+    }
+    Ok(())
+}
+
+fn validate_non_empty_items(name: &str, values: &[String]) -> Result<(), McpError> {
+    if values.iter().any(String::is_empty) {
+        return Err(invalid_params(format!("{name} items must be non-empty")));
     }
     Ok(())
 }
@@ -167,4 +403,19 @@ fn validate_since(value: &str) -> Result<(), McpError> {
 
 pub(super) fn invalid_params(message: impl Into<String>) -> McpError {
     McpError::invalid_params(message.into(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_lifecycle_action_rejects_values_outside_the_schema() {
+        let arguments = serde_json::json!({"action": "status"})
+            .as_object()
+            .expect("object arguments")
+            .clone();
+
+        assert!(decode::<HostLifecycleInput>(arguments).is_err());
+    }
 }

@@ -10,8 +10,8 @@ use std::sync::Arc;
 // lexical shape even when a client ignores `format`.
 const RFC3339_LEXICAL_PATTERN: &str = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})$";
 
-pub(super) fn tools() -> Vec<Tool> {
-    vec![
+pub(super) fn tools(enable_mutations: bool) -> Vec<Tool> {
+    let mut tools = vec![
         tool(
             "config_check",
             "Validate the selected Satelle configuration without contacting a Host.",
@@ -109,6 +109,99 @@ pub(super) fn tools() -> Vec<Tool> {
             object_schema(json!({"host": non_empty_string()}), &[]),
             Some(output_schema::host_sessions()),
         ),
+    ];
+    if enable_mutations {
+        tools.extend(mutation_tools());
+    }
+    tools
+}
+
+fn mutation_tools() -> Vec<Tool> {
+    let prompt_fields = json!({
+        "prompt": non_empty_string(),
+        "host": non_empty_string(),
+        "model": non_empty_string(),
+        "provider": non_empty_string(),
+        "detach": {"type": "boolean", "default": false},
+        "yolo": {"type": "boolean", "default": false},
+        "no_yolo": {"type": "boolean", "default": false},
+        "experimental_provider_computer_use": {"type": "boolean", "default": false},
+        "refresh_provider_smoke_test": {"type": "boolean", "default": false},
+        "timeout": non_empty_string(),
+        "images": {"type": "array", "items": non_empty_string(), "maxItems": 2}
+    });
+    let mut steer_fields = prompt_fields.clone();
+    steer_fields
+        .as_object_mut()
+        .expect("prompt fields are an object")
+        .insert("session_id".to_string(), session_id_schema());
+    vec![
+        mutation_tool(
+            "run",
+            "Start a Satelle Session and Turn.",
+            object_schema(prompt_fields, &["prompt"]),
+        ),
+        mutation_tool(
+            "steer",
+            "Start a follow-up Turn in a Satelle Session.",
+            object_schema(steer_fields, &["session_id", "prompt"]),
+        ),
+        mutation_tool(
+            "stop",
+            "Stop the active Turn in a Satelle Session.",
+            object_schema(
+                json!({"session_id": session_id_schema(), "host": non_empty_string()}),
+                &["session_id"],
+            ),
+        ),
+        mutation_tool(
+            "setup",
+            "Plan or apply Satelle Host setup.",
+            object_schema(
+                json!({
+                    "host": non_empty_string(), "dry_run": {"type": "boolean", "default": false},
+                    "verify": {"type": "boolean", "default": false}, "on_demand": {"type": "boolean", "default": false},
+                    "persistent": {"type": "boolean", "default": false}, "components": {"type": "array", "items": non_empty_string()},
+                    "yes": {"type": "boolean", "default": false}, "no_input": {"type": "boolean", "default": true},
+                    "expected_host_id": non_empty_string()
+                }),
+                &[],
+            ),
+        ),
+        mutation_tool(
+            "repair",
+            "Plan or apply Satelle repair actions.",
+            object_schema(
+                json!({
+                    "host": non_empty_string(), "run": non_empty_string(), "dry_run": {"type": "boolean", "default": false},
+                    "yes": {"type": "boolean", "default": false}, "no_input": {"type": "boolean", "default": true}
+                }),
+                &[],
+            ),
+        ),
+        mutation_tool(
+            "host_update",
+            "Plan or apply Host artifact updates.",
+            object_schema(
+                json!({
+                    "host": non_empty_string(), "components": {"type": "array", "items": non_empty_string()},
+                    "dry_run": {"type": "boolean", "default": false},
+                    "yes": {"type": "boolean", "default": false}, "no_input": {"type": "boolean", "default": true}
+                }),
+                &[],
+            ),
+        ),
+        mutation_tool(
+            "host_lifecycle",
+            "Stop or restart a persistent Host service.",
+            object_schema(
+                json!({
+                    "action": {"enum": ["stop", "restart"]}, "host": non_empty_string(),
+                    "yes": {"type": "boolean", "default": false}, "no_input": {"type": "boolean", "default": true}
+                }),
+                &["action"],
+            ),
+        ),
     ]
 }
 
@@ -128,6 +221,15 @@ fn tool(
         tool = tool.with_raw_output_schema(Arc::new(object(output_schema)));
     }
     tool
+}
+
+fn mutation_tool(name: &'static str, description: &'static str, input_schema: Value) -> Tool {
+    let annotations = ToolAnnotations::new()
+        .read_only(false)
+        .destructive(true)
+        .idempotent(false)
+        .open_world(true);
+    Tool::new(name, description, object(input_schema)).with_annotations(annotations)
 }
 
 fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -276,7 +378,7 @@ mod tests {
     }
 
     fn logs_input_validator() -> jsonschema::Validator {
-        let logs = tools()
+        let logs = tools(false)
             .into_iter()
             .find(|tool| tool.name == "logs")
             .expect("logs tool is advertised");

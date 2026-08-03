@@ -5,6 +5,14 @@ use std::future::{pending, ready};
 use std::time::Duration;
 
 #[test]
+fn mutation_subprocesses_use_the_executable_path_captured_at_server_start() {
+    let expected = std::env::current_exe().expect("resolve test executable");
+    let server = SatelleMcp::new(None, true).expect("capture test executable");
+
+    assert_eq!(server.executable.as_path(), expected);
+}
+
+#[test]
 fn direct_daemon_unreachable_is_a_retryable_remote_execution_error() {
     let tool_result = result::operational_error(SatelleError::direct_daemon_unreachable("remote"));
     let structured = tool_result
@@ -26,7 +34,7 @@ fn direct_daemon_unreachable_is_a_retryable_remote_execution_error() {
 
 #[tokio::test]
 async fn local_state_gate_prefers_cancellation_and_releases_the_waiter() {
-    let server = SatelleMcp::new(None);
+    let server = SatelleMcp::new(None, false).expect("resolve test executable");
     let held = server.local_state_gate.lock().await;
 
     let error = server
@@ -48,7 +56,7 @@ async fn local_state_gate_prefers_cancellation_and_releases_the_waiter() {
 
 #[tokio::test]
 async fn non_local_operation_bypasses_the_local_state_gate() {
-    let server = SatelleMcp::new(None);
+    let server = SatelleMcp::new(None, false).expect("resolve test executable");
     let _held = server.local_state_gate.lock().await;
 
     let guard = tokio::time::timeout(

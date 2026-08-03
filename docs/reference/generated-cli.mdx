@@ -45,6 +45,7 @@ Commands:
   stop
   session
   logs
+  skills
   mcp
   support
   help         Print this message or the help of the given subcommand(s)
@@ -485,6 +486,25 @@ Options:
   -h, --help                         Print help
 ```
 
+## `satelle skills`
+
+```text
+Usage: satelle skills [OPTIONS] <COMMAND>
+
+Commands:
+  list
+  get
+  path
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
 ## `satelle mcp`
 
 ```text
@@ -781,12 +801,64 @@ Options:
   -h, --help                   Print help
 ```
 
+## `satelle skills list`
+
+```text
+Usage: satelle skills list [OPTIONS]
+
+Options:
+      --format <FORMAT>        [possible values: human, json]
+      --no-color               Disable colored human output
+      --json                   Alias for --format json
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle skills get`
+
+```text
+Usage: satelle skills get [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+
+Options:
+      --format <FORMAT>        [possible values: human, json]
+      --no-color               Disable colored human output
+      --json                   Alias for --format json
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle skills path`
+
+```text
+Usage: satelle skills path [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+
+Options:
+      --format <FORMAT>        [possible values: human, json]
+      --no-color               Disable colored human output
+      --json                   Alias for --format json
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
 ## `satelle mcp serve`
 
 ```text
 Usage: satelle mcp serve [OPTIONS]
 
 Options:
+      --enable-mutations       Expose mutating MCP tools that retain the equivalent CLI consent and safety rules
       --no-color               Disable colored human output
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --profile <NAME>         Apply a named user-level configuration profile
@@ -809,6 +881,7 @@ Options:
       --error-format <FORMAT>        Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --satelle-path <SATELLE_PATH>
       --dry-run
+      --enable-mutations             Configure the MCP server with explicitly enabled mutating tools
       --format <FORMAT>              [possible values: human, json]
       --json                         Alias for --format json
   -h, --help                         Print help

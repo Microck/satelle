@@ -64,6 +64,7 @@ struct ProcessInterrupt {
 struct ProcessInterruptInner {
     started: AtomicBool,
     armed: AtomicBool,
+    arm_error: Mutex<Option<Arc<std::io::Error>>>,
     result: Mutex<Option<Result<(), Arc<std::io::Error>>>>,
     armed_changed: tokio::sync::Notify,
     changed: tokio::sync::Notify,
@@ -75,30 +76,55 @@ impl InterruptSource for ProcessInterrupt {
             if !self.inner.started.swap(true, Ordering::AcqRel) {
                 let inner = Arc::clone(&self.inner);
                 tokio::spawn(async move {
-                    let mut signal = Box::pin(tokio::signal::ctrl_c());
+                    let mut signal = Box::pin(process_interrupt_signal());
                     let first_poll =
                         std::future::poll_fn(|context| match signal.as_mut().poll(context) {
                             std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
                             std::task::Poll::Pending => std::task::Poll::Ready(None),
                         })
                         .await;
-                    inner.armed.store(true, Ordering::Release);
-                    inner.armed_changed.notify_waiters();
                     let result = match first_poll {
-                        Some(result) => result,
-                        None => signal.await,
-                    }
-                    .map_err(Arc::new);
+                        Some(Err(error)) => {
+                            // An error on the registration poll is a setup failure, not an
+                            // interrupt. Publish it before marking the listener armed so callers
+                            // cannot start admission and later mistake it for cancellation.
+                            let error = Arc::new(error);
+                            *inner
+                                .arm_error
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(Arc::clone(&error));
+                            Err(error)
+                        }
+                        Some(Ok(())) => Ok(()),
+                        None => {
+                            inner.armed.store(true, Ordering::Release);
+                            inner.armed_changed.notify_waiters();
+                            signal.await.map_err(Arc::new)
+                        }
+                    };
                     *inner
                         .result
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
                     inner.changed.notify_waiters();
+                    if !inner.armed.swap(true, Ordering::AcqRel) {
+                        inner.armed_changed.notify_waiters();
+                    }
                 });
             }
             loop {
                 let armed = self.inner.armed_changed.notified();
                 if self.inner.armed.load(Ordering::Acquire) {
+                    if let Some(error) = self
+                        .inner
+                        .arm_error
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_ref()
+                    {
+                        return Err(std::io::Error::new(error.kind(), error.to_string()));
+                    }
                     return Ok(());
                 }
                 armed.await;
@@ -124,6 +150,81 @@ impl InterruptSource for ProcessInterrupt {
                 changed.await;
             }
         })
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) async fn process_interrupt_signal() -> Result<(), std::io::Error> {
+    tokio::signal::ctrl_c().await
+}
+
+#[cfg(windows)]
+pub(crate) const MCP_INTERRUPT_EVENT_ENV: &str = "SATELLE_MCP_INTERRUPT_EVENT";
+
+#[cfg(windows)]
+struct WindowsInterruptEvent(std::os::windows::io::OwnedHandle);
+
+#[cfg(windows)]
+impl WindowsInterruptEvent {
+    fn open(name: &std::ffi::OsStr) -> Result<Self, std::io::Error> {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::io::{FromRawHandle as _, RawHandle};
+        use windows_sys::Win32::System::Threading::{OpenEventW, SYNCHRONIZATION_SYNCHRONIZE};
+
+        let wide_name = name.encode_wide().chain([0]).collect::<Vec<_>>();
+        // SAFETY: wide_name is NUL-terminated for the duration of the call. The returned handle,
+        // when non-null, is newly owned and transferred into OwnedHandle below.
+        let handle = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide_name.as_ptr()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(unsafe {
+            std::os::windows::io::OwnedHandle::from_raw_handle(handle as RawHandle)
+        }))
+    }
+
+    async fn wait(&self) -> Result<(), std::io::Error> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        loop {
+            // SAFETY: the owned event handle remains valid for this zero-timeout poll.
+            match unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) } {
+                WAIT_OBJECT_0 => return Ok(()),
+                WAIT_TIMEOUT => tokio::time::sleep(Duration::from_millis(20)).await,
+                WAIT_FAILED => return Err(std::io::Error::last_os_error()),
+                status => {
+                    return Err(std::io::Error::other(format!(
+                        "unexpected Windows interrupt wait status {status}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) async fn process_interrupt_signal() -> Result<(), std::io::Error> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+    if let Some(name) = std::env::var_os(MCP_INTERRUPT_EVENT_ENV) {
+        let event = WindowsInterruptEvent::open(&name)?;
+        tokio::select! {
+            signal = ctrl_c.recv() => signal.ok_or_else(|| {
+                std::io::Error::other("Windows Ctrl-C stream closed")
+            }),
+            signal = ctrl_break.recv() => signal.ok_or_else(|| {
+                std::io::Error::other("Windows Ctrl-Break stream closed")
+            }),
+            signal = event.wait() => signal,
+        }
+    } else {
+        tokio::select! {
+            signal = ctrl_c.recv() => signal,
+            signal = ctrl_break.recv() => signal,
+        }
+        .ok_or_else(|| std::io::Error::other("Windows console interrupt stream closed"))
     }
 }
 

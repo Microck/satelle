@@ -4123,6 +4123,77 @@ fn process_interrupt_arm_returns_only_after_ctrl_c_listener_is_polled() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn process_interrupt_arm_reports_named_event_open_failure_as_setup_failure() {
+    let missing_event = format!("Local\\SatelleMissingInterruptEvent-{}", std::process::id());
+    let mut child = std::process::Command::new(
+        std::env::current_exe().expect("resolve current test executable"),
+    )
+    .args([
+        "--exact",
+        "transport::tests::process_interrupt_missing_event_helper",
+        "--ignored",
+        "--nocapture",
+    ])
+    .env(MCP_INTERRUPT_EVENT_ENV, missing_event)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("run missing interrupt event helper");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .expect("poll missing interrupt event helper")
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("reap timed-out missing interrupt event helper");
+            panic!(
+                "missing event setup proof timed out:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child
+        .wait_with_output()
+        .expect("collect missing interrupt event helper output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success()
+            && stdout.contains("transport::tests::process_interrupt_missing_event_helper")
+            && stdout.contains("test result: ok"),
+        "missing event setup proof failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "helper process for process_interrupt_arm_reports_named_event_open_failure_as_setup_failure"]
+fn process_interrupt_missing_event_helper() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("construct signal test runtime");
+    let interrupt = ProcessInterrupt::default();
+
+    let error = runtime
+        .block_on(interrupt.arm())
+        .expect_err("opening a missing named event must fail interrupt setup");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
 #[test]
 fn local_attached_arms_interrupt_before_starting_admission_thread() {
     let state = TestStateDir::new().expect("temporary state directory");

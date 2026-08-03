@@ -25,6 +25,8 @@ Completion criterion: the agent has a typed failure, evidence from diagnostics o
 
 Completion criterion: the response names the specific skill to use next and why.
 
+Discover the release-matched bundle with `satelle skills list`. Use `satelle skills get <name>` to read one guide or `satelle skills path <name>` when a client needs a local SKILL.md path.
+
 ## Rules
 
 - Prefer Satelle JSON output for agent decisions.
