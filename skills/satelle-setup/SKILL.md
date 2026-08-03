@@ -43,12 +43,12 @@ Completion criterion: readiness is ready, or the agent reports typed blockers wi
 
 ## MCP And Client Setup
 
-When the release exposes MCP client installation, prefer a dry run first:
+Prefer an MCP client installation dry run first:
 
 ```bash
-satelle mcp install --target <client> --dry-run --json
+satelle mcp install --target codex --dry-run --json
 ```
 
-If `satelle mcp install` is not available in the current binary, report that MCP installation is specified but not implemented in this release. Apply only after the user accepts the target, server name, and Satelle binary path.
+Apply only after the user accepts the target, server name, and Satelle binary path. Add `--enable-mutations` only when the user also accepts exposing run, steer, stop, setup, repair, host update, and host lifecycle tools. Enabling those tools does not grant mutation consent. Each tool retains the equivalent CLI consent, Trusted Profile, YOLO, readiness, provider, and host-busy rules.
 
 Completion criterion: the AI client points to the intended Satelle MCP server command, or the dry run explains what would change.

@@ -13,6 +13,7 @@ base64.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 cliclack.workspace = true
+console.workspace = true
 command-group.workspace = true
 flate2.workspace = true
 notify.workspace = true
@@ -48,6 +49,8 @@ windows-sys = { workspace = true, features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Threading",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

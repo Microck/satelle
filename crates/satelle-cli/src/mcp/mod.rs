@@ -1,5 +1,6 @@
 mod arguments;
 pub(crate) mod install;
+mod mutation;
 #[path = "output-schema.rs"]
 mod output_schema;
 mod result;
@@ -10,8 +11,9 @@ use super::logs::read_logs_for_host;
 use super::read;
 use super::{CliFailure, ConfigContext, SelectedHost};
 use arguments::{
-    ConfigCheckInput, ConfigExplainInput, DoctorInput, HostInput, LogsInput, StatusInput, decode,
-    invalid_params, validate_doctor_scope, validate_host,
+    ConfigCheckInput, ConfigExplainInput, DoctorInput, HostInput, HostLifecycleInput,
+    HostUpdateInput, LogsInput, RepairInput, RunInput, SetupInput, StatusInput, SteerInput,
+    StopInput, decode, invalid_params, validate_doctor_scope, validate_host,
 };
 use result::{operational_error, structured};
 use rmcp::handler::server::ServerHandler;
@@ -27,18 +29,18 @@ use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 
-pub(super) fn serve(profile: Option<&str>) -> Result<(), CliFailure> {
+pub(super) fn serve(profile: Option<&str>, enable_mutations: bool) -> Result<(), CliFailure> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| mcp_failure(format!("could not start the MCP runtime: {error}")))?;
     runtime
-        .block_on(serve_async(profile.map(str::to_owned)))
+        .block_on(serve_async(profile.map(str::to_owned), enable_mutations))
         .map_err(mcp_failure)
 }
 
-async fn serve_async(profile: Option<String>) -> Result<(), String> {
-    let server = SatelleMcp::new(profile);
+async fn serve_async(profile: Option<String>, enable_mutations: bool) -> Result<(), String> {
+    let server = SatelleMcp::new(profile, enable_mutations)?;
     let (reader, writer, framer) = stdio::BoundedStdio::start().into_parts();
     let running = match server.serve((reader, writer)).await {
         Ok(running) => running,
@@ -86,17 +88,25 @@ fn mcp_failure(message: impl Into<String>) -> CliFailure {
 #[derive(Clone)]
 struct SatelleMcp {
     profile: Option<String>,
+    executable: Arc<std::path::PathBuf>,
     tools: Arc<Vec<Tool>>,
     local_state_gate: Arc<tokio::sync::Mutex<()>>,
+    enable_mutations: bool,
 }
 
 impl SatelleMcp {
-    fn new(profile: Option<String>) -> Self {
-        Self {
+    fn new(profile: Option<String>, enable_mutations: bool) -> Result<Self, String> {
+        // Capture the installed path before a self-update can replace the running inode. On Linux,
+        // resolving /proc/self/exe after replacement returns the unlinked old executable instead.
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("could not resolve Satelle executable: {error}"))?;
+        Ok(Self {
             profile,
-            tools: Arc::new(schema::tools()),
+            executable: Arc::new(executable),
+            tools: Arc::new(schema::tools(enable_mutations)),
             local_state_gate: Arc::new(tokio::sync::Mutex::new(())),
-        }
+            enable_mutations,
+        })
     }
 
     fn config(&self) -> ConfigContext<'_> {
@@ -256,6 +266,104 @@ impl SatelleMcp {
                 let value = serde_json::to_value(report)
                     .map_err(|error| McpError::internal_error(error.to_string(), None))?;
                 Ok(structured(value, false))
+            }
+            "run" if self.enable_mutations => {
+                if context.ct.is_cancelled() {
+                    return Err(cancelled_request());
+                }
+                let input = decode::<RunInput>(arguments)?;
+                input.validate()?;
+                mutation::run(
+                    self.executable.clone(),
+                    input,
+                    self.profile.clone(),
+                    context.ct.cancelled(),
+                )
+                .await
+            }
+            "steer" if self.enable_mutations => {
+                if context.ct.is_cancelled() {
+                    return Err(cancelled_request());
+                }
+                let input = decode::<SteerInput>(arguments)?;
+                input.validate()?;
+                mutation::steer(
+                    self.executable.clone(),
+                    input,
+                    self.profile.clone(),
+                    context.ct.cancelled(),
+                )
+                .await
+            }
+            "stop" if self.enable_mutations => {
+                if context.ct.is_cancelled() {
+                    return Err(cancelled_request());
+                }
+                let input = decode::<StopInput>(arguments)?;
+                input.validate()?;
+                mutation::stop(
+                    self.executable.clone(),
+                    input,
+                    self.profile.clone(),
+                    context.ct.cancelled(),
+                )
+                .await
+            }
+            "setup" if self.enable_mutations => {
+                if context.ct.is_cancelled() {
+                    return Err(cancelled_request());
+                }
+                let input = decode::<SetupInput>(arguments)?;
+                input.validate()?;
+                mutation::setup(
+                    self.executable.clone(),
+                    input,
+                    self.profile.clone(),
+                    context.ct.cancelled(),
+                )
+                .await
+            }
+            "repair" if self.enable_mutations => {
+                if context.ct.is_cancelled() {
+                    return Err(cancelled_request());
+                }
+                let input = decode::<RepairInput>(arguments)?;
+                input.validate()?;
+                mutation::repair(
+                    self.executable.clone(),
+                    input,
+                    self.profile.clone(),
+                    context.ct.cancelled(),
+                )
+                .await
+            }
+            "host_update" if self.enable_mutations => {
+                if context.ct.is_cancelled() {
+                    return Err(cancelled_request());
+                }
+                let input = decode::<HostUpdateInput>(arguments)?;
+                input.validate()?;
+                mutation::host_update(
+                    self.executable.clone(),
+                    input,
+                    self.profile.clone(),
+                    context.ct.cancelled(),
+                )
+                .await
+            }
+            "host_lifecycle" if self.enable_mutations => {
+                if context.ct.is_cancelled() {
+                    return Err(cancelled_request());
+                }
+                let input = decode::<HostLifecycleInput>(arguments)?;
+                input.validate()?;
+                mutation::host_lifecycle(
+                    self.executable.clone(),
+                    input,
+                    self.profile.clone(),
+                    context.ct.cancelled(),
+                )
+                .await
             }
             _ => Err(invalid_params("unknown Satelle MCP tool")),
         }

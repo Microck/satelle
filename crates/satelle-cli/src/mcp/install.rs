@@ -54,6 +54,7 @@ pub(crate) struct InstallRequest {
     pub satelle_path: Option<PathBuf>,
     pub profile: Option<String>,
     pub dry_run: bool,
+    pub enable_mutations: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,7 +217,7 @@ fn install_with_environment(
 ) -> Result<InstallReport, String> {
     validate_server_name(&request.server_name)?;
     let targets = selected_targets(&request)?;
-    let satelle_args = mcp_serve_args(request.profile.as_deref());
+    let satelle_args = mcp_serve_args(request.profile.as_deref(), request.enable_mutations);
     let satelle_path = match request.satelle_path {
         Some(path) if is_absolute_for_platform(&path, environment.platform) => path,
         Some(path) => env::current_dir()
@@ -784,14 +785,17 @@ fn update_json_config(
         .map_err(|error| format!("failed to serialize {}: {error}", path.display()))
 }
 
-fn mcp_serve_args(profile: Option<&str>) -> Vec<String> {
-    let mut args = Vec::with_capacity(if profile.is_some() { 4 } else { 2 });
+fn mcp_serve_args(profile: Option<&str>, enable_mutations: bool) -> Vec<String> {
+    let mut args = Vec::with_capacity(if profile.is_some() { 5 } else { 3 });
     if let Some(profile) = profile {
         args.push("--profile".to_string());
         args.push(profile.to_string());
     }
     args.push("mcp".to_string());
     args.push("serve".to_string());
+    if enable_mutations {
+        args.push("--enable-mutations".to_string());
+    }
     args
 }
 
@@ -1956,6 +1960,7 @@ mod tests {
             satelle_path: Some(PathBuf::from("/opt/satelle/bin/satelle")),
             profile: None,
             dry_run,
+            enable_mutations: false,
         }
     }
 
@@ -2262,6 +2267,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn mutation_enablement_is_an_explicit_installed_server_argument() {
+        assert_eq!(
+            mcp_serve_args(Some("work"), true),
+            ["--profile", "work", "mcp", "serve", "--enable-mutations"]
+        );
+        assert_eq!(mcp_serve_args(None, false), ["mcp", "serve"]);
     }
 
     #[test]
@@ -2677,7 +2691,7 @@ args = ["one"]
             cursor.clone(),
             "satelle",
             "/opt/satelle/bin/satelle",
-            &mcp_serve_args(None),
+            &mcp_serve_args(None, false),
         )
         .unwrap();
 

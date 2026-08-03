@@ -41,6 +41,8 @@ Use `satelle setup --dry-run`, `satelle repair --dry-run`, or `satelle host upda
 
 Completion criterion: the recovery plan identifies what will mutate, what state is preserved, and how to verify afterward.
 
+For MCP failures, first confirm whether the server was intentionally started with `satelle mcp serve --enable-mutations`. A missing mutation tool means mutation access was not enabled. It is not a reason to bypass the CLI consent or Trusted Profile rules.
+
 6. Escalate with a support bundle only after normal diagnostics are insufficient.
 
 Prefer redacted diagnostic bundles when the current binary exposes them. Avoid raw exports, screenshots, recordings, full transcripts, and provider payloads unless the user explicitly requests them.

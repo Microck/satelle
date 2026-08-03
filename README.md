@@ -73,6 +73,7 @@ The single `satelle` executable currently provides:
 - Host start, status, desktop-session inspection, and live `doctor` probes.
 - Configuration check/explain, resolved paths, shell completions, and MCP stdio
   serving and client configuration installation.
+- A release-matched Agent Skill Bundle discoverable through `satelle skills`.
 - Human output, stable JSON results, and command-specific lifecycle events.
 
 The following surfaces are not implemented and must not be treated as
@@ -83,7 +84,6 @@ available:
 - Direct transport setup or automatic direct-token provisioning.
 - Persistent Host service installation and Host stop/restart lifecycle control.
 - Repair, storage migration, or support bundle export.
-- The Satelle Agent Skill Bundle and `satelle skills` commands.
 - Native Linux Computer Use Host execution.
 
 Source builds are the only documented installation path until release

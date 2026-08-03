@@ -141,6 +141,16 @@ fn mcp_command_for(home: &Path, test_adapter: bool) -> Command {
     command
 }
 
+fn mutation_mcp_command_for(home: &Path) -> Command {
+    let mut command = satelle_command(home, true);
+    command
+        .args(["mcp", "serve", "--enable-mutations"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
 fn run_mcp(messages: &[Value]) -> Output {
     let (mut command, _home) = mcp_command();
     run_mcp_command(&mut command, messages)
@@ -570,6 +580,149 @@ fn initialize_and_tool_contracts_are_sdk_compatible() {
         response(&responses, 13)["result"]["structuredContent"]["bootstrap_actions"],
         json!([])
     );
+}
+
+#[test]
+fn mutating_tools_require_explicit_server_enablement_and_use_cli_policy() {
+    let home = TestStateDir::new().expect("production-safe temporary Satelle home");
+    let mut command = mutation_mcp_command_for(home.path());
+    let output = run_mcp_command(
+        &mut command,
+        &[
+            initialize(1),
+            initialized(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            tool_call(
+                3,
+                "stop",
+                json!({"session_id": SESSION_ID, "host": "local-demo"}),
+            ),
+            tool_call(
+                4,
+                "host_lifecycle",
+                json!({"action": "stop", "host": "local-demo"}),
+            ),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = responses(&output);
+    let tools = response(&responses, 2)["result"]["tools"]
+        .as_array()
+        .expect("tools/list tools array");
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name"))
+            .collect::<Vec<_>>(),
+        [
+            "config_check",
+            "config_explain",
+            "paths",
+            "status",
+            "logs",
+            "doctor",
+            "host_status",
+            "host_sessions",
+            "run",
+            "steer",
+            "stop",
+            "setup",
+            "repair",
+            "host_update",
+            "host_lifecycle",
+        ]
+    );
+    for tool in &tools[8..] {
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+        assert_eq!(tool["annotations"]["destructiveHint"], true);
+        assert_eq!(tool["annotations"]["openWorldHint"], true);
+    }
+    let host_update = tools
+        .iter()
+        .find(|tool| tool["name"] == "host_update")
+        .expect("host_update tool");
+    let host_update_properties = host_update["inputSchema"]["properties"]
+        .as_object()
+        .expect("host_update properties");
+    assert!(host_update_properties.contains_key("host"));
+    assert!(!host_update_properties.contains_key("hosts"));
+    assert!(!host_update_properties.contains_key("all_remotes"));
+
+    let missing = &response(&responses, 3)["result"];
+    assert_eq!(missing["isError"], true);
+    assert_eq!(
+        missing["structuredContent"]["schema_version"],
+        "satelle.error.v1"
+    );
+    assert_eq!(missing["structuredContent"]["code"], "session-not-found");
+    assert_eq!(
+        missing["content"][0]["text"],
+        missing["structuredContent"].to_string()
+    );
+
+    let consent = &response(&responses, 4)["result"];
+    assert_eq!(consent["isError"], true);
+    assert_eq!(
+        consent["structuredContent"]["code"],
+        "setup-consent-required"
+    );
+    assert_eq!(consent["structuredContent"]["details"]["mutated"], false);
+}
+
+#[test]
+fn mutation_tools_reject_inputs_outside_their_advertised_schemas() {
+    let home = TestStateDir::new().expect("production-safe temporary Satelle home");
+    let mut command = mutation_mcp_command_for(home.path());
+    let invalid_calls = [
+        (10, "run", json!({"prompt": ""})),
+        (11, "run", json!({"prompt": "go", "host": ""})),
+        (12, "run", json!({"prompt": "go", "model": ""})),
+        (13, "run", json!({"prompt": "go", "provider": ""})),
+        (14, "run", json!({"prompt": "go", "timeout": ""})),
+        (
+            15,
+            "run",
+            json!({"prompt": "go", "images": ["one", "two", "three"]}),
+        ),
+        (16, "run", json!({"prompt": "go", "images": [""]})),
+        (
+            17,
+            "steer",
+            json!({"session_id": "not-a-session", "prompt": "go"}),
+        ),
+        (18, "stop", json!({"session_id": "not-a-session"})),
+        (19, "setup", json!({"components": [""]})),
+        (20, "setup", json!({"expected_host_id": ""})),
+        (21, "repair", json!({"run": ""})),
+        (22, "host_update", json!({"components": [""]})),
+        (23, "host_lifecycle", json!({"action": "stop", "host": ""})),
+    ];
+    let mut messages = vec![initialize(1), initialized()];
+    messages.extend(
+        invalid_calls
+            .iter()
+            .map(|(id, tool, arguments)| tool_call(*id, tool, arguments.clone())),
+    );
+
+    let output = run_mcp_command(&mut command, &messages);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = responses(&output);
+    for (id, tool, _) in invalid_calls {
+        assert_eq!(
+            response(&responses, id)["error"]["code"],
+            -32602,
+            "{tool} must reject schema-invalid input at the MCP boundary"
+        );
+    }
 }
 
 #[test]
