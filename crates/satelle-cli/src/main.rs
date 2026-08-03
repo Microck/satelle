@@ -9,6 +9,8 @@ mod error_output;
 mod host_trust;
 #[path = "host-update.rs"]
 mod host_update;
+#[path = "host-update-batch.rs"]
+mod host_update_batch;
 mod logs;
 mod mcp;
 mod output;
@@ -72,7 +74,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitCode};
+use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -915,6 +917,8 @@ struct OfflineStorageRestorePreviewCommand {
 #[derive(Subcommand, Debug)]
 enum SelfSubcommand {
     Update(SelfUpdateCommand),
+    #[command(hide = true)]
+    UpdateRemotes(SelfUpdateRemoteStageCommand),
 }
 
 #[derive(Args, Debug)]
@@ -929,12 +933,41 @@ struct SelfUpdateCommand {
     host: Vec<String>,
     #[arg(long)]
     all_remotes: bool,
+    #[arg(long)]
+    component: Vec<String>,
     #[arg(long, default_value_t = 4)]
     concurrency: u8,
     #[arg(long)]
     no_input: bool,
     #[arg(long)]
     yes: bool,
+    #[arg(
+        long,
+        help = "Suppress non-error human remote-update output; use --json for stable automation data"
+    )]
+    quiet: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Args, Debug)]
+struct SelfUpdateRemoteStageCommand {
+    #[arg(long, required = true)]
+    host: Vec<String>,
+    #[arg(long)]
+    host_version: String,
+    #[arg(long)]
+    component: Vec<String>,
+    #[arg(long, default_value_t = 4)]
+    concurrency: u8,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    no_input: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    quiet: bool,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -9593,8 +9626,8 @@ fn run_host_update_invocation(
 ) -> Result<(), CliFailure> {
     validate_host_update_components(&command.component).map_err(failure)?;
     if command.all_remotes || command.host.len() > 1 {
-        return Err(failure(SatelleError::not_implemented(
-            "multi-Host update planning belongs to the packet 26 update train",
+        return Err(failure(SatelleError::invalid_usage(
+            "satelle host update accepts one Host; use satelle self update --update-remotes for multi-Host updates",
         )));
     }
     let host = config.resolve_host(command.host.first().map(String::as_str))?;
@@ -9603,17 +9636,7 @@ fn run_host_update_invocation(
         &host.alias,
         MutationCommandFamily::HostUpdate,
     );
-    let includes_all = command.component.iter().any(|component| component == "all");
-    let components = command
-        .component
-        .iter()
-        .filter_map(|component| match component.as_str() {
-            "host" => Some(satelle_core::host_update::HostUpdateComponent::Host),
-            "codex" => Some(satelle_core::host_update::HostUpdateComponent::Codex),
-            "all" => None,
-            _ => unreachable!("validated update component"),
-        })
-        .collect::<Vec<_>>();
+    let (components, includes_all) = selected_host_update_components(&command.component);
     let mut report =
         transport::plan_host_update(&host, &command.host_version, &components, includes_all)
             .map_err(failure)?;
@@ -9695,6 +9718,412 @@ fn run_host_update_invocation(
     }
 }
 
+#[derive(Clone)]
+struct PlannedRemoteHostUpdate {
+    host: SelectedHost,
+    plan: Result<satelle_core::host_update::HostUpdateReport, SatelleError>,
+}
+
+fn selected_host_update_components(
+    raw_components: &[String],
+) -> (Vec<satelle_core::host_update::HostUpdateComponent>, bool) {
+    let includes_all = raw_components.iter().any(|component| component == "all");
+    let components = raw_components
+        .iter()
+        .filter_map(|component| match component.as_str() {
+            "host" => Some(satelle_core::host_update::HostUpdateComponent::Host),
+            "codex" => Some(satelle_core::host_update::HostUpdateComponent::Codex),
+            "all" => None,
+            _ => unreachable!("validated update component"),
+        })
+        .collect();
+    (components, includes_all)
+}
+
+fn resolve_remote_update_hosts(
+    config: &ConfigContext<'_>,
+    explicit_hosts: &[String],
+) -> Result<Vec<SelectedHost>, CliFailure> {
+    let resolved = config.load()?;
+    let mut seen = BTreeSet::new();
+    let aliases = explicit_hosts
+        .iter()
+        .filter(|alias| seen.insert((*alias).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut hosts = Vec::with_capacity(aliases.len());
+    for alias in aliases {
+        let host = resolved
+            .resolve_host_with_project_source(Some(&alias))
+            .map(SelectedHost::from)
+            .map_err(failure)?;
+        if host.config.transport == TransportKind::Local {
+            return Err(failure(SatelleError::invalid_usage(format!(
+                "--update-remotes accepts configured remote Host aliases only; '{alias}' is local"
+            ))));
+        }
+        hosts.push(host);
+    }
+    if hosts.is_empty() {
+        return Err(failure(SatelleError::no_remote_host_selected(
+            resolved
+                .config
+                .hosts
+                .values()
+                .filter(|host| host.transport != TransportKind::Local)
+                .count(),
+        )));
+    }
+    Ok(hosts)
+}
+
+fn plan_remote_host_updates(
+    hosts: &[SelectedHost],
+    host_version: &str,
+    components: &[satelle_core::host_update::HostUpdateComponent],
+    raw_components: &[String],
+    includes_all: bool,
+    concurrency: usize,
+) -> Vec<PlannedRemoteHostUpdate> {
+    host_update_batch::bounded_map(hosts, concurrency, |host| {
+        transport::plan_host_update(&host, host_version, components, includes_all)
+    })
+    .into_iter()
+    .map(|(host, worker_result)| {
+        let plan = worker_result.unwrap_or_else(|_| {
+            Err(remote_update_worker_failure(
+                &host.alias,
+                "plan",
+                raw_components,
+            ))
+        });
+        PlannedRemoteHostUpdate { host, plan }
+    })
+    .collect()
+}
+
+fn remote_host_dry_run_report(
+    plans: Vec<PlannedRemoteHostUpdate>,
+    profile: Option<&str>,
+    raw_components: &[String],
+) -> host_update_batch::RemoteHostUpdateBatchReport {
+    host_update_batch::RemoteHostUpdateBatchReport::new(
+        plans
+            .into_iter()
+            .map(|planned| match planned.plan {
+                Ok(report) => host_update_batch::RemoteHostUpdateOutcome::completed(
+                    report.into_dry_run(),
+                    profile,
+                    raw_components,
+                ),
+                Err(error) => host_update_batch::RemoteHostUpdateOutcome::planning_failed(
+                    planned.host.alias,
+                    error,
+                    profile,
+                    raw_components,
+                ),
+            })
+            .collect(),
+    )
+}
+
+fn apply_remote_host_update_plans(
+    plans: Vec<PlannedRemoteHostUpdate>,
+    host_version: &str,
+    components: &[satelle_core::host_update::HostUpdateComponent],
+    raw_components: &[String],
+    includes_all: bool,
+    concurrency: usize,
+    profile: Option<&str>,
+) -> host_update_batch::RemoteHostUpdateBatchReport {
+    let mut outcomes = vec![None; plans.len()];
+    let mut applicable = Vec::new();
+    for (index, planned) in plans.into_iter().enumerate() {
+        match planned.plan {
+            Ok(report) if report.confirmation_required => {
+                applicable.push((index, planned.host, report));
+            }
+            Ok(report) => {
+                outcomes[index] = Some(host_update_batch::RemoteHostUpdateOutcome::completed(
+                    report,
+                    profile,
+                    raw_components,
+                ));
+            }
+            Err(error) => {
+                outcomes[index] =
+                    Some(host_update_batch::RemoteHostUpdateOutcome::planning_failed(
+                        planned.host.alias,
+                        error,
+                        profile,
+                        raw_components,
+                    ));
+            }
+        }
+    }
+
+    for ((index, host, _), worker_result) in
+        host_update_batch::bounded_map(&applicable, concurrency, |(_index, host, report)| {
+            match transport::apply_host_update(
+                &host,
+                host_version,
+                report,
+                components,
+                includes_all,
+            ) {
+                Ok(report) => host_update_batch::RemoteHostUpdateOutcome::completed(
+                    report,
+                    profile,
+                    raw_components,
+                ),
+                Err(error) => host_update_batch::RemoteHostUpdateOutcome::failed(
+                    host.alias,
+                    error,
+                    profile,
+                    raw_components,
+                ),
+            }
+        })
+    {
+        let outcome = worker_result.unwrap_or_else(|_| {
+            host_update_batch::RemoteHostUpdateOutcome::failed(
+                host.alias.clone(),
+                remote_update_worker_failure(&host.alias, "apply", raw_components),
+                profile,
+                raw_components,
+            )
+        });
+        outcomes[index] = Some(outcome);
+    }
+
+    host_update_batch::RemoteHostUpdateBatchReport::new(
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every selected remote Host has one terminal outcome"))
+            .collect(),
+    )
+}
+
+fn skipped_remote_host_update_report(
+    plans: Vec<PlannedRemoteHostUpdate>,
+    profile: Option<&str>,
+    raw_components: &[String],
+) -> host_update_batch::RemoteHostUpdateBatchReport {
+    host_update_batch::RemoteHostUpdateBatchReport::new(
+        plans
+            .into_iter()
+            .map(|planned| match planned.plan {
+                Ok(report) => declined_remote_host_update_outcome(report, profile, raw_components),
+                Err(error) => host_update_batch::RemoteHostUpdateOutcome::planning_failed(
+                    planned.host.alias,
+                    error,
+                    profile,
+                    raw_components,
+                ),
+            })
+            .collect(),
+    )
+}
+
+fn declined_remote_host_update_outcome(
+    report: satelle_core::host_update::HostUpdateReport,
+    profile: Option<&str>,
+    raw_components: &[String],
+) -> host_update_batch::RemoteHostUpdateOutcome {
+    if report.confirmation_required {
+        host_update_batch::RemoteHostUpdateOutcome::skipped(report)
+    } else {
+        host_update_batch::RemoteHostUpdateOutcome::completed(report, profile, raw_components)
+    }
+}
+
+fn remote_update_worker_failure(host: &str, phase: &str, components: &[String]) -> SatelleError {
+    let mut recovery_command = format!("satelle host update --host {}", shell_argument(host));
+    for component in components {
+        recovery_command.push_str(&format!(" --component {}", shell_argument(component)));
+    }
+    recovery_command.push_str(" --no-input --yes");
+    SatelleError {
+        code: ErrorCode::RemoteExecution,
+        message: format!("the {phase} worker failed while updating Host '{host}'"),
+        recovery_command: Some(recovery_command),
+        source_detail: None,
+        details: BTreeMap::from([(
+            "preserved_state".to_string(),
+            json!("Remote state could not be confirmed after the worker failure."),
+        )]),
+    }
+}
+
+fn print_remote_host_batch_human(
+    report: &host_update_batch::RemoteHostUpdateBatchReport,
+    failures_only: bool,
+) {
+    for (label, status) in [
+        (
+            "Succeeded",
+            host_update_batch::RemoteHostOutcomeStatus::Succeeded,
+        ),
+        (
+            "Unchanged",
+            host_update_batch::RemoteHostOutcomeStatus::Unchanged,
+        ),
+        (
+            "Skipped",
+            host_update_batch::RemoteHostOutcomeStatus::Skipped,
+        ),
+        ("Failed", host_update_batch::RemoteHostOutcomeStatus::Failed),
+    ] {
+        if !remote_host_outcome_visible(status, failures_only) {
+            continue;
+        }
+        let outcomes = report
+            .remote_hosts
+            .iter()
+            .filter(|outcome| outcome.status == status)
+            .collect::<Vec<_>>();
+        if outcomes.is_empty() {
+            continue;
+        }
+        println!("{label}:");
+        for outcome in outcomes {
+            println!("  - {}", outcome.host);
+            if let Some(state) = &outcome.preserved_state {
+                println!("    Remote state: {state}");
+            }
+            if let Some(message) = &outcome.error_message {
+                println!("    Error: {message}");
+            }
+            if let Some(command) = &outcome.recovery_command {
+                println!("    Recovery: {command}");
+            }
+        }
+    }
+}
+
+const fn remote_host_outcome_visible(
+    status: host_update_batch::RemoteHostOutcomeStatus,
+    failures_only: bool,
+) -> bool {
+    !failures_only || matches!(status, host_update_batch::RemoteHostOutcomeStatus::Failed)
+}
+
+fn quiet_self_update_remote_summary(
+    local_changed: bool,
+    changed_remote_hosts: usize,
+) -> Option<String> {
+    match (local_changed, changed_remote_hosts) {
+        (false, 0) => None,
+        (true, 0) => {
+            Some("Updated Satelle; configured remote Hosts were unchanged or skipped.".to_string())
+        }
+        (false, count) => Some(format!(
+            "Updated {count} configured remote Host(s); Satelle was already current."
+        )),
+        (true, count) => Some(format!(
+            "Updated Satelle and {count} configured remote Host(s)."
+        )),
+    }
+}
+
+fn execute_remote_host_update_batch(
+    command: HostUpdateInvocation,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+    concurrency: usize,
+    reserve_stdout_for_json: bool,
+) -> Result<host_update_batch::RemoteHostUpdateBatchReport, CliFailure> {
+    let profile = config.flag_profile;
+    let hosts = resolve_remote_update_hosts(&config, &command.host)?;
+    let (components, includes_all) = selected_host_update_components(&command.component);
+    let plans = plan_remote_host_updates(
+        &hosts,
+        &command.host_version,
+        &components,
+        &command.component,
+        includes_all,
+        concurrency,
+    );
+    if (!format.is_json() || reserve_stdout_for_json) && !command.quiet {
+        for planned in &plans {
+            if let Ok(report) = &planned.plan {
+                if reserve_stdout_for_json {
+                    eprint!("{}", host_update::render_host_update_plan(report));
+                } else {
+                    print!("{}", host_update::render_host_update_plan(report));
+                }
+            }
+        }
+    }
+    if command.dry_run {
+        return Ok(remote_host_dry_run_report(
+            plans,
+            profile,
+            &command.component,
+        ));
+    }
+    let planned_actions = plans
+        .iter()
+        .filter_map(|planned| planned.plan.as_ref().ok())
+        .flat_map(|report| report.planned_actions.iter().cloned())
+        .collect::<Vec<_>>();
+    let confirmation_required = plans.iter().any(|planned| {
+        planned
+            .plan
+            .as_ref()
+            .is_ok_and(|report| report.confirmation_required)
+    });
+    let resolved = config.load()?;
+    let trusted_consent = hosts.iter().all(|host| {
+        trusted_profile_allows_mutation(
+            resolved,
+            &host.alias,
+            MutationCommandFamily::SelfUpdateRemotes,
+        )
+    });
+    let consent_granted = host_update_consent_granted(command.yes, trusted_consent);
+    if confirmation_required && !consent_granted {
+        let noninteractive = command.no_input
+            || (format.is_json() && !reserve_stdout_for_json)
+            || !io::stdin().is_terminal();
+        if noninteractive {
+            return Err(failure(SatelleError::setup_consent_required(
+                &planned_actions,
+                "rerun the same multi-Host update with --no-input --yes",
+            )));
+        }
+        let confirmed = cliclack::confirm(format!(
+            "Apply the Host update to {} configured remote Hosts?",
+            hosts.len()
+        ))
+        .initial_value(false)
+        .interact()
+        .map_err(|source| {
+            failure(setup_interaction_error(
+                "could not read multi-Host update confirmation",
+                source,
+            ))
+        })?;
+        if !confirmed {
+            return Ok(skipped_remote_host_update_report(
+                plans,
+                profile,
+                &command.component,
+            ));
+        }
+    }
+
+    Ok(apply_remote_host_update_plans(
+        plans,
+        &command.host_version,
+        &components,
+        &command.component,
+        includes_all,
+        concurrency,
+        profile,
+    ))
+}
+
 const fn host_update_consent_granted(command_yes: bool, trusted_profile: bool) -> bool {
     command_yes || trusted_profile
 }
@@ -9740,6 +10169,65 @@ mod host_update_consent_tests {
     }
 
     #[test]
+    fn quiet_self_update_summary_describes_which_side_changed() {
+        assert_eq!(quiet_self_update_remote_summary(false, 0), None);
+        assert_eq!(
+            quiet_self_update_remote_summary(true, 0).as_deref(),
+            Some("Updated Satelle; configured remote Hosts were unchanged or skipped.")
+        );
+        assert_eq!(
+            quiet_self_update_remote_summary(false, 2).as_deref(),
+            Some("Updated 2 configured remote Host(s); Satelle was already current.")
+        );
+        assert_eq!(
+            quiet_self_update_remote_summary(true, 2).as_deref(),
+            Some("Updated Satelle and 2 configured remote Host(s).")
+        );
+    }
+
+    #[test]
+    fn declined_consent_skips_only_hosts_that_required_mutation() {
+        let unchanged = declined_remote_host_update_outcome(
+            satelle_core::host_update::HostUpdateReport::new("current", Vec::new(), Vec::new()),
+            None,
+            &[],
+        );
+        let mut changed_report =
+            satelle_core::host_update::HostUpdateReport::new("outdated", Vec::new(), Vec::new());
+        changed_report.confirmation_required = true;
+        let changed = declined_remote_host_update_outcome(changed_report, None, &[]);
+
+        assert_eq!(
+            unchanged.status,
+            host_update_batch::RemoteHostOutcomeStatus::Unchanged
+        );
+        assert_eq!(
+            changed.status,
+            host_update_batch::RemoteHostOutcomeStatus::Skipped
+        );
+    }
+
+    #[test]
+    fn quiet_partial_failures_render_only_failed_hosts() {
+        assert!(!remote_host_outcome_visible(
+            host_update_batch::RemoteHostOutcomeStatus::Succeeded,
+            true,
+        ));
+        assert!(!remote_host_outcome_visible(
+            host_update_batch::RemoteHostOutcomeStatus::Unchanged,
+            true,
+        ));
+        assert!(!remote_host_outcome_visible(
+            host_update_batch::RemoteHostOutcomeStatus::Skipped,
+            true,
+        ));
+        assert!(remote_host_outcome_visible(
+            host_update_batch::RemoteHostOutcomeStatus::Failed,
+            true,
+        ));
+    }
+
+    #[test]
     fn recovery_command_preserves_the_exact_component_selection() {
         assert_eq!(
             host_update_consent_command("office", &["host".to_string(), "codex".to_string()]),
@@ -9756,47 +10244,189 @@ mod host_update_consent_tests {
     }
 
     #[test]
+    fn worker_failure_recovery_preserves_the_exact_component_selection() {
+        let failure = remote_update_worker_failure("remote host", "apply", &["codex".to_string()]);
+
+        assert_eq!(
+            failure.recovery_command.as_deref(),
+            Some("satelle host update --host 'remote host' --component codex --no-input --yes")
+        );
+    }
+
+    #[test]
     fn self_update_remote_handoff_preserves_global_presentation_options() {
         assert_eq!(
-            self_update_remote_handoff_arguments(
-                Some("work"),
-                "office",
-                true,
-                ErrorFormat::Json,
-                true,
-                true,
-            ),
+            SelfUpdateRemoteHandoff {
+                profile: Some("work"),
+                hosts: &["office".to_string(), "lab".to_string()],
+                host_version: "1.2.3",
+                components: &["host".to_string()],
+                concurrency: 2,
+                no_color: true,
+                error_format: ErrorFormat::Json,
+                dry_run: false,
+                no_input: true,
+                yes: true,
+                quiet: true,
+                local_update_state: SelfUpdateLocalState::Updated,
+            }
+            .arguments(),
             [
                 "--no-color",
                 "--profile",
                 "work",
                 "--error-format",
                 "json",
-                "host",
-                "update",
+                "self",
+                "update-remotes",
+                "--host-version",
+                "1.2.3",
+                "--concurrency",
+                "2",
+                "--json",
                 "--host",
                 "office",
+                "--host",
+                "lab",
+                "--component",
+                "host",
                 "--no-input",
                 "--yes",
+                "--quiet",
             ]
         );
         assert_eq!(
-            self_update_remote_handoff_arguments(
-                None,
-                "office",
-                false,
-                ErrorFormat::Human,
-                false,
-                false,
-            ),
+            SelfUpdateRemoteHandoff {
+                profile: None,
+                hosts: &["office".to_string()],
+                host_version: "1.2.3",
+                components: &[],
+                concurrency: 1,
+                no_color: false,
+                error_format: ErrorFormat::Human,
+                dry_run: true,
+                no_input: false,
+                yes: false,
+                quiet: false,
+                local_update_state: SelfUpdateLocalState::DryRun,
+            }
+            .arguments(),
             [
                 "--error-format",
                 "human",
-                "host",
-                "update",
+                "self",
+                "update-remotes",
+                "--host-version",
+                "1.2.3",
+                "--concurrency",
+                "1",
+                "--json",
                 "--host",
                 "office",
+                "--dry-run",
             ]
+        );
+    }
+
+    #[test]
+    fn self_update_remote_handoff_failure_preserves_local_success_and_remote_recovery() {
+        let error = self_update_remote_handoff_error(
+            ErrorCode::RemoteExecution,
+            "complete the configured remote Host update",
+            &["office".to_string(), "remote host".to_string()],
+            "satelle self update --update-remotes --host office".to_string(),
+            SelfUpdateLocalState::Updated,
+            None,
+        );
+
+        assert!(error.message.contains("Updated the local Satelle CLI"));
+        assert!(error.message.contains("office, 'remote host'"));
+        assert!(
+            error
+                .message
+                .contains("Remote state could not be confirmed")
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some("satelle self update --update-remotes --host office")
+        );
+        assert_eq!(error.details["hosts"], json!(["office", "remote host"]));
+        assert_eq!(error.details["local_update"], "succeeded");
+    }
+
+    #[test]
+    fn self_update_remote_dry_run_failure_preserves_no_change_state() {
+        let recovery = self_update_remote_recovery_command(
+            None,
+            &["office".to_string()],
+            "1.2.3",
+            &["host".to_string()],
+            4,
+            true,
+        );
+        let error = self_update_remote_handoff_error(
+            ErrorCode::RemoteExecution,
+            "complete the configured remote Host update preview",
+            &["office".to_string()],
+            recovery.clone(),
+            SelfUpdateLocalState::DryRun,
+            None,
+        );
+
+        assert!(error.message.contains("No local update was applied"));
+        assert_eq!(error.details["local_update"], "not_applied");
+        assert!(recovery.contains("--dry-run"));
+        assert!(!recovery.contains("--yes"));
+    }
+
+    #[test]
+    fn self_update_remote_json_requires_noninteractive_consent() {
+        assert!(self_update_remote_consent_error_required(
+            false, false, true, true, false
+        ));
+        assert!(!self_update_remote_consent_error_required(
+            true, false, true, true, false
+        ));
+        assert!(!self_update_remote_consent_error_required(
+            false, false, true, true, true
+        ));
+    }
+
+    #[test]
+    fn self_update_remote_recovery_preserves_the_selected_profile() {
+        assert_eq!(
+            self_update_remote_recovery_command(
+                Some("team profile"),
+                &["office".to_string()],
+                "1.2.3",
+                &["host".to_string()],
+                2,
+                false,
+            ),
+            "satelle --profile 'team profile' self update --update-remotes --version 1.2.3 --host office --component host --concurrency 2 --no-input --yes"
+        );
+    }
+
+    #[test]
+    fn self_update_remote_handoff_failure_preserves_unchanged_local_state() {
+        let error = self_update_remote_handoff_error(
+            ErrorCode::RemoteExecution,
+            "complete the configured remote Host update",
+            &["office".to_string()],
+            "satelle self update --update-remotes --version 1.2.3 --host office".to_string(),
+            SelfUpdateLocalState::Unchanged,
+            None,
+        );
+
+        assert!(error.message.contains("already at the selected version"));
+        assert_eq!(error.details["local_update"], "unchanged");
+    }
+
+    #[test]
+    fn self_update_remote_handoff_timeout_scales_by_bounded_cohort() {
+        assert_eq!(
+            self_update_remote_handoff_timeout(8, 4),
+            Duration::from_secs(4_980)
         );
     }
 
@@ -9804,17 +10434,17 @@ mod host_update_consent_tests {
     fn trusted_profile_consent_authorizes_the_self_update_remote_family() {
         assert!(self_update_remote_consent_granted(
             false,
-            Some("office"),
+            &["office".to_string()],
             |host| host == "office"
         ));
         assert!(self_update_remote_consent_granted(
             true,
-            Some("office"),
+            &["office".to_string(), "lab".to_string()],
             |_| false
         ));
         assert!(!self_update_remote_consent_granted(
             false,
-            Some("lab"),
+            &["office".to_string(), "lab".to_string()],
             |host| host == "office"
         ));
     }
@@ -10782,22 +11412,22 @@ fn run_self(
                     return Err(failure(SatelleError::concurrency_without_remote_update()));
                 }
 
-                if command.all_remotes || !command.host.is_empty() {
+                if command.all_remotes
+                    || !command.host.is_empty()
+                    || !command.component.is_empty()
+                    || command.quiet
+                {
                     return Err(failure(SatelleError::invalid_usage(
-                        "--host and --all-remotes require --update-remotes",
+                        "--host, --all-remotes, --component, and --quiet require --update-remotes",
                     )));
                 }
             } else {
-                if command.all_remotes || !command.host.is_empty() || command.concurrency != 4 {
-                    return Err(failure(SatelleError::not_implemented(
-                        "explicit remote selectors and concurrency belong to the packet 26 update train",
+                if command.all_remotes && !command.host.is_empty() {
+                    return Err(failure(SatelleError::invalid_usage(
+                        "--host cannot be combined with --all-remotes",
                     )));
                 }
-                if command.dry_run || output.is_json() {
-                    return Err(failure(SatelleError::not_implemented(
-                        "configured-remote dry-run and JSON summaries belong to the packet 26 update train",
-                    )));
-                }
+                validate_host_update_components(&command.component).map_err(failure)?;
             }
 
             let remote_host_handoff_supported =
@@ -10805,7 +11435,7 @@ fn run_self(
                     .map_err(|error| failure(error.into_satelle_error()))?;
             if command.update_remotes && !remote_host_handoff_supported {
                 return Err(failure(SatelleError::invalid_usage(
-                    "prerelease self-updates cannot be combined with --update-remotes; update the local CLI without a Host handoff",
+                    "prerelease and downgrade self-updates cannot be combined with --update-remotes; update the local CLI without a Host handoff",
                 )));
             }
 
@@ -10832,17 +11462,38 @@ fn run_self(
                         .map(|(alias, _)| alias.clone()),
                 )
             });
-            let follow_up_host =
-                self_update::selected_remote_host(&remote_choices).map(str::to_owned);
-            if command.update_remotes && follow_up_host.is_none() {
-                return Err(failure(SatelleError::not_implemented(
-                    "--update-remotes could not resolve a current or configured default Host; explicit selectors belong to the packet 26 update train",
-                )));
+            let stdin_is_terminal = io::stdin().is_terminal();
+            let mut selected_remote_hosts = self_update::selected_remote_hosts(
+                &remote_choices,
+                &command.host,
+                command.all_remotes,
+            );
+            if command.update_remotes && selected_remote_hosts.is_empty() {
+                if !remote_choices.is_empty()
+                    && !command.no_input
+                    && stdin_is_terminal
+                    && !output.is_json()
+                {
+                    // Explicit interactive remote updates choose their targets
+                    // before the local binary changes. An empty answer means
+                    // the operator explicitly skipped every remote Host.
+                    selected_remote_hosts = prompt_remote_host_update(&remote_choices)?;
+                } else {
+                    return Err(failure(SatelleError::no_remote_host_selected(
+                        remote_choices.len(),
+                    )));
+                }
             }
-            let remote_consent_granted = self_update_remote_consent_granted(
-                command.yes,
-                follow_up_host.as_deref(),
-                |host| {
+            let follow_up_host = selected_remote_hosts.first().cloned();
+            if command.update_remotes && !selected_remote_hosts.is_empty() {
+                // Resolve every explicit alias before touching the local binary.
+                // The re-executed stage resolves them again against current
+                // config before planning or mutation. An empty interactive
+                // selection explicitly skips the remote stage.
+                resolve_remote_update_hosts(&config, &selected_remote_hosts)?;
+            }
+            let remote_consent_granted =
+                self_update_remote_consent_granted(command.yes, &selected_remote_hosts, |host| {
                     resolved_config.is_some_and(|resolved| {
                         trusted_profile_allows_mutation(
                             resolved,
@@ -10850,13 +11501,16 @@ fn run_self(
                             MutationCommandFamily::SelfUpdateRemotes,
                         )
                     })
-                },
-            );
+                });
 
-            let stdin_is_terminal = io::stdin().is_terminal();
             if command.update_remotes
-                && (command.no_input || !stdin_is_terminal)
-                && !remote_consent_granted
+                && self_update_remote_consent_error_required(
+                    command.dry_run,
+                    command.no_input,
+                    stdin_is_terminal,
+                    output.is_json(),
+                    remote_consent_granted,
+                )
             {
                 return Err(failure(SatelleError::setup_consent_required(
                     &["update the selected configured remote Host".to_string()],
@@ -10884,16 +11538,9 @@ fn run_self(
             .map_err(|error| failure(error.into_satelle_error()))?;
             let report =
                 self_update::run(request).map_err(|error| failure(error.into_satelle_error()))?;
-            if output.is_json() {
-                print_json(&report).map_err(failure)?;
-            } else {
-                for line in report.human_lines() {
-                    println!("{line}");
-                }
-            }
-
-            let selected_host = if command.update_remotes {
-                follow_up_host
+            let mut local_report_printed = false;
+            let selected_hosts = if command.update_remotes {
+                selected_remote_hosts
             } else if remote_host_handoff_supported
                 && report.should_offer_remote_update(
                     command.no_input,
@@ -10902,19 +11549,31 @@ fn run_self(
                     command.dry_run,
                 )
             {
+                for line in report.human_lines() {
+                    println!("{line}");
+                }
+                local_report_printed = true;
                 prompt_remote_host_update(&remote_choices)?
             } else {
-                None
+                Vec::new()
             };
 
-            let Some(host) = selected_host else {
+            if selected_hosts.is_empty() {
+                if !local_report_printed {
+                    if output.is_json() {
+                        print_json(&report).map_err(failure)?;
+                    } else {
+                        for line in report.human_lines() {
+                            println!("{line}");
+                        }
+                    }
+                }
                 return Ok(());
-            };
-            // Interactive selection may choose a Host other than the default.
-            // Recompute durable consent against that final Host so a Trusted
-            // Profile allowlist can never authorize a different handoff.
+            }
+
+            resolve_remote_update_hosts(&config, &selected_hosts)?;
             let remote_consent_granted =
-                self_update_remote_consent_granted(command.yes, Some(&host), |host| {
+                self_update_remote_consent_granted(command.yes, &selected_hosts, |host| {
                     resolved_config.is_some_and(|resolved| {
                         trusted_profile_allows_mutation(
                             resolved,
@@ -10923,147 +11582,418 @@ fn run_self(
                         )
                     })
                 });
-            run_self_update_remote_handoff(
-                report.installed_executable(),
-                config.flag_profile,
-                &host,
+            let components = if command.component.is_empty() {
+                vec!["host".to_string()]
+            } else {
+                command.component
+            };
+            let handoff = SelfUpdateRemoteHandoff {
+                profile: config.flag_profile,
+                hosts: &selected_hosts,
+                host_version: report.target_version(),
+                components: &components,
+                concurrency: command.concurrency,
                 no_color,
                 error_format,
-                command.no_input,
-                remote_consent_granted,
-            )
+                dry_run: command.dry_run,
+                no_input: command.no_input,
+                yes: remote_consent_granted,
+                quiet: command.quiet,
+                local_update_state: if command.dry_run {
+                    SelfUpdateLocalState::DryRun
+                } else if report.changed() {
+                    SelfUpdateLocalState::Updated
+                } else {
+                    SelfUpdateLocalState::Unchanged
+                },
+            };
+            let remote_report =
+                run_self_update_remote_handoff(report.installed_executable(), &handoff)?;
+            let combined = self_update::SelfUpdateRemoteReport::new(&report, &remote_report);
+            if output.is_json() {
+                print_json(&combined).map_err(failure)?;
+            } else if command.quiet && !remote_report.has_failures() {
+                if combined.changed()
+                    && let Some(summary) = quiet_self_update_remote_summary(
+                        report.changed(),
+                        remote_report.aggregate_counts.succeeded,
+                    )
+                {
+                    println!("{summary}");
+                }
+            } else {
+                if !local_report_printed {
+                    for line in report.human_lines() {
+                        println!("{line}");
+                    }
+                }
+                print_remote_host_batch_human(&remote_report, command.quiet);
+            }
+            if remote_report.has_failures() {
+                let error = if command.dry_run {
+                    SatelleError::remote_update_preview_failure(
+                        &remote_report.failed_hosts,
+                        &remote_report.recovery_commands,
+                    )
+                } else {
+                    SatelleError::remote_update_partial_failure(
+                        &remote_report.failed_hosts,
+                        &remote_report.recovery_commands,
+                        report.changed(),
+                    )
+                };
+                Err(failure(error))
+            } else {
+                Ok(())
+            }
+        }
+        SelfSubcommand::UpdateRemotes(command) => {
+            if command.concurrency == 0 || command.concurrency > 16 {
+                return Err(failure(SatelleError::concurrency_limit_exceeded(
+                    command.concurrency,
+                )));
+            }
+            validate_host_update_components(&command.component).map_err(failure)?;
+            let components = if command.component.is_empty() {
+                vec!["host".to_string()]
+            } else {
+                command.component
+            };
+            let report = execute_remote_host_update_batch(
+                HostUpdateInvocation {
+                    host: command.host,
+                    host_version: command.host_version,
+                    component: components,
+                    all_remotes: false,
+                    dry_run: command.dry_run,
+                    yes: command.yes,
+                    no_input: command.no_input,
+                    quiet: command.quiet,
+                },
+                config,
+                OutputFormat::Json,
+                usize::from(command.concurrency),
+                true,
+            )?;
+            // The parent process owns final rendering and error classification.
+            // This stage always returns the complete per-Host result as one JSON value.
+            print_json(&report).map_err(failure)
         }
     }
 }
 
 fn self_update_remote_consent_granted(
     command_yes: bool,
-    selected_host: Option<&str>,
-    trusted_profile_allows: impl FnOnce(&str) -> bool,
+    selected_hosts: &[String],
+    mut trusted_profile_allows: impl FnMut(&str) -> bool,
 ) -> bool {
-    command_yes || selected_host.is_some_and(trusted_profile_allows)
+    command_yes
+        || (!selected_hosts.is_empty()
+            && selected_hosts
+                .iter()
+                .all(|host| trusted_profile_allows(host)))
 }
 
-fn self_update_remote_handoff_arguments(
-    profile: Option<&str>,
-    host: &str,
+const fn self_update_remote_consent_error_required(
+    dry_run: bool,
+    no_input: bool,
+    stdin_is_terminal: bool,
+    json_output: bool,
+    consent_granted: bool,
+) -> bool {
+    !dry_run && (no_input || !stdin_is_terminal || json_output) && !consent_granted
+}
+
+struct SelfUpdateRemoteHandoff<'a> {
+    profile: Option<&'a str>,
+    hosts: &'a [String],
+    host_version: &'a str,
+    components: &'a [String],
+    concurrency: u8,
     no_color: bool,
     error_format: ErrorFormat,
+    dry_run: bool,
     no_input: bool,
     yes: bool,
-) -> Vec<String> {
-    let mut arguments = Vec::new();
-    if no_color {
-        arguments.push("--no-color".to_string());
-    }
-    if let Some(profile) = profile {
-        arguments.extend(["--profile".to_string(), profile.to_string()]);
-    }
-    arguments.extend([
-        "--error-format".to_string(),
-        match error_format {
-            ErrorFormat::Human => "human",
-            ErrorFormat::Json => "json",
+    quiet: bool,
+    local_update_state: SelfUpdateLocalState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelfUpdateLocalState {
+    Updated,
+    Unchanged,
+    DryRun,
+}
+
+impl SelfUpdateRemoteHandoff<'_> {
+    fn arguments(&self) -> Vec<String> {
+        let mut arguments = Vec::new();
+        if self.no_color {
+            arguments.push("--no-color".to_string());
         }
-        .to_string(),
-    ]);
-    arguments.extend([
-        "host".to_string(),
-        "update".to_string(),
-        "--host".to_string(),
-        host.to_string(),
-    ]);
-    if no_input {
-        arguments.push("--no-input".to_string());
+        if let Some(profile) = self.profile {
+            arguments.extend(["--profile".to_string(), profile.to_string()]);
+        }
+        arguments.extend([
+            "--error-format".to_string(),
+            match self.error_format {
+                ErrorFormat::Human => "human",
+                ErrorFormat::Json => "json",
+            }
+            .to_string(),
+        ]);
+        arguments.extend([
+            "self".to_string(),
+            "update-remotes".to_string(),
+            "--host-version".to_string(),
+            self.host_version.to_string(),
+            "--concurrency".to_string(),
+            self.concurrency.to_string(),
+            "--json".to_string(),
+        ]);
+        for host in self.hosts {
+            arguments.extend(["--host".to_string(), host.clone()]);
+        }
+        for component in self.components {
+            arguments.extend(["--component".to_string(), component.clone()]);
+        }
+        if self.dry_run {
+            arguments.push("--dry-run".to_string());
+        }
+        if self.no_input {
+            arguments.push("--no-input".to_string());
+        }
+        if self.yes {
+            arguments.push("--yes".to_string());
+        }
+        if self.quiet {
+            arguments.push("--quiet".to_string());
+        }
+        arguments
     }
-    if yes {
-        arguments.push("--yes".to_string());
-    }
-    arguments
 }
 
 fn run_self_update_remote_handoff(
     installed_executable: &Path,
-    profile: Option<&str>,
-    host: &str,
-    no_color: bool,
-    error_format: ErrorFormat,
-    no_input: bool,
-    yes: bool,
-) -> Result<(), CliFailure> {
+    handoff: &SelfUpdateRemoteHandoff<'_>,
+) -> Result<host_update_batch::RemoteHostUpdateBatchReport, CliFailure> {
+    let recovery_command = self_update_remote_recovery_command(
+        handoff.profile,
+        handoff.hosts,
+        handoff.host_version,
+        handoff.components,
+        handoff.concurrency,
+        handoff.dry_run,
+    );
     io::stdout().flush().map_err(|error| {
-        failure(SatelleError {
-            code: ErrorCode::SelfUpdateFailed,
-            message: "could not flush self-update output before remote handoff".to_string(),
-            recovery_command: Some(self_update::host_update_command(host)),
-            source_detail: Some(error.to_string()),
-            details: BTreeMap::from([("host".to_string(), json!(host))]),
-        })
-    })?;
-    let status = ProcessCommand::new(installed_executable)
-        .args(self_update_remote_handoff_arguments(
-            profile,
-            host,
-            no_color,
-            error_format,
-            no_input,
-            yes,
+        failure(self_update_remote_handoff_error(
+            ErrorCode::SelfUpdateFailed,
+            "flush output before starting the configured remote Host update",
+            handoff.hosts,
+            recovery_command.clone(),
+            handoff.local_update_state,
+            Some(error.to_string()),
         ))
-        .status()
+    })?;
+    let mut child = ProcessCommand::new(installed_executable)
+        .args(handoff.arguments())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
         .map_err(|error| {
-            failure(SatelleError {
-                code: ErrorCode::SelfUpdateFailed,
-                message: "could not start the updated Satelle executable".to_string(),
-                recovery_command: Some(self_update::host_update_command(host)),
-                source_detail: Some(error.to_string()),
-                details: BTreeMap::from([("host".to_string(), json!(host))]),
-            })
+            failure(self_update_remote_handoff_error(
+                ErrorCode::SelfUpdateFailed,
+                "start the updated Satelle executable for the configured remote Host update",
+                handoff.hosts,
+                recovery_command.clone(),
+                handoff.local_update_state,
+                Some(error.to_string()),
+            ))
+        })?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .expect("piped self-update handoff stdout must be present");
+    let output_reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).map(|_| output)
+    });
+    let status = self_update::wait_bounded(
+        &mut child,
+        self_update_remote_handoff_timeout(handoff.hosts.len(), handoff.concurrency),
+    )
+    .map_err(|error| {
+        failure(self_update_remote_handoff_error(
+            ErrorCode::SelfUpdateFailed,
+            "wait for the updated Satelle executable to finish the configured remote Host update",
+            handoff.hosts,
+            recovery_command.clone(),
+            handoff.local_update_state,
+            Some(error.to_string()),
+        ))
+    })?;
+    let output = output_reader
+        .join()
+        .expect("self-update handoff output reader must not panic")
+        .map_err(|error| {
+            failure(self_update_remote_handoff_error(
+                ErrorCode::SelfUpdateFailed,
+                "read the configured remote Host update result from the updated Satelle executable",
+                handoff.hosts,
+                recovery_command.clone(),
+                handoff.local_update_state,
+                Some(error.to_string()),
+            ))
         })?;
     if status.success() {
-        return Ok(());
+        return serde_json::from_str(&output).map_err(|error| {
+            failure(self_update_remote_handoff_error(
+                ErrorCode::SelfUpdateFailed,
+                "read a valid configured remote Host update summary from the updated Satelle executable",
+                handoff.hosts,
+                recovery_command.clone(),
+                handoff.local_update_state,
+                Some(error.to_string()),
+            ))
+        });
     }
 
-    // The re-executed binary already emitted its typed Host update failure.
-    // Preserve that single diagnostic while returning the remote execution class.
-    Err(reported_failure(SatelleError {
-        code: ErrorCode::RemoteExecution,
-        message: "the updated Satelle executable could not complete the remote Host update"
-            .to_string(),
-        recovery_command: Some(self_update::host_update_command(host)),
-        source_detail: None,
+    let mut error = self_update_remote_handoff_error(
+        ErrorCode::RemoteExecution,
+        "complete the configured remote Host update",
+        handoff.hosts,
+        recovery_command,
+        handoff.local_update_state,
+        None,
+    );
+    error
+        .details
+        .insert("child_exit_code".to_string(), json!(status.code()));
+    Err(failure(error))
+}
+
+fn self_update_remote_handoff_error(
+    code: ErrorCode,
+    action: &str,
+    hosts: &[String],
+    recovery_command: String,
+    local_update_state: SelfUpdateLocalState,
+    source_detail: Option<String>,
+) -> SatelleError {
+    let failed_hosts = hosts
+        .iter()
+        .map(|host| shell_argument(host))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (local_state, local_update) = match local_update_state {
+        SelfUpdateLocalState::Updated => ("Updated the local Satelle CLI", "succeeded"),
+        SelfUpdateLocalState::Unchanged => (
+            "The local Satelle CLI was already at the selected version",
+            "unchanged",
+        ),
+        SelfUpdateLocalState::DryRun => (
+            "No local update was applied during the dry-run",
+            "not_applied",
+        ),
+    };
+    SatelleError {
+        code,
+        message: format!(
+            "{local_state}, but could not {action} for: {failed_hosts}. Remote state could not be confirmed."
+        ),
+        recovery_command: Some(recovery_command),
+        source_detail,
         details: BTreeMap::from([
-            ("host".to_string(), json!(host)),
-            ("child_exit_code".to_string(), json!(status.code())),
+            ("hosts".to_string(), json!(hosts)),
+            ("local_update".to_string(), json!(local_update)),
+            (
+                "preserved_state".to_string(),
+                json!("Remote state could not be confirmed."),
+            ),
         ]),
-    }))
+    }
+}
+
+fn self_update_remote_handoff_timeout(host_count: usize, concurrency: u8) -> Duration {
+    // One slow Host can consume seven sequential five-minute release requests:
+    // the initial planning manifest, the revalidation manifest, the archive,
+    // the verification manifest, two tag-attestation API calls, and the
+    // attestation verifier. Each of the three release phases also performs a
+    // bounded verifier preflight. Keep a separate five-minute allowance for
+    // bounded SSH mutation, daemon relaunch, postchecks, child startup, and
+    // rendering. The parent must not kill the child after Maintenance has
+    // begun while any accepted request budget is still live.
+    const RELEASE_REQUESTS_PER_COHORT: u32 = 7;
+    const RELEASE_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+    const VERIFIER_PREFLIGHTS_PER_COHORT: u32 = 3;
+    const VERIFIER_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+    const REMOTE_MUTATION_AND_POSTCHECK_TIMEOUT: Duration = Duration::from_secs(300);
+    const PER_COHORT_TIMEOUT: Duration = RELEASE_REQUEST_TIMEOUT
+        .saturating_mul(RELEASE_REQUESTS_PER_COHORT)
+        .saturating_add(VERIFIER_PREFLIGHT_TIMEOUT.saturating_mul(VERIFIER_PREFLIGHTS_PER_COHORT))
+        .saturating_add(REMOTE_MUTATION_AND_POSTCHECK_TIMEOUT);
+    let cohort_count = host_count.div_ceil(usize::from(concurrency));
+    PER_COHORT_TIMEOUT.saturating_mul(cohort_count as u32)
+}
+
+fn self_update_remote_recovery_command(
+    profile: Option<&str>,
+    hosts: &[String],
+    host_version: &str,
+    components: &[String],
+    concurrency: u8,
+    dry_run: bool,
+) -> String {
+    let mut command = "satelle".to_string();
+    if let Some(profile) = profile {
+        command.push_str(&format!(" --profile {}", shell_argument(profile)));
+    }
+    command.push_str(&format!(
+        " self update --update-remotes --version {}",
+        shell_argument(host_version)
+    ));
+    for host in hosts {
+        command.push_str(&format!(" --host {}", shell_argument(host)));
+    }
+    for component in components {
+        command.push_str(&format!(" --component {}", shell_argument(component)));
+    }
+    command.push_str(&format!(" --concurrency {concurrency} --no-input"));
+    if dry_run {
+        command.push_str(" --dry-run");
+    } else {
+        command.push_str(" --yes");
+    }
+    command
 }
 
 fn prompt_remote_host_update(
     choices: &[self_update::RemoteHostChoice],
-) -> Result<Option<String>, CliFailure> {
+) -> Result<Vec<String>, CliFailure> {
     if choices.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
-    let mut items = choices
+    let items = choices
         .iter()
         .map(|choice| {
             (
-                Some(choice.alias.clone()),
+                choice.alias.clone(),
                 choice.alias.clone(),
                 if choice.selected { "preselected" } else { "" }.to_string(),
             )
         })
         .collect::<Vec<_>>();
-    items.push((
-        None,
-        "Not now".to_string(),
-        "leave remote Hosts unchanged".to_string(),
-    ));
-    let initial = self_update::selected_remote_host(choices).map(str::to_owned);
-    cliclack::select("Check and update a configured remote Host?")
+    let initial = choices
+        .iter()
+        .filter(|choice| choice.selected)
+        .map(|choice| choice.alias.clone())
+        .collect();
+    cliclack::multiselect("Check and update configured remote Hosts?")
         .items(&items)
-        .initial_value(initial)
+        .initial_values(initial)
+        .required(false)
         .interact()
         .map_err(|source| {
             failure(setup_interaction_error(

@@ -418,6 +418,8 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::AmbiguousCodexComponentOwnership
         | ErrorCode::HostUpdatePartiallyApplied
         | ErrorCode::HostUpdatePostcheckFailed
+        | ErrorCode::NoRemoteHostSelected
+        | ErrorCode::RemoteUpdatePartialFailure
         // Setup action and partial-application failures are Controller-local
         // execution results.
         | ErrorCode::SetupActionFailed
@@ -832,6 +834,32 @@ mod tests {
         assert_eq!(mapped.message, "the Host operation failed unexpectedly");
         assert_eq!(mapped.details, None);
         assert!(!mapped.message.contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn remote_batch_cli_failures_are_sanitized_at_the_host_boundary() {
+        for code in [
+            ErrorCode::NoRemoteHostSelected,
+            ErrorCode::RemoteUpdatePartialFailure,
+        ] {
+            let mapped = failure(&SatelleError {
+                code,
+                message: "PRIVATE_MESSAGE_CANARY".to_string(),
+                recovery_command: Some("PRIVATE_RECOVERY_CANARY".to_string()),
+                source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+                details: BTreeMap::from([(
+                    "private_canary".to_string(),
+                    json!("PRIVATE_DETAILS_CANARY"),
+                )]),
+            });
+
+            assert_eq!(mapped.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(mapped.code, ApiErrorCode::InternalError);
+            assert_eq!(mapped.category, ApiErrorCategory::Internal);
+            assert!(!mapped.retryable);
+            assert_eq!(mapped.message, "the Host operation failed unexpectedly");
+            assert_eq!(mapped.details, None);
+        }
     }
 
     #[test]

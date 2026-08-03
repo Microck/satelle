@@ -4227,6 +4227,22 @@ fn host_update_rejects_conflicting_or_unsupported_components() {
 }
 
 #[test]
+fn host_update_keeps_the_single_host_json_contract() {
+    for arguments in [
+        vec!["host", "update", "--all-remotes", "--json"],
+        vec![
+            "host", "update", "--host", "office", "--host", "lab", "--json",
+        ],
+    ] {
+        satelle()
+            .args(arguments)
+            .assert()
+            .code(64)
+            .stderr(predicate::str::contains(r#""code": "invalid-usage""#));
+    }
+}
+
+#[test]
 fn host_update_help_documents_json_and_component_filter_without_short_alias() {
     let output = satelle()
         .args(["host", "update", "--help"])
@@ -7610,6 +7626,142 @@ fn self_update_yes_requires_remote_handoff() {
 
     assert_eq!(error["code"], "invalid-usage");
     assert_eq!(error["message"], "--yes requires --update-remotes");
+}
+
+#[test]
+fn noninteractive_self_update_requires_an_unambiguous_remote_selection() {
+    let state = state_dir();
+    let config_file = state.path().join("config.toml");
+    write_user_config(
+        &config_file,
+        r#"
+[hosts.office]
+transport = "ssh"
+adapter = "fake"
+address = "operator@office.example"
+
+[hosts.lab]
+transport = "ssh"
+adapter = "fake"
+address = "operator@lab.example"
+"#,
+    )
+    .expect("write ambiguous self-update remote config");
+
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CONFIG_FILE", config_file)
+        .env_remove("SATELLE_HOST")
+        .args([
+            "--error-format",
+            "json",
+            "self",
+            "update",
+            "--update-remotes",
+            "--no-input",
+            "--yes",
+        ])
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+    let error = parse_json_output(&output.stderr);
+
+    assert_eq!(error["code"], "no-remote-host-selected");
+    assert_eq!(error["details"]["configured_remote_host_count"], 2);
+    assert_eq!(
+        error["suggested_commands"],
+        serde_json::json!(["pass one or more --host <alias> selectors or use --all-remotes"])
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interactive_self_update_empty_remote_selection_runs_the_local_update_only() {
+    let state = state_dir();
+    let config_file = state.path().join("config.toml");
+    write_user_config(
+        &config_file,
+        r#"
+[hosts.office]
+transport = "ssh"
+adapter = "fake"
+address = "operator@office.example"
+"#,
+    )
+    .expect("write interactive self-update config");
+
+    // Run a private copy with a matching install receipt so the local no-op
+    // path is real and does not depend on the repository build directory.
+    let install_dir = state.path().join("install");
+    fs::create_dir(&install_dir).expect("create private install directory");
+    let installed_binary = install_dir.join("satelle");
+    fs::copy(assert_cmd::cargo::cargo_bin!("satelle"), &installed_binary)
+        .expect("copy installed Satelle fixture");
+    let installed_binary = installed_binary
+        .canonicalize()
+        .expect("canonicalize installed Satelle fixture");
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "linux-x64-gnu",
+        "aarch64" => "linux-arm64-gnu",
+        architecture => panic!("unsupported Linux test architecture: {architecture}"),
+    };
+    fs::write(
+        install_dir.join(".satelle-install.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "install_method": "satelle-install-script",
+            "binary_path": installed_binary.clone(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "target": target,
+            "artifact_digest": "01".repeat(32),
+            "installed_at": "2026-08-03T00:00:00Z"
+        }))
+        .expect("serialize install receipt"),
+    )
+    .expect("write install receipt");
+
+    let mut command = std::process::Command::new(&installed_binary);
+    for name in [
+        "SATELLE_HOME",
+        "SATELLE_CONFIG_FILE",
+        "SATELLE_STATE_DIR",
+        "SATELLE_CACHE_DIR",
+        "SATELLE_LOG_DIR",
+        "SATELLE_HOST",
+        "SATELLE_PROFILE",
+        "SATELLE_ERROR_FORMAT",
+        TEST_SUPPORT_ADAPTER_ENV,
+    ] {
+        command.env_remove(name);
+    }
+    command
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_COMMAND_HISTORY", "false")
+        .args([
+            "self",
+            "update",
+            "--update-remotes",
+            "--version",
+            env!("CARGO_PKG_VERSION"),
+            "--dry-run",
+        ]);
+    let mut process = spawn_pty_command(command);
+
+    process.wait_for_after("Check and update configured remote Hosts?", 0);
+    process.write_input("\n");
+    let output = process.finish();
+    let rendered = combined_process_output(&output);
+
+    assert!(
+        output.status.success(),
+        "local-only update failed: {rendered}"
+    );
+    assert!(
+        rendered.contains("Satelle is up to date"),
+        "local result was not rendered: {rendered}"
+    );
+    assert!(!rendered.contains("no-remote-host-selected"));
 }
 
 #[test]

@@ -375,6 +375,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The Host update changed remote state but readiness failed.",
             default_recovery: "run satelle doctor for the selected Host",
         },
+        ErrorCode::RemoteUpdatePartialFailure => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: false,
+            outcome: "The local CLI state is preserved, but one or more remote Hosts failed.",
+            default_recovery: "run the reported recovery command for each failed Host",
+        },
         ErrorCode::SetupActionFailed => ErrorContract {
             category: ErrorCategory::RemoteExecution,
             retryable: false,
@@ -420,6 +426,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ConcurrencyWithoutRemoteUpdate
         | ErrorCode::ComponentSelectionConflict
         | ErrorCode::UnsupportedUpdateComponent
+        | ErrorCode::NoRemoteHostSelected
         | ErrorCode::SelfUpdateManagedInstall
         | ErrorCode::SelfUpdateVersionInvalid
         | ErrorCode::SelfUpdateExplicitVersionRequired
@@ -556,6 +563,8 @@ mod tests {
             (ErrorCode::ComputerUseNotReady, 75),
             (ErrorCode::SetupVerificationFailed, 75),
             (ErrorCode::RemoteExecution, 74),
+            (ErrorCode::NoRemoteHostSelected, 64),
+            (ErrorCode::RemoteUpdatePartialFailure, 74),
             (ErrorCode::CompletionInstallFailed, 73),
             (ErrorCode::AuthenticationFailed, 74),
             (ErrorCode::CertificateUntrusted, 74),

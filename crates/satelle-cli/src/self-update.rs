@@ -83,6 +83,14 @@ impl SelfUpdateReport {
         &self.planned_replacement
     }
 
+    pub(crate) fn target_version(&self) -> &str {
+        &self.latest_compatible_version
+    }
+
+    pub(crate) const fn changed(&self) -> bool {
+        self.changed
+    }
+
     pub(crate) const fn should_offer_remote_update(
         &self,
         no_input: bool,
@@ -120,6 +128,44 @@ impl SelfUpdateReport {
             lines.push(format!("Next: {command}"));
         }
         lines
+    }
+}
+
+#[derive(Serialize)]
+pub(crate) struct SelfUpdateRemoteReport<'a> {
+    schema_version: &'static str,
+    status: crate::host_update_batch::RemoteHostBatchStatus,
+    changed: bool,
+    local_update: &'a SelfUpdateReport,
+    remote_hosts: &'a [crate::host_update_batch::RemoteHostUpdateOutcome],
+    aggregate_counts: &'a crate::host_update_batch::RemoteHostAggregateCounts,
+    failed_hosts: &'a [String],
+    recovery_commands: &'a [String],
+    reusable_plan: bool,
+}
+
+impl<'a> SelfUpdateRemoteReport<'a> {
+    pub(crate) fn new(
+        local_update: &'a SelfUpdateReport,
+        remote_update: &'a crate::host_update_batch::RemoteHostUpdateBatchReport,
+    ) -> Self {
+        Self {
+            // The configured-remote summary has a different closed shape from
+            // the local-only self-update v1 result, so it has its own token.
+            schema_version: "satelle.self.update.remotes.v1",
+            status: remote_update.status,
+            changed: local_update.changed || remote_update.changed,
+            local_update,
+            remote_hosts: &remote_update.remote_hosts,
+            aggregate_counts: &remote_update.aggregate_counts,
+            failed_hosts: &remote_update.failed_hosts,
+            recovery_commands: &remote_update.recovery_commands,
+            reusable_plan: false,
+        }
+    }
+
+    pub(crate) const fn changed(&self) -> bool {
+        self.changed
     }
 }
 
@@ -167,6 +213,28 @@ pub(crate) fn selected_remote_host(choices: &[RemoteHostChoice]) -> Option<&str>
         .iter()
         .find(|choice| choice.selected)
         .map(|choice| choice.alias.as_str())
+}
+
+pub(crate) fn selected_remote_hosts(
+    choices: &[RemoteHostChoice],
+    explicit_hosts: &[String],
+    all_remotes: bool,
+) -> Vec<String> {
+    if all_remotes {
+        return choices.iter().map(|choice| choice.alias.clone()).collect();
+    }
+    if !explicit_hosts.is_empty() {
+        let mut seen = BTreeSet::new();
+        return explicit_hosts
+            .iter()
+            .filter(|host| seen.insert((*host).clone()))
+            .cloned()
+            .collect();
+    }
+    selected_remote_host(choices)
+        .map(str::to_owned)
+        .into_iter()
+        .collect()
 }
 
 pub(crate) fn host_update_arguments(host: &str) -> Vec<String> {
@@ -1423,7 +1491,9 @@ pub(crate) fn remote_host_handoff_supported(
         // Implicit selection uses the latest stable release by contract.
         return Ok(true);
     };
-    Ok(Version::parse(requested_version)?.prerelease.is_none())
+    let requested = Version::parse(requested_version)?;
+    let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
+    Ok(requested.prerelease.is_none() && requested.core() >= current.core())
 }
 
 impl Version {
@@ -1611,7 +1681,10 @@ fn run_gh_line_with(program: &Path, arguments: &[&str]) -> Result<String, SelfUp
     Ok(line.to_string())
 }
 
-fn wait_bounded(child: &mut Child, timeout: Duration) -> Result<ExitStatus, SelfUpdateError> {
+pub(crate) fn wait_bounded(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<ExitStatus, SelfUpdateError> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -2348,6 +2421,37 @@ mod tests {
     }
 
     #[test]
+    fn explicit_and_all_remote_selection_are_deterministic_and_unique() {
+        let choices = remote_host_choices(
+            Some("office"),
+            None,
+            [
+                "office".to_string(),
+                "lab".to_string(),
+                "workstation".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            selected_remote_hosts(
+                &choices,
+                &[
+                    "workstation".to_string(),
+                    "lab".to_string(),
+                    "lab".to_string()
+                ],
+                false,
+            ),
+            ["workstation", "lab"]
+        );
+        assert_eq!(
+            selected_remote_hosts(&choices, &[], true),
+            ["lab", "office", "workstation"]
+        );
+        assert_eq!(selected_remote_hosts(&choices, &[], false), ["office"]);
+    }
+
+    #[test]
     fn remote_update_offer_requires_a_changed_interactive_human_update() {
         let mut report = SelfUpdateReport {
             schema_version: "satelle.self.update.v1",
@@ -2378,6 +2482,62 @@ mod tests {
 
         report.changed = false;
         assert!(!report.should_offer_remote_update(false, true, false, false));
+    }
+
+    #[test]
+    fn remote_update_json_has_the_closed_batch_summary_shape() {
+        let local_update = SelfUpdateReport {
+            schema_version: "satelle.self.update.v1",
+            outcome: SelfUpdateOutcome::Updated,
+            current_version: "1.0.0".to_string(),
+            latest_compatible_version: "1.1.0".to_string(),
+            install_owner: "direct-github-release-archive".to_string(),
+            target_artifact: "satelle-v1.1.0-linux-x64-gnu.tar.gz".to_string(),
+            planned_replacement: PathBuf::from("/usr/local/bin/satelle"),
+            changed: true,
+            follow_up_host_update_command: None,
+        };
+        let remote_update = crate::host_update_batch::RemoteHostUpdateBatchReport::new(vec![
+            crate::host_update_batch::RemoteHostUpdateOutcome::completed(
+                satelle_core::host_update::HostUpdateReport::new("office", Vec::new(), Vec::new()),
+                None,
+                &[],
+            ),
+        ]);
+
+        let value =
+            serde_json::to_value(SelfUpdateRemoteReport::new(&local_update, &remote_update))
+                .expect("serialize combined self-update report");
+        let fields = value
+            .as_object()
+            .expect("combined self-update report is an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            fields,
+            BTreeSet::from([
+                "aggregate_counts",
+                "changed",
+                "failed_hosts",
+                "local_update",
+                "recovery_commands",
+                "remote_hosts",
+                "reusable_plan",
+                "schema_version",
+                "status",
+            ])
+        );
+        assert_eq!(value["status"], "succeeded");
+        assert_eq!(value["schema_version"], "satelle.self.update.remotes.v1");
+        assert_eq!(value["changed"], true);
+        assert_eq!(value["local_update"]["outcome"], "updated");
+        assert_eq!(value["remote_hosts"][0]["host"], "office");
+        assert_eq!(value["aggregate_counts"]["unchanged"], 1);
+        assert_eq!(value["failed_hosts"], json!([]));
+        assert_eq!(value["recovery_commands"], json!([]));
+        assert_eq!(value["reusable_plan"], false);
     }
 
     #[test]
@@ -2826,9 +2986,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_host_handoff_accepts_only_stable_release_selections() {
+    fn remote_host_handoff_rejects_prereleases_and_downgrades() {
         assert!(remote_host_handoff_supported(None).unwrap());
         assert!(remote_host_handoff_supported(Some("1.2.3")).unwrap());
+        assert!(!remote_host_handoff_supported(Some("0.0.0")).unwrap());
         assert!(!remote_host_handoff_supported(Some("1.2.3-rc.1")).unwrap());
         assert!(matches!(
             remote_host_handoff_supported(Some("invalid")),

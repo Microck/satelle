@@ -236,37 +236,37 @@
 - satelle self update interactive configured-remote update offer preselects only the current command target host when one is resolved, otherwise the configured default host when exactly one resolves unambiguously @spec @mvp @implemented
 - satelle self update interactive configured-remote update offer lists other configured remote hosts as unselected choices that the user may opt into before the remote update plan is built @spec @mvp @implemented
 - satelle self update --update-remotes without an explicit host selector targets the same current or default host selection used by the interactive offer instead of every configured remote host @spec @mvp @implemented
-- satelle self update supports repeatable --host <alias> with --update-remotes for explicitly selected configured remote hosts @spec @mvp
-- satelle self update supports --all-remotes with --update-remotes as the explicit request to check and update every configured remote host @spec @mvp
-- satelle self update reports a typed no-remote-host-selected error when --update-remotes cannot resolve a current or default host and no --host or --all-remotes selector is provided in noninteractive mode @spec @mvp
-- satelle self update re-executes the updated local binary before running any accepted or flag-requested configured-remote Host Daemon update flow @spec @mvp
-- satelle self update configured-remote update flow selects Satelle Host Daemon updates by default and does not select standalone Codex runtime updates unless the user explicitly requests additional host update components @spec @mvp
-- satelle self update configured-remote update flow uses host update planning, consent, action ledger, partial-failure, and post-update readiness rules instead of bypassing remote mutation controls @spec @mvp
-- satelle self update remote-update failure output states that the local CLI update succeeded, identifies each failed remote host, describes what remote state was preserved or changed, and gives the recovery command @spec @mvp
-- satelle self update configured-remote update flow builds per-host update plans for all selected remote hosts before applying any remote mutation @spec @mvp
-- satelle self update configured-remote --dry-run treats per-host update plans as preview diagnostics and does not persist or emit a reusable apply plan @spec @mvp
-- satelle self update configured-remote JSON dry-run output includes reusable_plan false so automation does not treat the preview as an apply artifact @spec @mvp
-- satelle self update configured-remote update flow re-probes selected remote hosts and rebuilds per-host update plans for every non-dry-run invocation even when a dry-run command was run earlier @spec @mvp
-- satelle self update configured-remote update flow may apply the in-memory plan shown immediately before final confirmation within the same CLI process without repeating the full dry-run command @spec @mvp
-- satelle self update configured-remote update flow revalidates selected host identity, current Host Daemon version, selected component set, target artifact digest, and restart impact before mutating each remote host @spec @mvp
-- satelle self update configured-remote update flow attempts every selected remote host that has a valid update plan after the combined plan passes consent instead of failing fast on the first host failure @spec @mvp
-- satelle self update configured-remote update flow uses bounded concurrency for per-host planning and per-host update application instead of serial-only execution or unbounded parallelism @spec @mvp
-- satelle self update configured-remote update flow defaults to a maximum of 4 concurrent remote hosts @spec @mvp
-- satelle self update supports --concurrency <n> with --update-remotes to set the maximum number of remote hosts processed at once @spec @mvp
-- satelle self update --concurrency 1 with --update-remotes forces serial remote host processing @spec @mvp
+- satelle self update supports repeatable --host <alias> with --update-remotes for explicitly selected configured remote hosts @spec @mvp @implemented
+- satelle self update supports --all-remotes with --update-remotes as the explicit request to check and update every configured remote host @spec @mvp @implemented
+- satelle self update reports a typed no-remote-host-selected error when --update-remotes cannot resolve a current or default host and no --host or --all-remotes selector is provided in noninteractive mode @spec @mvp @implemented
+- satelle self update re-executes the updated local binary before running any accepted or flag-requested configured-remote Host Daemon update flow @spec @mvp @implemented
+- satelle self update configured-remote update flow selects Satelle Host Daemon updates by default and does not select standalone Codex runtime updates unless the user explicitly requests additional host update components @spec @mvp @implemented
+- satelle self update configured-remote update flow uses host update planning, consent, action ledger, partial-failure, and post-update readiness rules instead of bypassing remote mutation controls @spec @mvp @implemented
+- satelle self update remote-update failure output states that the local CLI update succeeded, identifies each failed remote host, describes what remote state was preserved or changed, and gives the recovery command @spec @mvp @implemented
+- satelle self update configured-remote update flow builds per-host update plans for all selected remote hosts before applying any remote mutation @spec @mvp @implemented
+- satelle self update configured-remote --dry-run treats per-host update plans as preview diagnostics and does not persist or emit a reusable apply plan @spec @mvp @implemented
+- satelle self update configured-remote JSON dry-run output includes reusable_plan false so automation does not treat the preview as an apply artifact @spec @mvp @implemented
+- satelle self update configured-remote update flow re-probes selected remote hosts and rebuilds per-host update plans for every non-dry-run invocation even when a dry-run command was run earlier @spec @mvp @implemented
+- satelle self update configured-remote update flow may apply the in-memory plan shown immediately before final confirmation within the same CLI process without repeating the full dry-run command @spec @mvp @implemented
+- satelle self update configured-remote update flow revalidates selected host identity, current Host Daemon version, selected component set, target artifact digest, and restart impact before mutating each remote host @spec @mvp @implemented
+- satelle self update configured-remote update flow attempts every selected remote host that has a valid update plan after the combined plan passes consent instead of failing fast on the first host failure @spec @mvp @implemented
+- satelle self update configured-remote update flow uses bounded concurrency for per-host planning and per-host update application instead of serial-only execution or unbounded parallelism @spec @mvp @implemented
+- satelle self update configured-remote update flow defaults to a maximum of 4 concurrent remote hosts @spec @mvp @implemented
+- satelle self update supports --concurrency <n> with --update-remotes to set the maximum number of remote hosts processed at once @spec @mvp @implemented
+- satelle self update --concurrency 1 with --update-remotes forces serial remote host processing @spec @mvp @implemented
 - satelle self update MVP accepts --concurrency values from 1 through 16 and reports a typed concurrency-limit-exceeded usage error for larger values @implemented @mvp
 - satelle self update reports a typed concurrency-without-remote-update usage error when --concurrency is provided without --update-remotes @implemented @mvp
-- satelle self update configured-remote update flow keeps human progress grouped by remote host and does not interleave raw per-host logs in normal output @spec @mvp
-- satelle self update configured-remote update flow records each selected remote host outcome as succeeded, unchanged, skipped, or failed @spec @mvp
-- satelle self update configured-remote update flow treats unreachable hosts and host planning failures as per-host failed or skipped outcomes instead of blocking planning for every other selected host @spec @mvp
-- satelle self update configured-remote update flow exits 0 only when every selected remote host succeeds, is unchanged, or is explicitly skipped by user selection before mutation @spec @mvp
-- satelle self update configured-remote update flow exits with the remote execution failure class and typed remote-update-partial-failure error when at least one selected remote host fails after local update succeeds @spec @mvp
-- satelle self update configured-remote update flow does not roll back successful remote host updates when another selected remote host fails @spec @mvp
-- satelle self update configured-remote update flow human summary groups remote hosts by succeeded, unchanged, skipped, and failed, and prints recovery commands for failed hosts @spec @mvp
-- satelle self update configured-remote --quiet prints no human output when every selected remote host is unchanged or skipped and no error occurs @spec @mvp
-- satelle self update configured-remote --quiet prints one concise human changed summary when at least one selected remote host changes and no error occurs @spec @mvp
-- satelle self update configured-remote --quiet still prints failure summaries and recovery commands when any selected remote host fails @spec @mvp
-- satelle self update configured-remote update flow JSON summary includes status, changed, local_update, remote_hosts, aggregate_counts, failed_hosts, and recovery_commands fields @spec @mvp
+- satelle self update configured-remote update flow keeps human progress grouped by remote host and does not interleave raw per-host logs in normal output @spec @mvp @implemented
+- satelle self update configured-remote update flow records each selected remote host outcome as succeeded, unchanged, skipped, or failed @spec @mvp @implemented
+- satelle self update configured-remote update flow treats unreachable hosts and host planning failures as per-host failed or skipped outcomes instead of blocking planning for every other selected host @spec @mvp @implemented
+- satelle self update configured-remote update flow exits 0 only when every selected remote host succeeds, is unchanged, or is explicitly skipped by user selection before mutation @spec @mvp @implemented
+- satelle self update configured-remote update flow exits with the remote execution failure class and typed remote-update-partial-failure error when at least one selected remote host fails after local update succeeds @spec @mvp @implemented
+- satelle self update configured-remote update flow does not roll back successful remote host updates when another selected remote host fails @spec @mvp @implemented
+- satelle self update configured-remote update flow human summary groups remote hosts by succeeded, unchanged, skipped, and failed, and prints recovery commands for failed hosts @spec @mvp @implemented
+- satelle self update configured-remote --quiet prints no human output when every selected remote host is unchanged or skipped and no error occurs @spec @mvp @implemented
+- satelle self update configured-remote --quiet prints one concise human changed summary when at least one selected remote host changes and no error occurs @spec @mvp @implemented
+- satelle self update configured-remote --quiet still prints failure summaries and recovery commands when any selected remote host fails @spec @mvp @implemented
+- satelle self update configured-remote update flow JSON summary includes status, changed, local_update, remote_hosts, aggregate_counts, failed_hosts, and recovery_commands fields @spec @mvp @implemented
 - satelle post-MVP official package repository submissions are prioritized by user demand, repository acceptance fit, maintainer ownership, release automation compatibility, update latency, uninstall semantics, and support burden rather than pursued as a bulk checklist @spec @later
 - satelle post-MVP first official package repository candidates are WinGet and Scoop Main because their manifest models can reference versioned Windows release artifacts and checksums that Satelle already publishes @spec @later
 - satelle keeps the first-party Scoop bucket as the canonical Scoop installation path until a Scoop Main manifest is accepted and release automation proves Scoop Main updates do not lag normal Satelle releases @spec @mvp @implemented

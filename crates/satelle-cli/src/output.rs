@@ -259,6 +259,7 @@ impl SelfSubcommand {
     const fn output_request(&self) -> (OutputArgs, EventOutput) {
         match self {
             Self::Update(command) => (command.output_args, EventOutput::None),
+            Self::UpdateRemotes(command) => (command.output_args, EventOutput::None),
         }
     }
 }
