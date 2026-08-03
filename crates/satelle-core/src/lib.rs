@@ -7630,6 +7630,67 @@ mod doctor_options_tests {
     }
 }
 
+/// A requested Doctor fix remains a projection of the command that owns the
+/// mutation. The nested output is that command's normalized JSON contract,
+/// never captured stdout, stderr, or another raw subprocess stream.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorFixFlow {
+    pub request: DoctorFixRequest,
+    pub status: DoctorFixFlowStatus,
+    pub delegations: Vec<DoctorFixDelegation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postcheck: Option<DoctorFixPostcheck>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorFixRequest {
+    DryRun,
+    Apply,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorFixFlowStatus {
+    Planned,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl DoctorFixFlowStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorFixDelegation {
+    pub owner: DoctorFixOwner,
+    pub command: String,
+    pub affected_scopes: Vec<String>,
+    pub output: Value,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorFixOwner {
+    Setup,
+    Repair,
+    HostUpdate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorFixPostcheck {
+    pub ready: bool,
+    pub blocking_finding_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DoctorReport {
     pub schema_version: DoctorSchemaVersion,
@@ -7651,6 +7712,45 @@ pub struct DoctorReport {
     pub recovery_commands: Vec<String>,
     pub changed: bool,
     pub cache_updates: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_flow: Option<DoctorFixFlow>,
+}
+
+#[cfg(test)]
+mod doctor_fix_flow_contract_tests {
+    use super::*;
+
+    #[test]
+    fn fix_flow_serializes_delegated_output_and_postcheck_without_raw_stream_fields() {
+        let flow = DoctorFixFlow {
+            request: DoctorFixRequest::DryRun,
+            status: DoctorFixFlowStatus::Planned,
+            delegations: vec![DoctorFixDelegation {
+                owner: DoctorFixOwner::Setup,
+                command:
+                    "satelle setup --host local-demo --component provider-auth --dry-run --json"
+                        .to_string(),
+                affected_scopes: vec!["provider".to_string()],
+                output: serde_json::json!({"status": "planned"}),
+            }],
+            postcheck: None,
+        };
+
+        let value = serde_json::to_value(flow).expect("fix flow should serialize");
+        assert_eq!(value["request"], "dry_run");
+        assert_eq!(value["status"], "planned");
+        assert_eq!(value["delegations"][0]["owner"], "setup");
+        assert_eq!(
+            value["delegations"][0]["affected_scopes"],
+            serde_json::json!(["provider"])
+        );
+        assert!(value.get("postcheck").is_none());
+        let output = value["delegations"][0]["output"]
+            .as_object()
+            .expect("delegated output is a normalized JSON object");
+        assert!(!output.contains_key("stdout"));
+        assert!(!output.contains_key("stderr"));
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

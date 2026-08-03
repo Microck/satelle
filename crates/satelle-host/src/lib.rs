@@ -5994,6 +5994,8 @@ fn apply_native_refresh(
                     severity: "error".to_string(),
                     fixability: if manual_action_required {
                         DoctorFixability::ManualActionRequired
+                    } else if error.code == satelle_core::ErrorCode::ComputerUseNotReady {
+                        DoctorFixability::Repairable
                     } else {
                         DoctorFixability::Blocked
                     },
@@ -6182,16 +6184,16 @@ fn production_doctor_report_with_selection(
         .iter()
         .map(|scope| scope.as_str())
         .collect::<Vec<_>>();
-    let capability_recovery = "satelle doctor --scope computer-use --refresh --json";
     let mut findings = snapshot
         .verdict
         .blockers()
         .iter()
         .filter_map(|blocker| {
             let scope = blocker_scope(blocker);
-            selected_scopes
-                .contains(&scope)
-                .then(|| blocker_finding(scope, blocker, capability_recovery))
+            selected_scopes.contains(&scope).then(|| {
+                let recovery_command = blocker_recovery_command(host, blocker);
+                blocker_finding(scope, blocker, &recovery_command)
+            })
         })
         .collect::<Vec<_>>();
     if selected_scopes.contains(&"transport")
@@ -6204,7 +6206,10 @@ fn production_doctor_report_with_selection(
             "provider",
             "provider_readiness_not_observed",
             "provider readiness has not been observed through a production Host",
-            "satelle setup --host local-demo --component provider-auth --dry-run --json",
+            &format!(
+                "satelle setup --host {} --component provider-auth --dry-run --json",
+                doctor_shell_argument(host)
+            ),
         ));
     }
     findings.sort_by(|left, right| {
@@ -6270,7 +6275,10 @@ fn production_doctor_report_with_selection(
         summary: DoctorSummary {
             ready,
             blocking_findings,
-            repairable_findings: 0,
+            repairable_findings: findings
+                .iter()
+                .filter(|finding| finding.fixability == DoctorFixability::Repairable)
+                .count(),
             informational_findings: findings
                 .iter()
                 .filter(|finding| finding.fixability == DoctorFixability::Informational)
@@ -6283,7 +6291,38 @@ fn production_doctor_report_with_selection(
         recovery_commands,
         changed: false,
         cache_updates: Vec::new(),
+        fix_flow: None,
     }
+}
+
+fn blocker_recovery_command(host: &str, blocker: &Phase0CapabilityBlocker) -> String {
+    match blocker.reason {
+        BlockerReason::MissingCodexRuntime
+        | BlockerReason::MalformedCodexVersion
+        | BlockerReason::CodexVersionUnavailable
+        | BlockerReason::UnsupportedCodexVersion => format!(
+            "satelle host update --host {} --component codex --dry-run --json",
+            doctor_shell_argument(host)
+        ),
+        BlockerReason::UnsupportedHostPlatform
+        | BlockerReason::NativeExecutionPathUnavailable
+        | BlockerReason::NonStableSurface
+        | BlockerReason::IncompleteLiveProof => format!(
+            "satelle doctor --host {} --scope computer-use --refresh --json",
+            doctor_shell_argument(host)
+        ),
+    }
+}
+
+fn doctor_shell_argument(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_./:".contains(character))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn production_doctor_probes(
@@ -6403,7 +6442,7 @@ fn unavailable_scope_finding(
         finding_id: format!("production.{scope}.{reason}"),
         scope: scope.to_string(),
         severity: "error".to_string(),
-        fixability: DoctorFixability::Blocked,
+        fixability: DoctorFixability::Repairable,
         readiness_impact: "blocked".to_string(),
         summary: summary.to_string(),
         evidence: vec![format!("reason={reason}")],
@@ -6507,7 +6546,14 @@ fn blocker_finding(
         ),
         scope: scope.to_string(),
         severity: "error".to_string(),
-        fixability: DoctorFixability::Blocked,
+        fixability: if matches!(
+            blocker.reason,
+            BlockerReason::MissingCodexRuntime | BlockerReason::UnsupportedCodexVersion
+        ) {
+            DoctorFixability::ManualActionRequired
+        } else {
+            DoctorFixability::Blocked
+        },
         readiness_impact: "blocked".to_string(),
         summary: blocker_summary(blocker).to_string(),
         evidence,
@@ -6761,6 +6807,49 @@ mod packet17_doctor_tests {
                 .evidence
                 .contains(&"doctor_readiness_blocker=codex-runtime-missing".to_string())
         );
+        assert_eq!(finding.fixability, DoctorFixability::ManualActionRequired);
+
+        let unsupported = Phase0CapabilityBlocker {
+            reason: BlockerReason::UnsupportedCodexVersion,
+            ..blocker
+        };
+        assert_eq!(
+            blocker_finding("codex", &unsupported, "satelle doctor --refresh").fixability,
+            DoctorFixability::ManualActionRequired
+        );
+    }
+
+    #[test]
+    fn doctor_recovery_commands_quote_host_aliases_as_one_shell_argument() {
+        assert_eq!(
+            doctor_shell_argument("demo'; touch /tmp/canary"),
+            r#"'demo'"'"'; touch /tmp/canary'"#,
+        );
+    }
+
+    #[test]
+    fn phase0_recovery_matches_the_blocker_owner() {
+        let blocker = Phase0CapabilityBlocker {
+            reason: BlockerReason::MissingCodexRuntime,
+            capability: RequiredCapability::NativeReadiness,
+            codex_version: CodexVersionEvidence::Missing,
+            host_platform: codex_capabilities::HostPlatform::Windows,
+            observed_surface: codex_capabilities::EvidenceSurface::Absent,
+            live_proof: codex_capabilities::LiveProofStatus::NotObserved,
+        };
+
+        assert_eq!(
+            blocker_recovery_command("office", &blocker),
+            "satelle host update --host office --component codex --dry-run --json"
+        );
+        let unsupported_platform = Phase0CapabilityBlocker {
+            reason: BlockerReason::UnsupportedHostPlatform,
+            ..blocker
+        };
+        assert_eq!(
+            blocker_recovery_command("office", &unsupported_platform),
+            "satelle doctor --host office --scope computer-use --refresh --json"
+        );
     }
 
     #[test]
@@ -6782,6 +6871,7 @@ mod packet17_doctor_tests {
                 .iter()
                 .all(|entry| !entry.contains("computer-use-plugin-missing"))
         );
+        assert_eq!(finding.fixability, DoctorFixability::Blocked);
     }
 
     #[test]

@@ -276,6 +276,7 @@ pub(super) fn execute_transport_only_doctor(
         recovery_commands,
         changed: false,
         cache_updates: Vec::new(),
+        fix_flow: None,
     })
 }
 

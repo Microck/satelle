@@ -728,24 +728,24 @@
 - satelle doctor MVP does not expose a general probe concurrency tuning flag because --serial-probes is the only user-facing probe scheduling override @implemented @mvp
 - satelle doctor diagnoses and reports findings before offering or starting any fix flow @implemented @mvp
 - satelle doctor does not run setup, repair, install, host update, service, or configuration mutations during the diagnostic phase @implemented @mvp
-- satelle doctor in an interactive terminal offers to start a fix flow when at least one finding is repairable @spec @mvp
-- satelle doctor interactive fix offer defaults to No so pressing Enter after diagnostics does not start a mutation flow @spec @mvp
-- satelle doctor fix offer is consent to build the appropriate repair or host update plan, not consent to apply unseen mutations immediately @spec @mvp
-- satelle doctor accepted fix flow delegates mutation to setup, repair, or host update ownership boundaries instead of applying ad hoc doctor-specific mutations @spec @mvp
-- satelle doctor supports --fix as the explicit noninteractive request to build a delegated setup, repair, or host update fix plan after diagnostics complete @spec @mvp
-- satelle doctor --fix --dry-run emits the delegated fix plan and never mutates local or remote state @spec @mvp
-- satelle doctor --fix --no-input requires --yes or applicable Trusted Profile consent before delegated mutations begin @spec @mvp
-- satelle doctor --fix with prompts disabled and without --yes or applicable Trusted Profile consent emits the delegated plan, performs no mutation, and reports a typed doctor-fix-consent-required error @spec @mvp
-- satelle doctor --events with --fix reports a typed output-mode-conflict usage error @spec @mvp
-- satelle doctor accepted fix flow uses the target command's plan presentation, final confirmation, --yes, --no-input --yes, --dry-run, action ledger, partial-failure, and postcheck rules @spec @mvp
-- satelle doctor does not prompt for fixes when --no-input is set, stdin is not a TTY, JSON output mode is active, --events is active, --quiet is active, or --dry-run is active @spec @mvp
-- satelle doctor noninteractive and JSON outputs include recommended recovery commands for repairable findings instead of prompting @spec @mvp
-- satelle doctor accepted fix flow reruns affected readiness diagnostics before deciding the final doctor exit status @spec @mvp
-- satelle doctor exits 0 after an accepted fix flow only when the post-fix diagnostics no longer report readiness-blocking findings @spec @mvp
-- satelle doctor exits with the host readiness failure class when the user declines a fix offer and readiness-blocking findings remain @spec @mvp
+- satelle doctor in an interactive terminal offers to start a fix flow when at least one finding is repairable @spec @mvp @implemented
+- satelle doctor interactive fix offer defaults to No so pressing Enter after diagnostics does not start a mutation flow @spec @mvp @implemented
+- satelle doctor fix offer is consent to build the appropriate repair or host update plan, not consent to apply unseen mutations immediately @spec @mvp @implemented
+- satelle doctor accepted fix flow delegates mutation to setup, repair, or host update ownership boundaries instead of applying ad hoc doctor-specific mutations @spec @mvp @implemented
+- satelle doctor supports --fix as the explicit noninteractive request to build a delegated setup, repair, or host update fix plan after diagnostics complete @spec @mvp @implemented
+- satelle doctor --fix --dry-run emits the delegated fix plan and never mutates local or remote state @spec @mvp @implemented
+- satelle doctor --fix --no-input requires --yes or applicable Trusted Profile consent before delegated mutations begin @spec @mvp @implemented
+- satelle doctor --fix with prompts disabled and without --yes or applicable Trusted Profile consent emits the delegated plan, performs no mutation, and reports a typed doctor-fix-consent-required error @spec @mvp @implemented
+- satelle doctor --events with --fix reports a typed output-mode-conflict usage error @spec @mvp @implemented
+- satelle doctor accepted fix flow uses the target command's plan presentation, final confirmation, --yes, --no-input --yes, --dry-run, action ledger, partial-failure, and postcheck rules @spec @mvp @implemented
+- satelle doctor does not prompt for fixes when --no-input is set, stdin is not a TTY, JSON output mode is active, --events is active, --quiet is active, or --dry-run is active @spec @mvp @implemented
+- satelle doctor noninteractive and JSON outputs include recommended recovery commands for repairable findings instead of prompting @spec @mvp @implemented
+- satelle doctor accepted fix flow reruns affected readiness diagnostics before deciding the final doctor exit status @spec @mvp @implemented
+- satelle doctor exits 0 after an accepted fix flow only when the post-fix diagnostics no longer report readiness-blocking findings @spec @mvp @implemented
+- satelle doctor exits with the host readiness failure class when the user declines a fix offer and readiness-blocking findings remain @spec @mvp @implemented
 - satelle doctor may mutate readiness or provider smoke-test caches only when --refresh is explicitly provided; refresh never performs setup, repair, install, host update, service, or configuration mutations @spec @mvp @implemented
 - satelle doctor supports --scope computer-use --refresh to rerun the native Computer Use readiness smoke test and update the host readiness cache without starting prompt execution @implemented @mvp
-- satelle doctor accepts --refresh only when the selected scopes include computer-use, provider, or all and otherwise reports a typed refresh-scope-required usage error @spec @mvp
+- satelle doctor accepts --refresh only when the selected scopes include computer-use, provider, or all and otherwise reports a typed refresh-scope-required usage error @spec @mvp @implemented
 - satelle doctor --scope all --refresh reruns both native Computer Use readiness and required provider smoke tests before updating their independent caches @spec @mvp @implemented
 - satelle doctor computer-use refresh accepts an explicit timeout option for diagnostics without changing stored timeout configuration @implemented @mvp
 - satelle doctor computer-use refresh timeout option is --timeout <duration> and uses the same explicit-unit duration syntax as configuration @implemented @mvp
@@ -753,7 +753,7 @@
 - satelle doctor provider refresh accepts an explicit timeout option for diagnostics without changing stored timeout configuration @implemented @mvp
 - satelle doctor provider refresh timeout option is --timeout <duration> and uses the same explicit-unit duration syntax as configuration @implemented @mvp
 - satelle doctor accepts --timeout only with --refresh and a selected computer-use, provider, or all scope and otherwise reports a typed refresh-timeout-without-refresh usage error @spec @mvp @implemented
-- when doctor refresh selects both computer-use and provider, one --timeout value applies independently to each live probe rather than to their combined wall-clock duration @spec @mvp
+- when doctor refresh selects both computer-use and provider, one --timeout value applies independently to each live probe rather than to their combined wall-clock duration @spec @mvp @implemented
 - satelle doctor implementation uses modular probes internally instead of encoding subsystem checks directly in the command handler @implemented @mvp
 - satelle diagnostic bundle export is deferred until after MVP logs, status, and doctor behavior is implemented @spec @later
 - satelle diagnostic bundle export is a post-MVP support workflow instead of a prerequisite for MVP logs, status, or doctor @spec @later
@@ -762,8 +762,8 @@
 - satelle support bundle JSON v1 uses schema_version satelle.support.bundle.v1 and includes status, source Host, output path, artifact byte size, included and not_collected categories, redaction policy version, and created_at @spec @contract @later
 - satelle diagnostic bundles redact secrets and exclude screenshots, raw prompts, full transcripts, and desktop recordings by default @spec @later
 - the default diagnostic bundle includes redacted configuration shape, version information, readiness results, structured errors, up to 2000 recent redacted Log Entries, setup-ledger summaries, and transport diagnostics and marks unavailable categories as not_collected in its manifest @spec @later
-- satelle MVP normal diagnostics are limited to redacted metadata, normalized Satelle Log Entries, Doctor Findings, setup action ledger summaries, typed errors, exit statuses, readiness probe results, and recovery commands @spec @mvp
-- satelle MVP normal diagnostics do not capture, persist, display, or export raw protocol payloads, raw setup or repair subprocess streams, raw prompts, full transcripts, screenshots, desktop snapshots, or desktop recordings by default @spec @mvp
+- satelle MVP normal diagnostics are limited to redacted metadata, normalized Satelle Log Entries, Doctor Findings, setup action ledger summaries, typed errors, exit statuses, readiness probe results, and recovery commands @spec @mvp @implemented
+- satelle MVP normal diagnostics do not capture, persist, display, or export raw protocol payloads, raw setup or repair subprocess streams, raw prompts, full transcripts, screenshots, desktop snapshots, or desktop recordings by default @spec @mvp @implemented
 - satelle post-MVP Raw Diagnostic Exports are enabled only by explicit command-specific flags and are never enabled by --verbose, --debug, --json, --events, --plain, YOLO mode, Trusted Profiles, user-level configuration, or project-level configuration @spec @later
 - satelle Raw Diagnostic Exports require an explicit --output <path> destination and never choose an upload destination, support endpoint, cloud bucket, or public URL automatically @spec @later
 - satelle Raw Diagnostic Exports write artifacts to local filesystem paths controlled by the invoking OS user by default and do not upload artifacts to Satelle maintainers, third-party support systems, or remote storage @spec @later
@@ -781,10 +781,10 @@
 - satelle Raw Diagnostic Exports record audit metadata in the Host Daemon SQLite store without storing raw artifact contents, raw payloads, raw subprocess streams, screenshots, transcripts, prompts, provider credentials, or provider response bodies in the audit record @spec @later
 - satelle Raw Diagnostic Export audit metadata includes actor identity when known, host alias, command, selected scope, data categories, artifact byte size when available, redaction policy version, created_at, and success or failure status @spec @later
 - satelle Raw Diagnostic Export failures use typed errors such as raw-diagnostics-output-required, raw-diagnostics-consent-required, raw-diagnostics-redaction-failed, raw-diagnostics-staging-failed, and raw-diagnostics-export-failed with recovery guidance that states what data was preserved or deleted @spec @later
-- satelle commands that report state use human-readable output by default and support JSON output for automation @spec @mvp
-- satelle JSON output is treated as a stable command contract for scripts and other agents @spec @mvp
-- satelle human output may be optimized for readability as long as equivalent structured data is available through JSON output for state-reporting commands @spec @mvp
-- satelle MVP does not add stable --plain output modes to state-reporting commands unless a command-specific fact defines the plain format and compatibility contract @spec @mvp
+- satelle commands that report state use human-readable output by default and support JSON output for automation @spec @mvp @implemented
+- satelle JSON output is treated as a stable command contract for scripts and other agents @spec @mvp @implemented
+- satelle human output may be optimized for readability as long as equivalent structured data is available through JSON output for state-reporting commands @spec @mvp @implemented
+- satelle MVP does not add stable --plain output modes to state-reporting commands unless a command-specific fact defines the plain format and compatibility contract @spec @mvp @implemented
 
 # implementation-quality
 - satelle is implemented as a small Rust workspace with separate crates for the binary entrypoints, shared domain model, Codex adapter, and transport boundary @spec @mvp @implemented
@@ -1059,7 +1059,7 @@
 - satelle config check exits 0 only when every locally decidable configuration check passes @implemented @mvp
 - satelle config check exits with the configuration error class when any locally decidable configuration check fails @implemented @mvp
 - satelle config check supports --host and --profile as context selectors without changing stored defaults @mvp @implemented
-- satelle config check human output may include suggested recovery commands and minimal config snippets, but labels them as suggestions that were not applied @spec @mvp
+- satelle config check human output may include suggested recovery commands and minimal config snippets, but labels them as suggestions that were not applied @spec @mvp @implemented
 - satelle config check --json emits one final JSON object with schema_version, status, mode, checked_files, checked_contexts, selected_host, selected_profile, checks, errors, not_checked, and recovery_commands fields @implemented @mvp
 - satelle config check --json checked_contexts entries include host, profile, source, status, checks, errors, and not_checked fields @implemented @mvp
 - satelle exposes a read-only satelle config explain command separate from satelle config check @implemented @mvp
@@ -1763,12 +1763,12 @@
 - label: satelle setup action ledger entries store redacted failure hints only when the hint can be derived without preserving raw stdout or stderr
   command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
   tags: [spec, mvp, implemented, ci]
-- satelle setup and repair human output does not print raw installer stdout or stderr by default, even in verbose mode @spec @mvp
-- satelle setup and repair verbose output expands normalized action status, typed errors, exit status, and recovery hints without exposing raw subprocess streams by default @spec @mvp
-- satelle logs and status commands do not expose raw setup or repair subprocess stdout or stderr by default @spec @mvp
+- satelle setup and repair human output does not print raw installer stdout or stderr by default, even in verbose mode @spec @mvp @implemented
+- satelle setup and repair verbose output expands normalized action status, typed errors, exit status, and recovery hints without exposing raw subprocess streams by default @spec @mvp @implemented
+- satelle logs and status commands do not expose raw setup or repair subprocess stdout or stderr by default @spec @mvp @implemented
 - satelle diagnostic bundles do not include raw setup or repair subprocess stdout or stderr by default @spec @later
-- satelle MVP does not include a CLI flag, configuration key, API option, or diagnostic bundle mode for capturing or exporting raw setup and repair subprocess stdout or stderr @spec @mvp
-- satelle MVP setup and repair diagnostics rely on normalized action summaries, typed errors, exit status, readiness probes, and recovery commands instead of raw subprocess streams @spec @mvp
+- satelle MVP does not include a CLI flag, configuration key, API option, or diagnostic bundle mode for capturing or exporting raw setup and repair subprocess stdout or stderr @spec @mvp @implemented
+- satelle MVP setup and repair diagnostics rely on normalized action summaries, typed errors, exit status, readiness probes, and recovery commands instead of raw subprocess streams @spec @mvp @implemented
 - satelle later setup and repair raw subprocess output capture is implemented only as a Raw Diagnostic Export for one invocation and requires a command-specific raw export flag plus --output <path> before capture begins @spec @later
 - satelle setup and repair Raw Diagnostic Exports may include selected raw stdout and raw stderr from setup or repair subprocesses, subprocess command identifiers, exit or termination status, timestamps, and redaction metadata, but do not include raw provider secrets, raw prompts, full transcripts, screenshots, desktop recordings, or provider request or response bodies unless another command-specific raw export fact explicitly allows them @spec @later
 - satelle setup and repair Raw Diagnostic Exports apply the shared Satelle Raw Diagnostic Export warning, interactive and noninteractive consent, redaction, manifest, audit metadata, staging, failure-retention, and typed-error rules before any raw subprocess stream is captured or exported @spec @later

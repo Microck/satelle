@@ -548,6 +548,295 @@ fn ordinary_production_doctor_reports_blocked_probes_without_fake_readiness() {
 }
 
 #[test]
+fn production_doctor_fix_dry_run_delegates_a_normalized_setup_plan() {
+    let state = state_dir();
+    let output = production_satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor",
+            "--host",
+            "local-demo",
+            "--fix",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(75)
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    let setup = report["fix_flow"]["delegations"]
+        .as_array()
+        .and_then(|delegations| {
+            delegations
+                .iter()
+                .find(|delegation| delegation["owner"] == "setup")
+        })
+        .expect("provider readiness should delegate to setup ownership");
+
+    assert_eq!(report["fix_flow"]["request"], "dry_run");
+    assert_eq!(report["fix_flow"]["status"], "planned");
+    assert_eq!(setup["affected_scopes"], serde_json::json!(["provider"]));
+    assert!(setup["output"].is_object());
+    assert!(setup.get("stdout").is_none());
+    assert!(setup.get("stderr").is_none());
+}
+
+#[test]
+fn doctor_fix_stops_when_the_delegated_plan_requires_provider_input() {
+    let state = state_dir();
+    let config_file = state.path().join("missing-provider-source.toml");
+    let config = |include_source: bool| {
+        format!(
+            r#"
+default_host = "local"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.local]
+transport = "local"
+adapter = "fake"
+
+[hosts.local.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+auth_source = "operator-auth"
+{}
+"#,
+            if include_source {
+                r#"
+[hosts.local.provider_auth.operator-auth]
+kind = "environment"
+variable = "SATELLE_TEST_OPENAI_TOKEN"
+"#
+            } else {
+                ""
+            }
+        )
+    };
+    write_user_config(&config_file, config(true)).expect("write complete provider authorization");
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_TEST_OPENAI_TOKEN", "fixture-provider-token")
+        .args([
+            "setup",
+            "--host",
+            "local",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["host", "release-state"])
+        .assert()
+        .success();
+    write_user_config(&config_file, config(false))
+        .expect("remove the authorized provider source descriptor");
+
+    let output = production_satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor",
+            "--host",
+            "local",
+            "--scope",
+            "provider",
+            "--fix",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    let error = parse_json_output(&output.stderr);
+    let setup = report["fix_flow"]["delegations"]
+        .as_array()
+        .and_then(|delegations| {
+            delegations
+                .iter()
+                .find(|delegation| delegation["owner"] == "setup")
+        })
+        .expect("provider input should remain attached to the setup delegation");
+
+    assert_eq!(report["fix_flow"]["status"], "failed");
+    assert_eq!(setup["output"]["status"], "input_required");
+    assert_eq!(error["code"], "input-required");
+    assert!(
+        error["suggested_commands"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|command| {
+                command.as_str().is_some_and(|command| {
+                    command.contains("setup --host local --component provider-auth")
+                })
+            }))
+    );
+    assert!(!setup["command"].as_str().is_some_and(|command| {
+        command.contains("--no-input --yes") && !command.contains("--dry-run")
+    }));
+}
+
+#[test]
+fn production_doctor_fix_without_noninteractive_consent_emits_plan_and_typed_error() {
+    let state = state_dir();
+    let output = production_satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor",
+            "--host",
+            "local-demo",
+            "--fix",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .code(64)
+        .stderr(predicate::str::contains(
+            r#""code": "doctor-fix-consent-required""#,
+        ))
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+
+    assert_eq!(report["fix_flow"]["request"], "apply");
+    assert_eq!(report["fix_flow"]["status"], "planned");
+    assert!(
+        report["fix_flow"]["delegations"]
+            .as_array()
+            .is_some_and(|delegations| !delegations.is_empty())
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interactive_doctor_shows_findings_before_offering_a_fix_plan() {
+    let state = state_dir();
+    let executable = assert_cmd::cargo::cargo_bin!("satelle");
+    let mut command = std::process::Command::new(executable);
+    command
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_COMMAND_HISTORY", "false")
+        .env_remove(TEST_SUPPORT_ADAPTER_ENV)
+        .args(["doctor", "--host", "local-demo", "--scope", "provider"]);
+    let mut process = spawn_pty_command(command);
+
+    let finding_end = process.wait_for_after("[error]", 0);
+    let prompt_end = process.wait_for_after(
+        "Build a fix plan for the repairable Doctor findings?",
+        finding_end,
+    );
+    process.write_input("n\n");
+    let output = process.finish();
+    let rendered = combined_process_output(&output);
+
+    assert!(
+        finding_end < prompt_end,
+        "findings must precede consent: {rendered}"
+    );
+    assert!(!state.path().join("local-demo-state.json").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interactive_doctor_fix_decline_reports_typed_cancellation() {
+    let state = state_dir();
+    let executable = assert_cmd::cargo::cargo_bin!("satelle");
+    let mut command = std::process::Command::new(executable);
+    command
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_COMMAND_HISTORY", "false")
+        .env_remove(TEST_SUPPORT_ADAPTER_ENV)
+        .args([
+            "doctor",
+            "--host",
+            "local-demo",
+            "--scope",
+            "provider",
+            "--fix",
+        ]);
+    let mut process = spawn_pty_command(command);
+
+    let finding_end = process.wait_for_after("[error]", 0);
+    let confirmation_end = process.wait_for_after("Apply these Doctor fix plans?", finding_end);
+    process.write_input("n\n");
+    let output = process.finish();
+    let rendered = combined_process_output(&output);
+
+    assert!(
+        finding_end < confirmation_end,
+        "diagnostics and delegated plans must precede final consent: {rendered}"
+    );
+    assert!(
+        rendered.contains("Fix flow: cancelled"),
+        "decline must remain a typed terminal result: {rendered}"
+    );
+    assert!(!rendered.contains("Fix flow: completed"));
+    assert!(!state.path().join("local-demo-state.json").exists());
+}
+
+#[test]
+fn doctor_fix_trusted_profile_consent_reaches_the_delegated_target_without_raw_streams() {
+    let state = state_dir();
+    let config_file = state.path().join("config.toml");
+    write_user_config(
+        &config_file,
+        r#"
+[profiles.maintenance]
+trusted_profile = "maintenance"
+
+[trusted_profiles.maintenance]
+hosts = ["local-demo"]
+command_families = ["doctor_fix"]
+"#,
+    )
+    .expect("Doctor fix Trusted Profile config should be written");
+    let output = production_satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "--profile",
+            "maintenance",
+            "doctor",
+            "--host",
+            "local-demo",
+            "--fix",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .code(74)
+        .stderr(predicate::str::contains("doctor-fix-consent-required").not())
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    let serialized_report = serde_json::to_string(&report).expect("serialize Doctor report");
+
+    assert_eq!(report["fix_flow"]["status"], "failed");
+    assert!(
+        report["fix_flow"]["delegations"]
+            .as_array()
+            .is_some_and(|delegations| delegations.iter().any(|delegation| {
+                delegation["owner"] == "setup"
+                    && delegation["command"]
+                        .as_str()
+                        .is_some_and(|command| command.contains("--no-input --yes --json"))
+            }))
+    );
+    assert!(!serialized_report.contains(r#""stdout""#));
+    assert!(!serialized_report.contains(r#""stderr""#));
+}
+
+#[test]
 fn production_status_and_stop_do_not_read_or_mutate_demo_state() {
     let state = state_dir();
     let state_path = state.path().join("local-demo-state.json");
@@ -1137,8 +1426,10 @@ fn corrupt_sqlite_fails_closed_without_mutating_or_leaking_state() {
 #[test]
 fn stopping_terminal_turn_preserves_history_and_allows_later_steer() {
     let state = state_dir();
+    let cache = state.path().join("command-history-cache");
     let run_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "run",
             "--host",
@@ -1159,6 +1450,7 @@ fn stopping_terminal_turn_preserves_history_and_allows_later_steer() {
 
     let stop_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["stop", &session_id, "--json"])
         .assert()
         .success()
@@ -1189,6 +1481,7 @@ fn stopping_terminal_turn_preserves_history_and_allows_later_steer() {
 
     satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["stop", &session_id])
         .assert()
         .success()
@@ -1201,6 +1494,7 @@ fn stopping_terminal_turn_preserves_history_and_allows_later_steer() {
 
     let host_status = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["host", "status", "--json"])
         .assert()
         .success()
@@ -1212,6 +1506,7 @@ fn stopping_terminal_turn_preserves_history_and_allows_later_steer() {
 
     let steer_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "steer",
             &session_id,
@@ -1230,6 +1525,7 @@ fn stopping_terminal_turn_preserves_history_and_allows_later_steer() {
 
     let status_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["status", &session_id, "--json"])
         .assert()
         .success()
@@ -4763,6 +5059,86 @@ fn doctor_events_and_json_are_mutually_exclusive() {
         .stderr(predicate::str::contains(
             r#""code": "output-mode-conflict""#,
         ));
+}
+
+#[test]
+fn doctor_events_and_fix_are_mutually_exclusive() {
+    let state = state_dir();
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["doctor", "--host", "local-demo", "--events", "--fix"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            r#""code": "output-mode-conflict""#,
+        ));
+}
+
+#[test]
+fn doctor_refresh_fix_dry_run_is_rejected_without_mutating_state() {
+    let state = state_dir();
+    let provider_config = authorize_default_provider_binding(&state);
+
+    let output = assert_directory_tree_unchanged(
+        "satelle doctor --refresh --fix --dry-run",
+        state.path(),
+        || {
+            satelle()
+                .env("SATELLE_CONFIG_FILE", &provider_config)
+                .env("SATELLE_STATE_DIR", state.path())
+                .args([
+                    "doctor",
+                    "--host",
+                    "local-demo",
+                    "--scope",
+                    "provider",
+                    "--refresh",
+                    "--fix",
+                    "--dry-run",
+                    "--json",
+                ])
+                .assert()
+                .code(64)
+                .get_output()
+                .clone()
+        },
+    );
+    let error = parse_json_output(&output.stderr);
+
+    assert_eq!(error["code"], "invalid-usage");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--refresh cannot be combined"))
+    );
+}
+
+#[test]
+fn doctor_explicit_dry_run_publishes_a_conditional_fix_flow() {
+    let state = state_dir();
+    let provider_config = authorize_default_provider_binding(&state);
+    let output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "doctor",
+            "--host",
+            "local-demo",
+            "--fix",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+
+    assert_eq!(report["fix_flow"]["request"], "dry_run");
+    assert_eq!(report["fix_flow"]["status"], "planned");
+    assert_eq!(report["fix_flow"]["delegations"], serde_json::json!([]));
+    assert!(report["fix_flow"].get("postcheck").is_none());
 }
 
 #[test]
