@@ -1373,9 +1373,9 @@
 
 ## phase-0-upstream-contract
 - phase 0 is complete when one real supported Host exposes readiness and approval state, performs one harmless action, completes one attached native Codex Computer Use Turn through app-server, restores current Session state to a fresh Client after reconnect, starts one detached steer Turn, stops that Turn, and confirms its stopped state @spec @phase0 @mvp
-- phase 0 records the supported Codex and app-server version range plus the required start, event, approval, steer, stop, and recovery capability matrix without exposing upstream method names as public Satelle contracts @spec @phase0 @mvp
-- a missing required upstream capability produces an explicit typed blocker and prevents Satelle from claiming the affected workflow as supported @spec @phase0 @mvp
-- phase 0 rejects terminal UI scraping or undocumented GUI automation as a substitute for a missing app-server contract unless the product specification is explicitly revised @spec @phase0 @mvp
+- phase 0 records the supported Codex and app-server version range plus the required start, event, approval, steer, stop, and recovery capability matrix without exposing upstream method names as public Satelle contracts @spec @phase0 @mvp @implemented
+- a missing required upstream capability produces an explicit typed blocker and prevents Satelle from claiming the affected workflow as supported @spec @phase0 @mvp @implemented
+- phase 0 rejects terminal UI scraping or undocumented GUI automation as a substitute for a missing app-server contract unless the product specification is explicitly revised @spec @phase0 @mvp @implemented
 
 ## phase-1-core-contracts
 - phase 1 freezes Satelle domain vocabulary, public identifiers, API envelopes, typed errors, configuration trust boundaries, event schemas, Control Lease invariants, and persistence contracts @spec @phase1 @mvp @implemented
@@ -1384,7 +1384,7 @@
 
 ## phase-2-local-vertical-slice
 - phase 2 implements one real Host Daemon API, SQLite-backed authoritative state, transactional Control Lease acquisition, and the Codex adapter on one supported Computer Use Host Platform @spec @phase2 @mvp
-- phase 2 proves setup, doctor, run, status, steer, stop, logs, reconnect, restart recovery, redaction, and idempotency through the same public contracts @spec @phase2 @mvp
+- phase 2 proves setup, doctor, run, status, steer, stop, logs, reconnect, restart recovery, redaction, and idempotency through the same public contracts @spec @phase2 @mvp @implemented
 - phase 2 transport conformance uses real HTTP and WebSocket connections even when the Host Daemon runs in the same test process @spec @phase2 @mvp @implemented
 
 ## phase-3-remote-mvp
@@ -2407,7 +2407,7 @@
 
 ## contract-suites
 - the ci tag is reserved for command-bearing facts, while manual conformance and release-gate requirements use the verification tag until an executable mapping exists @spec @mvp @implemented
-- every versioned JSON and NDJSON surface has contract tests for schema_version, required fields, enum tokens, stdout, stderr, and exit status @spec @verification @mvp
+- every versioned JSON and NDJSON surface has contract tests for schema_version, required fields, enum tokens, stdout, stderr, and exit status @spec @verification @mvp @implemented
 - id: zox
   label: parser failures and semantic validation failures share the same human and JSON error conformance suite
   command: cargo test --locked -p satelle-cli --test error-output-contract parser_and_semantic_usage_failures_share_the_human_and_json_contract_and_status -- --exact
@@ -2425,9 +2425,9 @@
 - label: Host Daemon restart tests prove recovery_pending reconciliation before replacement Turn admission
   command: cargo test --locked -p satelle-host --lib storage::tests::lifecycle::restart_marks_active_turn_recovery_pending_and_retains_lease -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::new_admission_reconciles_restart_work_without_blocking_reads -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::unknown_restart_work_blocks_new_admission_until_stop_resolves_it -- --exact
   tags: [spec, verification, mvp, implemented, ci]
-- setup, repair, Host update, self-update remotes, and doctor fix have no-mutation dry-run tests @spec @verification @mvp
+- setup, repair, Host update, self-update remotes, and doctor fix have no-mutation dry-run tests @spec @verification @mvp @implemented
 - later storage migration and config repair have no-mutation dry-run tests @spec @verification @later
-- a canary secret and canary prompt are absent from every normal log, error, event, setup ledger, status result, and public API response @spec @verification @mvp
+- a canary secret and canary prompt are absent from every normal log, error, event, setup ledger, status result, and public API response @spec @verification @mvp @implemented
 - later diagnostic bundle and Raw Diagnostic Export redaction tests remove canary secrets from every artifact category covered by the declared redaction policy @spec @verification @later
 - label: project configuration trust tests prove a checkout cannot replace a concrete Host Binding, redirect an endpoint, select an unauthorized binding, or activate consent and YOLO policy
   command: cargo test --locked -p satelle-cli --features test-support --test project-host-binding && cargo test --locked -p satelle-cli --features test-support --test cli project_config_forbidden_keys_report_typed_errors -- --exact && cargo test --locked -p satelle-cli --features test-support --test config-profiles untrusted_profile_selectors_do_not_activate_yolo_policy -- --exact

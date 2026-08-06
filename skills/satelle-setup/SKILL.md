@@ -29,9 +29,9 @@ Completion criterion: any missing provider auth is represented as a descriptor o
 
 4. Separate consent from configuration.
 
-If the setup plan contains mutations, ask the user before using `--yes`. Never treat project config, profile selection, YOLO mode, or prior prompts as mutation consent.
+If the setup plan contains mutations, ask the user before using `--yes`. Project config, ordinary profile selection, YOLO mode, and prior prompts are not mutation consent. An applicable Trusted Profile can grant ordinary mutation consent only when an explicitly selected user-owned profile names it for the exact Host and command family. It cannot authorize provider-secret entry or replacement.
 
-Completion criterion: either no mutation is needed, or the user explicitly approved the exact setup command that mutates the host.
+Completion criterion: either no mutation is needed, the user explicitly approved the exact setup command, or an applicable user-owned Trusted Profile grants setup consent for the exact Host.
 
 5. Verify readiness.
 

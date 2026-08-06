@@ -1,5 +1,7 @@
 use super::RuntimeTurnOutcome;
-use super::adapter::{AdapterSubject, ExecuteHooks, ExecuteRequest, UpstreamReference};
+use super::adapter::{
+    AdapterSubject, AdmittedAppApproval, ExecuteHooks, ExecuteRequest, UpstreamReference,
+};
 use super::request::LocalLiveEventBuffer;
 use super::{RuntimeEngine, RuntimeTurnFailure, model};
 use crate::storage::{
@@ -254,6 +256,7 @@ pub(super) struct ExecutionPlan {
     pub(super) host: String,
     pub(super) prompt: String,
     pub(super) execution_mode: TurnExecutionMode,
+    pub(super) admitted_app_approval: AdmittedAppApproval,
     pub(super) work: TurnWork,
     pub(super) provider_smoke_event: Option<satelle_core::SatelleEventBody>,
     pub(super) resolved_provider_binding: Option<ResolvedProviderBinding>,
@@ -411,6 +414,7 @@ impl RuntimeEngine {
                 ),
                 plan.attachments.images(),
             )
+            .with_admitted_app_approval(&plan.admitted_app_approval)
             .with_resolved_provider_binding(plan.resolved_provider_binding.as_ref())
             .with_resolved_provider_secret(resolved_provider_secret),
         ) {

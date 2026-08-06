@@ -58,8 +58,17 @@ had_receipt=0
 active_command_pid=""
 active_wait_pid=""
 
+remove_file_if_present() {
+  remove_path=$1
+  if [ -e "$remove_path" ] || [ -L "$remove_path" ]; then
+    rm -f "$remove_path"
+  fi
+}
+
 rollback_install() {
-  rm -f "$binary_path" "$receipt_path" "$install_path" "$staged_receipt_path"
+  for rollback_path in "$binary_path" "$receipt_path" "$install_path" "$staged_receipt_path"; do
+    remove_file_if_present "$rollback_path"
+  done
   if [ "$had_binary" -eq 1 ] && [ -f "$previous_binary_path" ]; then
     mv -f "$previous_binary_path" "$binary_path"
   fi
@@ -85,7 +94,7 @@ cleanup() {
     rollback_install
   fi
   for cleanup_path in "$install_path" "$staged_receipt_path" "$previous_binary_path" "$previous_receipt_path"; do
-    [ -z "$cleanup_path" ] || rm -f "$cleanup_path"
+    [ -z "$cleanup_path" ] || remove_file_if_present "$cleanup_path"
   done
   [ -z "$temporary_root" ] || rm -rf "$temporary_root"
   if [ "$lock_held" -eq 1 ]; then
@@ -164,8 +173,8 @@ if [ "$uninstall" -eq 1 ]; then
     printf '%s\n' "Satelle install receipt not found at $receipt_path" >&2
     exit 1
   }
-  rm -f "$binary_path"
-  rm -f "$receipt_path"
+  remove_file_if_present "$binary_path"
+  remove_file_if_present "$receipt_path"
   printf '%s\n' "Uninstalled Satelle from $binary_path"
   exit 0
 fi
@@ -404,7 +413,8 @@ fi
 commit_started=1
 if mv -f "$install_path" "$binary_path" && mv -f "$staged_receipt_path" "$receipt_path"; then
   commit_started=0
-  rm -f "$previous_binary_path" "$previous_receipt_path"
+  remove_file_if_present "$previous_binary_path"
+  remove_file_if_present "$previous_receipt_path"
 else
   rollback_install
   printf '%s\n' "Satelle installation could not commit the binary and receipt" >&2

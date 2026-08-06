@@ -372,6 +372,87 @@ fn current_windows_app_policy_is_stable_and_does_not_retain_app_ids() {
 }
 
 #[test]
+fn current_windows_app_ids_are_loaded_only_for_ephemeral_callback_policy() {
+    let allowed = computer_use_allowed_app_ids_from_config(concat!(
+        "model = \"fixture\"\n",
+        "[computer_use.windows]\n",
+        "always_allowed_app_ids = [\"fixture-paint.exe\", \"308046B0AF4A39CB\"]\n",
+    ))
+    .expect("parse current Windows app policy");
+
+    assert_eq!(
+        allowed,
+        BTreeSet::from([
+            "308046B0AF4A39CB".to_string(),
+            "fixture-paint.exe".to_string(),
+        ])
+    );
+    assert!(computer_use_allowed_app_ids_from_config("invalid = [").is_none());
+}
+
+#[test]
+fn current_macos_persistent_app_ids_are_loaded_from_the_signed_helpers_group_container() {
+    let home = tempfile::TempDir::new().expect("create deterministic macOS home");
+    let approvals = home
+        .path()
+        .join("Library")
+        .join("Group Containers")
+        .join("2DC432GLL2.com.openai.sky.CUAService")
+        .join("Library")
+        .join("Application Support")
+        .join("Software")
+        .join("ComputerUseAppApprovals.json");
+    std::fs::create_dir_all(approvals.parent().unwrap())
+        .expect("create OpenAI approval container fixture");
+    std::fs::write(
+        &approvals,
+        r#"{"approvedBundleIdentifiers":["com.apple.Safari"]}"#,
+    )
+    .expect("write OpenAI approval fixture");
+
+    assert_eq!(
+        macos_computer_use_allowed_app_ids(home.path()),
+        BTreeSet::from(["com.apple.Safari".to_string()])
+    );
+
+    std::fs::write(&approvals, r#"{"approvedBundleIdentifiers":"Safari"}"#)
+        .expect("write malformed OpenAI approval fixture");
+    assert!(macos_computer_use_allowed_app_ids(home.path()).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn macos_persistent_app_ids_reject_a_redirected_container_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempfile::TempDir::new().expect("create deterministic macOS home");
+    let group_root = home
+        .path()
+        .join("Library")
+        .join("Group Containers")
+        .join("2DC432GLL2.com.openai.sky.CUAService");
+    let redirected = home.path().join("redirected-software");
+    std::fs::create_dir_all(&redirected).expect("create redirected approval directory");
+    std::fs::write(
+        redirected.join("ComputerUseAppApprovals.json"),
+        r#"{"approvedBundleIdentifiers":["com.apple.Safari"]}"#,
+    )
+    .expect("write redirected OpenAI approval fixture");
+    std::fs::create_dir_all(group_root.join("Library").join("Application Support"))
+        .expect("create exact app-group ancestors");
+    symlink(
+        &redirected,
+        group_root
+            .join("Library")
+            .join("Application Support")
+            .join("Software"),
+    )
+    .expect("redirect the Software ancestor");
+
+    assert!(macos_computer_use_allowed_app_ids(home.path()).is_empty());
+}
+
+#[test]
 fn legacy_allow_list_is_private_migration_input() {
     let codex_home = tempfile::TempDir::new().expect("create deterministic Codex home");
     std::fs::create_dir(codex_home.path().join("computer-use"))
@@ -990,7 +1071,7 @@ fn repeated_interrupted_kill_retries_stop_at_the_shared_deadline() {
 
 #[cfg(unix)]
 #[test]
-fn version_probe_deadline_survives_a_group_escaping_pipe_holder() {
+fn complete_version_does_not_wait_for_a_group_escaping_pipe_holder() {
     let fixture = super::control_plane_tests::compile_stdio_fixture();
     let mut command = Command::new(fixture.executable());
     command.arg("version-with-escaped-descendant");
@@ -998,7 +1079,12 @@ fn version_probe_deadline_survives_a_group_escaping_pipe_holder() {
 
     let evidence = probe_codex_version_command(command, Duration::from_millis(100));
 
-    assert_eq!(evidence, CodexVersionEvidence::Unavailable);
+    assert_eq!(
+        evidence,
+        CodexVersionEvidence::Detected {
+            version: CodexVersion::new(0, 144, 0)
+        }
+    );
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "an escaped stdout holder exceeded the version probe deadline"

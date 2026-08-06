@@ -17,7 +17,6 @@ use crate::provider_auth::{
     ResolvedProviderSecret, resolve_provider_secret,
 };
 use crate::{DEFAULT_MODEL_BINDING, DEFAULT_PROVIDER_BINDING, READINESS_CANCELLATION_GRACE};
-use command_group::{CommandGroup, GroupChild};
 use satelle_core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy,
@@ -32,9 +31,10 @@ use satelle_core::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::process::Command;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
@@ -89,9 +89,16 @@ struct ProviderProbePersistence<'a> {
     provider_secret: Option<ResolvedProviderSecret>,
 }
 
+struct ProviderPreflightContext<'a> {
+    cached_provider: Option<ProviderSmokeResult>,
+    provider_intent: &'a ProviderComputerUseIntent,
+    allowed_app_ids: &'a BTreeSet<String>,
+}
+
 struct ProviderSmokeInvocation<'a> {
     key: &'a ReadinessCacheKey,
     binding: &'a ResolvedProviderBinding,
+    allowed_app_ids: &'a BTreeSet<String>,
     provider_secret: Option<ResolvedProviderSecret>,
     provider_credential_fingerprint: &'a str,
     source: ProviderSmokeSource,
@@ -119,10 +126,14 @@ fn supported_execution_version(
         .evidence
         .host_platform
         .supports_native_computer_use()
-        || !snapshot.verdict.is_supported()
     {
         return Err(crate::execution_blocker(&snapshot.verdict));
     }
+    // The operation-specific control-plane gate runs before this check, and
+    // RuntimeEngine::preflight owns the exact live Host readiness key. Requiring
+    // the aggregate Phase 0 verdict here would make the first live probe
+    // impossible because that verdict intentionally starts with live proof
+    // unobserved.
     Ok(version)
 }
 
@@ -262,9 +273,14 @@ impl ProductionComputerUseAdapter {
                 resolved.clone()
             }
             None => {
-                let command = crate::codex_capabilities::installed_app_server_command()?;
-                let defaults = crate::codex_capabilities::probe_effective_codex_defaults(command)
-                    .map_err(|_| codex_effective_defaults_unavailable())?;
+                let deadline = Instant::now()
+                    .checked_add(Duration::from_secs(5))
+                    .ok_or_else(codex_effective_defaults_unavailable)?;
+                let app_server =
+                    crate::codex_capabilities::installed_read_only_app_server_command(deadline)?;
+                let defaults =
+                    crate::codex_capabilities::probe_effective_codex_defaults(app_server)
+                        .map_err(|_| codex_effective_defaults_unavailable())?;
                 ResolvedProviderBinding::from_authorization(
                     ProviderBindingAuthorization::new(
                         DEFAULT_MODEL_BINDING,
@@ -303,7 +319,7 @@ impl ProductionComputerUseAdapter {
     fn native_readiness_key(
         &self,
         provider_intent: &ProviderComputerUseIntent,
-    ) -> Result<(ReadinessCacheKey, ResolvedProviderBinding), SatelleError> {
+    ) -> Result<(ReadinessCacheKey, ResolvedProviderBinding, BTreeSet<String>), SatelleError> {
         let snapshot = crate::read_production_snapshot(&self.snapshot)?;
         snapshot
             .control_plane_admission
@@ -315,7 +331,13 @@ impl ProductionComputerUseAdapter {
         let desktops = crate::desktop_sessions::discover()?;
         let platform = crate::codex_capabilities::HostPlatform::current().as_str();
         let desktop = resolve_desktop_session_for(platform, &desktops, &self.desktop_selection)?;
-        let observations = native_prerequisite_observations(platform, desktop, app_policy_surface);
+        let allowed_app_ids = crate::codex_capabilities::configured_computer_use_allowed_app_ids();
+        let observations = native_prerequisite_observations(
+            platform,
+            desktop,
+            app_policy_surface,
+            &allowed_app_ids,
+        );
         let desktop_binding = DesktopBindingRef::new(desktop.desktop_user.clone())
             .map_err(|_| adapter_failure("desktop_binding_invalid"))?;
         let resolved_binding = self.resolve_provider_binding(provider_intent)?;
@@ -373,7 +395,7 @@ impl ProductionComputerUseAdapter {
         )
         .map(|key| key.with_provider_binding(&resolved_binding))
         .map_err(|_| adapter_failure("readiness_key_invalid"))?;
-        Ok((key, resolved_binding))
+        Ok((key, resolved_binding, allowed_app_ids))
     }
 
     fn readiness_from_evidence(
@@ -381,17 +403,11 @@ impl ProductionComputerUseAdapter {
         key: &ReadinessCacheKey,
         binding: &ResolvedProviderBinding,
         evidence: ReadinessEvidence,
-        cached_provider: Option<ProviderSmokeResult>,
-        provider_intent: &ProviderComputerUseIntent,
         persistence: &mut ProviderProbePersistence<'_>,
+        provider: ProviderPreflightContext<'_>,
     ) -> AdapterPreflight {
-        match self.run_required_provider_smoke(
-            key,
-            binding,
-            cached_provider,
-            provider_intent,
-            persistence,
-        ) {
+        let admitted_allowed_app_ids = provider.allowed_app_ids.to_owned();
+        match self.run_required_provider_smoke(key, binding, persistence, provider) {
             Ok(prepared_provider) => {
                 let PreparedProviderAdmission {
                     evidence: provider_smoke_evidence,
@@ -402,6 +418,7 @@ impl ProductionComputerUseAdapter {
                     key,
                     binding.clone(),
                     evidence,
+                    admitted_allowed_app_ids,
                     provider_smoke_evidence,
                     source,
                 )
@@ -434,6 +451,7 @@ impl ProductionComputerUseAdapter {
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
         persistence: &mut ProviderProbePersistence<'_>,
+        allowed_app_ids: &BTreeSet<String>,
     ) -> AdapterPreflight {
         let observed_at = time::OffsetDateTime::now_utc();
         let Some(expires_at) = observed_at.checked_add(self.native_readiness_ttl) else {
@@ -470,14 +488,18 @@ impl ProductionComputerUseAdapter {
             persistence.cancellation,
             &mut persist_thread_ref,
             &mut persist_turn_ref,
+            allowed_app_ids,
         ) {
             Ok(()) => self.readiness_from_evidence(
                 &key,
                 &binding,
                 evidence,
-                cached_provider,
-                provider_intent,
                 persistence,
+                ProviderPreflightContext {
+                    cached_provider,
+                    provider_intent,
+                    allowed_app_ids,
+                },
             ),
             Err(failure) => AdapterPreflight::Failed {
                 key,
@@ -494,8 +516,8 @@ impl ProductionComputerUseAdapter {
         cancellation: Option<&super::request::AdmissionCancellation>,
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        allowed_app_ids: &BTreeSet<String>,
     ) -> Result<(), NativeSmokeFailure> {
-        let nonce = format!("SATELLE-{}", satelle_core::TurnId::new());
         let deadline = cancellation
             .and_then(super::request::AdmissionCancellation::deadline)
             .map_or_else(
@@ -503,10 +525,6 @@ impl ProductionComputerUseAdapter {
                 Some,
             )
             .ok_or_else(|| native_smoke_failure("native_readiness_timeout_invalid"))?;
-        let target_timeout = deadline.saturating_duration_since(Instant::now());
-        let mut target =
-            NativeActionTarget::spawn(&nonce, target_timeout).map_err(native_smoke_failure)?;
-        wait_for_native_target_start(deadline, cancellation)?;
         let working_directory = self
             .working_directory
             .as_ref()
@@ -515,17 +533,25 @@ impl ProductionComputerUseAdapter {
                 prepare_working_directory(path)
                     .map_err(|_| native_smoke_failure("working_directory_unavailable"))
             })?;
-        let prompt = native_readiness_prompt(&nonce);
-        let command =
-            crate::codex_capabilities::installed_app_server_command().map_err(|error| {
-                NativeSmokeFailure {
-                    reason: "managed_codex_receipt_invalid",
-                    error: Box::new(error),
-                    dispatch_possible: false,
-                }
+        let verified_app_server = crate::codex_capabilities::installed_computer_use_app_server()
+            .map_err(|error| NativeSmokeFailure {
+                reason: "managed_codex_receipt_invalid",
+                error: Box::new(error),
+                dispatch_possible: false,
             })?;
+        let native_action_evidence = verified_app_server.native_action_evidence();
+        let target =
+            NativeActionTarget::spawn(deadline, cancellation, native_action_evidence.clone())
+                .map_err(native_smoke_failure)?;
+        let prompt = native_readiness_prompt(
+            target.page_url(),
+            &verified_app_server.native_action_path,
+            &native_action_evidence,
+        )
+        .map_err(native_smoke_failure)?;
+        let expected_mcp_server_name = verified_app_server.native_mcp_server_name;
         let run = run_codex_session_with_timeout_cancellation(
-            command,
+            verified_app_server.command,
             CodexSessionRequest {
                 working_directory: &working_directory,
                 prompt: &prompt,
@@ -541,6 +567,9 @@ impl ProductionComputerUseAdapter {
                 persist_thread_ref,
                 persist_turn_ref,
                 observe_native_approval: None,
+                native_action_evidence: Some(native_action_evidence.clone()),
+                expected_mcp_server_name: &expected_mcp_server_name,
+                computer_use_allowed_app_ids: allowed_app_ids,
                 control: None,
                 goal_set_supported: false,
                 image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -549,23 +578,27 @@ impl ProductionComputerUseAdapter {
             READINESS_CANCELLATION_GRACE,
             cancellation.cloned(),
         );
-        let terminal = classify_native_probe_run(run)?;
-        if terminal != CodexSessionTerminal::Completed {
-            return Err(native_smoke_failure("native_readiness_session_failed"));
+        let action_result = target.wait_for_success();
+        if action_result.is_ok() && !native_action_evidence.completed() {
+            return Err(native_smoke_failure(
+                "native_readiness_action_evidence_unavailable",
+            ));
         }
-        target
-            .wait_for_success(deadline, cancellation)
-            .map_err(native_smoke_failure)
+        classify_native_probe_completion(run, action_result)
     }
 
     fn run_required_provider_smoke(
         &self,
         key: &ReadinessCacheKey,
         binding: &ResolvedProviderBinding,
-        cached_provider: Option<ProviderSmokeResult>,
-        provider_intent: &ProviderComputerUseIntent,
         persistence: &mut ProviderProbePersistence<'_>,
+        provider: ProviderPreflightContext<'_>,
     ) -> Result<PreparedProviderAdmission, Box<ProviderSmokeAttemptFailure>> {
+        let ProviderPreflightContext {
+            cached_provider,
+            provider_intent,
+            allowed_app_ids,
+        } = provider;
         let candidate_secret_supplied = persistence.provider_secret.is_some();
         let provider_secret = match persistence.provider_secret.take() {
             Some(secret) => Some(secret),
@@ -624,6 +657,7 @@ impl ProductionComputerUseAdapter {
                 ProviderSmokeInvocation {
                     key,
                     binding,
+                    allowed_app_ids,
                     provider_secret,
                     provider_credential_fingerprint: &provider_credential_fingerprint,
                     source,
@@ -690,7 +724,9 @@ impl ProductionComputerUseAdapter {
         persistence: &mut ProviderProbePersistence<'_>,
     ) -> Result<ProviderSmokeEvidence, SatelleError> {
         self.run_live_provider_smoke_with_app_server(invocation, persistence, || {
-            preserve_managed_codex_error(crate::codex_capabilities::installed_app_server_command())
+            preserve_managed_codex_error(
+                crate::codex_capabilities::installed_computer_use_app_server(),
+            )
         })
     }
 
@@ -698,11 +734,15 @@ impl ProductionComputerUseAdapter {
         &self,
         invocation: ProviderSmokeInvocation<'_>,
         persistence: &mut ProviderProbePersistence<'_>,
-        app_server_command: impl FnOnce() -> Result<Command, SatelleError>,
+        app_server_command: impl FnOnce() -> Result<
+            crate::codex_capabilities::VerifiedComputerUseAppServer,
+            SatelleError,
+        >,
     ) -> Result<ProviderSmokeEvidence, SatelleError> {
         let ProviderSmokeInvocation {
             key,
             binding,
+            allowed_app_ids,
             provider_secret,
             provider_credential_fingerprint,
             source,
@@ -734,16 +774,22 @@ impl ProductionComputerUseAdapter {
         let prompt = format!(
             "Use native Computer Use only to open {page_url} in the approved visible browser. Read the nonce shown on the page, drag the marker into the drop target, and stop. Do not use shell, file, or network tools."
         );
+        let verified_app_server = app_server_command()?;
+        let expected_mcp_server_name = verified_app_server.native_mcp_server_name;
         let run = run_codex_session_with_timeout_cancellation(
-            app_server_command()?,
+            verified_app_server.command,
             provider_smoke_session_request(
                 binding,
                 provider_secret,
                 &working_directory,
                 &prompt,
                 deadline,
-                persistence.persist_thread_ref,
-                persistence.persist_turn_ref,
+                &expected_mcp_server_name,
+                ProviderSmokeSessionControl {
+                    computer_use_allowed_app_ids: allowed_app_ids,
+                    persist_thread_ref: persistence.persist_thread_ref,
+                    persist_turn_ref: persistence.persist_turn_ref,
+                },
             ),
             READINESS_CANCELLATION_GRACE,
             persistence.cancellation.cloned(),
@@ -845,8 +891,10 @@ impl ProductionComputerUseAdapter {
             .ok()
             .and_then(|path| prepare_working_directory(path).ok())?;
         let deadline = Instant::now().checked_add(Duration::from_secs(5))?;
+        let app_server =
+            crate::codex_capabilities::installed_read_only_app_server_command(deadline).ok()?;
         read_codex_turn(
-            crate::codex_capabilities::installed_app_server_command().ok()?,
+            app_server,
             CodexTurnReadRequest {
                 working_directory: &working_directory,
                 thread_ref,
@@ -872,8 +920,10 @@ impl ProductionComputerUseAdapter {
             .ok()
             .and_then(|path| prepare_working_directory(path).ok())?;
         let deadline = Instant::now().checked_add(Duration::from_secs(5))?;
+        let app_server =
+            crate::codex_capabilities::installed_read_only_app_server_command(deadline).ok()?;
         read_codex_turn(
-            crate::codex_capabilities::installed_app_server_command().ok()?,
+            app_server,
             CodexTurnReadRequest {
                 working_directory: &working_directory,
                 thread_ref,
@@ -891,7 +941,7 @@ impl ProductionComputerUseAdapter {
         cached_provider: Option<ProviderSmokeResult>,
         persistence: &mut ProviderProbePersistence<'_>,
     ) -> AdapterPreflight {
-        let (key, binding) = match self.native_readiness_key(provider_intent) {
+        let (key, binding, allowed_app_ids) = match self.native_readiness_key(provider_intent) {
             Ok(resolved) => resolved,
             Err(error) => return AdapterPreflight::UncachedFailure(error),
         };
@@ -903,9 +953,12 @@ impl ProductionComputerUseAdapter {
                 &key,
                 &binding,
                 evidence,
-                cached_provider,
-                provider_intent,
                 persistence,
+                ProviderPreflightContext {
+                    cached_provider,
+                    provider_intent,
+                    allowed_app_ids: &allowed_app_ids,
+                },
             ),
             None => self.live_native_preflight(
                 key,
@@ -913,9 +966,16 @@ impl ProductionComputerUseAdapter {
                 cached_provider,
                 provider_intent,
                 persistence,
+                &allowed_app_ids,
             ),
         }
     }
+}
+
+struct ProviderSmokeSessionControl<'a> {
+    computer_use_allowed_app_ids: &'a BTreeSet<String>,
+    persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
+    persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
 }
 
 fn provider_smoke_session_request<'a>(
@@ -924,9 +984,14 @@ fn provider_smoke_session_request<'a>(
     working_directory: &'a Path,
     prompt: &'a str,
     deadline: Instant,
-    persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
-    persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
+    expected_mcp_server_name: &'a str,
+    control: ProviderSmokeSessionControl<'a>,
 ) -> CodexSessionRequest<'a> {
+    let ProviderSmokeSessionControl {
+        computer_use_allowed_app_ids,
+        persist_thread_ref,
+        persist_turn_ref,
+    } = control;
     CodexSessionRequest {
         working_directory,
         prompt,
@@ -942,6 +1007,9 @@ fn provider_smoke_session_request<'a>(
         persist_thread_ref,
         persist_turn_ref,
         observe_native_approval: None,
+        native_action_evidence: None,
+        expected_mcp_server_name,
+        computer_use_allowed_app_ids,
         control: None,
         goal_set_supported: false,
         image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -1092,6 +1160,7 @@ fn native_readiness_from_evidence(
     key: &ReadinessCacheKey,
     binding: ResolvedProviderBinding,
     evidence: ReadinessEvidence,
+    computer_use_allowed_app_ids: BTreeSet<String>,
     provider_smoke_evidence: Option<ProviderSmokeEvidence>,
     source: ReadinessSource,
 ) -> Result<AdapterReadiness, EvidenceError> {
@@ -1104,320 +1173,102 @@ fn native_readiness_from_evidence(
         provider_smoke_evidence,
         Some(binding),
     )
-    .map(|readiness| readiness.with_source(source))
+    .map(|readiness| {
+        readiness
+            .with_admitted_app_approval(computer_use_allowed_app_ids)
+            .with_source(source)
+    })
 }
 
 struct NativeActionTarget {
-    child: GroupChild,
+    surface: crate::provider_probe::ProviderProbeSurface,
 }
 
 impl NativeActionTarget {
-    fn spawn(nonce: &str, timeout: Duration) -> Result<Self, &'static str> {
-        let mut command = native_action_command(nonce, timeout)?;
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        command
-            .group_spawn()
-            .map(|child| Self { child })
-            .map_err(|_| "native_readiness_target_unavailable")
-    }
-
-    fn wait_for_success(
-        &mut self,
+    fn spawn(
         deadline: Instant,
         cancellation: Option<&super::request::AdmissionCancellation>,
-    ) -> Result<(), &'static str> {
-        loop {
-            if cancellation
-                .is_some_and(super::request::AdmissionCancellation::is_requested_or_expired)
-            {
-                let _ = crate::codex_capabilities::terminate_group(&mut self.child);
-                return Err("native_readiness_cancelled");
-            }
-            match self.child.try_wait() {
-                Ok(Some(status)) if status.success() => return Ok(()),
-                Ok(Some(_)) => return Err("native_readiness_action_not_observed"),
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Ok(None) => {
-                    let _ = crate::codex_capabilities::terminate_group(&mut self.child);
-                    return Err("native_readiness_timed_out");
-                }
-                Err(_) => return Err("native_readiness_target_failed"),
-            }
+        evidence: crate::provider_probe::NativeActionEvidence,
+    ) -> Result<Self, &'static str> {
+        let surface = crate::provider_probe::ProviderProbeSurface::start_native_with_evidence(
+            deadline,
+            cancellation.cloned(),
+            evidence,
+        );
+        surface
+            .map(|surface| Self { surface })
+            .map_err(native_target_error)
+    }
+
+    fn page_url(&self) -> &str {
+        self.surface.page_url()
+    }
+
+    fn wait_for_success(self) -> Result<(), &'static str> {
+        self.surface
+            .wait_for_completion()
+            .map_err(native_target_error)
+    }
+}
+
+fn native_target_error(error: crate::provider_probe::ProviderProbeError) -> &'static str {
+    match error {
+        crate::provider_probe::ProviderProbeError::TimedOut => "native_readiness_timed_out",
+        crate::provider_probe::ProviderProbeError::NativeClickNotObserved => {
+            "native_readiness_click_not_observed"
+        }
+        crate::provider_probe::ProviderProbeError::NativeDragNotObserved => {
+            "native_readiness_drag_not_observed"
+        }
+        crate::provider_probe::ProviderProbeError::Cancelled => "native_readiness_cancelled",
+        crate::provider_probe::ProviderProbeError::Bind(_)
+        | crate::provider_probe::ProviderProbeError::Random(_)
+        | crate::provider_probe::ProviderProbeError::WorkerSpawn(_) => {
+            "native_readiness_target_unavailable"
+        }
+        crate::provider_probe::ProviderProbeError::InvalidRequest => {
+            "native_readiness_callback_invalid"
+        }
+        crate::provider_probe::ProviderProbeError::Io(_)
+        | crate::provider_probe::ProviderProbeError::WorkerStopped => {
+            "native_readiness_target_failed"
         }
     }
 }
 
-fn wait_for_native_target_start(
-    deadline: Instant,
-    cancellation: Option<&super::request::AdmissionCancellation>,
-) -> Result<(), NativeSmokeFailure> {
-    let ready_at = Instant::now()
-        .checked_add(Duration::from_millis(200))
-        .unwrap_or(deadline)
-        .min(deadline);
-    loop {
-        if cancellation.is_some_and(super::request::AdmissionCancellation::is_requested_or_expired)
-        {
-            return Err(native_smoke_failure("native_readiness_cancelled"));
+fn native_readiness_prompt(
+    page_url: &str,
+    action_path: &crate::codex_capabilities::NativeComputerUseActionPath,
+    native_action_evidence: &crate::provider_probe::NativeActionEvidence,
+) -> Result<String, &'static str> {
+    let page_url = serde_json::to_string(page_url).expect("a loopback URL is JSON representable");
+    match action_path {
+        crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl {
+            client_module_base64,
+            client_module_url,
+        } => {
+            let client_module_base64 = serde_json::to_string(client_module_base64)
+                .expect("authenticated module bytes are JSON string representable");
+            let client_module_url = serde_json::to_string(client_module_url)
+                .expect("an authenticated module URL is JSON string representable");
+            let script = format!(
+                "var clientModuleBase64 = {client_module_base64}; var clientModuleUrl = {client_module_url}; var registerHooks = (await import('node:module')).registerHooks; registerHooks({{ load(url, context, nextLoad) {{ if (url === clientModuleUrl) return {{ format: 'module', source: Buffer.from(clientModuleBase64, 'base64'), shortCircuit: true }}; return nextLoad(url, context); }} }}); var client = await import(clientModuleUrl); await client.setupComputerUseRuntime({{ globals: globalThis }}); var apps = await sky.list_apps(); var browser = apps.find(app => app.id === 'Helium'); if (!browser) throw new Error('Helium is unavailable'); var browserWindow = browser.windows[0]; if (!browserWindow) {{ await sky.launch_app({{ app: browser.id }}); apps = await sky.list_apps(); browser = apps.find(app => app.id === 'Helium'); browserWindow = browser.windows[0]; }} await sky.activate_window({{ window: browserWindow }}); await sky.press_key({{ window: browserWindow, key: 'Control_L+l' }}); await sky.press_key({{ window: browserWindow, key: 'Control_L+a' }}); await sky.press_key({{ window: browserWindow, key: 'BackSpace' }}); await sky.type_text({{ window: browserWindow, text: {page_url} }}); await sky.press_key({{ window: browserWindow, key: 'Return' }}); await new Promise(resolve => setTimeout(resolve, 2000)); apps = await sky.list_apps(); browser = apps.find(app => app.id === 'Helium'); browserWindow = browser.windows[0]; var state = await sky.get_window_state({{ window: browserWindow, include_screenshot: true, include_text: true }}); var buttonMatch = state.accessibility.tree.match(/(\\d+)\\s+button Click to confirm/); if (!buttonMatch) throw new Error('button missing'); await sky.click({{ window: browserWindow, element_index: Number(buttonMatch[1]) }}); await sky.drag({{ window: browserWindow, from_x: 211, from_y: 333, to_x: 632, to_y: 438 }}); await new Promise(resolve => setTimeout(resolve, 500)); var finalState = await sky.get_window_state({{ window: browserWindow, include_screenshot: false, include_text: true }}); var observed = finalState.accessibility.tree.split('\\n').filter(line => line.includes('event observed')).join('\\n'); if (!observed.includes('Click event observed') || !observed.includes('Drag event observed')) throw new Error('native events missing: ' + (observed || 'none')); nodeRepl.write(observed);"
+            );
+            native_action_evidence.expect_script(&script);
+            Ok(format!(
+                "Use the installed official Computer Use plugin through mcp__node_repl__js immediately. Do not search the tool catalog or read documentation. Your first and only tool call must run this complete JavaScript in one persistent-kernel cell: `{script}`. The target is a private loopback capability, and the accessibility tree is formatted text. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list. Do not use Firefox because the installed helper cannot enforce URL policy for it. Do not inspect Object.keys or probe API shapes. Stop immediately after that one tool call."
+            ))
         }
-        let remaining = ready_at.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return if Instant::now() >= deadline {
-                Err(native_smoke_failure("native_readiness_timed_out"))
-            } else {
-                Ok(())
-            };
+        crate::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
+            let script = format!(
+                "globalThis.sky ??= (await import(\"@oai/sky\")).sky; var state = await sky.get_app_state({{ app: \"Safari\", disableDiff: true }}); await sky.press_key({{ app: \"Safari\", key: \"super+n\" }}); state = await sky.get_app_state({{ app: \"Safari\", disableDiff: true }}); var addressMatch = state.text.match(/^\\s*(\\d+) text field .*ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD/m); if (!addressMatch) throw new Error(\"Safari address field missing\"); await sky.set_value({{ app: \"Safari\", element_index: Number(addressMatch[1]), value: {page_url} }}); await sky.press_key({{ app: \"Safari\", key: \"Return\" }}); var buttonMatch = null; for (var attempt = 0; attempt < 8 && !buttonMatch; attempt++) {{ await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1000 : 500)); state = await sky.get_app_state({{ app: \"Safari\", disableDiff: true }}); buttonMatch = state.text.match(/^\\s*(\\d+) button Click to confirm/m); }} if (!buttonMatch) throw new Error(\"readiness button missing\"); await sky.click({{ app: \"Safari\", element_index: Number(buttonMatch[1]) }}); await sky.drag({{ app: \"Safari\", from_x: 180, from_y: 320, to_x: 600, to_y: 425 }}); await new Promise(resolve => setTimeout(resolve, 500)); await sky.press_key({{ app: \"Safari\", key: \"super+w\" }}); nodeRepl.write(\"Native click and drag actions dispatched\");"
+            );
+            native_action_evidence.expect_script(&script);
+            Ok(format!(
+                "Use the installed official Computer Use plugin through mcp__node_repl__js immediately. Do not search the tool catalog or read documentation. Do not send commentary before the tool call. Your first and only tool call must run this complete JavaScript in one persistent-kernel cell: `{script}`. The private loopback target independently verifies both native events. It rejects a missing click or drag. The target has a fixed 1024 by 678 readiness surface, so the app-window drag coordinates are part of this probe contract. Use only the authenticated sky Computer Use API. Do not use shell, file, generic browser automation, or other network tools. Do not print the app list or inspect unrelated apps. Stop immediately after that one tool call."
+            ))
         }
-        std::thread::sleep(Duration::from_millis(10).min(remaining));
     }
-}
-
-impl Drop for NativeActionTarget {
-    fn drop(&mut self) {
-        let _ = crate::codex_capabilities::terminate_group(&mut self.child);
-    }
-}
-
-#[cfg(windows)]
-fn native_action_command(nonce: &str, _timeout: Duration) -> Result<Command, &'static str> {
-    let script = windows_native_readiness_target_source(nonce);
-    let mut command = Command::new("powershell.exe");
-    command.args(["-NoLogo", "-NoProfile", "-STA", "-Command", &script]);
-    Ok(command)
-}
-
-#[cfg(target_os = "macos")]
-fn native_action_command(nonce: &str, timeout: Duration) -> Result<Command, &'static str> {
-    let script = macos_native_readiness_target_source(nonce);
-    let mut command = Command::new("/usr/bin/osascript");
-    command.args([
-        "-l",
-        "JavaScript",
-        "-e",
-        &format!(
-            "const readinessTimeoutSeconds = {};\n{script}",
-            timeout.as_secs().max(1)
-        ),
-    ]);
-    Ok(command)
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-fn native_action_command(_nonce: &str, _timeout: Duration) -> Result<Command, &'static str> {
-    Err("unsupported_host_platform")
-}
-
-fn native_readiness_prompt(nonce: &str) -> String {
-    format!(
-        "Use native Computer Use, not shell or file tools, in the private topmost 'Satelle Native Readiness' window. Independently click the button labeled {nonce}, then drag the 'Drag from here' control into the 'Drop here' target. Stop only after both actions are complete."
-    )
-}
-
-#[cfg(any(test, windows))]
-fn windows_native_readiness_target_source(nonce: &str) -> String {
-    r#"
-$ErrorActionPreference='Stop'
-Add-Type -AssemblyName PresentationFramework
-$window=New-Object Windows.Window
-$window.Title='Satelle Native Readiness'
-$window.Width=640
-$window.Height=300
-$window.Topmost=$true
-$window.ShowInTaskbar=$false
-$window.WindowStartupLocation='CenterScreen'
-$window.Tag='failed'
-
-$clickConfirmed=$false
-$dragConfirmed=$false
-$dragStarted=$false
-$dragMoved=$false
-
-$grid=New-Object Windows.Controls.Grid
-$grid.Margin=20
-1..3 | ForEach-Object {
-    $row=New-Object Windows.Controls.RowDefinition
-    $row.Height='*'
-    [void]$grid.RowDefinitions.Add($row)
-}
-
-$instructions=New-Object Windows.Controls.TextBlock
-$instructions.Text='Complete both independent pointer actions'
-$instructions.FontSize=18
-$instructions.HorizontalAlignment='Center'
-[Windows.Controls.Grid]::SetRow($instructions,0)
-[void]$grid.Children.Add($instructions)
-
-$clickButton=New-Object Windows.Controls.Button
-$clickButton.Name='pointer_click_confirmed'
-$clickButton.Content='__NONCE__'
-$clickButton.FontSize=22
-$clickButton.Margin=8
-$clickButton.Add_Click({
-    $script:clickConfirmed=$true
-    if ($clickConfirmed -and $dragConfirmed) {
-        $window.Tag='passed'
-        $window.Close()
-    }
-})
-[Windows.Controls.Grid]::SetRow($clickButton,1)
-[void]$grid.Children.Add($clickButton)
-
-$dragGrid=New-Object Windows.Controls.Grid
-1..2 | ForEach-Object {
-    $column=New-Object Windows.Controls.ColumnDefinition
-    $column.Width='*'
-    [void]$dragGrid.ColumnDefinitions.Add($column)
-}
-$dragSource=New-Object Windows.Controls.Button
-$dragSource.Content='Drag from here'
-$dragSource.Margin=12
-$dragSource.Add_MouseDown({
-    $script:dragStarted=$true
-    $script:dragMoved=$false
-    [void]$dragSource.CaptureMouse()
-})
-$dragSource.Add_MouseMove({
-    param($sender,$event)
-    if ($dragStarted -and $event.LeftButton -eq 'Pressed') {
-        $script:dragMoved=$true
-    }
-})
-$dragSource.Add_MouseUp({
-    param($sender,$event)
-    $point=$event.GetPosition($dropTarget)
-    $inside=$point.X -ge 0 -and $point.Y -ge 0 -and
-        $point.X -le $dropTarget.ActualWidth -and $point.Y -le $dropTarget.ActualHeight
-    $dragSource.ReleaseMouseCapture()
-    if ($dragStarted -and $dragMoved -and $inside) {
-        $script:dragConfirmed=$true
-    }
-    $script:dragStarted=$false
-    if ($clickConfirmed -and $dragConfirmed) {
-        $window.Tag='passed'
-        $window.Close()
-    }
-})
-[Windows.Controls.Grid]::SetColumn($dragSource,0)
-[void]$dragGrid.Children.Add($dragSource)
-
-$dropTarget=New-Object Windows.Controls.Border
-$dropTarget.Name='pointer_drag_confirmed'
-$dropTarget.BorderBrush='DarkGreen'
-$dropTarget.BorderThickness=3
-$dropTarget.CornerRadius=8
-$dropTarget.Margin=12
-$dropLabel=New-Object Windows.Controls.TextBlock
-$dropLabel.Text='Drop here'
-$dropLabel.FontSize=20
-$dropLabel.HorizontalAlignment='Center'
-$dropLabel.VerticalAlignment='Center'
-$dropTarget.Child=$dropLabel
-[Windows.Controls.Grid]::SetColumn($dropTarget,1)
-[void]$dragGrid.Children.Add($dropTarget)
-
-[Windows.Controls.Grid]::SetRow($dragGrid,2)
-[void]$grid.Children.Add($dragGrid)
-$window.Content=$grid
-[void]$window.ShowDialog()
-if ($window.Tag -eq 'passed') { exit 0 } else { exit 1 }
-"#
-    .replace("__NONCE__", nonce)
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn macos_native_readiness_target_source(nonce: &str) -> String {
-    r#"
-ObjC.import('Cocoa')
-ObjC.import('stdlib')
-
-const app = $.NSApplication.sharedApplication
-app.setActivationPolicy($.NSApplicationActivationPolicyAccessory)
-const style = $.NSWindowStyleMaskTitled | $.NSWindowStyleMaskClosable
-const panel = $.NSPanel.alloc.initWithContentRectStyleMaskBackingDefer(
-    $.NSMakeRect(0, 0, 640, 300),
-    style,
-    $.NSBackingStoreBuffered,
-    false
-)
-panel.title = 'Satelle Native Readiness'
-panel.level = $.NSFloatingWindowLevel
-panel.hidesOnDeactivate = false
-panel.center
-
-function makeButton(title, frame) {
-    const button = $.NSButton.alloc.initWithFrame(frame)
-    button.title = title
-    button.bezelStyle = $.NSBezelStyleRounded
-    panel.contentView.addSubview(button)
-    return button
-}
-
-const clickButton = makeButton('__NONCE__', $.NSMakeRect(170, 170, 300, 60))
-clickButton.identifier = 'pointer_click_confirmed'
-const dragSource = makeButton('Drag from here', $.NSMakeRect(70, 55, 200, 65))
-const dropTarget = makeButton('Drop here', $.NSMakeRect(370, 55, 200, 65))
-dropTarget.identifier = 'pointer_drag_confirmed'
-
-panel.orderFrontRegardless
-app.activateIgnoringOtherApps(true)
-
-let clickConfirmed = false
-let dragConfirmed = false
-let clickStarted = false
-let dragStarted = false
-let dragMoved = false
-const deadline = Date.now() + readinessTimeoutSeconds * 1000
-
-function contains(rect, point) {
-    return point.x >= rect.origin.x &&
-        point.y >= rect.origin.y &&
-        point.x <= rect.origin.x + rect.size.width &&
-        point.y <= rect.origin.y + rect.size.height
-}
-
-const eventMask = $.NSEventMaskLeftMouseDown |
-    $.NSEventMaskLeftMouseDragged |
-    $.NSEventMaskLeftMouseUp
-const localHandler = ObjC.block(['id', ['id']], function(event) {
-    if (Number(event.window.windowNumber) !== Number(panel.windowNumber)) {
-        return event
-    }
-    const point = event.locationInWindow
-    const eventType = Number(event.type)
-    if (eventType === Number($.NSEventTypeLeftMouseDown)) {
-        clickStarted = contains(clickButton.frame, point)
-        dragStarted = contains(dragSource.frame, point)
-        dragMoved = false
-    } else if (eventType === Number($.NSEventTypeLeftMouseDragged) && dragStarted) {
-        dragMoved = true
-    } else if (eventType === Number($.NSEventTypeLeftMouseUp)) {
-        clickConfirmed = clickConfirmed || (clickStarted && contains(clickButton.frame, point))
-        dragConfirmed = dragConfirmed ||
-            (dragStarted && dragMoved && contains(dropTarget.frame, point))
-        clickStarted = false
-        dragStarted = false
-    }
-    return event
-})
-const localMonitor = $.NSEvent.addLocalMonitorForEventsMatchingMaskHandler(
-    eventMask,
-    localHandler
-)
-
-while (Date.now() < deadline && !(clickConfirmed && dragConfirmed)) {
-    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.01))
-}
-
-$.NSEvent.removeMonitor(localMonitor)
-panel.close
-$.exit(clickConfirmed && dragConfirmed ? 0 : 1)
-"#
-    .replace("__NONCE__", nonce)
 }
 
 struct NativePrerequisiteObservations {
@@ -1431,6 +1282,7 @@ fn native_prerequisite_observations(
     platform: &str,
     desktop: &satelle_core::DesktopSessionRecord,
     app_policy_surface: crate::codex_capabilities::EvidenceSurface,
+    allowed_app_ids: &BTreeSet<String>,
 ) -> NativePrerequisiteObservations {
     let os_permission_state = if platform == "windows" {
         // Desktop resolution already proved this exact session is active,
@@ -1449,24 +1301,56 @@ fn native_prerequisite_observations(
             "{}:{}:{}:{}",
             desktop.state, desktop.session_kind, desktop.is_console, desktop.is_remote
         ),
-        app_fingerprint_material: app_policy_fingerprint_material(platform, app_policy_surface),
+        app_fingerprint_material: app_policy_fingerprint_material(
+            platform,
+            app_policy_surface,
+            allowed_app_ids,
+        ),
     }
 }
 
 fn app_policy_fingerprint_material(
     platform: &str,
     observed: crate::codex_capabilities::EvidenceSurface,
+    allowed_app_ids: &BTreeSet<String>,
 ) -> String {
-    if platform != "windows" {
+    if !matches!(platform, "windows" | "macos") {
         return "app_policy:not_observable".to_string();
     }
     let classified = match observed {
         crate::codex_capabilities::EvidenceSurface::Stable => "stable",
         crate::codex_capabilities::EvidenceSurface::Absent => "absent",
         crate::codex_capabilities::EvidenceSurface::Incomplete => "incomplete",
+        crate::codex_capabilities::EvidenceSurface::Private if platform == "macos" => "private",
         _ => "incomplete",
     };
-    format!("windows_app_policy:{classified}")
+    let mut digest = Sha256::new();
+    digest.update(b"satelle-computer-use-allowed-apps-v1\0");
+    for app_id in allowed_app_ids {
+        digest.update(app_id.as_bytes());
+        digest.update([0]);
+    }
+    let allowed_apps_digest = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{platform}_app_policy:{classified}:{allowed_apps_digest}")
+}
+
+fn app_approval_fingerprint_for_policy(
+    platform: &str,
+    observed: crate::codex_capabilities::EvidenceSurface,
+    allowed_app_ids: &BTreeSet<String>,
+    execution_policy: &ExecutionPolicy,
+) -> String {
+    readiness_fingerprint(
+        "app-approval",
+        platform,
+        execution_policy.desktop_target().session_id(),
+        ReadinessObservationState::Unknown,
+        &app_policy_fingerprint_material(platform, observed, allowed_app_ids),
+    )
 }
 
 fn readiness_fingerprint(
@@ -1765,6 +1649,33 @@ fn classify_native_probe_run(
     run.result.map_err(native_smoke_session_failure)
 }
 
+fn classify_native_probe_completion(
+    run: crate::codex_session::TimedCodexSessionRun,
+    action_result: Result<(), &'static str>,
+) -> Result<(), NativeSmokeFailure> {
+    if let Err(failure) = &run.result
+        && !failure.turn_dispatch_attempted()
+    {
+        return Err(native_smoke_session_failure(*failure));
+    }
+    if action_result.is_ok()
+        && matches!(
+            run.cancellation,
+            Some(
+                StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed
+            )
+        )
+    {
+        return Ok(());
+    }
+
+    let terminal = classify_native_probe_run(run)?;
+    if terminal != CodexSessionTerminal::Completed {
+        return Err(native_smoke_failure("native_readiness_session_failed"));
+    }
+    action_result.map_err(native_smoke_failure)
+}
+
 fn native_readiness_timeout_after_cancellation(observation: StopObservation) -> NativeSmokeFailure {
     let reason = "native_readiness_timed_out";
     let mut error = SatelleError::native_readiness_timeout();
@@ -1947,6 +1858,11 @@ fn provider_smoke_failure(error: crate::provider_probe::ProviderProbeError) -> S
             ErrorCode::ComputerUseNotReady,
             "provider_smoke_callback_invalid",
         ),
+        crate::provider_probe::ProviderProbeError::NativeClickNotObserved
+        | crate::provider_probe::ProviderProbeError::NativeDragNotObserved => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_callback_incomplete",
+        ),
         crate::provider_probe::ProviderProbeError::Cancelled => {
             (ErrorCode::ComputerUseNotReady, "provider_smoke_cancelled")
         }
@@ -2108,7 +2024,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
         self.native_readiness_key(provider_intent)
-            .map(|(key, _)| Some(key))
+            .map(|(key, _, _)| Some(key))
     }
 
     fn preflight_terminal(
@@ -2204,10 +2120,26 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                     ));
                 }
                 let model_provider = provider_child_model_provider(binding);
+                let allowed_app_ids =
+                    crate::codex_capabilities::configured_computer_use_allowed_app_ids();
+                let current_app_approval_fingerprint = app_approval_fingerprint_for_policy(
+                    crate::codex_capabilities::HostPlatform::current().as_str(),
+                    snapshot.evidence.capabilities.approval_observation.surface,
+                    &allowed_app_ids,
+                    request.execution_policy(),
+                );
+                let admitted_app_approval = request
+                    .admitted_app_approval()
+                    .ok_or_else(|| adapter_failure("app_approval_missing_after_admission"))?;
+                if current_app_approval_fingerprint != admitted_app_approval.fingerprint() {
+                    return Err(adapter_failure("app_approval_changed_after_admission"));
+                }
+                let verified_app_server = preserve_managed_codex_error(
+                    crate::codex_capabilities::installed_computer_use_app_server(),
+                )?;
+                let expected_mcp_server_name = verified_app_server.native_mcp_server_name;
                 let run = run_codex_session_with_timeout_cancellation(
-                    preserve_managed_codex_error(
-                        crate::codex_capabilities::installed_app_server_command(),
-                    )?,
+                    verified_app_server.command,
                     CodexSessionRequest {
                         working_directory: &working_directory,
                         prompt: request.prompt(),
@@ -2223,6 +2155,9 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                         persist_thread_ref: &mut persist_thread_ref,
                         persist_turn_ref: &mut persist_turn_ref,
                         observe_native_approval: Some(&mut observe_native_approval),
+                        native_action_evidence: None,
+                        expected_mcp_server_name: &expected_mcp_server_name,
+                        computer_use_allowed_app_ids: admitted_app_approval.allowed_app_ids(),
                         control: Some(control),
                         goal_set_supported,
                         image_input_mode,
@@ -2300,7 +2235,33 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
         if let Some(result) = denied_native_probe_result(key, &evidence) {
             return result;
         }
-        match self.run_native_smoke(Some(cancellation), persist_thread_ref, persist_turn_ref) {
+        let allowed_app_ids = crate::codex_capabilities::configured_computer_use_allowed_app_ids();
+        let platform = crate::codex_capabilities::HostPlatform::current().as_str();
+        let app_policy_surface = crate::read_production_snapshot(&self.snapshot)
+            .map(|snapshot| snapshot.evidence.capabilities.approval_observation.surface);
+        let current_fingerprint = app_policy_surface.map(|surface| {
+            readiness_fingerprint(
+                "app-approval",
+                platform,
+                key.desktop_session_ref(),
+                key.app_approval_state(),
+                &app_policy_fingerprint_material(platform, surface, &allowed_app_ids),
+            )
+        });
+        if !matches!(
+            current_fingerprint.as_deref(),
+            Ok(fingerprint) if fingerprint == key.app_approval_fingerprint()
+        ) {
+            return NativeProbeResult::UncachedFailure(adapter_failure(
+                "readiness_app_policy_changed",
+            ));
+        }
+        match self.run_native_smoke(
+            Some(cancellation),
+            persist_thread_ref,
+            persist_turn_ref,
+            &allowed_app_ids,
+        ) {
             Ok(()) => NativeProbeResult::Passed(evidence),
             Err(failure) if cancellation.is_requested_or_expired() => {
                 let observation = probe_cancellation_observation(
@@ -2607,8 +2568,8 @@ fn adapter_failure(reason: &'static str) -> SatelleError {
 }
 
 fn preserve_managed_codex_error(
-    command: Result<Command, SatelleError>,
-) -> Result<Command, SatelleError> {
+    command: Result<crate::codex_capabilities::VerifiedComputerUseAppServer, SatelleError>,
+) -> Result<crate::codex_capabilities::VerifiedComputerUseAppServer, SatelleError> {
     command
 }
 
@@ -2841,14 +2802,19 @@ mod tests {
         let working_directory = tempfile::tempdir().expect("provider smoke working directory");
         let mut persist_thread_ref = |_value: &str| Ok(());
         let mut persist_turn_ref = |_value: &str| Ok(());
+        let allowed_app_ids = BTreeSet::new();
         let request = provider_smoke_session_request(
             &binding,
             candidate,
             working_directory.path(),
             "candidate live smoke",
             Instant::now() + Duration::from_secs(10),
-            &mut persist_thread_ref,
-            &mut persist_turn_ref,
+            "computer-use",
+            ProviderSmokeSessionControl {
+                computer_use_allowed_app_ids: &allowed_app_ids,
+                persist_thread_ref: &mut persist_thread_ref,
+                persist_turn_ref: &mut persist_turn_ref,
+            },
         );
         assert!(
             request
@@ -2971,6 +2937,7 @@ mod tests {
         let prompt = "PRIVATE_PROVIDER_SMOKE_PROMPT";
         let mut persist_thread_ref = |_value: &str| Ok(());
         let mut persist_turn_ref = |_value: &str| Ok(());
+        let allowed_app_ids = BTreeSet::new();
 
         let request = provider_smoke_session_request(
             &binding,
@@ -2980,8 +2947,12 @@ mod tests {
             working_directory.path(),
             prompt,
             Instant::now() + Duration::from_secs(10),
-            &mut persist_thread_ref,
-            &mut persist_turn_ref,
+            "computer-use",
+            ProviderSmokeSessionControl {
+                computer_use_allowed_app_ids: &allowed_app_ids,
+                persist_thread_ref: &mut persist_thread_ref,
+                persist_turn_ref: &mut persist_turn_ref,
+            },
         );
 
         assert_eq!(request.model, Some("provider-concrete-model"));
@@ -3138,6 +3109,37 @@ mod tests {
     }
 
     #[test]
+    fn native_callbacks_survive_confirmed_deadline_cancellation() {
+        let outcome = classify_native_probe_completion(
+            crate::codex_session::TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::Interrupted),
+                cancellation: Some(StopObservation::CancellationConfirmed),
+            },
+            Ok(()),
+        );
+
+        assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn native_callbacks_do_not_hide_an_unconfirmed_upstream_turn() {
+        let failure = classify_native_probe_completion(
+            crate::codex_session::TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::Interrupted),
+                cancellation: Some(StopObservation::OutcomeUnknown),
+            },
+            Ok(()),
+        )
+        .expect_err("unknown upstream state must block readiness");
+
+        assert_eq!(failure.reason, "native_readiness_timed_out");
+        assert_eq!(
+            failure.error.details["native_readiness_cancellation"],
+            "outcome_unknown"
+        );
+    }
+
+    #[test]
     fn provider_probe_pre_dispatch_result_wins_simultaneous_watchdog_cancellation() {
         let failure = classify_provider_probe_run(crate::codex_session::TimedCodexSessionRun {
             result: Err(CodexSessionFailure::before_turn_dispatch_for_test(
@@ -3158,7 +3160,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_failure_precedes_execution_readiness_for_run_and_steer() {
+    fn control_plane_failure_precedes_live_preflight_for_run_and_steer() {
         let evidence = crate::codex_capabilities::Phase0CapabilityEvidence {
             codex_version: crate::codex_capabilities::CodexVersionEvidence::Detected {
                 version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
@@ -3200,11 +3202,9 @@ mod tests {
         snapshot.write().unwrap().control_plane_admission =
             crate::codex_capabilities::ControlPlaneAdmission::not_applicable();
         for operation in [ControlPlaneOperation::Run, ControlPlaneOperation::Steer] {
-            let error = adapter
+            adapter
                 .admit_operation(operation)
-                .expect_err("execution readiness must still gate run and steer");
-            assert_eq!(error.code, ErrorCode::ComputerUseNotReady);
-            assert!(error.details.is_empty());
+                .expect("live readiness preflight, not static admission, owns the first proof");
         }
         for operation in [ControlPlaneOperation::Stop, ControlPlaneOperation::Status] {
             adapter
@@ -3536,6 +3536,7 @@ mod tests {
             provider_secret: None,
         };
         let provider_intent = ProviderComputerUseIntent::new(None, None, false);
+        let allowed_app_ids = BTreeSet::new();
         let binding = resolved_provider_binding_for_test("model-provider-cache", "provider-cache");
         let provider_credential_fingerprint =
             crate::provider_auth::provider_smoke_credential_fingerprint_for_test(
@@ -3556,9 +3557,12 @@ mod tests {
             .run_required_provider_smoke(
                 &key,
                 &binding,
-                Some(ProviderSmokeResult::Passed(provider.clone())),
-                &provider_intent,
                 &mut persistence,
+                ProviderPreflightContext {
+                    cached_provider: Some(ProviderSmokeResult::Passed(provider.clone())),
+                    provider_intent: &provider_intent,
+                    allowed_app_ids: &allowed_app_ids,
+                },
             )
             .unwrap();
         assert_eq!(prepared.evidence, Some(provider.clone()));
@@ -3578,9 +3582,12 @@ mod tests {
             .run_required_provider_smoke(
                 &key,
                 &binding,
-                Some(ProviderSmokeResult::Failed(provider_failure.clone())),
-                &provider_intent,
                 &mut persistence,
+                ProviderPreflightContext {
+                    cached_provider: Some(ProviderSmokeResult::Failed(provider_failure.clone())),
+                    provider_intent: &provider_intent,
+                    allowed_app_ids: &allowed_app_ids,
+                },
             )
             .expect_err("a cached provider failure remains a preflight blocker");
         assert!(cached_failure.evidence.is_none());
@@ -3723,13 +3730,14 @@ mod tests {
                 ProviderSmokeInvocation {
                     key: &key,
                     binding: &binding,
+                    allowed_app_ids: &BTreeSet::new(),
                     provider_secret: None,
                     provider_credential_fingerprint: &provider_credential_fingerprint,
                     source: ProviderSmokeSource::Live,
                     timeout_override: Some(Duration::from_secs(2)),
                 },
                 &mut persistence,
-                || Ok(command),
+                || Ok(crate::codex_capabilities::VerifiedComputerUseAppServer::for_test(command)),
             );
             if should_pass {
                 let evidence = outcome.expect("the real drag callback should pass");
@@ -4066,29 +4074,50 @@ mod tests {
     }
 
     #[test]
-    fn native_readiness_targets_require_independent_click_and_drag_confirmation() {
-        let windows = windows_native_readiness_target_source("readiness-nonce");
-        assert!(windows.contains("Topmost"));
-        assert!(windows.contains("ShowInTaskbar"));
-        assert!(windows.contains("MouseDown"));
-        assert!(windows.contains("MouseMove"));
-        assert!(windows.contains("MouseUp"));
-        assert!(windows.contains("pointer_click_confirmed"));
-        assert!(windows.contains("pointer_drag_confirmed"));
-        assert!(windows.contains("$clickConfirmed -and $dragConfirmed"));
-
-        let macos = macos_native_readiness_target_source("readiness-nonce");
-        assert!(macos.contains("NSFloatingWindowLevel"));
-        assert!(macos.contains("addLocalMonitorForEventsMatchingMaskHandler"));
-        assert!(macos.contains("event.window.windowNumber"));
-        assert!(macos.contains("NSEventTypeLeftMouseDown"));
-        assert!(macos.contains("NSEventTypeLeftMouseDragged"));
-        assert!(macos.contains("NSEventTypeLeftMouseUp"));
-        assert!(!macos.contains("NSEvent.mouseLocation"));
-        assert!(!macos.contains("NSEvent.pressedMouseButtons"));
-        assert!(macos.contains("pointer_click_confirmed"));
-        assert!(macos.contains("pointer_drag_confirmed"));
-        assert!(macos.contains("clickConfirmed && dragConfirmed"));
+    fn native_readiness_prompt_uses_only_the_verified_plugin_and_browser_surface() {
+        let action_path = crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl {
+            client_module_base64: "ZXhwb3J0IHt9".to_string(),
+            client_module_url: "file:///C:/satelle/client.mjs".to_string(),
+        };
+        let evidence = crate::provider_probe::NativeActionEvidence::new();
+        let prompt = native_readiness_prompt(
+            "http://127.0.0.1:12345/probe/private-capability",
+            &action_path,
+            &evidence,
+        )
+        .expect("the authenticated client bytes should form a registered module load hook");
+        assert!(
+            prompt.contains("official Computer Use plugin through mcp__node_repl__js immediately")
+        );
+        assert!(prompt.contains("Do not search the tool catalog or read documentation"));
+        assert!(prompt.contains("registerHooks"));
+        assert!(prompt.contains("url === clientModuleUrl"));
+        assert!(prompt.contains("source: Buffer.from(clientModuleBase64, 'base64')"));
+        assert!(prompt.contains("import(clientModuleUrl)"));
+        assert!(!prompt.contains("readFile"));
+        assert!(!prompt.contains("createHash"));
+        assert!(!prompt.contains("data:text"));
+        assert!(prompt.contains("http://127.0.0.1:12345/probe/private-capability"));
+        assert!(prompt.contains("sky.list_apps()"));
+        assert!(prompt.contains("sky.activate_window({ window: browserWindow })"));
+        assert!(prompt.contains("sky.press_key"));
+        assert!(prompt.contains("sky.type_text"));
+        assert!(prompt.contains("Control_L+l"));
+        assert!(prompt.contains("Control_L+a"));
+        assert!(prompt.contains("BackSpace"));
+        assert!(prompt.contains("Return"));
+        assert!(prompt.contains("sky.get_window_state({ window: browserWindow"));
+        assert!(prompt.contains("state.accessibility.tree"));
+        assert!(prompt.contains("accessibility tree is formatted text"));
+        assert!(prompt.contains("click"));
+        assert!(prompt.contains("element_index: Number(buttonMatch[1])"));
+        assert!(prompt.contains("sky.drag({ window: browserWindow"));
+        assert!(prompt.contains("first and only tool call"));
+        assert!(prompt.contains("Click event observed"));
+        assert!(prompt.contains("Drag event observed"));
+        assert!(prompt.contains(
+            "Do not use shell, separate file tools, browser automation, or network tools"
+        ));
     }
 
     #[test]
@@ -4124,6 +4153,7 @@ mod tests {
             &current,
             resolved_provider_binding_for_test("model-readiness", "provider-readiness"),
             live_evidence,
+            BTreeSet::new(),
             None,
             ReadinessSource::Live,
         )
@@ -4144,6 +4174,7 @@ mod tests {
             &current,
             resolved_provider_binding_for_test("model-readiness", "provider-readiness"),
             matching_evidence,
+            BTreeSet::new(),
             None,
             ReadinessSource::Cache,
         )
@@ -4241,29 +4272,70 @@ mod tests {
             native_selectors: vec!["PRIVATE_NATIVE_SELECTOR_CANARY".to_string()],
             selected_by_current_config: true,
         };
-        let stable = native_prerequisite_observations("windows", &desktop, EvidenceSurface::Stable);
-        let absent = native_prerequisite_observations("windows", &desktop, EvidenceSurface::Absent);
-        let incomplete =
-            native_prerequisite_observations("windows", &desktop, EvidenceSurface::Incomplete);
-        let private =
-            native_prerequisite_observations("windows", &desktop, EvidenceSurface::Private);
+        let allowed_app_ids = BTreeSet::from(["fixture-paint.exe".to_string()]);
+        let stable = native_prerequisite_observations(
+            "windows",
+            &desktop,
+            EvidenceSurface::Stable,
+            &allowed_app_ids,
+        );
+        let absent = native_prerequisite_observations(
+            "windows",
+            &desktop,
+            EvidenceSurface::Absent,
+            &allowed_app_ids,
+        );
+        let incomplete = native_prerequisite_observations(
+            "windows",
+            &desktop,
+            EvidenceSurface::Incomplete,
+            &allowed_app_ids,
+        );
+        let private = native_prerequisite_observations(
+            "windows",
+            &desktop,
+            EvidenceSurface::Private,
+            &allowed_app_ids,
+        );
 
-        assert_eq!(stable.app_fingerprint_material, "windows_app_policy:stable");
-        assert_eq!(absent.app_fingerprint_material, "windows_app_policy:absent");
-        assert_eq!(
-            incomplete.app_fingerprint_material,
-            "windows_app_policy:incomplete"
+        assert!(
+            stable
+                .app_fingerprint_material
+                .starts_with("windows_app_policy:stable:")
+        );
+        assert!(
+            absent
+                .app_fingerprint_material
+                .starts_with("windows_app_policy:absent:")
+        );
+        assert!(
+            incomplete
+                .app_fingerprint_material
+                .starts_with("windows_app_policy:incomplete:")
         );
         assert_eq!(
             private.app_fingerprint_material,
-            "windows_app_policy:incomplete"
+            incomplete.app_fingerprint_material
+        );
+        let changed_allowed_app_ids = BTreeSet::from(["fixture-notepad.exe".to_string()]);
+        let changed = native_prerequisite_observations(
+            "windows",
+            &desktop,
+            EvidenceSurface::Stable,
+            &changed_allowed_app_ids,
+        );
+        assert_ne!(
+            stable.app_fingerprint_material,
+            changed.app_fingerprint_material
         );
         for material in [
             &stable.app_fingerprint_material,
             &absent.app_fingerprint_material,
             &incomplete.app_fingerprint_material,
+            &changed.app_fingerprint_material,
         ] {
             assert!(!material.contains("PRIVATE_"));
+            assert!(!material.contains("fixture-"));
         }
         let fingerprint = |material: &str| {
             readiness_fingerprint(
@@ -4282,11 +4354,81 @@ mod tests {
             fingerprint(&absent.app_fingerprint_material),
             fingerprint(&incomplete.app_fingerprint_material)
         );
+        let policy = execution_policy_for("operator", &desktop.session_id);
+        assert_eq!(
+            app_approval_fingerprint_for_policy(
+                "windows",
+                EvidenceSurface::Stable,
+                &allowed_app_ids,
+                &policy,
+            ),
+            fingerprint(&stable.app_fingerprint_material)
+        );
+        assert_ne!(
+            app_approval_fingerprint_for_policy(
+                "windows",
+                EvidenceSurface::Stable,
+                &changed_allowed_app_ids,
+                &policy,
+            ),
+            fingerprint(&stable.app_fingerprint_material)
+        );
+    }
+
+    #[test]
+    fn macos_app_policy_fingerprint_changes_with_the_ephemeral_approval_set() {
+        use crate::codex_capabilities::EvidenceSurface;
+
+        let desktop = satelle_core::DesktopSessionRecord {
+            session_id: "PRIVATE_SESSION_ID_CANARY".to_string(),
+            desktop_user: "operator".to_string(),
+            state: "active".to_string(),
+            session_kind: "visible_desktop".to_string(),
+            is_console: true,
+            is_remote: false,
+            display_summary: "PRIVATE_DISPLAY_CANARY".to_string(),
+            portable_selectors: vec!["active".to_string(), "console".to_string()],
+            native_selectors: vec!["PRIVATE_NATIVE_SELECTOR_CANARY".to_string()],
+            selected_by_current_config: true,
+        };
+        let safari = native_prerequisite_observations(
+            "macos",
+            &desktop,
+            EvidenceSurface::Private,
+            &BTreeSet::from(["com.apple.Safari".to_string()]),
+        );
+        let terminal = native_prerequisite_observations(
+            "macos",
+            &desktop,
+            EvidenceSurface::Private,
+            &BTreeSet::from(["com.apple.Terminal".to_string()]),
+        );
+
+        assert_ne!(
+            safari.app_fingerprint_material,
+            terminal.app_fingerprint_material
+        );
+        assert!(
+            safari
+                .app_fingerprint_material
+                .starts_with("macos_app_policy:private:")
+        );
+        assert!(!safari.app_fingerprint_material.contains("com.apple"));
     }
 
     #[test]
     fn native_readiness_prompt_names_both_required_actions_and_private_target() {
-        let prompt = native_readiness_prompt("readiness-nonce");
+        let action_path = crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl {
+            client_module_base64: "ZXhwb3J0IHt9".to_string(),
+            client_module_url: "file:///C:/satelle/client.mjs".to_string(),
+        };
+        let evidence = crate::provider_probe::NativeActionEvidence::new();
+        let prompt = native_readiness_prompt(
+            "http://127.0.0.1:12345/probe/readiness-nonce",
+            &action_path,
+            &evidence,
+        )
+        .expect("the authenticated client bytes should form a registered module load hook");
 
         assert!(prompt.contains("private"));
         assert!(prompt.contains("click"));
@@ -4294,27 +4436,50 @@ mod tests {
         assert!(prompt.contains("readiness-nonce"));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn native_target_cancellation_terminates_the_child_before_return() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 30"]);
-        let child = command.group_spawn().expect("spawn native target fixture");
-        let mut target = NativeActionTarget { child };
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let cancellation = crate::runtime::AdmissionCancellation::with_deadline(deadline);
-        cancellation.request();
+    fn native_readiness_prompt_uses_the_validated_macos_node_repl_namespace() {
+        let evidence = crate::provider_probe::NativeActionEvidence::new();
+        let prompt = native_readiness_prompt(
+            "http://127.0.0.1:12345/probe/readiness-nonce",
+            &crate::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl,
+            &evidence,
+        )
+        .expect("the macOS node_repl path does not require a client file URL");
 
-        let outcome = target.wait_for_success(deadline, Some(&cancellation));
-
-        assert_eq!(outcome, Err("native_readiness_cancelled"));
+        assert!(prompt.contains("mcp__node_repl__js"));
+        assert!(prompt.contains("first and only tool call"));
+        assert!(prompt.contains("import(\"@oai/sky\")"));
+        let initial_state = prompt
+            .find("get_app_state({ app: \"Safari\", disableDiff: true })")
+            .expect("the prompt must read current Safari state");
+        let new_window = prompt
+            .find("sky.press_key({ app: \"Safari\", key: \"super+n\" })")
+            .expect("the prompt must open a temporary Safari window");
+        let temporary_window_state = prompt[new_window..]
+            .find("get_app_state({ app: \"Safari\", disableDiff: true })")
+            .map(|offset| new_window + offset)
+            .expect("the prompt must refresh state for the temporary window");
+        assert!(initial_state < new_window);
+        assert!(new_window < temporary_window_state);
+        assert!(prompt.contains("get_app_state({ app: \"Safari\", disableDiff: true })"));
+        assert!(prompt.contains("ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"));
         assert!(
-            target
-                .child
-                .try_wait()
-                .expect("read terminated child")
-                .is_some(),
-            "native target survived cancellation"
+            !prompt
+                .contains("sky.click({ app: \"Safari\", element_index: Number(addressMatch[1]) })")
         );
+        assert!(prompt.contains("sky.set_value({ app: \"Safari\", element_index:"));
+        assert!(prompt.contains("sky.press_key({ app: \"Safari\", key: \"Return\" })"));
+        assert!(prompt.contains("attempt < 8"));
+        assert!(prompt.contains("sky.click({ app: \"Safari\", element_index:"));
+        assert!(!prompt.contains("finalState.text.includes"));
+        assert!(!prompt.contains("native events missing"));
+        assert!(prompt.contains("Native click and drag actions dispatched"));
+        assert!(prompt.contains("from_x: 180, from_y: 320, to_x: 600, to_y: 425"));
+        assert!(prompt.contains("sky.press_key({ app: \"Safari\", key: \"super+w\" })"));
+        assert!(prompt.contains("independently verifies both native events"));
+        assert!(prompt.contains("Do not search the tool catalog"));
+        assert!(!prompt.contains("mcp__computer_use"));
+        assert!(!prompt.contains("Helium"));
+        assert!(!prompt.contains("Control_L"));
     }
 }

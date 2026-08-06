@@ -20,8 +20,16 @@ use std::time::{Duration, Instant};
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("descendant") {
-        std::thread::sleep(Duration::from_millis(300));
-        std::fs::write(std::env::args().nth(2).unwrap(), "escaped").unwrap();
+        let escaped_marker = std::env::args().nth(2).unwrap();
+        let release_marker = PathBuf::from(std::env::args().nth(3).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !release_marker.exists() {
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(escaped_marker, "escaped").unwrap();
         return;
     }
     if let Some(path) = std::env::var_os("SATELLE_FIXTURE_ARGS_LOG") {
@@ -76,6 +84,7 @@ fn main() {
         Command::new(std::env::current_exe().unwrap())
             .arg("descendant")
             .arg(std::env::var_os("SATELLE_DESCENDANT_MARKER").unwrap())
+            .arg(std::env::var_os("SATELLE_DESCENDANT_RELEASE_MARKER").unwrap())
             .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::null())
             .spawn().unwrap();
         hang();
@@ -115,7 +124,14 @@ fn main() {
 
     if scenario == "notification-first" {
         send(&mut output, &format!(r#"{{"method":"thread/started","params":{{"thread":{{"id":"{thread_id}"}}}}}}"#));
+        send_mcp_ready(&mut output, thread_id);
         wait_for(&thread_marker);
+        let inventory_request = receive(&mut input, &log);
+        assert_mcp_inventory_request(&inventory_request, thread_id);
+        send_mcp_inventory(&mut output);
+        let plugin_request = receive(&mut input, &log);
+        assert_plugin_inventory_request(&plugin_request);
+        send_plugin_inventory(&mut output, false);
         receive(&mut input, &log);
         send(&mut output, &format!(r#"{{"method":"turn/started","params":{{"threadId":"{thread_id}","turn":{{"id":"turn-1","status":"inProgress"}}}}}}"#));
         wait_for(&turn_marker);
@@ -123,19 +139,34 @@ fn main() {
     } else if scenario == "conflict" {
         send(&mut output, &thread_response);
         wait_for(&thread_marker);
-        receive(&mut input, &log);
         send(&mut output, r#"{"method":"thread/started","params":{"thread":{"id":"thread-conflict"}}}"#);
         hang();
     } else {
         send(&mut output, &thread_response);
+        if scenario == "unexpected-mcp-server" {
+            send(&mut output, &format!(r#"{{"method":"mcpServer/startupStatus/updated","params":{{"threadId":"{thread_id}","name":"unexpected","status":"starting","error":null,"failureReason":null}}}}"#));
+            hang();
+        }
+        send_mcp_ready(&mut output, thread_id);
         if thread_id == "thread-1" { wait_for(&thread_marker); }
+        let inventory_request = receive(&mut input, &log);
+        assert_mcp_inventory_request(&inventory_request, thread_id);
+        send_mcp_inventory(&mut output);
+        let plugin_request = receive(&mut input, &log);
+        assert_plugin_inventory_request(&plugin_request);
+        if scenario == "unexpected-plugin" {
+            send_plugin_inventory(&mut output, true);
+            hang();
+        }
+        send_plugin_inventory(&mut output, false);
         if scenario == "blocked-write" { hang(); }
         let next_request = receive(&mut input, &log);
-        if scenario == "goal" {
+        if scenario.starts_with("goal") {
             assert!(next_request.contains(r#""id":3"#));
             assert!(next_request.contains(r#""method":"thread/goal/set""#));
             assert!(next_request.contains(r#""threadId":"thread-1""#));
-            send(&mut output, r#"{"id":3,"result":{"goal":{"threadId":"thread-1","objective":"perform the harmless action PRIVATE_PROMPT_CANARY","status":"active","createdAt":1,"updatedAt":1,"tokensUsed":0,"timeUsedSeconds":0,"tokenBudget":null}}}"#);
+            let status = if scenario == "goal-active" { "active" } else { "paused" };
+            send(&mut output, &format!(r#"{{"id":3,"result":{{"goal":{{"threadId":"thread-1","objective":"perform the harmless action PRIVATE_PROMPT_CANARY","status":"{status}","createdAt":1,"updatedAt":1,"tokensUsed":0,"timeUsedSeconds":0,"tokenBudget":null}}}}}}"#));
             receive(&mut input, &log);
         } else if scenario == "provider-probe-responses" {
             complete_provider_probe_drag(&next_request);
@@ -218,6 +249,7 @@ fn main() {
         Command::new(std::env::current_exe().unwrap())
             .arg("descendant")
             .arg(std::env::var_os("SATELLE_DESCENDANT_MARKER").unwrap())
+            .arg(std::env::var_os("SATELLE_DESCENDANT_RELEASE_MARKER").unwrap())
             .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::null())
             .spawn().unwrap();
     }
@@ -247,6 +279,41 @@ fn receive(input: &mut impl BufRead, log_path: &Path) -> String {
 fn send(output: &mut impl Write, line: &str) {
     writeln!(output, "{line}").unwrap();
     output.flush().unwrap();
+}
+
+fn assert_mcp_inventory_request(request: &str, thread_id: &str) {
+    assert!(request.contains(r#""id":6"#));
+    assert!(request.contains(r#""method":"mcpServerStatus/list""#));
+    assert!(request.contains(&format!(r#""threadId":"{thread_id}""#)));
+    assert!(request.contains(r#""detail":"toolsAndAuthOnly""#));
+}
+
+fn send_mcp_inventory(output: &mut impl Write) {
+    send(output, r#"{"id":6,"result":{"data":[{"name":"computer-use","serverInfo":null,"tools":{},"authStatus":"unsupported"},{"name":"disabled-server","serverInfo":null,"tools":{},"authStatus":"unsupported"}],"nextCursor":null}}"#);
+}
+
+fn send_mcp_ready(output: &mut impl Write, thread_id: &str) {
+    send(output, &format!(r#"{{"method":"mcpServer/startupStatus/updated","params":{{"threadId":"{thread_id}","name":"computer-use","status":"ready","error":null,"failureReason":null}}}}"#));
+}
+
+fn assert_plugin_inventory_request(request: &str) {
+    assert!(request.contains(r#""id":7"#));
+    assert!(request.contains(r#""method":"plugin/list""#));
+    assert!(request.contains(r#""cwds""#));
+}
+
+fn send_plugin_inventory(output: &mut impl Write, include_unexpected: bool) {
+    let marketplaces = if include_unexpected {
+        r#"[{"name":"unexpected","plugins":[{"id":"unexpected","installed":true,"enabled":true}]}]"#
+    } else {
+        "[]"
+    };
+    send(
+        output,
+        &format!(
+            r#"{{"id":7,"result":{{"marketplaces":{marketplaces},"marketplaceLoadErrors":[],"featuredPluginIds":[]}}}}"#,
+        ),
+    );
 }
 
 fn wait_for(path: &Path) {
@@ -465,6 +532,7 @@ fn run_scenario_with_options(
     let thread_marker = directory.path().join("thread-persisted");
     let turn_marker = directory.path().join("turn-persisted");
     let descendant_marker = directory.path().join("descendant-escaped");
+    let descendant_release_marker = directory.path().join("descendant-release");
     let mut command = Command::new(&fixture.executable);
     command
         .env("SATELLE_FIXTURE_SCENARIO", scenario)
@@ -472,7 +540,11 @@ fn run_scenario_with_options(
         .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
         .env("SATELLE_THREAD_MARKER", &thread_marker)
         .env("SATELLE_TURN_MARKER", &turn_marker)
-        .env("SATELLE_DESCENDANT_MARKER", &descendant_marker);
+        .env("SATELLE_DESCENDANT_MARKER", &descendant_marker)
+        .env(
+            "SATELLE_DESCENDANT_RELEASE_MARKER",
+            &descendant_release_marker,
+        );
 
     let mut persisted_threads = Vec::new();
     let mut persisted_turns = Vec::new();
@@ -537,8 +609,11 @@ fn run_scenario_with_options(
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: Some(&mut observe_native_approval),
+            native_action_evidence: None,
+            expected_mcp_server_name: "computer-use",
+            computer_use_allowed_app_ids: &BTreeSet::new(),
             control: None,
-            goal_set_supported: scenario == "goal",
+            goal_set_supported: scenario.starts_with("goal"),
             image_input_mode: if uses_local_image {
                 crate::codex_capabilities::CodexImageInputMode::Local
             } else {
@@ -598,6 +673,16 @@ fn wait_for(path: &Path) {
     }
 }
 
+fn process_startup_timeout(default: Duration) -> Duration {
+    // Native Windows and macOS runners need enough time to initialize the
+    // fixture before a timeout test starts exercising active-turn cleanup.
+    if cfg!(any(windows, target_os = "macos")) {
+        default.max(Duration::from_secs(3))
+    } else {
+        default
+    }
+}
+
 #[test]
 fn first_thread_uses_exact_policy_order_and_persists_refs() {
     let run = run_scenario("completed", None, Duration::from_secs(3));
@@ -612,7 +697,7 @@ fn first_thread_uses_exact_policy_order_and_persists_refs() {
         run.child_working_directory,
         std::env::current_dir().unwrap()
     );
-    assert_eq!(run.requests.len(), 4);
+    assert_eq!(run.requests.len(), 6);
     assert_eq!(run.requests[0]["id"], 1);
     assert_eq!(run.requests[0]["method"], "initialize");
     assert_eq!(run.requests[1], json!({"method": "initialized"}));
@@ -624,6 +709,16 @@ fn first_thread_uses_exact_policy_order_and_persists_refs() {
     );
     assert_eq!(
         run.requests[3],
+        json!({"id":6,"method":"mcpServerStatus/list","params":{
+            "threadId":"thread-1","cursor":null,"limit":100,"detail":"toolsAndAuthOnly"}})
+    );
+    assert_eq!(
+        run.requests[4],
+        json!({"id":7,"method":"plugin/list","params":{
+            "cwds":[run.directory.path()]}})
+    );
+    assert_eq!(
+        run.requests[5],
         json!({"id":3,"method":"turn/start","params":{
         "input":[{"type":"text","text":"perform the harmless action PRIVATE_PROMPT_CANARY"}],
         "threadId":"thread-1","model":"gpt-fixture","approvalPolicy":"on-request",
@@ -686,6 +781,9 @@ fn provider_child_overrides_are_process_scoped_and_secret_safe() {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
+            native_action_evidence: None,
+            expected_mcp_server_name: "computer-use",
+            computer_use_allowed_app_ids: &BTreeSet::new(),
             control: None,
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -794,6 +892,9 @@ fn builtin_openai_provider_secret_is_process_scoped_and_shell_excluded() {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
+            native_action_evidence: None,
+            expected_mcp_server_name: "computer-use",
+            computer_use_allowed_app_ids: &BTreeSet::new(),
             control: None,
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -833,36 +934,49 @@ fn builtin_openai_provider_secret_is_process_scoped_and_shell_excluded() {
 fn supported_goal_is_confirmed_before_the_first_turn() {
     let run = run_scenario("goal", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
-    assert_eq!(run.requests.len(), 5);
+    assert_eq!(run.requests.len(), 7);
     assert_eq!(run.requests[2]["method"], "thread/start");
-    assert_eq!(run.requests[3]["id"], 3);
-    assert_eq!(run.requests[3]["method"], "thread/goal/set");
-    assert_eq!(run.requests[3]["params"]["threadId"], "thread-1");
+    assert_eq!(run.requests[5]["id"], 3);
+    assert_eq!(run.requests[5]["method"], "thread/goal/set");
+    assert_eq!(run.requests[5]["params"]["threadId"], "thread-1");
     assert_eq!(
-        run.requests[3]["params"]["objective"],
+        run.requests[5]["params"]["objective"],
         "perform the harmless action PRIVATE_PROMPT_CANARY"
     );
-    assert_eq!(run.requests[4]["id"], 4);
-    assert_eq!(run.requests[4]["method"], "turn/start");
+    assert_eq!(run.requests[5]["params"]["status"], "paused");
+    assert_eq!(run.requests[6]["id"], 4);
+    assert_eq!(run.requests[6]["method"], "turn/start");
+}
+
+#[test]
+fn active_goal_response_blocks_the_competing_explicit_turn() {
+    let run = run_scenario("goal-active", None, Duration::from_secs(3));
+    assert_eq!(run.result, Err(CodexSessionError::MalformedMessage));
+    assert_eq!(run.requests.len(), 6);
+    assert_eq!(run.requests[5]["method"], "thread/goal/set");
 }
 
 #[test]
 fn staged_images_are_sent_as_daemon_local_image_inputs() {
     let run = run_scenario("local-image", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
-    assert_eq!(run.requests[3]["method"], "turn/start");
-    assert_eq!(run.requests[3]["params"]["input"][0]["type"], "text");
-    assert_eq!(run.requests[3]["params"]["input"][1]["type"], "localImage");
-    let image_path = run.requests[3]["params"]["input"][1]["path"]
+    assert_eq!(run.requests[5]["method"], "turn/start");
+    assert_eq!(run.requests[5]["params"]["input"][0]["type"], "text");
+    assert_eq!(run.requests[5]["params"]["input"][1]["type"], "localImage");
+    let image_path = run.requests[5]["params"]["input"][1]["path"]
         .as_str()
         .expect("local image path");
     assert!(Path::new(image_path).starts_with(run.directory.path()));
-    assert!(!run.requests[3].to_string().contains("data:image"));
+    assert!(!run.requests[5].to_string().contains("data:image"));
 }
 
 #[test]
 fn timeout_drops_staged_local_images() {
-    let run = run_scenario("timeout-local-image", None, Duration::from_millis(500));
+    let run = run_scenario(
+        "timeout-local-image",
+        None,
+        process_startup_timeout(Duration::from_millis(500)),
+    );
 
     assert_eq!(run.result, Err(CodexSessionError::Timeout));
     assert!(
@@ -880,7 +994,7 @@ fn resume_uses_persisted_thread_without_persisting_it_again() {
     assert_eq!(run.persisted_turns, ["turn-1"]);
     assert_eq!(run.requests[2]["method"], "thread/resume");
     assert_eq!(run.requests[2]["params"]["threadId"], "thread-existing");
-    assert_eq!(run.requests[3]["params"]["threadId"], "thread-existing");
+    assert_eq!(run.requests[5]["params"]["threadId"], "thread-existing");
 }
 
 #[test]
@@ -962,6 +1076,9 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
                 persist_thread_ref: &mut persist_thread,
                 persist_turn_ref: &mut persist_turn,
                 observe_native_approval: None,
+                native_action_evidence: None,
+                expected_mcp_server_name: "computer-use",
+                computer_use_allowed_app_ids: &BTreeSet::new(),
                 control: Some(session_control),
                 goal_set_supported: false,
                 image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -1015,7 +1132,7 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
         Ok(())
     };
 
-    let timeout_deadline = Instant::now() + Duration::from_millis(100);
+    let timeout_deadline = Instant::now() + process_startup_timeout(Duration::from_millis(100));
     let cancellation_grace = Duration::from_secs(1);
     let registered_control = CodexSessionControl::new(timeout_deadline + cancellation_grace);
     let run = run_codex_session_with_timeout_cancellation(
@@ -1035,6 +1152,9 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
+            native_action_evidence: None,
+            expected_mcp_server_name: "computer-use",
+            computer_use_allowed_app_ids: &BTreeSet::new(),
             control: Some(registered_control.clone()),
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
@@ -1148,6 +1268,22 @@ fn malformed_and_adversarial_messages_fail_closed() {
 }
 
 #[test]
+fn an_unexpected_thread_mcp_server_blocks_turn_dispatch() {
+    let run = run_scenario("unexpected-mcp-server", None, Duration::from_secs(3));
+
+    assert_eq!(run.result, Err(CodexSessionError::ConflictingIdentity));
+    assert!(!run.turn_dispatch_attempted);
+}
+
+#[test]
+fn an_unexpected_enabled_plugin_blocks_turn_dispatch() {
+    let run = run_scenario("unexpected-plugin", None, Duration::from_secs(3));
+
+    assert_eq!(run.result, Err(CodexSessionError::ConflictingIdentity));
+    assert!(!run.turn_dispatch_attempted);
+}
+
+#[test]
 fn persistence_failure_stops_before_dependent_protocol_work() {
     let thread_failure = run_scenario_with_options(
         "completed",
@@ -1173,7 +1309,7 @@ fn persistence_failure_stops_before_dependent_protocol_work() {
     );
     assert_eq!(turn_failure.result, Err(CodexSessionError::Persistence));
     assert!(turn_failure.turn_dispatch_attempted);
-    assert_eq!(turn_failure.requests.len(), 4);
+    assert_eq!(turn_failure.requests.len(), 6);
     assert_eq!(turn_failure.persisted_threads, ["thread-1"]);
     assert!(turn_failure.persisted_turns.is_empty());
 }
@@ -1208,7 +1344,7 @@ fn notification_flood_is_backpressured_and_cleanup_remains_bounded() {
 fn unknown_and_item_payloads_are_discarded_without_leaking_canaries() {
     let run = run_scenario("unknown-canary", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
-    assert_eq!(run.requests.len(), 4);
+    assert_eq!(run.requests.len(), 6);
     assert_eq!(run.persisted_threads, ["thread-1"]);
     assert_eq!(run.persisted_turns, ["turn-1"]);
 
@@ -1225,7 +1361,9 @@ fn unknown_and_item_payloads_are_discarded_without_leaking_canaries() {
 fn terminating_a_successful_session_contains_descendants() {
     let run = run_scenario("descendant", None, Duration::from_secs(3));
     let escaped_marker = run.directory.path().join("descendant-escaped");
+    let release_marker = run.directory.path().join("descendant-release");
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    touch(&release_marker);
     let deadline = Instant::now() + Duration::from_secs(1);
     while Instant::now() < deadline && !escaped_marker.exists() {
         std::thread::sleep(Duration::from_millis(10));
@@ -1235,10 +1373,16 @@ fn terminating_a_successful_session_contains_descendants() {
 
 #[test]
 fn timeout_cleanup_contains_descendants() {
-    let run = run_scenario("descendant-timeout", None, Duration::from_millis(250));
+    let run = run_scenario(
+        "descendant-timeout",
+        None,
+        process_startup_timeout(Duration::from_millis(250)),
+    );
     let escaped_marker = run.directory.path().join("descendant-escaped");
+    let release_marker = run.directory.path().join("descendant-release");
 
     assert_eq!(run.result, Err(CodexSessionError::Timeout));
+    touch(&release_marker);
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         !escaped_marker.exists(),
