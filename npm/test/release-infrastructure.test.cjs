@@ -3143,6 +3143,7 @@ test("one-time npm bootstrap is bound to the failed v0.1.0 release artifacts", (
   assert.match(workflow, /^  contents: write$/m);
   assert.match(workflow, /^  id-token: write$/m);
   assert.match(workflow, /^    runs-on: ubuntu-24\.04$/m);
+  assert.match(workflow, /^    timeout-minutes: 270$/m);
   assert.match(workflow, /^      BOOTSTRAP_TAG: bootstrap-v0\.1\.0$/m);
   assert.match(workflow, /^      BOOTSTRAP_VERSION: 0\.1\.0$/m);
   assert.match(workflow, /EXPECTED_SOURCE_DIGEST: 918d3ddc9f1a8460152f509d202c8e634fac549c/);
@@ -3164,9 +3165,25 @@ test("one-time npm bootstrap is bound to the failed v0.1.0 release artifacts", (
     workflow,
     /read_published_version\(\)[\s\S]*\.error\.code == "E404"[\s\S]*return "\$status"/,
   );
+  const waitHelper = workflow.slice(
+    workflow.indexOf("          wait_for_published_version() {"),
+    workflow.indexOf('          test "$(npm whoami)" = microck'),
+  );
+  assert.match(waitHelper, /for attempt in \$\(seq 1 60\); do/);
+  assert.match(
+    waitHelper,
+    /if \[ "\$attempt" = 60 \]; then\n {16}break\n {14}fi[\s\S]*sleep 30/,
+  );
+  assert.match(waitHelper, /sleep 30[\s\S]*return 1/);
   assert.doesNotMatch(workflow, /published_version=.*\|\| true/);
   assert.match(workflow, /validate-npm-artifacts dist --write-manifest/);
-  assert.match(workflow, /npm publish "\.\/dist\/\$package_file"/);
+  const publishLoop = workflow.slice(workflow.indexOf("          for package_name in \\"));
+  const publishIndex = publishLoop.indexOf('npm publish "./dist/$package_file"');
+  const waitIndex = publishLoop.indexOf('wait_for_published_version "$package_spec"');
+  const metadataIndex = publishLoop.indexOf('npm view "$package_spec" version --json');
+  assert.ok(publishIndex >= 0);
+  assert.ok(waitIndex > publishIndex);
+  assert.ok(metadataIndex > waitIndex);
   assert.match(workflow, /--tag "\$BOOTSTRAP_TAG" --provenance --access public --ignore-scripts/);
   assert.match(workflow, /npm view "\$package_spec" version --json[\s\S]*= "\$BOOTSTRAP_VERSION"/);
   assert.match(workflow, /npm view "\$package_spec" dist\.integrity --json[\s\S]*= "\$expected_integrity"/);
