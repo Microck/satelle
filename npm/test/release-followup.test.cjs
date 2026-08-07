@@ -225,18 +225,19 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.match(workflow, /candidate_pattern=.*npm-candidate-v.*\[0-9\]\+/);
   assert.match(workflow, /promotion_pattern=.*npm-promotion-v.*\[0-9\]\+/);
   assert.match(workflow, /sha256sum --check/);
-  assert.match(workflow, /gh release edit "\$GITHUB_REF_NAME"[^\n]*--draft=false --latest/);
+  assert.match(workflow, /gh release edit "\$RELEASE_TAG"[^\n]*--draft=false --latest/);
   assert.match(
     workflow,
-    /pnpm --dir "\$install_root" --minimum-release-age=0 add --ignore-scripts "\$package_spec"/,
+    /pnpm --dir "\$install_root" add --ignore-scripts "\$package_spec"/,
   );
+  assert.doesNotMatch(workflow, /minimum-release-age/);
   assert.match(
     workflow,
     /repos\/\$GITHUB_REPOSITORY\/immutable-releases[\s\S]*?immutable releases are not enabled/,
   );
   assert.match(
     workflow,
-    /cmp -s "\$current_assets" "\$verified_assets"[\s\S]*?recheck_release_tag\n\s+gh release edit "\$GITHUB_REF_NAME"/,
+    /cmp -s "\$current_assets" "\$verified_assets"[\s\S]*?recheck_release_tag\n\s+gh release edit "\$RELEASE_TAG"/,
   );
   assert.doesNotMatch(workflow, /^\s+(?:validated|dist)\/npm-.*\.tgz \\?$/m);
   assert.match(workflow, /\.\/dist\/npm-satelle-scoped\.tgz/);
@@ -280,7 +281,7 @@ test("release workflow validates six targets and publishes only a fully verified
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
   ) ?? [];
-  assert.equal(checkoutUses.length, 10);
+  assert.equal(checkoutUses.length, 11);
   assert.equal(hardenedCheckoutUses.length, checkoutUses.length);
 });
 

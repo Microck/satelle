@@ -25,6 +25,7 @@ on:
         options:
           - diagnostics
           - candidate-resume
+          - candidate-finalize
           - candidate-tag-repair
           - rollback
       version:
@@ -705,8 +706,19 @@ jobs:
 
   validate-registry-candidates:
     name: Validate npm candidates on ${{ matrix.target }}
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [collect, publish-candidates]
+    if: >-
+      ${{
+        always() &&
+        (
+          (startsWith(github.ref, 'refs/tags/v') &&
+            needs.collect.result == 'success' &&
+            needs.publish-candidates.result == 'success') ||
+          (github.event_name == 'workflow_dispatch' &&
+            inputs.operation == 'candidate-finalize' &&
+            needs.authorize-recovery-tag.result == 'success')
+        )
+      }}
+    needs: [authorize-recovery-tag, collect, publish-candidates]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
@@ -743,7 +755,7 @@ jobs:
 
       - name: Clean-install and smoke both launcher identities
         env:
-          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+          RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && needs.collect.outputs.version || inputs.version }}
         shell: bash
         run: |
           root="$RUNNER_TEMP/satelle-registry-validation"
@@ -765,7 +777,7 @@ jobs:
               node -e 'require("fs").writeFileSync(process.argv[1], "{\"private\":true}\n")' "$install_root/package.json"
               case "$manager" in
                 npm) npm install --prefix "$install_root" --include=optional --ignore-scripts --no-audit --no-fund "$package_spec" ;;
-                pnpm) pnpm --dir "$install_root" --minimum-release-age=0 add --ignore-scripts "$package_spec" ;;
+                pnpm) pnpm --dir "$install_root" add --ignore-scripts "$package_spec" ;;
                 bun) bun --cwd "$install_root" add --ignore-scripts "$package_spec" ;;
               esac
               smoke "$install_root/node_modules/.bin/satelle"
@@ -774,17 +786,45 @@ jobs:
 
   promote-and-publish:
     name: Promote npm graph and publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [attest, collect, draft-release, validate-registry-candidates]
+    if: >-
+      ${{
+        always() &&
+        needs.validate-registry-candidates.result == 'success' &&
+        (
+          (startsWith(github.ref, 'refs/tags/v') &&
+            needs.attest.result == 'success' &&
+            needs.collect.result == 'success' &&
+            needs.draft-release.result == 'success') ||
+          (github.event_name == 'workflow_dispatch' &&
+            inputs.operation == 'candidate-finalize' &&
+            needs.authorize-recovery-tag.result == 'success')
+        )
+      }}
+    needs: [attest, authorize-recovery-tag, collect, draft-release, validate-registry-candidates]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
+      actions: read
       contents: write
+    env:
+      SATELLE_RELEASE_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'candidate-finalize' && '1' || '0' }}
+      SATELLE_RELEASE_RECOVERY_OPERATION: candidate-finalize
+      SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: ${{ github.workspace }}/signed-release-source
+      SATELLE_RELEASE_RECOVERY_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
+      VERIFIED_SOURCE_DIGEST: ${{ startsWith(github.ref, 'refs/tags/v') && needs.attest.outputs.source-digest || needs.authorize-recovery-tag.outputs.source-digest }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      - name: Check out signed release metadata for recovery
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'candidate-finalize'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          path: signed-release-source
+          ref: ${{ needs.authorize-recovery-tag.outputs.source-digest }}
 
       - name: Install Node.js for npm dist-tag recovery
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -797,19 +837,59 @@ jobs:
         run: npm install --global npm@11.5.1
 
       - name: Download validated release candidate
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: validated-release-candidate
           path: validated
+
+      - name: Download the exact signed-tag candidate for recovery
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'candidate-finalize'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          VERIFIED_SOURCE_DIGEST: ${{ needs.authorize-recovery-tag.outputs.source-digest }}
+        shell: bash
+        run: |
+          recovery_source_not_trusted() {
+            jq -cn \
+              --arg message "$1" \
+              '{code:"recovery-source-not-trusted", message:$message}' >&2
+            exit 1
+          }
+          tag="v${RELEASE_VERSION}"
+          test "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true || \
+            recovery_source_not_trusted "GitHub release is not draft"
+          source_runs=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?event=push&branch=${tag}&per_page=100")
+          source_run_ids=$(printf '%s' "$source_runs" | jq -c \
+            --arg source_digest "$VERIFIED_SOURCE_DIGEST" \
+            --arg tag "$tag" \
+            '[.workflow_runs[] | select(
+              .head_branch == $tag and
+              .head_sha == $source_digest and
+              .event == "push" and
+              .status == "completed" and
+              .conclusion == "failure"
+            ) | .id]')
+          source_run_count=$(printf '%s' "$source_run_ids" | jq -r 'length')
+          test "$source_run_count" = 1 || \
+            recovery_source_not_trusted "expected one failed signed-tag run; found ${source_run_count}"
+          source_run_id=$(printf '%s' "$source_run_ids" | jq -r '.[0]')
+          gh run download "$source_run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name validated-release-candidate \
+            --dir validated
 
       - name: Promote latest tags with durable checkpoints
         env:
           GH_TOKEN: ${{ github.token }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
           SATELLE_PROMOTION_RECORD_KEY: ${{ secrets.NPM_PROMOTION_RECORD_KEY }}
-          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
-          EXPECTED_SOURCE_DIGEST: ${{ needs.attest.outputs.source-digest }}
-          EXPECTED_TAG_DIGEST: ${{ needs.attest.outputs.tag-digest }}
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
+          RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && needs.collect.outputs.version || inputs.version }}
+          EXPECTED_SOURCE_DIGEST: ${{ startsWith(github.ref, 'refs/tags/v') && needs.attest.outputs.source-digest || needs.authorize-recovery-tag.outputs.source-digest }}
+          EXPECTED_TAG_DIGEST: ${{ startsWith(github.ref, 'refs/tags/v') && needs.attest.outputs.tag-digest || needs.authorize-recovery-tag.outputs.tag-digest }}
         shell: bash
         run: |
           release_tag_not_trusted() {
@@ -818,7 +898,7 @@ jobs:
           }
           recheck_release_tag() {
             current_tag_digest=$(gh api \
-              "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
               --jq 'select(.object.type == "tag") | .object.sha') || \
               release_tag_not_trusted "release tag ref cannot be resolved"
             test -n "$current_tag_digest" && test "$current_tag_digest" = "$EXPECTED_TAG_DIGEST" || \
@@ -830,7 +910,7 @@ jobs:
             test -n "$current_source_digest" && test "$current_source_digest" = "$EXPECTED_SOURCE_DIGEST" || \
               release_tag_not_trusted "release tag source changed after attestation"
             is_draft=$(gh release view \
-              "$GITHUB_REF_NAME" \
+              "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --json isDraft \
               --jq .isDraft) || \
@@ -869,10 +949,11 @@ jobs:
           fi
 
           checkpoint() {
+            recheck_release_tag
             sequence=$(node -e 'process.stdout.write(String(require(process.argv[1]).record.sequence))' "$record")
             snapshot="$RUNNER_TEMP/npm-promotion-v${RELEASE_VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${sequence}.json"
             cp "$record" "$snapshot"
-            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$snapshot"
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber "$snapshot"
           }
           checkpoint
           trap 'checkpoint' ERR
@@ -901,9 +982,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SATELLE_PROMOTION_RECORD_KEY: ${{ secrets.NPM_PROMOTION_RECORD_KEY }}
-          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
-          EXPECTED_SOURCE_DIGEST: ${{ needs.attest.outputs.source-digest }}
-          EXPECTED_TAG_DIGEST: ${{ needs.attest.outputs.tag-digest }}
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
+          RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && needs.collect.outputs.version || inputs.version }}
+          EXPECTED_SOURCE_DIGEST: ${{ startsWith(github.ref, 'refs/tags/v') && needs.attest.outputs.source-digest || needs.authorize-recovery-tag.outputs.source-digest }}
+          EXPECTED_TAG_DIGEST: ${{ startsWith(github.ref, 'refs/tags/v') && needs.attest.outputs.tag-digest || needs.authorize-recovery-tag.outputs.tag-digest }}
         shell: bash
         run: |
           release_tag_not_trusted() {
@@ -912,7 +994,7 @@ jobs:
           }
           recheck_release_tag() {
             current_tag_digest=$(gh api \
-              "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
               --jq 'select(.object.type == "tag") | .object.sha') || \
               release_tag_not_trusted "release tag ref cannot be resolved"
             test -n "$current_tag_digest" && test "$current_tag_digest" = "$EXPECTED_TAG_DIGEST" || \
@@ -970,7 +1052,7 @@ jobs:
           version_pattern=${RELEASE_VERSION//./\\.}
           candidate_pattern="^npm-candidate-v${version_pattern}-[0-9]+-[0-9]+-[0-9]+\\.json$"
           promotion_pattern="^npm-promotion-v${version_pattern}-[0-9]+-[0-9]+-[0-9]+\\.json$"
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
             --jq '.assets[] | [.id, .name] | @tsv' \
             | while IFS=$'\t' read -r asset_id asset_name; do
                 if grep -Fqx "$asset_name" "$expected_names"; then
@@ -1003,19 +1085,20 @@ jobs:
             release_asset_invalid "release is missing its authenticated npm promotion record"
           node npm/scripts/npm-promotion.cjs verify-complete "$records/$current_file"
 
+          recheck_release_tag
           while read -r asset_id; do
             [ -n "$asset_id" ] || continue
             gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
           done < "$candidate_ids"
           LC_ALL=C sort -o "$verified_assets" "$verified_assets"
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
             --jq '.assets[] | [.id, .name] | @tsv' \
             | LC_ALL=C sort > "$current_assets"
           cmp -s "$current_assets" "$verified_assets" || \
             release_asset_invalid "release asset set changed during final verification"
           require_immutable_releases
           recheck_release_tag
-          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
 
   authorize-recovery-tag:
     name: Authorize signed tag recovery
@@ -1309,6 +1392,7 @@ jobs:
       contents: write
     env:
       SATELLE_RELEASE_RECOVERY: "1"
+      SATELLE_RELEASE_RECOVERY_OPERATION: rollback
       SATELLE_RELEASE_RECOVERY_TAG: v${{ inputs.version }}
     steps:
       - name: Check out repository

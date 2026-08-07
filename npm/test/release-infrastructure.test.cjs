@@ -35,12 +35,14 @@ const {
 } = require(releaseScriptPath);
 const {
   PromotionError,
+  requireReleaseAutomation,
   assertExclusiveRegistryWriter,
   auditRecords,
   beginRollback,
   checkpointOperation,
   createPromotionRecord,
   planRegistryOperation,
+  promotionReleaseRoot,
   promotionTagValue,
   sealPromotionRecord,
   verifyCompleteRecord,
@@ -3032,11 +3034,15 @@ test("npm recovery metadata requires a clean signed-source checkout", (context) 
   }).trim();
   const originalEnvironment = {
     GITHUB_WORKSPACE: process.env.GITHUB_WORKSPACE,
+    SATELLE_RELEASE_RECOVERY: process.env.SATELLE_RELEASE_RECOVERY,
+    SATELLE_RELEASE_RECOVERY_OPERATION: process.env.SATELLE_RELEASE_RECOVERY_OPERATION,
     SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: process.env.SATELLE_RELEASE_RECOVERY_SOURCE_ROOT,
     VERIFIED_SOURCE_DIGEST: process.env.VERIFIED_SOURCE_DIGEST,
   };
   Object.assign(process.env, {
     GITHUB_WORKSPACE: workspace,
+    SATELLE_RELEASE_RECOVERY: "1",
+    SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-finalize",
     SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: signedSource,
     VERIFIED_SOURCE_DIGEST: sourceDigest,
   });
@@ -3048,11 +3054,25 @@ test("npm recovery metadata requires a clean signed-source checkout", (context) 
   });
 
   assert.equal(recoveryReleaseRoot(), realpathSync(signedSource));
+  assert.equal(promotionReleaseRoot(), realpathSync(signedSource));
+
+  // A normal signed-tag run shares the operation label but must read metadata
+  // from its checked-out release source, not the recovery-only checkout.
+  process.env.SATELLE_RELEASE_RECOVERY = "0";
+  assert.equal(promotionReleaseRoot(), repositoryRoot);
+  process.env.SATELLE_RELEASE_RECOVERY = "1";
+
   writeFileSync(path.join(signedSource, "untracked.txt"), "changed\n");
   assert.throws(
     () => recoveryReleaseRoot(),
     (error) =>
       error instanceof CandidatePublicationError &&
+      error.code === "release-recovery-not-authorized",
+  );
+  assert.throws(
+    () => promotionReleaseRoot(),
+    (error) =>
+      error instanceof PromotionError &&
       error.code === "release-recovery-not-authorized",
   );
 });
@@ -3263,6 +3283,7 @@ test("npm rollback recovery is bound to the matching release tag", (context) => 
     GITHUB_REF: "refs/heads/main",
     GITHUB_REPOSITORY: "Microck/satelle",
     SATELLE_RELEASE_RECOVERY: "1",
+    SATELLE_RELEASE_RECOVERY_OPERATION: "rollback",
     SATELLE_PROMOTION_RECORD_KEY: signingKey,
   };
 
@@ -3286,6 +3307,56 @@ test("npm rollback recovery is bound to the matching release tag", (context) => 
   assert.equal(rollbackCheckpoint.schemaVersion, "satelle.npm-promotion.checkpoint.v1");
   assert.match(rollbackCheckpoint.authentication.value, /^[0-9a-f]{64}$/);
   assert.equal(rollbackCheckpoint.record.status, "rolling_back");
+});
+
+test("npm promotion recovery requires the exact finalization operation and tag", (context) => {
+  const environmentKeys = [
+    "GITHUB_ACTIONS",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_REF",
+    "GITHUB_REPOSITORY",
+    "SATELLE_RELEASE_RECOVERY",
+    "SATELLE_RELEASE_RECOVERY_OPERATION",
+    "SATELLE_RELEASE_RECOVERY_TAG",
+  ];
+  const originalEnvironment = Object.fromEntries(
+    environmentKeys.map((key) => [key, process.env[key]]),
+  );
+  context.after(() => {
+    for (const [key, value] of Object.entries(originalEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+  Object.assign(process.env, {
+    GITHUB_ACTIONS: "true",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_REF: "refs/heads/main",
+    GITHUB_REPOSITORY: "Microck/satelle",
+    SATELLE_RELEASE_RECOVERY: "1",
+    SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-finalize",
+    SATELLE_RELEASE_RECOVERY_TAG: "v1.2.3",
+  });
+
+  assert.doesNotThrow(() =>
+    requireReleaseAutomation("1.2.3", { recoveryOperation: "candidate-finalize" }),
+  );
+  for (const invalidEnvironment of [
+    { SATELLE_RELEASE_RECOVERY_OPERATION: "rollback" },
+    { SATELLE_RELEASE_RECOVERY_TAG: "v9.9.9" },
+    { GITHUB_REPOSITORY: "someone/satelle" },
+  ]) {
+    Object.assign(process.env, {
+      GITHUB_REPOSITORY: "Microck/satelle",
+      SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-finalize",
+      SATELLE_RELEASE_RECOVERY_TAG: "v1.2.3",
+      ...invalidEnvironment,
+    });
+    assert.throws(
+      () => requireReleaseAutomation("1.2.3", { recoveryOperation: "candidate-finalize" }),
+      (error) => error instanceof PromotionError && error.code === "release-automation-required",
+    );
+  }
 });
 
 test("registry mutation helpers reject local developer execution", () => {
@@ -3477,6 +3548,10 @@ test("release workflow gates draft publication on candidate validation and promo
     promoteAndPublish,
     "Promote latest tags with durable checkpoints",
   );
+  const finalizationDownloadStep = workflowStep(
+    promoteAndPublish,
+    "Download the exact signed-tag candidate for recovery",
+  );
   const finalPublishStep = workflowStep(
     promoteAndPublish,
     "Recheck signed tag and publish the GitHub release",
@@ -3503,6 +3578,7 @@ test("release workflow gates draft publication on candidate validation and promo
     /^    if: github\.event_name == 'workflow_dispatch' && inputs\.operation != 'diagnostics'$/m,
   );
   assert.match(workflow, /^          - candidate-resume$/m);
+  assert.match(workflow, /^          - candidate-finalize$/m);
   assert.match(
     resumeCandidates,
     /^    if: github\.event_name == 'workflow_dispatch' && inputs\.operation == 'candidate-resume'$/m,
@@ -3578,24 +3654,60 @@ test("release workflow gates draft publication on candidate validation and promo
   assert.match(candidateRepairStep, /npm-candidate-publication\.cjs repair-tags/);
   assert.match(candidateRepairStep, /git rev-parse HEAD/);
   assert.match(candidateRepairStep, /VERIFIED_TAG_DIGEST/);
-  assert.match(validateRegistryCandidates, /^    needs: \[collect, publish-candidates\]$/m);
+  assert.match(
+    validateRegistryCandidates,
+    /^    needs: \[authorize-recovery-tag, collect, publish-candidates\]$/m,
+  );
+  assert.match(validateRegistryCandidates, /inputs\.operation == 'candidate-finalize'/);
+  assert.match(validateRegistryCandidates, /needs\.authorize-recovery-tag\.result == 'success'/);
   assert.match(
     validateRegistryCandidates,
     /@microck\/satelle satelle[\s\S]*for manager in npm pnpm bun/,
   );
   assert.match(
-    promoteAndPublish,
-    /^    needs: \[attest, collect, draft-release, validate-registry-candidates\]$/m,
+    validateRegistryCandidates,
+    /pnpm --dir "\$install_root" add --ignore-scripts "\$package_spec"/,
   );
-  assert.match(promoteAndPublish, /EXPECTED_SOURCE_DIGEST: \$\{\{ needs\.attest\.outputs\.source-digest \}\}/);
-  assert.match(promoteAndPublish, /EXPECTED_TAG_DIGEST: \$\{\{ needs\.attest\.outputs\.tag-digest \}\}/);
+  assert.doesNotMatch(validateRegistryCandidates, /minimum-release-age/);
+  assert.match(
+    promoteAndPublish,
+    /^    needs: \[attest, authorize-recovery-tag, collect, draft-release, validate-registry-candidates\]$/m,
+  );
+  assert.match(promoteAndPublish, /inputs\.operation == 'candidate-finalize'/);
+  assert.match(promoteAndPublish, /needs\.authorize-recovery-tag\.result == 'success'/);
+  assert.match(promoteAndPublish, /SATELLE_RELEASE_RECOVERY_OPERATION: candidate-finalize/);
+  assert.match(promoteAndPublish, /SATELLE_RELEASE_RECOVERY_TAG: \$\{\{ startsWith\(github\.ref/);
+  assert.match(
+    promoteAndPublish,
+    /path: signed-release-source[\s\S]*ref: \$\{\{ needs\.authorize-recovery-tag\.outputs\.source-digest \}\}/,
+  );
+  assert.match(
+    promoteAndPublish,
+    /SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: \$\{\{ github\.workspace \}\}\/signed-release-source/,
+  );
+  assert.match(
+    promoteAndPublish,
+    /EXPECTED_SOURCE_DIGEST: \$\{\{ startsWith\(github\.ref, 'refs\/tags\/v'\) && needs\.attest\.outputs\.source-digest \|\| needs\.authorize-recovery-tag\.outputs\.source-digest \}\}/,
+  );
+  assert.match(
+    promoteAndPublish,
+    /EXPECTED_TAG_DIGEST: \$\{\{ startsWith\(github\.ref, 'refs\/tags\/v'\) && needs\.attest\.outputs\.tag-digest \|\| needs\.authorize-recovery-tag\.outputs\.tag-digest \}\}/,
+  );
+  assert.match(finalizationDownloadStep, /actions\/workflows\/release\.yml\/runs\?event=push&branch=\$\{tag\}/);
+  assert.match(finalizationDownloadStep, /test "\$source_run_count" = 1/);
+  assert.match(finalizationDownloadStep, /gh run download "\$source_run_id"/);
+  assert.match(finalizationDownloadStep, /--name validated-release-candidate/);
   assert.match(
     promotionStep,
-    /recheck_release_tag[\s\S]*git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*gh release view[\s\S]*--jq \.isDraft[\s\S]*recheck_release_tag[\s\S]*npm-promotion\.cjs advance/,
+    /recheck_release_tag[\s\S]*git\/ref\/tags\/\$RELEASE_TAG[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*gh release view[\s\S]*--jq \.isDraft[\s\S]*recheck_release_tag[\s\S]*npm-promotion\.cjs advance/,
   );
   assert.match(
     promotionStep,
     /gh api --paginate "repos\/\$GITHUB_REPOSITORY\/releases\?per_page=100"/,
+  );
+  assert.match(
+    promotionStep,
+    /checkpoint\(\) \{\n\s+recheck_release_tag\n[\s\S]*gh release upload "\$RELEASE_TAG"/,
   );
   assert.doesNotMatch(
     promotionStep,
@@ -3611,7 +3723,7 @@ test("release workflow gates draft publication on candidate validation and promo
   );
   assert.match(
     promoteAndPublish,
-    /npm-promotion\.cjs advance[\s\S]*npm-promotion\.cjs verify-complete[\s\S]*Recheck signed tag and publish the GitHub release[\s\S]*git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*gh release edit .*--draft=false --latest/,
+    /npm-promotion\.cjs advance[\s\S]*npm-promotion\.cjs verify-complete[\s\S]*Recheck signed tag and publish the GitHub release[\s\S]*git\/ref\/tags\/\$RELEASE_TAG[\s\S]*gh release edit .*--draft=false --latest/,
   );
   assert.match(
     finalPublishStep,
@@ -3623,7 +3735,7 @@ test("release workflow gates draft publication on candidate validation and promo
   );
   assert.match(
     finalPublishStep,
-    /--method DELETE[\s\S]*release asset set changed during final verification[\s\S]*gh release edit .*--draft=false --latest/,
+    /recheck_release_tag\n\s+while read -r asset_id; do[\s\S]*--method DELETE[\s\S]*release asset set changed during final verification[\s\S]*gh release edit .*--draft=false --latest/,
   );
   assert.match(
     rollbackPromotion,
@@ -3638,6 +3750,7 @@ test("release workflow gates draft publication on candidate validation and promo
     /gh api --paginate "repos\/\$GITHUB_REPOSITORY\/releases\?per_page=100"/,
   );
   assert.match(rollbackPromotion, /^    needs: authorize-recovery-tag$/m);
+  assert.match(rollbackPromotion, /SATELLE_RELEASE_RECOVERY_OPERATION: rollback/);
   assert.match(
     rollbackPromotion,
     /^          SATELLE_PROMOTION_RECORD_KEY: \$\{\{ secrets\.NPM_PROMOTION_RECORD_KEY \}\}$/m,

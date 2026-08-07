@@ -181,9 +181,29 @@ function assertPromotionPackageGraph(record, expectedPackageNames) {
   return record;
 }
 
+function promotionReleaseRoot() {
+  if (
+    process.env.SATELLE_RELEASE_RECOVERY !== "1" ||
+    process.env.SATELLE_RELEASE_RECOVERY_OPERATION !== "candidate-finalize"
+  ) {
+    return path.resolve(__dirname, "../..");
+  }
+  try {
+    const { recoveryReleaseRoot } = require("./npm-candidate-publication.cjs");
+    return recoveryReleaseRoot();
+  } catch (error) {
+    fail(
+      error?.code === "release-recovery-not-authorized"
+        ? error.code
+        : "release-recovery-not-authorized",
+      error.message,
+    );
+  }
+}
+
 function canonicalPublicationOrder(version) {
   const { createReleaseContext } = require("./release.cjs");
-  return createReleaseContext(path.resolve(__dirname, "../..")).check(`v${version}`).publicationOrder;
+  return createReleaseContext(promotionReleaseRoot()).check(`v${version}`).publicationOrder;
 }
 
 function pendingEntry(record) {
@@ -409,13 +429,14 @@ function readAllLatest(record) {
   return Object.fromEntries(record.packages.map(({ name }) => [name, readLatest(name)]));
 }
 
-function requireReleaseAutomation(version, { recovery = false } = {}) {
+function requireReleaseAutomation(version, { recoveryOperation = null } = {}) {
   const expectedRef = `refs/tags/v${version}`;
   const tagRun = process.env.GITHUB_REF === expectedRef;
   const recoveryRun =
-    recovery &&
+    typeof recoveryOperation === "string" &&
     process.env.GITHUB_EVENT_NAME === "workflow_dispatch" &&
     process.env.SATELLE_RELEASE_RECOVERY === "1" &&
+    process.env.SATELLE_RELEASE_RECOVERY_OPERATION === recoveryOperation &&
     process.env.SATELLE_RELEASE_RECOVERY_TAG === `v${version}`;
   if (
     process.env.GITHUB_ACTIONS !== "true" ||
@@ -446,12 +467,12 @@ function verifyCandidate(packageName, version, candidateTag, expectedIntegrity) 
 }
 
 function createRecordFromRegistry(version, recordPath, manifestPath) {
-  requireReleaseAutomation(version);
+  requireReleaseAutomation(version, { recoveryOperation: "candidate-finalize" });
   if (existsSync(recordPath)) {
     fail("promotion-record-exists", `promotion record already exists at ${recordPath}`);
   }
   const { createReleaseContext } = require("./release.cjs");
-  const plan = createReleaseContext(path.resolve(__dirname, "../..")).check(`v${version}`);
+  const plan = createReleaseContext(promotionReleaseRoot()).check(`v${version}`);
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   const manifestPackages = new Map(manifest.packages.map((entry) => [entry.package, entry]));
   const previousLatest = {};
@@ -481,7 +502,9 @@ function createRecordFromRegistry(version, recordPath, manifestPath) {
 function advanceRecord(recordPath) {
   let record = readRecord(recordPath);
   assertPromotionPackageGraph(record, canonicalPublicationOrder(record.version));
-  requireReleaseAutomation(record.version, { recovery: record.mode === "rollback" });
+  requireReleaseAutomation(record.version, {
+    recoveryOperation: record.mode === "rollback" ? "rollback" : "candidate-finalize",
+  });
   const entry = pendingEntry(record);
   if (!entry) return record;
   try {
@@ -580,7 +603,7 @@ function runCli() {
   } else if (command === "abort") {
     let record = readRecord(argumentsList[0]);
     assertPromotionPackageGraph(record, canonicalPublicationOrder(record.version));
-    requireReleaseAutomation(record.version, { recovery: true });
+    requireReleaseAutomation(record.version, { recoveryOperation: "rollback" });
     record = beginRollback(record);
     writeRecord(argumentsList[0], record);
     output = record;
@@ -589,7 +612,7 @@ function runCli() {
   } else if (command === "verify-complete") {
     const record = readRecord(argumentsList[0]);
     assertPromotionPackageGraph(record, canonicalPublicationOrder(record.version));
-    requireReleaseAutomation(record.version);
+    requireReleaseAutomation(record.version, { recoveryOperation: "candidate-finalize" });
     output = verifyCompleteRecord(record, readAllLatest(record));
   } else if (command === "status") {
     output = readRecord(argumentsList[0]);
@@ -617,8 +640,10 @@ module.exports = {
   checkpointOperation,
   createPromotionRecord,
   planRegistryOperation,
+  promotionReleaseRoot,
   promotionTagValue,
   readCandidate,
+  requireReleaseAutomation,
   sealPromotionRecord,
   verifyCompleteRecord,
 };
