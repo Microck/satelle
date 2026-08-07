@@ -27,16 +27,25 @@ function fail(code, message) {
 }
 
 function requireReleaseAutomation(version) {
-  if (
+  const tagReleaseInvalid =
     process.env.GITHUB_ACTIONS !== "true" ||
     process.env.GITHUB_REPOSITORY !== "Microck/satelle" ||
-    process.env.GITHUB_REF !== `refs/tags/v${version}`
-  ) {
+    process.env.GITHUB_REF !== `refs/tags/v${version}`;
+  const candidateRecovery =
+    process.env.GITHUB_ACTIONS === "true" &&
+    process.env.GITHUB_EVENT_NAME === "workflow_dispatch" &&
+    process.env.GITHUB_REPOSITORY === "Microck/satelle" &&
+    process.env.GITHUB_REF === "refs/heads/main" &&
+    process.env.SATELLE_RELEASE_RECOVERY === "1" &&
+    process.env.SATELLE_RELEASE_RECOVERY_OPERATION === "candidate-resume" &&
+    process.env.SATELLE_RELEASE_RECOVERY_TAG === `v${version}`;
+  if (tagReleaseInvalid && !candidateRecovery) {
     fail(
       "release-automation-required",
       "npm candidate publication is limited to the Microck/satelle tag release workflow",
     );
   }
+  return candidateRecovery ? "recovery" : "tag-release";
 }
 
 function requireCandidateTagRecovery(version) {
@@ -44,6 +53,7 @@ function requireCandidateTagRecovery(version) {
     process.env.GITHUB_ACTIONS !== "true" ||
     process.env.GITHUB_EVENT_NAME !== "workflow_dispatch" ||
     process.env.GITHUB_REPOSITORY !== "Microck/satelle" ||
+    process.env.GITHUB_REF !== "refs/heads/main" ||
     process.env.SATELLE_RELEASE_RECOVERY !== "1" ||
     process.env.SATELLE_RELEASE_RECOVERY_TAG !== `v${version}`
   ) {
@@ -125,11 +135,16 @@ function recheckCandidateRecoveryAuthorization(version) {
   }
 }
 
-function createPublicationRecord(version, manifest, now) {
+function createPublicationRecord(
+  version,
+  manifest,
+  now,
+  releaseRoot = path.resolve(__dirname, "../.."),
+) {
   if (!versionPattern.test(version ?? "") || manifest?.version !== version) {
     fail("candidate-record-invalid", "candidate version and npm artifact manifest must match");
   }
-  const releasePlan = createReleaseContext(path.resolve(__dirname, "../..")).check(`v${version}`);
+  const releasePlan = createReleaseContext(releaseRoot).check(`v${version}`);
   const artifacts = new Map((manifest.packages ?? []).map((entry) => [entry.package, entry]));
   const packages = releasePlan.publicationOrder.map((packageName) => {
     const artifact = artifacts.get(packageName);
@@ -277,6 +292,235 @@ function readCandidateTag(packageName, candidateTag) {
   return candidateTagValue(npmView(packageName, "dist-tags"), candidateTag);
 }
 
+function readPublishedCandidateState(entry, record, view = npmView) {
+  const packageSpec = `${entry.name}@${record.version}`;
+  const version = view(packageSpec, "version");
+  const taggedVersion = candidateTagValue(view(entry.name, "dist-tags"), record.candidateTag);
+  if (version === null) {
+    return { version: null, integrity: null, taggedVersion };
+  }
+  return {
+    version,
+    integrity: view(packageSpec, "dist.integrity"),
+    taggedVersion,
+  };
+}
+
+function assertPublishedCandidateState(entry, record, state) {
+  const packageSpec = `${entry.name}@${record.version}`;
+  if (state.version === null && state.integrity === null && state.taggedVersion !== null) {
+    fail(
+      "candidate-registry-tag-mismatch",
+      `${record.candidateTag} already points to ${state.taggedVersion} while ${packageSpec} is absent`,
+    );
+  }
+  if (state.version !== record.version || state.integrity !== entry.integrity) {
+    fail(
+      "candidate-registry-integrity-mismatch",
+      `${packageSpec} does not match the validated immutable artifact`,
+    );
+  }
+  if (state.taggedVersion !== record.version) {
+    fail(
+      "candidate-registry-tag-mismatch",
+      `${packageSpec} is not visible under ${record.candidateTag}; dispatch candidate-tag-repair for v${record.version}, then rerun the signed-tag workflow`,
+    );
+  }
+}
+
+function waitForMilliseconds(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function waitForPublishedCandidate(entry, record, options = {}) {
+  const attempts = options.attempts ?? 60;
+  const delayMs = options.delayMs ?? 30_000;
+  const readState = options.readState ?? readPublishedCandidateState;
+  const wait = options.wait ?? waitForMilliseconds;
+  const allowAbsent = options.allowAbsent ?? false;
+  let state;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    state = readState(entry, record);
+    if (
+      state.version === record.version &&
+      state.integrity === entry.integrity &&
+      state.taggedVersion === record.version
+    ) {
+      return true;
+    }
+    if (
+      (state.version !== null && state.version !== record.version) ||
+      (state.integrity !== null && state.integrity !== entry.integrity) ||
+      (state.taggedVersion !== null && state.taggedVersion !== record.version)
+    ) {
+      assertPublishedCandidateState(entry, record, state);
+    }
+    if (attempt < attempts) wait(delayMs);
+  }
+
+  if (
+    allowAbsent &&
+    state.version === null &&
+    state.integrity === null &&
+    state.taggedVersion === null
+  ) {
+    return false;
+  }
+  assertPublishedCandidateState(entry, record, state);
+}
+
+function recoveryReleaseRoot() {
+  const configuredRoot = process.env.SATELLE_RELEASE_RECOVERY_SOURCE_ROOT;
+  const workspace = process.env.GITHUB_WORKSPACE;
+  const verifiedSourceDigest = process.env.VERIFIED_SOURCE_DIGEST;
+  if (!path.isAbsolute(configuredRoot ?? "") || !path.isAbsolute(workspace ?? "")) {
+    fail("release-recovery-not-authorized", "candidate recovery source root is not absolute");
+  }
+  try {
+    const resolvedRoot = realpathSync(configuredRoot);
+    const resolvedWorkspace = realpathSync(workspace);
+    const relativeRoot = path.relative(resolvedWorkspace, resolvedRoot);
+    if (
+      relativeRoot === "" ||
+      relativeRoot === ".." ||
+      relativeRoot.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relativeRoot)
+    ) {
+      fail(
+        "release-recovery-not-authorized",
+        "candidate recovery source root must be a separate checkout inside the workflow workspace",
+      );
+    }
+    const sourceDigest = execFileSync("git", ["-C", resolvedRoot, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+      timeout: 120_000,
+    }).trim();
+    if (sourceDigest !== verifiedSourceDigest) {
+      fail(
+        "release-recovery-not-authorized",
+        "candidate recovery metadata does not match the verified signed release commit",
+      );
+    }
+    const worktreeStatus = execFileSync(
+      "git",
+      ["-C", resolvedRoot, "status", "--porcelain", "--untracked-files=all"],
+      { encoding: "utf8", timeout: 120_000 },
+    ).trim();
+    if (worktreeStatus !== "") {
+      fail(
+        "release-recovery-not-authorized",
+        "candidate recovery source checkout differs from the signed release commit",
+      );
+    }
+    return resolvedRoot;
+  } catch (error) {
+    if (error instanceof CandidatePublicationError) throw error;
+    fail(
+      "release-recovery-not-authorized",
+      `candidate recovery source root could not be verified: ${error.message}`,
+    );
+  }
+}
+
+function npmPackagePurl(packageName, version) {
+  if (packageName.startsWith("@")) {
+    const separator = packageName.indexOf("/");
+    return `pkg:npm/${encodeURIComponent(packageName.slice(0, separator))}/${encodeURIComponent(packageName.slice(separator + 1))}@${version}`;
+  }
+  return `pkg:npm/${encodeURIComponent(packageName)}@${version}`;
+}
+
+function createRecoveryProvenanceStatement(entry, record, environment = process.env) {
+  const sourceDigest = environment.VERIFIED_SOURCE_DIGEST;
+  const workflowReference = environment.GITHUB_WORKFLOW_REF ?? "";
+  const workflowDelimiter = workflowReference.indexOf("@");
+  const repositoryPrefix = `${environment.GITHUB_REPOSITORY}/`;
+  const integrityPrefix = "sha512-";
+  const numericIdentity = [
+    environment.GITHUB_REPOSITORY_ID,
+    environment.GITHUB_REPOSITORY_OWNER_ID,
+    environment.GITHUB_RUN_ID,
+    environment.GITHUB_RUN_ATTEMPT,
+  ];
+  if (
+    !/^[0-9a-f]{40}$/.test(sourceDigest ?? "") ||
+    environment.GITHUB_REPOSITORY !== "Microck/satelle" ||
+    environment.GITHUB_SERVER_URL !== "https://github.com" ||
+    environment.RUNNER_ENVIRONMENT !== "github-hosted" ||
+    numericIdentity.some((value) => !/^[1-9]\d*$/.test(value ?? "")) ||
+    !workflowReference.startsWith(repositoryPrefix) ||
+    workflowDelimiter <= repositoryPrefix.length ||
+    !entry.integrity.startsWith(integrityPrefix)
+  ) {
+    fail(
+      "release-recovery-not-authorized",
+      "candidate recovery provenance requires the signed source and current workflow identity",
+    );
+  }
+  const workflowPath = workflowReference.slice(repositoryPrefix.length, workflowDelimiter);
+  const workflowRef = workflowReference.slice(workflowDelimiter + 1);
+  const serverUrl = environment.GITHUB_SERVER_URL ?? "https://github.com";
+  // Recovery republishes an immutable archive produced by the signed-tag run. Its attestation must
+  // identify this recovery invocation as the publisher and the signed release commit as its input.
+  return {
+    _type: "https://in-toto.io/Statement/v1",
+    subject: [
+      {
+        name: npmPackagePurl(entry.name, record.version),
+        digest: {
+          sha512: Buffer.from(entry.integrity.slice(integrityPrefix.length), "base64").toString("hex"),
+        },
+      },
+    ],
+    predicateType: "https://slsa.dev/provenance/v1",
+    predicate: {
+      buildDefinition: {
+        buildType: "https://github.com/Microck/satelle/.github/workflows/release.yml/npm-candidate-recovery/v1",
+        externalParameters: {
+          workflow: {
+            ref: workflowRef,
+            repository: `${serverUrl}/${environment.GITHUB_REPOSITORY}`,
+            path: workflowPath,
+          },
+          signedRelease: {
+            tag: `refs/tags/v${record.version}`,
+            commit: sourceDigest,
+          },
+        },
+        internalParameters: {
+          github: {
+            event_name: environment.GITHUB_EVENT_NAME,
+            repository_id: environment.GITHUB_REPOSITORY_ID,
+            repository_owner_id: environment.GITHUB_REPOSITORY_OWNER_ID,
+          },
+        },
+        resolvedDependencies: [
+          {
+            uri: `git+${serverUrl}/${environment.GITHUB_REPOSITORY}@refs/tags/v${record.version}`,
+            digest: { gitCommit: sourceDigest },
+          },
+        ],
+      },
+      runDetails: {
+        builder: { id: `https://github.com/actions/runner/${environment.RUNNER_ENVIRONMENT}` },
+        metadata: {
+          invocationId: `${serverUrl}/${environment.GITHUB_REPOSITORY}/actions/runs/${environment.GITHUB_RUN_ID}/attempts/${environment.GITHUB_RUN_ATTEMPT}`,
+        },
+      },
+    },
+  };
+}
+
+async function createRecoveryProvenanceBundle(entry, record, environment = process.env) {
+  const sigstore = require("sigstore");
+  const statement = createRecoveryProvenanceStatement(entry, record, environment);
+  return sigstore.attest(
+    Buffer.from(JSON.stringify(statement)),
+    "application/vnd.in-toto+json",
+  );
+}
+
 function resolveArtifactPath(artifactDirectory, fileName) {
   if (path.isAbsolute(fileName)) {
     fail("candidate-record-invalid", "candidate artifact paths must be relative");
@@ -302,25 +546,6 @@ function resolveArtifactPath(artifactDirectory, fileName) {
     fail("candidate-record-invalid", "candidate artifact path must stay inside its artifact directory");
   }
   return resolvedArtifactPath;
-}
-
-function verifyPublishedCandidate(entry, record) {
-  const packageSpec = `${entry.name}@${record.version}`;
-  const version = npmView(packageSpec, "version");
-  const integrity = npmView(packageSpec, "dist.integrity");
-  const taggedVersion = readCandidateTag(entry.name, record.candidateTag);
-  if (version !== record.version || integrity !== entry.integrity) {
-    fail(
-      "candidate-registry-integrity-mismatch",
-      `${packageSpec} does not match the validated immutable artifact`,
-    );
-  }
-  if (taggedVersion !== record.version) {
-    fail(
-      "candidate-registry-tag-mismatch",
-      `${packageSpec} is not visible under ${record.candidateTag}; dispatch candidate-tag-repair for v${record.version}, then rerun the signed-tag workflow`,
-    );
-  }
 }
 
 function repairCandidateTags(version, manifest) {
@@ -377,32 +602,62 @@ function repairCandidateTags(version, manifest) {
   return { version, candidateTag: record.candidateTag, repaired, alreadyTagged, unpublished };
 }
 
-function advancePublication(recordPath, artifactDirectory) {
+async function advancePublication(recordPath, artifactDirectory) {
   let record = readRecord(recordPath);
-  requireReleaseAutomation(record.version);
+  const automationMode = requireReleaseAutomation(record.version);
   const entry = record.packages.find((candidate) => candidate.status === "pending");
   if (!entry) return record;
   try {
-    const packageSpec = `${entry.name}@${record.version}`;
-    const publishedVersion = npmView(packageSpec, "version");
-    if (publishedVersion === null) {
-      const artifactPath = resolveArtifactPath(artifactDirectory, entry.file);
-      execFileSync(
-        "npm",
-        [
-          "publish",
-          artifactPath,
-          "--tag",
-          record.candidateTag,
-          "--provenance",
-          "--access",
-          "public",
-          "--ignore-scripts",
-        ],
-        { stdio: "inherit", timeout: 300_000 },
-      );
+    const publishedState = readPublishedCandidateState(entry, record);
+    if (publishedState.version === null) {
+      if (
+        publishedState.taggedVersion !== null &&
+        publishedState.taggedVersion !== record.version
+      ) {
+        assertPublishedCandidateState(entry, record, publishedState);
+      }
+      if (publishedState.taggedVersion === record.version) {
+        waitForPublishedCandidate(entry, record);
+      } else {
+        const artifactPath = resolveArtifactPath(artifactDirectory, entry.file);
+        let provenanceDirectory;
+        let provenanceArguments = ["--provenance"];
+        if (automationMode === "recovery") {
+          provenanceDirectory = mkdtempSync(path.join(path.dirname(recordPath), "npm-provenance-"));
+          const provenancePath = path.join(provenanceDirectory, "bundle.json");
+          writeFileSync(
+            provenancePath,
+            `${JSON.stringify(await createRecoveryProvenanceBundle(entry, record))}\n`,
+            { encoding: "utf8", mode: 0o600 },
+          );
+          provenanceArguments = ["--provenance-file", provenancePath];
+        }
+        try {
+          if (automationMode === "recovery") {
+            recheckCandidateRecoveryAuthorization(record.version);
+          }
+          execFileSync(
+            "npm",
+            [
+              "publish",
+              artifactPath,
+              "--tag",
+              record.candidateTag,
+              ...provenanceArguments,
+              "--access",
+              "public",
+              "--ignore-scripts",
+            ],
+            { stdio: "inherit", timeout: 300_000 },
+          );
+        } finally {
+          if (provenanceDirectory) rmSync(provenanceDirectory, { recursive: true, force: true });
+        }
+        waitForPublishedCandidate(entry, record);
+      }
+    } else {
+      assertPublishedCandidateState(entry, record, publishedState);
     }
-    verifyPublishedCandidate(entry, record);
     record = checkpointPublished(record, entry.name);
     writeRecord(recordPath, record);
     return record;
@@ -420,16 +675,66 @@ function advancePublication(recordPath, artifactDirectory) {
   }
 }
 
-function runCli() {
+function reconcileRecoveryPrefix(recordPath, options = {}) {
+  let record = readRecord(recordPath);
+  if (requireReleaseAutomation(record.version) !== "recovery") {
+    fail(
+      "release-automation-required",
+      "npm candidate reconciliation is limited to release recovery",
+    );
+  }
+
+  while (true) {
+    const entry = record.packages.find((candidate) => candidate.status === "pending");
+    if (!entry) return record;
+    const state = (options.readState ?? readPublishedCandidateState)(entry, record);
+    const complete =
+      state.version === record.version &&
+      state.integrity === entry.integrity &&
+      state.taggedVersion === record.version;
+    if (!complete) {
+      if (
+        (state.version !== null && state.version !== record.version) ||
+        (state.integrity !== null && state.integrity !== entry.integrity) ||
+        (state.taggedVersion !== null && state.taggedVersion !== record.version)
+      ) {
+        assertPublishedCandidateState(entry, record, state);
+      }
+      const visible = waitForPublishedCandidate(entry, record, {
+        ...options,
+        allowAbsent: state.version === null,
+      });
+      if (visible) {
+        record = checkpointPublished(record, entry.name);
+        writeRecord(recordPath, record);
+      }
+      return record;
+    }
+    record = checkpointPublished(record, entry.name);
+    writeRecord(recordPath, record);
+  }
+}
+
+async function runCli() {
   const [command, ...argumentsList] = process.argv.slice(2);
   let output;
   if (command === "create") {
     const [version, manifestPath, recordPath] = argumentsList;
-    requireReleaseAutomation(version);
-    output = createPublicationRecord(version, JSON.parse(readFileSync(manifestPath, "utf8")));
+    const automationMode = requireReleaseAutomation(version);
+    const releaseRoot = automationMode === "recovery"
+      ? recoveryReleaseRoot()
+      : path.resolve(__dirname, "../..");
+    output = createPublicationRecord(
+      version,
+      JSON.parse(readFileSync(manifestPath, "utf8")),
+      undefined,
+      releaseRoot,
+    );
     writeRecord(recordPath, output);
   } else if (command === "advance") {
-    output = advancePublication(argumentsList[0], argumentsList[1]);
+    output = await advancePublication(argumentsList[0], argumentsList[1]);
+  } else if (command === "reconcile") {
+    output = reconcileRecoveryPrefix(argumentsList[0]);
   } else if (command === "status") {
     output = readRecord(argumentsList[0]);
   } else if (command === "repair-tags") {
@@ -442,15 +747,13 @@ function runCli() {
 }
 
 if (require.main === module) {
-  try {
-    runCli();
-  } catch (error) {
+  runCli().catch((error) => {
     const code = error instanceof CandidatePublicationError
       ? error.code
       : "candidate-command-failed";
     process.stderr.write(`${JSON.stringify({ code, message: error.message })}\n`);
     process.exitCode = 1;
-  }
+  });
 }
 
 module.exports = {
@@ -459,10 +762,16 @@ module.exports = {
   candidateTagRepairAction,
   candidateTagValue,
   checkpointPublished,
+  createRecoveryProvenanceStatement,
   createPublicationRecord,
+  npmPackagePurl,
   npmView,
   publicationRecoveryInstruction,
   readCandidateTag,
+  readPublishedCandidateState,
+  reconcileRecoveryPrefix,
+  recoveryReleaseRoot,
   repairCandidateTags,
   resolveArtifactPath,
+  waitForPublishedCandidate,
 };

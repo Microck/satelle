@@ -187,7 +187,8 @@ test("release workflow validates six targets and publishes only a fully verified
     .sort((left, right) => left.target.localeCompare(right.target));
   assert.deepEqual(actualTargets, expectedTargets);
   assert.match(workflow, /workflow_dispatch:/);
-  assert.match(workflow, /npm publish[^\n]*--dry-run/);
+  assert.match(workflow, /npm pack[^\n]*--dry-run/);
+  assert.doesNotMatch(workflow, /npm publish[^\n]*--dry-run/);
   assert.match(
     workflow,
     /publish-candidates:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[attest, collect, draft-release\]/,
@@ -267,7 +268,7 @@ test("release workflow validates six targets and publishes only a fully verified
   );
   const sealPublicationFiles = workflow.indexOf("chmod 400 validated/npm/*");
   const sealPublicationDirectories = workflow.indexOf("chmod 500 validated/npm validated");
-  const publicationDryRuns = workflow.indexOf("- name: Run npm publication dry-runs sequentially");
+  const publicationDryRuns = workflow.indexOf("- name: Run npm package dry-runs sequentially");
   assert.ok(completePublicationSet >= 0, "validated npm publication set is not completed");
   assert.ok(
     completePublicationSet < sealPublicationFiles &&
@@ -279,7 +280,7 @@ test("release workflow validates six targets and publishes only a fully verified
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
   ) ?? [];
-  assert.equal(checkoutUses.length, 8);
+  assert.equal(checkoutUses.length, 10);
   assert.equal(hardenedCheckoutUses.length, checkoutUses.length);
 });
 
