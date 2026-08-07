@@ -190,7 +190,7 @@ jobs:
             if [ "$published_version" != "$BOOTSTRAP_VERSION" ]; then
               test -z "$published_version"
               recheck_authorization
-              npm publish "dist/$package_file" \
+              npm publish "./dist/$package_file" \
                 --tag "$BOOTSTRAP_TAG" --provenance --access public --ignore-scripts
             fi
             test "$(npm view "$package_spec" version --json | jq -r .)" = "$BOOTSTRAP_VERSION"

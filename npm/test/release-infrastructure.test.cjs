@@ -3166,7 +3166,7 @@ test("one-time npm bootstrap is bound to the failed v0.1.0 release artifacts", (
   );
   assert.doesNotMatch(workflow, /published_version=.*\|\| true/);
   assert.match(workflow, /validate-npm-artifacts dist --write-manifest/);
-  assert.match(workflow, /npm publish "dist\/\$package_file"/);
+  assert.match(workflow, /npm publish "\.\/dist\/\$package_file"/);
   assert.match(workflow, /--tag "\$BOOTSTRAP_TAG" --provenance --access public --ignore-scripts/);
   assert.match(workflow, /npm view "\$package_spec" version --json[\s\S]*= "\$BOOTSTRAP_VERSION"/);
   assert.match(workflow, /npm view "\$package_spec" dist\.integrity --json[\s\S]*= "\$expected_integrity"/);
