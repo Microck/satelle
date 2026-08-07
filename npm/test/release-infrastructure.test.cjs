@@ -3125,3 +3125,63 @@ test("release workflow gates draft publication on candidate validation and promo
   assert.equal((workflow.match(/sequence did not advance/g) ?? []).length, 3);
   assert.match(workflow, /SATELLE_RELEASE_RECOVERY_TAG: v\$\{\{ inputs\.version \}\}/);
 });
+
+test("one-time npm bootstrap is bound to the failed v0.1.0 release artifacts", () => {
+  const workflow = readFileSync(
+    path.join(repositoryRoot, ".github", "workflows", "npm-bootstrap.yml"),
+    "utf8",
+  ).replaceAll("\r\n", "\n");
+
+  assert.match(workflow, /^name: Bootstrap npm packages for trusted publishing$/m);
+  const triggerBlock = workflow.slice(workflow.indexOf("on:\n"), workflow.indexOf("concurrency:\n"));
+  assert.deepEqual(
+    [...triggerBlock.matchAll(/^  ([a-z_]+):$/gm)].map((match) => match[1]),
+    ["workflow_dispatch"],
+  );
+  assert.match(workflow, /group: satelle-npm-release-writer/);
+  assert.match(workflow, /^  cancel-in-progress: false$/m);
+  assert.match(workflow, /^  id-token: write$/m);
+  assert.match(workflow, /^    runs-on: ubuntu-24\.04$/m);
+  assert.match(workflow, /^      BOOTSTRAP_TAG: bootstrap-v0\.1\.0$/m);
+  assert.match(workflow, /^      BOOTSTRAP_VERSION: 0\.1\.0$/m);
+  assert.match(workflow, /EXPECTED_SOURCE_DIGEST: 918d3ddc9f1a8460152f509d202c8e634fac549c/);
+  assert.match(workflow, /EXPECTED_TAG_DIGEST: 950afaa10218ea8d7bd8d44a761ce9004f9cb861/);
+  assert.match(workflow, /EXPECTED_SOURCE_RUN_ID: "31137002544"/);
+  assert.match(workflow, /RELEASE_SOURCE_DIGEST: 03a0a308b981cec335daac963191152ae4a45cff/);
+  assert.match(workflow, /RELEASE_TAG_DIGEST: 53a12693965f21b359309dc9b765c61c2ac639ce/);
+  assert.match(workflow, /verification\.verified == true and \.object\.type == "commit"/);
+  assert.match(workflow, /gh release view v0\.1\.1[\s\S]*--json isDraft --jq \.isDraft/);
+  assert.match(workflow, /workflow_id == 315850256/);
+  assert.match(workflow, /\.path == "\.github\/workflows\/release\.yml"/);
+  assert.match(workflow, /\.head_branch == "v0\.1\.0"/);
+  assert.match(workflow, /head_sha == \$source_digest/);
+  assert.match(workflow, /\.status == "completed"/);
+  assert.match(workflow, /\.conclusion == "failure"/);
+  assert.match(workflow, /npm install --global npm@10\.9\.4/);
+  assert.match(workflow, /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_DIST_TAG_TOKEN \}\}/);
+  assert.match(
+    workflow,
+    /read_published_version\(\)[\s\S]*\.error\.code == "E404"[\s\S]*return "\$status"/,
+  );
+  assert.doesNotMatch(workflow, /published_version=.*\|\| true/);
+  assert.match(workflow, /validate-npm-artifacts dist --write-manifest/);
+  assert.match(workflow, /npm publish "dist\/\$package_file"/);
+  assert.match(workflow, /--tag "\$BOOTSTRAP_TAG" --provenance --access public --ignore-scripts/);
+  assert.match(workflow, /npm view "\$package_spec" version --json[\s\S]*= "\$BOOTSTRAP_VERSION"/);
+  assert.match(workflow, /npm view "\$package_spec" dist\.integrity --json[\s\S]*= "\$expected_integrity"/);
+  assert.match(workflow, /npm view "\$package_name" dist-tags --json[\s\S]*= "\$BOOTSTRAP_VERSION"/);
+  assert.doesNotMatch(workflow, /dist-tag\s+add\b|--tag(?:=|\s+)latest\b/);
+  for (const packageName of [
+    "@microck/satelle-darwin-arm64",
+    "@microck/satelle-darwin-x64",
+    "@microck/satelle-linux-arm64-gnu",
+    "@microck/satelle-linux-x64-gnu",
+    "@microck/satelle-win32-arm64-msvc",
+    "@microck/satelle-win32-x64-msvc",
+    "@microck/satelle",
+    "satelle",
+  ]) {
+    assert.ok(workflow.includes(`            ${packageName}`), packageName);
+  }
+  assert.match(workflow, /Delete this workflow after all eight packages exist and trust release\.yml/);
+});
