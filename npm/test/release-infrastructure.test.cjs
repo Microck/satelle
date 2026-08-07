@@ -3668,6 +3668,11 @@ test("release workflow gates draft publication on candidate validation and promo
     validateRegistryCandidates,
     /pnpm --dir "\$install_root" add --ignore-scripts "\$package_spec"/,
   );
+  assert.match(
+    validateRegistryCandidates,
+    /bun add --cwd "\$install_root" --ignore-scripts "\$package_spec"/,
+  );
+  assert.doesNotMatch(validateRegistryCandidates, /bun --cwd .* add/);
   assert.doesNotMatch(validateRegistryCandidates, /minimum-release-age/);
   assert.match(
     promoteAndPublish,

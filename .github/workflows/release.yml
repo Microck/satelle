@@ -778,7 +778,7 @@ jobs:
               case "$manager" in
                 npm) npm install --prefix "$install_root" --include=optional --ignore-scripts --no-audit --no-fund "$package_spec" ;;
                 pnpm) pnpm --dir "$install_root" add --ignore-scripts "$package_spec" ;;
-                bun) bun --cwd "$install_root" add --ignore-scripts "$package_spec" ;;
+                bun) bun add --cwd "$install_root" --ignore-scripts "$package_spec" ;;
               esac
               smoke "$install_root/node_modules/.bin/satelle"
             done
