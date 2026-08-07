@@ -3140,6 +3140,7 @@ test("one-time npm bootstrap is bound to the failed v0.1.0 release artifacts", (
   );
   assert.match(workflow, /group: satelle-npm-release-writer/);
   assert.match(workflow, /^  cancel-in-progress: false$/m);
+  assert.match(workflow, /^  contents: write$/m);
   assert.match(workflow, /^  id-token: write$/m);
   assert.match(workflow, /^    runs-on: ubuntu-24\.04$/m);
   assert.match(workflow, /^      BOOTSTRAP_TAG: bootstrap-v0\.1\.0$/m);
