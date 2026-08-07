@@ -23,7 +23,7 @@ jobs:
   bootstrap:
     name: Publish v0.1.0 package records under a non-default tag
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 270
     env:
       BOOTSTRAP_TAG: bootstrap-v0.1.0
       BOOTSTRAP_VERSION: 0.1.0
@@ -166,6 +166,23 @@ jobs:
             return "$status"
           }
 
+          wait_for_published_version() {
+            package_spec=$1
+            for attempt in $(seq 1 60); do
+              published_version=$(read_published_version "$package_spec")
+              if [ "$published_version" = "$BOOTSTRAP_VERSION" ]; then
+                return 0
+              fi
+              test -z "$published_version"
+              if [ "$attempt" = 60 ]; then
+                break
+              fi
+              echo "$package_spec is still in npm publish-time scanning ($attempt/60)"
+              sleep 30
+            done
+            return 1
+          }
+
           test "$(npm whoami)" = microck
           for package_name in \
             @microck/satelle-darwin-arm64 \
@@ -192,6 +209,7 @@ jobs:
               recheck_authorization
               npm publish "./dist/$package_file" \
                 --tag "$BOOTSTRAP_TAG" --provenance --access public --ignore-scripts
+              wait_for_published_version "$package_spec"
             fi
             test "$(npm view "$package_spec" version --json | jq -r .)" = "$BOOTSTRAP_VERSION"
             test "$(npm view "$package_spec" dist.integrity --json | jq -r .)" = "$expected_integrity"
