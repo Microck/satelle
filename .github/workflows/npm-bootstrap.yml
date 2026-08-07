@@ -1,0 +1,199 @@
+# One-time bootstrap for npm trusted publishing.
+# Delete this workflow after all eight packages exist and trust release.yml.
+name: Bootstrap npm packages for trusted publishing
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type bootstrap-v0.1.0 to create the initial package records
+        required: true
+        type: string
+
+concurrency:
+  group: satelle-npm-release-writer
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  bootstrap:
+    name: Publish v0.1.0 package records under a non-default tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      BOOTSTRAP_TAG: bootstrap-v0.1.0
+      BOOTSTRAP_VERSION: 0.1.0
+      EXPECTED_SOURCE_DIGEST: 918d3ddc9f1a8460152f509d202c8e634fac549c
+      EXPECTED_TAG_DIGEST: 950afaa10218ea8d7bd8d44a761ce9004f9cb861
+      EXPECTED_SOURCE_RUN_ID: "31137002544"
+      RELEASE_SOURCE_DIGEST: 03a0a308b981cec335daac963191152ae4a45cff
+      RELEASE_TAG_DIGEST: 53a12693965f21b359309dc9b765c61c2ac639ce
+    steps:
+      - name: Authorize the one-time bootstrap
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        shell: bash
+        run: |
+          test "$CONFIRMATION" = "$BOOTSTRAP_TAG"
+          test "$GITHUB_REF" = refs/heads/main
+
+          tag_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$BOOTSTRAP_VERSION" \
+            --jq '.object.type + " " + .object.sha')
+          test "${tag_ref%% *}" = tag
+          test "${tag_ref#* }" = "$EXPECTED_TAG_DIGEST"
+          source_digest=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$EXPECTED_TAG_DIGEST" \
+            --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha')
+          test "$source_digest" = "$EXPECTED_SOURCE_DIGEST"
+
+          release_tag_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v0.1.1" \
+            --jq '.object.type + " " + .object.sha')
+          test "${release_tag_ref%% *}" = tag
+          test "${release_tag_ref#* }" = "$RELEASE_TAG_DIGEST"
+          release_source_digest=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$RELEASE_TAG_DIGEST" \
+            --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha')
+          test "$release_source_digest" = "$RELEASE_SOURCE_DIGEST"
+          test "$(gh release view v0.1.1 --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+
+          source_run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$EXPECTED_SOURCE_RUN_ID")
+          jq -e \
+            --arg source_digest "$source_digest" \
+            '.event == "workflow_dispatch" and
+             .workflow_id == 315850256 and
+             .path == ".github/workflows/release.yml" and
+             .head_branch == "v0.1.0" and
+             .head_sha == $source_digest and
+             .status == "completed" and
+             .conclusion == "failure"' \
+            <<< "$source_run"
+
+      - name: Check out the signed v0.1.0 source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ env.EXPECTED_SOURCE_DIGEST }}
+
+      - name: Install Node.js for token bootstrap
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      # npm 10 supports provenance but predates registry OIDC. This makes the
+      # explicit bootstrap token authoritative while Sigstore still uses OIDC.
+      - name: Install pinned pre-trusted-publishing npm CLI
+        run: |
+          npm install --global npm@10.9.4
+          test "$(npm --version)" = 10.9.4
+
+      - name: Download the exact v0.1.0 native artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mkdir dist
+          for target in \
+            darwin-arm64 \
+            darwin-x64 \
+            linux-arm64-gnu \
+            linux-x64-gnu \
+            win32-arm64-msvc \
+            win32-x64-msvc
+          do
+            gh run download "$EXPECTED_SOURCE_RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name "release-$target" \
+              --dir dist
+          done
+
+      - name: Rebuild and validate the v0.1.0 npm graph
+        run: |
+          test "$(node npm/scripts/release.cjs check | jq -r .version)" = "$BOOTSTRAP_VERSION"
+          node npm/scripts/release.cjs stage-launchers dist
+          node npm/scripts/release.cjs validate-npm-artifacts dist --write-manifest
+
+      - name: Publish initial package records without changing latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_DIST_TAG_TOKEN }}
+        shell: bash
+        run: |
+          recheck_authorization() {
+            current_tag_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/v$BOOTSTRAP_VERSION" \
+              --jq '.object.sha')
+            test "$current_tag_digest" = "$EXPECTED_TAG_DIGEST"
+            current_source_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/tags/$EXPECTED_TAG_DIGEST" \
+              --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha')
+            test "$current_source_digest" = "$EXPECTED_SOURCE_DIGEST"
+            current_release_tag_digest=$(gh api \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/v0.1.1" \
+              --jq '.object.sha')
+            test "$current_release_tag_digest" = "$RELEASE_TAG_DIGEST"
+            test "$(gh release view v0.1.1 --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          }
+
+          read_published_version() {
+            package_spec=$1
+            stdout_file=$(mktemp "$RUNNER_TEMP/npm-view-stdout-XXXXXX")
+            stderr_file=$(mktemp "$RUNNER_TEMP/npm-view-stderr-XXXXXX")
+            if npm view "$package_spec" version --json > "$stdout_file" 2> "$stderr_file"; then
+              value=$(jq -er 'select(type == "string")' "$stdout_file") || {
+                cat "$stdout_file" "$stderr_file" >&2
+                rm -f "$stdout_file" "$stderr_file"
+                return 1
+              }
+              rm -f "$stdout_file" "$stderr_file"
+              printf '%s' "$value"
+              return 0
+            else
+              status=$?
+            fi
+
+            if jq -e '.error.code == "E404"' "$stdout_file" >/dev/null 2>&1 || \
+              grep -Eq 'npm error code E404|npm ERR! code E404' "$stderr_file"; then
+              rm -f "$stdout_file" "$stderr_file"
+              return 0
+            fi
+            cat "$stdout_file" "$stderr_file" >&2
+            rm -f "$stdout_file" "$stderr_file"
+            return "$status"
+          }
+
+          test "$(npm whoami)" = microck
+          for package_name in \
+            @microck/satelle-darwin-arm64 \
+            @microck/satelle-darwin-x64 \
+            @microck/satelle-linux-arm64-gnu \
+            @microck/satelle-linux-x64-gnu \
+            @microck/satelle-win32-arm64-msvc \
+            @microck/satelle-win32-x64-msvc \
+            @microck/satelle \
+            satelle
+          do
+            package_file=$(jq -er \
+              --arg package_name "$package_name" \
+              '.packages[] | select(.package == $package_name) | .file' \
+              dist/npm-artifacts.json)
+            expected_integrity=$(jq -er \
+              --arg package_name "$package_name" \
+              '.packages[] | select(.package == $package_name) | .integrity' \
+              dist/npm-artifacts.json)
+            package_spec="$package_name@$BOOTSTRAP_VERSION"
+            published_version=$(read_published_version "$package_spec")
+            if [ "$published_version" != "$BOOTSTRAP_VERSION" ]; then
+              test -z "$published_version"
+              recheck_authorization
+              npm publish "dist/$package_file" \
+                --tag "$BOOTSTRAP_TAG" --provenance --access public --ignore-scripts
+            fi
+            test "$(npm view "$package_spec" version --json | jq -r .)" = "$BOOTSTRAP_VERSION"
+            test "$(npm view "$package_spec" dist.integrity --json | jq -r .)" = "$expected_integrity"
+            test "$(npm view "$package_name" dist-tags --json | jq -r --arg tag "$BOOTSTRAP_TAG" '.[$tag]')" = "$BOOTSTRAP_VERSION"
+          done
