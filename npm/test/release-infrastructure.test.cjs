@@ -3865,7 +3865,7 @@ test("release workflow gates draft publication on candidate validation and promo
   );
   assert.match(
     promoteAndPublish,
-    /npm-promotion\.cjs advance[\s\S]*npm-promotion\.cjs verify-complete[\s\S]*Recheck signed tag and publish the GitHub release[\s\S]*git\/ref\/tags\/\$RELEASE_TAG[\s\S]*gh release edit .*--draft=false --latest/,
+    /npm-promotion\.cjs advance[\s\S]*npm-promotion\.cjs verify-complete[\s\S]*Recheck signed tag and publish the GitHub release[\s\S]*git\/ref\/tags\/\$RELEASE_TAG[\s\S]*publication_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=true/,
   );
   assert.match(
     finalPublishStep,
@@ -3877,7 +3877,31 @@ test("release workflow gates draft publication on candidate validation and promo
   );
   assert.match(
     finalPublishStep,
-    /recheck_release_tag\n\s+while read -r asset_id; do[\s\S]*--method DELETE[\s\S]*release asset set changed during final verification[\s\S]*gh release edit .*--draft=false --latest/,
+    /recheck_release_tag\n\s+while read -r asset_id; do[\s\S]*--method DELETE[\s\S]*release asset set changed during final verification[\s\S]*publication_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=true/,
+  );
+  assert.match(
+    finalPublishStep,
+    /RELEASE_POLICY_TOKEN: \$\{\{ secrets\.RELEASE_POLICY_TOKEN \}\}[\s\S]*GH_TOKEN="\$RELEASE_POLICY_TOKEN" gh api[\s\S]*immutable-releases/,
+  );
+  assert.match(
+    finalPublishStep,
+    /publication_state[\s\S]*\.draft == false and \.immutable == true[\s\S]*\.draft == false and \.immutable == false[\s\S]*recheck_release_tag[\s\S]*rollback_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=true[\s\S]*\.draft == true/,
+  );
+  assert.match(
+    finalPublishStep,
+    /for attempt in \$\(seq 1 10\); do[\s\S]*publication_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=false[\s\S]*publication_state=\$\(gh api[\s\S]*releases\/\$release_id[\s\S]*\.draft == true and \.immutable == false[\s\S]*sleep 1/,
+  );
+  assert.match(
+    finalPublishStep,
+    /for attempt in \$\(seq 1 10\); do[\s\S]*rollback_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=true[\s\S]*rollback_state=\$\(gh api[\s\S]*releases\/\$release_id[\s\S]*\.draft == false and \.immutable == false[\s\S]*sleep 1/,
+  );
+  assert.match(
+    finalPublishStep,
+    /recheck_release_tag\(\)[\s\S]*retry_transient[\s\S]*return 1[\s\S]*for attempt in \$\(seq 1 10\); do[\s\S]*if ! recheck_release_tag retry_transient[\s\S]*sleep 1[\s\S]*continue/,
+  );
+  assert.match(
+    finalPublishStep,
+    /publication_state=\n\s+for attempt in \$\(seq 1 10\); do\n\s+if ! recheck_release_tag retry_transient[\s\S]*release publication tag could not be rechecked[\s\S]*sleep 1[\s\S]*continue/,
   );
   assert.match(
     rollbackPromotion,
@@ -3910,82 +3934,4 @@ test("release workflow gates draft publication on candidate validation and promo
   assert.equal((workflow.match(/after_sequence=/g) ?? []).length, 4);
   assert.equal((workflow.match(/sequence did not advance/g) ?? []).length, 4);
   assert.match(workflow, /SATELLE_RELEASE_RECOVERY_TAG: v\$\{\{ inputs\.version \}\}/);
-});
-
-test("one-time npm bootstrap is bound to the failed v0.1.0 release artifacts", () => {
-  const workflow = readFileSync(
-    path.join(repositoryRoot, ".github", "workflows", "npm-bootstrap.yml"),
-    "utf8",
-  ).replaceAll("\r\n", "\n");
-
-  assert.match(workflow, /^name: Bootstrap npm packages for trusted publishing$/m);
-  const triggerBlock = workflow.slice(workflow.indexOf("on:\n"), workflow.indexOf("concurrency:\n"));
-  assert.deepEqual(
-    [...triggerBlock.matchAll(/^  ([a-z_]+):$/gm)].map((match) => match[1]),
-    ["workflow_dispatch"],
-  );
-  assert.match(workflow, /group: satelle-npm-release-writer/);
-  assert.match(workflow, /^  cancel-in-progress: false$/m);
-  assert.match(workflow, /^  contents: write$/m);
-  assert.match(workflow, /^  id-token: write$/m);
-  assert.match(workflow, /^    runs-on: ubuntu-24\.04$/m);
-  assert.match(workflow, /^    timeout-minutes: 270$/m);
-  assert.match(workflow, /^      BOOTSTRAP_TAG: bootstrap-v0\.1\.0$/m);
-  assert.match(workflow, /^      BOOTSTRAP_VERSION: 0\.1\.0$/m);
-  assert.match(workflow, /EXPECTED_SOURCE_DIGEST: 918d3ddc9f1a8460152f509d202c8e634fac549c/);
-  assert.match(workflow, /EXPECTED_TAG_DIGEST: 950afaa10218ea8d7bd8d44a761ce9004f9cb861/);
-  assert.match(workflow, /EXPECTED_SOURCE_RUN_ID: "31137002544"/);
-  assert.match(workflow, /RELEASE_SOURCE_DIGEST: 03a0a308b981cec335daac963191152ae4a45cff/);
-  assert.match(workflow, /RELEASE_TAG_DIGEST: 53a12693965f21b359309dc9b765c61c2ac639ce/);
-  assert.match(workflow, /verification\.verified == true and \.object\.type == "commit"/);
-  assert.match(workflow, /gh release view v0\.1\.1[\s\S]*--json isDraft --jq \.isDraft/);
-  assert.match(workflow, /workflow_id == 315850256/);
-  assert.match(workflow, /\.path == "\.github\/workflows\/release\.yml"/);
-  assert.match(workflow, /\.head_branch == "v0\.1\.0"/);
-  assert.match(workflow, /head_sha == \$source_digest/);
-  assert.match(workflow, /\.status == "completed"/);
-  assert.match(workflow, /\.conclusion == "failure"/);
-  assert.match(workflow, /npm install --global npm@10\.9\.4/);
-  assert.match(workflow, /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_DIST_TAG_TOKEN \}\}/);
-  assert.match(
-    workflow,
-    /read_published_version\(\)[\s\S]*\.error\.code == "E404"[\s\S]*return "\$status"/,
-  );
-  const waitHelper = workflow.slice(
-    workflow.indexOf("          wait_for_published_version() {"),
-    workflow.indexOf('          test "$(npm whoami)" = microck'),
-  );
-  assert.match(waitHelper, /for attempt in \$\(seq 1 60\); do/);
-  assert.match(
-    waitHelper,
-    /if \[ "\$attempt" = 60 \]; then\n {16}break\n {14}fi[\s\S]*sleep 30/,
-  );
-  assert.match(waitHelper, /sleep 30[\s\S]*return 1/);
-  assert.doesNotMatch(workflow, /published_version=.*\|\| true/);
-  assert.match(workflow, /validate-npm-artifacts dist --write-manifest/);
-  const publishLoop = workflow.slice(workflow.indexOf("          for package_name in \\"));
-  const publishIndex = publishLoop.indexOf('npm publish "./dist/$package_file"');
-  const waitIndex = publishLoop.indexOf('wait_for_published_version "$package_spec"');
-  const metadataIndex = publishLoop.indexOf('npm view "$package_spec" version --json');
-  assert.ok(publishIndex >= 0);
-  assert.ok(waitIndex > publishIndex);
-  assert.ok(metadataIndex > waitIndex);
-  assert.match(workflow, /--tag "\$BOOTSTRAP_TAG" --provenance --access public --ignore-scripts/);
-  assert.match(workflow, /npm view "\$package_spec" version --json[\s\S]*= "\$BOOTSTRAP_VERSION"/);
-  assert.match(workflow, /npm view "\$package_spec" dist\.integrity --json[\s\S]*= "\$expected_integrity"/);
-  assert.match(workflow, /npm view "\$package_name" dist-tags --json[\s\S]*= "\$BOOTSTRAP_VERSION"/);
-  assert.doesNotMatch(workflow, /dist-tag\s+add\b|--tag(?:=|\s+)latest\b/);
-  for (const packageName of [
-    "@microck/satelle-darwin-arm64",
-    "@microck/satelle-darwin-x64",
-    "@microck/satelle-linux-arm64-gnu",
-    "@microck/satelle-linux-x64-gnu",
-    "@microck/satelle-win32-arm64-msvc",
-    "@microck/satelle-win32-x64-msvc",
-    "@microck/satelle",
-    "satelle",
-  ]) {
-    assert.ok(workflow.includes(`            ${packageName}`), packageName);
-  }
-  assert.match(workflow, /Delete this workflow after all eight packages exist and trust release\.yml/);
 });

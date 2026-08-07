@@ -82,6 +82,24 @@ disabled, rechecks the signed tag at the publication boundary, and relies on the
 authorized release writer not mutating the draft between the final asset read and
 GitHub's immutable publication transition.
 
+The publication API response must bind the same release ID and tag and report
+`draft=false` and `immutable=true`. If it instead reports a public mutable
+release, the workflow rechecks the signed tag, restores that exact release ID to
+draft, validates the rollback response, and fails the release.
+If the publication request fails without a response, the workflow reads that
+exact release ID and retries the idempotent publication only while it remains a
+mutable draft.
+Draft restoration uses the same rule and retries only while that exact release
+remains public and mutable.
+Transient failures while re-reading the signed tag are retried inside the
+bounded publication and restoration loops. A confirmed tag or source mismatch
+still fails at once without another write.
+
+The repository Actions secret `RELEASE_POLICY_TOKEN` must contain an authorized
+releaser token with repository Administration read permission. The workflow uses
+that token only to read the immutable-release policy before publication. Release
+writes continue to use the job's scoped `GITHUB_TOKEN`.
+
 ## Candidate publication and validation
 
 The tag workflow creates a draft GitHub release only after six archives pass
