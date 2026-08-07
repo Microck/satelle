@@ -11,6 +11,9 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 // but the MVP release deliberately has no crates.io publication target.
 const preventCargoPublication: TegamiPlugin = {
   name: "satelle-prevent-cargo-publication",
+  publishPreflight({ pkg }) {
+    if (pkg.manager === "cargo") return { shouldPublish: false };
+  },
   willPublish({ pkg }) {
     if (pkg.manager === "cargo") return false;
   },
@@ -22,7 +25,8 @@ const paper = tegami({
   lockPath: path.join(repositoryRoot, "npm/release-tooling/publish-lock.yaml"),
   // Every Satelle crate inherits one workspace version. Avoid applying one dependency
   // bump per dependent crate while still letting Cargo update dependency ranges.
-  plugins: [cargo({ bumpDep: () => false }), preventCargoPublication],
+  // The preflight guard must run before the Cargo plugin, which otherwise checks crates.io.
+  plugins: [preventCargoPublication, cargo({ bumpDep: () => false })],
 });
 
 await runCli(paper, {

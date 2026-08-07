@@ -1,0 +1,24 @@
+core:changelogs:
+  - content: "---\npackages:\n  cargo:satelle-cli:\n    type: patch\n---\n\n## Satelle public MVP\n\nShip the first public Satelle release with the Controller, Host Daemon, native desktop control,\nmulti-Host operations, diagnostics, repair, updates, MCP tools, and signed cross-platform packages.\n"
+    filename: 2026-08-07-v0.1.1.md
+    v: 0.0.0
+core:packages:
+  - id: npm:satelle-repository
+    updated: false
+  - id: npm:satelle-docs
+    updated: false
+  - changelogIds:
+      - 2026-08-07-v0.1.1.md
+    id: cargo:satelle-cli
+    updated: true
+  - id: cargo:satelle-host
+    updated: true
+  - id: cargo:satelle-core
+    updated: true
+  - id: cargo:satelle-test-contract
+    updated: true
+  - id: cargo:satelle-transport
+    updated: true
+npm:packages:
+  - id: npm:satelle-repository
+  - id: npm:satelle-docs

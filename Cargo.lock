@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "satelle-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "assert_cmd",
  "base64",
@@ -2494,7 +2494,7 @@ dependencies = [
 
 [[package]]
 name = "satelle-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "directories",
  "libc",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "satelle-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "command-group",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "satelle-test-contract"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "notify",
  "serde_json",
@@ -2553,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "satelle-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "base64",

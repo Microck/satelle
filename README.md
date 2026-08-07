@@ -6,7 +6,7 @@ execution, Session state, logs, desktop access, and provider credentials.
 
 > [!IMPORTANT]
 > Satelle is pre-release software. Build it from source. This tree is version
-> 0.1.0. The npm package names reserved by this repository are not published
+> 0.1.1. The npm package names reserved by this repository are not published
 > installation paths yet.
 
 The [installation guide](docs/how-to/install-satelle.mdx) lists the reserved

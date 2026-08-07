@@ -41,7 +41,7 @@ function verifyChangelogs(version, expectedFiles = changelogFiles()) {
     const contents = readFileSync(filePath, "utf8");
     const escapedVersion = version.replaceAll(".", "\\.");
     return new RegExp(
-      `^##? (?:\\[v?${escapedVersion}\\]|v?${escapedVersion})(?![0-9A-Za-z.+-])`,
+      `^##? (?:[a-z0-9_-]+@)?(?:\\[v?${escapedVersion}\\]|v?${escapedVersion})(?![0-9A-Za-z.+-])`,
       "m",
     ).test(contents);
   });
