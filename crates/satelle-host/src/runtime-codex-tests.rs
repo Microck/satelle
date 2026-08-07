@@ -3,16 +3,16 @@ use super::control_plane::MacosNativeSessionResources;
 #[cfg(unix)]
 use super::control_plane::perform_handshake;
 #[cfg(unix)]
-use super::control_plane::validate_computer_use_client_path;
 #[cfg(unix)]
 use super::control_plane::validate_macos_computer_use_service_layout;
 use super::control_plane::{
     CodexImageInputMode, ControlPlaneAdmission, NativeMcpBinding,
     PlannedNativeComputerUseActionPath, bounded_inventory_command_output,
     codex_isolation_plan_from_json, configure_app_server_command,
-    configure_control_plane_probe_command, macos_authenticated_bridge_args,
-    mcp_server_names_from_json, native_bridge_root_path, path_is_absolute_for_platform,
-    probe_control_plane_with, same_path_for_platform, windows_locked_bridge_args,
+    configure_control_plane_probe_command, configure_mcp_inventory_command,
+    macos_authenticated_bridge_args, mcp_server_names_from_json, native_bridge_root_path,
+    path_is_absolute_for_platform, probe_control_plane_with, same_path_for_platform,
+    windows_locked_bridge_args,
 };
 use satelle_core::{ControlPlaneCapability, ControlPlaneOperation, ErrorCode};
 use serde_json::json;
@@ -487,7 +487,7 @@ fn windows_protected_bridge_requires_the_pinned_desktop_version() {
     };
 
     assert!(windows_package_full_name_version_matches(
-        "OpenAI.Codex_26.727.6591.0_x64__2p2nqsd0c76g0",
+        "OpenAI.Codex_26.803.5235.0_x64__2p2nqsd0c76g0",
         WINDOWS_CODEX_DESKTOP_VERSION,
     ));
     assert!(!windows_package_full_name_version_matches(
@@ -597,6 +597,26 @@ fn control_plane_probe_disables_every_discovered_mcp_server() {
 }
 
 #[test]
+fn mcp_inventory_excludes_plugin_derived_servers() {
+    let command = configure_mcp_inventory_command(Command::new("codex"));
+    let arguments = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        arguments,
+        [
+            "mcp",
+            "list",
+            "--config",
+            "features.plugins=false",
+            "--json",
+        ]
+    );
+}
+
+#[test]
 fn read_only_app_server_keeps_native_computer_use_disabled() {
     let command = configure_control_plane_probe_command(
         Command::new("codex"),
@@ -674,7 +694,7 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
                 "marketplaceName": "openai-bundled",
                 "installed": true,
                 "enabled": true,
-                "version": "26.727.51351",
+                "version": "26.803.41515",
                 "source": {
                     "source": "local",
                     "path": "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use"
@@ -726,11 +746,7 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
     assert_eq!(plan.native_mcp_server_name, "node_repl");
     assert_eq!(
         plan.planned_native_action_path,
-        PlannedNativeComputerUseActionPath::WindowsNodeRepl {
-            client_path: PathBuf::from(
-                "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use\\scripts\\computer-use-client.mjs"
-            ),
-        }
+        PlannedNativeComputerUseActionPath::WindowsNodeRepl
     );
     assert_eq!(plan.disabled_mcp_server_names, ["paper"]);
 
@@ -754,7 +770,7 @@ fn isolation_strips_unrecognized_native_bridge_environment() {
             "marketplaceName": "openai-bundled",
             "installed": true,
             "enabled": true,
-            "version": "26.727.51351",
+            "version": "26.803.41515",
             "source": {
                 "source": "local",
                 "path": "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use"
@@ -833,7 +849,7 @@ fn isolation_rejects_a_same_named_bridge_outside_the_official_runtime() {
             "marketplaceName": "openai-bundled",
             "installed": true,
             "enabled": true,
-            "version": "26.727.51351",
+            "version": "26.803.41515",
             "source": {
                 "source": "local",
                 "path": "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use"
@@ -888,12 +904,12 @@ fn isolation_rejects_unpinned_or_redirected_computer_use_plugins() {
 
     for (version, path, expected_reason) in [
         (
-            "26.727.99999",
+            "26.803.99999",
             "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use",
             "computer_use_plugin_not_ready",
         ),
         (
-            "26.727.51351",
+            "26.803.41515",
             "C:\\Users\\operator\\Downloads\\computer-use",
             "computer_use_plugin_source_untrusted",
         ),
@@ -1012,7 +1028,7 @@ fn macos_isolation_selects_the_official_node_repl_path() {
 fn macos_isolation_rejects_the_wrong_plugin_version_or_relative_bridge_base() {
     for (version, command, cwd) in [
         (
-            "26.727.51351",
+            "26.803.41515",
             "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
             ".",
         ),
@@ -1141,7 +1157,7 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
                 "marketplaceName": "openai-bundled",
                 "installed": true,
                 "enabled": true,
-                "version": if platform == "macos" { "1.0.1000621" } else { "26.727.51351" },
+                "version": if platform == "macos" { "1.0.1000621" } else { "26.803.41515" },
                 "source": {"source": "local", "path": plugin_path}
             }]
         }))
@@ -1200,110 +1216,6 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
 
         assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn computer_use_client_rejects_replacement_bytes_at_the_trusted_path() {
-    use sha2::{Digest, Sha256};
-
-    let directory = tempfile::tempdir().expect("create Computer Use client fixture");
-    let codex_home = directory.path().join("codex-home");
-    let client_path = codex_home
-        .join(".tmp")
-        .join("bundled-marketplaces")
-        .join("openai-bundled")
-        .join("plugins")
-        .join("computer-use")
-        .join("scripts")
-        .join("computer-use-client.mjs");
-    std::fs::create_dir_all(client_path.parent().unwrap()).expect("create canonical client path");
-    let authenticated_bytes = b"export const authenticated = true;";
-    std::fs::write(&client_path, authenticated_bytes).expect("write authenticated client");
-    let expected_sha256 = Sha256::digest(authenticated_bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    validate_computer_use_client_path(&client_path, &codex_home, "macos", &expected_sha256)
-        .expect("the exact authenticated client bytes must be admitted");
-
-    std::fs::write(&client_path, "export const replaced = true;")
-        .expect("replace client at the same canonical path");
-    let error =
-        validate_computer_use_client_path(&client_path, &codex_home, "macos", &expected_sha256)
-            .expect_err("replacement bytes at the trusted path must fail closed");
-
-    assert_eq!(
-        error.details["reason"],
-        json!("computer_use_client_untrusted")
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn computer_use_client_rejects_an_oversized_file_before_reading_it() {
-    let directory = tempfile::tempdir().expect("create Computer Use client fixture");
-    let codex_home = directory.path().join("codex-home");
-    let client_path = codex_home
-        .join(".tmp")
-        .join("bundled-marketplaces")
-        .join("openai-bundled")
-        .join("plugins")
-        .join("computer-use")
-        .join("scripts")
-        .join("computer-use-client.mjs");
-    std::fs::create_dir_all(client_path.parent().unwrap()).expect("create canonical client path");
-    let client = std::fs::File::create(&client_path).expect("create sparse client fixture");
-    client
-        .set_len(8 * 1024 * 1024 + 1)
-        .expect("make client fixture exceed the admission limit");
-
-    let error =
-        validate_computer_use_client_path(&client_path, &codex_home, "macos", &"0".repeat(64))
-            .expect_err("an oversized client must fail before Host allocation");
-
-    assert_eq!(
-        error.details["reason"],
-        json!("computer_use_client_untrusted")
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn computer_use_client_rejects_a_redirected_scripts_ancestor() {
-    use std::os::unix::fs::symlink;
-
-    let directory = tempfile::tempdir().expect("create Computer Use client fixture");
-    let codex_home = directory.path().join("codex-home");
-    let plugin_root = codex_home
-        .join(".tmp")
-        .join("bundled-marketplaces")
-        .join("openai-bundled")
-        .join("plugins")
-        .join("computer-use");
-    std::fs::create_dir_all(&plugin_root).expect("create canonical plugin root");
-    let redirected_scripts = directory.path().join("redirected-scripts");
-    std::fs::create_dir_all(&redirected_scripts).expect("create redirected scripts directory");
-    std::fs::write(
-        redirected_scripts.join("computer-use-client.mjs"),
-        "export const redirected = true;",
-    )
-    .expect("write redirected Computer Use client");
-    symlink(&redirected_scripts, plugin_root.join("scripts"))
-        .expect("redirect the scripts ancestor");
-
-    let error = validate_computer_use_client_path(
-        &plugin_root.join("scripts").join("computer-use-client.mjs"),
-        &codex_home,
-        "macos",
-        &"0".repeat(64),
-    )
-    .expect_err("a redirected plugin ancestor must not receive native authority");
-
-    assert_eq!(
-        error.details["reason"],
-        json!("computer_use_client_untrusted")
-    );
 }
 
 #[test]

@@ -51,6 +51,7 @@ model_provider = "openai"
     satelle()
         .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", state.path().join("cache"))
         .args([
             "setup",
             "--host",
@@ -66,6 +67,7 @@ model_provider = "openai"
     satelle()
         .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", state.path().join("cache"))
         .args(["host", "release-state"])
         .assert()
         .success();
@@ -75,6 +77,7 @@ model_provider = "openai"
 fn json_report(state: &TestStateDir, args: Vec<&str>) -> Value {
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", state.path().join("cache"))
         .args(args)
         .assert()
         .success()
@@ -93,6 +96,7 @@ fn json_report_with_config(
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", config_file)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", state.path().join("cache"))
         .args(args)
         .assert()
         .success()
@@ -118,6 +122,7 @@ fn assert_report_contract(report: &Value, schema_version: &str, expected_fields:
 fn json_command_result(state: &TestStateDir, args: Vec<&str>) -> Value {
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", state.path().join("cache"))
         .args(args)
         .assert()
         .get_output()

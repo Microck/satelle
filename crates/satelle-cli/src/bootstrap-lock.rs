@@ -9,8 +9,17 @@ const STALE_AFTER_SECONDS: u64 = 30;
 const COMMIT_REQUIRED_MUTATION_PHASES: &[&str] = &[
     "daemon_start",
     "durable_token_verification",
+    "cache_promotion",
+    "identity_artifact_upload",
+    "identity_operation_artifact_cleanup",
     "maintenance_handoff_begin",
     "maintenance_handoff_complete",
+    "persistent_path_directories",
+    "persistent_service_definition",
+    "persistent_service_register",
+    "persistent_service_start",
+    "persistent_service_restart",
+    "persistent_service_stop",
     "service_lifecycle_maintenance_begin",
     "persistent_maintenance_begin",
     "persistent_action_start",
@@ -23,15 +32,13 @@ const SUCCESS_MUTATION_PHASES: &[&str] = &[
     "cache_directory_creation",
     "cache_upload",
     "cache_staging_permissions",
-    "cache_promotion",
     "state_owner_release",
-    "persistent_service_definition",
-    "persistent_service_register",
-    "persistent_service_start",
-    "persistent_service_restart",
-    "persistent_service_stop",
     "offline_storage_maintenance",
 ];
+
+pub(super) fn mutation_phase_requires_commit(phase: &str) -> bool {
+    COMMIT_REQUIRED_MUTATION_PHASES.contains(&phase)
+}
 const RECOVERABLE_OPERATION_KINDS: &[&str] = &[
     "initial_setup",
     "missing_daemon_repair",
@@ -943,7 +950,7 @@ for competitor in "$lock_root"/*; do
   if [ -d "$cache_root" ] && find "$cache_root" -type f -name satelle -print -quit 2>/dev/null | grep . >/dev/null 2>&1; then binary_present=true; fi
   service_probe=null
   if command -v systemctl >/dev/null 2>&1; then
-    if systemctl --user is-active --quiet satelle-host 2>/dev/null; then
+    if systemctl --user is-active --quiet satelle-host >/dev/null 2>&1; then
       service_probe=true
     else
       probe_status=$?
@@ -1110,7 +1117,7 @@ for competitor in "$lock_root"/*; do
     fi
     post_service_probe=null
     if command -v systemctl >/dev/null 2>&1; then
-      if systemctl --user is-active --quiet satelle-host 2>/dev/null; then post_service_probe=true; else
+      if systemctl --user is-active --quiet satelle-host >/dev/null 2>&1; then post_service_probe=true; else
         probe_status=$?
         case "$probe_status" in 3|4) post_service_probe=false;; esac
       fi
@@ -1684,7 +1691,10 @@ mod tests {
         fs::create_dir(&bin).expect("create probe bin");
         for (name, script) in [
             ("ps", "#!/bin/sh\nexit 0\n"),
-            ("systemctl", "#!/bin/sh\nexit 3\n"),
+            (
+                "systemctl",
+                "#!/bin/sh\nprintf 'untrusted service probe output\\n'\nexit 3\n",
+            ),
             ("curl", curl_script),
         ] {
             let executable = bin.join(name);
@@ -1948,8 +1958,8 @@ mod tests {
         let succeeded_claim = write_stale_started_claim(&succeeded_lock);
         fs::create_dir(succeeded_claim.join(format!("execution_started.{attempt}")))
             .expect("record exact execution start");
-        fs::create_dir(succeeded_claim.join(format!("execution_succeeded.{attempt}")))
-            .expect("record exact execution success");
+        fs::create_dir(succeeded_claim.join(format!("execution_committed.{attempt}")))
+            .expect("record exact verified execution commit");
         let active_probe_path = path_with_active_daemon_probe(succeeded_home.path());
         let mut recovered = RunningProtocol::start_with_path(
             &replacement_request,
@@ -2172,7 +2182,7 @@ mod tests {
             Request::new("operation-2", OperationKind::MissingDaemonRepair, None)
                 .expect("valid replacement");
         let crash_points: &[(&str, &[&str])] = &[
-            ("cache_promotion", &["execution_succeeded"]),
+            ("cache_promotion", &["execution_committed"]),
             ("cache_promotion", &[]),
             ("durable_token_verification", &["execution_committed"]),
             ("durable_token_verification", &[]),
@@ -2280,7 +2290,7 @@ mod tests {
 
         for (phase, invalid_marker) in [
             ("durable_token_verification", "execution_succeeded"),
-            ("cache_promotion", "execution_committed"),
+            ("cache_upload", "execution_committed"),
         ] {
             let state_home = tempfile::tempdir().expect("temporary invalid marker home");
             let lock_root = state_home.path().join("satelle/bootstrap.lock");
@@ -2327,12 +2337,11 @@ mod tests {
         let mut owner = RunningProtocol::start(&request(), sequential_home.path());
         assert_ready_line(&owner.read_line());
         owner.exchange(
-            &mutation_started_line("cache_promotion", first_attempt)
+            &mutation_started_line("cache_upload", first_attempt)
                 .expect("valid first mutation phase"),
         );
         owner.exchange(
-            &mutation_executing_line("cache_promotion", first_attempt)
-                .expect("valid first execution"),
+            &mutation_executing_line("cache_upload", first_attempt).expect("valid first execution"),
         );
         fs::create_dir(
             only_claim(&sequential_lock).join(format!("execution_succeeded.{first_attempt}")),
@@ -2459,11 +2468,11 @@ mod tests {
         let mut partial = RunningProtocol::start(&request(), partial_home.path());
         assert_ready_line(&partial.read_line());
         partial.exchange(
-            &mutation_started_line("cache_promotion", first_attempt)
+            &mutation_started_line("cache_upload", first_attempt)
                 .expect("valid partial-retirement phase"),
         );
         partial.exchange(
-            &mutation_executing_line("cache_promotion", first_attempt)
+            &mutation_executing_line("cache_upload", first_attempt)
                 .expect("valid partial-retirement execution"),
         );
         let partial_claim = only_claim(&partial_lock);
@@ -2647,8 +2656,8 @@ mod tests {
         );
 
         let old_claim = only_claim(&lock_root);
-        fs::create_dir(old_claim.join(format!("execution_succeeded.{attempt}")))
-            .expect("record the exact phase postcondition");
+        fs::create_dir(old_claim.join(format!("execution_committed.{attempt}")))
+            .expect("record the exact verified phase commit");
         let mut reconciler = RunningProtocol::start(
             &Request::new("operation-3", OperationKind::MissingDaemonRepair, None)
                 .expect("valid reconciler"),
@@ -2691,7 +2700,7 @@ mod tests {
         let attempt = "0123456789abcdef0123456789abcdef";
         let mut owner = RunningProtocol::start(&request(), state_home.path());
         assert_ready_line(&owner.read_line());
-        owner.exchange(&mutation_started_line("cache_promotion", attempt).unwrap());
+        owner.exchange(&mutation_started_line("cache_upload", attempt).unwrap());
         let claim = only_claim(&lock_root);
         fs::create_dir(claim.join(format!("execution_started.{attempt}"))).unwrap();
         fs::create_dir(claim.join(format!("execution_succeeded.{attempt}"))).unwrap();
@@ -2756,8 +2765,17 @@ mod tests {
             &[
                 "daemon_start",
                 "durable_token_verification",
+                "cache_promotion",
+                "identity_artifact_upload",
+                "identity_operation_artifact_cleanup",
                 "maintenance_handoff_begin",
                 "maintenance_handoff_complete",
+                "persistent_path_directories",
+                "persistent_service_definition",
+                "persistent_service_register",
+                "persistent_service_start",
+                "persistent_service_restart",
+                "persistent_service_stop",
                 "service_lifecycle_maintenance_begin",
                 "persistent_maintenance_begin",
                 "persistent_action_start",
@@ -2773,13 +2791,7 @@ mod tests {
                 "cache_directory_creation",
                 "cache_upload",
                 "cache_staging_permissions",
-                "cache_promotion",
                 "state_owner_release",
-                "persistent_service_definition",
-                "persistent_service_register",
-                "persistent_service_start",
-                "persistent_service_restart",
-                "persistent_service_stop",
                 "offline_storage_maintenance",
             ]
         );
@@ -2797,11 +2809,11 @@ mod tests {
 
         let posix = request().posix_script();
         let windows = request().windows_script();
-        for phase in &COMMIT_REQUIRED_MUTATION_PHASES[4..] {
+        for phase in &COMMIT_REQUIRED_MUTATION_PHASES[7..] {
             assert_eq!(posix.matches(phase).count(), 5, "POSIX {phase}");
             assert_eq!(windows.matches(phase).count(), 5, "Windows {phase}");
         }
-        for phase in &SUCCESS_MUTATION_PHASES[5..] {
+        for phase in &SUCCESS_MUTATION_PHASES[4..] {
             assert_eq!(posix.matches(phase).count(), 2, "POSIX {phase}");
             assert_eq!(windows.matches(phase).count(), 2, "Windows {phase}");
         }
@@ -2818,11 +2830,11 @@ mod tests {
     fn persistent_phases_advance_and_recover_with_their_exact_terminal_proof() {
         let first_attempt = "0123456789abcdef0123456789abcdef";
         let second_attempt = "fedcba9876543210fedcba9876543210";
-        let phases = COMMIT_REQUIRED_MUTATION_PHASES[4..]
+        let phases = COMMIT_REQUIRED_MUTATION_PHASES[7..]
             .iter()
             .map(|phase| (*phase, "execution_committed"))
             .chain(
-                SUCCESS_MUTATION_PHASES[5..]
+                SUCCESS_MUTATION_PHASES[4..]
                     .iter()
                     .map(|phase| (*phase, "execution_succeeded")),
             );

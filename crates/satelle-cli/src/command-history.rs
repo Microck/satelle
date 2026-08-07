@@ -491,6 +491,24 @@ mod tests {
     use std::time::{Duration, Instant};
     use time::OffsetDateTime;
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // Some CI runners use an unusual umask that leaves a default
+            // temporary directory writable by other users. Ask tempfile for
+            // the same owner-only boundary required by command history.
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        builder
+            .tempdir()
+            .expect("create private command history parent")
+    }
+
     #[test]
     fn fixed_width_timestamps_sort_chronologically_within_the_same_second() {
         let second = OffsetDateTime::from_unix_timestamp(1_700_000_000)
@@ -518,7 +536,7 @@ mod tests {
 
     #[test]
     fn persistence_drops_an_invocation_that_expired_while_running() {
-        let root = tempfile::tempdir().expect("create command history parent");
+        let root = private_tempdir();
         let cache_root = root.path().join("cache");
         let started_at_time = OffsetDateTime::now_utc() - time::Duration::days(8);
         let start = InvocationStart {
@@ -544,7 +562,7 @@ mod tests {
 
     #[test]
     fn candidate_lookup_is_read_only_recent_success_only_and_host_distinct() {
-        let root = tempfile::tempdir().expect("create candidate cache parent");
+        let root = private_tempdir();
         let cache_root = root.path().join("cache");
         let session_id = SessionId::new();
         let now = OffsetDateTime::now_utc();

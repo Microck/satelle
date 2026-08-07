@@ -2746,6 +2746,70 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owner_only_directory_accepts_standard_macos_home_deny_acl() {
+        fn remove_first_acl(path: &std::path::Path) -> std::io::Result<()> {
+            let status = std::process::Command::new("chmod")
+                .args(["-a#", "0"])
+                .arg(path)
+                .status()?;
+            status
+                .success()
+                .then_some(())
+                .ok_or_else(|| std::io::Error::other("chmod did not remove the test ACL"))
+        }
+
+        struct DenyAclGuard(std::path::PathBuf);
+
+        impl Drop for DenyAclGuard {
+            fn drop(&mut self) {
+                let _ = remove_first_acl(&self.0);
+            }
+        }
+
+        let parent = tempfile::tempdir().expect("create a private macOS ACL parent");
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700))
+            .expect("make the ACL parent owner-only");
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "group:everyone deny delete"])
+            .arg(parent.path())
+            .status()
+            .expect("apply the standard macOS home deny ACL");
+        assert!(status.success(), "chmod must apply the test ACL");
+        let acl = std::process::Command::new("ls")
+            .arg("-lde")
+            .arg(parent.path())
+            .output()
+            .expect("read the applied macOS ACL");
+        assert!(acl.status.success(), "ls must report the test ACL");
+        assert!(
+            String::from_utf8_lossy(&acl.stdout).contains("group:everyone deny delete"),
+            "the deterministic fixture must contain the standard deny ACL"
+        );
+        let acl_guard = DenyAclGuard(parent.path().to_path_buf());
+        let directory = tempfile::Builder::new()
+            .prefix("satelle-owner-only-")
+            .tempdir_in(parent.path())
+            .expect("create a directory under the ACL parent");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("make the test directory owner-only");
+
+        drop(
+            open_or_create_owner_only_directory(directory.path())
+                .expect("the restrictive macOS home ACL must not weaken owner-only storage"),
+        );
+        let lock_path = directory.path().join(".satelle-setup.lock");
+        drop(
+            open_or_create_owner_only_file(&lock_path)
+                .expect("an owner-only lock file must be creatable under that directory"),
+        );
+
+        drop(directory);
+        remove_first_acl(parent.path()).expect("remove the deterministic macOS test ACL");
+        std::mem::forget(acl_guard);
+    }
+
     const SSH_IDENTITY_OPERATION_ID: &str = "0195f6d5-18da-7a80-8000-000000000001";
     const SSH_IDENTITY_BINARY_SHA256: &str =
         "2222222222222222222222222222222222222222222222222222222222222222";

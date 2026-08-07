@@ -1,4 +1,3 @@
-use base64::Engine;
 use command_group::CommandGroup;
 use satelle_core::{
     ControlPlaneCapability, ControlPlaneCapabilitySet, ControlPlaneFailureReason,
@@ -31,7 +30,7 @@ const HANDSHAKE_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const INVENTORY_OUTPUT_LIMIT: u64 = 2 * 1024 * 1024;
 const COMPUTER_USE_PLUGIN_ID: &str = "computer-use@openai-bundled";
-const WINDOWS_COMPUTER_USE_PLUGIN_VERSION: &str = "26.727.51351";
+const WINDOWS_COMPUTER_USE_PLUGIN_VERSION: &str = "26.803.41515";
 const MACOS_COMPUTER_USE_PLUGIN_VERSION: &str = "1.0.1000621";
 const MACOS_CHATGPT_APP_VERSION: &str = "26.730.61639";
 const MACOS_NODE_REPL_ROOT: &str = "/Applications/ChatGPT.app/Contents/Resources/cua_node";
@@ -48,10 +47,8 @@ const MACOS_COMPUTER_USE_SERVICE_CDHASH: &str = "7b92130f7c70b8e1adb7758a4fa7e49
 const MACOS_COMPUTER_USE_SERVICE_ID: &str = "com.openai.sky.CUAService";
 #[cfg(any(target_os = "macos", all(test, unix)))]
 const MACOS_COMPUTER_USE_SERVICE_EXECUTABLE: &str = "SkyComputerUseService";
-const COMPUTER_USE_CLIENT_SHA256: &str =
-    "c5e8b73f10ecc47ad1be38f14ba6b79cd3af06fcd86637f7b6b857ae209a686e";
 #[cfg(any(windows, test))]
-pub(super) const WINDOWS_CODEX_DESKTOP_VERSION: &str = "26.727.6591.0";
+pub(super) const WINDOWS_CODEX_DESKTOP_VERSION: &str = "26.803.5235.0";
 #[cfg(windows)]
 const CODEX_PACKAGE_FAMILY: &str = "OpenAI.Codex_2p2nqsd0c76g0";
 #[cfg(windows)]
@@ -59,7 +56,6 @@ const CODEX_PACKAGE_NODE_REPL: &str = "app/resources/cua_node/bin/node_repl.exe"
 const NATIVE_BRIDGE_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const MACOS_NATIVE_LAUNCHER_FILE_LIMIT: u64 = 256 * 1024 * 1024;
-const COMPUTER_USE_CLIENT_FILE_LIMIT: u64 = 8 * 1024 * 1024;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 const MACOS_SERVICE_INFO_LIMIT: u64 = 1024 * 1024;
 const WINDOWS_LOCKED_BRIDGE_SCRIPT: &str = r#"& { param([string]$bridge,[string]$expected) $ErrorActionPreference='Stop'; if ([string]::IsNullOrEmpty($bridge) -or [string]::IsNullOrEmpty($expected)) { exit 64 }; $stream=$null; $child=$null; try { $stream=[System.IO.File]::Open($bridge,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::Read); $sha=[System.Security.Cryptography.SHA256]::Create(); try { $actual=([System.BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','') } finally { $sha.Dispose() }; if (-not $actual.Equals($expected,[System.StringComparison]::OrdinalIgnoreCase)) { exit 74 }; $start=New-Object System.Diagnostics.ProcessStartInfo; $start.FileName=$bridge; $start.UseShellExecute=$false; $child=[System.Diagnostics.Process]::Start($start); if ($null -eq $child) { exit 74 } } catch { exit 74 } finally { if ($null -ne $stream) { $stream.Dispose() } }; $child.WaitForExit(); exit $child.ExitCode }"#;
@@ -257,7 +253,7 @@ pub(super) fn probe_installed_control_plane(
     else {
         return ControlPlaneProbe::unavailable();
     };
-    mcp_command.args(["mcp", "list", "--json"]);
+    mcp_command = configure_mcp_inventory_command(mcp_command);
     let Ok(mcp_output) = bounded_inventory_command_output(
         mcp_command,
         deadline,
@@ -289,6 +285,21 @@ pub(super) fn mcp_server_names_from_json(mcp_json: &[u8]) -> Result<Vec<String>,
         .into_iter()
         .map(|server| server.name)
         .collect())
+}
+
+pub(super) fn configure_mcp_inventory_command(mut command: Command) -> Command {
+    // Plugin MCP servers are resolved from plugin-relative paths. Re-declaring
+    // one as a partial top-level override makes Codex reject the transport
+    // before the app-server starts. Inventory only user-configured servers;
+    // `features.plugins=false` isolates every plugin-provided server itself.
+    command.args([
+        "mcp",
+        "list",
+        "--config",
+        "features.plugins=false",
+        "--json",
+    ]);
+    command
 }
 
 fn configured_mcp_servers_from_json(
@@ -339,7 +350,7 @@ pub(crate) fn installed_read_only_app_server_command(
     // inventory subprocess then consumes the same recovery deadline before
     // the already-verified app-server command can be returned.
     let [mut mcp_command, app_server_command] = runtime.commands()?;
-    mcp_command.args(["mcp", "list", "--json"]);
+    mcp_command = configure_mcp_inventory_command(mcp_command);
     let mcp_output = bounded_inventory_command_output(
         mcp_command,
         deadline,
@@ -382,21 +393,8 @@ fn verified_computer_use_app_server(
         .args
         .splice(0..0, prepared_native_bridge.prefix_args);
     let native_action_path = match isolation.planned_native_action_path {
-        PlannedNativeComputerUseActionPath::WindowsNodeRepl { client_path } => {
-            let authenticated = validate_computer_use_client_path(
-                &client_path,
-                runtime.codex_home(),
-                std::env::consts::OS,
-                COMPUTER_USE_CLIENT_SHA256,
-            )?;
-            let client_module_url = url::Url::from_file_path(&client_path)
-                .map_err(|()| codex_isolation_error("computer_use_client_untrusted"))?
-                .to_string();
-            NativeComputerUseActionPath::WindowsNodeRepl {
-                client_module_base64: base64::engine::general_purpose::STANDARD
-                    .encode(authenticated.bytes),
-                client_module_url,
-            }
+        PlannedNativeComputerUseActionPath::WindowsNodeRepl => {
+            NativeComputerUseActionPath::WindowsNodeRepl
         }
         PlannedNativeComputerUseActionPath::MacosNodeRepl => {
             NativeComputerUseActionPath::MacosNodeRepl
@@ -491,17 +489,14 @@ pub(crate) struct CodexIsolationPlan {
 
 #[derive(Eq, PartialEq)]
 pub(crate) enum NativeComputerUseActionPath {
-    WindowsNodeRepl {
-        client_module_base64: String,
-        client_module_url: String,
-    },
+    WindowsNodeRepl,
     MacosNodeRepl,
 }
 
 impl std::fmt::Debug for NativeComputerUseActionPath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WindowsNodeRepl { .. } => formatter.write_str("WindowsNodeRepl"),
+            Self::WindowsNodeRepl => formatter.write_str("WindowsNodeRepl"),
             Self::MacosNodeRepl => formatter.write_str("MacosNodeRepl"),
         }
     }
@@ -509,7 +504,7 @@ impl std::fmt::Debug for NativeComputerUseActionPath {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum PlannedNativeComputerUseActionPath {
-    WindowsNodeRepl { client_path: PathBuf },
+    WindowsNodeRepl,
     MacosNodeRepl,
 }
 
@@ -612,7 +607,7 @@ fn configured_codex_isolation(
     )?;
 
     let mut mcp_command = runtime.command()?;
-    mcp_command.args(["mcp", "list", "--json"]);
+    mcp_command = configure_mcp_inventory_command(mcp_command);
     let mcp_output = bounded_inventory_command_output(
         mcp_command,
         deadline,
@@ -859,16 +854,7 @@ pub(crate) fn codex_isolation_plan_from_json(
         ));
     }
     let planned_native_action_path = match platform {
-        "windows" => PlannedNativeComputerUseActionPath::WindowsNodeRepl {
-            client_path: PathBuf::from(format!(
-                "{}\\scripts\\computer-use-client.mjs",
-                computer_use
-                    .source
-                    .path
-                    .to_string_lossy()
-                    .trim_end_matches(['\\', '/'])
-            )),
-        },
+        "windows" => PlannedNativeComputerUseActionPath::WindowsNodeRepl,
         "macos" => PlannedNativeComputerUseActionPath::MacosNodeRepl,
         _ => return Err(codex_isolation_error("native_bridge_platform_unsupported")),
     };
@@ -945,74 +931,6 @@ fn normalized_windows_drive_path(path: &Path) -> Option<String> {
     let bytes = path.as_bytes();
     (bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/')
         .then(|| path.to_string())
-}
-
-pub(super) fn validate_computer_use_client_path(
-    path: &Path,
-    codex_home: &Path,
-    platform: &str,
-    expected_sha256: &str,
-) -> Result<AuthenticatedComputerUseClient, SatelleError> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|_| codex_isolation_error("computer_use_client_missing"))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(codex_isolation_error("computer_use_client_untrusted"));
-    }
-    let canonical_home = fs::canonicalize(codex_home)
-        .map_err(|_| codex_isolation_error("computer_use_client_untrusted"))?;
-    let plugin_root = expected_computer_use_plugin_root(codex_home);
-    let root_metadata = fs::symlink_metadata(&plugin_root)
-        .map_err(|_| codex_isolation_error("computer_use_client_untrusted"))?;
-    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
-        return Err(codex_isolation_error("computer_use_client_untrusted"));
-    }
-    let canonical_plugin_root = fs::canonicalize(&plugin_root)
-        .map_err(|_| codex_isolation_error("computer_use_client_untrusted"))?;
-    let expected_canonical_root = expected_computer_use_plugin_root(&canonical_home);
-    if !same_path_for_platform(&canonical_plugin_root, &expected_canonical_root, platform) {
-        return Err(codex_isolation_error("computer_use_client_untrusted"));
-    }
-    let canonical_path = fs::canonicalize(path)
-        .map_err(|_| codex_isolation_error("computer_use_client_untrusted"))?;
-    let expected_client = canonical_plugin_root
-        .join("scripts")
-        .join("computer-use-client.mjs");
-    if !same_path_for_platform(&canonical_path, &expected_client, platform) {
-        return Err(codex_isolation_error("computer_use_client_untrusted"));
-    }
-    if metadata.len() > COMPUTER_USE_CLIENT_FILE_LIMIT {
-        return Err(codex_isolation_error("computer_use_client_untrusted"));
-    }
-    let mut bytes = Vec::new();
-    File::open(&canonical_path)
-        .map_err(|_| codex_isolation_error("computer_use_client_untrusted"))?
-        .take(COMPUTER_USE_CLIENT_FILE_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| codex_isolation_error("computer_use_client_untrusted"))?;
-    if bytes.len() > COMPUTER_USE_CLIENT_FILE_LIMIT as usize {
-        return Err(codex_isolation_error("computer_use_client_untrusted"));
-    }
-    let actual_sha256 = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
-        return Err(codex_isolation_error("computer_use_client_untrusted"));
-    }
-    Ok(AuthenticatedComputerUseClient { bytes })
-}
-
-pub(super) struct AuthenticatedComputerUseClient {
-    bytes: Vec<u8>,
-}
-
-impl std::fmt::Debug for AuthenticatedComputerUseClient {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AuthenticatedComputerUseClient")
-            .field("bytes", &self.bytes.len())
-            .finish()
-    }
 }
 
 fn prepare_native_bridge(

@@ -85,9 +85,9 @@ use tailscale::{
     execute_transport_only_doctor, prepare_transport_only_doctor, transport_doctor_probe,
 };
 use transport::{
-    AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, authenticated_ssh_bootstrap_user,
-    discover_direct_host_identity, discover_ssh_host, transport_for, transport_for_setup,
-    transport_for_with_ssh_bootstrap,
+    AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, api_token_file_exists,
+    authenticated_ssh_bootstrap_user, discover_direct_host_identity, discover_ssh_host,
+    transport_for, transport_for_setup, transport_for_with_ssh_bootstrap,
 };
 use uuid::Uuid;
 
@@ -3419,6 +3419,105 @@ fn resolve_setup_desktop_selection(
     }
 }
 
+const fn native_readiness_invalidation_before_setup(
+    native_affecting_setup: bool,
+    mutation_planned: bool,
+    first_ssh_trust: bool,
+    authenticated_transport_available: bool,
+) -> bool {
+    native_affecting_setup
+        && mutation_planned
+        && !first_ssh_trust
+        && authenticated_transport_available
+}
+
+const fn authenticated_host_available_for_setup(
+    first_ssh_trust: bool,
+    ssh_transport: bool,
+    api_token_file_exists: bool,
+    current_daemon_available: bool,
+) -> bool {
+    !first_ssh_trust && (!ssh_transport || (api_token_file_exists && current_daemon_available))
+}
+
+fn observe_current_daemon_for_setup<E>(
+    current_daemon_available: bool,
+    observation_required: bool,
+    observe: impl FnOnce() -> Result<(), E>,
+) -> Result<bool, E> {
+    if current_daemon_available || !observation_required {
+        return Ok(current_daemon_available);
+    }
+
+    observe()?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod setup_native_invalidation_tests {
+    use super::{
+        authenticated_host_available_for_setup, native_readiness_invalidation_before_setup,
+        observe_current_daemon_for_setup,
+    };
+
+    #[test]
+    fn trusted_ssh_host_without_a_token_remains_bootstrap_only_during_setup() {
+        assert!(!authenticated_host_available_for_setup(
+            false, true, false, false,
+        ));
+        assert!(!authenticated_host_available_for_setup(
+            false, true, true, false,
+        ));
+        assert!(authenticated_host_available_for_setup(
+            false, true, true, true,
+        ));
+        assert!(authenticated_host_available_for_setup(
+            false, false, false, false,
+        ));
+        assert!(!authenticated_host_available_for_setup(
+            true, true, true, true,
+        ));
+    }
+
+    #[test]
+    fn missing_ssh_token_defers_invalidation_until_setup_establishes_authentication() {
+        assert!(!native_readiness_invalidation_before_setup(
+            true, true, false, false,
+        ));
+        assert!(native_readiness_invalidation_before_setup(
+            true, true, false, true,
+        ));
+    }
+
+    #[test]
+    fn ssh_follow_up_observes_the_daemon_before_treating_it_as_available() {
+        let observed = std::cell::Cell::new(false);
+        assert_eq!(
+            observe_current_daemon_for_setup(false, true, || {
+                observed.set(true);
+                Ok::<_, &'static str>(())
+            }),
+            Ok(true)
+        );
+        assert!(observed.get());
+
+        let skipped = std::cell::Cell::new(false);
+        assert_eq!(
+            observe_current_daemon_for_setup(false, false, || {
+                skipped.set(true);
+                Ok::<_, &'static str>(())
+            }),
+            Ok(false)
+        );
+        assert!(!skipped.get());
+
+        assert_eq!(
+            observe_current_daemon_for_setup(false, true, || Err("Host unavailable")),
+            Err("Host unavailable")
+        );
+    }
+}
+
 fn run_setup(
     command: SetupCommand,
     config: ConfigContext<'_>,
@@ -3600,12 +3699,44 @@ fn run_setup(
             ));
         }
     }
+    let api_token_file_exists =
+        api_token_file_exists(host.config.api_token.as_ref()).map_err(failure)?;
+    let current_daemon_available = report
+        .host_artifact
+        .as_ref()
+        .is_some_and(|artifact| artifact.current_version.is_some());
+    // An empty SSH Host subplan produces no artifact observation. Before any
+    // authenticated follow-up, prove that the configured daemon is live instead
+    // of treating the absence of Host setup work as proof of availability.
+    let current_daemon_available = observe_current_daemon_for_setup(
+        current_daemon_available,
+        !host_setup_required
+            && !command.dry_run
+            && report.required_input.is_empty()
+            && !first_ssh_trust
+            && ssh_transport
+            && api_token_file_exists
+            && (command.verify
+                || (!local_verification_only && (desktop_setup || provider_auth_setup))),
+        || {
+            transport_for(&host)?
+                .host_status()
+                .map(|_| ())
+                .map_err(failure)
+        },
+    )?;
+    let authenticated_host_available = authenticated_host_available_for_setup(
+        first_ssh_trust,
+        ssh_transport,
+        api_token_file_exists,
+        current_daemon_available,
+    );
     let mut desktop_selection = None;
     if desktop_setup
         && !local_verification_only
         && !command.dry_run
         && report.required_input.is_empty()
-        && (host.config.transport != satelle_core::TransportKind::Ssh || !first_ssh_trust)
+        && authenticated_host_available
     {
         let authenticated_bootstrap_user = (host.config.transport
             == satelle_core::TransportKind::Ssh)
@@ -3645,8 +3776,12 @@ fn run_setup(
     }
     // Capture this before provider-auth planning can mark an otherwise native-stable
     // setup as mutating. First SSH trust has no prior authenticated Host cache.
-    let native_readiness_invalidation_planned =
-        native_affecting_setup && report.mutation_planned && !first_ssh_trust;
+    let native_readiness_invalidation_planned = native_readiness_invalidation_before_setup(
+        native_affecting_setup,
+        report.mutation_planned,
+        first_ssh_trust,
+        authenticated_host_available,
+    );
 
     if provider_auth_setup
         && !local_verification_only
@@ -3664,7 +3799,7 @@ fn run_setup(
             }
         };
         if let Some((model_alias, provider_alias)) = provider_aliases {
-            if first_ssh_trust {
+            if !authenticated_host_available {
                 report.planned_actions.push(format!(
                     "validate provider binding '{provider_alias}/{model_alias}' on Host '{}'",
                     host.alias

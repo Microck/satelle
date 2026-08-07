@@ -780,6 +780,36 @@ pub(super) enum InitialHostState {
     PendingIdentityCommit(SshIdentityCommitRecord),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialHostStateProbe<'a> {
+    Fresh,
+    Existing,
+    PendingIdentityCommit(&'a str),
+}
+
+fn parse_initial_host_state_probe(
+    output: &str,
+) -> Result<InitialHostStateProbe<'_>, SshBootstrapError> {
+    // Both probe scripts terminate their last line. Remove exactly that frame
+    // delimiter while preserving every byte of a pending commit record.
+    let output = output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(output);
+    let mut sections = output.splitn(3, '\n');
+    if sections.next() != Some("satelle-initial-host-state-v2") {
+        return Err(SshBootstrapError::InvalidProbe);
+    }
+    match (sections.next(), sections.next()) {
+        (Some("fresh"), None) => Ok(InitialHostStateProbe::Fresh),
+        (Some("existing"), None) => Ok(InitialHostStateProbe::Existing),
+        (Some("pending_identity_commit"), Some(encoded)) => {
+            Ok(InitialHostStateProbe::PendingIdentityCommit(encoded))
+        }
+        _ => Err(SshBootstrapError::InvalidProbe),
+    }
+}
+
 pub(super) struct PreparedIdentityOperation {
     record: SshIdentityCommitRecord,
     artifact: DownloadedArtifact,
@@ -866,21 +896,12 @@ impl RemoteTarget {
         }
         let output =
             std::str::from_utf8(&output.stdout).map_err(|_| SshBootstrapError::InvalidProbe)?;
-        let mut sections = output.splitn(3, '\n');
-        if sections.next() != Some("satelle-initial-host-state-v2") {
-            return Err(SshBootstrapError::InvalidProbe);
-        }
-        let state = match sections.next() {
-            Some("fresh") => InitialHostState::Fresh,
-            Some("existing") => InitialHostState::Existing,
-            Some("pending_identity_commit") => {
-                let record = sections
-                    .next()
-                    .ok_or(SshBootstrapError::InvalidProbe)
-                    .and_then(|encoded| {
-                        SshIdentityCommitRecord::parse(encoded)
-                            .map_err(|_| SshBootstrapError::InvalidProbe)
-                    })?;
+        let state = match parse_initial_host_state_probe(output)? {
+            InitialHostStateProbe::Fresh => InitialHostState::Fresh,
+            InitialHostStateProbe::Existing => InitialHostState::Existing,
+            InitialHostStateProbe::PendingIdentityCommit(encoded) => {
+                let record = SshIdentityCommitRecord::parse(encoded)
+                    .map_err(|_| SshBootstrapError::InvalidProbe)?;
                 let cache_root = host_config
                     .daemon_cache_dir
                     .as_ref()
@@ -905,11 +926,7 @@ impl RemoteTarget {
                 }
                 return Ok(InitialHostState::PendingIdentityCommit(record));
             }
-            _ => return Err(SshBootstrapError::InvalidProbe),
         };
-        if sections.next().is_some() {
-            return Err(SshBootstrapError::InvalidProbe);
-        }
         Ok(state)
     }
 
@@ -1144,7 +1161,7 @@ while :; do
   [ -d "$current" ] && [ ! -L "$current" ] || exit 75
   owner=$(stat -c %u "$current" 2>/dev/null || stat -f %u "$current") || exit 75
   [ "$owner" = "$uid" ] || exit 75
-  chmod 700 -- "$current"
+  chmod 700 "$current"
   [ "$current" = "$root" ] && break
   current="${{current%/*}}"
   [ -n "$current" ] || exit 75
@@ -1164,7 +1181,7 @@ set -C
 cat >"$staged"
 if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$staged" | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 "$staged" | awk '{{print $1}}'); else actual=$(openssl dgst -sha256 "$staged" | awk '{{print $NF}}'); fi
 [ "$actual" = "$expected" ] || exit {digest_mismatch_exit_code}
-chmod 700 -- "$staged"
+chmod 700 "$staged"
 mv "$staged" "$final_path"
 trap - EXIT
 sync"#,
@@ -1465,6 +1482,7 @@ sync"#,
         attempt: &str,
         command: &str,
     ) -> String {
+        let commit_required = bootstrap_lock::mutation_phase_requires_commit(phase);
         if self.is_windows() {
             let operation_id = powershell_quote(operation_id);
             let claim_identity = powershell_quote(claim_identity);
@@ -1479,6 +1497,7 @@ $claimIdentity = {claim_identity}
 $claimBasename = {claim_basename}
 $phase = {phase}
 $attempt = {attempt}
+$commitRequired = {commit_required}
 $innerCommand = {command}
 $expectedGate = '{MUTATION_EXECUTE}'
 $gateBytes = [Text.Encoding]::UTF8.GetBytes($expectedGate + "`n")
@@ -1529,7 +1548,7 @@ try {{
   $terminalClaimExact = $false
 }}
 if ($terminalClaimExact) {{
-  if (($status -eq 0) -or
+  if ((((-not $commitRequired) -or ($phase -ceq 'daemon_start')) -and ($status -eq 0)) -or
       (($status -eq {digest_mismatch_exit_code}) -and
        (($phase -ceq 'cache_upload') -or ($phase -ceq 'cache_staging_permissions')))) {{
     [IO.File]::Open((Join-Path $claimPath ('execution_succeeded.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
@@ -1540,6 +1559,7 @@ if ($terminalClaimExact) {{
 }}
 exit $status"#,
                 digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
+                commit_required = if commit_required { "$true" } else { "$false" },
             ));
         }
 
@@ -1556,6 +1576,7 @@ claim_identity={claim_identity}
 claim_basename={claim_basename}
 phase={phase}
 attempt={attempt}
+commit_required={commit_required}
 inner_command={command}
 gate="$(dd bs=1 count={execute_gate_length} 2>/dev/null && printf x)" || exit 75
 [ "$gate" = '{MUTATION_EXECUTE}
@@ -1585,7 +1606,7 @@ set +e
 status=$?
 set -e
 if exact_terminal_attempt; then
-  if [ "$status" -eq 0 ] || {{ [ "$status" -eq {digest_mismatch_exit_code} ] &&
+  if {{ {{ [ "$commit_required" = false ] || [ "$phase" = daemon_start ]; }} && [ "$status" -eq 0 ]; }} || {{ [ "$status" -eq {digest_mismatch_exit_code} ] &&
        {{ [ "$phase" = cache_upload ] || [ "$phase" = cache_staging_permissions ]; }}; }}; then
     mkdir "$claim_path/execution_succeeded.$attempt" || exit 75
   elif [ "$phase" = daemon_start ] || [ "$phase" = offline_storage_maintenance ]; then
@@ -1595,6 +1616,7 @@ fi
 exit "$status""#,
             execute_gate_length = MUTATION_EXECUTE.len() + 1,
             digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
+            commit_required = commit_required,
         );
         format!("sh -c {}", posix_quote(&script))
     }
@@ -2354,7 +2376,6 @@ pub(super) struct RemoteUserDirectories {
 pub(super) struct UploadedHostArtifact {
     remote_path: String,
     binary_sha256: String,
-    cache_changed: bool,
 }
 
 impl UploadedHostArtifact {
@@ -2364,10 +2385,6 @@ impl UploadedHostArtifact {
 
     pub(super) fn binary_sha256(&self) -> &str {
         &self.binary_sha256
-    }
-
-    pub(super) const fn cache_changed(&self) -> bool {
-        self.cache_changed
     }
 }
 
@@ -2460,6 +2477,24 @@ impl<'a> PersistentServiceRemote<'a> {
     ) -> Result<UploadedHostArtifact, SshBootstrapError> {
         let artifact = DownloadedArtifact::fetch(self.target)?;
         self.install_host_artifact(artifact)
+    }
+
+    /// Stops the temporary bootstrap daemon and waits until it releases the
+    /// exact state store that the persistent service will open. Killing the
+    /// controller-side SSH process is not a remote lifecycle guarantee on
+    /// macOS or Windows, so service startup must use the daemon's coordinated
+    /// state-owner handoff protocol.
+    pub(super) fn release_bootstrap_state_owner(
+        &mut self,
+        artifact: &UploadedHostArtifact,
+        host_config: &HostConfig,
+    ) -> Result<(), SshBootstrapError> {
+        let environment = self.target.validated_daemon_environment(host_config)?;
+        let binary = self.absolute_artifact_path(artifact);
+        let command = self
+            .target
+            .release_state_command_with_environment(&binary, &environment);
+        self.mutate("state_owner_release", &command, None)
     }
 
     pub(super) fn install_verified_host_artifact(
@@ -3229,7 +3264,7 @@ foreach ($path in @({paths})) {{
             .collect::<Vec<_>>()
             .join(" ");
         format!(
-            "set -eu\numask 077\nuid=$(id -u)\nfor path in {paths}; do mkdir -p -- \"$path\"; chmod 700 -- \"$path\"; test -d \"$path\" && test ! -L \"$path\"; owner=$(stat -c %u \"$path\" 2>/dev/null || stat -f %u \"$path\"); [ \"$owner\" = \"$uid\" ]; done"
+            "set -eu\numask 077\nuid=$(id -u)\nfor path in {paths}; do mkdir -p -- \"$path\"; chmod 700 \"$path\"; test -d \"$path\" && test ! -L \"$path\"; owner=$(stat -c %u \"$path\" 2>/dev/null || stat -f %u \"$path\"); [ \"$owner\" = \"$uid\" ]; done"
         )
     }
 }
@@ -3829,7 +3864,7 @@ fn launchd_observe_command(definition: &LaunchdServiceDefinition) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!(
-        "set -eu\npath={}\nexpected={}\nif ! launchctl print \"gui/$(id -u)/{LAUNCHD_LABEL}\" >/dev/null 2>&1; then printf 'satelle-persistent-service-v1\\nabsent\\n'; exit 0; fi\nactual=$(shasum -a 256 \"$path\" | awk '{{print $1}}')\nprintf 'satelle-persistent-service-v1\\n'\nif [ \"$actual\" = \"$expected\" ]; then printf 'matching\\n'; else printf 'drifted\\n'; fi",
+        "set -eu\nservice_path={}\nexpected={}\nif ! launchctl print \"gui/$(id -u)/{LAUNCHD_LABEL}\" >/dev/null 2>&1; then printf 'satelle-persistent-service-v1\\nabsent\\n'; exit 0; fi\nactual=$(shasum -a 256 \"$service_path\" | awk '{{print $1}}')\nprintf 'satelle-persistent-service-v1\\n'\nif [ \"$actual\" = \"$expected\" ]; then printf 'matching\\n'; else printf 'drifted\\n'; fi",
         posix_quote(definition.plist_path()),
         posix_quote(&digest),
     )
@@ -4965,7 +5000,6 @@ fn upload_artifact(
             return Ok(UploadedHostArtifact {
                 remote_path: content_addressed_path,
                 binary_sha256: local_digest_hex,
-                cache_changed: false,
             });
         }
         content_addressed_path
@@ -4987,15 +5021,14 @@ fn upload_artifact(
     )?;
     let promote = run_fenced_ssh_command(destination, &command, None)?;
     require_success(promote)?;
-    if remote_artifact_matches(destination, target, &final_path, &local_digest)? {
-        Ok(UploadedHostArtifact {
-            remote_path: final_path,
-            binary_sha256: local_digest_hex,
-            cache_changed: true,
-        })
-    } else {
-        Err(SshBootstrapError::RemoteCacheEntryRejected)
+    if !remote_artifact_matches(destination, target, &final_path, &local_digest)? {
+        return Err(SshBootstrapError::RemoteCacheEntryRejected);
     }
+    bootstrap_lock.commit_current_mutation()?;
+    Ok(UploadedHostArtifact {
+        remote_path: final_path,
+        binary_sha256: local_digest_hex,
+    })
 }
 
 fn upload_operation_artifact(
@@ -5023,7 +5056,6 @@ fn upload_operation_artifact(
     Ok(UploadedHostArtifact {
         remote_path: record.exact_remote_path().to_string(),
         binary_sha256: digest_hex(&local_digest),
-        cache_changed: true,
     })
 }
 
@@ -5660,6 +5692,28 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn initial_host_state_probe_accepts_platform_line_endings() {
+        assert_eq!(
+            parse_initial_host_state_probe("satelle-initial-host-state-v2\nfresh\n")
+                .expect("parse the POSIX probe frame"),
+            InitialHostStateProbe::Fresh
+        );
+        assert_eq!(
+            parse_initial_host_state_probe("satelle-initial-host-state-v2\nexisting\r\n")
+                .expect("parse the Windows probe frame"),
+            InitialHostStateProbe::Existing
+        );
+    }
+
+    #[test]
+    fn initial_host_state_probe_rejects_trailing_output() {
+        assert!(matches!(
+            parse_initial_host_state_probe("satelle-initial-host-state-v2\nfresh\nuntrusted"),
+            Err(SshBootstrapError::InvalidProbe)
+        ));
+    }
 
     #[cfg(unix)]
     fn persistent_storage_policy() -> satelle_core::daemon_service::PersistentHostStoragePolicy {
@@ -6474,6 +6528,7 @@ mod tests {
         );
         assert!(posix.contains("umask 077"));
         assert!(posix.contains("chmod 700"));
+        assert!(!posix.contains("chmod 700 --"));
         assert!(posix.contains("test ! -L"));
         assert!(posix.contains("stat -f %u"));
     }
@@ -6498,6 +6553,8 @@ mod tests {
             assert!(!command.contains("LaunchDaemons"));
         }
         assert!(register.contains("launchctl bootstrap"));
+        assert!(observe.contains("service_path="));
+        assert!(!observe.contains("\npath="));
         assert!(kickstart.contains("launchctl kickstart -k"));
         assert!(bootout.contains("launchctl bootout"));
         assert!(absent.contains("launchctl print"));
@@ -7917,6 +7974,9 @@ mod tests {
         let command = RemoteTarget::DarwinArm64
             .operation_artifact_upload_command(&record)
             .expect("construct artifact publication command");
+        assert!(command.contains("chmod 700 \"$current\""));
+        assert!(command.contains("chmod 700 \"$staged\""));
+        assert!(!command.contains("chmod 700 --"));
         assert!(command.contains("\nsync"));
         assert!(!command.contains("sync \"$final_path\""));
     }
@@ -8166,6 +8226,7 @@ mod tests {
         assert!(posix.contains("mutation_started"));
         assert!(posix.contains("mutation_phase"));
         assert!(posix.contains("mutation_attempt"));
+        assert!(posix.contains("commit_required=false"));
         assert!(posix.contains(attempt));
         assert!(posix.contains(MUTATION_EXECUTE));
         assert!(posix.contains("execution_started.$attempt"));
@@ -8196,6 +8257,7 @@ mod tests {
         assert!(script.contains("mutation_started"));
         assert!(script.contains("mutation_phase"));
         assert!(script.contains("mutation_attempt"));
+        assert!(script.contains("$commitRequired = $false"));
         assert!(script.contains(attempt));
         assert!(script.contains(MUTATION_EXECUTE));
         assert!(script.contains("execution_started."));
@@ -8218,6 +8280,29 @@ mod tests {
         assert!(script.contains("[IO.FileAttributes]::ReparsePoint"));
         assert!(!script.contains("$claims = @("));
         assert!(script.contains("Invoke-Expression $innerCommand"));
+
+        let commit_required_posix = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+            "repair-operation",
+            identity,
+            basename,
+            "identity_artifact_upload",
+            attempt,
+            "sh -c 'exit 0'",
+        );
+        assert!(commit_required_posix.contains("commit_required=true"));
+        let commit_required_windows = RemoteTarget::WindowsX64Msvc.fenced_mutation_command(
+            "repair-operation",
+            identity,
+            basename,
+            "identity_artifact_upload",
+            attempt,
+            "cmd.exe /d /c exit 0",
+        );
+        assert!(
+            decode_powershell_command(&commit_required_windows)
+                .expect("decode commit-required mutation")
+                .contains("$commitRequired = $true")
+        );
         assert_occurs_before(
             &script,
             "Invoke-Expression $innerCommand",
@@ -8410,7 +8495,9 @@ mod tests {
         fs::write(claim.join("state"), "mutation_started").expect("write claim state");
         fs::write(claim.join("mutation_phase"), "cache_upload").expect("write mutation phase");
 
-        let run = |attempt: &str, input: &[u8], output: &Path| {
+        let run = |phase: &str, attempt: &str, input: &[u8], output: &Path| {
+            fs::write(claim.join("state"), "mutation_started").expect("write claim state");
+            fs::write(claim.join("mutation_phase"), phase).expect("write mutation phase");
             fs::write(claim.join("mutation_attempt"), attempt).expect("write mutation attempt");
             let inner_command = format!(
                 "cat > {}",
@@ -8420,7 +8507,7 @@ mod tests {
                 operation_id,
                 identity,
                 basename,
-                "cache_upload",
+                phase,
                 attempt,
                 &inner_command,
             );
@@ -8444,6 +8531,7 @@ mod tests {
         let rejected_attempt = "missing-newline";
         let rejected_output = state.path().join("rejected-output");
         let rejected = run(
+            "cache_upload",
             rejected_attempt,
             MUTATION_EXECUTE.as_bytes(),
             &rejected_output,
@@ -8466,7 +8554,12 @@ mod tests {
         let payload = b"token-line\n\0binary-after-gate\xff\n";
         let mut valid_input = format!("{MUTATION_EXECUTE}\n").into_bytes();
         valid_input.extend_from_slice(payload);
-        let accepted = run(accepted_attempt, &valid_input, &accepted_output);
+        let accepted = run(
+            "cache_upload",
+            accepted_attempt,
+            &valid_input,
+            &accepted_output,
+        );
         assert!(accepted.success());
         assert_eq!(
             fs::read(accepted_output).expect("read accepted payload"),
@@ -8481,6 +8574,27 @@ mod tests {
             claim
                 .join(format!("execution_succeeded.{accepted_attempt}"))
                 .is_dir()
+        );
+
+        let commit_attempt = "commit-required";
+        let commit_output = state.path().join("commit-required-output");
+        let commit_required = run(
+            "identity_artifact_upload",
+            commit_attempt,
+            format!("{MUTATION_EXECUTE}\n").as_bytes(),
+            &commit_output,
+        );
+        assert!(commit_required.success());
+        assert!(
+            claim
+                .join(format!("execution_started.{commit_attempt}"))
+                .is_dir()
+        );
+        assert!(
+            !claim
+                .join(format!("execution_succeeded.{commit_attempt}"))
+                .exists(),
+            "a commit-required phase waits for the controller's verified commit"
         );
     }
 

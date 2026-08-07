@@ -57,6 +57,7 @@ variable = "SATELLE_TEST_PROVIDER_TOKEN"
     let setup_output = satelle()
         .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", state.path().join("cache"))
         .env("SATELLE_TEST_PROVIDER_TOKEN", "fixture-provider-token")
         .args([
             "setup",
@@ -88,6 +89,7 @@ variable = "SATELLE_TEST_PROVIDER_TOKEN"
     satelle()
         .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", state.path().join("cache"))
         .args(["host", "release-state"])
         .assert()
         .success();
@@ -391,11 +393,13 @@ fn stop_json_v1_has_one_closed_contract_for_stopped_and_already_terminal_turns()
         ("pending", ("stopped", "recovery_pending", "stopped", true)),
     ] {
         let state = state_dir();
+        let cache = state.path().join("cache");
         let provider_config = authorize_default_provider_binding(&state);
         let mut run_command = satelle();
         run_command
             .env("SATELLE_CONFIG_FILE", &provider_config)
             .env("SATELLE_STATE_DIR", state.path())
+            .env("SATELLE_CACHE_DIR", &cache)
             .env("SATELLE_TEST_PROVIDER_TOKEN", "fixture-provider-token")
             .env(TEST_SUPPORT_ADAPTER_ENV, adapter)
             .args(["run", "--host", "local-demo"]);
@@ -420,6 +424,7 @@ fn stop_json_v1_has_one_closed_contract_for_stopped_and_already_terminal_turns()
         let stop = satelle()
             .env("SATELLE_CONFIG_FILE", &provider_config)
             .env("SATELLE_STATE_DIR", state.path())
+            .env("SATELLE_CACHE_DIR", &cache)
             .env("SATELLE_TEST_PROVIDER_TOKEN", "fixture-provider-token")
             .env(TEST_SUPPORT_ADAPTER_ENV, adapter)
             .args(["stop", session_id, "--json"])

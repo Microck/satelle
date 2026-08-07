@@ -45,6 +45,8 @@ Upstream evidence:
   retrieved 2026-07-09 for current Computer Use platform and approval policy
 - [Current Computer Use guide](https://learn.chatgpt.com/docs/computer-use),
   retrieved 2026-07-18 for Windows app-policy storage and migration behavior
+- [Current Windows app guide](https://learn.chatgpt.com/docs/windows/windows-app),
+  retrieved 2026-08-08 for the official Store package identity and install path
 
 The version-tagged README and schema are authoritative for protocol shape. The
 current manual is authoritative only for current product availability and
@@ -57,7 +59,7 @@ authority for readiness.
 | --- | --- |
 | Codex contract target | Exactly `0.144.0` |
 | Candidate version range | `>=0.144.0, <=0.144.0` |
-| Windows Codex Desktop contract target | Exactly `26.727.6591.0` with bundled Computer Use plugin `26.727.51351` |
+| Windows Codex Desktop contract target | Exactly `26.803.5235.0` with bundled Computer Use plugin `26.803.41515` |
 | macOS Codex Desktop contract target | Exactly `26.730.61639` with bundled Computer Use plugin inventory version `1.0.1000621` and signed helper version `26.803.1000621` |
 | Production support verdict | Blocked until the complete Windows and macOS real-Host acceptance journeys pass |
 | Schema surface | Stable schema generated without `--experimental` |
@@ -71,6 +73,17 @@ The exact version pin is intentional. A later Codex release is unsupported
 until Satelle regenerates its stable schema evidence and reruns the real-Host
 acceptance journey. A semver comparison by itself must never mark a release as
 compatible.
+
+The Windows 26.803 plugin removed the old `computer-use-client.mjs` shim. Its
+documented entry point is now a direct `@oai/sky` import in the authenticated
+`node_repl` session. Satelle therefore admits the signed packaged bridge and
+the exact plugin inventory, then calls that documented entry point directly.
+It does not retain or recreate the removed shim.
+
+The readiness probe selects the `MSEdge` identifier returned by that same
+authenticated app inventory. Microsoft Edge is part of the declared Windows
+Host baseline. The probe does not depend on a browser installed only in a test
+image.
 
 The upstream stdio choice does not change Satelle's own remote transport. The
 Host Daemon may expose Satelle HTTP and WebSocket contracts while keeping
