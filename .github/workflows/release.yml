@@ -32,6 +32,11 @@ on:
         description: Existing release version for recovery
         required: false
         type: string
+      recover_rolled_back:
+        description: Explicitly resume promotion after a completed rollback
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.operation != 'diagnostics')) && 'satelle-npm-release-writer' || format('release-candidate-{0}', github.ref) }}
@@ -890,6 +895,7 @@ jobs:
           RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && needs.collect.outputs.version || inputs.version }}
           EXPECTED_SOURCE_DIGEST: ${{ startsWith(github.ref, 'refs/tags/v') && needs.attest.outputs.source-digest || needs.authorize-recovery-tag.outputs.source-digest }}
           EXPECTED_TAG_DIGEST: ${{ startsWith(github.ref, 'refs/tags/v') && needs.attest.outputs.tag-digest || needs.authorize-recovery-tag.outputs.tag-digest }}
+          ALLOW_ROLLED_BACK_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'candidate-finalize' && inputs.recover_rolled_back && '1' || '0' }}
         shell: bash
         run: |
           release_tag_not_trusted() {
@@ -955,6 +961,15 @@ jobs:
             cp "$record" "$snapshot"
             gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber "$snapshot"
           }
+          recheck_release_tag
+          record_status=$(node -e 'process.stdout.write(require(process.argv[1]).record.status)' "$record")
+          if [ "$record_status" = conflicted ]; then
+            node npm/scripts/npm-promotion.cjs restart "$record"
+          elif [ "$record_status" = rolled_back ]; then
+            test "$ALLOW_ROLLED_BACK_RECOVERY" = 1 || \
+              release_tag_not_trusted "rolled-back promotion requires explicit recovery authorization"
+            node npm/scripts/npm-promotion.cjs restart "$record" --allow-rolled-back
+          fi
           checkpoint
           trap 'checkpoint' ERR
           max_advances=$(node -e 'process.stdout.write(String(require(process.argv[1]).record.packages.length))' "$record")
