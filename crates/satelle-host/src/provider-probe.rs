@@ -25,6 +25,7 @@ pub(crate) struct NativeActionEvidence {
 #[derive(Default)]
 struct NativeActionState {
     expected_script: Option<String>,
+    expected_app_id: Option<String>,
     active_item: Option<String>,
     observed_actions: u8,
     invalidated: bool,
@@ -43,17 +44,35 @@ impl NativeActionEvidence {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.expected_script = None;
+        state.expected_app_id = None;
         state.active_item = None;
         state.observed_actions = 0;
         state.invalidated = false;
     }
 
+    #[cfg(test)]
     pub(crate) fn expect_script(&self, script: &str) {
+        self.expect_script_for_app(script, "test-app");
+    }
+
+    pub(crate) fn expect_script_for_app(&self, script: &str, app_id: &str) {
         let (state, _) = &*self.state;
         let mut state = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.expected_script = Some(script.to_string());
+        state.expected_app_id = Some(app_id.to_string());
+    }
+
+    pub(crate) fn expected_authorization(&self) -> Option<(String, String)> {
+        let (state, _) = &*self.state;
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .expected_script
+            .clone()
+            .zip(state.expected_app_id.clone())
     }
 
     fn wait_for(&self, action: NativeAction) -> bool {
@@ -144,6 +163,8 @@ impl NativeActionEvidence {
 /// Codex execution attempt.
 pub(crate) struct ProviderProbeSurface {
     page_url: String,
+    #[cfg(windows)]
+    _native_window: Option<crate::windows_native_probe::WindowsNativeProbeWindow>,
     deadline: Instant,
     shutdown: Arc<AtomicBool>,
     observed_actions: Arc<AtomicU8>,
@@ -155,6 +176,7 @@ pub(crate) struct ProviderProbeSurface {
 
 #[derive(Clone, Copy)]
 enum ProbeRequirements {
+    #[cfg(test)]
     DragOnly,
     ClickAndDrag,
 }
@@ -169,6 +191,7 @@ struct ProbeServerControl<'a> {
 }
 
 enum NativeGestureEvidence {
+    #[cfg(test)]
     NotRequired,
     Native {
         evidence: NativeActionEvidence,
@@ -185,8 +208,9 @@ enum NativeAction {
 }
 
 impl NativeGestureEvidence {
-    fn new(requirements: ProbeRequirements, evidence: Option<NativeActionEvidence>) -> Self {
-        if matches!(requirements, ProbeRequirements::DragOnly) {
+    fn new(_requirements: ProbeRequirements, evidence: Option<NativeActionEvidence>) -> Self {
+        #[cfg(test)]
+        if matches!(_requirements, ProbeRequirements::DragOnly) {
             return Self::NotRequired;
         }
         match evidence {
@@ -201,6 +225,7 @@ impl NativeGestureEvidence {
 
     fn accept(&mut self, action: NativeAction) -> bool {
         match self {
+            #[cfg(test)]
             Self::NotRequired => true,
             Self::Native {
                 evidence,
@@ -275,6 +300,9 @@ pub(crate) enum ProviderProbeError {
     Io(#[source] std::io::Error),
     #[error("the provider probe worker could not start")]
     WorkerSpawn(#[source] std::io::Error),
+    #[cfg(windows)]
+    #[error("the native provider probe window could not start")]
+    NativeWindow(#[source] std::io::Error),
     #[error("the provider probe worker stopped unexpectedly")]
     WorkerStopped,
 }
@@ -291,6 +319,7 @@ impl ProviderProbeSurface {
     /// Starts the listener with the caller's absolute execution deadline.
     /// Doctor passes its scheduler-owned cancellation capability unchanged;
     /// the private shutdown flag exists only to make RAII teardown joinable.
+    #[cfg(test)]
     pub(crate) fn start_with_control(
         deadline: Instant,
         cancellation: Option<crate::runtime::AdmissionCancellation>,
@@ -358,6 +387,18 @@ impl ProviderProbeSurface {
         }
         let capability = random_token(32)?;
         let page_url = format!("http://127.0.0.1:{port}/probe/{capability}");
+        #[cfg(windows)]
+        let native_window = native_action_evidence
+            .as_ref()
+            .map(|_| {
+                crate::windows_native_probe::WindowsNativeProbeWindow::spawn(
+                    address,
+                    &capability,
+                    &nonce,
+                )
+            })
+            .transpose()
+            .map_err(ProviderProbeError::NativeWindow)?;
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
         let observed_actions = Arc::new(AtomicU8::new(0));
@@ -388,6 +429,8 @@ impl ProviderProbeSurface {
 
         Ok(Self {
             page_url,
+            #[cfg(windows)]
+            _native_window: native_window,
             deadline,
             shutdown,
             observed_actions,
@@ -553,6 +596,7 @@ fn serve_probe(
                     && request.content_type.as_deref() == Some(FORM_CONTENT_TYPE)
                     && request.content_length == Some(request.body.len())
                     && match requirements {
+                        #[cfg(test)]
                         ProbeRequirements::DragOnly => request.body == drag_body.as_bytes(),
                         ProbeRequirements::ClickAndDrag => {
                             request.body == click_body.as_bytes()
@@ -609,6 +653,7 @@ fn serve_probe(
 
 fn probe_requirements_satisfied(requirements: ProbeRequirements, observed_actions: u8) -> bool {
     match requirements {
+        #[cfg(test)]
         ProbeRequirements::DragOnly => observed_actions & DRAG_OBSERVED != 0,
         ProbeRequirements::ClickAndDrag => {
             observed_actions & (CLICK_OBSERVED | DRAG_OBSERVED) == (CLICK_OBSERVED | DRAG_OBSERVED)
@@ -824,12 +869,14 @@ fn write_page(
     requirements: ProbeRequirements,
 ) -> Result<(), ProviderProbeError> {
     let click_control = match requirements {
+        #[cfg(test)]
         ProbeRequirements::DragOnly => String::new(),
         ProbeRequirements::ClickAndDrag => format!(
             "<button id=confirm type=button>Click to confirm</button><script>document.querySelector('#confirm').addEventListener('click',event=>{{if(!event.isTrusted)return;event.currentTarget.textContent='Click event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',body:'nonce={nonce}&action=click'}});}});</script>"
         ),
     };
     let title = match requirements {
+        #[cfg(test)]
         ProbeRequirements::DragOnly => "Satelle provider probe",
         ProbeRequirements::ClickAndDrag => "Satelle native readiness probe",
     };

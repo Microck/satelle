@@ -1,4 +1,5 @@
 use crate::provider_auth::ResolvedProviderSecret;
+use crate::provider_probe::NativeActionEvidence;
 use base64::Engine as _;
 use satelle_core::session::StopObservation;
 use satelle_core::session::TurnExecutionMode;
@@ -695,9 +696,17 @@ impl<'a> SessionExchange<'a> {
         let method = required_string(object, "method")?;
         let auto_approve = self.request.auto_approves_callbacks();
         if method == "mcpServer/elicitation/request" {
+            let expected_native_action = self
+                .request
+                .native_action_evidence
+                .as_ref()
+                .and_then(NativeActionEvidence::expected_authorization);
             let (result, authorized) = codex_approval::computer_use_elicitation_result(
                 object,
                 self.request.computer_use_allowed_app_ids,
+                expected_native_action
+                    .as_ref()
+                    .map(|(script, _authorized_app_id)| script.as_str()),
                 self.thread_ref.as_deref(),
                 self.turn_ref.as_deref(),
             )?;
@@ -1060,7 +1069,15 @@ impl<'a> SessionExchange<'a> {
                     "name": "satelle-host",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "capabilities": {"experimentalApi": false}
+                // The official Computer Use bridge rejects approval-backed
+                // calls unless its MCP client receives OpenAI form elicitation
+                // support during initialize. This explicit capability field is
+                // shared by every admitted Codex release, so Satelle does not
+                // depend on a release-specific extension shape.
+                "capabilities": {
+                    "experimentalApi": false,
+                    "mcpServerOpenaiFormElicitation": true
+                }
             }
         }))
     }

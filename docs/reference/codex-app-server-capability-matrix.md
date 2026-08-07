@@ -1,6 +1,6 @@
 ---
 title: Codex app-server capability matrix
-description: Pinned upstream capabilities, approval boundaries, and native Host readiness blockers.
+description: Upstream capabilities, approval boundaries, and native Host readiness blockers.
 ---
 
 # Codex app-server capability matrix
@@ -45,6 +45,8 @@ Upstream evidence:
   retrieved 2026-07-09 for current Computer Use platform and approval policy
 - [Current Computer Use guide](https://learn.chatgpt.com/docs/computer-use),
   retrieved 2026-07-18 for Windows app-policy storage and migration behavior
+- [Current Windows app guide](https://learn.chatgpt.com/docs/windows/windows-app),
+  retrieved 2026-08-08 for the official Store package identity and install path
 
 The version-tagged README and schema are authoritative for protocol shape. The
 current manual is authoritative only for current product availability and
@@ -55,10 +57,10 @@ authority for readiness.
 
 | Property | Phase 0 contract |
 | --- | --- |
-| Codex contract target | Exactly `0.144.0` |
-| Candidate version range | `>=0.144.0, <=0.144.0` |
-| Windows Codex Desktop contract target | Exactly `26.727.6591.0` with bundled Computer Use plugin `26.727.51351` |
-| macOS Codex Desktop contract target | Exactly `26.730.61639` with bundled Computer Use plugin inventory version `1.0.1000621` and signed helper version `26.803.1000621` |
+| Codex contract baseline | `0.144.0` stable app-server schema |
+| Candidate version range | `>=0.144.0`, subject to every stable capability and live-readiness gate |
+| Windows Codex Desktop contract | Official signed package identity, bundled Computer Use plugin provenance, and live readiness gates. The first proof used Desktop `26.803.5235.0` and plugin `26.803.41515`. |
+| macOS Codex Desktop contract | Official OpenAI code-signing identity, bundled Computer Use plugin provenance, and live readiness gates. The first proof used Desktop `26.730.61639`, plugin `1.0.1000621`, and helper `26.803.1000621`. |
 | Production support verdict | Blocked until the complete Windows and macOS real-Host acceptance journeys pass |
 | Schema surface | Stable schema generated without `--experimental` |
 | App-server transport | `stdio://` |
@@ -67,10 +69,31 @@ authority for readiness.
 | Excluded upstream transport | `ws://` because Codex documents it as experimental and unsupported |
 | Not selected for Phase 0 | Unix-socket control transport; it is unnecessary for the first adapter |
 
-The exact version pin is intentional. A later Codex release is unsupported
-until Satelle regenerates its stable schema evidence and reruns the real-Host
-acceptance journey. A semver comparison by itself must never mark a release as
-compatible.
+`0.144.0` is the supported floor, not a version pin. Satelle may admit a newer
+owner-authorized official standalone release only after that runtime exposes
+the required stable schema, completes the private app-server handshake, and
+passes the applicable live Host readiness proof. A semver comparison by itself
+never marks a release as compatible. A removed or changed required capability
+produces the same typed blocker on any newer release.
+
+Codex Desktop and bundled Computer Use component versions are evidence and
+cache identity, not admission pins. Satelle authenticates the platform package
+or OpenAI signing identity, validates bundled provenance and bridge shape, and
+then requires the live capability proof. An updated official build is accepted
+when those checks pass and rejected when they do not. The macOS bridge's single
+client handshake digest is likewise taken from the verified current inventory
+after strict SHA-256 shape validation; it is not a baked-in release digest.
+
+The Windows 26.803 plugin removed the old `computer-use-client.mjs` shim. Its
+documented entry point is now a direct `@oai/sky` import in the authenticated
+`node_repl` session. Satelle therefore admits the signed packaged bridge and
+the exact plugin inventory, then calls that documented entry point directly.
+It does not retain or recreate the removed shim.
+
+The readiness probe selects the `MSEdge` identifier returned by that same
+authenticated app inventory. Microsoft Edge is part of the declared Windows
+Host baseline. The probe does not depend on a browser installed only in a test
+image.
 
 The upstream stdio choice does not change Satelle's own remote transport. The
 Host Daemon may expose Satelle HTTP and WebSocket contracts while keeping
@@ -111,7 +134,7 @@ Status meanings:
 | Generic approval callbacks | Stable server requests for command execution, file change, and permission approval | partial | These callbacks cover their documented action classes only. They are not evidence of native Computer Use app approval coverage. |
 | Windows persistent app policy | `initialize` supplies the active `codexHome`; `config/read` with layers includes the raw parsed user `config.toml` layer | partial | Match the base user layer to `codexHome/config.toml`, then report `stable` only for a string array at `[computer_use.windows].always_allowed_app_ids`. A legacy `[apps].allowed` list is `private` migration input. Missing policy is `absent`; malformed or unreadable evidence is `incomplete`. Never retain the path or app identifiers. The removed legacy `denied` list is not a fallback. |
 | macOS persistent app policy | The signed Computer Use helper stores approved bundle identifiers in its app-group container | partial | Read only `~/Library/Group Containers/2DC432GLL2.com.openai.sky.CUAService/Library/Application Support/Software/ComputerUseAppApprovals.json`. Require a regular non-symlink file below the regular non-symlink group root, enforce the 1 MiB limit and exact JSON shape, and retain identifiers only in process memory. |
-| Native Computer Use approval state | The official Computer Use bridge can issue `mcpServer/elicitation/request` for an app-selection decision | partial | Accept only the exact Computer Use connector, official platform bridge (`node_repl` on Windows or `computer-use` on macOS), current thread and Turn, form shape, and app identifier already present in the platform's canonical persistent policy. All other app and sensitive-action prompts remain operator decisions. |
+| Native Computer Use approval state | The official Computer Use bridge can issue `mcpServer/elicitation/request` for an app-selection decision | partial | Advertise the stable `mcpServerOpenaiFormElicitation` capability during `initialize` without enabling the experimental API. Accept only the exact Computer Use connector, official platform bridge (`node_repl` on Windows or `computer-use` on macOS), current thread and Turn, form shape, and app identifier already present in the platform's canonical persistent policy. All other app and sensitive-action prompts remain operator decisions. |
 | Native Computer Use readiness | The official bundled plugin loads its platform bridge through the isolated private app-server process | partial | Plugin presence, OS policy, and request acknowledgement are not readiness. The target Host must pass the live harmless click-and-drag probe through the same bridge used for prompt Turns. |
 | Harmless native action | One Turn invokes the official Computer Use API through the isolated bridge and observes two private loopback callbacks | partial | The Windows candidate passed an independently observed click and drag. Every supported Host still must pass this live probe, and full Session acceptance remains separate. |
 | Restore current Session state after Client reconnect | Satelle Host Daemon state plus stable `thread/read` with `includeTurns`, and `thread/resume` when the adapter must reopen the stored thread | partial | A fresh Satelle Client reads Host Daemon state. If the adapter connection is also fresh, initialize it before reading or resuming. Prove that identifiers, active/terminal Turn state, and approval state survive the Client reconnect. |
@@ -153,7 +176,11 @@ closed request shape tied to the official Computer Use connector, the current
 thread and Turn, and an app identifier already present in the Host platform's
 canonical persistent policy. Windows uses the current allow-list. macOS uses
 the signed helper's approval file. That response does not add or persist
-authority.
+authority. Satelle declares the stable OpenAI form elicitation capability
+during the private app-server handshake because the official bridge uses that
+negotiated capability to enable form elicitation. Satelle keeps
+`experimentalApi` false.
+This capability check does not depend on a Codex or Desktop version.
 
 Therefore Satelle Phase 0 must distinguish two outcomes:
 
@@ -316,5 +343,5 @@ remains required before public release.
 | The complete Windows Session acceptance journey has not passed | Native readiness alone does not prove reconnect, follow-up Turn, detached ownership, or confirmed stop. |
 | No passing macOS Host acceptance record exists | Public MVP support requires a complete real-Host acceptance run on macOS. |
 | Native app and sensitive-action prompts outside the exact allowed-app elicitation shape remain operator-only | Satelle must report action required or a typed blocker and must not broaden YOLO authority. |
-| Only 0.144.0 has been inspected | All other Codex versions remain unsupported until schema and real-Host validation pass. |
+| `0.144.0` is the oldest inspected stable schema | Newer Codex releases remain gated by schema, handshake, and real-Host validation rather than an exact version match. |
 | Linux lacks official native Computer Use Host support | Linux validation may cover Controller and generic protocol behavior only. |

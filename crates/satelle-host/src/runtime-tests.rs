@@ -1607,6 +1607,42 @@ fn setup_provider_binding_failure_occurs_after_returned_native_evidence() {
 }
 
 #[test]
+fn explicit_host_binding_is_attached_before_native_readiness_key_resolution() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let mut config = host_config_with_provider_binding("UNUSED_PROVIDER_SECRET");
+    config
+        .provider_bindings
+        .get_mut("openai")
+        .and_then(|models| models.get_mut("review"))
+        .expect("the exact Host binding exists")
+        .auth_source = None;
+    let adapter =
+        ProviderProbeRecoveryAdapter::with_native_only_results([], [NativeProbeBehavior::Passed])
+            .requiring_resolved_explicit_binding();
+    let runtime = RuntimeHandle::new_with_provider_policy_and_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+        RuntimeProviderPolicy::from_host_config(&config),
+    );
+    let intent = ProviderComputerUseIntent::new(
+        Some(EffectiveModelRef::new("review").expect("valid model alias")),
+        Some(ProviderBindingRef::new("openai").expect("valid provider alias")),
+        false,
+    );
+
+    runtime
+        .run(
+            RunCommand::attached(LOCAL_DEMO_HOST, "use-the-explicit-host-binding")
+                .with_provider_intent(intent),
+        )
+        .expect("the resolved Host binding must be available to native readiness");
+
+    assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.execute_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn fresh_readiness_replacing_cached_candidate_reports_live_source() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter =
@@ -2490,6 +2526,7 @@ struct ProviderProbeRecoveryAdapter {
     replace_cached_readiness: Arc<AtomicBool>,
     cached_replacement_calls: Arc<AtomicUsize>,
     native_only: bool,
+    require_resolved_explicit_binding: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2516,6 +2553,7 @@ impl ProviderProbeRecoveryAdapter {
             replace_cached_readiness: Arc::new(AtomicBool::new(false)),
             cached_replacement_calls: Arc::new(AtomicUsize::new(0)),
             native_only: false,
+            require_resolved_explicit_binding: false,
         }
     }
 
@@ -2618,6 +2656,11 @@ impl ProviderProbeRecoveryAdapter {
         self.replace_cached_readiness.store(true, Ordering::SeqCst);
     }
 
+    fn requiring_resolved_explicit_binding(mut self) -> Self {
+        self.require_resolved_explicit_binding = true;
+        self
+    }
+
     fn adapter_readiness(&self, evidence: ReadinessEvidence) -> AdapterReadiness {
         let key = self.effective_key();
         if self.native_only {
@@ -2676,6 +2719,13 @@ impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
         _host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        if self.require_resolved_explicit_binding
+            && provider_intent.model().is_some()
+            && provider_intent.provider().is_some()
+            && provider_intent.resolved_provider_binding().is_none()
+        {
+            return Err(super::model_provider_binding_missing(provider_intent));
+        }
         Ok(Some(
             provider_intent.resolved_provider_binding().map_or_else(
                 || self.effective_key(),

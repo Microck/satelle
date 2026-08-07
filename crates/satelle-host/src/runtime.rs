@@ -1360,10 +1360,17 @@ impl RuntimeEngine {
             cancellation.finish(AdmissionCancellationState::Cancelled);
             return Err(SatelleError::interrupted_attached_command());
         }
-        // Native readiness is independent of provider credentials. Prove this
-        // phase before provider authorization so a missing secret cannot hide
-        // the current native Host state.
-        let native_cache_key = self.adapter.readiness_cache_key(host, provider_intent)?;
+        // Native readiness is independent of provider credentials. Attach the
+        // exact binding descriptor so the adapter can build its native cache
+        // identity, but defer a missing secret descriptor until native state
+        // has been proved.
+        let (provider_intent, deferred_provider_error) = self
+            .prepare_provider_intent_for_native_readiness(
+                host,
+                provider_intent,
+                supplied_native.is_some(),
+            )?;
+        let native_cache_key = self.adapter.readiness_cache_key(host, &provider_intent)?;
         if let (Some(key), Some(driver)) = (
             native_cache_key.as_ref(),
             self.readiness_probe_driver.as_ref(),
@@ -1405,7 +1412,10 @@ impl RuntimeEngine {
 
         // Provider authorization and provider-smoke ownership begin only
         // after native readiness has completed successfully.
-        let provider_intent = self.authorize_provider_intent(host, provider_intent)?;
+        if let Some(error) = deferred_provider_error {
+            return Err(error);
+        }
+        let provider_intent = self.authorize_provider_intent(host, &provider_intent)?;
         let cache_key = self.adapter.readiness_cache_key(host, &provider_intent)?;
         let provider_smoke_enabled = cache_key.as_ref().is_some_and(|key| {
             key.execution_policy()
@@ -1761,6 +1771,53 @@ impl RuntimeEngine {
         Ok(provider_intent
             .clone()
             .with_resolved_provider_binding(binding))
+    }
+
+    fn prepare_provider_intent_for_native_readiness(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        defer_missing_binding: bool,
+    ) -> Result<(ProviderComputerUseIntent, Option<SatelleError>), SatelleError> {
+        if provider_intent.resolved_provider_binding().is_some() {
+            return self
+                .authorize_provider_intent(host, provider_intent)
+                .map(|intent| (intent, None));
+        }
+        let resolution = match self.resolve_requested_provider_binding(host, provider_intent) {
+            Ok(resolution) => resolution,
+            Err(error)
+                if error.code == ErrorCode::ModelProviderBindingMissing
+                    && provider_intent.model().is_some()
+                    && provider_intent.provider().is_some()
+                    && defer_missing_binding =>
+            {
+                return Ok((provider_intent.clone(), Some(error)));
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(resolution) = resolution else {
+            return Ok((provider_intent.clone(), None));
+        };
+        let resolution = resolution.with_experimental_provider_computer_use(
+            provider_intent.experimental_provider_computer_use(),
+        );
+        let (binding, deferred_provider_error) = match resolution {
+            ProviderBindingResolution::Ready(binding) => (binding, None),
+            ProviderBindingResolution::MissingDescriptor {
+                binding,
+                auth_source_name,
+            } => (
+                binding,
+                Some(provider_secret_source_missing(&auth_source_name)),
+            ),
+        };
+        Ok((
+            provider_intent
+                .clone()
+                .with_resolved_provider_binding(binding),
+            deferred_provider_error,
+        ))
     }
 
     fn resolve_requested_provider_binding(
@@ -2982,7 +3039,7 @@ impl RuntimeHandle {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn new_with_provider_policy_and_readiness_probe_driver<A, D>(
         state_root: Result<PathBuf, SatelleError>,
         adapter: A,

@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
-/// Validates the pinned Codex 0.144.0 approval payload before selecting a
+/// Validates the supported stable Codex approval payload before selecting a
 /// response. Unknown methods remain outside this closed dispatcher.
 pub(super) fn approval_result(
     method: &str,
@@ -38,8 +38,8 @@ pub(super) fn approval_result(
         }
         "item/permissions/requestApproval" => {
             if auto_approve {
-                // A grant can echo only the exact permission vocabulary pinned
-                // to this Codex version. Unknown authority must fail closed.
+                // A grant can echo only the exact supported permission
+                // vocabulary. Unknown authority must fail closed.
                 let params: PermissionsParams = decode_params(object)?;
                 correlate_turn(
                     expected_thread,
@@ -82,12 +82,14 @@ pub(super) fn approval_result(
     Ok(Some(result))
 }
 
-/// Accepts only the pinned Computer Use app prompt whose app identifier is
-/// already present in the user's canonical always-allowed table. Every other
-/// MCP elicitation remains a manual-action blocker.
+/// Accepts only a supported Computer Use prompt bound to either an app in the
+/// canonical allowlist or the exact readiness script whose app authority was
+/// checked before generation. Every other MCP elicitation remains a
+/// manual-action blocker.
 pub(super) fn computer_use_elicitation_result(
     object: &Map<String, Value>,
     allowed_app_ids: &BTreeSet<String>,
+    expected_native_script: Option<&str>,
     expected_thread: Option<&str>,
     expected_turn: Option<&str>,
 ) -> Result<(Value, bool), CodexSessionError> {
@@ -107,11 +109,105 @@ pub(super) fn computer_use_elicitation_result(
     }
 
     let turn_correlated = params.get("turnId").is_none_or(Value::is_null) || turn_matches;
-    let authorized = turn_correlated && exact_computer_use_app_prompt(params, allowed_app_ids);
+    let authorized = turn_correlated
+        && (exact_computer_use_app_prompt(params, allowed_app_ids)
+            || expected_native_script.is_some_and(|expected_script| {
+                exact_computer_use_script_prompt(params, expected_script)
+            }));
     Ok((
-        json!({"action": if authorized { "accept" } else { "decline" }}),
+        json!({
+            "action": if authorized { "accept" } else { "decline" },
+            "content": null,
+            "_meta": null,
+        }),
         authorized,
     ))
+}
+
+fn exact_computer_use_script_prompt(params: &Map<String, Value>, expected_script: &str) -> bool {
+    const REQUIRED_PARAM_KEYS: [&str; 7] = [
+        "_meta",
+        "message",
+        "mode",
+        "requestedSchema",
+        "serverName",
+        "threadId",
+        "turnId",
+    ];
+    if params.len() != REQUIRED_PARAM_KEYS.len()
+        || !REQUIRED_PARAM_KEYS
+            .iter()
+            .all(|key| params.contains_key(*key))
+        || params.get("serverName").and_then(Value::as_str) != Some("node_repl")
+        || params.get("mode").and_then(Value::as_str) != Some("form")
+        || params.get("message").and_then(Value::as_str)
+            != Some("Allow the node_repl MCP server to run tool \"js\"?")
+        || params.get("requestedSchema") != Some(&json!({"type": "object", "properties": {}}))
+    {
+        return false;
+    }
+
+    let Some(metadata) = params.get("_meta").and_then(Value::as_object) else {
+        return false;
+    };
+    const REQUIRED_METADATA_KEYS: [&str; 5] = [
+        "codex_approval_kind",
+        "persist",
+        "tool_description",
+        "tool_params",
+        "tool_params_display",
+    ];
+    if metadata.len() != REQUIRED_METADATA_KEYS.len()
+        || !REQUIRED_METADATA_KEYS
+            .iter()
+            .all(|key| metadata.contains_key(*key))
+        || metadata.get("codex_approval_kind").and_then(Value::as_str) != Some("mcp_tool_call")
+        || metadata.get("persist") != Some(&json!(["session", "always"]))
+        || !metadata
+            .get("tool_description")
+            .and_then(Value::as_str)
+            .is_some_and(|description| !description.is_empty())
+    {
+        return false;
+    }
+
+    let Some(tool_params) = metadata.get("tool_params").and_then(Value::as_object) else {
+        return false;
+    };
+    if tool_params.get("code").and_then(Value::as_str) != Some(expected_script) {
+        return false;
+    }
+    let title = match tool_params.get("title") {
+        Some(title) => match title.as_str().filter(|title| !title.is_empty()) {
+            Some(title) => Some(title),
+            None => return false,
+        },
+        None => None,
+    };
+    let expected_param_count = if title.is_some() { 2 } else { 1 };
+    if tool_params.len() != expected_param_count {
+        return false;
+    }
+
+    let Some(display) = metadata
+        .get("tool_params_display")
+        .and_then(Value::as_array)
+        .filter(|display| display.len() == expected_param_count)
+    else {
+        return false;
+    };
+    exact_tool_param_display(&display[0], "code", expected_script)
+        && title.is_none_or(|title| exact_tool_param_display(&display[1], "title", title))
+}
+
+fn exact_tool_param_display(display: &Value, name: &str, value: &str) -> bool {
+    let Some(display) = display.as_object() else {
+        return false;
+    };
+    display.len() == 3
+        && display.get("name").and_then(Value::as_str) == Some(name)
+        && display.get("display_name").and_then(Value::as_str) == Some(name)
+        && display.get("value").and_then(Value::as_str) == Some(value)
 }
 
 fn exact_computer_use_app_prompt(
@@ -518,6 +614,156 @@ mod tests {
         })
     }
 
+    fn computer_use_script_prompt(script: &str, title: &str) -> Value {
+        json!({
+            "params": {
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "persist": ["session", "always"],
+                    "tool_description": "Run JavaScript in a persistent Node-backed kernel.",
+                    "tool_params": {"code": script, "title": title},
+                    "tool_params_display": [
+                        {"name": "code", "display_name": "code", "value": script},
+                        {"name": "title", "display_name": "title", "value": title}
+                    ]
+                },
+                "message": "Allow the node_repl MCP server to run tool \"js\"?",
+                "mode": "form",
+                "requestedSchema": {"type": "object", "properties": {}},
+                "serverName": "node_repl",
+                "threadId": "thread-1",
+                "turnId": "turn-1"
+            }
+        })
+    }
+
+    #[test]
+    fn exact_preapproved_computer_use_script_elicitation_uses_carried_authority() {
+        let script = "exact native readiness script";
+        let request = computer_use_script_prompt(script, "Activate Microsoft Edge");
+
+        assert_eq!(
+            computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &BTreeSet::new(),
+                Some(script),
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            Ok((
+                json!({"action": "accept", "content": null, "_meta": null}),
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn exact_preapproved_computer_use_script_without_optional_title_is_accepted() {
+        let script = "exact native readiness script";
+        let mut request = computer_use_script_prompt(script, "Activate Microsoft Edge");
+        request["params"]["_meta"]["tool_params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("title");
+        request["params"]["_meta"]["tool_params_display"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+
+        assert_eq!(
+            computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &BTreeSet::new(),
+                Some(script),
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            Ok((
+                json!({"action": "accept", "content": null, "_meta": null}),
+                true
+            ))
+        );
+    }
+
+    #[test]
+    fn computer_use_script_elicitation_rejects_changed_or_missing_authority() {
+        let script = "exact native readiness script";
+        let allowed = BTreeSet::from(["MSEdge".to_string()]);
+        let cases = [
+            {
+                let mut request =
+                    computer_use_script_prompt("different script", "Activate Microsoft Edge");
+                request["params"]["_meta"]["tool_params_display"][0]["value"] =
+                    json!("different script");
+                request
+            },
+            {
+                let mut request = computer_use_script_prompt(script, "Activate Microsoft Edge");
+                request["params"]["_meta"]["tool_params"]["extra"] = json!(true);
+                request
+            },
+            {
+                let mut request = computer_use_script_prompt(script, "Activate Microsoft Edge");
+                request["params"]["_meta"]["tool_params_display"][0]["value"] =
+                    json!("different script");
+                request
+            },
+            {
+                let mut request = computer_use_script_prompt(script, "Activate Microsoft Edge");
+                request["params"]["_meta"]["tool_params"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("title");
+                request
+            },
+            {
+                let mut request = computer_use_script_prompt(script, "Activate Microsoft Edge");
+                request["params"]["_meta"]["tool_params_display"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+                request
+            },
+            {
+                let mut request = computer_use_script_prompt(script, "Activate Microsoft Edge");
+                request["params"]["_meta"]["tool_params"]["title"] = json!("");
+                request["params"]["_meta"]["tool_params_display"][1]["value"] = json!("");
+                request
+            },
+        ];
+
+        for request in cases {
+            assert_eq!(
+                computer_use_elicitation_result(
+                    request.as_object().unwrap(),
+                    &allowed,
+                    Some(script),
+                    Some("thread-1"),
+                    Some("turn-1"),
+                ),
+                Ok((
+                    json!({"action": "decline", "content": null, "_meta": null}),
+                    false
+                ))
+            );
+        }
+
+        let request = computer_use_script_prompt(script, "Activate Microsoft Edge");
+        assert_eq!(
+            computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &BTreeSet::new(),
+                None,
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            Ok((
+                json!({"action": "decline", "content": null, "_meta": null}),
+                false
+            ))
+        );
+    }
+
     #[test]
     fn exact_preapproved_computer_use_app_elicitation_is_accepted() {
         let mut request = computer_use_app_prompt("firefox.exe");
@@ -527,20 +773,28 @@ mod tests {
             computer_use_elicitation_result(
                 request.as_object().unwrap(),
                 &allowed,
+                None,
                 Some("thread-1"),
                 Some("turn-1"),
             ),
-            Ok((json!({"action": "accept"}), true))
+            Ok((
+                json!({"action": "accept", "content": null, "_meta": null}),
+                true
+            ))
         );
         request["params"]["_meta"]["riskLevel"] = json!("high");
         assert_eq!(
             computer_use_elicitation_result(
                 request.as_object().unwrap(),
                 &allowed,
+                None,
                 Some("thread-1"),
                 Some("turn-1"),
             ),
-            Ok((json!({"action": "accept"}), true)),
+            Ok((
+                json!({"action": "accept", "content": null, "_meta": null}),
+                true
+            )),
             "risk presentation must not override an exact prior app decision"
         );
     }
@@ -556,10 +810,14 @@ mod tests {
             computer_use_elicitation_result(
                 request.as_object().unwrap(),
                 &BTreeSet::from(["com.apple.Safari".to_string()]),
+                None,
                 Some("thread-1"),
                 Some("turn-1"),
             ),
-            Ok((json!({"action": "accept"}), true))
+            Ok((
+                json!({"action": "accept", "content": null, "_meta": null}),
+                true
+            ))
         );
     }
 
@@ -579,10 +837,14 @@ mod tests {
             computer_use_elicitation_result(
                 request.as_object().unwrap(),
                 &allowed,
+                None,
                 Some("thread-1"),
                 Some("turn-1"),
             ),
-            Ok((json!({"action": "accept"}), true))
+            Ok((
+                json!({"action": "accept", "content": null, "_meta": null}),
+                true
+            ))
         );
     }
 
@@ -617,10 +879,14 @@ mod tests {
                 computer_use_elicitation_result(
                     request.as_object().unwrap(),
                     &allowed,
+                    None,
                     Some("thread-1"),
                     Some("turn-1"),
                 ),
-                Ok((json!({"action": "decline"}), false))
+                Ok((
+                    json!({"action": "decline", "content": null, "_meta": null}),
+                    false
+                ))
             );
         }
     }

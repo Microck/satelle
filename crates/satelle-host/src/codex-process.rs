@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 const INBOUND_LINE_LIMIT: usize = 2 * 1024 * 1024;
 const INBOUND_QUEUE_CAPACITY: usize = 8;
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) trait CodexExchange {
     type Output;
@@ -96,18 +97,47 @@ pub(super) fn run_exchange<E: CodexExchange>(
     };
     let exchange_result = exchange.run(&writer, &receiver);
     let turn_dispatch_attempted = exchange.turn_dispatch_attempted();
+    let mut writer = Some(writer);
+    let mut writer_thread = Some(writer_thread);
 
-    // Keep both pipe-owning threads connected until the process group is
-    // signaled and reaped. Closing stdout first can make a backpressured child
-    // exit while group termination is starting, leaving macOS unable to prove
-    // that the group is contained.
+    // A successful app-server exchange has no pending protocol writes. Close
+    // stdin first so Codex can shut down MCP servers and their sandboxed
+    // kernels, including kernels that created a process group of their own.
+    // Error paths still force-stop first because their writer can be blocked
+    // on an app-server that stopped reading.
+    let successful_exchange = exchange_result.is_ok();
+    let writer_stopped = if successful_exchange {
+        drop(writer.take());
+        let writer_stopped = writer_thread
+            .take()
+            .is_some_and(|writer_thread| writer_thread.join().is_ok());
+        if writer_stopped {
+            let _ = crate::codex_capabilities::wait_for_group_shutdown(
+                &mut child,
+                GRACEFUL_SHUTDOWN_TIMEOUT,
+            );
+        }
+        writer_stopped
+    } else {
+        false
+    };
+
+    // Keep stdout connected until the process group is signaled and reaped.
+    // Closing it first can make a backpressured child exit while termination
+    // is starting, leaving macOS unable to prove that the group is contained.
     let group_stopped = crate::codex_capabilities::terminate_group(&mut child);
     // Release a reader blocked on the bounded queue before joining either pipe
     // owner. A completed reader retains stdout in its JoinHandle until join.
     drop(receiver);
-    drop(writer);
     let reader_stopped = reader.join().is_ok();
-    let writer_stopped = writer_thread.join().is_ok();
+    let writer_stopped = if successful_exchange {
+        writer_stopped
+    } else {
+        drop(writer.take());
+        writer_thread
+            .take()
+            .is_some_and(|writer_thread| writer_thread.join().is_ok())
+    };
     if !group_stopped || !reader_stopped || !writer_stopped {
         return Err(CodexSessionFailure::after_exchange(
             CodexSessionError::Containment,

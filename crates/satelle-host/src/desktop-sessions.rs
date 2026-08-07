@@ -14,16 +14,48 @@ struct DesktopObservation {
     is_remote: bool,
 }
 
-fn record(observation: DesktopObservation) -> Option<DesktopSessionRecord> {
+#[cfg(any(test, target_os = "macos"))]
+fn macos_console_observation(
+    daemon_uid: u32,
+    daemon_user: &str,
+    console_uid: u32,
+    console_user: &str,
+) -> DesktopObservation {
+    DesktopObservation {
+        platform_name: "macOS",
+        native_selector: format!("macos:console-uid:{console_uid}"),
+        desktop_user: console_user.to_string(),
+        active: daemon_uid == console_uid && daemon_user == console_user,
+        is_console: true,
+        is_remote: false,
+    }
+}
+
+fn compatible_connection(observation: &DesktopObservation) -> Option<(&'static str, bool, bool)> {
     if !observation.active || observation.desktop_user.is_empty() {
         return None;
     }
-    let (connection, is_console, is_remote) = match (observation.is_console, observation.is_remote)
-    {
+    Some(match (observation.is_console, observation.is_remote) {
         (true, false) => ("console", true, false),
         (false, true) => ("remote", false, true),
         _ => return None,
-    };
+    })
+}
+
+#[cfg(any(test, windows))]
+fn prefer_windows_observation(
+    daemon_session: DesktopObservation,
+    active_console: Option<DesktopObservation>,
+) -> DesktopObservation {
+    if compatible_connection(&daemon_session).is_some() {
+        daemon_session
+    } else {
+        active_console.unwrap_or(daemon_session)
+    }
+}
+
+fn record(observation: DesktopObservation) -> Option<DesktopSessionRecord> {
+    let (connection, is_console, is_remote) = compatible_connection(&observation)?;
     let native_selector = observation.native_selector;
     let portable_selectors = vec!["active".to_string(), connection.to_string()];
     Some(DesktopSessionRecord {
@@ -70,20 +102,47 @@ mod platform {
                 Some(io::Error::last_os_error().to_string()),
             ));
         }
+        // SAFETY: this function takes no pointers and returns an identifier.
+        let console_session = unsafe { WTSGetActiveConsoleSessionId() };
+        let daemon_observation = observe_session(session_id, console_session);
+
+        // Task Scheduler and SSH can host the daemon outside the interactive
+        // window station even while a real console user is active. Preserve a
+        // compatible daemon-owned remote session, but otherwise query the
+        // live console instead of publishing an empty background session.
+        let console_observation = (console_session != u32::MAX
+            && console_session != session_id
+            && !daemon_observation
+                .as_ref()
+                .is_ok_and(|observation| super::compatible_connection(observation).is_some()))
+        .then(|| observe_session(console_session, console_session))
+        .transpose()?;
+
+        match daemon_observation {
+            Ok(observation) => Ok(Some(super::prefer_windows_observation(
+                observation,
+                console_observation,
+            ))),
+            Err(error) => console_observation.map(Some).ok_or(error),
+        }
+    }
+
+    fn observe_session(
+        session_id: u32,
+        console_session: u32,
+    ) -> Result<DesktopObservation, SatelleError> {
         let desktop_user = query_string(session_id, WTSUserName)?;
         let state = query_value::<i32>(session_id, WTSConnectState)?;
         let protocol = query_value::<u16>(session_id, WTSClientProtocolType)?;
-        // SAFETY: this function takes no pointers and returns an identifier.
-        let console_session = unsafe { WTSGetActiveConsoleSessionId() };
         let is_console = session_id == console_session && protocol == 0;
-        Ok(Some(DesktopObservation {
+        Ok(DesktopObservation {
             platform_name: "Windows",
             native_selector: format!("windows:wts-session:{session_id}"),
             desktop_user,
             active: session_id != 0 && state == WTSActive,
             is_console,
             is_remote: protocol != 0,
-        }))
+        })
     }
 
     struct WtsMemory(*mut u16);
@@ -173,15 +232,25 @@ mod platform {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::DesktopObservation;
+    use core_foundation::base::TCFType;
+    use core_foundation::string::{CFString, CFStringRef};
     use satelle_core::{ErrorCode, SatelleError};
     use std::collections::BTreeMap;
-    use std::os::unix::fs::MetadataExt;
+    use std::ffi::c_void;
     use std::process::Command;
+    use std::ptr;
+
+    #[link(name = "SystemConfiguration", kind = "framework")]
+    unsafe extern "C" {
+        fn SCDynamicStoreCopyConsoleUser(
+            store: *const c_void,
+            uid: *mut libc::uid_t,
+            gid: *mut libc::gid_t,
+        ) -> CFStringRef;
+    }
 
     pub(super) fn observe() -> Result<Option<DesktopObservation>, SatelleError> {
         let effective_user = rustix::process::geteuid().as_raw();
-        let console = std::fs::symlink_metadata("/dev/console")
-            .map_err(|error| discovery_error("macOS could not inspect /dev/console", error))?;
         let output = Command::new("/usr/bin/id")
             .arg("-un")
             .output()
@@ -196,14 +265,33 @@ mod platform {
             .map_err(|error| discovery_error("macOS returned a non-UTF-8 daemon user", error))?
             .trim()
             .to_string();
-        Ok(Some(DesktopObservation {
-            platform_name: "macOS",
-            native_selector: format!("macos:console-uid:{effective_user}"),
-            desktop_user,
-            active: console.uid() == effective_user,
-            is_console: true,
-            is_remote: false,
-        }))
+        let (console_user, console_uid) = live_console_user()?;
+        Ok(Some(super::macos_console_observation(
+            effective_user,
+            &desktop_user,
+            console_uid,
+            &console_user,
+        )))
+    }
+
+    pub(super) fn live_console_user() -> Result<(String, u32), SatelleError> {
+        let mut uid = 0;
+        let mut gid = 0;
+        // SAFETY: a null store asks SystemConfiguration for its current global
+        // dynamic store. The writable UID/GID pointers remain valid for the
+        // complete call, and the returned create-rule CFString is owned here.
+        let raw_user = unsafe { SCDynamicStoreCopyConsoleUser(ptr::null(), &mut uid, &mut gid) };
+        if raw_user.is_null() {
+            return Err(discovery_error(
+                "macOS could not resolve the active console user",
+                "SystemConfiguration returned no console user",
+            ));
+        }
+        // SAFETY: SCDynamicStoreCopyConsoleUser returned a non-null CFString
+        // under the Core Foundation create rule, so this wrapper owns one
+        // matching release.
+        let user = unsafe { CFString::wrap_under_create_rule(raw_user) }.to_string();
+        Ok((user, uid))
     }
 
     fn discovery_error(message: &'static str, source: impl std::fmt::Display) -> SatelleError {
@@ -261,6 +349,60 @@ mod tests {
     }
 
     #[test]
+    fn windows_background_host_falls_back_to_the_active_console_session() {
+        let background = DesktopObservation {
+            platform_name: "Windows",
+            native_selector: "windows:wts-session:0".to_string(),
+            desktop_user: String::new(),
+            active: false,
+            is_console: false,
+            is_remote: false,
+        };
+        let console = DesktopObservation {
+            platform_name: "Windows",
+            native_selector: "windows:wts-session:2".to_string(),
+            desktop_user: "Administrator".to_string(),
+            active: true,
+            is_console: true,
+            is_remote: false,
+        };
+
+        let session = record(prefer_windows_observation(background, Some(console)))
+            .expect("the active console is the compatible visible desktop");
+
+        assert_eq!(session.session_id, "windows:wts-session:2");
+        assert_eq!(session.desktop_user, "Administrator");
+        assert_eq!(session.portable_selectors, ["active", "console"]);
+    }
+
+    #[test]
+    fn windows_active_remote_host_remains_selected_over_the_console_session() {
+        let remote = DesktopObservation {
+            platform_name: "Windows",
+            native_selector: "windows:wts-session:4".to_string(),
+            desktop_user: "remote-user".to_string(),
+            active: true,
+            is_console: false,
+            is_remote: true,
+        };
+        let console = DesktopObservation {
+            platform_name: "Windows",
+            native_selector: "windows:wts-session:2".to_string(),
+            desktop_user: "console-user".to_string(),
+            active: true,
+            is_console: true,
+            is_remote: false,
+        };
+
+        let session = record(prefer_windows_observation(remote, Some(console)))
+            .expect("an active remote daemon session remains the compatible desktop");
+
+        assert_eq!(session.session_id, "windows:wts-session:4");
+        assert_eq!(session.desktop_user, "remote-user");
+        assert_eq!(session.portable_selectors, ["active", "remote"]);
+    }
+
+    #[test]
     fn macos_console_session_uses_the_daemon_user_identity() {
         let record = record(DesktopObservation {
             platform_name: "macOS",
@@ -274,6 +416,22 @@ mod tests {
         assert_eq!(record.session_id, "macos:console-uid:501");
         assert_eq!(record.portable_selectors, ["active", "console"]);
         assert_eq!(record.native_selectors, ["macos:console-uid:501"]);
+    }
+
+    #[test]
+    fn macos_console_session_uses_live_console_identity_instead_of_device_ownership() {
+        let observation = macos_console_observation(501, "operator", 501, "operator");
+
+        let record = record(observation)
+            .expect("a live matching console remains valid when /dev/console ownership is stale");
+        assert_eq!(record.desktop_user, "operator");
+        assert_eq!(record.session_id, "macos:console-uid:501");
+    }
+
+    #[test]
+    fn macos_console_session_rejects_a_different_live_console_identity() {
+        assert!(record(macos_console_observation(501, "operator", 502, "operator")).is_none());
+        assert!(record(macos_console_observation(501, "operator", 501, "other")).is_none());
     }
 
     #[test]
@@ -335,15 +493,19 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_native_discovery_obeys_console_ownership() {
-        use std::os::unix::fs::MetadataExt;
-
+    fn macos_native_discovery_obeys_live_console_identity() {
         let sessions = discover().expect("macOS console discovery");
         let effective_user = rustix::process::geteuid().as_raw();
-        let console_user = std::fs::symlink_metadata("/dev/console")
-            .expect("macOS console metadata")
-            .uid();
-        if console_user == effective_user {
+        let daemon_user = std::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .expect("daemon user query");
+        let daemon_user = String::from_utf8(daemon_user.stdout)
+            .expect("UTF-8 daemon user")
+            .trim()
+            .to_string();
+        let (console_user, console_uid) = platform::live_console_user().expect("live console user");
+        if console_uid == effective_user && console_user == daemon_user {
             assert_eq!(sessions.len(), 1);
             assert_eq!(
                 sessions[0].session_id,

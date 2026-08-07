@@ -512,7 +512,7 @@ impl DaemonRuntimeCapabilities {
 
 impl HostService {
     pub fn required_codex_version() -> String {
-        crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string()
+        crate::codex_capabilities::MINIMUM_CODEX_VERSION.to_string()
     }
 
     /// Adds a process-local credential for a loopback bootstrap transport.
@@ -627,7 +627,7 @@ impl HostService {
                         satelle_core::host_update::CodexComponentOwnership::CodexOwned,
                     runtime_current_version: None,
                     native_component_current_version: None,
-                    required_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string(),
+                    required_version: crate::codex_capabilities::MINIMUM_CODEX_VERSION.to_string(),
                     runtime_update_required: true,
                     native_update_required: true,
                     runtime_compatibility_reason: Some(
@@ -1902,7 +1902,7 @@ fn production_codex_update_evidence(
         // component state. Readiness-cache state says only whether a prior
         // smoke-test result can be reused.
         native_component_current_version,
-        required_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION.to_string(),
+        required_version: crate::codex_capabilities::MINIMUM_CODEX_VERSION.to_string(),
         runtime_update_required: runtime_compatibility_reason.is_some(),
         native_update_required: native_component_compatibility_reason.is_some(),
         runtime_compatibility_reason,
@@ -2121,7 +2121,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_live_proof_requires_native_readiness_repair() {
+    fn newer_runtime_with_incomplete_live_proof_requires_only_native_readiness_repair() {
         use crate::codex_capabilities::{
             CapabilityMatrix, CodexVersionEvidence, ControlPlaneAdmission, EvidenceSurface,
             HostPlatform, LiveProofStatus, Phase0CapabilityBlocker, Phase0CapabilityEvidence,
@@ -2129,9 +2129,10 @@ mod tests {
         };
 
         let mut snapshot = ProductionCapabilitySnapshot::collect(None);
+        let newer_version = crate::codex_capabilities::CodexVersion::new(0, 147, 0);
         snapshot.evidence = Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Detected {
-                version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                version: newer_version,
             },
             host_platform: HostPlatform::Windows,
             capabilities: CapabilityMatrix::unproven(),
@@ -2141,7 +2142,7 @@ mod tests {
                 reason: BlockerReason::IncompleteLiveProof,
                 capability: RequiredCapability::NativeReadiness,
                 codex_version: CodexVersionEvidence::Detected {
-                    version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                    version: newer_version,
                 },
                 host_platform: HostPlatform::Windows,
                 observed_surface: EvidenceSurface::Stable,

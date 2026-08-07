@@ -15,8 +15,9 @@ source-build path without presenting unpublished packages as usable.
 
 ## Run the shortest successful flow
 
-Install Rust 1.97.0 and Codex 0.144.0 on a candidate macOS or Windows Host,
-then build Satelle from the repository root:
+Install Rust 1.97.0 and an official standalone Codex release at or above
+0.144.0 on a candidate macOS or Windows Host, then build Satelle from the
+repository root:
 
 ```sh
 cargo build --release --locked -p satelle-cli

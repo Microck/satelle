@@ -248,13 +248,8 @@ fn linux_discovery_skips_the_native_computer_use_control_plane() {
 }
 
 #[test]
-fn every_other_codex_version_is_blocked_at_the_handshake_gate() {
-    for detected_version in [
-        CodexVersion::new(0, 143, 9),
-        CodexVersion::new(0, 144, 1),
-        CodexVersion::new(0, 145, 0),
-        CodexVersion::new(1, 0, 0),
-    ] {
+fn versions_below_the_supported_floor_are_blocked_at_the_handshake_gate() {
+    for detected_version in [CodexVersion::new(0, 0, 0), CodexVersion::new(0, 143, 9)] {
         let mut evidence = fully_proven_evidence(HostPlatform::Windows);
         evidence.codex_version = CodexVersionEvidence::Detected {
             version: detected_version,
@@ -272,6 +267,28 @@ fn every_other_codex_version_is_blocked_at_the_handshake_gate() {
                 observed_surface: EvidenceSurface::Stable,
                 live_proof: LiveProofStatus::NotRequired,
             }]
+        );
+    }
+}
+
+#[test]
+fn newer_versions_still_require_and_can_pass_the_complete_capability_gate() {
+    for detected_version in [
+        CodexVersion::new(0, 144, 1),
+        CodexVersion::new(0, 145, 0),
+        CodexVersion::new(1, 0, 0),
+    ] {
+        let mut evidence = fully_proven_evidence(HostPlatform::Windows);
+        evidence.codex_version = CodexVersionEvidence::Detected {
+            version: detected_version,
+        };
+
+        assert_eq!(
+            evaluate_phase0_support(evidence),
+            Phase0SupportVerdict::Supported {
+                codex_version: detected_version,
+                host_platform: HostPlatform::Windows,
+            }
         );
     }
 }
@@ -731,7 +748,7 @@ fn every_live_proof_capability_rejects_every_incomplete_proof_state() {
 fn version_surface_and_live_proof_blockers_are_reported_together() {
     let mut evidence = fully_proven_evidence(HostPlatform::Windows);
     evidence.codex_version = CodexVersionEvidence::Detected {
-        version: CodexVersion::new(0, 145, 0),
+        version: CodexVersion::new(0, 143, 9),
     };
     evidence.capabilities.approval_observation.surface = EvidenceSurface::Absent;
     evidence.capabilities.approval_observation.live_proof = LiveProofStatus::NotObserved;

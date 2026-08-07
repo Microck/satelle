@@ -15,8 +15,9 @@ use time::format_description::well_known::Rfc3339;
 const RECEIPT_FILE_NAME: &str = "codex-install-receipt.json";
 const RECEIPT_SCHEMA: &str = "satelle.codex-install-receipt.v1";
 const RECEIPT_MANAGER: &str = "satelle";
-const CODEX_VERSION: &str = "0.144.0";
-const CODEX_RELEASE_TAG: &str = "rust-v0.144.0";
+const BASELINE_CODEX_VERSION: &str = "0.144.0";
+#[cfg(test)]
+const BASELINE_CODEX_RELEASE_TAG: &str = "rust-v0.144.0";
 const SUPPORTED_TARGETS: [&str; 4] = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -24,7 +25,7 @@ const SUPPORTED_TARGETS: [&str; 4] = [
     "x86_64-pc-windows-msvc",
 ];
 
-fn official_artifact_sha256(target: &str) -> Option<&'static str> {
+fn baseline_artifact_sha256(target: &str) -> Option<&'static str> {
     match target {
         "aarch64-apple-darwin" => {
             Some("4584a243ff8a671250bc716f89c5a50ed59917a98390acfdffa3ecb6cfe5bb34")
@@ -169,25 +170,36 @@ fn validate_receipt_metadata(
     receipt: &ManagedCodexReceipt,
     expected_target: &str,
 ) -> Result<(), SatelleError> {
+    let version = crate::codex_capabilities::CodexVersion::parse(&receipt.version)
+        .filter(|version| crate::codex_capabilities::supports_codex_version(*version))
+        .ok_or_else(|| invalid_receipt("receipt_metadata_invalid"))?;
+    let expected_release_tag = format!("rust-v{version}");
     if receipt.schema != RECEIPT_SCHEMA
         || receipt.manager != RECEIPT_MANAGER
-        || receipt.version != CODEX_VERSION
-        || receipt.release_tag != CODEX_RELEASE_TAG
+        || receipt.release_tag != expected_release_tag
         || receipt.target != expected_target
         || !SUPPORTED_TARGETS.contains(&receipt.target.as_str())
+        || !is_sha256(&receipt.artifact_sha256)
         || !is_sha256(&receipt.immutable_binary_sha256)
         || OffsetDateTime::parse(&receipt.installed_at, &Rfc3339).is_err()
     {
         return Err(invalid_receipt("receipt_metadata_invalid"));
     }
     let expected_url = format!(
-        "https://github.com/openai/codex/releases/download/{CODEX_RELEASE_TAG}/codex-package-{}.tar.gz",
-        receipt.target
+        "https://github.com/openai/codex/releases/download/{}/codex-package-{}.tar.gz",
+        receipt.release_tag, receipt.target
     );
     if receipt.artifact_url != expected_url {
         return Err(invalid_receipt("artifact_url_invalid"));
     }
-    if official_artifact_sha256(&receipt.target) != Some(receipt.artifact_sha256.as_str()) {
+    // Satelle ships the baseline digest as an independent trust anchor. A
+    // newer receipt is an explicit Operator authorization for the exact
+    // official release URL and immutable artifact digest it records. Runtime
+    // admission then re-hashes the binary and runs the stable capability and
+    // live-readiness gates before granting Computer Use authority.
+    if receipt.version == BASELINE_CODEX_VERSION
+        && baseline_artifact_sha256(&receipt.target) != Some(receipt.artifact_sha256.as_str())
+    {
         return Err(invalid_receipt("artifact_digest_invalid"));
     }
     Ok(())
@@ -407,7 +419,7 @@ mod tests {
                 .join("packages")
                 .join("standalone")
                 .join("releases")
-                .join(format!("{CODEX_VERSION}-{FIXTURE_TARGET}"));
+                .join(format!("{BASELINE_CODEX_VERSION}-{FIXTURE_TARGET}"));
             let binary_path = package_root.join("bin").join(BINARY_NAME);
             fs::create_dir_all(binary_path.parent().expect("binary parent"))
                 .expect("create package");
@@ -423,11 +435,11 @@ mod tests {
             let receipt = json!({
                 "schema": RECEIPT_SCHEMA,
                 "manager": RECEIPT_MANAGER,
-                "version": CODEX_VERSION,
+                "version": BASELINE_CODEX_VERSION,
                 "target": FIXTURE_TARGET,
-                "release_tag": CODEX_RELEASE_TAG,
+                "release_tag": BASELINE_CODEX_RELEASE_TAG,
                 "artifact_url": format!(
-                    "https://github.com/openai/codex/releases/download/{CODEX_RELEASE_TAG}/codex-package-{FIXTURE_TARGET}.tar.gz"
+                    "https://github.com/openai/codex/releases/download/{BASELINE_CODEX_RELEASE_TAG}/codex-package-{FIXTURE_TARGET}.tar.gz"
                 ),
                 "artifact_sha256": FIXTURE_ARTIFACT_SHA256,
                 "codex_home": codex_home,
@@ -520,6 +532,66 @@ mod tests {
                 "accepted wrong {field}"
             );
         }
+    }
+
+    #[test]
+    fn receipt_admission_accepts_newer_official_release_metadata() {
+        let mut fixture = ReceiptFixture::new();
+        let version = "0.145.0";
+        let release_tag = "rust-v0.145.0";
+        let package_root = fixture
+            .codex_home
+            .join("packages")
+            .join("standalone")
+            .join("releases")
+            .join(format!("{version}-{FIXTURE_TARGET}"));
+        let binary_path = package_root.join("bin").join(BINARY_NAME);
+        fs::create_dir_all(binary_path.parent().expect("binary parent"))
+            .expect("create newer package");
+        fs::copy(&fixture.binary_path, &binary_path).expect("copy newer binary");
+        fixture
+            .receipt_object_mut()
+            .insert("version".to_string(), json!(version));
+        fixture
+            .receipt_object_mut()
+            .insert("release_tag".to_string(), json!(release_tag));
+        fixture.receipt_object_mut().insert(
+            "artifact_url".to_string(),
+            json!(format!(
+                "https://github.com/openai/codex/releases/download/{release_tag}/codex-package-{FIXTURE_TARGET}.tar.gz"
+            )),
+        );
+        fixture
+            .receipt_object_mut()
+            .insert("immutable_package_root".to_string(), json!(package_root));
+        fixture
+            .receipt_object_mut()
+            .insert("immutable_binary_path".to_string(), json!(binary_path));
+        fixture.write_receipt();
+
+        admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+            .expect("admit newer compatible Codex release");
+    }
+
+    #[test]
+    fn receipt_admission_rejects_a_release_below_the_supported_floor() {
+        let mut fixture = ReceiptFixture::new();
+        fixture
+            .receipt_object_mut()
+            .insert("version".to_string(), json!("0.143.9"));
+        fixture
+            .receipt_object_mut()
+            .insert("release_tag".to_string(), json!("rust-v0.143.9"));
+        fixture.receipt_object_mut().insert(
+            "artifact_url".to_string(),
+            json!(format!(
+                "https://github.com/openai/codex/releases/download/rust-v0.143.9/codex-package-{FIXTURE_TARGET}.tar.gz"
+            )),
+        );
+        fixture.write_receipt();
+
+        admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+            .expect_err("reject Codex below the supported floor");
     }
 
     #[cfg(unix)]
@@ -635,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_admission_requires_the_current_target_and_official_artifact_digest() {
+    fn receipt_admission_requires_the_current_target_and_baseline_artifact_digest() {
         let mut fixture = ReceiptFixture::new();
         assert!(
             admit_managed_codex_from_state_root_for_target(
