@@ -44,7 +44,10 @@ const {
   planRegistryOperation,
   promotionReleaseRoot,
   promotionTagValue,
+  restartPromotion,
   sealPromotionRecord,
+  waitForAllLatest,
+  waitForLatest,
   verifyCompleteRecord,
 } = require("../scripts/npm-promotion.cjs");
 const {
@@ -2635,6 +2638,131 @@ test("npm promotion retries accept only the prior or candidate latest state", ()
   );
 });
 
+test("npm promotion waits for a stale latest read to converge", () => {
+  const states = ["1.2.2", "1.2.2", "1.2.3"];
+  const waits = [];
+
+  assert.equal(
+    waitForLatest("satelle", "1.2.3", "1.2.2", {
+      attempts: 3,
+      delayMs: 30,
+      read: () => states.shift(),
+      wait: (milliseconds) => waits.push(milliseconds),
+    }),
+    "1.2.3",
+  );
+  assert.deepEqual(waits, [30, 30]);
+  assert.equal(states.length, 0);
+});
+
+test("npm promotion polling rejects conflicts and bounds stale reads", () => {
+  const conflictWaits = [];
+  assert.throws(
+    () => waitForLatest("satelle", "1.2.3", "1.2.2", {
+      read: () => "9.9.9",
+      wait: (milliseconds) => conflictWaits.push(milliseconds),
+    }),
+    (error) => error instanceof PromotionError && error.code === "promotion-state-conflict",
+  );
+  assert.deepEqual(conflictWaits, []);
+
+  const staleWaits = [];
+  assert.throws(
+    () => waitForLatest("satelle", "1.2.3", "1.2.2", {
+      attempts: 3,
+      delayMs: 30,
+      read: () => "1.2.2",
+      wait: (milliseconds) => staleWaits.push(milliseconds),
+    }),
+    (error) =>
+      error instanceof PromotionError &&
+      error.code === "promotion-registry-propagation-timeout",
+  );
+  assert.deepEqual(staleWaits, [30, 30]);
+});
+
+test("npm promotion waits for the complete latest graph to converge", () => {
+  const record = createPromotionRecord({
+    version: "1.2.3",
+    packageNames: ["native", "launcher"],
+    previousLatest: { native: "1.2.2", launcher: "1.2.2" },
+    now: 0,
+  });
+  const states = {
+    native: ["1.2.2", "1.2.3"],
+    launcher: ["1.2.3"],
+  };
+  const waits = [];
+
+  assert.deepEqual(
+    waitForAllLatest(record, {
+      attempts: 2,
+      delayMs: 30,
+      read: (packageName) => states[packageName].shift(),
+      wait: (milliseconds) => waits.push(milliseconds),
+    }),
+    { native: "1.2.3", launcher: "1.2.3" },
+  );
+  assert.deepEqual(waits, [30]);
+});
+
+test("npm promotion restarts a recoverable checkpoint from registry state", () => {
+  const conflicted = {
+    ...createPromotionRecord({
+      version: "1.2.3",
+      packageNames: ["native", "launcher"],
+      previousLatest: { native: "1.2.2", launcher: "1.2.2" },
+      now: 0,
+    }),
+    mode: "rollback",
+    status: "conflicted",
+    sequence: 9,
+    conflict: { code: "promotion-state-conflict", message: "stale confirmation" },
+  };
+
+  const restarted = restartPromotion(conflicted, {
+    native: "1.2.3",
+    launcher: "1.2.2",
+  }, 1_000);
+  assert.equal(restarted.mode, "promotion");
+  assert.equal(restarted.status, "in_progress");
+  assert.equal(restarted.sequence, 10);
+  assert.equal(restarted.conflict, null);
+  assert.deepEqual(
+    restarted.packages.map(({ promotionStatus, restorationStatus }) => ({
+      promotionStatus,
+      restorationStatus,
+    })),
+    [
+      { promotionStatus: "promoted", restorationStatus: "pending" },
+      { promotionStatus: "pending", restorationStatus: "pending" },
+    ],
+  );
+  assert.throws(
+    () => restartPromotion(conflicted, { native: "9.9.9", launcher: "1.2.2" }),
+    (error) => error instanceof PromotionError && error.code === "promotion-state-conflict",
+  );
+
+  const rolledBack = {
+    ...conflicted,
+    status: "rolled_back",
+    conflict: null,
+  };
+  assert.throws(
+    () => restartPromotion(rolledBack, { native: "1.2.2", launcher: "1.2.2" }),
+    (error) => error instanceof PromotionError && error.code === "promotion-state-conflict",
+  );
+  assert.equal(
+    restartPromotion(
+      rolledBack,
+      { native: "1.2.2", launcher: "1.2.2" },
+      1_000,
+      { allowRolledBack: true },
+    ).status,
+    "in_progress",
+  );
+});
+
 test("npm promotion requires its token identity to be the only registry writer", () => {
   assert.equal(
     assertExclusiveRegistryWriter("satelle", "satelle-release", {
@@ -3579,6 +3707,7 @@ test("release workflow gates draft publication on candidate validation and promo
   );
   assert.match(workflow, /^          - candidate-resume$/m);
   assert.match(workflow, /^          - candidate-finalize$/m);
+  assert.match(workflow, /^      recover_rolled_back:$/m);
   assert.match(
     resumeCandidates,
     /^    if: github\.event_name == 'workflow_dispatch' && inputs\.operation == 'candidate-resume'$/m,
@@ -3713,6 +3842,14 @@ test("release workflow gates draft publication on candidate validation and promo
   assert.match(
     promotionStep,
     /checkpoint\(\) \{\n\s+recheck_release_tag\n[\s\S]*gh release upload "\$RELEASE_TAG"/,
+  );
+  assert.match(
+    promotionStep,
+    /recheck_release_tag\n\s+record_status=[\s\S]*npm-promotion\.cjs restart "\$record" --allow-rolled-back[\s\S]*checkpoint/,
+  );
+  assert.match(
+    promotionStep,
+    /ALLOW_ROLLED_BACK_RECOVERY[\s\S]*rolled-back promotion requires explicit recovery authorization/,
   );
   assert.doesNotMatch(
     promotionStep,

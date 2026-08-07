@@ -336,6 +336,49 @@ function beginRollback(record, now) {
   return next;
 }
 
+function restartPromotion(record, allLatest, now, options = {}) {
+  validatePromotionRecord(record);
+  if (
+    record.status !== "conflicted" &&
+    !(
+      options.allowRolledBack === true &&
+      record.mode === "rollback" &&
+      record.status === "rolled_back"
+    )
+  ) {
+    fail(
+      "promotion-state-conflict",
+      `npm promotion is ${record.mode}/${record.status}; expected a recoverable checkpoint`,
+    );
+  }
+
+  const next = structuredClone(record);
+  for (const entry of next.packages) {
+    if (!Object.hasOwn(allLatest ?? {}, entry.name)) {
+      fail("promotion-state-conflict", `${entry.name} latest is missing during recovery`);
+    }
+    const observedLatest = allLatest[entry.name];
+    if (observedLatest === next.version) entry.promotionStatus = "promoted";
+    else if (observedLatest === entry.previousLatest) entry.promotionStatus = "pending";
+    else {
+      fail(
+        "promotion-state-conflict",
+        `${entry.name} latest is ${observedLatest ?? "absent"}; expected ${entry.previousLatest ?? "absent"} or ${next.version}`,
+      );
+    }
+    entry.restorationStatus = "pending";
+  }
+
+  next.mode = "promotion";
+  next.status = next.packages.every(({ promotionStatus }) => promotionStatus === "promoted")
+    ? "complete"
+    : "in_progress";
+  next.sequence += 1;
+  next.updatedAt = new Date(now ?? Date.now()).toISOString();
+  next.conflict = null;
+  return next;
+}
+
 function conflictedRecord(record, error) {
   const next = structuredClone(record);
   next.status = "conflicted";
@@ -429,6 +472,44 @@ function readAllLatest(record) {
   return Object.fromEntries(record.packages.map(({ name }) => [name, readLatest(name)]));
 }
 
+function waitForMilliseconds(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function waitForLatest(packageName, expectedLatest, staleLatest, options = {}) {
+  const attempts = options.attempts ?? 60;
+  const delayMs = options.delayMs ?? 1_000;
+  const read = options.read ?? readLatest;
+  const wait = options.wait ?? waitForMilliseconds;
+  let observedLatest;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    observedLatest = read(packageName);
+    if (observedLatest === expectedLatest) return observedLatest;
+    if (observedLatest !== staleLatest) {
+      fail(
+        "promotion-state-conflict",
+        `${packageName} latest is ${observedLatest ?? "absent"}; expected ${staleLatest ?? "absent"} or ${expectedLatest ?? "absent"}`,
+      );
+    }
+    if (attempt < attempts) wait(delayMs);
+  }
+
+  fail(
+    "promotion-registry-propagation-timeout",
+    `${packageName} latest did not converge to ${expectedLatest ?? "absent"}`,
+  );
+}
+
+function waitForAllLatest(record, options = {}) {
+  return Object.fromEntries(
+    record.packages.map((entry) => [
+      entry.name,
+      waitForLatest(entry.name, record.version, entry.previousLatest, options),
+    ]),
+  );
+}
+
 function requireReleaseAutomation(version, { recoveryOperation = null } = {}) {
   const expectedRef = `refs/tags/v${version}`;
   const tagRun = process.env.GITHUB_REF === expectedRef;
@@ -511,24 +592,27 @@ function advanceRecord(recordPath) {
     // npm has no supported conditional dist-tag update. Requiring the token to
     // be the package's only writer makes the registry mutation single-writer.
     verifyExclusiveRegistryWriter(entry.name);
-    const operation = planRegistryOperation(record, readLatest(entry.name));
+    const initialLatest = readLatest(entry.name);
+    const operation = planRegistryOperation(record, initialLatest);
+    let observedLatest = initialLatest;
     if (operation.type === "set_latest") {
       execFileSync("npm", ["dist-tag", "add", `${entry.name}@${operation.version}`, "latest"], {
         stdio: "inherit",
         timeout: 120_000,
       });
+      observedLatest = waitForLatest(entry.name, operation.version, initialLatest);
     } else if (operation.type === "remove_latest") {
       execFileSync("npm", ["dist-tag", "rm", entry.name, "latest"], {
         stdio: "inherit",
         timeout: 120_000,
       });
+      observedLatest = waitForLatest(entry.name, null, initialLatest);
     }
-    const observedLatest = readLatest(entry.name);
     const isFinal = record.mode === "promotion" && record.packages.every(
       (candidate) => candidate.name === entry.name || candidate.promotionStatus === "promoted",
     );
     record = checkpointOperation(record, observedLatest, {
-      allLatest: isFinal ? readAllLatest(record) : undefined,
+      allLatest: isFinal ? waitForAllLatest(record) : undefined,
     });
     writeRecord(recordPath, record);
     return record;
@@ -600,6 +684,17 @@ function runCli() {
     );
   } else if (command === "advance") {
     output = advanceRecord(argumentsList[0]);
+  } else if (command === "restart") {
+    let record = readRecord(argumentsList[0]);
+    const allowRolledBack = argumentsList[1] === "--allow-rolled-back";
+    if (argumentsList.length > 1 && !allowRolledBack) {
+      fail("promotion-state-conflict", `unknown restart option ${argumentsList[1]}`);
+    }
+    assertPromotionPackageGraph(record, canonicalPublicationOrder(record.version));
+    requireReleaseAutomation(record.version, { recoveryOperation: "candidate-finalize" });
+    record = restartPromotion(record, readAllLatest(record), undefined, { allowRolledBack });
+    writeRecord(argumentsList[0], record);
+    output = record;
   } else if (command === "abort") {
     let record = readRecord(argumentsList[0]);
     assertPromotionPackageGraph(record, canonicalPublicationOrder(record.version));
@@ -613,7 +708,7 @@ function runCli() {
     const record = readRecord(argumentsList[0]);
     assertPromotionPackageGraph(record, canonicalPublicationOrder(record.version));
     requireReleaseAutomation(record.version, { recoveryOperation: "candidate-finalize" });
-    output = verifyCompleteRecord(record, readAllLatest(record));
+    output = verifyCompleteRecord(record, waitForAllLatest(record));
   } else if (command === "status") {
     output = readRecord(argumentsList[0]);
   } else {
@@ -644,6 +739,9 @@ module.exports = {
   promotionTagValue,
   readCandidate,
   requireReleaseAutomation,
+  restartPromotion,
   sealPromotionRecord,
+  waitForAllLatest,
+  waitForLatest,
   verifyCompleteRecord,
 };
