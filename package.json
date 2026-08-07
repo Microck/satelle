@@ -16,5 +16,8 @@
     "release:validate-native-archives": "node npm/scripts/release.cjs validate-native-release-archives",
     "test": "npm run check:npm",
     "test:npm": "npm run check:npm"
+  },
+  "devDependencies": {
+    "sigstore": "4.0.0"
   }
 }

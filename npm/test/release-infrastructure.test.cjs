@@ -51,11 +51,17 @@ const {
   candidateTagRepairAction,
   candidateTagValue,
   checkpointPublished,
+  createRecoveryProvenanceStatement,
   createPublicationRecord,
+  npmPackagePurl,
   npmView,
   publicationRecoveryInstruction,
+  readPublishedCandidateState,
+  reconcileRecoveryPrefix,
+  recoveryReleaseRoot,
   repairCandidateTags,
   resolveArtifactPath,
+  waitForPublishedCandidate,
 } = require("../scripts/npm-candidate-publication.cjs");
 
 const platformMatrix = readJson(
@@ -2800,6 +2806,395 @@ test("npm candidate publication recovery guidance follows the current failure", 
   );
 });
 
+test("npm candidate publication waits for post-publish registry visibility", () => {
+  const entry = {
+    name: "@microck/satelle-darwin-arm64",
+    integrity: "sha512-expected",
+  };
+  const record = {
+    version: "1.2.3",
+    candidateTag: "rc-v1.2.3",
+  };
+  const states = [
+    { version: null, integrity: null, taggedVersion: null },
+    { version: "1.2.3", integrity: "sha512-expected", taggedVersion: null },
+    { version: "1.2.3", integrity: "sha512-expected", taggedVersion: "1.2.3" },
+  ];
+  const waits = [];
+
+  waitForPublishedCandidate(entry, record, {
+    attempts: 3,
+    delayMs: 30,
+    readState: () => states.shift(),
+    wait: (milliseconds) => waits.push(milliseconds),
+  });
+
+  assert.deepEqual(waits, [30, 30]);
+  assert.equal(states.length, 0);
+});
+
+test("npm candidate visibility polling fails closed without a final sleep", () => {
+  const entry = { name: "satelle", integrity: "sha512-expected" };
+  const record = { version: "1.2.3", candidateTag: "rc-v1.2.3" };
+  const waits = [];
+
+  assert.throws(
+    () => waitForPublishedCandidate(entry, record, {
+      attempts: 3,
+      delayMs: 30,
+      readState: () => ({
+        version: "1.2.3",
+        integrity: "sha512-expected",
+        taggedVersion: null,
+      }),
+      wait: (milliseconds) => waits.push(milliseconds),
+    }),
+    (error) =>
+      error instanceof CandidatePublicationError &&
+      error.code === "candidate-registry-tag-mismatch",
+  );
+  assert.deepEqual(waits, [30, 30]);
+});
+
+test("npm candidate visibility polling rejects immutable-byte mismatches immediately", () => {
+  const waits = [];
+  assert.throws(
+    () => waitForPublishedCandidate(
+      { name: "satelle", integrity: "sha512-expected" },
+      { version: "1.2.3", candidateTag: "rc-v1.2.3" },
+      {
+        readState: () => ({
+          version: "1.2.3",
+          integrity: "sha512-wrong",
+          taggedVersion: "1.2.3",
+        }),
+        wait: (milliseconds) => waits.push(milliseconds),
+      },
+    ),
+    (error) =>
+      error instanceof CandidatePublicationError &&
+      error.code === "candidate-registry-integrity-mismatch",
+  );
+  assert.deepEqual(waits, []);
+});
+
+test("npm candidate visibility polling rejects candidate tag conflicts immediately", () => {
+  const waits = [];
+  assert.throws(
+    () => waitForPublishedCandidate(
+      { name: "satelle", integrity: "sha512-expected" },
+      { version: "1.2.3", candidateTag: "rc-v1.2.3" },
+      {
+        readState: () => ({
+          version: "1.2.3",
+          integrity: "sha512-expected",
+          taggedVersion: "1.2.2",
+        }),
+        wait: (milliseconds) => waits.push(milliseconds),
+      },
+    ),
+    (error) =>
+      error instanceof CandidatePublicationError &&
+      error.code === "candidate-registry-tag-mismatch",
+  );
+  assert.deepEqual(waits, []);
+});
+
+test("npm candidate state preserves a conflicting tag when the requested version is absent", () => {
+  const calls = [];
+  const state = readPublishedCandidateState(
+    { name: "satelle" },
+    { version: "1.2.3", candidateTag: "rc-v1.2.3" },
+    (packageSpec, field) => {
+      calls.push([packageSpec, field]);
+      if (field === "version") return null;
+      if (field === "dist-tags") return { "rc-v1.2.3": "1.2.2" };
+      assert.fail(`unexpected npm field ${field}`);
+    },
+  );
+  assert.deepEqual(state, {
+    version: null,
+    integrity: null,
+    taggedVersion: "1.2.2",
+  });
+  assert.deepEqual(calls, [
+    ["satelle@1.2.3", "version"],
+    ["satelle", "dist-tags"],
+  ]);
+  assert.throws(
+    () => waitForPublishedCandidate(
+      { name: "satelle", integrity: "sha512-expected" },
+      { version: "1.2.3", candidateTag: "rc-v1.2.3" },
+      { readState: () => state, wait: () => assert.fail("a known conflict must not wait") },
+    ),
+    (error) =>
+      error instanceof CandidatePublicationError &&
+      error.code === "candidate-registry-tag-mismatch",
+  );
+});
+
+test("npm candidate visibility polling accepts a matching tag before its version appears", () => {
+  const states = [
+    { version: null, integrity: null, taggedVersion: "1.2.3" },
+    { version: "1.2.3", integrity: "sha512-expected", taggedVersion: "1.2.3" },
+  ];
+  const waits = [];
+  assert.equal(
+    waitForPublishedCandidate(
+      { name: "satelle", integrity: "sha512-expected" },
+      { version: "1.2.3", candidateTag: "rc-v1.2.3" },
+      {
+        attempts: 2,
+        delayMs: 30,
+        readState: () => states.shift(),
+        wait: (milliseconds) => waits.push(milliseconds),
+      },
+    ),
+    true,
+  );
+  assert.deepEqual(waits, [30]);
+  assert.deepEqual(states, []);
+});
+
+test("npm recovery provenance names the recovery workflow and signed release input", () => {
+  const environment = {
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_REPOSITORY: "Microck/satelle",
+    GITHUB_REPOSITORY_ID: "123",
+    GITHUB_REPOSITORY_OWNER_ID: "456",
+    GITHUB_REF: "refs/heads/main",
+    GITHUB_RUN_ATTEMPT: "2",
+    GITHUB_RUN_ID: "789",
+    GITHUB_SERVER_URL: "https://github.com",
+    GITHUB_SHA: "1".repeat(40),
+    GITHUB_WORKFLOW_REF: "Microck/satelle/.github/workflows/release.yml@refs/heads/main",
+    RUNNER_ENVIRONMENT: "github-hosted",
+    VERIFIED_SOURCE_DIGEST: "2".repeat(40),
+  };
+  const statement = createRecoveryProvenanceStatement(
+    { name: "@microck/satelle", integrity: `sha512-${Buffer.from("artifact").toString("base64")}` },
+    { version: "1.2.3" },
+    environment,
+  );
+  assert.equal(statement.subject[0].name, "pkg:npm/%40microck/satelle@1.2.3");
+  assert.equal(statement.subject[0].digest.sha512, Buffer.from("artifact").toString("hex"));
+  assert.equal(
+    statement.predicate.buildDefinition.externalParameters.workflow.ref,
+    "refs/heads/main",
+  );
+  assert.equal(
+    statement.predicate.buildDefinition.externalParameters.workflow.path,
+    ".github/workflows/release.yml",
+  );
+  assert.deepEqual(statement.predicate.buildDefinition.externalParameters.signedRelease, {
+    tag: "refs/tags/v1.2.3",
+    commit: "2".repeat(40),
+  });
+  assert.equal(
+    statement.predicate.buildDefinition.resolvedDependencies[0].uri,
+    "git+https://github.com/Microck/satelle@refs/tags/v1.2.3",
+  );
+  assert.equal(
+    statement.predicate.runDetails.metadata.invocationId,
+    "https://github.com/Microck/satelle/actions/runs/789/attempts/2",
+  );
+  assert.equal(environment.GITHUB_REF, "refs/heads/main");
+  assert.throws(
+    () => createRecoveryProvenanceStatement(
+      { name: "satelle", integrity: "sha512-invalid" },
+      { version: "1.2.3" },
+      {},
+    ),
+    (error) =>
+      error instanceof CandidatePublicationError &&
+      error.code === "release-recovery-not-authorized",
+  );
+});
+
+test("npm package provenance uses canonical package URLs", () => {
+  assert.equal(npmPackagePurl("@microck/satelle", "1.2.3"), "pkg:npm/%40microck/satelle@1.2.3");
+  assert.equal(npmPackagePurl("satelle", "1.2.3"), "pkg:npm/satelle@1.2.3");
+});
+
+test("npm recovery metadata requires a clean signed-source checkout", (context) => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "satelle-signed-source-"));
+  const signedSource = path.join(workspace, "signed-release-source");
+  mkdirSync(signedSource);
+  context.after(() => rmSync(workspace, { recursive: true, force: true }));
+  execFileSync("git", ["init", "--quiet", signedSource]);
+  execFileSync("git", ["-C", signedSource, "config", "user.name", "Satelle Test"]);
+  execFileSync("git", ["-C", signedSource, "config", "user.email", "test@satelle.invalid"]);
+  writeFileSync(path.join(signedSource, "metadata.txt"), "signed\n");
+  execFileSync("git", ["-C", signedSource, "add", "metadata.txt"]);
+  execFileSync("git", ["-C", signedSource, "commit", "--quiet", "-m", "signed source"]);
+  const sourceDigest = execFileSync("git", ["-C", signedSource, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+  }).trim();
+  const originalEnvironment = {
+    GITHUB_WORKSPACE: process.env.GITHUB_WORKSPACE,
+    SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: process.env.SATELLE_RELEASE_RECOVERY_SOURCE_ROOT,
+    VERIFIED_SOURCE_DIGEST: process.env.VERIFIED_SOURCE_DIGEST,
+  };
+  Object.assign(process.env, {
+    GITHUB_WORKSPACE: workspace,
+    SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: signedSource,
+    VERIFIED_SOURCE_DIGEST: sourceDigest,
+  });
+  context.after(() => {
+    for (const [key, value] of Object.entries(originalEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  assert.equal(recoveryReleaseRoot(), realpathSync(signedSource));
+  writeFileSync(path.join(signedSource, "untracked.txt"), "changed\n");
+  assert.throws(
+    () => recoveryReleaseRoot(),
+    (error) =>
+      error instanceof CandidatePublicationError &&
+      error.code === "release-recovery-not-authorized",
+  );
+});
+
+test("npm candidate recovery reconciles the published prefix before retrying", (context) => {
+  const release = createReleaseContext(repositoryRoot);
+  const plan = release.check();
+  const manifest = {
+    version: plan.version,
+    packages: plan.publicationOrder.map((packageName) => ({
+      package: packageName,
+      version: plan.version,
+      file: `${packageName.replaceAll("/", "-")}.tgz`,
+      integrity: `sha512-${Buffer.from(packageName).toString("base64")}`,
+    })),
+  };
+  const root = mkdtempSync(path.join(tmpdir(), "satelle-candidate-reconcile-"));
+  const recordPath = path.join(root, "record.json");
+  const record = createPublicationRecord(plan.version, manifest);
+  writeJson(recordPath, record);
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const environmentKeys = [
+    "GITHUB_ACTIONS",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_REF",
+    "GITHUB_REPOSITORY",
+    "SATELLE_RELEASE_RECOVERY",
+    "SATELLE_RELEASE_RECOVERY_OPERATION",
+    "SATELLE_RELEASE_RECOVERY_TAG",
+  ];
+  const originalEnvironment = Object.fromEntries(
+    environmentKeys.map((key) => [key, process.env[key]]),
+  );
+  Object.assign(process.env, {
+    GITHUB_ACTIONS: "true",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_REF: "refs/heads/main",
+    GITHUB_REPOSITORY: "Microck/satelle",
+    SATELLE_RELEASE_RECOVERY: "1",
+    SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-resume",
+    SATELLE_RELEASE_RECOVERY_TAG: `v${plan.version}`,
+  });
+
+  const first = record.packages[0];
+  const second = record.packages[1];
+  let secondReads = 0;
+  const waits = [];
+  try {
+    const reconciled = reconcileRecoveryPrefix(recordPath, {
+      attempts: 2,
+      delayMs: 1,
+      readState: (entry) => {
+        if (entry.name === first.name) {
+          return {
+            version: plan.version,
+            integrity: first.integrity,
+            taggedVersion: plan.version,
+          };
+        }
+        secondReads += 1;
+        if (secondReads < 3) {
+          return { version: null, integrity: null, taggedVersion: null };
+        }
+        return {
+          version: plan.version,
+          integrity: second.integrity,
+          taggedVersion: plan.version,
+        };
+      },
+      wait: (milliseconds) => waits.push(milliseconds),
+    });
+    assert.deepEqual(reconciled.packages.slice(0, 3).map((entry) => entry.status), [
+      "published",
+      "published",
+      "pending",
+    ]);
+    assert.deepEqual(waits, [1]);
+  } finally {
+    for (const [key, value] of Object.entries(originalEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("npm candidate recovery polls partial registry visibility", (context) => {
+  const release = createReleaseContext(repositoryRoot);
+  const plan = release.check();
+  const manifest = {
+    version: plan.version,
+    packages: plan.publicationOrder.map((packageName) => ({
+      package: packageName,
+      version: plan.version,
+      file: `${packageName.replaceAll("/", "-")}.tgz`,
+      integrity: `sha512-${Buffer.from(packageName).toString("base64")}`,
+    })),
+  };
+  const root = mkdtempSync(path.join(tmpdir(), "satelle-candidate-partial-"));
+  const recordPath = path.join(root, "record.json");
+  const record = createPublicationRecord(plan.version, manifest);
+  writeJson(recordPath, record);
+  context.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const originalEnvironment = { ...process.env };
+  Object.assign(process.env, {
+    GITHUB_ACTIONS: "true",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_REF: "refs/heads/main",
+    GITHUB_REPOSITORY: "Microck/satelle",
+    SATELLE_RELEASE_RECOVERY: "1",
+    SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-resume",
+    SATELLE_RELEASE_RECOVERY_TAG: `v${plan.version}`,
+  });
+  const entry = record.packages[0];
+  let reads = 0;
+  try {
+    const reconciled = reconcileRecoveryPrefix(recordPath, {
+      attempts: 1,
+      readState: () => {
+        reads += 1;
+        return reads === 1
+          ? { version: plan.version, integrity: null, taggedVersion: null }
+          : {
+              version: plan.version,
+              integrity: entry.integrity,
+              taggedVersion: plan.version,
+            };
+      },
+      wait: () => assert.fail("one successful poll must not sleep"),
+    });
+    assert.equal(reconciled.packages[0].status, "published");
+    assert.equal(reconciled.packages[1].status, "pending");
+    assert.equal(reads, 2);
+  } finally {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnvironment)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnvironment);
+  }
+});
+
 test("npm candidate publication fails closed on process and artifact path boundaries", (context) => {
   const originalPath = process.env.PATH;
   const artifactRoot = mkdtempSync(path.join(tmpdir(), "satelle-candidate-artifacts-"));
@@ -2915,6 +3310,78 @@ test("registry mutation helpers reject local developer execution", () => {
     assert.equal(JSON.parse(child.stderr).code, "release-automation-required");
   }
 
+  const wrongRecoveryBranch = spawnSync(
+    process.execPath,
+    [
+      path.join(repositoryRoot, "npm", "scripts", "npm-candidate-publication.cjs"),
+      "create",
+      workspaceVersion(),
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_ACTIONS: "true",
+        GITHUB_EVENT_NAME: "workflow_dispatch",
+        GITHUB_REF: "refs/heads/release-recovery-copy",
+        GITHUB_REPOSITORY: "Microck/satelle",
+        SATELLE_RELEASE_RECOVERY: "1",
+        SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-resume",
+        SATELLE_RELEASE_RECOVERY_TAG: `v${workspaceVersion()}`,
+      },
+    },
+  );
+  assert.equal(wrongRecoveryBranch.status, 1);
+  assert.equal(JSON.parse(wrongRecoveryBranch.stderr).code, "release-automation-required");
+
+  const wrongRecoveryOperation = spawnSync(
+    process.execPath,
+    [
+      path.join(repositoryRoot, "npm", "scripts", "npm-candidate-publication.cjs"),
+      "create",
+      workspaceVersion(),
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_ACTIONS: "true",
+        GITHUB_EVENT_NAME: "workflow_dispatch",
+        GITHUB_REF: "refs/heads/main",
+        GITHUB_REPOSITORY: "Microck/satelle",
+        SATELLE_RELEASE_RECOVERY: "1",
+        SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-tag-repair",
+        SATELLE_RELEASE_RECOVERY_TAG: `v${workspaceVersion()}`,
+      },
+    },
+  );
+  assert.equal(wrongRecoveryOperation.status, 1);
+  assert.equal(JSON.parse(wrongRecoveryOperation.stderr).code, "release-automation-required");
+
+  const wrongRecoveryTag = spawnSync(
+    process.execPath,
+    [
+      path.join(repositoryRoot, "npm", "scripts", "npm-candidate-publication.cjs"),
+      "create",
+      workspaceVersion(),
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_ACTIONS: "true",
+        GITHUB_EVENT_NAME: "workflow_dispatch",
+        GITHUB_REF: "refs/heads/main",
+        GITHUB_REPOSITORY: "Microck/satelle",
+        SATELLE_RELEASE_RECOVERY: "1",
+        SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-resume",
+        SATELLE_RELEASE_RECOVERY_TAG: "v9.9.9",
+      },
+    },
+  );
+  assert.equal(wrongRecoveryTag.status, 1);
+  assert.equal(JSON.parse(wrongRecoveryTag.stderr).code, "release-automation-required");
+
   const root = mkdtempSync(path.join(tmpdir(), "satelle-candidate-recovery-auth-"));
   const manifestPath = path.join(root, "npm-artifacts.json");
   writeJson(manifestPath, {});
@@ -2983,6 +3450,19 @@ test("release workflow gates draft publication on candidate validation and promo
   const validateRegistryCandidates = workflowJob(workflow, "validate-registry-candidates");
   const promoteAndPublish = workflowJob(workflow, "promote-and-publish");
   const authorizeRecoveryTag = workflowJob(workflow, "authorize-recovery-tag");
+  const resumeCandidates = workflowJob(workflow, "resume-candidates");
+  const recoveryDownloadStep = workflowStep(
+    resumeCandidates,
+    "Download the exact signed-tag candidate",
+  );
+  const recoverySignerStep = workflowStep(
+    resumeCandidates,
+    "Install recovery provenance signer",
+  );
+  const recoveryPublishStep = workflowStep(
+    resumeCandidates,
+    "Publish native, scoped, then unscoped candidate packages",
+  );
   const repairCandidateTags = workflowJob(workflow, "repair-candidate-tags");
   const rollbackPromotion = workflowJob(workflow, "rollback-promotion");
   const candidatePublishStep = workflowStep(
@@ -3022,6 +3502,57 @@ test("release workflow gates draft publication on candidate validation and promo
     authorizeRecoveryTag,
     /^    if: github\.event_name == 'workflow_dispatch' && inputs\.operation != 'diagnostics'$/m,
   );
+  assert.match(workflow, /^          - candidate-resume$/m);
+  assert.match(
+    resumeCandidates,
+    /^    if: github\.event_name == 'workflow_dispatch' && inputs\.operation == 'candidate-resume'$/m,
+  );
+  assert.match(resumeCandidates, /^    needs: authorize-recovery-tag$/m);
+  assert.match(resumeCandidates, /^    timeout-minutes: 360$/m);
+  const candidatePublicationConcurrency = /concurrency:\n      group: npm-candidate-publication-\$\{\{ github\.event_name == 'workflow_dispatch' && format\('v\{0\}', inputs\.version\) \|\| github\.ref_name \}\}\n      cancel-in-progress: false/g;
+  assert.equal((workflow.match(candidatePublicationConcurrency) ?? []).length, 2);
+  assert.match(
+    resumeCandidates,
+    /^    permissions:\n      actions: read\n      contents: write\n      id-token: write$/m,
+  );
+  assert.match(resumeCandidates, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(
+    resumeCandidates,
+    /path: signed-release-source[\s\S]*ref: \$\{\{ needs\.authorize-recovery-tag\.outputs\.source-digest \}\}/,
+  );
+  assert.match(
+    resumeCandidates,
+    /SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: \$\{\{ github\.workspace \}\}\/signed-release-source/,
+  );
+  assert.match(
+    resumeCandidates,
+    /actions\/workflows\/release\.yml\/runs\?event=push&branch=v\$\{RELEASE_VERSION\}/,
+  );
+  assert.match(
+    resumeCandidates,
+    /\.head_sha == \$source_digest[\s\S]*\.status == "completed"[\s\S]*\.conclusion == "failure"/,
+  );
+  assert.match(recoveryDownloadStep, /source_run_count=.*jq -r 'length'/);
+  assert.match(recoveryDownloadStep, /test "\$source_run_count" = 1/);
+  assert.match(recoveryDownloadStep, /gh run download "\$source_run_id"/);
+  assert.match(recoveryDownloadStep, /--name validated-release-candidate/);
+  assert.match(resumeCandidates, /npm-candidate-publication\.cjs reconcile "\$record"/);
+  assert.match(resumeCandidates, /npm-candidate-publication\.cjs advance/);
+  assert.match(recoveryPublishStep, /^        id: publish-recovery$/m);
+  assert.doesNotMatch(candidatePublishStep, /id: publish-recovery/);
+  assert.match(recoverySignerStep, /npm ci --ignore-scripts/);
+  assert.doesNotMatch(publishCandidates, /Install recovery provenance signer/);
+  assert.match(
+    workflowStep(resumeCandidates, "Preserve failed npm recovery record"),
+    /if: failure\(\) && steps\.publish-recovery\.outcome == 'failure'[\s\S]*npm-candidate-publication\.json/,
+  );
+  assert.doesNotMatch(resumeCandidates, /trap 'checkpoint' ERR/);
+  const candidatePublicationScript = readFileSync(
+    path.join(repositoryRoot, "npm", "scripts", "npm-candidate-publication.cjs"),
+    "utf8",
+  );
+  assert.match(candidatePublicationScript, /--provenance-file/);
+  assert.doesNotMatch(resumeCandidates, /NODE_AUTH_TOKEN|NPM_DIST_TAG_TOKEN/);
   assert.match(authorizeRecoveryTag, /git\/ref\/tags\/v\$RELEASE_VERSION/);
   assert.match(authorizeRecoveryTag, /verification\.verified == true/);
   assert.match(authorizeRecoveryTag, /GITHUB_REF.*refs\/heads\/\$default_branch/);
@@ -3121,8 +3652,8 @@ test("release workflow gates draft publication on candidate validation and promo
     /ref: \$\{\{ needs\.authorize-recovery-tag\.outputs\.source-digest \}\}/,
   );
   assert.equal((workflow.match(/asset_ids="\$RUNNER_TEMP\/[^"]+"/g) ?? []).length, 2);
-  assert.equal((workflow.match(/after_sequence=/g) ?? []).length, 3);
-  assert.equal((workflow.match(/sequence did not advance/g) ?? []).length, 3);
+  assert.equal((workflow.match(/after_sequence=/g) ?? []).length, 4);
+  assert.equal((workflow.match(/sequence did not advance/g) ?? []).length, 4);
   assert.match(workflow, /SATELLE_RELEASE_RECOVERY_TAG: v\$\{\{ inputs\.version \}\}/);
 });
 
