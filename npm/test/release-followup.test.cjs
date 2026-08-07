@@ -303,6 +303,8 @@ test("packet 27 gates release publication on Tegami and typed signed-tag trust",
   assert.equal(toolingPackage.dependencies.tegami, "1.2.5");
   assert.match(tegamiSource, /cargo\(/);
   assert.match(tegamiSource, /pkg\.manager === "cargo"\) return false/);
+  assert.match(tegamiSource, /publishPreflight\(\{ pkg \}\)/);
+  assert.match(tegamiSource, /plugins: \[preventCargoPublication, cargo\(/);
   assert.match(dryRunSource, /satelle\.tegami-validation\.v1/);
   for (const field of [
     "nodeVersion",
@@ -395,6 +397,10 @@ test("release tooling gate binds committed changelog output to the release versi
   const changelog = path.join(root, "CHANGELOG.md");
   writeFileSync(changelog, "# Changelog\n\n## 1.2.3\n\n- Initial release.\n");
 
+  assert.deepEqual(verifyChangelogs("1.2.3", [changelog]), [
+    path.relative(repositoryRoot, changelog).split(path.sep).join("/"),
+  ]);
+  writeFileSync(changelog, "# Changelog\n\n## satelle-cli@1.2.3\n\n- Initial release.\n");
   assert.deepEqual(verifyChangelogs("1.2.3", [changelog]), [
     path.relative(repositoryRoot, changelog).split(path.sep).join("/"),
   ]);

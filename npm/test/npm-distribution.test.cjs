@@ -18,6 +18,9 @@ const test = require("node:test");
 
 const repositoryRoot = path.resolve(__dirname, "../..");
 const canonicalPackageRoot = path.join(repositoryRoot, "npm", "satelle");
+const canonicalPackageVersion = readJson(
+  path.join(canonicalPackageRoot, "package.json"),
+).version;
 const publicLauncher = require(path.join(canonicalPackageRoot, "bin", "satelle.cjs"));
 const launcher = require(path.join(canonicalPackageRoot, "lib", "launcher.cjs"));
 const platformMatrix = require(path.join(canonicalPackageRoot, "platforms.json"));
@@ -699,8 +702,8 @@ test("canonical launches detect an installed unscoped forwarding package", (cont
     path.join(unscopedRoot, "package.json"),
     JSON.stringify({
       name: "satelle",
-      version: "0.1.0",
-      dependencies: { "@microck/satelle": "0.1.0" },
+      version: canonicalPackageVersion,
+      dependencies: { "@microck/satelle": canonicalPackageVersion },
     }),
   );
 
