@@ -225,7 +225,10 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.match(workflow, /candidate_pattern=.*npm-candidate-v.*\[0-9\]\+/);
   assert.match(workflow, /promotion_pattern=.*npm-promotion-v.*\[0-9\]\+/);
   assert.match(workflow, /sha256sum --check/);
-  assert.match(workflow, /gh release edit "\$RELEASE_TAG"[^\n]*--draft=false --latest/);
+  assert.match(
+    workflow,
+    /publication_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=true/,
+  );
   assert.match(
     workflow,
     /pnpm --dir "\$install_root" add --ignore-scripts "\$package_spec"/,
@@ -233,11 +236,15 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.doesNotMatch(workflow, /minimum-release-age/);
   assert.match(
     workflow,
-    /repos\/\$GITHUB_REPOSITORY\/immutable-releases[\s\S]*?immutable releases are not enabled/,
+    /GH_TOKEN="\$RELEASE_POLICY_TOKEN" gh api[\s\S]*repos\/\$GITHUB_REPOSITORY\/immutable-releases[\s\S]*immutable releases are not enabled/,
   );
   assert.match(
     workflow,
-    /cmp -s "\$current_assets" "\$verified_assets"[\s\S]*?recheck_release_tag\n\s+gh release edit "\$RELEASE_TAG"/,
+    /require_immutable_releases[\s\S]*recheck_release_tag[\s\S]*publication_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=true[\s\S]*\.immutable == true/,
+  );
+  assert.match(
+    workflow,
+    /cmp -s "\$current_assets" "\$verified_assets"[\s\S]*?for attempt in \$\(seq 1 10\); do\n\s+if ! recheck_release_tag retry_transient[\s\S]*?if publication_state=\$\(gh api/,
   );
   assert.doesNotMatch(workflow, /^\s+(?:validated|dist)\/npm-.*\.tgz \\?$/m);
   assert.match(workflow, /\.\/dist\/npm-satelle-scoped\.tgz/);
