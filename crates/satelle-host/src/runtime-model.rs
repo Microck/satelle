@@ -301,8 +301,7 @@ pub(super) fn integrity_failure(message: impl Into<String>) -> SatelleError {
         code: ErrorCode::StorageIntegrityFailed,
         message: message.into(),
         recovery_command: Some(
-            "preserve the state directory and run satelle doctor --scope storage --json"
-                .to_string(),
+            "preserve the state directory and run satelle doctor --scope all --json".to_string(),
         ),
         source_detail: None,
         details: std::collections::BTreeMap::new(),
@@ -392,7 +391,7 @@ mod storage_failure_tests {
         assert_eq!(error.message, "the Satelle SQLite migration failed");
         assert_eq!(
             error.recovery_command.as_deref(),
-            Some("preserve the state directory and run satelle doctor --scope storage --json")
+            Some("preserve the state directory and run satelle doctor --scope all --json")
         );
         assert!(error.source_detail.is_none());
     }

@@ -41,11 +41,14 @@ satelle setup --host local-demo --on-demand --dry-run
 satelle setup --host local-demo --persistent --dry-run
 ```
 
-Local setup is planning-only. SSH setup can apply only the on-demand transport
-token handoff described in the remote connection guide. Local mutation,
-persistent service installation, direct setup, and SSH setup for broader
-components are not implemented; those combinations fail closed instead of
-reporting a mutation that did not occur.
+Local setup is planning-only. SSH setup applies the authenticated transport
+handoff described in the remote connection guide. On macOS and Windows,
+persistent mode also installs or updates a user-scoped login-session service.
+Linux does not support a persistent service: an explicit persistent request
+fails closed, while an inherited persistent default falls back to on-demand
+mode and reports the fallback. Desktop and provider setup run through the
+authenticated Host after the daemon is ready; the SSH bootstrap does not apply
+those broader components directly.
 
 ## Bind the visible desktop
 

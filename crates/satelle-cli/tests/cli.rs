@@ -396,6 +396,7 @@ variable = "FIXTURE_PROVIDER_TOKEN"
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", state.path().join("cache"))
         .env("FIXTURE_PROVIDER_TOKEN", "fixture-provider-token")
         .args([
             "setup",
@@ -430,6 +431,7 @@ variable = "FIXTURE_PROVIDER_TOKEN"
     satelle()
         .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", state.path().join("cache"))
         .args(["host", "release-state"])
         .assert()
         .success();
@@ -1098,8 +1100,10 @@ address = "127.0.0.1:3001"
 #[test]
 fn run_steer_and_status_share_a_local_demo_session() {
     let state = state_dir();
+    let cache = state.path().join("cache");
     let run_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "run",
             "--host",
@@ -1116,6 +1120,7 @@ fn run_steer_and_status_share_a_local_demo_session() {
 
     satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["steer", &session_id, "Continue from the same session"])
         .assert()
         .success()
@@ -1124,6 +1129,7 @@ fn run_steer_and_status_share_a_local_demo_session() {
 
     satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["status", &session_id])
         .assert()
         .success()
@@ -1179,12 +1185,14 @@ fn read_only_fixture_diagnostics_do_not_initialize_runtime_storage() {
 #[test]
 fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() {
     let state = state_dir();
+    let cache = state.path().join("cache");
     let run_secret = "sk-satelle-run-private-canary";
     let run_upstream_id = "thread_codex_run_private_canary";
     let run_prompt_canary = "RUN_PRIVATE_PROMPT_CANARY";
     let run_prompt = format!("{run_prompt_canary} secret={run_secret} upstream={run_upstream_id}");
     let run_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["run", "--host", "local-demo", "--json", &run_prompt])
         .assert()
         .success()
@@ -1215,6 +1223,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
         format!("{steer_prompt_canary} secret={steer_secret} upstream={steer_upstream_id}");
     let steer_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "steer",
             &session,
@@ -1236,6 +1245,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
 
     let status_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["status", &session, "--json"])
         .assert()
         .success()
@@ -1255,6 +1265,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
 
     let logs_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["logs", "--session", &session, "--json"])
         .assert()
         .success()
@@ -1279,6 +1290,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
         format!("{event_prompt_canary} secret={event_secret} upstream={event_upstream_id}");
     let events_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "run",
             "--host",
@@ -1303,6 +1315,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
         format!("{verbose_prompt_canary} secret={verbose_secret} upstream={verbose_upstream_id}");
     let verbose_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "run",
             "--host",
@@ -1330,6 +1343,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     );
     let detached_run_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "run",
             "--host",
@@ -1358,6 +1372,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
 
     let stop_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["stop", &detached_session, "--json"])
         .assert()
         .success()
@@ -1380,6 +1395,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
     );
     let detached_steer_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "steer",
             &detached_session,
@@ -1402,6 +1418,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
 
     let detached_status_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["status", &detached_session, "--json"])
         .assert()
         .success()
@@ -1421,6 +1438,7 @@ fn runtime_surfaces_and_persisted_state_do_not_retain_prompts_or_upstream_ids() 
 
     let detached_logs_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["logs", "--session", &detached_session, "--json"])
         .assert()
         .success()
@@ -1649,10 +1667,12 @@ fn stopping_terminal_turn_preserves_history_and_allows_later_steer() {
 #[test]
 fn stopping_detached_turn_returns_exact_stop_contract() {
     let state = state_dir();
+    let cache = state.path().join("cache");
     let provider_config = authorize_default_provider_binding(&state);
     let run_output = satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args([
             "run",
@@ -1675,6 +1695,7 @@ fn stopping_detached_turn_returns_exact_stop_contract() {
 
     let stop_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args(["stop", &session_id, "--json"])
         .assert()
@@ -1707,6 +1728,7 @@ fn stopping_detached_turn_returns_exact_stop_contract() {
 
     let status_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args(["status", &session_id, "--json"])
         .assert()
@@ -2436,10 +2458,12 @@ fn run_and_steer_reject_conflicting_interrupt_modes_before_admission() {
 #[test]
 fn detach_returns_starting_session_without_event_streaming() {
     let state = state_dir();
+    let cache = state.path().join("cache");
     let provider_config = authorize_default_provider_binding(&state);
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args([
             "run",
@@ -2464,6 +2488,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     let status_output = satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["status", &session_id, "--json"])
         .assert()
         .success()
@@ -2475,6 +2500,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     let logs_output = satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["logs", "--session", &session_id, "--json"])
         .assert()
         .success()
@@ -2501,6 +2527,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     let busy_output = satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "run",
             "--host",
@@ -2520,6 +2547,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     let busy_output = satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "steer",
             &session_id,
@@ -2537,6 +2565,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["stop", &session_id, "--json"])
         .assert()
         .success();
@@ -2544,6 +2573,7 @@ fn detach_returns_starting_session_without_event_streaming() {
     let steer_output = satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "steer",
             &session_id,
@@ -5044,6 +5074,7 @@ yolo = true
 #[test]
 fn run_and_steer_report_yolo_state_and_flags_override_config() {
     let state = state_dir();
+    let cache = state.path().join("cache");
     let user_config = state.path().join("user-config.toml");
     write_user_config(
         &user_config,
@@ -5061,6 +5092,7 @@ yolo = true
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args([
             "run",
             "--host",
@@ -5082,6 +5114,7 @@ yolo = true
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["steer", &session, "--json", "--yolo", "Continue"])
         .assert()
         .success()
@@ -7566,6 +7599,7 @@ adapter = "fake"
 #[test]
 fn run_and_steer_fail_before_admission_when_desktop_selection_is_invalid() {
     let state = state_dir();
+    let cache = state.path().join("cache");
     let user_config = state.path().join("user-config.toml");
     let cases = [
         (
@@ -7634,6 +7668,7 @@ adapter = "fake"
         let output = satelle()
             .env("SATELLE_CONFIG_FILE", &user_config)
             .env("SATELLE_STATE_DIR", state.path())
+            .env("SATELLE_CACHE_DIR", &cache)
             .args(["run", "--detach", "--json", "Open the browser"])
             .assert()
             .code(75)
@@ -7659,6 +7694,7 @@ desktop_session_preference = "only"
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["run", "--detach", "--json", "Open the browser"])
         .assert()
         .success()
@@ -7684,6 +7720,7 @@ desktop_user = "another-user"
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
         .args(["steer", &session_id, "--detach", "--json", "Open settings"])
         .assert()
         .code(75)

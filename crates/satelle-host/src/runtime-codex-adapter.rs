@@ -578,6 +578,14 @@ impl ProductionComputerUseAdapter {
             READINESS_CANCELLATION_GRACE,
             cancellation.cloned(),
         );
+        // A pre-dispatch failure or rejected turn cannot drive the action
+        // surface. Report it now instead of masking it behind the action-page
+        // deadline, which can be several minutes. Other post-dispatch errors
+        // still wait because a confirmed native callback can outlive process
+        // shutdown.
+        if let Some(failure) = classify_native_probe_failure_before_action_wait(&run) {
+            return Err(failure);
+        }
         let action_result = target.wait_for_success();
         if action_result.is_ok() && !native_action_evidence.completed() {
             return Err(native_smoke_failure(
@@ -1243,20 +1251,13 @@ fn native_readiness_prompt(
 ) -> Result<String, &'static str> {
     let page_url = serde_json::to_string(page_url).expect("a loopback URL is JSON representable");
     match action_path {
-        crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl {
-            client_module_base64,
-            client_module_url,
-        } => {
-            let client_module_base64 = serde_json::to_string(client_module_base64)
-                .expect("authenticated module bytes are JSON string representable");
-            let client_module_url = serde_json::to_string(client_module_url)
-                .expect("an authenticated module URL is JSON string representable");
+        crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl => {
             let script = format!(
-                "var clientModuleBase64 = {client_module_base64}; var clientModuleUrl = {client_module_url}; var registerHooks = (await import('node:module')).registerHooks; registerHooks({{ load(url, context, nextLoad) {{ if (url === clientModuleUrl) return {{ format: 'module', source: Buffer.from(clientModuleBase64, 'base64'), shortCircuit: true }}; return nextLoad(url, context); }} }}); var client = await import(clientModuleUrl); await client.setupComputerUseRuntime({{ globals: globalThis }}); var apps = await sky.list_apps(); var browser = apps.find(app => app.id === 'Helium'); if (!browser) throw new Error('Helium is unavailable'); var browserWindow = browser.windows[0]; if (!browserWindow) {{ await sky.launch_app({{ app: browser.id }}); apps = await sky.list_apps(); browser = apps.find(app => app.id === 'Helium'); browserWindow = browser.windows[0]; }} await sky.activate_window({{ window: browserWindow }}); await sky.press_key({{ window: browserWindow, key: 'Control_L+l' }}); await sky.press_key({{ window: browserWindow, key: 'Control_L+a' }}); await sky.press_key({{ window: browserWindow, key: 'BackSpace' }}); await sky.type_text({{ window: browserWindow, text: {page_url} }}); await sky.press_key({{ window: browserWindow, key: 'Return' }}); await new Promise(resolve => setTimeout(resolve, 2000)); apps = await sky.list_apps(); browser = apps.find(app => app.id === 'Helium'); browserWindow = browser.windows[0]; var state = await sky.get_window_state({{ window: browserWindow, include_screenshot: true, include_text: true }}); var buttonMatch = state.accessibility.tree.match(/(\\d+)\\s+button Click to confirm/); if (!buttonMatch) throw new Error('button missing'); await sky.click({{ window: browserWindow, element_index: Number(buttonMatch[1]) }}); await sky.drag({{ window: browserWindow, from_x: 211, from_y: 333, to_x: 632, to_y: 438 }}); await new Promise(resolve => setTimeout(resolve, 500)); var finalState = await sky.get_window_state({{ window: browserWindow, include_screenshot: false, include_text: true }}); var observed = finalState.accessibility.tree.split('\\n').filter(line => line.includes('event observed')).join('\\n'); if (!observed.includes('Click event observed') || !observed.includes('Drag event observed')) throw new Error('native events missing: ' + (observed || 'none')); nodeRepl.write(observed);"
+                "globalThis.sky ??= (await import(\"@oai/sky\")).sky; var apps = await sky.list_apps(); var browser = apps.find(app => app.id === 'MSEdge'); if (!browser) throw new Error('Microsoft Edge is unavailable'); var browserWindow = browser.windows[0]; if (!browserWindow) {{ await sky.launch_app({{ app: browser.id }}); for (var attempt = 0; attempt < 8 && !browserWindow; attempt++) {{ await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1000 : 500)); apps = await sky.list_apps(); browser = apps.find(app => app.id === 'MSEdge'); browserWindow = browser?.windows[0]; }} }} if (!browserWindow) throw new Error('Microsoft Edge window is unavailable'); await sky.activate_window({{ window: browserWindow }}); await sky.press_key({{ window: browserWindow, key: 'Control_L+l' }}); await sky.press_key({{ window: browserWindow, key: 'Control_L+a' }}); await sky.press_key({{ window: browserWindow, key: 'BackSpace' }}); await sky.type_text({{ window: browserWindow, text: {page_url} }}); await sky.press_key({{ window: browserWindow, key: 'Return' }}); await new Promise(resolve => setTimeout(resolve, 2000)); apps = await sky.list_apps(); browser = apps.find(app => app.id === 'MSEdge'); browserWindow = browser.windows[0]; var state = await sky.get_window_state({{ window: browserWindow, include_screenshot: true, include_text: true }}); var buttonMatch = state.accessibility.tree.match(/(\\d+)\\s+button Click to confirm/); if (!buttonMatch) throw new Error('button missing'); await sky.click({{ window: browserWindow, element_index: Number(buttonMatch[1]) }}); await sky.drag({{ window: browserWindow, from_x: 211, from_y: 333, to_x: 632, to_y: 438 }}); await new Promise(resolve => setTimeout(resolve, 500)); var finalState = await sky.get_window_state({{ window: browserWindow, include_screenshot: false, include_text: true }}); var observed = finalState.accessibility.tree.split('\\n').filter(line => line.includes('event observed')).join('\\n'); if (!observed.includes('Click event observed') || !observed.includes('Drag event observed')) throw new Error('native events missing: ' + (observed || 'none')); nodeRepl.write(observed);"
             );
             native_action_evidence.expect_script(&script);
             Ok(format!(
-                "Use the installed official Computer Use plugin through mcp__node_repl__js immediately. Do not search the tool catalog or read documentation. Your first and only tool call must run this complete JavaScript in one persistent-kernel cell: `{script}`. The target is a private loopback capability, and the accessibility tree is formatted text. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list. Do not use Firefox because the installed helper cannot enforce URL policy for it. Do not inspect Object.keys or probe API shapes. Stop immediately after that one tool call."
+                "Use the installed official Computer Use plugin through mcp__node_repl__js immediately. Do not search the tool catalog or read documentation. Your first and only tool call must run this complete JavaScript in one persistent-kernel cell: `{script}`. The target is a private loopback capability, and the accessibility tree is formatted text. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list or substitute another browser. Do not inspect Object.keys or probe API shapes. Stop immediately after that one tool call."
             ))
         }
         crate::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
@@ -1649,14 +1650,34 @@ fn classify_native_probe_run(
     run.result.map_err(native_smoke_session_failure)
 }
 
+fn classify_native_probe_failure_before_action_wait(
+    run: &crate::codex_session::TimedCodexSessionRun,
+) -> Option<NativeSmokeFailure> {
+    match &run.result {
+        Err(failure)
+            if !failure.turn_dispatch_attempted()
+                || failure.error() == CodexSessionError::ResponseError =>
+        {
+            Some(native_smoke_session_failure(*failure))
+        }
+        Ok(CodexSessionTerminal::Failed(crate::codex_session::CodexFailedTurnKind::Other))
+            if run.cancellation.is_none() =>
+        {
+            Some(native_smoke_failure("native_readiness_session_failed"))
+        }
+        Ok(CodexSessionTerminal::Completed | CodexSessionTerminal::Interrupted)
+        | Ok(CodexSessionTerminal::Failed(crate::codex_session::CodexFailedTurnKind::Other))
+        | Ok(CodexSessionTerminal::StoppedByControl)
+        | Err(_) => None,
+    }
+}
+
 fn classify_native_probe_completion(
     run: crate::codex_session::TimedCodexSessionRun,
     action_result: Result<(), &'static str>,
 ) -> Result<(), NativeSmokeFailure> {
-    if let Err(failure) = &run.result
-        && !failure.turn_dispatch_attempted()
-    {
-        return Err(native_smoke_session_failure(*failure));
+    if let Some(failure) = classify_native_probe_failure_before_action_wait(&run) {
+        return Err(failure);
     }
     if action_result.is_ok()
         && matches!(
@@ -3109,6 +3130,66 @@ mod tests {
     }
 
     #[test]
+    fn native_session_failure_is_classified_before_waiting_for_the_action_surface() {
+        let run = crate::codex_session::TimedCodexSessionRun {
+            result: Err(CodexSessionFailure::after_exchange(
+                CodexSessionError::ResponseError,
+                true,
+            )),
+            cancellation: None,
+        };
+
+        let failure = classify_native_probe_failure_before_action_wait(&run)
+            .expect("a terminal session failure cannot produce native readiness");
+
+        assert_eq!(failure.reason, "native_readiness_session_failed");
+        assert!(failure.dispatch_possible);
+    }
+
+    #[test]
+    fn postdispatch_shutdown_failure_still_waits_for_a_confirmed_native_callback() {
+        let run = crate::codex_session::TimedCodexSessionRun {
+            result: Err(CodexSessionFailure::after_exchange(
+                CodexSessionError::Containment,
+                true,
+            )),
+            cancellation: Some(StopObservation::CancellationConfirmed),
+        };
+
+        assert!(classify_native_probe_failure_before_action_wait(&run).is_none());
+        assert!(classify_native_probe_completion(run, Ok(())).is_ok());
+    }
+
+    #[test]
+    fn failed_turn_is_classified_before_waiting_for_the_action_surface() {
+        let run = crate::codex_session::TimedCodexSessionRun {
+            result: Ok(CodexSessionTerminal::Failed(
+                crate::codex_session::CodexFailedTurnKind::Other,
+            )),
+            cancellation: None,
+        };
+
+        let failure = classify_native_probe_failure_before_action_wait(&run)
+            .expect("a failed turn cannot produce native readiness");
+
+        assert_eq!(failure.reason, "native_readiness_session_failed");
+        assert!(!failure.dispatch_possible);
+    }
+
+    #[test]
+    fn failed_turn_after_confirmed_cancellation_still_accepts_a_native_callback() {
+        let run = crate::codex_session::TimedCodexSessionRun {
+            result: Ok(CodexSessionTerminal::Failed(
+                crate::codex_session::CodexFailedTurnKind::Other,
+            )),
+            cancellation: Some(StopObservation::CancellationConfirmed),
+        };
+
+        assert!(classify_native_probe_failure_before_action_wait(&run).is_none());
+        assert!(classify_native_probe_completion(run, Ok(())).is_ok());
+    }
+
+    #[test]
     fn native_callbacks_survive_confirmed_deadline_cancellation() {
         let outcome = classify_native_probe_completion(
             crate::codex_session::TimedCodexSessionRun {
@@ -4075,30 +4156,30 @@ mod tests {
 
     #[test]
     fn native_readiness_prompt_uses_only_the_verified_plugin_and_browser_surface() {
-        let action_path = crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl {
-            client_module_base64: "ZXhwb3J0IHt9".to_string(),
-            client_module_url: "file:///C:/satelle/client.mjs".to_string(),
-        };
+        let action_path = crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl;
         let evidence = crate::provider_probe::NativeActionEvidence::new();
         let prompt = native_readiness_prompt(
             "http://127.0.0.1:12345/probe/private-capability",
             &action_path,
             &evidence,
         )
-        .expect("the authenticated client bytes should form a registered module load hook");
+        .expect("the authenticated Windows node_repl path should form a direct plugin call");
         assert!(
             prompt.contains("official Computer Use plugin through mcp__node_repl__js immediately")
         );
         assert!(prompt.contains("Do not search the tool catalog or read documentation"));
-        assert!(prompt.contains("registerHooks"));
-        assert!(prompt.contains("url === clientModuleUrl"));
-        assert!(prompt.contains("source: Buffer.from(clientModuleBase64, 'base64')"));
-        assert!(prompt.contains("import(clientModuleUrl)"));
+        assert!(prompt.contains("import(\"@oai/sky\")"));
+        assert!(!prompt.contains("registerHooks"));
+        assert!(!prompt.contains("clientModuleUrl"));
         assert!(!prompt.contains("readFile"));
         assert!(!prompt.contains("createHash"));
         assert!(!prompt.contains("data:text"));
         assert!(prompt.contains("http://127.0.0.1:12345/probe/private-capability"));
         assert!(prompt.contains("sky.list_apps()"));
+        assert!(prompt.contains("app.id === 'MSEdge'"));
+        assert!(!prompt.contains("Helium"));
+        assert!(prompt.contains("attempt < 8 && !browserWindow"));
+        assert!(prompt.contains("Microsoft Edge window is unavailable"));
         assert!(prompt.contains("sky.activate_window({ window: browserWindow })"));
         assert!(prompt.contains("sky.press_key"));
         assert!(prompt.contains("sky.type_text"));
@@ -4418,17 +4499,14 @@ mod tests {
 
     #[test]
     fn native_readiness_prompt_names_both_required_actions_and_private_target() {
-        let action_path = crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl {
-            client_module_base64: "ZXhwb3J0IHt9".to_string(),
-            client_module_url: "file:///C:/satelle/client.mjs".to_string(),
-        };
+        let action_path = crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl;
         let evidence = crate::provider_probe::NativeActionEvidence::new();
         let prompt = native_readiness_prompt(
             "http://127.0.0.1:12345/probe/readiness-nonce",
             &action_path,
             &evidence,
         )
-        .expect("the authenticated client bytes should form a registered module load hook");
+        .expect("the authenticated Windows node_repl path should form a direct plugin call");
 
         assert!(prompt.contains("private"));
         assert!(prompt.contains("click"));

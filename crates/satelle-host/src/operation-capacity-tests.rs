@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
-const WAIT_LIMIT: Duration = Duration::from_secs(2);
+// This synchronizes test workers; it is not an operation-capacity deadline.
+// Native CI can take several seconds to schedule a newly admitted worker.
+const WAIT_LIMIT: Duration = Duration::from_secs(10);
 
 #[test]
 fn cancellation_registered_before_run_uses_the_same_gate_and_prevents_admission() {
