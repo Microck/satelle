@@ -89,13 +89,13 @@
 - satelle is the canonical local CLI executable name @implemented @mvp
 - Satelle name selection accepts the known online availability caveat that satelle has an existing AI-agent-adjacent GitHub repository collision and still treats Satelle as the chosen MVP product identity @spec @mvp @implemented
 - Satelle's brand metaphor is satellite-adjacent remote presence, command uplink, telemetry downlink, and visible remote operation rather than generic remote desktop administration @implemented @mvp
-- Satelle's Beacon Coral palette is the selected MVP brand palette rather than a placeholder palette @implemented @mvp
-- Satelle's primary brand color is Beacon Coral #FF5E5B / oklch(0.693 0.197 24.774) @implemented @mvp
+- Satelle's Beacon Red palette is the selected MVP brand palette rather than a placeholder palette @implemented @mvp
+- Satelle's primary brand color is Beacon Red #E5184D / oklch(0.592 0.228 16.032) @implemented @mvp
 - Satelle's default dark brand surface is Orbit Ink #0F0D17 / oklch(0.167 0.021 293.174) @implemented @mvp
 - Satelle's primary light text color is Platinum #D6D8E0 / oklch(0.883 0.011 274.878) @implemented @mvp
-- Satelle's secondary accent color is Relay Rose #FF8FB1 / oklch(0.779 0.139 1.409) @implemented @mvp
-- Satelle cliclack prompts use Beacon Coral for prompt glyphs, active selections, and primary brand emphasis @spec @mvp @implemented
-- Satelle cliclack prompts use Relay Rose only for sparse highlights so normal CLI screens do not become one-note pink @spec @mvp @implemented
+- Satelle's secondary accent color is Beacon Red #E5184D / oklch(0.592 0.228 16.032) @implemented @mvp
+- Satelle cliclack prompts use Beacon Red for prompt glyphs, active selections, and primary brand emphasis @spec @mvp @implemented
+- Satelle cliclack prompts use Beacon Red only for sparse highlights so normal CLI screens do not become one-note red @spec @mvp @implemented
 - Satelle cliclack prompts use #A6E22E / oklch(0.841 0.204 127.286) for success states and #FF4D6D / oklch(0.679 0.213 14.719) for error or cancel states @spec @mvp @implemented
 - Satelle color output respects terminal no-color and dumb-terminal conventions by falling back to plain text without changing command behavior @spec @mvp @implemented
 
