@@ -146,6 +146,10 @@ fn quiet_current_host_update_has_no_output() {
     let state = TestStateDir::new().expect("temporary update state");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
+        .env(
+            "SATELLE_CACHE_DIR",
+            state.path().join("command-history-cache"),
+        )
         .args([
             "host",
             "update",

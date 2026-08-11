@@ -1,18 +1,26 @@
 #[cfg(target_os = "macos")]
 use super::control_plane::MacosNativeSessionResources;
+use super::control_plane::macos_native_runtime_version;
 #[cfg(unix)]
 use super::control_plane::perform_handshake;
-#[cfg(unix)]
-#[cfg(unix)]
-use super::control_plane::validate_macos_computer_use_service_layout;
 use super::control_plane::{
-    CodexImageInputMode, ControlPlaneAdmission, NativeMcpBinding,
-    PlannedNativeComputerUseActionPath, bounded_inventory_command_output,
+    CodexImageInputMode, ControlPlaneAdmission, NATIVE_ISOLATION_TIMEOUT, NativeMcpBinding,
+    PROBE_TIMEOUT, PlannedNativeComputerUseActionPath, bounded_inventory_command_output,
     codex_isolation_plan_from_json, configure_app_server_command,
     configure_control_plane_probe_command, configure_mcp_inventory_command,
-    macos_authenticated_bridge_args, mcp_server_names_from_json, native_bridge_root_path,
-    path_is_absolute_for_platform, probe_control_plane_with, same_path_for_platform,
+    macos_authenticated_bridge_args, macos_codex_app_command, mcp_server_names_from_json,
+    native_bridge_root_path, path_is_absolute_for_platform, probe_control_plane_with,
+    refresh_windows_native_pipe_binding_from_config, same_path_for_platform,
     windows_locked_bridge_args,
+};
+#[cfg(unix)]
+use super::control_plane::{
+    validate_macos_codex_app_layout, validate_macos_computer_use_service_layout,
+};
+use crate::runtime::{ReadinessCacheKey, ReadinessObservationState};
+use satelle_core::session::{
+    ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
+    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, TimeoutPolicy,
 };
 use satelle_core::{ControlPlaneCapability, ControlPlaneOperation, ErrorCode};
 use serde_json::json;
@@ -27,6 +35,49 @@ const FIXTURE_MODE: &str = "SATELLE_CODEX_CONTROL_PLANE_FIXTURE";
 const FIXTURE_SCHEMA_DIR: &str = "SATELLE_CODEX_SCHEMA_FIXTURE_DIR";
 const RAW_NOTIFICATION_CANARY: &str = "PRIVATE_RAW_NOTIFICATION_CANARY";
 const RAW_SCHEMA_CANARY: &str = "PRIVATE_RAW_SCHEMA_CANARY";
+
+#[test]
+fn macos_runtime_identity_binds_every_authenticated_native_executable() {
+    let identity = macos_native_runtime_version("bridge-a", "codex-a", "service-a");
+
+    assert_ne!(
+        identity,
+        macos_native_runtime_version("bridge-b", "codex-a", "service-a")
+    );
+    assert_ne!(
+        identity,
+        macos_native_runtime_version("bridge-a", "codex-b", "service-a")
+    );
+    assert_ne!(
+        identity,
+        macos_native_runtime_version("bridge-a", "codex-a", "service-b")
+    );
+
+    let desktop = DesktopBindingRef::new("desktop-1").expect("desktop binding");
+    let execution_policy = ExecutionPolicy::new(
+        EffectiveModelRef::new("gpt-5.6-luna").expect("model"),
+        ProviderBindingRef::new("openai").expect("provider"),
+        DesktopTarget::new(desktop.clone(), "console-admin"),
+        ApprovalPolicy::OnRequest,
+        SandboxPolicy::WorkspaceWrite,
+        TimeoutPolicy::bounded_seconds(120).expect("timeout"),
+        ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+    );
+    let key = ReadinessCacheKey::new(
+        "codex-native-computer-use",
+        desktop,
+        execution_policy,
+        "0.147.0",
+        identity.clone(),
+        Some("1.0.1000633"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ReadinessObservationState::Granted,
+        ReadinessObservationState::Granted,
+    )
+    .expect("the composite runtime identity must fit the readiness key contract");
+    assert_eq!(key.native_runtime_version(), identity);
+}
 
 fn windows_native_bridge_env() -> BTreeMap<String, String> {
     BTreeMap::from([
@@ -396,6 +447,22 @@ fn inventory_probe_is_bounded_and_terminates_descendants() {
     assert_eq!(error.details["reason"], json!("inventory_unavailable"));
 }
 
+#[test]
+fn native_isolation_budget_covers_inventories_and_macos_authentication() {
+    assert!(
+        NATIVE_ISOLATION_TIMEOUT >= Duration::from_secs(90),
+        "both inventories and macOS service authentication share one deadline"
+    );
+}
+
+#[test]
+fn default_control_plane_budget_covers_a_cold_managed_runtime() {
+    assert!(
+        PROBE_TIMEOUT >= Duration::from_secs(60),
+        "schema generation and the live handshake must fit after a cold runtime integrity check"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn complete_inventory_does_not_wait_for_an_escaped_stdout_holder() {
@@ -541,6 +608,53 @@ fn installed_app_server_is_private_stdio_only() {
     );
 }
 
+#[test]
+fn windows_native_pipe_refresh_replaces_the_retired_managed_address() {
+    let mut binding = NativeMcpBinding {
+        command: r"C:\OpenAI\node_repl.exe".to_string(),
+        args: Vec::new(),
+        env: BTreeMap::from([(
+            "SKY_CUA_NATIVE_PIPE_DIRECTORY".to_string(),
+            r"\\.\pipe\codex-computer-use-11111111-1111-1111-1111-111111111111".to_string(),
+        )]),
+    };
+    let current_config = r#"
+        [mcp_servers.node_repl.env]
+        BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+        SKY_CUA_NATIVE_PIPE = "1"
+        SKY_CUA_NATIVE_PIPE_DIRECTORY = '\\.\pipe\codex-computer-use-22222222-2222-4222-8222-222222222222'
+    "#;
+
+    refresh_windows_native_pipe_binding_from_config(&mut binding, "node_repl", current_config)
+        .expect("the current Codex app pipe must replace the retired managed address");
+
+    assert_eq!(
+        binding.env.get("SKY_CUA_NATIVE_PIPE_DIRECTORY"),
+        Some(&r"\\.\pipe\codex-computer-use-22222222-2222-4222-8222-222222222222".to_string())
+    );
+}
+
+#[test]
+fn windows_native_pipe_refresh_rejects_an_arbitrary_pipe() {
+    let mut binding = NativeMcpBinding {
+        command: r"C:\OpenAI\node_repl.exe".to_string(),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+    };
+    let current_config = r#"
+        [mcp_servers.node_repl.env]
+        BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+        SKY_CUA_NATIVE_PIPE = "1"
+        SKY_CUA_NATIVE_PIPE_DIRECTORY = '\\.\pipe\attacker-controlled'
+    "#;
+
+    assert!(
+        refresh_windows_native_pipe_binding_from_config(&mut binding, "node_repl", current_config)
+            .is_err()
+    );
+    assert!(!binding.env.contains_key("SKY_CUA_NATIVE_PIPE_DIRECTORY"));
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_protected_bridge_selection_preserves_the_admitted_identity() {
@@ -577,6 +691,9 @@ fn windows_protected_bridge_accepts_any_well_formed_desktop_version() {
     ));
     assert!(!windows_package_full_name_has_valid_version(
         "OpenAI.Codex_27..0.0_x64__2p2nqsd0c76g0",
+    ));
+    assert!(!windows_package_full_name_has_valid_version(
+        "OpenAI.Codex_27.1.0_x64__2p2nqsd0c76g0",
     ));
 }
 
@@ -1054,7 +1171,6 @@ fn macos_isolation_selects_the_official_node_repl_path() {
                 "env": {
                     "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS": "1000",
                     "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "SKY_CUA_SERVICE_PATH": "/Users/operator/.codex/computer-use/Codex Computer Use.app",
                     "BROWSER_USE_CODEX_APP_VERSION": "27.1.0",
                     "NODE_REPL_TRUSTED_CODE_PATHS": "/Users/operator/.codex:/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
                     "NODE_REPL_NODE_MODULE_DIRS": "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
@@ -1065,7 +1181,8 @@ fn macos_isolation_selects_the_official_node_repl_path() {
                     "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME": "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative.",
                     "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE": "Control desktop apps on macOS through Computer Use.",
                     "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
-                    "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex"
+                    "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex",
+                    "SKY_CUA_SERVICE_PATH": "/Users/operator/.codex/computer-use/Codex Computer Use.app"
                 }
             }
         }
@@ -1082,6 +1199,7 @@ fn macos_isolation_selects_the_official_node_repl_path() {
     .expect("the official macOS node_repl path must be admitted");
 
     assert_eq!(plan.native_mcp_server_name, "node_repl");
+    assert_eq!(plan.plugin_version, "2.0.0");
     assert_eq!(plan.disabled_mcp_server_names, ["computer-use"]);
     assert_eq!(
         plan.planned_native_action_path,
@@ -1092,6 +1210,20 @@ fn macos_isolation_selects_the_official_node_repl_path() {
         "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
     );
 
+    mcp_inventory[1]["transport"]["env"]["SKY_CUA_SERVICE_PATH"] =
+        json!("/tmp/untrusted/Codex Computer Use.app");
+    let error = codex_isolation_plan_from_json(
+        &plugins,
+        &serde_json::to_vec(&mcp_inventory).expect("serialize tampered service path fixture"),
+        "macos",
+        Path::new("/Users/operator/.codex"),
+        Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+    )
+    .expect_err("an untrusted Computer Use service path must fail closed");
+    assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
+
+    mcp_inventory[1]["transport"]["env"]["SKY_CUA_SERVICE_PATH"] =
+        json!("/Users/operator/.codex/computer-use/Codex Computer Use.app");
     mcp_inventory[1]["transport"]["env"]["UNTRUSTED_EXTRA"] = json!("1");
     let error = codex_isolation_plan_from_json(
         &plugins,
@@ -1117,6 +1249,19 @@ fn macos_isolation_selects_the_official_node_repl_path() {
         Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
     )
     .expect_err("a malformed bridge client digest must fail closed");
+    assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
+
+    mcp_inventory[1]["transport"]["env"]["NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S"] =
+        json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    mcp_inventory[1]["transport"]["env"]["BROWSER_USE_CODEX_APP_VERSION"] = json!("27..1");
+    let error = codex_isolation_plan_from_json(
+        &plugins,
+        &serde_json::to_vec(&mcp_inventory).expect("serialize malformed version fixture"),
+        "macos",
+        Path::new("/Users/operator/.codex"),
+        Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+    )
+    .expect_err("a malformed bridge app version must fail closed");
     assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
 }
 
@@ -1220,12 +1365,66 @@ fn macos_computer_use_service_layout_rejects_redirected_executable_identity() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn macos_codex_app_layout_rejects_redirected_cli_identity() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("create macOS Codex app fixture");
+    // macOS exposes temporary directories through `/var`, which canonicalizes
+    // to `/private/var`. Start from the canonical root so this fixture tests
+    // the embedded CLI identity instead of failing on the parent alias.
+    let fixture_root =
+        std::fs::canonicalize(directory.path()).expect("canonicalize macOS fixture root");
+    let bundle = fixture_root.join("Codex.app");
+    let resources = bundle.join("Contents").join("Resources");
+    std::fs::create_dir_all(&resources).expect("create exact Codex app layout");
+    let executable = resources.join("codex");
+    std::fs::write(&executable, "fixture").expect("write embedded Codex fixture");
+    assert_eq!(
+        validate_macos_codex_app_layout(&bundle)
+            .expect("the exact regular Codex app layout must be accepted"),
+        std::fs::canonicalize(&executable).expect("canonicalize embedded Codex fixture")
+    );
+
+    std::fs::remove_file(&executable).expect("remove regular embedded Codex fixture");
+    let redirected = fixture_root.join("replacement-codex");
+    std::fs::write(&redirected, "replacement").expect("write redirected Codex fixture");
+    symlink(&redirected, &executable).expect("redirect the embedded Codex executable");
+    let error = validate_macos_codex_app_layout(&bundle)
+        .expect_err("a redirected embedded Codex executable must fail closed");
+    assert_eq!(
+        error.details["reason"],
+        json!("codex_app_runtime_untrusted")
+    );
+}
+
+#[test]
+fn macos_computer_use_runtime_uses_the_desktop_bundles_embedded_codex() {
+    let command = macos_codex_app_command(
+        Path::new("/Applications/ChatGPT.app/Contents/Resources/codex"),
+        Path::new("/Users/operator/.codex"),
+    );
+
+    assert_eq!(
+        command.get_program(),
+        "/Applications/ChatGPT.app/Contents/Resources/codex"
+    );
+    assert_eq!(
+        command.get_envs().collect::<Vec<_>>(),
+        [(
+            std::ffi::OsStr::new("CODEX_HOME"),
+            Some(std::ffi::OsStr::new("/Users/operator/.codex"))
+        )]
+    );
+}
+
 #[test]
 fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
     for (platform, command, codex_home, trusted_root) in [
         (
             "macos",
-            "/tmp/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+            "/tmp/Codex.app/Contents/Resources/cua_node/bin/node_repl",
             "/Users/operator/.codex",
             "/Applications/ChatGPT.app/Contents/Resources/cua_node",
         ),
@@ -1265,7 +1464,6 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
                 json!({
                     "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS": "1000",
                     "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "091a81603ff202a16ed56557709bf42d97caf8f0dd2e07ae9e26d7c014d71035",
-                    "SKY_CUA_SERVICE_PATH": "/Users/operator/.codex/computer-use/Codex Computer Use.app",
                     "BROWSER_USE_CODEX_APP_VERSION": "26.730.61639",
                     "NODE_REPL_TRUSTED_CODE_PATHS": "/Users/operator/.codex:/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
                     "NODE_REPL_NODE_MODULE_DIRS": "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
@@ -1276,7 +1474,8 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
                     "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME": "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative.",
                     "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE": "Control desktop apps on macOS through Computer Use.",
                     "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
-                    "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex"
+                    "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex",
+                    "SKY_CUA_SERVICE_PATH": "/Users/operator/.codex/computer-use/Codex Computer Use.app"
                 }),
             )
         } else {

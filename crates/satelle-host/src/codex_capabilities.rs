@@ -30,6 +30,7 @@ const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const APP_POLICY_MESSAGE_LIMIT: usize = 128;
 const APP_POLICY_LINE_LIMIT: u64 = 2 * 1024 * 1024;
 const APP_POLICY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const EFFECTIVE_DEFAULTS_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const APP_POLICY_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const LEGACY_APP_POLICY_LIMIT: u64 = 64 * 1024;
 const CURRENT_APP_POLICY_LIMIT: u64 = 1024 * 1024;
@@ -142,11 +143,6 @@ fn computer_use_allowed_app_ids_from_config(contents: &str) -> Option<BTreeSet<S
 /// Newer releases must still pass the same capability and live-readiness
 /// gates. Version ordering alone never establishes compatibility.
 pub(crate) const MINIMUM_CODEX_VERSION: CodexVersion = CodexVersion::new(0, 144, 0);
-
-// Existing test fixtures use the original name to denote the baseline release.
-// Production admission uses `supports_codex_version` instead of equality.
-#[cfg(test)]
-pub(crate) const REQUIRED_CODEX_VERSION: CodexVersion = MINIMUM_CODEX_VERSION;
 
 /// Every upstream capability required before native Computer Use can be
 /// advertised as supported.
@@ -938,7 +934,7 @@ fn probe_windows_app_policy_with(mut command: Command, timeout: Duration) -> Evi
 pub(crate) fn probe_effective_codex_defaults(
     command: Command,
 ) -> Result<EffectiveCodexDefaults, ()> {
-    probe_effective_codex_defaults_with(command, APP_POLICY_PROBE_TIMEOUT).ok_or(())
+    probe_effective_codex_defaults_with(command, EFFECTIVE_DEFAULTS_PROBE_TIMEOUT).ok_or(())
 }
 
 fn probe_effective_codex_defaults_with(

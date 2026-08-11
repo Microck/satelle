@@ -1,7 +1,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddrV4, TcpStream};
 use std::ptr::{null, null_mut};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -10,18 +11,22 @@ use windows_sys::Win32::Graphics::Gdi::{
     DrawTextW, EndPaint, FillRect, PAINTSTRUCT, UpdateWindow,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HMENU, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_SHOW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage,
-    WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WNDCLASSW, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HMENU, KillTimer, MSG, PostQuitMessage,
+    RegisterClassW, SW_SHOW, SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    TranslateMessage, WM_COMMAND, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WM_TIMER,
+    WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 const WINDOW_TITLE: &str = "Satelle native readiness probe";
 const BUTTON_ID: usize = 100;
+const SHUTDOWN_TIMER_ID: usize = 1;
+const SHUTDOWN_POLL_MILLIS: u32 = 50;
 const WINDOW_WIDTH: i32 = 1024;
 const WINDOW_HEIGHT: i32 = 678;
 const SOURCE_RECT: RECT = RECT {
@@ -38,7 +43,7 @@ const TARGET_RECT: RECT = RECT {
 };
 
 pub(crate) struct WindowsNativeProbeWindow {
-    hwnd: isize,
+    shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -50,6 +55,7 @@ struct ProbeCallback {
 
 struct WindowState {
     callback: ProbeCallback,
+    shutdown: Arc<AtomicBool>,
     click_status: HWND,
     drag_status: HWND,
     click_observed: bool,
@@ -62,19 +68,23 @@ impl WindowsNativeProbeWindow {
         address: SocketAddrV4,
         capability: &str,
         nonce: &str,
+        desktop_session_id: &str,
     ) -> std::io::Result<Self> {
+        require_current_process_session(desktop_session_id)?;
         let callback = ProbeCallback {
             address,
             completion_target: format!("/complete/{capability}"),
             nonce: nonce.to_string(),
         };
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
         let worker = std::thread::Builder::new()
             .name("satelle-native-probe-window".to_string())
-            .spawn(move || run_window(callback, ready_sender))?;
+            .spawn(move || run_window(callback, worker_shutdown, ready_sender))?;
         match ready_receiver.recv() {
-            Ok(Ok(hwnd)) => Ok(Self {
-                hwnd,
+            Ok(Ok(())) => Ok(Self {
+                shutdown,
                 worker: Some(worker),
             }),
             Ok(Err(error)) => {
@@ -93,18 +103,51 @@ impl WindowsNativeProbeWindow {
 
 impl Drop for WindowsNativeProbeWindow {
     fn drop(&mut self) {
-        // HWND is thread-affine for direct destruction. Posting WM_CLOSE lets
-        // the owning message loop destroy the window and release its state.
-        unsafe {
-            PostMessageW(self.hwnd as HWND, WM_CLOSE, 0, 0);
-        }
+        self.shutdown.store(true, Ordering::Release);
+        // The owner-thread timer observes this flag within 50 ms and destroys
+        // its own HWND. Do not send through a copied handle: Windows can reuse
+        // a user-closed HWND for an unrelated window before this guard drops.
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
 }
 
-fn run_window(callback: ProbeCallback, ready_sender: mpsc::SyncSender<std::io::Result<isize>>) {
+fn require_current_process_session(desktop_session_id: &str) -> std::io::Result<()> {
+    let selected_session = desktop_session_id
+        .strip_prefix("windows:wts-session:")
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| std::io::Error::other("the selected Windows desktop session is invalid"))?;
+    let process_session = current_process_session_id()?;
+    if selected_session != process_session {
+        return Err(std::io::Error::other(
+            "the selected Windows desktop session is not owned by this Host process",
+        ));
+    }
+    Ok(())
+}
+
+fn current_process_session_id() -> std::io::Result<u32> {
+    let mut process_session = 0_u32;
+    if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut process_session) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(process_session)
+}
+
+#[cfg(test)]
+pub(crate) fn current_process_desktop_session_id() -> String {
+    format!(
+        "windows:wts-session:{}",
+        current_process_session_id().expect("the test process has a Windows session")
+    )
+}
+
+fn run_window(
+    callback: ProbeCallback,
+    shutdown: Arc<AtomicBool>,
+    ready_sender: mpsc::SyncSender<std::io::Result<()>>,
+) {
     let class_name = wide("SatelleNativeReadinessProbe");
     let title = wide(WINDOW_TITLE);
     let instance = unsafe { GetModuleHandleW(null()) };
@@ -148,6 +191,7 @@ fn run_window(callback: ProbeCallback, ready_sender: mpsc::SyncSender<std::io::R
 
     let state = Box::into_raw(Box::new(WindowState {
         callback,
+        shutdown,
         click_status: null_mut(),
         drag_status: null_mut(),
         click_observed: false,
@@ -168,11 +212,22 @@ fn run_window(callback: ProbeCallback, ready_sender: mpsc::SyncSender<std::io::R
         return;
     }
 
+    if unsafe { SetTimer(hwnd, SHUTDOWN_TIMER_ID, SHUTDOWN_POLL_MILLIS, None) } == 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DestroyWindow(hwnd);
+            drop(Box::from_raw(state));
+        }
+        let _ = ready_sender.send(Err(error));
+        return;
+    }
+
     unsafe {
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
     }
-    if ready_sender.send(Ok(hwnd as isize)).is_err() {
+    if ready_sender.send(Ok(())).is_err() {
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             DestroyWindow(hwnd);
@@ -189,7 +244,6 @@ fn run_window(callback: ProbeCallback, ready_sender: mpsc::SyncSender<std::io::R
         }
     }
     unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         drop(Box::from_raw(state));
     }
 }
@@ -371,11 +425,28 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_PAINT => {
-            paint_drag_surface(hwnd);
+            if paint_drag_surface(hwnd) {
+                0
+            } else {
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
+        }
+        WM_TIMER
+            if !state.is_null()
+                && wparam == SHUTDOWN_TIMER_ID
+                && unsafe { &*state }.shutdown.load(Ordering::Acquire) =>
+        {
+            unsafe {
+                DestroyWindow(hwnd);
+            }
             0
         }
         WM_DESTROY => {
             unsafe {
+                KillTimer(hwnd, SHUTDOWN_TIMER_ID);
+                // Clear the pointer while WM_DESTROY still owns a valid HWND.
+                // After this callback returns, Windows may recycle the handle.
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 PostQuitMessage(0);
             }
             0
@@ -384,11 +455,11 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn paint_drag_surface(hwnd: HWND) {
+fn paint_drag_surface(hwnd: HWND) -> bool {
     let mut paint = PAINTSTRUCT::default();
     let device = unsafe { BeginPaint(hwnd, &mut paint) };
     if device.is_null() {
-        return;
+        return false;
     }
     let source_brush = (COLOR_HIGHLIGHT + 1) as usize as _;
     let target_brush = (COLOR_BTNFACE + 1) as usize as _;
@@ -417,6 +488,7 @@ fn paint_drag_surface(hwnd: HWND) {
         );
         EndPaint(hwnd, &paint);
     }
+    true
 }
 
 impl ProbeCallback {
@@ -441,9 +513,19 @@ impl ProbeCallback {
         if stream.write_all(request.as_bytes()).is_err() {
             return false;
         }
-        let mut response = String::new();
-        stream.read_to_string(&mut response).is_ok()
-            && response.starts_with("HTTP/1.1 204 No Content")
+        const STATUS_LINE: &[u8] = b"HTTP/1.1 204 No Content";
+        let mut response = [0_u8; 64];
+        let mut received = 0;
+        while received < STATUS_LINE.len() {
+            let Ok(count) = stream.read(&mut response[received..]) else {
+                return false;
+            };
+            if count == 0 {
+                return false;
+            }
+            received += count;
+        }
+        response.starts_with(STATUS_LINE)
     }
 }
 
@@ -461,4 +543,28 @@ fn point_in_rect(rect: RECT, point: (i32, i32)) -> bool {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_probe_requires_the_selected_wts_session_to_own_the_host_process() {
+        let mut current_session = 0_u32;
+        assert_ne!(
+            unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut current_session) },
+            0,
+            "Windows must resolve the test process WTS session"
+        );
+
+        require_current_process_session(&format!("windows:wts-session:{current_session}"))
+            .expect("the process-owned desktop session is eligible for a probe window");
+
+        let other_session = current_session.wrapping_add(1);
+        let error =
+            require_current_process_session(&format!("windows:wts-session:{other_session}"))
+                .expect_err("a probe window cannot be created in another WTS session");
+        assert!(error.to_string().contains("not owned by this Host process"));
+    }
 }

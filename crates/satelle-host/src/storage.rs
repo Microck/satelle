@@ -2738,12 +2738,15 @@ impl Storage {
         if let Some(previous_digest) = previous_digest
             && previous_digest != binding.binding_digest()
         {
+            // Provider smoke identity also includes the admitted Codex,
+            // native runtime, and Computer Use plugin versions. The binding
+            // digest cannot be recovered from that composite fingerprint, so
+            // an authorization change invalidates this derived cache as one
+            // unit. Binding mutations are rare; preserving unrelated smoke
+            // rows is not worth risking revival after an identical digest is
+            // restored.
             connection
-                .execute(
-                    "DELETE FROM provider_smoke_results
-                     WHERE provider_config_fingerprint = ?1",
-                    rusqlite::params![previous_digest],
-                )
+                .execute("DELETE FROM provider_smoke_results", [])
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         }
         Ok(())
@@ -2829,15 +2832,12 @@ impl Storage {
                 rusqlite::params![provider_alias, model_alias],
             )
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        if deleted == 1
-            && let Some(previous_digest) = previous_digest
-        {
+        if deleted == 1 && previous_digest.is_some() {
+            // Keep deletion aligned with replacement: a provider smoke row
+            // carries a composite runtime fingerprint, not a reversible copy
+            // of the deleted binding digest.
             connection
-                .execute(
-                    "DELETE FROM provider_smoke_results
-                     WHERE provider_config_fingerprint = ?1",
-                    rusqlite::params![previous_digest],
-                )
+                .execute("DELETE FROM provider_smoke_results", [])
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         }
         Ok(deleted == 1)

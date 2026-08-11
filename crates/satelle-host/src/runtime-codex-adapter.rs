@@ -41,6 +41,10 @@ use time::format_description::well_known::Rfc3339;
 
 const NATIVE_ADAPTER: &str = "codex-native-computer-use";
 const PROVIDER_CHILD_ID: &str = "satelle_runtime";
+const DEFAULT_PROVIDER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(60);
+// Recovery can release ownership only after a conclusive upstream read. Give
+// the managed app-server the same cold-start budget as blocking resolution.
+const PERSISTED_TURN_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn native_approval_event(
     host: &str,
@@ -274,7 +278,7 @@ impl ProductionComputerUseAdapter {
             }
             None => {
                 let deadline = Instant::now()
-                    .checked_add(Duration::from_secs(5))
+                    .checked_add(DEFAULT_PROVIDER_RESOLUTION_TIMEOUT)
                     .ok_or_else(codex_effective_defaults_unavailable)?;
                 let app_server =
                     crate::codex_capabilities::installed_read_only_app_server_command(deadline)?;
@@ -327,6 +331,9 @@ impl ProductionComputerUseAdapter {
         let version = supported_execution_version(&snapshot)?;
         let app_policy_surface = snapshot.evidence.capabilities.approval_observation.surface;
         drop(snapshot);
+        let verified_app_server = crate::codex_capabilities::installed_computer_use_app_server()?;
+        let plugin_version = verified_app_server.plugin_version().to_string();
+        let native_runtime_version = verified_app_server.native_runtime_version().to_string();
 
         let desktops = crate::desktop_sessions::discover()?;
         let platform = crate::codex_capabilities::HostPlatform::current().as_str();
@@ -368,14 +375,13 @@ impl ProductionComputerUseAdapter {
             ),
         );
         let codex_version = version.to_string();
-        let native_runtime_version = format!("codex-native-{codex_version}");
         let key = ReadinessCacheKey::new(
             NATIVE_ADAPTER,
             desktop_binding,
             execution_policy,
             codex_version,
             native_runtime_version,
-            None::<String>,
+            Some(plugin_version),
             readiness_fingerprint(
                 "os-permission",
                 platform,
@@ -489,6 +495,7 @@ impl ProductionComputerUseAdapter {
             &mut persist_thread_ref,
             &mut persist_turn_ref,
             allowed_app_ids,
+            &key,
         ) {
             Ok(()) => self.readiness_from_evidence(
                 &key,
@@ -517,6 +524,7 @@ impl ProductionComputerUseAdapter {
         persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
         allowed_app_ids: &BTreeSet<String>,
+        key: &ReadinessCacheKey,
     ) -> Result<(), NativeSmokeFailure> {
         let deadline = cancellation
             .and_then(super::request::AdmissionCancellation::deadline)
@@ -539,10 +547,22 @@ impl ProductionComputerUseAdapter {
                 error: Box::new(error),
                 dispatch_possible: false,
             })?;
+        if let Some(reason) = native_component_identity_error(
+            key.native_runtime_version(),
+            key.plugin_version(),
+            verified_app_server.native_runtime_version(),
+            verified_app_server.plugin_version(),
+        ) {
+            return Err(native_smoke_failure(reason));
+        }
         let native_action_evidence = verified_app_server.native_action_evidence();
-        let target =
-            NativeActionTarget::spawn(deadline, cancellation, native_action_evidence.clone())
-                .map_err(native_smoke_failure)?;
+        let target = NativeActionTarget::spawn(
+            deadline,
+            cancellation,
+            native_action_evidence.clone(),
+            key.execution_policy().desktop_target().session_id(),
+        )
+        .map_err(native_smoke_failure)?;
         let prompt = native_readiness_prompt(
             target.page_url(),
             &verified_app_server.native_action_path,
@@ -776,6 +796,14 @@ impl ProductionComputerUseAdapter {
             .map_err(|error| mark_probe_dispatch_possible(error, false))?;
         let verified_app_server =
             app_server_command().map_err(|error| mark_probe_dispatch_possible(error, false))?;
+        if let Some(reason) = native_component_identity_error(
+            key.native_runtime_version(),
+            key.plugin_version(),
+            verified_app_server.native_runtime_version(),
+            verified_app_server.plugin_version(),
+        ) {
+            return Err(mark_probe_dispatch_possible(adapter_failure(reason), false));
+        }
         let native_action_evidence = verified_app_server.native_action_evidence();
         // Provider smoke uses the native click-and-drag prompt, so it must use
         // the matching two-action surface and bind the same tool-call evidence.
@@ -784,6 +812,7 @@ impl ProductionComputerUseAdapter {
             deadline,
             persistence.cancellation.cloned(),
             native_action_evidence.clone(),
+            key.execution_policy().desktop_target().session_id(),
         )
         .map_err(|error| mark_probe_dispatch_possible(provider_smoke_failure(error), false))?;
         let page_url = probe.page_url().to_string();
@@ -806,7 +835,7 @@ impl ProductionComputerUseAdapter {
                 &expected_mcp_server_name,
                 ProviderSmokeSessionControl {
                     computer_use_allowed_app_ids: allowed_app_ids,
-                    native_action_evidence,
+                    native_action_evidence: native_action_evidence.clone(),
                     persist_thread_ref: persistence.persist_thread_ref,
                     persist_turn_ref: persistence.persist_turn_ref,
                 },
@@ -828,6 +857,12 @@ impl ProductionComputerUseAdapter {
         probe
             .wait_for_completion()
             .map_err(|error| mark_probe_dispatch_possible(provider_smoke_failure(error), false))?;
+        if !native_action_evidence.completed() {
+            return Err(mark_probe_dispatch_possible(
+                provider_smoke_failure(crate::provider_probe::ProviderProbeError::InvalidRequest),
+                false,
+            ));
+        }
 
         let observed_at = time::OffsetDateTime::now_utc();
         let expires_at = observed_at + self.provider_smoke_success_ttl;
@@ -910,7 +945,7 @@ impl ProductionComputerUseAdapter {
             .as_ref()
             .ok()
             .and_then(|path| prepare_working_directory(path).ok())?;
-        let deadline = Instant::now().checked_add(Duration::from_secs(5))?;
+        let deadline = Instant::now().checked_add(PERSISTED_TURN_READ_TIMEOUT)?;
         let app_server =
             crate::codex_capabilities::installed_read_only_app_server_command(deadline).ok()?;
         read_codex_turn(
@@ -939,7 +974,7 @@ impl ProductionComputerUseAdapter {
             .as_ref()
             .ok()
             .and_then(|path| prepare_working_directory(path).ok())?;
-        let deadline = Instant::now().checked_add(Duration::from_secs(5))?;
+        let deadline = Instant::now().checked_add(PERSISTED_TURN_READ_TIMEOUT)?;
         let app_server =
             crate::codex_capabilities::installed_read_only_app_server_command(deadline).ok()?;
         read_codex_turn(
@@ -1211,11 +1246,13 @@ impl NativeActionTarget {
         deadline: Instant,
         cancellation: Option<&super::request::AdmissionCancellation>,
         evidence: crate::provider_probe::NativeActionEvidence,
+        desktop_session_id: &str,
     ) -> Result<Self, &'static str> {
         let surface = crate::provider_probe::ProviderProbeSurface::start_native_with_evidence(
             deadline,
             cancellation.cloned(),
             evidence,
+            desktop_session_id,
         );
         surface
             .map(|surface| Self { surface })
@@ -1262,6 +1299,24 @@ fn native_target_error(error: crate::provider_probe::ProviderProbeError) -> &'st
     }
 }
 
+fn native_component_identity_error(
+    expected_native_runtime_version: &str,
+    expected_plugin_version: Option<&str>,
+    admitted_native_runtime_version: &str,
+    admitted_plugin_version: &str,
+) -> Option<&'static str> {
+    match expected_plugin_version {
+        Some(expected_plugin)
+            if expected_native_runtime_version == admitted_native_runtime_version
+                && expected_plugin == admitted_plugin_version =>
+        {
+            None
+        }
+        Some(_) => Some("native_component_changed_during_preflight"),
+        None => Some("native_component_identity_unavailable"),
+    }
+}
+
 fn javascript_single_quoted(value: &str) -> String {
     let mut literal = String::with_capacity(value.len() + 2);
     literal.push('\'');
@@ -1299,10 +1354,15 @@ fn native_readiness_prompt(
             if !allowed_app_ids.contains("satelle.exe") {
                 return Err("native_app_approval_unavailable");
             }
-            let script = "globalThis.sky ??= (await import('@oai/sky')).sky; var apps = await sky.list_apps(); var satelle = apps.find(app => app.id.toLowerCase().endsWith('satelle.exe')); if (!satelle) throw new Error('Satelle is unavailable'); var probeWindow = satelle.windows.find(window => window.title === 'Satelle native readiness probe'); if (!probeWindow) throw new Error('Satelle native readiness probe window is unavailable'); await sky.activate_window({ window: probeWindow }); var state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); var buttonMatch = state.accessibility.tree.match(/(\\d+)\\s+button Click to confirm/); if (!buttonMatch) throw new Error('button missing'); await sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) }); await sky.drag({ window: probeWindow, from_x: 211, from_y: 333, to_x: 632, to_y: 438 }); await new Promise(resolve => setTimeout(resolve, 500)); var finalState = await sky.get_window_state({ window: probeWindow, include_screenshot: false, include_text: true }); var observed = finalState.accessibility.tree; if (!observed.includes('Click event observed') || !observed.includes('Drag event observed')) throw new Error('native events missing'); nodeRepl.write('Native click and drag actions observed');".to_string();
+            // The signed bridge exposes the Win32 button through its stable
+            // accessibility label. Resolve its current index instead of
+            // coupling click delivery to window chrome geometry. The painted
+            // drag surfaces have no accessibility elements, so bind their
+            // fixed full-window coordinates to a fresh screenshot.
+            let script = "globalThis.sky ??= (await import('@oai/sky')).sky; var apps = await sky.list_apps(); var satelle = apps.find(app => app.id.toLowerCase().endsWith('satelle.exe')); if (!satelle) throw new Error('Satelle is unavailable'); var probeWindow = satelle.windows.find(window => window.title === 'Satelle native readiness probe'); if (!probeWindow) throw new Error('Satelle native readiness probe window is unavailable'); await sky.activate_window({ window: probeWindow }); var state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); var buttonLine = state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); var buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) }); await new Promise(resolve => setTimeout(resolve, 300)); state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); if (!state.accessibility.tree.includes('Click event observed')) throw new Error('native click event missing'); var screenshot = state.screenshots[0]; if (!screenshot) throw new Error('window screenshot missing after click'); await sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 668, to_y: 461, screenshotId: screenshot.id }); await new Promise(resolve => setTimeout(resolve, 500)); var finalState = await sky.get_window_state({ window: probeWindow, include_screenshot: false, include_text: true }); if (!finalState.accessibility.tree.includes('Drag event observed')) throw new Error('native drag event missing'); nodeRepl.write('Native click and drag actions observed');".to_string();
             native_action_evidence.expect_script_for_app(&script, "satelle.exe");
             Ok(format!(
-                "Use the installed official Computer Use plugin through mcp__node_repl__js immediately. Do not search the tool catalog or read documentation. Your first and only tool call must run this complete JavaScript in one persistent-kernel cell: `{script}`. The Satelle-owned window independently reports both native events to a private loopback capability, and the accessibility tree is formatted text. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list or inspect unrelated apps. Do not inspect Object.keys or probe API shapes. Stop immediately after that one tool call."
+                "Use the installed official Computer Use plugin through mcp__node_repl__js immediately. Do not search the tool catalog or read documentation. Make the call through functions.exec. Its source must begin exactly with `// @exec: {{\"yield_time_ms\": 30000, \"max_output_tokens\": 2000}}` so the nested call returns its terminal output instead of yielding early. Your first and only tool call inside functions.exec must invoke mcp__node_repl__js with the exact `code` argument containing this complete JavaScript in one persistent-kernel cell: `{script}`. The Satelle-owned window independently reports both native events to a private loopback capability, and the accessibility tree is formatted text. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list or inspect unrelated apps. Do not inspect Object.keys or probe API shapes. If functions.exec reports `Script running with cell ID`, call functions.wait for that same cell. Repeat only functions.wait while that same cell remains running, until that same cell reaches a terminal result. Do not invoke any other tool. Stop immediately after that same cell reaches a terminal result."
             ))
         }
         crate::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
@@ -1311,11 +1371,11 @@ fn native_readiness_prompt(
                 return Err("native_app_approval_unavailable");
             }
             let script = format!(
-                "globalThis.sky ??= (await import('@oai/sky')).sky; var state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); await sky.press_key({{ app: 'Safari', key: 'super+n' }}); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var addressMatch = state.text.match(/^\\s*(\\d+) text field .*ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD/m); if (!addressMatch) throw new Error('Safari address field missing'); await sky.set_value({{ app: 'Safari', element_index: Number(addressMatch[1]), value: {page_url} }}); await sky.press_key({{ app: 'Safari', key: 'Return' }}); var buttonMatch = null; for (var attempt = 0; attempt < 8 && !buttonMatch; attempt++) {{ await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1000 : 500)); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); buttonMatch = state.text.match(/^\\s*(\\d+) button Click to confirm/m); }} if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({{ app: 'Safari', element_index: Number(buttonMatch[1]) }}); await sky.drag({{ app: 'Safari', from_x: 180, from_y: 320, to_x: 600, to_y: 425 }}); await new Promise(resolve => setTimeout(resolve, 500)); await sky.press_key({{ app: 'Safari', key: 'super+w' }}); nodeRepl.write('Native click and drag actions dispatched');"
+                "globalThis.sky ??= (await import('@oai/sky')).sky; var state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); await sky.press_key({{ app: 'Safari', key: 'super+n' }}); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var addressLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('text field') && line.includes('ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD')); var addressMatch = addressLine && addressLine.trim().match(/^([0-9]+)/); if (!addressMatch) throw new Error('Safari address field missing'); await sky.set_value({{ app: 'Safari', element_index: Number(addressMatch[1]), value: {page_url} }}); await sky.press_key({{ app: 'Safari', key: 'Return' }}); var buttonMatch = null; for (var attempt = 0; attempt < 8 && !buttonMatch; attempt++) {{ await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1000 : 500)); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var buttonLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); }} if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({{ app: 'Safari', element_index: Number(buttonMatch[1]) }}); await sky.drag({{ app: 'Safari', from_x: 100, from_y: 320, to_x: 600, to_y: 425 }}); await sky.press_key({{ app: 'Safari', key: 'super+w' }}); nodeRepl.write('Native click and drag actions dispatched');"
             );
             native_action_evidence.expect_script_for_app(&script, "com.apple.Safari");
             Ok(format!(
-                "Use the installed official Computer Use plugin through mcp__node_repl__js immediately. Do not search the tool catalog or read documentation. Do not send commentary before the tool call. Your first and only tool call must run this complete JavaScript in one persistent-kernel cell: `{script}`. The private loopback target independently verifies both native events. It rejects a missing click or drag. The target has a fixed 1024 by 678 readiness surface, so the app-window drag coordinates are part of this probe contract. Use only the authenticated sky Computer Use API. Do not use shell, file, generic browser automation, or other network tools. Do not print the app list or inspect unrelated apps. Stop immediately after that one tool call."
+                "Use the installed official Computer Use plugin through mcp__node_repl__js immediately. Do not search the tool catalog or read documentation. Do not send commentary before the tool call. Make the call through functions.exec. Its source must begin exactly with `// @exec: {{\"yield_time_ms\": 30000, \"max_output_tokens\": 2000}}` so the nested call returns its terminal output instead of yielding early. Your first and only tool call inside functions.exec must invoke mcp__node_repl__js with the exact `code` argument containing this complete JavaScript in one persistent-kernel cell: `{script}`. The private loopback target independently verifies both native events. It rejects a missing click or drag. The target has a fixed 1024 by 678 readiness surface, so the app-window drag coordinates are part of this probe contract. Use only the authenticated sky Computer Use API. Do not use shell, file, generic browser automation, or other network tools. Do not print the app list or inspect unrelated apps. If functions.exec reports `Script running with cell ID`, call functions.wait for that same cell. Repeat only functions.wait while that same cell remains running, until that same cell reaches a terminal result. Do not invoke any other tool. Stop immediately after that same cell reaches a terminal result."
             ))
         }
     }
@@ -2336,6 +2396,7 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
             persist_thread_ref,
             persist_turn_ref,
             &allowed_app_ids,
+            key,
         ) {
             Ok(()) => NativeProbeResult::Passed(evidence),
             Err(failure) if cancellation.is_requested_or_expired() => {
@@ -2656,6 +2717,22 @@ fn host_turn_timeout_ceiling() -> Result<TimeoutPolicy, SatelleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_provider_resolution_allows_a_cold_managed_control_plane() {
+        assert!(
+            DEFAULT_PROVIDER_RESOLUTION_TIMEOUT >= Duration::from_secs(60),
+            "default resolution must include serialized inventory and app-server startup"
+        );
+    }
+
+    #[test]
+    fn persisted_turn_recovery_allows_a_cold_managed_control_plane() {
+        assert!(
+            PERSISTED_TURN_READ_TIMEOUT >= Duration::from_secs(120),
+            "recovery must outlive cold app-server startup before retaining ownership as unknown"
+        );
+    }
 
     #[test]
     fn native_approval_event_contains_only_normalized_manual_action_state() {
@@ -3300,7 +3377,7 @@ mod tests {
     fn control_plane_failure_precedes_live_preflight_for_run_and_steer() {
         let evidence = crate::codex_capabilities::Phase0CapabilityEvidence {
             codex_version: crate::codex_capabilities::CodexVersionEvidence::Detected {
-                version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                version: crate::codex_capabilities::MINIMUM_CODEX_VERSION,
             },
             host_platform: crate::codex_capabilities::HostPlatform::Windows,
             capabilities: crate::codex_capabilities::CapabilityMatrix::unproven(),
@@ -3566,7 +3643,7 @@ mod tests {
             policy,
             "0.144.0",
             "codex-native-0.144.0",
-            None::<String>,
+            Some("test-plugin-1"),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             ReadinessObservationState::Unknown,
@@ -3662,6 +3739,50 @@ mod tests {
                 .with_provider_binding(&changed_endpoint)
                 .provider_config_fingerprint(),
             "endpoint changes must invalidate provider smoke evidence"
+        );
+        let changed_plugin_key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            key.desktop_binding().clone(),
+            key.execution_policy().clone(),
+            key.codex_version(),
+            key.native_runtime_version(),
+            Some("2.0.0"),
+            key.os_permission_fingerprint(),
+            key.app_approval_fingerprint(),
+            key.os_permission_state(),
+            key.app_approval_state(),
+        )
+        .unwrap();
+        assert_ne!(
+            key.clone()
+                .with_provider_binding(&binding)
+                .provider_config_fingerprint(),
+            changed_plugin_key
+                .with_provider_binding(&binding)
+                .provider_config_fingerprint(),
+            "desktop plugin updates must invalidate provider smoke evidence"
+        );
+        let changed_bridge_key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            key.desktop_binding().clone(),
+            key.execution_policy().clone(),
+            key.codex_version(),
+            "sha256-updated-native-bridge",
+            key.plugin_version(),
+            key.os_permission_fingerprint(),
+            key.app_approval_fingerprint(),
+            key.os_permission_state(),
+            key.app_approval_state(),
+        )
+        .unwrap();
+        assert_ne!(
+            key.clone()
+                .with_provider_binding(&binding)
+                .provider_config_fingerprint(),
+            changed_bridge_key
+                .with_provider_binding(&binding)
+                .provider_config_fingerprint(),
+            "authenticated native bridge updates must invalidate provider smoke evidence"
         );
         let observed_at = time::OffsetDateTime::now_utc();
         let mut persist_thread_ref = |_value: &str| Ok(());
@@ -3784,6 +3905,26 @@ mod tests {
     }
 
     #[test]
+    fn native_component_identity_changes_fail_closed_before_dispatch() {
+        assert_eq!(
+            native_component_identity_error("bridge-b", None, "bridge-b", "2.0.0"),
+            Some("native_component_identity_unavailable")
+        );
+        assert_eq!(
+            native_component_identity_error("bridge-a", Some("2.0.0"), "bridge-b", "2.0.0"),
+            Some("native_component_changed_during_preflight")
+        );
+        assert_eq!(
+            native_component_identity_error("bridge-b", Some("1.0.0"), "bridge-b", "2.0.0"),
+            Some("native_component_changed_during_preflight")
+        );
+        assert_eq!(
+            native_component_identity_error("bridge-b", Some("2.0.0"), "bridge-b", "2.0.0"),
+            None
+        );
+    }
+
+    #[test]
     fn live_provider_probe_requires_exact_native_callbacks_before_cacheable_evidence() {
         let fixture = crate::codex_session::tests::compile_fixture();
         let working_directory = tempfile::tempdir().expect("provider probe working directory");
@@ -3794,10 +3935,14 @@ mod tests {
             Ok(working_directory.path().join("codex-work")),
         );
         let desktop_binding = DesktopBindingRef::new("desktop-live-provider-probe").unwrap();
+        #[cfg(windows)]
+        let desktop_session_id = crate::windows_native_probe::current_process_desktop_session_id();
+        #[cfg(not(windows))]
+        let desktop_session_id = "provider-probe-session".to_string();
         let policy = ExecutionPolicy::new(
             EffectiveModelRef::new("visual-provider-model").unwrap(),
             ProviderBindingRef::new("responses-provider").unwrap(),
-            DesktopTarget::new(desktop_binding.clone(), "provider-probe-session"),
+            DesktopTarget::new(desktop_binding.clone(), desktop_session_id),
             ApprovalPolicy::OnRequest,
             SandboxPolicy::WorkspaceWrite,
             TimeoutPolicy::bounded_seconds(120).unwrap(),
@@ -3818,8 +3963,8 @@ mod tests {
             desktop_binding,
             policy,
             "0.144.0",
-            "codex-native-0.144.0",
-            None::<String>,
+            "cdhash-test-bridge-1",
+            Some("test-plugin-1"),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             ReadinessObservationState::Unknown,
@@ -3833,9 +3978,22 @@ mod tests {
                 None,
             );
 
-        for (scenario, should_pass) in [
-            ("provider-probe-responses", true),
-            ("provider-probe-text-only", false),
+        for (scenario, expected_failure) in [
+            ("provider-probe-responses", None),
+            (
+                "provider-probe-text-only",
+                Some((
+                    ErrorCode::ProviderSmokeTestTimeout,
+                    "provider_smoke_test_timed_out",
+                )),
+            ),
+            (
+                "provider-probe-invalidated-after-callbacks",
+                Some((
+                    ErrorCode::ComputerUseNotReady,
+                    "provider_smoke_callback_invalid",
+                )),
+            ),
         ] {
             let directory = tempfile::tempdir().expect("provider probe scenario directory");
             let protocol_log = directory.path().join("requests.jsonl");
@@ -3877,7 +4035,14 @@ mod tests {
                 &mut persistence,
                 || Ok(crate::codex_capabilities::VerifiedComputerUseAppServer::for_test(command)),
             );
-            if should_pass {
+            if let Some((expected_code, expected_reason)) = expected_failure {
+                let error = outcome.expect_err("invalid provider smoke evidence must fail closed");
+                assert_eq!(error.code, expected_code);
+                assert_eq!(error.details["reason"], expected_reason);
+                let protocol =
+                    std::fs::read_to_string(&protocol_log).expect("provider protocol log");
+                assert!(protocol.contains(r#""method":"turn/start""#));
+            } else {
                 let evidence = outcome.expect("the exact click and drag callbacks should pass");
                 assert_eq!(evidence.source(), ProviderSmokeSource::Live);
                 assert_eq!(
@@ -3894,13 +4059,6 @@ mod tests {
                     args.lines()
                         .any(|arg| arg == "model_providers.satelle_runtime.wire_api=\"responses\"")
                 );
-            } else {
-                let error = outcome.expect_err("text completion cannot satisfy the UI probe");
-                assert_eq!(error.code, ErrorCode::ProviderSmokeTestTimeout);
-                assert_eq!(error.details["reason"], "provider_smoke_test_timed_out");
-                let protocol =
-                    std::fs::read_to_string(&protocol_log).expect("provider protocol log");
-                assert!(protocol.contains(r#""method":"turn/start""#));
             }
         }
     }
@@ -4249,14 +4407,47 @@ mod tests {
         assert!(prompt.contains("sky.activate_window({ window: probeWindow })"));
         assert!(!prompt.contains("sky.type_text"));
         assert!(prompt.contains("sky.get_window_state({ window: probeWindow"));
-        assert!(prompt.contains("state.accessibility.tree"));
+        assert!(prompt.contains("finalState.accessibility.tree"));
         assert!(prompt.contains("accessibility tree is formatted text"));
-        assert!(prompt.contains("click"));
-        assert!(prompt.contains("element_index: Number(buttonMatch[1])"));
-        assert!(prompt.contains("sky.drag({ window: probeWindow"));
+        // Resolve the indexed native button by its stable label. Only the
+        // painted drag surface remains bound to the fixed window geometry.
+        assert!(prompt.contains("button Click to confirm"));
+        assert!(prompt.contains("buttonMatch"));
+        assert!(
+            prompt.contains(
+                "sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) })"
+            )
+        );
+        assert!(prompt.contains(
+            "sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 668, to_y: 461"
+        ));
+        assert!(prompt.contains("screenshotId: screenshot.id"));
+        let click = prompt
+            .find("await sky.click({ window: probeWindow")
+            .expect("the probe must click the fixed readiness control");
+        let refreshed_state = prompt[click..]
+            .find("state = await sky.get_window_state({ window: probeWindow, include_screenshot: true")
+            .map(|offset| click + offset)
+            .expect("the probe must refresh screenshot state after the click");
+        let drag = prompt
+            .find("await sky.drag({ window: probeWindow")
+            .expect("the probe must drag on the readiness surface");
+        assert!(click < refreshed_state);
+        assert!(refreshed_state < drag);
         assert!(prompt.contains("first and only tool call"));
+        assert!(prompt.contains("through functions.exec"));
+        assert!(prompt.contains("exact `code` argument"));
+        assert!(prompt.contains(
+            "If functions.exec reports `Script running with cell ID`, call functions.wait"
+        ));
+        assert!(prompt.contains("until that same cell reaches a terminal result"));
+        assert!(
+            prompt.contains("// @exec: {\"yield_time_ms\": 30000, \"max_output_tokens\": 2000}")
+        );
         assert!(prompt.contains("Click event observed"));
         assert!(prompt.contains("Drag event observed"));
+        assert!(prompt.contains("native click event missing"));
+        assert!(prompt.contains("native drag event missing"));
         assert!(prompt.contains(
             "Do not use shell, separate file tools, browser automation, or network tools"
         ));
@@ -4604,8 +4795,15 @@ mod tests {
         assert!(prompt.contains("click"));
         assert!(prompt.contains("drag"));
         assert!(!prompt.contains("readiness-nonce"));
-        assert!(prompt.contains("var observed = finalState.accessibility.tree;"));
-        assert!(!prompt.contains(".split("));
+        assert!(prompt.contains("finalState.accessibility.tree.includes('Drag event observed')"));
+        assert!(prompt.contains(
+            "state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm'))"
+        ));
+        assert!(
+            prompt.contains(
+                "sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) })"
+            )
+        );
     }
 
     #[test]
@@ -4621,6 +4819,9 @@ mod tests {
 
         assert!(prompt.contains("mcp__node_repl__js"));
         assert!(prompt.contains("first and only tool call"));
+        assert!(prompt.contains(
+            "If functions.exec reports `Script running with cell ID`, call functions.wait"
+        ));
         assert!(prompt.contains("import('@oai/sky')"));
         let initial_state = prompt
             .find("get_app_state({ app: 'Safari', disableDiff: true })")
@@ -4647,7 +4848,7 @@ mod tests {
         assert!(!prompt.contains("finalState.text.includes"));
         assert!(!prompt.contains("native events missing"));
         assert!(prompt.contains("Native click and drag actions dispatched"));
-        assert!(prompt.contains("from_x: 180, from_y: 320, to_x: 600, to_y: 425"));
+        assert!(prompt.contains("from_x: 100, from_y: 320, to_x: 600, to_y: 425"));
         assert!(prompt.contains("sky.press_key({ app: 'Safari', key: 'super+w' })"));
         assert!(prompt.contains("independently verifies both native events"));
         assert!(prompt.contains("Do not search the tool catalog"));

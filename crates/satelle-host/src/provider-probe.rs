@@ -324,7 +324,13 @@ impl ProviderProbeSurface {
         deadline: Instant,
         cancellation: Option<crate::runtime::AdmissionCancellation>,
     ) -> Result<Self, ProviderProbeError> {
-        Self::start_with_requirements(deadline, cancellation, ProbeRequirements::DragOnly, None)
+        Self::start_with_requirements(
+            deadline,
+            cancellation,
+            ProbeRequirements::DragOnly,
+            None,
+            None,
+        )
     }
 
     /// Starts the independent native action proof. The same private loopback
@@ -339,6 +345,7 @@ impl ProviderProbeSurface {
             cancellation,
             ProbeRequirements::ClickAndDrag,
             None,
+            None,
         )
     }
 
@@ -346,12 +353,14 @@ impl ProviderProbeSurface {
         deadline: Instant,
         cancellation: Option<crate::runtime::AdmissionCancellation>,
         evidence: NativeActionEvidence,
+        desktop_session_id: &str,
     ) -> Result<Self, ProviderProbeError> {
         Self::start_with_requirements(
             deadline,
             cancellation,
             ProbeRequirements::ClickAndDrag,
             Some(evidence),
+            Some(desktop_session_id),
         )
     }
 
@@ -360,7 +369,10 @@ impl ProviderProbeSurface {
         cancellation: Option<crate::runtime::AdmissionCancellation>,
         requirements: ProbeRequirements,
         native_action_evidence: Option<NativeActionEvidence>,
+        desktop_session_id: Option<&str>,
     ) -> Result<Self, ProviderProbeError> {
+        #[cfg(not(windows))]
+        let _ = desktop_session_id;
         if Instant::now() >= deadline {
             return Err(ProviderProbeError::TimedOut);
         }
@@ -395,6 +407,7 @@ impl ProviderProbeSurface {
                     address,
                     &capability,
                     &nonce,
+                    desktop_session_id.expect("native Windows probes bind an exact desktop"),
                 )
             })
             .transpose()
@@ -872,7 +885,7 @@ fn write_page(
         #[cfg(test)]
         ProbeRequirements::DragOnly => String::new(),
         ProbeRequirements::ClickAndDrag => format!(
-            "<button id=confirm type=button>Click to confirm</button><script>document.querySelector('#confirm').addEventListener('click',event=>{{if(!event.isTrusted)return;event.currentTarget.textContent='Click event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',body:'nonce={nonce}&action=click'}});}});</script>"
+            "<button id=confirm type=button>Click to confirm</button><script>document.querySelector('#confirm').addEventListener('click',event=>{{if(!event.isTrusted)return;event.currentTarget.textContent='Click event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',keepalive:true,body:'nonce={nonce}&action=click'}});}});</script>"
         ),
     };
     let title = match requirements {
@@ -880,8 +893,12 @@ fn write_page(
         ProbeRequirements::DragOnly => "Satelle provider probe",
         ProbeRequirements::ClickAndDrag => "Satelle native readiness probe",
     };
+    // The macOS Window API drags at app-window coordinates. A range control
+    // turns real pointer travel into a trusted, observable value change. This
+    // avoids HTML drag-and-drop semantics, which Safari may not emit for the
+    // Computer Use service's synthesized mouse gesture.
     let body = format!(
-        "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><link rel=icon href=data:,><title>{title}</title><style>main{{font:24px sans-serif;padding:40px}}button,#source,#target{{display:block;box-sizing:border-box;width:320px;min-height:80px;margin:24px 0;padding:24px;border:3px solid #222;background:#fff;color:#111;text-align:center}}#source{{cursor:grab}}#target{{margin-left:420px;background:#eee}}</style><main><p>Nonce: <strong>{nonce}</strong></p>{click_control}<div id=source draggable=true>Drag from here</div><div id=target>Drop here</div></main><script>const source=document.querySelector('#source');const target=document.querySelector('#target');let dragStart=null;let dragSent=false;let sourceDragStarted=false;const completeDrag=()=>{{if(dragSent)return;dragSent=true;target.textContent='Drag event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',body:'nonce={nonce}&action=drag'}});}};const rememberStart=event=>{{if(!event.isTrusted)return;dragStart={{x:event.clientX,y:event.clientY}};}};const movedFromSource=event=>dragStart&&Math.hypot(event.clientX-dragStart.x,event.clientY-dragStart.y)>100;const completeAt=event=>{{if(!event.isTrusted)return;const end=document.elementFromPoint(event.clientX,event.clientY);if(movedFromSource(event)&&end?.closest('#target'))completeDrag();dragStart=null;}};source.addEventListener('mousedown',rememberStart);source.addEventListener('pointerdown',rememberStart);document.addEventListener('mouseup',completeAt);document.addEventListener('pointerup',completeAt);source.addEventListener('dragstart',event=>{{if(!event.isTrusted)return;sourceDragStarted=true;dragStart??={{x:event.clientX,y:event.clientY}};event.dataTransfer.setData('text/plain','satelle');}});source.addEventListener('dragend',completeAt);target.addEventListener('mousemove',event=>{{if(!event.isTrusted)return;if(event.buttons&1&&movedFromSource(event))completeDrag();}});target.addEventListener('pointermove',event=>{{if(!event.isTrusted)return;if(event.buttons&1&&movedFromSource(event))completeDrag();}});target.addEventListener('dragover',event=>{{if(!event.isTrusted)return;event.preventDefault();if(sourceDragStarted)completeDrag();}});target.addEventListener('drop',event=>{{if(!event.isTrusted)return;event.preventDefault();if(sourceDragStarted)completeDrag();}});</script>"
+        "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><link rel=icon href=data:,><title>{title}</title><style>main{{font:24px sans-serif;padding:40px}}button{{display:block;box-sizing:border-box;width:320px;min-height:80px;margin:24px 0;padding:24px;border:3px solid #222;background:#fff;color:#111;text-align:center}}#source{{position:fixed;left:48px;top:228px;width:740px;height:80px;margin:0;cursor:grab}}#target{{position:fixed;left:48px;top:332px}}</style><main><p>Nonce: <strong>{nonce}</strong></p>{click_control}<label id=target for=source>Drag the control</label><input id=source type=range min=0 max=100 value=0></main><script>const source=document.querySelector('#source');const target=document.querySelector('#target');let dragSent=false;const completeDrag=event=>{{if(!event.isTrusted||Number(event.currentTarget.value)<50||dragSent)return;dragSent=true;target.textContent='Drag event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',keepalive:true,body:'nonce={nonce}&action=drag'}});}};source.addEventListener('input',completeDrag);</script>"
     );
     write_response(stream, "200 OK", "text/html; charset=utf-8", &body)
 }
@@ -1128,23 +1145,14 @@ mod tests {
 
         assert!(page.contains("Satelle native readiness probe"));
         assert!(page.contains("<button id=confirm type=button>Click to confirm</button>"));
-        assert!(page.contains("#source,#target"));
-        assert!(page.contains("Drag from here"));
-        assert!(page.contains("Drop here"));
-        assert!(page.contains("Math.hypot(event.clientX-dragStart.x"));
-        assert!(page.contains("document.elementFromPoint(event.clientX,event.clientY)"));
-        assert!(page.contains("sourceDragStarted"));
-        assert!(page.contains("source.addEventListener('pointerdown',rememberStart)"));
-        assert!(page.contains("document.addEventListener('pointerup',completeAt)"));
-        assert!(page.contains("dragStart??={x:event.clientX,y:event.clientY}"));
-        assert!(page.contains("if(sourceDragStarted)completeDrag()"));
-        assert!(page.contains("const movedFromSource=event=>dragStart&&Math.hypot"));
-        assert!(page.contains("event.buttons&1&&movedFromSource(event)"));
-        assert!(page.contains("source.addEventListener('dragend'"));
-        assert!(page.contains("end?.closest('#target')"));
-        assert!(page.contains("event.buttons&1"));
+        assert!(page.contains("<input id=source type=range min=0 max=100 value=0>"));
+        assert!(page.contains("#source{position:fixed;left:48px;top:228px"));
+        assert!(page.contains("width:740px;height:80px"));
+        assert!(page.contains("source.addEventListener('input',completeDrag)"));
+        assert!(page.contains("Number(event.currentTarget.value)<50"));
         assert!(page.contains("Click event observed"));
         assert!(page.contains("Drag event observed"));
+        assert_eq!(page.matches("keepalive:true").count(), 2);
         assert!(page.contains("if(!event.isTrusted)return"));
 
         let nonce = between(&page, "Nonce: <strong>", "</strong>");

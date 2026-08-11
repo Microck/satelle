@@ -2458,6 +2458,7 @@ dependencies = [
  "command-group",
  "console",
  "flate2",
+ "hyper",
  "jsonschema",
  "libc",
  "notify",

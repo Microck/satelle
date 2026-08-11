@@ -42,18 +42,6 @@ fn compatible_connection(observation: &DesktopObservation) -> Option<(&'static s
     })
 }
 
-#[cfg(any(test, windows))]
-fn prefer_windows_observation(
-    daemon_session: DesktopObservation,
-    active_console: Option<DesktopObservation>,
-) -> DesktopObservation {
-    if compatible_connection(&daemon_session).is_some() {
-        daemon_session
-    } else {
-        active_console.unwrap_or(daemon_session)
-    }
-}
-
 fn record(observation: DesktopObservation) -> Option<DesktopSessionRecord> {
     let (connection, is_console, is_remote) = compatible_connection(&observation)?;
     let native_selector = observation.native_selector;
@@ -104,27 +92,11 @@ mod platform {
         }
         // SAFETY: this function takes no pointers and returns an identifier.
         let console_session = unsafe { WTSGetActiveConsoleSessionId() };
-        let daemon_observation = observe_session(session_id, console_session);
-
-        // Task Scheduler and SSH can host the daemon outside the interactive
-        // window station even while a real console user is active. Preserve a
-        // compatible daemon-owned remote session, but otherwise query the
-        // live console instead of publishing an empty background session.
-        let console_observation = (console_session != u32::MAX
-            && console_session != session_id
-            && !daemon_observation
-                .as_ref()
-                .is_ok_and(|observation| super::compatible_connection(observation).is_some()))
-        .then(|| observe_session(console_session, console_session))
-        .transpose()?;
-
-        match daemon_observation {
-            Ok(observation) => Ok(Some(super::prefer_windows_observation(
-                observation,
-                console_observation,
-            ))),
-            Err(error) => console_observation.map(Some).ok_or(error),
-        }
+        // Native Computer Use runs inside this Host process and the probe
+        // rejects any WTS selector owned by another process session. An SSH or
+        // background Host therefore cannot advertise a separate live console;
+        // setup must launch the Host in that interactive session first.
+        observe_session(session_id, console_session).map(Some)
     }
 
     fn observe_session(
@@ -291,6 +263,15 @@ mod platform {
         // under the Core Foundation create rule, so this wrapper owns one
         // matching release.
         let user = unsafe { CFString::wrap_under_create_rule(raw_user) }.to_string();
+        // SystemConfiguration uses this sentinel when no visible desktop has
+        // an active owner. Publishing it as a real session would admit native
+        // work into the macOS login screen.
+        if user == "loginwindow" {
+            return Err(discovery_error(
+                "macOS could not resolve the active console user",
+                "SystemConfiguration reported the loginwindow sentinel",
+            ));
+        }
         Ok((user, uid))
     }
 
@@ -349,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_background_host_falls_back_to_the_active_console_session() {
+    fn windows_background_host_does_not_publish_an_off_process_console_session() {
         let background = DesktopObservation {
             platform_name: "Windows",
             native_selector: "windows:wts-session:0".to_string(),
@@ -358,48 +339,7 @@ mod tests {
             is_console: false,
             is_remote: false,
         };
-        let console = DesktopObservation {
-            platform_name: "Windows",
-            native_selector: "windows:wts-session:2".to_string(),
-            desktop_user: "Administrator".to_string(),
-            active: true,
-            is_console: true,
-            is_remote: false,
-        };
-
-        let session = record(prefer_windows_observation(background, Some(console)))
-            .expect("the active console is the compatible visible desktop");
-
-        assert_eq!(session.session_id, "windows:wts-session:2");
-        assert_eq!(session.desktop_user, "Administrator");
-        assert_eq!(session.portable_selectors, ["active", "console"]);
-    }
-
-    #[test]
-    fn windows_active_remote_host_remains_selected_over_the_console_session() {
-        let remote = DesktopObservation {
-            platform_name: "Windows",
-            native_selector: "windows:wts-session:4".to_string(),
-            desktop_user: "remote-user".to_string(),
-            active: true,
-            is_console: false,
-            is_remote: true,
-        };
-        let console = DesktopObservation {
-            platform_name: "Windows",
-            native_selector: "windows:wts-session:2".to_string(),
-            desktop_user: "console-user".to_string(),
-            active: true,
-            is_console: true,
-            is_remote: false,
-        };
-
-        let session = record(prefer_windows_observation(remote, Some(console)))
-            .expect("an active remote daemon session remains the compatible desktop");
-
-        assert_eq!(session.session_id, "windows:wts-session:4");
-        assert_eq!(session.desktop_user, "remote-user");
-        assert_eq!(session.portable_selectors, ["active", "remote"]);
+        assert!(record(background).is_none());
     }
 
     #[test]
@@ -482,8 +422,22 @@ mod tests {
     fn windows_native_discovery_returns_at_most_the_daemon_process_session() {
         let sessions = discover().expect("Windows WTS discovery");
         assert!(sessions.len() <= 1);
+        let mut process_session = 0_u32;
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+                    windows_sys::Win32::System::Threading::GetCurrentProcessId(),
+                    &mut process_session,
+                )
+            },
+            0,
+            "Windows must resolve the test process WTS session"
+        );
         for session in sessions {
-            assert!(session.session_id.starts_with("windows:wts-session:"));
+            assert_eq!(
+                session.session_id,
+                format!("windows:wts-session:{process_session}")
+            );
             assert_eq!(session.native_selectors.len(), 1);
             assert_eq!(session.native_selectors[0], session.session_id);
             assert_eq!(session.state, "active");

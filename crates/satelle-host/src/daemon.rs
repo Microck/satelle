@@ -2112,7 +2112,7 @@ mod tests {
         assert_eq!(
             runtime_compatibility_reason(
                 crate::codex_capabilities::CodexVersionEvidence::Detected {
-                    version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                    version: crate::codex_capabilities::MINIMUM_CODEX_VERSION,
                 },
                 [BlockerReason::NonStableSurface].into_iter(),
             ),
@@ -2176,10 +2176,10 @@ mod tests {
                 .write()
                 .expect("write retained production capability snapshot");
             retained.evidence.codex_version = CodexVersionEvidence::Detected {
-                version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                version: crate::codex_capabilities::MINIMUM_CODEX_VERSION,
             };
             retained.verdict = Phase0SupportVerdict::Supported {
-                codex_version: crate::codex_capabilities::REQUIRED_CODEX_VERSION,
+                codex_version: crate::codex_capabilities::MINIMUM_CODEX_VERSION,
                 host_platform: HostPlatform::Windows,
             };
         }

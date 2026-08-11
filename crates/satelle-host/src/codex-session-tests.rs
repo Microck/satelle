@@ -177,7 +177,10 @@ fn main() {
             let status = if scenario == "goal-active" { "active" } else { "paused" };
             send(&mut output, &format!(r#"{{"id":3,"result":{{"goal":{{"threadId":"thread-1","objective":"perform the harmless action PRIVATE_PROMPT_CANARY","status":"{status}","createdAt":1,"updatedAt":1,"tokensUsed":0,"timeUsedSeconds":0,"tokenBudget":null}}}}}}"#));
             receive(&mut input, &log);
-        } else if scenario == "provider-probe-responses" {
+        } else if matches!(
+            scenario.as_str(),
+            "provider-probe-responses" | "provider-probe-invalidated-after-callbacks"
+        ) {
             provider_probe_request = Some(next_request);
         }
     }
@@ -215,7 +218,10 @@ fn main() {
         send(&mut output, r#"{"id":4,"result":{}}"#);
         return;
     }
-    if scenario == "provider-probe-responses" {
+    if matches!(
+        scenario.as_str(),
+        "provider-probe-responses" | "provider-probe-invalidated-after-callbacks"
+    ) {
         let next_request = provider_probe_request.as_deref().unwrap();
         let script_start = next_request.find("cell: `").unwrap() + "cell: `".len();
         let script_end = script_start + next_request[script_start..].find('`').unwrap();
@@ -225,6 +231,9 @@ fn main() {
         complete_provider_probe_actions(&next_request);
         let item = item.replace(r#""status":"inProgress""#, r#""status":"completed""#);
         send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{item}}}}}"#));
+        if scenario == "provider-probe-invalidated-after-callbacks" {
+            send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{{"id":"item-extra","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{{"code":"unexpected()"}},"status":"inProgress"}}}}}}"#));
+        }
     }
     if scenario == "server-requests" {
         send(&mut output, &format!(r#"{{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"additionalPermissions":{{"fileSystem":{{"entries":[]}}}},"availableDecisions":["accept","decline"]}}}}"#));
@@ -387,9 +396,9 @@ fn complete_provider_probe_actions(turn_request: &str) {
     page_stream.read_to_string(&mut page).unwrap();
     assert!(page.starts_with("HTTP/1.1 200 OK"));
     assert!(page.contains("id=confirm type=button"));
-    assert!(page.contains("id=source draggable=true"));
+    assert!(page.contains("id=source type=range min=0 max=100 value=0"));
     assert!(page.contains("id=target"));
-    assert!(page.contains("addEventListener('drop'"));
+    assert!(page.contains("source.addEventListener('input',completeDrag)"));
 
     let nonce_start = page.find("<strong>").unwrap() + "<strong>".len();
     let nonce_end = nonce_start + page[nonce_start..].find("</strong>").unwrap();

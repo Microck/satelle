@@ -1252,6 +1252,29 @@ fn validate_local_daemon_path_overrides(
     Ok(())
 }
 
+fn transport_proves_daemon_is_absent(error: &reqwest::Error) -> bool {
+    if error.is_connect() {
+        return true;
+    }
+    let mut cause = std::error::Error::source(error);
+    while let Some(current) = cause {
+        if current
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(|error| error.is_closed() || error.is_incomplete_message())
+        {
+            return true;
+        }
+        if current
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset)
+        {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
+}
+
 fn map_ssh_daemon_bootstrap_error(
     alias: &str,
     error: ssh_bootstrap::SshBootstrapError,
@@ -1768,27 +1791,13 @@ impl SshSetupTransport {
         )
         .map_err(|error| direct_transport_error(&self.alias, error))?;
         if self.requires_first_trust {
-            let discovered_identity = match client.discover_host_identity() {
-                Ok(identity) => identity,
-                // A first install has no daemon behind the SSH tunnel yet. SSH
-                // can still establish the forwarding listener, after which the
-                // HTTP client observes a reset instead of a connect error. That
-                // is the expected missing-artifact state, not an unreachable
-                // Host. Setup remains read-only until the later trust and
-                // mutation boundaries.
-                Err(DaemonClientError::Transport(_)) => {
-                    return Ok(Self::missing_current_daemon_observation());
-                }
-                Err(DaemonClientError::Api { status: _, error })
-                    if matches!(
-                        error.code(),
-                        ApiErrorCode::AuthenticationFailed | ApiErrorCode::HostIdentityMismatch
-                    ) =>
-                {
-                    return Err(self.unauthenticated_daemon_version_error());
-                }
-                Err(error) => return Err(direct_transport_error(&self.alias, error)),
-            };
+            let discovered_identity =
+                match self.first_trust_discovered_identity(client.discover_host_identity())? {
+                    Some(identity) => identity,
+                    None => {
+                        return Ok(Self::missing_current_daemon_observation());
+                    }
+                };
             let token = ApiBearerToken::parse(
                 first_trust_token
                     .expect("first-trust probing retains its typed credential")
@@ -1805,6 +1814,34 @@ impl SshSetupTransport {
             return self.current_daemon_observation(client.capabilities());
         }
         self.current_daemon_observation(client.capabilities())
+    }
+
+    fn first_trust_discovered_identity(
+        &self,
+        response: Result<String, DaemonClientError>,
+    ) -> Result<Option<String>, SatelleError> {
+        match response {
+            Ok(identity) => Ok(Some(identity)),
+            // A first install has no daemon behind the SSH tunnel yet. SSH can
+            // still establish the forwarding listener, after which the HTTP
+            // client observes a closed or reset connection. Only that exact
+            // failure proves absence; timeouts and other transport failures
+            // leave the current Host state unknown and must fail closed.
+            Err(DaemonClientError::Transport(error))
+                if transport_proves_daemon_is_absent(&error) =>
+            {
+                Ok(None)
+            }
+            Err(DaemonClientError::Api { status: _, error })
+                if matches!(
+                    error.code(),
+                    ApiErrorCode::AuthenticationFailed | ApiErrorCode::HostIdentityMismatch
+                ) =>
+            {
+                Err(self.unauthenticated_daemon_version_error())
+            }
+            Err(error) => Err(direct_transport_error(&self.alias, error)),
+        }
     }
 
     fn missing_current_daemon_observation() -> CurrentDaemonArtifactObservation {
@@ -1872,7 +1909,9 @@ impl SshSetupTransport {
             {
                 Err(self.unauthenticated_daemon_version_error())
             }
-            Err(DaemonClientError::Transport(_)) => Ok(Self::missing_current_daemon_observation()),
+            Err(DaemonClientError::Transport(error)) if error.is_connect() => {
+                Ok(Self::missing_current_daemon_observation())
+            }
             Err(error) => Err(direct_transport_error(&self.alias, error)),
         }
     }
@@ -9431,10 +9470,12 @@ fn first_trust_daemon_is_live(alias: &str, client: &DaemonClient) -> Result<bool
     match client.live() {
         Ok(_) => Ok(true),
         // The SSH forwarding listener can accept the HTTP connection and then
-        // reset it when no daemon owns the remote loopback port. First-trust
-        // setup inspects durable Host state next, so every transport failure
-        // here means there is no usable live daemon, not that SSH is down.
-        Err(DaemonClientError::Transport(_)) => Ok(false),
+        // reset it when no daemon owns the remote loopback port. Only those
+        // typed absence signals permit durable-state inspection. A timeout or
+        // malformed response leaves daemon ownership unknown and fails closed.
+        Err(DaemonClientError::Transport(error)) if transport_proves_daemon_is_absent(&error) => {
+            Ok(false)
+        }
         Err(error) => Err(direct_transport_error(alias, error)),
     }
 }

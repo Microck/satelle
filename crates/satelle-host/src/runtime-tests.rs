@@ -2661,8 +2661,12 @@ impl ProviderProbeRecoveryAdapter {
         self
     }
 
-    fn adapter_readiness(&self, evidence: ReadinessEvidence) -> AdapterReadiness {
-        let key = self.effective_key();
+    fn adapter_readiness(
+        &self,
+        key: &ReadinessCacheKey,
+        evidence: ReadinessEvidence,
+        resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
+    ) -> AdapterReadiness {
         if self.native_only {
             return AdapterReadiness::ready(
                 key.adapter(),
@@ -2691,15 +2695,7 @@ impl ProviderProbeRecoveryAdapter {
             key.execution_policy().clone(),
             evidence,
             Some(provider_evidence),
-            Some(satelle_core::ResolvedProviderBinding::from_authorization(
-                satelle_core::ProviderBindingAuthorization::new(
-                    "provider-probe-model",
-                    "provider-probe",
-                    "provider-probe-model",
-                    "openai",
-                ),
-                satelle_core::ProviderBindingSource::HostOwned,
-            )),
+            resolved_provider_binding,
         )
         .unwrap()
     }
@@ -2736,19 +2732,34 @@ impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
 
     fn preflight_terminal(
         &self,
-        _host: &str,
+        host: &str,
         cached: Option<ReadinessEvidence>,
         _cached_provider: Option<super::ProviderSmokeResult>,
-        _provider_intent: &ProviderComputerUseIntent,
+        provider_intent: &ProviderComputerUseIntent,
     ) -> AdapterPreflight {
         let evidence = cached.expect("the runtime supplies live or reusable native evidence");
+        let key = self
+            .readiness_cache_key(host, provider_intent)
+            .expect("the fixture readiness key resolves")
+            .expect("the fixture has a readiness key");
+        let resolved_provider_binding = provider_intent.resolved_provider_binding().cloned();
         if self.replace_cached_readiness.load(Ordering::SeqCst) {
             self.cached_replacement_calls.fetch_add(1, Ordering::SeqCst);
-            return AdapterPreflight::Ready(
-                self.adapter_readiness(self.readiness_with_id("fresh-live-after-cached-candidate")),
-            );
+            let now = time::OffsetDateTime::now_utc();
+            let evidence = key
+                .evidence(
+                    "fresh-live-after-cached-candidate",
+                    now,
+                    now + time::Duration::minutes(5),
+                )
+                .expect("the exact resolved key forms fresh readiness evidence");
+            return AdapterPreflight::Ready(self.adapter_readiness(
+                &key,
+                evidence,
+                resolved_provider_binding,
+            ));
         }
-        AdapterPreflight::Ready(self.adapter_readiness(evidence))
+        AdapterPreflight::Ready(self.adapter_readiness(&key, evidence, resolved_provider_binding))
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {

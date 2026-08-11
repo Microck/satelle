@@ -3791,6 +3791,56 @@ path = '{}'
 }
 
 #[test]
+fn desktop_only_setup_rejects_a_missing_configured_ssh_token() {
+    let state = state_dir();
+    let config_file = state.path().join("desktop-only-missing-token.toml");
+    let missing_token = state.path().join("missing-api-token");
+    let token_path = toml::Value::String(missing_token.to_string_lossy().into_owned()).to_string();
+    write_user_config(
+        &config_file,
+        format!(
+            r#"
+default_host = "remote"
+
+[hosts.remote]
+transport = "ssh"
+adapter = "codex"
+address = "operator@127.0.0.1:1"
+expected_host_id = "host-remote"
+api_token = {{ kind = "file", path = {token_path} }}
+"#,
+        ),
+    )
+    .expect("trusted SSH config should be written");
+
+    let output = production_satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
+        .env("SATELLE_STATE_DIR", state.path().join("operator-state"))
+        .args([
+            "setup",
+            "--host",
+            "remote",
+            "--component",
+            "desktop",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "configuration-error");
+    assert_eq!(
+        error["suggested_commands"],
+        serde_json::json!(["edit the TOML file or run satelle config check"])
+    );
+}
+
+#[test]
 fn setup_verify_dry_run_plans_checks_without_probing_or_mutating() {
     let state = state_dir();
     let output =

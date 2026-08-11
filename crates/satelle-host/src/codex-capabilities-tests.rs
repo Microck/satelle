@@ -211,6 +211,14 @@ fn effective_defaults_probe_keeps_only_the_model_pair_and_closed_origins() {
 }
 
 #[test]
+fn effective_defaults_probe_allows_a_cold_managed_app_server() {
+    assert!(
+        EFFECTIVE_DEFAULTS_PROBE_TIMEOUT >= Duration::from_secs(60),
+        "blocking default resolution must not inherit the optional app-policy timeout"
+    );
+}
+
+#[test]
 fn exact_candidate_with_complete_proof_supports_macos_and_windows() {
     for platform in [HostPlatform::Macos, HostPlatform::Windows] {
         let verdict = evaluate_phase0_support(fully_proven_evidence(platform));
@@ -218,7 +226,7 @@ fn exact_candidate_with_complete_proof_supports_macos_and_windows() {
         assert_eq!(
             verdict,
             Phase0SupportVerdict::Supported {
-                codex_version: REQUIRED_CODEX_VERSION,
+                codex_version: MINIMUM_CODEX_VERSION,
                 host_platform: platform,
             }
         );
@@ -272,6 +280,17 @@ fn versions_below_the_supported_floor_are_blocked_at_the_handshake_gate() {
 }
 
 #[test]
+fn codex_version_parser_accepts_only_three_numeric_components() {
+    assert_eq!(
+        CodexVersion::parse("0.144.0"),
+        Some(CodexVersion::new(0, 144, 0))
+    );
+    for rejected in ["0.144", "0.144.0.1", "0.144.0-alpha", ""] {
+        assert_eq!(CodexVersion::parse(rejected), None, "version {rejected:?}");
+    }
+}
+
+#[test]
 fn newer_versions_still_require_and_can_pass_the_complete_capability_gate() {
     for detected_version in [
         CodexVersion::new(0, 144, 1),
@@ -304,7 +323,7 @@ fn every_non_host_platform_is_blocked_at_native_readiness() {
                 reason: BlockerReason::UnsupportedHostPlatform,
                 capability: RequiredCapability::NativeReadiness,
                 codex_version: CodexVersionEvidence::Detected {
-                    version: REQUIRED_CODEX_VERSION,
+                    version: MINIMUM_CODEX_VERSION,
                 },
                 host_platform: platform,
                 observed_surface: EvidenceSurface::Stable,
@@ -618,7 +637,7 @@ fn a_stable_app_allow_list_does_not_prove_sensitive_action_approval() {
             reason: BlockerReason::IncompleteLiveProof,
             capability: RequiredCapability::ApprovalObservation,
             codex_version: CodexVersionEvidence::Detected {
-                version: REQUIRED_CODEX_VERSION,
+                version: MINIMUM_CODEX_VERSION,
             },
             host_platform: HostPlatform::Windows,
             observed_surface: EvidenceSurface::Stable,
@@ -661,7 +680,7 @@ fn absent_native_surface_reports_the_private_execution_path_blocker() {
                 reason: BlockerReason::NativeExecutionPathUnavailable,
                 capability,
                 codex_version: CodexVersionEvidence::Detected {
-                    version: REQUIRED_CODEX_VERSION,
+                    version: MINIMUM_CODEX_VERSION,
                 },
                 host_platform: HostPlatform::Windows,
                 observed_surface: EvidenceSurface::Absent,
@@ -700,7 +719,7 @@ fn every_required_capability_rejects_every_non_stable_surface() {
                     reason: surface_blocker_reason(evidence.capabilities, capability),
                     capability,
                     codex_version: CodexVersionEvidence::Detected {
-                        version: REQUIRED_CODEX_VERSION,
+                        version: MINIMUM_CODEX_VERSION,
                     },
                     host_platform: HostPlatform::Macos,
                     observed_surface: surface,
@@ -732,7 +751,7 @@ fn every_live_proof_capability_rejects_every_incomplete_proof_state() {
                     reason: BlockerReason::IncompleteLiveProof,
                     capability,
                     codex_version: CodexVersionEvidence::Detected {
-                        version: REQUIRED_CODEX_VERSION,
+                        version: MINIMUM_CODEX_VERSION,
                     },
                     host_platform: HostPlatform::Windows,
                     observed_surface: EvidenceSurface::Stable,
@@ -812,7 +831,7 @@ fn fully_proven_evidence(host_platform: HostPlatform) -> Phase0CapabilityEvidenc
 
     Phase0CapabilityEvidence {
         codex_version: CodexVersionEvidence::Detected {
-            version: REQUIRED_CODEX_VERSION,
+            version: MINIMUM_CODEX_VERSION,
         },
         host_platform,
         capabilities: CapabilityMatrix {
@@ -864,7 +883,7 @@ fn blockers(verdict: Phase0SupportVerdict) -> Vec<Phase0CapabilityBlocker> {
 #[test]
 fn version_probe_parser_accepts_only_the_canonical_codex_cli_line() {
     let expected = CodexVersionEvidence::Detected {
-        version: REQUIRED_CODEX_VERSION,
+        version: MINIMUM_CODEX_VERSION,
     };
     assert_eq!(parse_codex_version_output(b"codex-cli 0.144.0\n"), expected);
     assert_eq!(
@@ -1010,7 +1029,7 @@ fn version_probe_terminates_stdout_inheriting_descendants_after_leader_exit() {
     assert_eq!(
         evidence,
         CodexVersionEvidence::Detected {
-            version: REQUIRED_CODEX_VERSION,
+            version: MINIMUM_CODEX_VERSION,
         }
     );
     assert!(

@@ -932,6 +932,74 @@ fn ssh_setup_host(api_token: Option<ApiTokenSource>) -> SelectedHost {
 }
 
 #[test]
+fn current_daemon_observation_treats_only_connect_failures_as_missing() {
+    let transport = SshSetupTransport::new(&ssh_setup_host(None)).expect("construct setup");
+    let connect_failure = reqwest::blocking::Client::new()
+        .get("http://127.0.0.1:0")
+        .send()
+        .expect_err("closed loopback endpoint creates a connect error");
+    let missing = transport
+        .current_daemon_observation::<satelle_transport::CapabilitiesResponse>(Err(
+            DaemonClientError::Transport(connect_failure),
+        ))
+        .expect("a closed daemon endpoint proves that no current artifact is listening");
+    assert_eq!(missing.current_version, None);
+
+    let invalid_request = reqwest::blocking::Client::new()
+        .get("not a valid URL")
+        .build()
+        .expect_err("invalid URL creates a non-connect transport error");
+    let error = transport
+        .current_daemon_observation::<satelle_transport::CapabilitiesResponse>(Err(
+            DaemonClientError::Transport(invalid_request),
+        ))
+        .expect_err("an unproven transport failure must remain blocking");
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+}
+
+#[test]
+fn first_trust_identity_discovery_treats_only_connect_failures_as_missing() {
+    let transport = SshSetupTransport::new(&ssh_setup_host(None)).expect("construct setup");
+    let connect_failure = reqwest::blocking::Client::new()
+        .get("http://127.0.0.1:0")
+        .send()
+        .expect_err("closed loopback endpoint creates a connect error");
+    let missing = transport
+        .first_trust_discovered_identity(Err(DaemonClientError::Transport(connect_failure)))
+        .expect("a closed daemon endpoint proves that no current artifact is listening");
+    assert_eq!(missing, None);
+
+    let invalid_request = reqwest::blocking::Client::new()
+        .get("not a valid URL")
+        .build()
+        .expect_err("invalid URL creates a non-connect transport error");
+    let error = transport
+        .first_trust_discovered_identity(Err(DaemonClientError::Transport(invalid_request)))
+        .expect_err("an unproven first-trust transport failure must remain blocking");
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind stalled endpoint");
+    let address = listener.local_addr().expect("read stalled endpoint");
+    let stalled = thread::spawn(move || {
+        let (_stream, _) = listener.accept().expect("accept stalled request");
+        thread::sleep(Duration::from_millis(200));
+    });
+    let timeout = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(20))
+        .build()
+        .expect("build bounded client")
+        .get(format!("http://{address}/v1/capabilities"))
+        .send()
+        .expect_err("stalled endpoint reaches the request timeout");
+    assert!(timeout.is_timeout());
+    let error = transport
+        .first_trust_discovered_identity(Err(DaemonClientError::Transport(timeout)))
+        .expect_err("a first-trust timeout leaves daemon presence unknown");
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+    stalled.join().expect("join stalled endpoint");
+}
+
+#[test]
 fn ssh_setup_plan_reaches_explicit_trust_for_an_unpinned_host() {
     let state = TestStateDir::new().expect("temporary state directory");
     let mut host = ssh_setup_host(Some(ApiTokenSource::File {
@@ -2963,31 +3031,36 @@ fn first_trust_artifact_probe_rejects_an_unauthenticated_reachable_daemon() {
 #[cfg(unix)]
 #[test]
 fn first_trust_artifact_probe_treats_a_closed_daemon_port_as_not_installed() {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .expect("bind a real loopback endpoint for the missing daemon");
-    let address = listener.local_addr().expect("read loopback endpoint");
-    let closer = thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept artifact probe");
-        drop(stream);
-    });
     let mut host = ssh_setup_host(Some(ApiTokenSource::File {
         path: PathBuf::from("/tmp/satelle-first-trust-token"),
     }));
     host.config.expected_host_id = None;
     let transport = SshSetupTransport::new(&host).expect("construct first-trust transport");
 
-    let observation = transport
-        .observe_current_daemon_at(
-            address,
-            ApiBearerToken::generate().expect("generate first-trust probe token"),
-        )
-        .expect("a closed daemon port means the Host artifact is not installed yet");
+    // A fresh client can observe an immediate peer close as either a closed
+    // request channel or an incomplete HTTP message. Exercise the race enough
+    // times to keep both typed close paths inside the missing-daemon contract.
+    for _ in 0..32 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind a real loopback endpoint for the missing daemon");
+        let address = listener.local_addr().expect("read loopback endpoint");
+        let closer = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept artifact probe");
+            drop(stream);
+        });
+        let observation = transport
+            .observe_current_daemon_at(
+                address,
+                ApiBearerToken::generate().expect("generate first-trust probe token"),
+            )
+            .expect("a closed daemon port means the Host artifact is not installed yet");
 
-    assert_eq!(observation.current_version, None);
-    assert_eq!(observation.minimum_host_version, None);
-    assert!(observation.protocol_compatible);
-    assert_eq!(observation.validated_host_identity, None);
-    closer.join().expect("join loopback endpoint");
+        assert_eq!(observation.current_version, None);
+        assert_eq!(observation.minimum_host_version, None);
+        assert!(observation.protocol_compatible);
+        assert_eq!(observation.validated_host_identity, None);
+        closer.join().expect("join loopback endpoint");
+    }
 }
 
 #[cfg(unix)]
@@ -3013,6 +3086,31 @@ fn first_trust_liveness_treats_a_closed_daemon_port_as_not_running() {
             .expect("a closed daemon port means no daemon is running")
     );
     closer.join().expect("join loopback endpoint");
+}
+
+#[cfg(unix)]
+#[test]
+fn first_trust_liveness_preserves_a_stalled_transport_failure() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind a real loopback endpoint for the stalled daemon");
+    let address = listener.local_addr().expect("read loopback endpoint");
+    let stalled = thread::spawn(move || {
+        let (_stream, _) = listener.accept().expect("accept liveness probe");
+        thread::sleep(Duration::from_millis(250));
+    });
+    let client = DaemonClient::loopback_with_timeout(
+        address,
+        ApiBearerToken::generate().expect("generate first-trust probe token"),
+        "trust-probe-test",
+        Duration::from_millis(50),
+    )
+    .expect("construct first-trust liveness client");
+
+    let error = first_trust_daemon_is_live("first-trust-host", &client)
+        .expect_err("a stalled live endpoint does not prove that the daemon is absent");
+
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+    stalled.join().expect("join stalled loopback endpoint");
 }
 
 #[test]

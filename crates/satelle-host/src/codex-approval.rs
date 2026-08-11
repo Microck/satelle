@@ -108,12 +108,13 @@ pub(super) fn computer_use_elicitation_result(
         return Err(CodexSessionError::ConflictingIdentity);
     }
 
-    let turn_correlated = params.get("turnId").is_none_or(Value::is_null) || turn_matches;
-    let authorized = turn_correlated
-        && (exact_computer_use_app_prompt(params, allowed_app_ids)
-            || expected_native_script.is_some_and(|expected_script| {
-                exact_computer_use_script_prompt(params, expected_script)
-            }));
+    let app_authorized = (params.get("turnId").is_none_or(Value::is_null) || turn_matches)
+        && exact_computer_use_app_prompt(params, allowed_app_ids);
+    let script_authorized = turn_matches
+        && expected_native_script.is_some_and(|expected_script| {
+            exact_computer_use_script_prompt(params, expected_script)
+        });
+    let authorized = app_authorized || script_authorized;
     Ok((
         json!({
             "action": if authorized { "accept" } else { "decline" },
@@ -686,10 +687,50 @@ mod tests {
     }
 
     #[test]
+    fn generated_script_authority_requires_an_exact_non_null_turn() {
+        let script = "exact native readiness script";
+        for turn_id in [Value::Null, json!("different-turn")] {
+            let mut request = computer_use_script_prompt(script, "Activate Microsoft Edge");
+            request["params"]["turnId"] = turn_id;
+
+            let result = computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &BTreeSet::new(),
+                Some(script),
+                Some("thread-1"),
+                Some("turn-1"),
+            );
+            if request["params"]["turnId"].is_null() {
+                assert_eq!(
+                    result,
+                    Ok((
+                        json!({"action": "decline", "content": null, "_meta": null}),
+                        false,
+                    ))
+                );
+            } else {
+                assert_eq!(result, Err(CodexSessionError::ConflictingIdentity));
+            }
+        }
+    }
+
+    #[test]
     fn computer_use_script_elicitation_rejects_changed_or_missing_authority() {
         let script = "exact native readiness script";
         let allowed = BTreeSet::from(["MSEdge".to_string()]);
         let cases = [
+            {
+                let mut request = computer_use_script_prompt(script, "Activate Microsoft Edge");
+                let tool_params = request["params"]["_meta"]["tool_params"]
+                    .as_object_mut()
+                    .unwrap();
+                let code = tool_params.remove("code").unwrap();
+                tool_params.insert("source".to_string(), code);
+                request["params"]["_meta"]["tool_params_display"][0]["name"] = json!("source");
+                request["params"]["_meta"]["tool_params_display"][0]["display_name"] =
+                    json!("source");
+                request
+            },
             {
                 let mut request =
                     computer_use_script_prompt("different script", "Activate Microsoft Edge");

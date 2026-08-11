@@ -102,6 +102,23 @@ const STATE_OWNERSHIP_LOCK: &str = "satelle.sqlite3.lock";
 const STATE_RELEASE_TIMEOUT: Duration = Duration::from_secs(20);
 const STATE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MACOS_NATIVE_BRIDGE_LAUNCHER: &str = "__satelle-launch-macos-native-bridge";
+#[cfg(any(target_os = "macos", test))]
+const MACOS_NATIVE_BRIDGE_ENVIRONMENT: [&str; 14] = [
+    "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS",
+    "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S",
+    "SKY_CUA_SERVICE_PATH",
+    "BROWSER_USE_CODEX_APP_VERSION",
+    "NODE_REPL_TRUSTED_CODE_PATHS",
+    "NODE_REPL_NODE_MODULE_DIRS",
+    "NODE_REPL_NODE_PATH",
+    "BROWSER_USE_AVAILABLE_BACKENDS",
+    "CODEX_HOME",
+    "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER",
+    "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME",
+    "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE",
+    "BROWSER_USE_CODEX_APP_BUILD_FLAVOR",
+    "CODEX_CLI_PATH",
+];
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use zeroize::Zeroizing;
@@ -1336,22 +1353,7 @@ fn run_authenticated_macos_native_bridge(arguments: &[std::ffi::OsString]) -> Ex
     // The trusted MCP binding owns the complete child environment. Do not
     // leak unrelated Host credentials into the privileged native bridge.
     let mut environment = Vec::new();
-    for name in [
-        "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS",
-        "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S",
-        "SKY_CUA_SERVICE_PATH",
-        "BROWSER_USE_CODEX_APP_VERSION",
-        "NODE_REPL_TRUSTED_CODE_PATHS",
-        "NODE_REPL_NODE_MODULE_DIRS",
-        "NODE_REPL_NODE_PATH",
-        "BROWSER_USE_AVAILABLE_BACKENDS",
-        "CODEX_HOME",
-        "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER",
-        "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME",
-        "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE",
-        "BROWSER_USE_CODEX_APP_BUILD_FLAVOR",
-        "CODEX_CLI_PATH",
-    ] {
+    for name in MACOS_NATIVE_BRIDGE_ENVIRONMENT {
         let Some(value) = std::env::var_os(name) else {
             return ExitCode::from(74);
         };
@@ -1617,6 +1619,14 @@ fn process_has_disallowed_bearer_token(args: &[std::ffi::OsString]) -> bool {
 #[cfg(test)]
 mod process_boundary_tests {
     use super::*;
+
+    #[test]
+    fn macos_launcher_environment_includes_the_verified_service_path() {
+        assert!(
+            MACOS_NATIVE_BRIDGE_ENVIRONMENT.contains(&"SKY_CUA_SERVICE_PATH"),
+            "the authenticated launcher must forward the verified Computer Use service path"
+        );
+    }
 
     #[test]
     fn bearer_token_in_argument_zero_is_rejected() {
@@ -3440,6 +3450,36 @@ const fn authenticated_host_available_for_setup(
     !first_ssh_trust && (!ssh_transport || (api_token_file_exists && current_daemon_available))
 }
 
+const fn authenticated_follow_up_after_host_setup(
+    first_ssh_trust: bool,
+    ssh_transport: bool,
+    api_token_descriptor_configured: bool,
+    current_daemon_available: bool,
+    host_setup_required: bool,
+) -> bool {
+    !first_ssh_trust
+        && ssh_transport
+        && api_token_descriptor_configured
+        && !current_daemon_available
+        && host_setup_required
+}
+
+fn add_deferred_desktop_selection_plan(
+    report: &mut SetupReport,
+    host_alias: &str,
+    selection_will_be_persisted: bool,
+) {
+    report.planned_actions.push(
+        "inspect compatible desktop sessions through the authenticated Host Daemon".to_string(),
+    );
+    if selection_will_be_persisted {
+        report.planned_actions.push(format!(
+            "persist the discovered desktop_user and desktop_session_preference in Host Binding '{host_alias}'"
+        ));
+        report.mutation_planned = true;
+    }
+}
+
 fn observe_current_daemon_for_setup<E>(
     current_daemon_available: bool,
     observation_required: bool,
@@ -3456,8 +3496,9 @@ fn observe_current_daemon_for_setup<E>(
 #[cfg(test)]
 mod setup_native_invalidation_tests {
     use super::{
-        authenticated_host_available_for_setup, native_readiness_invalidation_before_setup,
-        observe_current_daemon_for_setup,
+        add_deferred_desktop_selection_plan, authenticated_follow_up_after_host_setup,
+        authenticated_host_available_for_setup, cli_owned_setup_report,
+        native_readiness_invalidation_before_setup, observe_current_daemon_for_setup,
     };
 
     #[test]
@@ -3487,6 +3528,42 @@ mod setup_native_invalidation_tests {
         assert!(native_readiness_invalidation_before_setup(
             true, true, false, true,
         ));
+    }
+
+    #[test]
+    fn stopped_trusted_ssh_host_follows_up_when_setup_can_issue_its_configured_token() {
+        assert!(authenticated_follow_up_after_host_setup(
+            false, true, true, false, true,
+        ));
+        assert!(!authenticated_follow_up_after_host_setup(
+            false, true, true, true, true,
+        ));
+        assert!(!authenticated_follow_up_after_host_setup(
+            false, true, false, false, true,
+        ));
+        assert!(!authenticated_follow_up_after_host_setup(
+            true, true, true, false, true,
+        ));
+    }
+
+    #[test]
+    fn deferred_desktop_selection_plan_discloses_binding_persistence() {
+        let mut report =
+            cli_owned_setup_report("studio", false, "on_demand", vec!["desktop".to_string()]);
+
+        add_deferred_desktop_selection_plan(&mut report, "studio", true);
+
+        assert_eq!(
+            report.planned_actions,
+            [
+                "inspect compatible desktop sessions through the authenticated Host Daemon",
+                concat!(
+                    "persist the discovered desktop_user and desktop_session_preference ",
+                    "in Host Binding 'studio'"
+                ),
+            ]
+        );
+        assert!(report.mutation_planned);
     }
 
     #[test]
@@ -3715,7 +3792,7 @@ fn run_setup(
             && report.required_input.is_empty()
             && !first_ssh_trust
             && ssh_transport
-            && api_token_file_exists
+            && host.config.api_token.is_some()
             && (command.verify
                 || (!local_verification_only && (desktop_setup || provider_auth_setup))),
         || {
@@ -3730,6 +3807,13 @@ fn run_setup(
         ssh_transport,
         api_token_file_exists,
         current_daemon_available,
+    );
+    let authenticated_follow_up_after_host_setup = authenticated_follow_up_after_host_setup(
+        first_ssh_trust,
+        ssh_transport,
+        host.config.api_token.is_some(),
+        current_daemon_available,
+        host_setup_required,
     );
     let mut desktop_selection = None;
     if desktop_setup
@@ -3761,8 +3845,10 @@ fn run_setup(
         && report.required_input.is_empty()
         && host.config.transport == satelle_core::TransportKind::Ssh
     {
-        report.planned_actions.push(
-            "inspect compatible desktop sessions through the authenticated Host Daemon".to_string(),
+        add_deferred_desktop_selection_plan(
+            &mut report,
+            &host.alias,
+            authenticated_follow_up_after_host_setup,
         );
     }
 
@@ -3782,6 +3868,9 @@ fn run_setup(
         first_ssh_trust,
         authenticated_host_available,
     );
+    let native_readiness_invalidation_after_setup = native_affecting_setup
+        && report.mutation_planned
+        && authenticated_follow_up_after_host_setup;
 
     if provider_auth_setup
         && !local_verification_only
@@ -4102,6 +4191,74 @@ fn run_setup(
                     Ok(())
                 },
             )?;
+
+            if native_readiness_invalidation_after_setup {
+                // A stopped trusted SSH daemon cannot invalidate before its
+                // repair. Do it as the first authenticated follow-up, before
+                // desktop persistence can change the readiness cache key.
+                let invalidation_request = SetupVerificationRequest::new(
+                    provider_selection.requested_model_alias.clone(),
+                    provider_selection.requested_provider_alias.clone(),
+                    provider_selection.model_alias_from_project,
+                    provider_selection.provider_alias_from_project,
+                    provider_selection.experimental_provider_computer_use,
+                )
+                .map_err(|message| failure(SatelleError::invalid_usage(message)))?;
+                let invalidated = match transport_for(&host)?
+                    .invalidate_native_readiness(&invalidation_request)
+                {
+                    Ok(invalidated) => invalidated,
+                    Err(error) if command.verify => {
+                        ensure_exact_setup_verification_recovery(&mut report, &host.alias);
+                        if let Some(recovery) = error.recovery_command.as_ref()
+                            && !report.recovery_commands.contains(recovery)
+                        {
+                            report.recovery_commands.push(recovery.clone());
+                        }
+                        report.status = "failed".to_string();
+                        report.verification = Some(SetupVerification {
+                            status: "failed".to_string(),
+                            planned_checks: verification_checks.clone(),
+                            result: None,
+                            cache_updates: verification_cache_updates,
+                        });
+                        return Err(failure(SatelleError::setup_verification_failed(&report)));
+                    }
+                    Err(error) => return Err(failure(error)),
+                };
+                let cache_update = format!("invalidated_native_readiness_results:{invalidated}");
+                verification_cache_updates.push(cache_update.clone());
+                native_invalidation_action = Some(cache_update);
+            }
+
+            if desktop_setup
+                && desktop_selection.is_none()
+                && authenticated_follow_up_after_host_setup
+            {
+                let authenticated_bootstrap_user =
+                    authenticated_ssh_bootstrap_user(&host).map_err(failure)?;
+                let sessions = transport_for(&host)?.host_sessions(true).map_err(failure)?;
+                desktop_selection = resolve_setup_desktop_selection(
+                    &sessions,
+                    &host.config,
+                    interactive_selection,
+                    Some(&authenticated_bootstrap_user),
+                )
+                .map_err(failure)?;
+                if let Some(selection) = &desktop_selection {
+                    persist_desktop_selection(
+                        &user_config_path,
+                        &host.alias,
+                        &selection.desktop_user,
+                        Some(&selection.preference),
+                    )
+                    .map_err(failure)?;
+                    host.config.desktop_user = Some(selection.desktop_user.clone());
+                    host.config.desktop_session_preference = Some(selection.preference.clone());
+                    host.config.desktop_session_native_selector = None;
+                    persisted_desktop_action = Some(selection.action(&host.alias));
+                }
+            }
         }
 
         if provider_auth_setup
