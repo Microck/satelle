@@ -3696,6 +3696,38 @@ test("release workflow gates draft publication on candidate validation and promo
     promoteAndPublish,
     "Recheck signed tag and publish the GitHub release",
   );
+  const draftReleaseQuery = finalPublishStep.match(
+    /jq -s -e -c --arg tag "\$RELEASE_TAG" \\\n\s+'([\s\S]*?)'\) \|\| \\/,
+  )?.[1];
+  assert.ok(draftReleaseQuery, "draft release query is missing");
+  const mutableDraftQuery = finalPublishStep.match(
+    /mutable_draft_query='([\s\S]*?)'/,
+  )?.[1];
+  assert.ok(mutableDraftQuery, "mutable draft identity query is missing");
+  const resolveDraftRelease = (pages) =>
+    spawnSync(
+      "jq",
+      ["-s", "-e", "-c", "--arg", "tag", "v0.1.2", draftReleaseQuery],
+      {
+        encoding: "utf8",
+        input: pages.map((page) => JSON.stringify(page)).join("\n"),
+      },
+    );
+  const isMutableDraft = (release) =>
+    spawnSync(
+      "jq",
+      [
+        "-e",
+        "--arg",
+        "tag",
+        "v0.1.2",
+        "--argjson",
+        "id",
+        "370072321",
+        mutableDraftQuery,
+      ],
+      { encoding: "utf8", input: JSON.stringify(release) },
+    );
   const rollbackStep = workflowStep(
     rollbackPromotion,
     "Restore prior latest tags in reverse dependency order",
@@ -3885,6 +3917,41 @@ test("release workflow gates draft publication on candidate validation and promo
   );
   assert.match(
     finalPublishStep,
+    /gh api --paginate \\\n\s+"repos\/\$GITHUB_REPOSITORY\/releases\?per_page=100"[\s\S]*jq -s -e -c --arg tag "\$RELEASE_TAG"[\s\S]*\.tag_name == \$tag and \.draft == true and \.immutable == false/,
+  );
+  assert.doesNotMatch(finalPublishStep, /releases\/tags\/\$RELEASE_TAG/);
+  assert.match(finalPublishStep, /repos\/\$GITHUB_REPOSITORY\/releases\/\$release_id/);
+  const matchingDraft = {
+    id: 370072321,
+    tag_name: "v0.1.2",
+    draft: true,
+    immutable: false,
+  };
+  for (const pages of [
+    [[matchingDraft]],
+    [[{ ...matchingDraft, tag_name: "v0.1.1" }], [matchingDraft]],
+  ]) {
+    const resolved = resolveDraftRelease(pages);
+    assert.equal(resolved.status, 0, resolved.stderr);
+    assert.deepEqual(JSON.parse(resolved.stdout), matchingDraft);
+  }
+  for (const pages of [
+    [[{ ...matchingDraft, draft: false }]],
+    [[matchingDraft], [{ ...matchingDraft, id: matchingDraft.id + 1 }]],
+  ]) {
+    assert.notEqual(resolveDraftRelease(pages).status, 0);
+  }
+  assert.equal(isMutableDraft(matchingDraft).status, 0);
+  for (const release of [
+    { ...matchingDraft, id: matchingDraft.id + 1 },
+    { ...matchingDraft, tag_name: "v0.1.1" },
+    { ...matchingDraft, draft: false },
+    { ...matchingDraft, immutable: true },
+  ]) {
+    assert.notEqual(isMutableDraft(release).status, 0);
+  }
+  assert.match(
+    finalPublishStep,
     /gh api[\s\S]*releases\/assets\/\$asset_id[\s\S]*sha256sum --check[\s\S]*npm-promotion\.cjs audit-records[\s\S]*npm-promotion\.cjs verify-complete/,
   );
   assert.match(
@@ -3913,7 +3980,7 @@ test("release workflow gates draft publication on candidate validation and promo
   );
   assert.match(
     finalPublishStep,
-    /publication_state=\n\s+for attempt in \$\(seq 1 10\); do\n\s+if ! recheck_release_tag retry_transient[\s\S]*release publication tag could not be rechecked[\s\S]*sleep 1[\s\S]*continue/,
+    /publication_state=\n\s+for attempt in \$\(seq 1 10\); do\n\s+if ! recheck_release_tag retry_transient[\s\S]*release publication tag could not be rechecked[\s\S]*draft_state=\$\(gh api[\s\S]*releases\/\$release_id[\s\S]*mutable_draft_query[\s\S]*draft release identity changed before publication[\s\S]*--method PATCH/,
   );
   assert.match(
     rollbackPromotion,
