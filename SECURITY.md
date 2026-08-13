@@ -6,8 +6,8 @@ security issues as private until a fix and disclosure plan are ready.
 
 ## Supported versions
 
-Satelle has not published a public release. Security fixes currently target the
-latest commit on the default branch. Include the exact commit or `satelle
+Satelle publishes pre-release versions. Security fixes target the latest
+published release and the default branch. Include the exact commit or `satelle
 --version` output in a report so the affected code can be identified.
 
 ## Report a vulnerability

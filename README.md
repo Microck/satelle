@@ -23,35 +23,31 @@ bun add --global @microck/satelle
 
 ## Run the shortest successful flow
 
-Install Rust 1.97.0 and an official standalone Codex release at or above
-0.144.0 on a candidate macOS or Windows Host, then build Satelle from the
-repository root:
-
-```sh
-cargo build --release --locked -p satelle-cli
-```
+Install an official standalone Codex release at or above 0.144.0 on a
+candidate macOS or Windows Host. The package-manager command above exposes the
+installed Satelle executable as `satelle`.
 
 Review the local setup plan, then prove that the visible desktop is ready:
 
 ```sh
-./target/release/satelle setup --host local-demo --dry-run
-./target/release/satelle doctor --host local-demo --scope computer-use --refresh
+satelle setup --host local-demo --dry-run
+satelle doctor --host local-demo --scope computer-use --refresh
 ```
 
 Start one attached Turn and save the returned `session_id`:
 
 ```sh
-./target/release/satelle run --host local-demo "Open the browser"
+satelle run --host local-demo "Open the browser"
 ```
 
 The Session is durable. A fresh Controller process can inspect it, start a
 detached follow-up Turn, stop that Turn, and confirm the terminal state:
 
 ```sh
-./target/release/satelle status <session_id> --host local-demo
-./target/release/satelle steer <session_id> --host local-demo --detach "Open settings"
-./target/release/satelle stop <session_id> --host local-demo
-./target/release/satelle status <session_id> --host local-demo
+satelle status <session_id> --host local-demo
+satelle steer <session_id> --host local-demo --detach "Open settings"
+satelle stop <session_id> --host local-demo
+satelle status <session_id> --host local-demo
 ```
 
 `ready` from the live Computer Use probe is required. A binary, plugin, or
