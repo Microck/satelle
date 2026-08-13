@@ -769,7 +769,7 @@ test("artifact tar validation maps its deadline to a typed error", (context) => 
   );
 });
 
-test("release check rejects missing or contradictory pre-publication README guidance", (context) => {
+test("release check rejects missing or contradictory public installation guidance", (context) => {
   const missingGuidanceRoot = fixtureRepository(context);
   writeFileSync(path.join(missingGuidanceRoot, "README.md"), "# Satelle\n");
 
@@ -779,21 +779,33 @@ test("release check rejects missing or contradictory pre-publication README guid
   );
 
   for (const command of [
-    "npm install --global satelle",
-    "npm install --global \\\n  @microck/satelle",
-    "pnpm --package=@microck/satelle dlx satelle",
+    "npm install --global @microck/satelle --include=optional",
+    "pnpm add --global @microck/satelle",
+    "bun add --global @microck/satelle",
   ]) {
-    const contradictoryGuidanceRoot = fixtureRepository(context);
+    const missingCommandRoot = fixtureRepository(context);
+    const readmePath = path.join(missingCommandRoot, "README.md");
     writeFileSync(
-      path.join(contradictoryGuidanceRoot, "README.md"),
-      `${readFileSync(path.join(contradictoryGuidanceRoot, "README.md"), "utf8")}\n\`${command}\`\n`,
+      readmePath,
+      readFileSync(readmePath, "utf8").replace(command, "installation command removed"),
     );
     assert.throws(
-      () => createReleaseContext(contradictoryGuidanceRoot).check(),
+      () => createReleaseContext(missingCommandRoot).check(),
       expectReleaseError("release-readme-mismatch"),
       command,
     );
   }
+
+  const staleGuidanceRoot = fixtureRepository(context);
+  const staleReadmePath = path.join(staleGuidanceRoot, "README.md");
+  writeFileSync(
+    staleReadmePath,
+    `${readFileSync(staleReadmePath, "utf8")}\nThe npm packages are not published installation paths yet.\n`,
+  );
+  assert.throws(
+    () => createReleaseContext(staleGuidanceRoot).check(),
+    expectReleaseError("release-readme-mismatch"),
+  );
 });
 
 test("native package assembly is real and leaves source packages unchanged", (context) => {

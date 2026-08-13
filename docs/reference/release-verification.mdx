@@ -3,11 +3,10 @@ title: Release archive verification
 description: Verify Satelle release archives before a direct installation.
 ---
 
-Satelle is still pre-release, so these commands document the release contract
-and do not claim that public archives or npm packages are currently available.
-When publication starts, installers and direct archive users must authenticate
-an archive before executing it. `SHA256SUMS` is an integrity cross-check, not
-an authenticity root.
+Satelle is pre-release software with public npm packages and GitHub release
+archives. Installers and direct archive users must authenticate an archive
+before executing it. `SHA256SUMS` is an integrity cross-check, not an
+authenticity root.
 
 ## Installer entrypoints
 
@@ -21,14 +20,14 @@ The Unix installer accepts an explicit version and installs into a user-owned
 directory without changing shell profiles:
 
 ```sh
-curl -fsSL "$SATELLE_INSTALLER_URL" | \
+curl -fsSL https://raw.githubusercontent.com/Microck/satelle/main/scripts/install.sh | \
   sh -s -- --version X.Y.Z
 ```
 
 `wget` is also supported:
 
 ```sh
-wget -qO- "$SATELLE_INSTALLER_URL" | \
+wget -qO- https://raw.githubusercontent.com/Microck/satelle/main/scripts/install.sh | \
   sh -s -- --version X.Y.Z
 ```
 
@@ -36,11 +35,8 @@ The Windows installer is invoked with `Invoke-RestMethod` and accepts the same
 explicit version selection:
 
 ```powershell
-& ([scriptblock]::Create((Invoke-RestMethod $SatelleInstallerUrl))) -Version X.Y.Z
+& ([scriptblock]::Create((Invoke-RestMethod https://raw.githubusercontent.com/Microck/satelle/main/scripts/install.ps1))) -Version X.Y.Z
 ```
-
-The public installer URL is intentionally withheld until release publication;
-the repository does not present these pre-release scripts as live downloads.
 
 Both installers default to a user-writable `.local/bin` directory, leave PATH
 and profile files unchanged, and write `.satelle-install.json` beside the

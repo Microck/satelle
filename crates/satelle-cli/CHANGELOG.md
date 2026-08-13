@@ -1,3 +1,11 @@
+## satelle-cli@0.1.2
+
+### Native acceptance and release reliability
+
+Complete authenticated Host setup and native Computer Use acceptance on macOS and Windows.
+Harden installer locking, release publication recovery, npm validation, and process containment
+for reliable upgrades and public artifacts.
+
 ## satelle-cli@0.1.1
 
 ### Satelle public MVP

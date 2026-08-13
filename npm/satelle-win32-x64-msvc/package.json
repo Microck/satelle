@@ -1,6 +1,6 @@
 {
   "name": "@microck/satelle-win32-x64-msvc",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Satelle native CLI for Windows x64 with MSVC.",
   "license": "MIT",
   "repository": {

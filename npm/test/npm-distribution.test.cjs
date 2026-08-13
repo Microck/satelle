@@ -85,7 +85,7 @@ test("installation docs freeze package identities, ownership, and cache contract
   assert.equal(new Set(packageIdentities).size, 8);
   assert.match(
     installationGuide,
-    /None of these eight npm package identities is available from the public npm registry yet\./,
+    /All eight npm package identities are available from the public npm registry\./,
   );
   for (const packageName of packageIdentities) {
     assert.ok(installationGuide.includes(`\`${packageName}\``), packageName);
@@ -149,7 +149,11 @@ test("installation docs freeze package identities, ownership, and cache contract
   );
   assert.match(
     normalizedInstallationGuide,
-    /None is published yet\. Satelle does not invent placeholder URLs or coordinates/,
+    /GitHub release archives and the verified Unix and Windows installer scripts are published/,
+  );
+  assert.match(
+    normalizedInstallationGuide,
+    /The first-party Homebrew tap and Scoop bucket are not published yet/,
   );
   assert.doesNotMatch(installationGuide, /\b(?:brew|scoop) install\b/);
   assert.match(
