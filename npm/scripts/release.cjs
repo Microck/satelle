@@ -920,27 +920,22 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
 
   function validateReadme() {
     const readmeSource = readFileSync(path.join(repositoryRoot, "README.md"), "utf8");
-    const guidanceSource = readmeSource.replace(/\\\r?\n\s*/g, " ");
     const readme = readmeSource.replace(/^> ?/gm, "").replace(/\s+/g, " ");
     const requiredGuidance = [
-      "Satelle is pre-release software. Build it from source.",
-      "reserved by this repository are not published installation paths yet.",
-      "Source builds are the only documented installation path until release publication is complete.",
+      "Satelle is pre-release software.",
+      "npm install --global @microck/satelle --include=optional",
+      "pnpm add --global @microck/satelle",
+      "bun add --global @microck/satelle",
     ];
-    const publicNpmGuidance = [
-      /\bnpm\s+(?:install|i|exec)\b[^\n`]*\b(?:@microck\/satelle|satelle)\b/i,
-      /\bpnpm\s+(?:add|dlx)\b[^\n`]*\b(?:@microck\/satelle|satelle)\b/i,
-      /\bpnpm\s+--package(?:=|\s+)(?:@microck\/satelle|satelle)\s+dlx\b/i,
-      /\b(?:npx|bunx)\b[^\n`]*\b(?:@microck\/satelle|satelle)\b/i,
-      /\bbun\s+add\b[^\n`]*\b(?:@microck\/satelle|satelle)\b/i,
-    ];
+    const staleGuidance =
+      /not published installation paths|source builds are the only documented installation path/i;
     if (
       requiredGuidance.some((text) => !readme.includes(text)) ||
-      publicNpmGuidance.some((pattern) => pattern.test(guidanceSource))
+      staleGuidance.test(readme)
     ) {
       fail(
         "release-readme-mismatch",
-        "README installation guidance must keep npm packages unavailable before publication",
+        "README installation guidance must describe the public package paths",
       );
     }
   }

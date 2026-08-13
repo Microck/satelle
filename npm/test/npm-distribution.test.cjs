@@ -71,6 +71,15 @@ test("installation docs freeze package identities, ownership, and cache contract
   );
   const readme = readFileSync(path.join(repositoryRoot, "README.md"), "utf8");
   const documentationIndex = readFileSync(path.join(repositoryRoot, "docs", "index.mdx"), "utf8");
+  const releaseVerification = readFileSync(
+    path.join(repositoryRoot, "docs", "reference", "release-verification.mdx"),
+    "utf8",
+  );
+  const securityPolicy = readFileSync(path.join(repositoryRoot, "SECURITY.md"), "utf8");
+  const firstSessionTutorial = readFileSync(
+    path.join(repositoryRoot, "docs", "tutorial", "first-session.mdx"),
+    "utf8",
+  );
   const normalizedInstallationGuide = installationGuide.replace(/\s+/g, " ");
   const canonicalManifest = readJson(path.join(canonicalPackageRoot, "package.json"));
   const unscopedManifest = readJson(
@@ -85,7 +94,7 @@ test("installation docs freeze package identities, ownership, and cache contract
   assert.equal(new Set(packageIdentities).size, 8);
   assert.match(
     installationGuide,
-    /None of these eight npm package identities is available from the public npm registry yet\./,
+    /All eight npm package identities are available from the public npm registry\./,
   );
   for (const packageName of packageIdentities) {
     assert.ok(installationGuide.includes(`\`${packageName}\``), packageName);
@@ -149,7 +158,11 @@ test("installation docs freeze package identities, ownership, and cache contract
   );
   assert.match(
     normalizedInstallationGuide,
-    /None is published yet\. Satelle does not invent placeholder URLs or coordinates/,
+    /GitHub release archives and the verified Unix and Windows installer scripts are published/,
+  );
+  assert.match(
+    normalizedInstallationGuide,
+    /The first-party Homebrew tap and Scoop bucket are not published yet/,
   );
   assert.doesNotMatch(installationGuide, /\b(?:brew|scoop) install\b/);
   assert.match(
@@ -181,6 +194,31 @@ test("installation docs freeze package identities, ownership, and cache contract
   for (const publicEntryPoint of [readme, documentationIndex]) {
     assert.ok(publicEntryPoint.includes("install-satelle"));
   }
+
+  const immutableInstallerRevision = "2a9bde9ec2fdc9c6289438d07a645b159866d00c";
+  for (const installerGuide of [installationGuide, releaseVerification]) {
+    assert.doesNotMatch(installerGuide, /Microck\/satelle\/main\/scripts\/install\.(?:sh|ps1)/);
+    assert.match(
+      installerGuide,
+      new RegExp(`Microck/satelle/${immutableInstallerRevision}/scripts/install\\.sh`),
+    );
+    assert.match(
+      installerGuide,
+      new RegExp(`Microck/satelle/${immutableInstallerRevision}/scripts/install\\.ps1`),
+    );
+  }
+  assert.match(securityPolicy, /Security fixes target the latest\s+published release/);
+  assert.doesNotMatch(securityPolicy, /has not published a public release/);
+  assert.doesNotMatch(readme, /\.\/target\/release\/satelle/);
+  assert.match(readme, /satelle setup --host local-demo --dry-run/);
+  assert.match(
+    firstSessionTutorial,
+    /npm install --global @microck\/satelle --include=optional/,
+  );
+  assert.doesNotMatch(
+    firstSessionTutorial,
+    /Public npm packages are not available yet|The release has not been published to npm/,
+  );
 });
 
 function npmSpawnOptions(options = {}) {

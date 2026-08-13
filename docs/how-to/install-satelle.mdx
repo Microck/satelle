@@ -3,10 +3,9 @@ title: Install Satelle
 description: Choose a Satelle installation method and keep its owner responsible for updates.
 ---
 
-Satelle 0.1.1 is pre-release software. Build it from source today. The package
-names and commands below define the installation contract for publication;
-they are not evidence that a public package, installer, tap, bucket, or release
-archive exists.
+Satelle 0.1.2 is pre-release software. Install it from npm or a verified GitHub
+release artifact, or build it from source. Choose one installation owner and
+use that same owner for upgrades and uninstall.
 
 ## Build the current source tree
 
@@ -22,10 +21,10 @@ The result is `target/release/satelle` on Unix-like systems and
 Controller commands are present on every supported Controller target, and
 native Computer Use Host targets use the same executable for Host Daemon mode.
 
-## Use an npm-registry package after publication
+## Use an npm-registry package
 
-The npm registry will be a first-class installation path and the recommended
-local CLI installation path. npm, pnpm, and Bun all use the same canonical
+The npm registry is the recommended local CLI installation path. npm, pnpm,
+and Bun all use the same canonical
 package identity. They do not use package-manager-specific Satelle package
 names.
 
@@ -48,13 +47,13 @@ bun add --global @microck/satelle
 ```
 
 Each command exposes `satelle`. The unscoped `satelle` convenience package may
-replace `@microck/satelle` in any of these commands after publication. It
+replace `@microck/satelle` in any of these commands. It
 forwards to the canonical scoped launcher instead of owning separate native
 selection logic.
 
-### Reserved npm identities
+### Published npm identities
 
-None of these eight npm package identities is available from the public npm registry yet.
+All eight npm package identities are available from the public npm registry.
 
 | Role | Package identity |
 | --- | --- |
@@ -80,10 +79,24 @@ Satelle MVP defines these first-party non-npm installation methods:
 4. First-party Scoop bucket.
 5. Direct GitHub release archive download.
 
-None is published yet. Satelle does not invent placeholder URLs or coordinates
-for unpublished installers, the Homebrew tap, or the Scoop bucket. After
-publication, direct archives and both installers must follow the [release
-archive verification contract](/docs/reference/release-verification).
+GitHub release archives and the verified Unix and Windows installer scripts are
+published. The first-party Homebrew tap and Scoop bucket are not published yet.
+Direct archives and both installers follow the [release archive verification
+contract](/docs/reference/release-verification).
+
+Install the latest verified release on Unix:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Microck/satelle/2a9bde9ec2fdc9c6289438d07a645b159866d00c/scripts/install.sh | sh
+```
+
+Install it on Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((Invoke-RestMethod https://raw.githubusercontent.com/Microck/satelle/2a9bde9ec2fdc9c6289438d07a645b159866d00c/scripts/install.ps1)))
+```
+
+Direct archives are available from the [latest GitHub release](https://github.com/Microck/satelle/releases/latest).
 
 The first-party Homebrew tap remains the canonical Homebrew path until Satelle
 is accepted into Homebrew core and core updates prove reliable. The first-party

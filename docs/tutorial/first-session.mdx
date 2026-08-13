@@ -1,6 +1,6 @@
 ---
 title: Run your first session
-description: Build Satelle, inspect setup, prove native readiness, and start durable work.
+description: Install Satelle, inspect setup, prove native readiness, and start durable work.
 ---
 
 This tutorial uses `local-demo`, the built-in local Host binding. Run it on the
@@ -12,18 +12,19 @@ Satelle does not add a confirmation before each native action. Treat text and
 instructions shown on the desktop as untrusted content: they cannot override
 the Operator's instructions, Host policy, or consent boundaries.
 
-## 1. Build the executable
+## 1. Install the executable
 
-Install Rust 1.97.0 and an official standalone Codex release at or above
-0.144.0, then build from the repository root. Satelle still rejects the runtime
-unless its stable capabilities and live Host readiness checks pass.
+Install an official standalone Codex release at or above 0.144.0, then install
+Satelle from the public npm registry:
 
 ```sh
-cargo build --release --locked -p satelle-cli
+npm install --global @microck/satelle --include=optional
 ```
 
-Use `target/release/satelle` below, or put that executable on your `PATH`.
-Public npm packages are not available yet.
+This exposes `satelle` on your `PATH`. To use the current source tree instead,
+install Rust 1.97.0, run `cargo build --release --locked -p satelle-cli`, and
+put `target/release/satelle` on your `PATH`. Satelle still rejects the runtime
+unless its stable capabilities and live Host readiness checks pass.
 
 ## 2. Inspect setup before changing anything
 
@@ -85,7 +86,6 @@ the detached follow-up Turn stopped.
 
 - Native Host readiness is supported only on candidate macOS and Windows
   Hosts that pass the live probe. Linux native Computer Use is unavailable.
-- The release has not been published to npm.
 - SSH on-demand transport setup and tunneled operation are implemented, but
   persistent remote service installation is not.
 - Local setup mutation, direct setup, and support bundle export are not

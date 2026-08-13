@@ -5,45 +5,49 @@ Controller sends work to an operator-controlled Host, while the Host owns
 execution, Session state, logs, desktop access, and provider credentials.
 
 > [!IMPORTANT]
-> Satelle is pre-release software. Build it from source. This tree is version
-> 0.1.1. The npm package names reserved by this repository are not published
-> installation paths yet.
+> Satelle is pre-release software. The current release is 0.1.2. Native
+> Computer Use Host support remains gated by the live readiness probe.
 
-The [installation guide](docs/how-to/install-satelle.mdx) lists the reserved
-package identities, the post-publication commands, and the currently available
-source-build path without presenting unpublished packages as usable.
+The [installation guide](docs/how-to/install-satelle.mdx) covers the public npm
+packages, verified GitHub release installers, direct archives, and source builds.
+
+## Install
+
+Use npm, pnpm, or Bun with the canonical package:
+
+```sh
+npm install --global @microck/satelle --include=optional
+pnpm add --global @microck/satelle
+bun add --global @microck/satelle
+```
 
 ## Run the shortest successful flow
 
-Install Rust 1.97.0 and an official standalone Codex release at or above
-0.144.0 on a candidate macOS or Windows Host, then build Satelle from the
-repository root:
-
-```sh
-cargo build --release --locked -p satelle-cli
-```
+Install an official standalone Codex release at or above 0.144.0 on a
+candidate macOS or Windows Host. The package-manager command above exposes the
+installed Satelle executable as `satelle`.
 
 Review the local setup plan, then prove that the visible desktop is ready:
 
 ```sh
-./target/release/satelle setup --host local-demo --dry-run
-./target/release/satelle doctor --host local-demo --scope computer-use --refresh
+satelle setup --host local-demo --dry-run
+satelle doctor --host local-demo --scope computer-use --refresh
 ```
 
 Start one attached Turn and save the returned `session_id`:
 
 ```sh
-./target/release/satelle run --host local-demo "Open the browser"
+satelle run --host local-demo "Open the browser"
 ```
 
 The Session is durable. A fresh Controller process can inspect it, start a
 detached follow-up Turn, stop that Turn, and confirm the terminal state:
 
 ```sh
-./target/release/satelle status <session_id> --host local-demo
-./target/release/satelle steer <session_id> --host local-demo --detach "Open settings"
-./target/release/satelle stop <session_id> --host local-demo
-./target/release/satelle status <session_id> --host local-demo
+satelle status <session_id> --host local-demo
+satelle steer <session_id> --host local-demo --detach "Open settings"
+satelle stop <session_id> --host local-demo
+satelle status <session_id> --host local-demo
 ```
 
 `ready` from the live Computer Use probe is required. A binary, plugin, or
@@ -77,18 +81,16 @@ The single `satelle` executable currently provides:
 - A release-matched Agent Skill Bundle discoverable through `satelle skills`.
 - Human output, stable JSON results, and command-specific lifecycle events.
 
-The following surfaces are not implemented and must not be treated as
-available:
+The following surfaces are not implemented and must not be treated as available:
 
-- Public npm packages or release archives.
 - Local setup mutation after planning.
 - Direct transport setup or automatic direct-token provisioning.
 - Persistent Host service installation and Host stop/restart lifecycle control.
 - Storage migration or support bundle export.
 - Native Linux Computer Use Host execution.
 
-Source builds are the only documented installation path until release
-publication is complete.
+The first-party Homebrew tap and Scoop bucket are not published yet. Use npm,
+the verified GitHub release installers, direct archives, or a source build.
 
 Use `satelle <command> --help` as the exact option reference for the binary you
 are running.
