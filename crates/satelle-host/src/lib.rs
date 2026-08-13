@@ -26,6 +26,9 @@ mod storage;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "test-runtime.rs"]
 mod test_runtime;
+#[cfg(windows)]
+#[path = "windows-native-probe.rs"]
+mod windows_native_probe;
 
 use api_auth::EphemeralApiAuthenticator;
 pub use api_auth::{

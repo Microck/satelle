@@ -1,18 +1,26 @@
 #[cfg(target_os = "macos")]
 use super::control_plane::MacosNativeSessionResources;
+use super::control_plane::macos_native_runtime_version;
 #[cfg(unix)]
 use super::control_plane::perform_handshake;
-#[cfg(unix)]
-use super::control_plane::validate_computer_use_client_path;
-#[cfg(unix)]
-use super::control_plane::validate_macos_computer_use_service_layout;
 use super::control_plane::{
-    CodexImageInputMode, ControlPlaneAdmission, NativeMcpBinding,
-    PlannedNativeComputerUseActionPath, bounded_inventory_command_output,
+    CodexImageInputMode, ControlPlaneAdmission, NATIVE_ISOLATION_TIMEOUT, NativeMcpBinding,
+    PROBE_TIMEOUT, PlannedNativeComputerUseActionPath, bounded_inventory_command_output,
     codex_isolation_plan_from_json, configure_app_server_command,
-    configure_control_plane_probe_command, macos_authenticated_bridge_args,
-    mcp_server_names_from_json, native_bridge_root_path, path_is_absolute_for_platform,
-    probe_control_plane_with, same_path_for_platform, windows_locked_bridge_args,
+    configure_control_plane_probe_command, configure_mcp_inventory_command,
+    macos_authenticated_bridge_args, macos_codex_app_command, mcp_server_names_from_json,
+    native_bridge_root_path, path_is_absolute_for_platform, probe_control_plane_with,
+    refresh_windows_native_pipe_binding_from_config, same_path_for_platform,
+    windows_locked_bridge_args,
+};
+#[cfg(unix)]
+use super::control_plane::{
+    validate_macos_codex_app_layout, validate_macos_computer_use_service_layout,
+};
+use crate::runtime::{ReadinessCacheKey, ReadinessObservationState};
+use satelle_core::session::{
+    ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
+    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, TimeoutPolicy,
 };
 use satelle_core::{ControlPlaneCapability, ControlPlaneOperation, ErrorCode};
 use serde_json::json;
@@ -27,6 +35,130 @@ const FIXTURE_MODE: &str = "SATELLE_CODEX_CONTROL_PLANE_FIXTURE";
 const FIXTURE_SCHEMA_DIR: &str = "SATELLE_CODEX_SCHEMA_FIXTURE_DIR";
 const RAW_NOTIFICATION_CANARY: &str = "PRIVATE_RAW_NOTIFICATION_CANARY";
 const RAW_SCHEMA_CANARY: &str = "PRIVATE_RAW_SCHEMA_CANARY";
+
+#[test]
+fn macos_runtime_identity_binds_every_authenticated_native_executable() {
+    let identity = macos_native_runtime_version("bridge-a", "codex-a", "service-a");
+
+    assert_ne!(
+        identity,
+        macos_native_runtime_version("bridge-b", "codex-a", "service-a")
+    );
+    assert_ne!(
+        identity,
+        macos_native_runtime_version("bridge-a", "codex-b", "service-a")
+    );
+    assert_ne!(
+        identity,
+        macos_native_runtime_version("bridge-a", "codex-a", "service-b")
+    );
+
+    let desktop = DesktopBindingRef::new("desktop-1").expect("desktop binding");
+    let execution_policy = ExecutionPolicy::new(
+        EffectiveModelRef::new("gpt-5.6-luna").expect("model"),
+        ProviderBindingRef::new("openai").expect("provider"),
+        DesktopTarget::new(desktop.clone(), "console-admin"),
+        ApprovalPolicy::OnRequest,
+        SandboxPolicy::WorkspaceWrite,
+        TimeoutPolicy::bounded_seconds(120).expect("timeout"),
+        ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+    );
+    let key = ReadinessCacheKey::new(
+        "codex-native-computer-use",
+        desktop,
+        execution_policy,
+        "0.147.0",
+        identity.clone(),
+        Some("1.0.1000633"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ReadinessObservationState::Granted,
+        ReadinessObservationState::Granted,
+    )
+    .expect("the composite runtime identity must fit the readiness key contract");
+    assert_eq!(key.native_runtime_version(), identity);
+}
+
+fn windows_native_bridge_env() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS".to_string(),
+            "1000".to_string(),
+        ),
+        (
+            "NODE_REPL_NODE_MODULE_DIRS".to_string(),
+            "C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\f1359d6e9a17bb1d\\bin\\node_modules".to_string(),
+        ),
+        (
+            "NODE_REPL_NODE_PATH".to_string(),
+            "C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\f1359d6e9a17bb1d\\bin\\node.exe".to_string(),
+        ),
+        (
+            "NODE_REPL_TRUSTED_CODE_PATHS".to_string(),
+            "C:\\Users\\operator\\.codex;C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\f1359d6e9a17bb1d\\bin\\node_modules".to_string(),
+        ),
+        (
+            "CODEX_HOME".to_string(),
+            "C:\\Users\\operator\\.codex".to_string(),
+        ),
+        (
+            "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S".to_string(),
+            "8676faca28eddb6424d4b54116fe8305e2da6a0ca4e5271e8758fc3c55c3b8fc".to_string(),
+        ),
+        (
+            "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
+            "chrome,iab".to_string(),
+        ),
+        (
+            "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER".to_string(),
+            "Control the in-app browser in conjunction with the Browser Plugin.".to_string(),
+        ),
+        (
+            "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME".to_string(),
+            "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative."
+                .to_string(),
+        ),
+        (
+            "BROWSER_USE_CODEX_APP_BUILD_FLAVOR".to_string(),
+            "prod".to_string(),
+        ),
+        (
+            "BROWSER_USE_CODEX_APP_VERSION".to_string(),
+            "26.803.81509".to_string(),
+        ),
+        ("SKY_CUA_NATIVE_PIPE".to_string(), "1".to_string()),
+        (
+            "SKY_CUA_NATIVE_PIPE_DIRECTORY".to_string(),
+            "\\\\.\\pipe\\codex-computer-use-a0550551-be64-480e-bc74-dc897ea30e0c".to_string(),
+        ),
+        (
+            "CODEX_CLI_PATH".to_string(),
+            "C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\bin\\a61afac3bb4ee395\\codex.exe".to_string(),
+        ),
+    ])
+}
+
+fn expected_windows_native_binding_env() -> BTreeMap<String, String> {
+    let reported = windows_native_bridge_env();
+    BTreeMap::from([
+        (
+            "BROWSER_USE_CODEX_APP_BUILD_FLAVOR".to_string(),
+            reported["BROWSER_USE_CODEX_APP_BUILD_FLAVOR"].clone(),
+        ),
+        (
+            "NODE_REPL_TRUSTED_CODE_PATHS".to_string(),
+            reported["NODE_REPL_TRUSTED_CODE_PATHS"].clone(),
+        ),
+        (
+            "SKY_CUA_NATIVE_PIPE".to_string(),
+            reported["SKY_CUA_NATIVE_PIPE"].clone(),
+        ),
+        (
+            "SKY_CUA_NATIVE_PIPE_DIRECTORY".to_string(),
+            reported["SKY_CUA_NATIVE_PIPE_DIRECTORY"].clone(),
+        ),
+    ])
+}
 
 const STDIO_FIXTURE_SOURCE: &str = r#"
 use std::io::{BufRead, Write};
@@ -315,6 +447,22 @@ fn inventory_probe_is_bounded_and_terminates_descendants() {
     assert_eq!(error.details["reason"], json!("inventory_unavailable"));
 }
 
+#[test]
+fn native_isolation_budget_covers_inventories_and_macos_authentication() {
+    assert!(
+        NATIVE_ISOLATION_TIMEOUT >= Duration::from_secs(90),
+        "both inventories and macOS service authentication share one deadline"
+    );
+}
+
+#[test]
+fn default_control_plane_budget_covers_a_cold_managed_runtime() {
+    assert!(
+        PROBE_TIMEOUT >= Duration::from_secs(60),
+        "schema generation and the live handshake must fit after a cold runtime integrity check"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn complete_inventory_does_not_wait_for_an_escaped_stdout_holder() {
@@ -434,6 +582,10 @@ fn installed_app_server_is_private_stdio_only() {
             "--config",
             native_env_config.as_str(),
             "--config",
+            "features.auth_elicitation=true",
+            "--config",
+            "features.tool_call_mcp_elicitation=true",
+            "--config",
             "features.apps=false",
             "--config",
             "features.plugins=false",
@@ -454,6 +606,53 @@ fn installed_app_server_is_private_stdio_only() {
             .iter()
             .any(|argument| { argument.starts_with("ws://") || argument.starts_with("unix://") })
     );
+}
+
+#[test]
+fn windows_native_pipe_refresh_replaces_the_retired_managed_address() {
+    let mut binding = NativeMcpBinding {
+        command: r"C:\OpenAI\node_repl.exe".to_string(),
+        args: Vec::new(),
+        env: BTreeMap::from([(
+            "SKY_CUA_NATIVE_PIPE_DIRECTORY".to_string(),
+            r"\\.\pipe\codex-computer-use-11111111-1111-1111-1111-111111111111".to_string(),
+        )]),
+    };
+    let current_config = r#"
+        [mcp_servers.node_repl.env]
+        BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+        SKY_CUA_NATIVE_PIPE = "1"
+        SKY_CUA_NATIVE_PIPE_DIRECTORY = '\\.\pipe\codex-computer-use-22222222-2222-4222-8222-222222222222'
+    "#;
+
+    refresh_windows_native_pipe_binding_from_config(&mut binding, "node_repl", current_config)
+        .expect("the current Codex app pipe must replace the retired managed address");
+
+    assert_eq!(
+        binding.env.get("SKY_CUA_NATIVE_PIPE_DIRECTORY"),
+        Some(&r"\\.\pipe\codex-computer-use-22222222-2222-4222-8222-222222222222".to_string())
+    );
+}
+
+#[test]
+fn windows_native_pipe_refresh_rejects_an_arbitrary_pipe() {
+    let mut binding = NativeMcpBinding {
+        command: r"C:\OpenAI\node_repl.exe".to_string(),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+    };
+    let current_config = r#"
+        [mcp_servers.node_repl.env]
+        BROWSER_USE_CODEX_APP_BUILD_FLAVOR = "prod"
+        SKY_CUA_NATIVE_PIPE = "1"
+        SKY_CUA_NATIVE_PIPE_DIRECTORY = '\\.\pipe\attacker-controlled'
+    "#;
+
+    assert!(
+        refresh_windows_native_pipe_binding_from_config(&mut binding, "node_repl", current_config)
+            .is_err()
+    );
+    assert!(!binding.env.contains_key("SKY_CUA_NATIVE_PIPE_DIRECTORY"));
 }
 
 #[cfg(windows)]
@@ -481,18 +680,20 @@ fn windows_protected_bridge_selection_preserves_the_admitted_identity() {
 }
 
 #[test]
-fn windows_protected_bridge_requires_the_pinned_desktop_version() {
-    use super::control_plane::{
-        WINDOWS_CODEX_DESKTOP_VERSION, windows_package_full_name_version_matches,
-    };
+fn windows_protected_bridge_accepts_any_well_formed_desktop_version() {
+    use super::control_plane::windows_package_full_name_has_valid_version;
 
-    assert!(windows_package_full_name_version_matches(
-        "OpenAI.Codex_26.727.6591.0_x64__2p2nqsd0c76g0",
-        WINDOWS_CODEX_DESKTOP_VERSION,
+    assert!(windows_package_full_name_has_valid_version(
+        "OpenAI.Codex_26.803.5235.0_x64__2p2nqsd0c76g0",
     ));
-    assert!(!windows_package_full_name_version_matches(
-        "OpenAI.Codex_26.726.1234.0_x64__2p2nqsd0c76g0",
-        WINDOWS_CODEX_DESKTOP_VERSION,
+    assert!(windows_package_full_name_has_valid_version(
+        "OpenAI.Codex_27.1.0.0_x64__2p2nqsd0c76g0",
+    ));
+    assert!(!windows_package_full_name_has_valid_version(
+        "OpenAI.Codex_27..0.0_x64__2p2nqsd0c76g0",
+    ));
+    assert!(!windows_package_full_name_has_valid_version(
+        "OpenAI.Codex_27.1.0_x64__2p2nqsd0c76g0",
     ));
 }
 
@@ -597,6 +798,26 @@ fn control_plane_probe_disables_every_discovered_mcp_server() {
 }
 
 #[test]
+fn mcp_inventory_excludes_plugin_derived_servers() {
+    let command = configure_mcp_inventory_command(Command::new("codex"));
+    let arguments = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        arguments,
+        [
+            "mcp",
+            "list",
+            "--config",
+            "features.plugins=false",
+            "--json",
+        ]
+    );
+}
+
+#[test]
 fn read_only_app_server_keeps_native_computer_use_disabled() {
     let command = configure_control_plane_probe_command(
         Command::new("codex"),
@@ -674,7 +895,7 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
                 "marketplaceName": "openai-bundled",
                 "installed": true,
                 "enabled": true,
-                "version": "26.727.51351",
+                "version": "27.1.0",
                 "source": {
                     "source": "local",
                     "path": "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use"
@@ -704,11 +925,7 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
                 "type": "stdio",
                 "command": "C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\f1359d6e9a17bb1d\\bin\\node_repl.exe",
                 "args": [],
-                "env": {
-                    "SKY_CUA_NATIVE_PIPE": "1",
-                    "SKY_CUA_NATIVE_PIPE_DIRECTORY": "C:\\Users\\operator\\AppData\\Local\\Temp\\codex-computer-use",
-                    "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod"
-                }
+                "env": windows_native_bridge_env()
             }
         }
     ]);
@@ -726,11 +943,11 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
     assert_eq!(plan.native_mcp_server_name, "node_repl");
     assert_eq!(
         plan.planned_native_action_path,
-        PlannedNativeComputerUseActionPath::WindowsNodeRepl {
-            client_path: PathBuf::from(
-                "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use\\scripts\\computer-use-client.mjs"
-            ),
-        }
+        PlannedNativeComputerUseActionPath::WindowsNodeRepl
+    );
+    assert_eq!(
+        plan.native_mcp_binding.env,
+        expected_windows_native_binding_env()
     );
     assert_eq!(plan.disabled_mcp_server_names, ["paper"]);
 
@@ -747,14 +964,14 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
 }
 
 #[test]
-fn isolation_strips_unrecognized_native_bridge_environment() {
+fn isolation_rejects_incomplete_or_tampered_windows_bridge_environment() {
     let plugins = serde_json::to_vec(&json!({
         "installed": [{
             "pluginId": "computer-use@openai-bundled",
             "marketplaceName": "openai-bundled",
             "installed": true,
             "enabled": true,
-            "version": "26.727.51351",
+            "version": "26.803.41515",
             "source": {
                 "source": "local",
                 "path": "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use"
@@ -762,45 +979,41 @@ fn isolation_strips_unrecognized_native_bridge_environment() {
         }]
     }))
     .expect("serialize plugin fixture");
-    let mcp_servers = serde_json::to_vec(&json!([{
-        "name": "node_repl",
-        "transport": {
-            "type": "stdio",
-            "command": "C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\f1359d6e9a17bb1d\\bin\\node_repl.exe",
-            "args": [],
-            "env": {
-                "SKY_CUA_NATIVE_PIPE": "1",
-                "SKY_CUA_NATIVE_PIPE_DIRECTORY": "C:\\Users\\operator\\AppData\\Local\\Temp\\codex-computer-use",
-                "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
-                "CODEX_HOME": "C:\\Users\\operator\\untrusted-codex-home"
+    for mutate in [
+        |env: &mut BTreeMap<String, String>| {
+            env.remove("NODE_REPL_TRUSTED_CODE_PATHS");
+        },
+        |env: &mut BTreeMap<String, String>| {
+            env.insert(
+                "NODE_REPL_TRUSTED_CODE_PATHS".to_string(),
+                "C:\\Users\\operator\\Downloads".to_string(),
+            );
+        },
+    ] {
+        let mut env = windows_native_bridge_env();
+        mutate(&mut env);
+        let mcp_servers = serde_json::to_vec(&json!([{
+            "name": "node_repl",
+            "transport": {
+                "type": "stdio",
+                "command": "C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\f1359d6e9a17bb1d\\bin\\node_repl.exe",
+                "args": [],
+                "env": env
             }
-        }
-    }]))
-    .expect("serialize MCP fixture");
+        }]))
+        .expect("serialize MCP fixture");
 
-    let plan = codex_isolation_plan_from_json(
-        &plugins,
-        &mcp_servers,
-        "windows",
-        Path::new("C:\\Users\\operator\\.codex"),
-        Path::new("C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node"),
-    )
-    .expect("an installed bridge may report environment outside Satelle's launch allowlist");
+        let error = codex_isolation_plan_from_json(
+            &plugins,
+            &mcp_servers,
+            "windows",
+            Path::new("C:\\Users\\operator\\.codex"),
+            Path::new("C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node"),
+        )
+        .expect_err("the trusted bridge environment must fail closed");
 
-    assert_eq!(
-        plan.native_mcp_binding.env,
-        BTreeMap::from([
-            (
-                "BROWSER_USE_CODEX_APP_BUILD_FLAVOR".to_string(),
-                "prod".to_string(),
-            ),
-            ("SKY_CUA_NATIVE_PIPE".to_string(), "1".to_string()),
-            (
-                "SKY_CUA_NATIVE_PIPE_DIRECTORY".to_string(),
-                "C:\\Users\\operator\\AppData\\Local\\Temp\\codex-computer-use".to_string(),
-            ),
-        ])
-    );
+        assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
+    }
 }
 
 #[test]
@@ -833,7 +1046,7 @@ fn isolation_rejects_a_same_named_bridge_outside_the_official_runtime() {
             "marketplaceName": "openai-bundled",
             "installed": true,
             "enabled": true,
-            "version": "26.727.51351",
+            "version": "26.803.41515",
             "source": {
                 "source": "local",
                 "path": "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use"
@@ -870,7 +1083,7 @@ fn isolation_rejects_a_same_named_bridge_outside_the_official_runtime() {
 }
 
 #[test]
-fn isolation_rejects_unpinned_or_redirected_computer_use_plugins() {
+fn isolation_rejects_malformed_or_redirected_computer_use_plugins() {
     let mcp_servers = serde_json::to_vec(&json!([{
         "name": "node_repl",
         "transport": {
@@ -888,12 +1101,12 @@ fn isolation_rejects_unpinned_or_redirected_computer_use_plugins() {
 
     for (version, path, expected_reason) in [
         (
-            "26.727.99999",
+            "26..99999",
             "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use",
             "computer_use_plugin_not_ready",
         ),
         (
-            "26.727.51351",
+            "26.803.41515",
             "C:\\Users\\operator\\Downloads\\computer-use",
             "computer_use_plugin_source_untrusted",
         ),
@@ -930,7 +1143,7 @@ fn macos_isolation_selects_the_official_node_repl_path() {
             "marketplaceName": "openai-bundled",
             "installed": true,
             "enabled": true,
-            "version": "1.0.1000621",
+            "version": "2.0.0",
             "source": {
                 "source": "local",
                 "path": "/Users/operator/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use"
@@ -957,9 +1170,8 @@ fn macos_isolation_selects_the_official_node_repl_path() {
                 "args": [],
                 "env": {
                     "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS": "1000",
-                    "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "091a81603ff202a16ed56557709bf42d97caf8f0dd2e07ae9e26d7c014d71035",
-                    "SKY_CUA_SERVICE_PATH": "/Users/operator/.codex/computer-use/Codex Computer Use.app",
-                    "BROWSER_USE_CODEX_APP_VERSION": "26.730.61639",
+                    "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "BROWSER_USE_CODEX_APP_VERSION": "27.1.0",
                     "NODE_REPL_TRUSTED_CODE_PATHS": "/Users/operator/.codex:/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
                     "NODE_REPL_NODE_MODULE_DIRS": "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
                     "NODE_REPL_NODE_PATH": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node",
@@ -969,7 +1181,8 @@ fn macos_isolation_selects_the_official_node_repl_path() {
                     "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME": "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative.",
                     "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE": "Control desktop apps on macOS through Computer Use.",
                     "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
-                    "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex"
+                    "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex",
+                    "SKY_CUA_SERVICE_PATH": "/Users/operator/.codex/computer-use/Codex Computer Use.app"
                 }
             }
         }
@@ -986,6 +1199,7 @@ fn macos_isolation_selects_the_official_node_repl_path() {
     .expect("the official macOS node_repl path must be admitted");
 
     assert_eq!(plan.native_mcp_server_name, "node_repl");
+    assert_eq!(plan.plugin_version, "2.0.0");
     assert_eq!(plan.disabled_mcp_server_names, ["computer-use"]);
     assert_eq!(
         plan.planned_native_action_path,
@@ -996,6 +1210,20 @@ fn macos_isolation_selects_the_official_node_repl_path() {
         "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
     );
 
+    mcp_inventory[1]["transport"]["env"]["SKY_CUA_SERVICE_PATH"] =
+        json!("/tmp/untrusted/Codex Computer Use.app");
+    let error = codex_isolation_plan_from_json(
+        &plugins,
+        &serde_json::to_vec(&mcp_inventory).expect("serialize tampered service path fixture"),
+        "macos",
+        Path::new("/Users/operator/.codex"),
+        Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+    )
+    .expect_err("an untrusted Computer Use service path must fail closed");
+    assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
+
+    mcp_inventory[1]["transport"]["env"]["SKY_CUA_SERVICE_PATH"] =
+        json!("/Users/operator/.codex/computer-use/Codex Computer Use.app");
     mcp_inventory[1]["transport"]["env"]["UNTRUSTED_EXTRA"] = json!("1");
     let error = codex_isolation_plan_from_json(
         &plugins,
@@ -1006,13 +1234,42 @@ fn macos_isolation_selects_the_official_node_repl_path() {
     )
     .expect_err("unrecognized node_repl environment must fail closed");
     assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
+
+    mcp_inventory[1]["transport"]["env"]
+        .as_object_mut()
+        .expect("node_repl environment")
+        .remove("UNTRUSTED_EXTRA");
+    mcp_inventory[1]["transport"]["env"]["NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S"] =
+        json!("not-a-sha256");
+    let error = codex_isolation_plan_from_json(
+        &plugins,
+        &serde_json::to_vec(&mcp_inventory).expect("serialize malformed digest fixture"),
+        "macos",
+        Path::new("/Users/operator/.codex"),
+        Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+    )
+    .expect_err("a malformed bridge client digest must fail closed");
+    assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
+
+    mcp_inventory[1]["transport"]["env"]["NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S"] =
+        json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    mcp_inventory[1]["transport"]["env"]["BROWSER_USE_CODEX_APP_VERSION"] = json!("27..1");
+    let error = codex_isolation_plan_from_json(
+        &plugins,
+        &serde_json::to_vec(&mcp_inventory).expect("serialize malformed version fixture"),
+        "macos",
+        Path::new("/Users/operator/.codex"),
+        Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+    )
+    .expect_err("a malformed bridge app version must fail closed");
+    assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
 }
 
 #[test]
-fn macos_isolation_rejects_the_wrong_plugin_version_or_relative_bridge_base() {
+fn macos_isolation_rejects_a_malformed_plugin_version_or_relative_bridge_base() {
     for (version, command, cwd) in [
         (
-            "26.727.51351",
+            "1..0",
             "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
             ".",
         ),
@@ -1108,12 +1365,66 @@ fn macos_computer_use_service_layout_rejects_redirected_executable_identity() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn macos_codex_app_layout_rejects_redirected_cli_identity() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("create macOS Codex app fixture");
+    // macOS exposes temporary directories through `/var`, which canonicalizes
+    // to `/private/var`. Start from the canonical root so this fixture tests
+    // the embedded CLI identity instead of failing on the parent alias.
+    let fixture_root =
+        std::fs::canonicalize(directory.path()).expect("canonicalize macOS fixture root");
+    let bundle = fixture_root.join("Codex.app");
+    let resources = bundle.join("Contents").join("Resources");
+    std::fs::create_dir_all(&resources).expect("create exact Codex app layout");
+    let executable = resources.join("codex");
+    std::fs::write(&executable, "fixture").expect("write embedded Codex fixture");
+    assert_eq!(
+        validate_macos_codex_app_layout(&bundle)
+            .expect("the exact regular Codex app layout must be accepted"),
+        std::fs::canonicalize(&executable).expect("canonicalize embedded Codex fixture")
+    );
+
+    std::fs::remove_file(&executable).expect("remove regular embedded Codex fixture");
+    let redirected = fixture_root.join("replacement-codex");
+    std::fs::write(&redirected, "replacement").expect("write redirected Codex fixture");
+    symlink(&redirected, &executable).expect("redirect the embedded Codex executable");
+    let error = validate_macos_codex_app_layout(&bundle)
+        .expect_err("a redirected embedded Codex executable must fail closed");
+    assert_eq!(
+        error.details["reason"],
+        json!("codex_app_runtime_untrusted")
+    );
+}
+
+#[test]
+fn macos_computer_use_runtime_uses_the_desktop_bundles_embedded_codex() {
+    let command = macos_codex_app_command(
+        Path::new("/Applications/ChatGPT.app/Contents/Resources/codex"),
+        Path::new("/Users/operator/.codex"),
+    );
+
+    assert_eq!(
+        command.get_program(),
+        "/Applications/ChatGPT.app/Contents/Resources/codex"
+    );
+    assert_eq!(
+        command.get_envs().collect::<Vec<_>>(),
+        [(
+            std::ffi::OsStr::new("CODEX_HOME"),
+            Some(std::ffi::OsStr::new("/Users/operator/.codex"))
+        )]
+    );
+}
+
 #[test]
 fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
     for (platform, command, codex_home, trusted_root) in [
         (
             "macos",
-            "/tmp/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+            "/tmp/Codex.app/Contents/Resources/cua_node/bin/node_repl",
             "/Users/operator/.codex",
             "/Applications/ChatGPT.app/Contents/Resources/cua_node",
         ),
@@ -1141,7 +1452,7 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
                 "marketplaceName": "openai-bundled",
                 "installed": true,
                 "enabled": true,
-                "version": if platform == "macos" { "1.0.1000621" } else { "26.727.51351" },
+                "version": if platform == "macos" { "1.0.1000621" } else { "26.803.41515" },
                 "source": {"source": "local", "path": plugin_path}
             }]
         }))
@@ -1153,7 +1464,6 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
                 json!({
                     "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS": "1000",
                     "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "091a81603ff202a16ed56557709bf42d97caf8f0dd2e07ae9e26d7c014d71035",
-                    "SKY_CUA_SERVICE_PATH": "/Users/operator/.codex/computer-use/Codex Computer Use.app",
                     "BROWSER_USE_CODEX_APP_VERSION": "26.730.61639",
                     "NODE_REPL_TRUSTED_CODE_PATHS": "/Users/operator/.codex:/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
                     "NODE_REPL_NODE_MODULE_DIRS": "/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules",
@@ -1164,7 +1474,8 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
                     "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME": "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative.",
                     "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE": "Control desktop apps on macOS through Computer Use.",
                     "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
-                    "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex"
+                    "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex",
+                    "SKY_CUA_SERVICE_PATH": "/Users/operator/.codex/computer-use/Codex Computer Use.app"
                 }),
             )
         } else {
@@ -1200,110 +1511,6 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
 
         assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn computer_use_client_rejects_replacement_bytes_at_the_trusted_path() {
-    use sha2::{Digest, Sha256};
-
-    let directory = tempfile::tempdir().expect("create Computer Use client fixture");
-    let codex_home = directory.path().join("codex-home");
-    let client_path = codex_home
-        .join(".tmp")
-        .join("bundled-marketplaces")
-        .join("openai-bundled")
-        .join("plugins")
-        .join("computer-use")
-        .join("scripts")
-        .join("computer-use-client.mjs");
-    std::fs::create_dir_all(client_path.parent().unwrap()).expect("create canonical client path");
-    let authenticated_bytes = b"export const authenticated = true;";
-    std::fs::write(&client_path, authenticated_bytes).expect("write authenticated client");
-    let expected_sha256 = Sha256::digest(authenticated_bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    validate_computer_use_client_path(&client_path, &codex_home, "macos", &expected_sha256)
-        .expect("the exact authenticated client bytes must be admitted");
-
-    std::fs::write(&client_path, "export const replaced = true;")
-        .expect("replace client at the same canonical path");
-    let error =
-        validate_computer_use_client_path(&client_path, &codex_home, "macos", &expected_sha256)
-            .expect_err("replacement bytes at the trusted path must fail closed");
-
-    assert_eq!(
-        error.details["reason"],
-        json!("computer_use_client_untrusted")
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn computer_use_client_rejects_an_oversized_file_before_reading_it() {
-    let directory = tempfile::tempdir().expect("create Computer Use client fixture");
-    let codex_home = directory.path().join("codex-home");
-    let client_path = codex_home
-        .join(".tmp")
-        .join("bundled-marketplaces")
-        .join("openai-bundled")
-        .join("plugins")
-        .join("computer-use")
-        .join("scripts")
-        .join("computer-use-client.mjs");
-    std::fs::create_dir_all(client_path.parent().unwrap()).expect("create canonical client path");
-    let client = std::fs::File::create(&client_path).expect("create sparse client fixture");
-    client
-        .set_len(8 * 1024 * 1024 + 1)
-        .expect("make client fixture exceed the admission limit");
-
-    let error =
-        validate_computer_use_client_path(&client_path, &codex_home, "macos", &"0".repeat(64))
-            .expect_err("an oversized client must fail before Host allocation");
-
-    assert_eq!(
-        error.details["reason"],
-        json!("computer_use_client_untrusted")
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn computer_use_client_rejects_a_redirected_scripts_ancestor() {
-    use std::os::unix::fs::symlink;
-
-    let directory = tempfile::tempdir().expect("create Computer Use client fixture");
-    let codex_home = directory.path().join("codex-home");
-    let plugin_root = codex_home
-        .join(".tmp")
-        .join("bundled-marketplaces")
-        .join("openai-bundled")
-        .join("plugins")
-        .join("computer-use");
-    std::fs::create_dir_all(&plugin_root).expect("create canonical plugin root");
-    let redirected_scripts = directory.path().join("redirected-scripts");
-    std::fs::create_dir_all(&redirected_scripts).expect("create redirected scripts directory");
-    std::fs::write(
-        redirected_scripts.join("computer-use-client.mjs"),
-        "export const redirected = true;",
-    )
-    .expect("write redirected Computer Use client");
-    symlink(&redirected_scripts, plugin_root.join("scripts"))
-        .expect("redirect the scripts ancestor");
-
-    let error = validate_computer_use_client_path(
-        &plugin_root.join("scripts").join("computer-use-client.mjs"),
-        &codex_home,
-        "macos",
-        &"0".repeat(64),
-    )
-    .expect_err("a redirected plugin ancestor must not receive native authority");
-
-    assert_eq!(
-        error.details["reason"],
-        json!("computer_use_client_untrusted")
-    );
 }
 
 #[test]

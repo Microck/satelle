@@ -46,12 +46,12 @@ fi
 binary_path="$bin_dir/satelle"
 receipt_path="$bin_dir/.satelle-install.json"
 lock_path="$bin_dir/.satelle-install.lock"
+lock_candidate_path="$lock_path.$$"
 temporary_root=""
 install_path=""
 staged_receipt_path=""
 previous_binary_path=""
 previous_receipt_path=""
-lock_held=0
 commit_started=0
 had_binary=0
 had_receipt=0
@@ -97,9 +97,11 @@ cleanup() {
     [ -z "$cleanup_path" ] || remove_file_if_present "$cleanup_path"
   done
   [ -z "$temporary_root" ] || rm -rf "$temporary_root"
-  if [ "$lock_held" -eq 1 ]; then
-    rmdir "$lock_path" 2>/dev/null || :
-    lock_held=0
+  if [ -e "$lock_candidate_path" ] || [ -L "$lock_candidate_path" ]; then
+    if [ -e "$lock_path" ] && [ "$lock_candidate_path" -ef "$lock_path" ]; then
+      rm -f "$lock_path"
+    fi
+    rm -f "$lock_candidate_path"
   fi
 }
 
@@ -117,11 +119,15 @@ trap 'terminate 143' TERM
 
 acquire_install_lock() {
   mkdir -p "$bin_dir"
-  if ! mkdir "$lock_path" 2>/dev/null; then
+  rm -f "$lock_candidate_path"
+  (umask 077 && : > "$lock_candidate_path")
+  # A hard link acquires the public lock atomically. Cleanup compares inode identity, so a
+  # signal cannot leave this lock behind or remove a lock owned by another installer.
+  if [ -e "$lock_path" ] || [ -L "$lock_path" ] || ! ln "$lock_candidate_path" "$lock_path" 2>/dev/null; then
+    rm -f "$lock_candidate_path"
     printf '%s\n' "another Satelle install operation holds $lock_path; remove it only after confirming no installer is running" >&2
     exit 1
   fi
-  lock_held=1
 }
 
 # Keep both the command and polling sleep as direct children so every signal path can reap

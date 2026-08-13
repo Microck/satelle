@@ -14,7 +14,9 @@ the Operator's instructions, Host policy, or consent boundaries.
 
 ## 1. Build the executable
 
-Install Rust 1.97.0 and Codex 0.144.0, then build from the repository root:
+Install Rust 1.97.0 and an official standalone Codex release at or above
+0.144.0, then build from the repository root. Satelle still rejects the runtime
+unless its stable capabilities and live Host readiness checks pass.
 
 ```sh
 cargo build --release --locked -p satelle-cli

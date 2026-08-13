@@ -29,6 +29,10 @@ use std::sync::{Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
+// These waits synchronize test threads; they do not define a product timeout.
+// Native CI can take several seconds to schedule a freshly admitted worker.
+const INTERRUPT_TEST_COORDINATION_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[test]
 fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
     let recovery_command = SshStorageMaintenance::Restore.recovery_command(
@@ -925,6 +929,74 @@ fn ssh_setup_host(api_token: Option<ApiTokenSource>) -> SelectedHost {
         config,
         from_project: false,
     }
+}
+
+#[test]
+fn current_daemon_observation_treats_only_connect_failures_as_missing() {
+    let transport = SshSetupTransport::new(&ssh_setup_host(None)).expect("construct setup");
+    let connect_failure = reqwest::blocking::Client::new()
+        .get("http://127.0.0.1:0")
+        .send()
+        .expect_err("closed loopback endpoint creates a connect error");
+    let missing = transport
+        .current_daemon_observation::<satelle_transport::CapabilitiesResponse>(Err(
+            DaemonClientError::Transport(connect_failure),
+        ))
+        .expect("a closed daemon endpoint proves that no current artifact is listening");
+    assert_eq!(missing.current_version, None);
+
+    let invalid_request = reqwest::blocking::Client::new()
+        .get("not a valid URL")
+        .build()
+        .expect_err("invalid URL creates a non-connect transport error");
+    let error = transport
+        .current_daemon_observation::<satelle_transport::CapabilitiesResponse>(Err(
+            DaemonClientError::Transport(invalid_request),
+        ))
+        .expect_err("an unproven transport failure must remain blocking");
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+}
+
+#[test]
+fn first_trust_identity_discovery_treats_only_connect_failures_as_missing() {
+    let transport = SshSetupTransport::new(&ssh_setup_host(None)).expect("construct setup");
+    let connect_failure = reqwest::blocking::Client::new()
+        .get("http://127.0.0.1:0")
+        .send()
+        .expect_err("closed loopback endpoint creates a connect error");
+    let missing = transport
+        .first_trust_discovered_identity(Err(DaemonClientError::Transport(connect_failure)))
+        .expect("a closed daemon endpoint proves that no current artifact is listening");
+    assert_eq!(missing, None);
+
+    let invalid_request = reqwest::blocking::Client::new()
+        .get("not a valid URL")
+        .build()
+        .expect_err("invalid URL creates a non-connect transport error");
+    let error = transport
+        .first_trust_discovered_identity(Err(DaemonClientError::Transport(invalid_request)))
+        .expect_err("an unproven first-trust transport failure must remain blocking");
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind stalled endpoint");
+    let address = listener.local_addr().expect("read stalled endpoint");
+    let stalled = thread::spawn(move || {
+        let (_stream, _) = listener.accept().expect("accept stalled request");
+        thread::sleep(Duration::from_millis(200));
+    });
+    let timeout = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(20))
+        .build()
+        .expect("build bounded client")
+        .get(format!("http://{address}/v1/capabilities"))
+        .send()
+        .expect_err("stalled endpoint reaches the request timeout");
+    assert!(timeout.is_timeout());
+    let error = transport
+        .first_trust_discovered_identity(Err(DaemonClientError::Transport(timeout)))
+        .expect_err("a first-trust timeout leaves daemon presence unknown");
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+    stalled.join().expect("join stalled endpoint");
 }
 
 #[test]
@@ -2956,6 +3028,91 @@ fn first_trust_artifact_probe_rejects_an_unauthenticated_reachable_daemon() {
     drop(server);
 }
 
+#[cfg(unix)]
+#[test]
+fn first_trust_artifact_probe_treats_a_closed_daemon_port_as_not_installed() {
+    let mut host = ssh_setup_host(Some(ApiTokenSource::File {
+        path: PathBuf::from("/tmp/satelle-first-trust-token"),
+    }));
+    host.config.expected_host_id = None;
+    let transport = SshSetupTransport::new(&host).expect("construct first-trust transport");
+
+    // A fresh client can observe an immediate peer close as either a closed
+    // request channel or an incomplete HTTP message. Exercise the race enough
+    // times to keep both typed close paths inside the missing-daemon contract.
+    for _ in 0..32 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("bind a real loopback endpoint for the missing daemon");
+        let address = listener.local_addr().expect("read loopback endpoint");
+        let closer = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept artifact probe");
+            drop(stream);
+        });
+        let observation = transport
+            .observe_current_daemon_at(
+                address,
+                ApiBearerToken::generate().expect("generate first-trust probe token"),
+            )
+            .expect("a closed daemon port means the Host artifact is not installed yet");
+
+        assert_eq!(observation.current_version, None);
+        assert_eq!(observation.minimum_host_version, None);
+        assert!(observation.protocol_compatible);
+        assert_eq!(observation.validated_host_identity, None);
+        closer.join().expect("join loopback endpoint");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn first_trust_liveness_treats_a_closed_daemon_port_as_not_running() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind a real loopback endpoint for the missing daemon");
+    let address = listener.local_addr().expect("read loopback endpoint");
+    let closer = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept liveness probe");
+        drop(stream);
+    });
+    let client = DaemonClient::loopback_with_timeout(
+        address,
+        ApiBearerToken::generate().expect("generate first-trust probe token"),
+        "trust-probe-test",
+        SSH_DAEMON_REQUEST_TIMEOUT,
+    )
+    .expect("construct first-trust liveness client");
+
+    assert!(
+        !first_trust_daemon_is_live("first-trust-host", &client)
+            .expect("a closed daemon port means no daemon is running")
+    );
+    closer.join().expect("join loopback endpoint");
+}
+
+#[cfg(unix)]
+#[test]
+fn first_trust_liveness_preserves_a_stalled_transport_failure() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind a real loopback endpoint for the stalled daemon");
+    let address = listener.local_addr().expect("read loopback endpoint");
+    let stalled = thread::spawn(move || {
+        let (_stream, _) = listener.accept().expect("accept liveness probe");
+        thread::sleep(Duration::from_millis(250));
+    });
+    let client = DaemonClient::loopback_with_timeout(
+        address,
+        ApiBearerToken::generate().expect("generate first-trust probe token"),
+        "trust-probe-test",
+        Duration::from_millis(50),
+    )
+    .expect("construct first-trust liveness client");
+
+    let error = first_trust_daemon_is_live("first-trust-host", &client)
+        .expect_err("a stalled live endpoint does not prove that the daemon is absent");
+
+    assert_eq!(error.code, ErrorCode::HostUnreachable);
+    stalled.join().expect("join stalled loopback endpoint");
+}
+
 #[test]
 fn persistent_service_lifecycle_uses_distinct_bootstrap_operations() {
     assert_eq!(
@@ -4244,7 +4401,9 @@ fn injected_interrupt_before_local_run_admission_cancels_without_creating_a_turn
         )
     });
     assert!(
-        adapter.preflight_started.wait_for(Duration::from_secs(2)),
+        adapter
+            .preflight_started
+            .wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
         "preflight must be active before interruption"
     );
 
@@ -4295,7 +4454,9 @@ fn local_interrupt_wait_failure_reconciles_the_spawned_operation() {
             .expect("test result receiver remains connected");
     });
     assert!(
-        adapter.preflight_started.wait_for(Duration::from_secs(2)),
+        adapter
+            .preflight_started
+            .wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
         "preflight must be active before the listener fails"
     );
     if let Ok(result) = result_receiver.recv_timeout(Duration::from_millis(100)) {
@@ -4306,7 +4467,7 @@ fn local_interrupt_wait_failure_reconciles_the_spawned_operation() {
 
     adapter.preflight_release.signal();
     let failure = result_receiver
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(INTERRUPT_TEST_COORDINATION_TIMEOUT)
         .expect("operation must reconcile after preflight exits")
         .expect_err("listener failure must fail the attached command");
     command.join().expect("command thread must not panic");
@@ -4374,7 +4535,9 @@ fn injected_interrupt_after_local_run_admission_confirms_stop_before_exit_130() 
         )
     });
     assert!(
-        adapter.execute_started.wait_for(Duration::from_secs(2)),
+        adapter
+            .execute_started
+            .wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
         "execution must start after durable admission"
     );
 
@@ -4435,12 +4598,14 @@ fn unconfirmed_local_stop_preserves_buffered_live_events_without_waiting_for_exe
             .expect("test result receiver remains connected");
     });
     assert!(
-        adapter.execute_started.wait_for(Duration::from_secs(2)),
+        adapter
+            .execute_started
+            .wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
         "execution must publish its live event before interruption"
     );
 
     interrupt.signal();
-    let failure = match result_receiver.recv_timeout(Duration::from_secs(2)) {
+    let failure = match result_receiver.recv_timeout(INTERRUPT_TEST_COORDINATION_TIMEOUT) {
         Ok(Err(failure)) => failure,
         Ok(Ok(_)) => panic!("post-admission interruption must fail with exit 130"),
         Err(error) => {
@@ -5307,7 +5472,7 @@ fn injected_interrupt_after_direct_run_admission_confirms_stop_before_exit_130()
         assert!(
             coordinator_adapter
                 .execute_started
-                .wait_for(Duration::from_secs(2)),
+                .wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
             "direct run must be durably admitted before interruption"
         );
         coordinator_interrupt.signal();
@@ -5353,7 +5518,9 @@ fn injected_interrupt_after_direct_steer_admission_detaches_without_stop() {
         .run_detached(&TurnRequest::new("seed direct steer interruption"))
         .expect("seed Session");
     assert!(
-        adapter.execute_finished.wait_for(Duration::from_secs(2)),
+        adapter
+            .execute_finished
+            .wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
         "seed direct Turn must finish before steer"
     );
     adapter.execute_finished.reset();
@@ -5365,7 +5532,7 @@ fn injected_interrupt_after_direct_steer_admission_detaches_without_stop() {
         assert!(
             coordinator_adapter
                 .execute_started
-                .wait_for(Duration::from_secs(2)),
+                .wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
             "direct steer must be durably admitted before interruption"
         );
         coordinator_interrupt.signal();
@@ -5404,7 +5571,9 @@ fn injected_interrupt_after_direct_steer_admission_detaches_without_stop() {
 
     adapter.execute_release.signal();
     assert!(
-        adapter.execute_finished.wait_for(Duration::from_secs(2)),
+        adapter
+            .execute_finished
+            .wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
         "detached direct worker must finish after explicit test release"
     );
 }

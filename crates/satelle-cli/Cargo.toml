@@ -16,6 +16,7 @@ cliclack.workspace = true
 console.workspace = true
 command-group.workspace = true
 flate2.workspace = true
+hyper.workspace = true
 notify.workspace = true
 rmcp.workspace = true
 reqwest.workspace = true

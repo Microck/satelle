@@ -30,6 +30,7 @@ const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const APP_POLICY_MESSAGE_LIMIT: usize = 128;
 const APP_POLICY_LINE_LIMIT: u64 = 2 * 1024 * 1024;
 const APP_POLICY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const EFFECTIVE_DEFAULTS_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const APP_POLICY_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const LEGACY_APP_POLICY_LIMIT: u64 = 64 * 1024;
 const CURRENT_APP_POLICY_LIMIT: u64 = 1024 * 1024;
@@ -138,9 +139,10 @@ fn computer_use_allowed_app_ids_from_config(contents: &str) -> Option<BTreeSet<S
     )
 }
 
-/// Exact Codex release whose stable schema and native-host behavior define the
-/// Phase 0 compatibility contract. Later patches require fresh acceptance.
-pub(crate) const REQUIRED_CODEX_VERSION: CodexVersion = CodexVersion::new(0, 144, 0);
+/// Oldest Codex release whose stable app-server surface has been inspected.
+/// Newer releases must still pass the same capability and live-readiness
+/// gates. Version ordering alone never establishes compatibility.
+pub(crate) const MINIMUM_CODEX_VERSION: CodexVersion = CodexVersion::new(0, 144, 0);
 
 /// Every upstream capability required before native Computer Use can be
 /// advertised as supported.
@@ -161,7 +163,7 @@ pub(crate) const REQUIRED_CAPABILITIES: [RequiredCapability; 12] = [
 
 /// A parsed Codex version. Numeric fields keep diagnostic blockers free of
 /// arbitrary command output.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub(crate) struct CodexVersion {
     pub(crate) major: u16,
     pub(crate) minor: u16,
@@ -176,6 +178,21 @@ impl CodexVersion {
             patch,
         }
     }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let mut fields = value.split('.');
+        let major = fields.next().and_then(parse_version_component)?;
+        let minor = fields.next().and_then(parse_version_component)?;
+        let patch = fields.next().and_then(parse_version_component)?;
+        fields
+            .next()
+            .is_none()
+            .then_some(Self::new(major, minor, patch))
+    }
+}
+
+pub(crate) fn supports_codex_version(version: CodexVersion) -> bool {
+    version >= MINIMUM_CODEX_VERSION
 }
 
 impl fmt::Display for CodexVersion {
@@ -681,7 +698,7 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
     };
     let codex_version = probe_codex_version(&runtime, version_timeout);
     let (capabilities, control_plane_admission) = match codex_version {
-        CodexVersionEvidence::Detected { version } if version == REQUIRED_CODEX_VERSION => {
+        CodexVersionEvidence::Detected { version } if supports_codex_version(version) => {
             let control_plane_timeout = match budget.optional_remaining(Instant::now()) {
                 Ok(timeout) => timeout,
                 Err(failure) => {
@@ -917,7 +934,7 @@ fn probe_windows_app_policy_with(mut command: Command, timeout: Duration) -> Evi
 pub(crate) fn probe_effective_codex_defaults(
     command: Command,
 ) -> Result<EffectiveCodexDefaults, ()> {
-    probe_effective_codex_defaults_with(command, APP_POLICY_PROBE_TIMEOUT).ok_or(())
+    probe_effective_codex_defaults_with(command, EFFECTIVE_DEFAULTS_PROBE_TIMEOUT).ok_or(())
 }
 
 fn probe_effective_codex_defaults_with(
@@ -1432,7 +1449,7 @@ pub(crate) fn evaluate_phase0_support(evidence: Phase0CapabilityEvidence) -> Pha
     let mut blockers = Vec::new();
 
     let version_blocker = match evidence.codex_version {
-        CodexVersionEvidence::Detected { version } if version == REQUIRED_CODEX_VERSION => None,
+        CodexVersionEvidence::Detected { version } if supports_codex_version(version) => None,
         CodexVersionEvidence::Detected { .. } => Some(BlockerReason::UnsupportedCodexVersion),
         CodexVersionEvidence::Missing => Some(BlockerReason::MissingCodexRuntime),
         CodexVersionEvidence::Malformed => Some(BlockerReason::MalformedCodexVersion),
@@ -1660,6 +1677,13 @@ fn wait_for_group(child: &mut GroupChild, deadline: Instant) -> GroupWaitOutcome
             Err(_) => return GroupWaitOutcome::Error,
         }
     }
+}
+
+pub(crate) fn wait_for_group_shutdown(child: &mut GroupChild, timeout: Duration) -> bool {
+    matches!(
+        wait_for_group(child, Instant::now() + timeout),
+        GroupWaitOutcome::Exited(_)
+    )
 }
 
 pub(crate) fn terminate_group(child: &mut GroupChild) -> bool {

@@ -1,7 +1,7 @@
 use super::*;
 use crate::codex_capabilities::{
-    CapabilityMatrix, CodexVersionEvidence, HostPlatform, Phase0CapabilityEvidence,
-    REQUIRED_CODEX_VERSION,
+    CapabilityMatrix, CodexVersionEvidence, HostPlatform, MINIMUM_CODEX_VERSION,
+    Phase0CapabilityEvidence,
 };
 use base64::Engine as _;
 use satelle_core::session::TurnExecutionMode;
@@ -1577,7 +1577,7 @@ fn unsupported_production_execution_is_blocked_without_state_admission() {
         "unsupported-linux-host",
         Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Detected {
-                version: REQUIRED_CODEX_VERSION,
+                version: MINIMUM_CODEX_VERSION,
             },
             host_platform: HostPlatform::Linux,
             capabilities: CapabilityMatrix::unproven(),
@@ -1685,7 +1685,7 @@ fn blocked_control_plane_precedes_capability_and_live_desktop_checks() {
     let state = TestStateDir::new().expect("temporary state directory should exist");
     let evidence = Phase0CapabilityEvidence {
         codex_version: CodexVersionEvidence::Detected {
-            version: REQUIRED_CODEX_VERSION,
+            version: MINIMUM_CODEX_VERSION,
         },
         host_platform: HostPlatform::Windows,
         capabilities: CapabilityMatrix::unproven(),
@@ -1824,7 +1824,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
     let initial = capability_snapshot(
         Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Detected {
-                version: REQUIRED_CODEX_VERSION,
+                version: MINIMUM_CODEX_VERSION,
             },
             host_platform: HostPlatform::Windows,
             capabilities: CapabilityMatrix::unproven(),
@@ -1903,7 +1903,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
 fn production_doctor_test_service(state: &TestStateDir) -> HostService {
     let evidence = Phase0CapabilityEvidence {
         codex_version: CodexVersionEvidence::Detected {
-            version: REQUIRED_CODEX_VERSION,
+            version: MINIMUM_CODEX_VERSION,
         },
         host_platform: HostPlatform::Linux,
         capabilities: CapabilityMatrix::unproven(),
@@ -1935,7 +1935,7 @@ fn fatal_doctor_failure_preserves_independent_terminal_probe_results() {
     let snapshot = Arc::new(RwLock::new(capability_snapshot(
         Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Detected {
-                version: REQUIRED_CODEX_VERSION,
+                version: MINIMUM_CODEX_VERSION,
             },
             host_platform: HostPlatform::Linux,
             capabilities: CapabilityMatrix::unproven(),
@@ -2107,7 +2107,7 @@ fn non_codex_phase0_findings_do_not_block_the_codex_result() {
     let snapshot = capability_snapshot(
         Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Detected {
-                version: REQUIRED_CODEX_VERSION,
+                version: MINIMUM_CODEX_VERSION,
             },
             host_platform: HostPlatform::Windows,
             capabilities,
@@ -2360,7 +2360,7 @@ fn same_batch_spawn_failure_preserves_already_published_rows() {
     let snapshot_slot = RwLock::new(capability_snapshot(
         Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Detected {
-                version: REQUIRED_CODEX_VERSION,
+                version: MINIMUM_CODEX_VERSION,
             },
             host_platform: HostPlatform::Linux,
             capabilities: CapabilityMatrix::unproven(),
@@ -2527,7 +2527,7 @@ fn production_doctor_identifies_the_missing_private_native_execution_path() {
     let snapshot = capability_snapshot(
         Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Detected {
-                version: REQUIRED_CODEX_VERSION,
+                version: MINIMUM_CODEX_VERSION,
             },
             host_platform: HostPlatform::Windows,
             capabilities,
@@ -2776,7 +2776,7 @@ fn refresh_projection_preserves_worker_finish_timestamps() {
     let snapshot = capability_snapshot(
         Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Detected {
-                version: REQUIRED_CODEX_VERSION,
+                version: MINIMUM_CODEX_VERSION,
             },
             host_platform: HostPlatform::Linux,
             capabilities: CapabilityMatrix::unproven(),
@@ -2850,7 +2850,7 @@ fn native_refresh_marks_only_repair_owned_failures_repairable() {
     let snapshot = capability_snapshot(
         Phase0CapabilityEvidence {
             codex_version: CodexVersionEvidence::Detected {
-                version: REQUIRED_CODEX_VERSION,
+                version: MINIMUM_CODEX_VERSION,
             },
             host_platform: HostPlatform::Linux,
             capabilities: CapabilityMatrix::unproven(),

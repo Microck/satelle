@@ -1,4 +1,5 @@
 use crate::self_update;
+use base64::Engine as _;
 use satelle_core::session::HostIdentityRef;
 use satelle_core::{DaemonPathOverrides, HostConfig, SshIdentityCommitRecord};
 use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
@@ -10,6 +11,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
@@ -37,6 +40,14 @@ const BOOTSTRAP_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const MUTATION_EXECUTE: &str = "satelle-bootstrap-execute-v1";
 const BOOTSTRAP_LOCK_EXIT_GRACE: Duration = Duration::from_millis(500);
 const BOOTSTRAP_LOCK_EXIT_POLL: Duration = Duration::from_millis(10);
+const WINDOWS_BOOTSTRAP_LOCK_STDIN_LOADER: &str = r#"$ErrorActionPreference = 'Stop'
+$encodedScript = [Console]::In.ReadLine()
+if ($null -eq $encodedScript) { exit 64 }
+try {
+  $scriptBytes = [Convert]::FromBase64String($encodedScript)
+  $script = [Text.Encoding]::UTF8.GetString($scriptBytes)
+} catch { exit 64 }
+Invoke-Expression $script"#;
 const CACHE_CLEANUP_PROTOCOL: &str = "satelle-cache-cleanup-v1";
 const STAGED_DIGEST_MISMATCH_EXIT_CODE: i32 = 65;
 const POSIX_CACHE_DIRECTORY_GUARD: &str = r#"safe_cache_directory() {
@@ -103,6 +114,11 @@ pub(super) struct SshBootstrapLock {
     exchanged_lock_lines: Vec<String>,
     #[cfg(all(test, unix))]
     lose_next_mutation_start_response: bool,
+}
+
+struct BootstrapLockInvocation {
+    command: String,
+    stdin_prelude: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -208,16 +224,17 @@ impl SshBootstrapLock {
         ssh_program: &OsStr,
     ) -> Result<Self, SshBootstrapError> {
         let target = RemoteTarget::probe_with_program(destination, ssh_program)?;
+        let invocation = target.bootstrap_lock_invocation(&request);
         let mut child = Command::new(ssh_program)
             .arg("-T")
             .arg(destination)
-            .arg(target.bootstrap_lock_command(&request))
+            .arg(&invocation.command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(SshBootstrapError::SpawnSsh)?;
-        let stdin = child
+        let mut stdin = child
             .stdin
             .take()
             .expect("bootstrap-lock SSH stdin was configured as piped");
@@ -236,6 +253,19 @@ impl SshBootstrapLock {
             .name("satelle-ssh-bootstrap-lock-stdout".to_string())
             .spawn(move || drain_bootstrap_lock_stdout(stdout, ready_sender, response_sender))
             .map_err(|error| terminate_child(&mut child, SshBootstrapError::ReaderThread(error)))?;
+
+        // Windows cannot carry the full lock program in an OpenSSH exec request.
+        // Send the trusted generated program as one framed stdin line, then keep
+        // the same channel open for the existing heartbeat and mutation protocol.
+        if let Some(prelude) = invocation.stdin_prelude
+            && let Err(error) = writeln!(stdin, "{prelude}").and_then(|()| stdin.flush())
+        {
+            let error =
+                terminate_child(&mut child, SshBootstrapError::BootstrapLockProtocol(error));
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(error);
+        }
 
         let ready = match ready_receiver.recv_timeout(PROCESS_TIMEOUT) {
             Ok(ready) => ready,
@@ -780,6 +810,42 @@ pub(super) enum InitialHostState {
     PendingIdentityCommit(SshIdentityCommitRecord),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialHostStateProbe<'a> {
+    Fresh,
+    Existing,
+    PendingIdentityCommit(&'a str),
+}
+
+fn parse_initial_host_state_probe(
+    output: &str,
+) -> Result<InitialHostStateProbe<'_>, SshBootstrapError> {
+    // Both probe scripts terminate their last line. Remove exactly that frame
+    // delimiter while preserving every byte of a pending commit record.
+    let output = output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(output);
+    let mut sections = output.splitn(3, '\n');
+    let header = sections
+        .next()
+        .map(|section| section.strip_suffix('\r').unwrap_or(section));
+    if header != Some("satelle-initial-host-state-v2") {
+        return Err(SshBootstrapError::InvalidProbe);
+    }
+    let state = sections
+        .next()
+        .map(|section| section.strip_suffix('\r').unwrap_or(section));
+    match (state, sections.next()) {
+        (Some("fresh"), None) => Ok(InitialHostStateProbe::Fresh),
+        (Some("existing"), None) => Ok(InitialHostStateProbe::Existing),
+        (Some("pending_identity_commit"), Some(encoded)) => {
+            Ok(InitialHostStateProbe::PendingIdentityCommit(encoded))
+        }
+        _ => Err(SshBootstrapError::InvalidProbe),
+    }
+}
+
 pub(super) struct PreparedIdentityOperation {
     record: SshIdentityCommitRecord,
     artifact: DownloadedArtifact,
@@ -866,21 +932,12 @@ impl RemoteTarget {
         }
         let output =
             std::str::from_utf8(&output.stdout).map_err(|_| SshBootstrapError::InvalidProbe)?;
-        let mut sections = output.splitn(3, '\n');
-        if sections.next() != Some("satelle-initial-host-state-v2") {
-            return Err(SshBootstrapError::InvalidProbe);
-        }
-        let state = match sections.next() {
-            Some("fresh") => InitialHostState::Fresh,
-            Some("existing") => InitialHostState::Existing,
-            Some("pending_identity_commit") => {
-                let record = sections
-                    .next()
-                    .ok_or(SshBootstrapError::InvalidProbe)
-                    .and_then(|encoded| {
-                        SshIdentityCommitRecord::parse(encoded)
-                            .map_err(|_| SshBootstrapError::InvalidProbe)
-                    })?;
+        let state = match parse_initial_host_state_probe(output)? {
+            InitialHostStateProbe::Fresh => InitialHostState::Fresh,
+            InitialHostStateProbe::Existing => InitialHostState::Existing,
+            InitialHostStateProbe::PendingIdentityCommit(encoded) => {
+                let record = SshIdentityCommitRecord::parse(encoded)
+                    .map_err(|_| SshBootstrapError::InvalidProbe)?;
                 let cache_root = host_config
                     .daemon_cache_dir
                     .as_ref()
@@ -905,11 +962,7 @@ impl RemoteTarget {
                 }
                 return Ok(InitialHostState::PendingIdentityCommit(record));
             }
-            _ => return Err(SshBootstrapError::InvalidProbe),
         };
-        if sections.next().is_some() {
-            return Err(SshBootstrapError::InvalidProbe);
-        }
         Ok(state)
     }
 
@@ -1144,7 +1197,7 @@ while :; do
   [ -d "$current" ] && [ ! -L "$current" ] || exit 75
   owner=$(stat -c %u "$current" 2>/dev/null || stat -f %u "$current") || exit 75
   [ "$owner" = "$uid" ] || exit 75
-  chmod 700 -- "$current"
+  chmod 700 "$current"
   [ "$current" = "$root" ] && break
   current="${{current%/*}}"
   [ -n "$current" ] || exit 75
@@ -1164,7 +1217,7 @@ set -C
 cat >"$staged"
 if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$staged" | awk '{{print $1}}'); elif command -v shasum >/dev/null 2>&1; then actual=$(shasum -a 256 "$staged" | awk '{{print $1}}'); else actual=$(openssl dgst -sha256 "$staged" | awk '{{print $NF}}'); fi
 [ "$actual" = "$expected" ] || exit {digest_mismatch_exit_code}
-chmod 700 -- "$staged"
+chmod 700 "$staged"
 mv "$staged" "$final_path"
 trap - EXIT
 sync"#,
@@ -1448,11 +1501,23 @@ sync"#,
         }
     }
 
-    fn bootstrap_lock_command(self, request: &bootstrap_lock::Request) -> String {
+    fn bootstrap_lock_invocation(
+        self,
+        request: &bootstrap_lock::Request,
+    ) -> BootstrapLockInvocation {
         if self.is_windows() {
-            powershell_encoded_command(&request.windows_script())
+            BootstrapLockInvocation {
+                command: powershell_encoded_command(WINDOWS_BOOTSTRAP_LOCK_STDIN_LOADER),
+                stdin_prelude: Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(request.windows_script().as_bytes()),
+                ),
+            }
         } else {
-            request.posix_command()
+            BootstrapLockInvocation {
+                command: request.posix_command(),
+                stdin_prelude: None,
+            }
         }
     }
 
@@ -1465,6 +1530,7 @@ sync"#,
         attempt: &str,
         command: &str,
     ) -> String {
+        let commit_required = bootstrap_lock::mutation_phase_requires_commit(phase);
         if self.is_windows() {
             let operation_id = powershell_quote(operation_id);
             let claim_identity = powershell_quote(claim_identity);
@@ -1479,6 +1545,7 @@ $claimIdentity = {claim_identity}
 $claimBasename = {claim_basename}
 $phase = {phase}
 $attempt = {attempt}
+$commitRequired = {commit_required}
 $innerCommand = {command}
 $expectedGate = '{MUTATION_EXECUTE}'
 $gateBytes = [Text.Encoding]::UTF8.GetBytes($expectedGate + "`n")
@@ -1529,7 +1596,7 @@ try {{
   $terminalClaimExact = $false
 }}
 if ($terminalClaimExact) {{
-  if (($status -eq 0) -or
+  if ((((-not $commitRequired) -or ($phase -ceq 'daemon_start')) -and ($status -eq 0)) -or
       (($status -eq {digest_mismatch_exit_code}) -and
        (($phase -ceq 'cache_upload') -or ($phase -ceq 'cache_staging_permissions')))) {{
     [IO.File]::Open((Join-Path $claimPath ('execution_succeeded.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
@@ -1540,6 +1607,7 @@ if ($terminalClaimExact) {{
 }}
 exit $status"#,
                 digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
+                commit_required = if commit_required { "$true" } else { "$false" },
             ));
         }
 
@@ -1556,6 +1624,7 @@ claim_identity={claim_identity}
 claim_basename={claim_basename}
 phase={phase}
 attempt={attempt}
+commit_required={commit_required}
 inner_command={command}
 gate="$(dd bs=1 count={execute_gate_length} 2>/dev/null && printf x)" || exit 75
 [ "$gate" = '{MUTATION_EXECUTE}
@@ -1585,7 +1654,7 @@ set +e
 status=$?
 set -e
 if exact_terminal_attempt; then
-  if [ "$status" -eq 0 ] || {{ [ "$status" -eq {digest_mismatch_exit_code} ] &&
+  if {{ {{ [ "$commit_required" = false ] || [ "$phase" = daemon_start ]; }} && [ "$status" -eq 0 ]; }} || {{ [ "$status" -eq {digest_mismatch_exit_code} ] &&
        {{ [ "$phase" = cache_upload ] || [ "$phase" = cache_staging_permissions ]; }}; }}; then
     mkdir "$claim_path/execution_succeeded.$attempt" || exit 75
   elif [ "$phase" = daemon_start ] || [ "$phase" = offline_storage_maintenance ]; then
@@ -1595,6 +1664,7 @@ fi
 exit "$status""#,
             execute_gate_length = MUTATION_EXECUTE.len() + 1,
             digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
+            commit_required = commit_required,
         );
         format!("sh -c {}", posix_quote(&script))
     }
@@ -2354,7 +2424,6 @@ pub(super) struct RemoteUserDirectories {
 pub(super) struct UploadedHostArtifact {
     remote_path: String,
     binary_sha256: String,
-    cache_changed: bool,
 }
 
 impl UploadedHostArtifact {
@@ -2364,10 +2433,6 @@ impl UploadedHostArtifact {
 
     pub(super) fn binary_sha256(&self) -> &str {
         &self.binary_sha256
-    }
-
-    pub(super) const fn cache_changed(&self) -> bool {
-        self.cache_changed
     }
 }
 
@@ -2460,6 +2525,24 @@ impl<'a> PersistentServiceRemote<'a> {
     ) -> Result<UploadedHostArtifact, SshBootstrapError> {
         let artifact = DownloadedArtifact::fetch(self.target)?;
         self.install_host_artifact(artifact)
+    }
+
+    /// Stops the temporary bootstrap daemon and waits until it releases the
+    /// exact state store that the persistent service will open. Killing the
+    /// controller-side SSH process is not a remote lifecycle guarantee on
+    /// macOS or Windows, so service startup must use the daemon's coordinated
+    /// state-owner handoff protocol.
+    pub(super) fn release_bootstrap_state_owner(
+        &mut self,
+        artifact: &UploadedHostArtifact,
+        host_config: &HostConfig,
+    ) -> Result<(), SshBootstrapError> {
+        let environment = self.target.validated_daemon_environment(host_config)?;
+        let binary = self.absolute_artifact_path(artifact);
+        let command = self
+            .target
+            .release_state_command_with_environment(&binary, &environment);
+        self.mutate("state_owner_release", &command, None)
     }
 
     pub(super) fn install_verified_host_artifact(
@@ -3229,7 +3312,7 @@ foreach ($path in @({paths})) {{
             .collect::<Vec<_>>()
             .join(" ");
         format!(
-            "set -eu\numask 077\nuid=$(id -u)\nfor path in {paths}; do mkdir -p -- \"$path\"; chmod 700 -- \"$path\"; test -d \"$path\" && test ! -L \"$path\"; owner=$(stat -c %u \"$path\" 2>/dev/null || stat -f %u \"$path\"); [ \"$owner\" = \"$uid\" ]; done"
+            "set -eu\numask 077\nuid=$(id -u)\nfor path in {paths}; do mkdir -p -- \"$path\"; chmod 700 \"$path\"; test -d \"$path\" && test ! -L \"$path\"; owner=$(stat -c %u \"$path\" 2>/dev/null || stat -f %u \"$path\"); [ \"$owner\" = \"$uid\" ]; done"
         )
     }
 }
@@ -3829,7 +3912,7 @@ fn launchd_observe_command(definition: &LaunchdServiceDefinition) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!(
-        "set -eu\npath={}\nexpected={}\nif ! launchctl print \"gui/$(id -u)/{LAUNCHD_LABEL}\" >/dev/null 2>&1; then printf 'satelle-persistent-service-v1\\nabsent\\n'; exit 0; fi\nactual=$(shasum -a 256 \"$path\" | awk '{{print $1}}')\nprintf 'satelle-persistent-service-v1\\n'\nif [ \"$actual\" = \"$expected\" ]; then printf 'matching\\n'; else printf 'drifted\\n'; fi",
+        "set -eu\nservice_path={}\nexpected={}\nif ! launchctl print \"gui/$(id -u)/{LAUNCHD_LABEL}\" >/dev/null 2>&1; then printf 'satelle-persistent-service-v1\\nabsent\\n'; exit 0; fi\nactual=$(shasum -a 256 \"$service_path\" | awk '{{print $1}}')\nprintf 'satelle-persistent-service-v1\\n'\nif [ \"$actual\" = \"$expected\" ]; then printf 'matching\\n'; else printf 'drifted\\n'; fi",
         posix_quote(definition.plist_path()),
         posix_quote(&digest),
     )
@@ -4965,7 +5048,6 @@ fn upload_artifact(
             return Ok(UploadedHostArtifact {
                 remote_path: content_addressed_path,
                 binary_sha256: local_digest_hex,
-                cache_changed: false,
             });
         }
         content_addressed_path
@@ -4987,15 +5069,14 @@ fn upload_artifact(
     )?;
     let promote = run_fenced_ssh_command(destination, &command, None)?;
     require_success(promote)?;
-    if remote_artifact_matches(destination, target, &final_path, &local_digest)? {
-        Ok(UploadedHostArtifact {
-            remote_path: final_path,
-            binary_sha256: local_digest_hex,
-            cache_changed: true,
-        })
-    } else {
-        Err(SshBootstrapError::RemoteCacheEntryRejected)
+    if !remote_artifact_matches(destination, target, &final_path, &local_digest)? {
+        return Err(SshBootstrapError::RemoteCacheEntryRejected);
     }
+    bootstrap_lock.commit_current_mutation()?;
+    Ok(UploadedHostArtifact {
+        remote_path: final_path,
+        binary_sha256: local_digest_hex,
+    })
 }
 
 fn upload_operation_artifact(
@@ -5023,7 +5104,6 @@ fn upload_operation_artifact(
     Ok(UploadedHostArtifact {
         remote_path: record.exact_remote_path().to_string(),
         binary_sha256: digest_hex(&local_digest),
-        cache_changed: true,
     })
 }
 
@@ -5254,6 +5334,9 @@ fn run_ssh_command_with_program(
         ssh_program,
         [
             OsStr::new("-T"),
+            // These read-only commands never carry input. Make that contract
+            // explicit to OpenSSH instead of relying on inherited stdin.
+            OsStr::new("-n"),
             OsStr::new(destination),
             OsStr::new(remote_command),
         ],
@@ -5270,6 +5353,7 @@ fn run_ssh_command_with_output_limit(
         "ssh",
         [
             OsStr::new("-T"),
+            OsStr::new("-n"),
             OsStr::new(destination),
             OsStr::new(remote_command),
         ],
@@ -5354,6 +5438,7 @@ fn run_fenced_ssh_command_with_output_limit(
     })
 }
 
+#[cfg(not(windows))]
 fn run_program_with_output_limit<const N: usize>(
     program: impl AsRef<OsStr>,
     arguments: [&OsStr; N],
@@ -5386,6 +5471,90 @@ fn run_program_with_output_limit<const N: usize>(
         stdout,
         stderr,
     })
+}
+
+#[cfg(windows)]
+fn run_program_with_output_limit<const N: usize>(
+    program: impl AsRef<OsStr>,
+    arguments: [&OsStr; N],
+    output_limit: usize,
+) -> Result<CommandOutput, SshBootstrapError> {
+    // Windows OpenSSH can keep a process alive after the remote command exits
+    // when both output streams are anonymous pipes. Disk-backed temporary
+    // handles preserve bounded capture without triggering that OpenSSH bug.
+    let mut stdout = tempfile::tempfile().map_err(SshBootstrapError::LocalFile)?;
+    let mut stderr = tempfile::tempfile().map_err(SshBootstrapError::LocalFile)?;
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            stdout.try_clone().map_err(SshBootstrapError::LocalFile)?,
+        ))
+        .stderr(Stdio::from(
+            stderr.try_clone().map_err(SshBootstrapError::LocalFile)?,
+        ))
+        .spawn()
+        .map_err(SshBootstrapError::SpawnSsh)?;
+    let status = loop {
+        let output_limit_exceeded = match output_file_limit_exceeded(&stdout, &stderr, output_limit)
+        {
+            Ok(exceeded) => exceeded,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        if output_limit_exceeded {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SshBootstrapError::ProcessOutputTooLarge);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SshBootstrapError::WaitSsh(error));
+            }
+        }
+    };
+    // Close the race where the process appends its final bytes after the last
+    // polling check and exits before try_wait observes it.
+    if output_file_limit_exceeded(&stdout, &stderr, output_limit)? {
+        return Err(SshBootstrapError::ProcessOutputTooLarge);
+    }
+    stdout
+        .seek(SeekFrom::Start(0))
+        .map_err(SshBootstrapError::ReadProcess)?;
+    stderr
+        .seek(SeekFrom::Start(0))
+        .map_err(SshBootstrapError::ReadProcess)?;
+    Ok(CommandOutput {
+        status,
+        stdout: read_bounded(stdout, output_limit)?,
+        stderr: classify_stderr(stderr),
+    })
+}
+
+#[cfg(windows)]
+fn output_file_limit_exceeded(
+    stdout: &File,
+    stderr: &File,
+    output_limit: usize,
+) -> Result<bool, SshBootstrapError> {
+    let output_limit = output_limit as u64;
+    Ok(stdout
+        .metadata()
+        .map_err(SshBootstrapError::LocalFile)?
+        .len()
+        > output_limit
+        || stderr
+            .metadata()
+            .map_err(SshBootstrapError::LocalFile)?
+            .len()
+            > output_limit)
 }
 
 fn require_success(output: CommandOutput) -> Result<(), SshBootstrapError> {
@@ -5660,6 +5829,35 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn initial_host_state_probe_accepts_platform_line_endings() {
+        assert_eq!(
+            parse_initial_host_state_probe("satelle-initial-host-state-v2\nfresh\n")
+                .expect("parse the POSIX probe frame"),
+            InitialHostStateProbe::Fresh
+        );
+        assert_eq!(
+            parse_initial_host_state_probe("satelle-initial-host-state-v2\r\nexisting\r\n")
+                .expect("parse the Windows probe frame"),
+            InitialHostStateProbe::Existing
+        );
+        assert_eq!(
+            parse_initial_host_state_probe(
+                "satelle-initial-host-state-v2\r\npending_identity_commit\r\nrecord-bytes",
+            )
+            .expect("parse the Windows pending-commit frame"),
+            InitialHostStateProbe::PendingIdentityCommit("record-bytes")
+        );
+    }
+
+    #[test]
+    fn initial_host_state_probe_rejects_trailing_output() {
+        assert!(matches!(
+            parse_initial_host_state_probe("satelle-initial-host-state-v2\nfresh\nuntrusted"),
+            Err(SshBootstrapError::InvalidProbe)
+        ));
+    }
 
     #[cfg(unix)]
     fn persistent_storage_policy() -> satelle_core::daemon_service::PersistentHostStoragePolicy {
@@ -5950,6 +6148,9 @@ mod tests {
         );
 
         let invocation = fs::read_to_string(&audit_log).expect("read fake SSH audit");
+        let mut invocation_lines = invocation.lines();
+        assert_eq!(invocation_lines.next(), Some("-T"));
+        assert_eq!(invocation_lines.next(), Some("-n"));
         assert!(invocation.contains("/usr/bin/plutil"));
         for mutation in [
             "Set-Content",
@@ -6474,6 +6675,7 @@ mod tests {
         );
         assert!(posix.contains("umask 077"));
         assert!(posix.contains("chmod 700"));
+        assert!(!posix.contains("chmod 700 --"));
         assert!(posix.contains("test ! -L"));
         assert!(posix.contains("stat -f %u"));
     }
@@ -6498,6 +6700,8 @@ mod tests {
             assert!(!command.contains("LaunchDaemons"));
         }
         assert!(register.contains("launchctl bootstrap"));
+        assert!(observe.contains("service_path="));
+        assert!(!observe.contains("\npath="));
         assert!(kickstart.contains("launchctl kickstart -k"));
         assert!(bootout.contains("launchctl bootout"));
         assert!(absent.contains("launchctl print"));
@@ -7060,7 +7264,8 @@ mod tests {
                 format!(
                     concat!(
                         "#!/bin/sh\n",
-                        "remote_command=$3\n",
+                        "remote_command=\n",
+                        "for argument in \"$@\"; do remote_command=$argument; done\n",
                         "case \"$remote_command\" in cmd.exe*) exit 1;; esac\n",
                         "cd {}\n",
                         "export HOME={}\n",
@@ -7917,6 +8122,9 @@ mod tests {
         let command = RemoteTarget::DarwinArm64
             .operation_artifact_upload_command(&record)
             .expect("construct artifact publication command");
+        assert!(command.contains("chmod 700 \"$current\""));
+        assert!(command.contains("chmod 700 \"$staged\""));
+        assert!(!command.contains("chmod 700 --"));
         assert!(command.contains("\nsync"));
         assert!(!command.contains("sync \"$final_path\""));
     }
@@ -8134,13 +8342,34 @@ mod tests {
             Some("controller@test".to_string()),
         )
         .expect("valid lock request");
-        let posix = RemoteTarget::LinuxX64Gnu.bootstrap_lock_command(&request);
-        assert!(posix.starts_with("sh -c "));
-        assert!(posix.contains("mkdir -p \"$lock_root\""));
-        assert!(posix.contains("mv \"$pending_path\" \"$claim_path\""));
-        assert!(!posix.contains("host bootstrap-lock"));
-        let windows = RemoteTarget::WindowsX64Msvc.bootstrap_lock_command(&request);
-        let script = decode_powershell_command(&windows).expect("decode lock command");
+        let posix = RemoteTarget::LinuxX64Gnu.bootstrap_lock_invocation(&request);
+        assert!(posix.command.starts_with("sh -c "));
+        assert!(posix.command.contains("mkdir -p \"$lock_root\""));
+        assert!(
+            posix
+                .command
+                .contains("mv \"$pending_path\" \"$claim_path\"")
+        );
+        assert!(!posix.command.contains("host bootstrap-lock"));
+        assert_eq!(posix.stdin_prelude, None);
+
+        let windows = RemoteTarget::WindowsX64Msvc.bootstrap_lock_invocation(&request);
+        assert!(windows.command.len() < 32_767);
+        let loader = decode_powershell_command(&windows.command).expect("decode lock loader");
+        assert!(loader.contains("[Console]::In.ReadLine()"));
+        assert!(loader.contains("[Convert]::FromBase64String($encodedScript)"));
+        assert!(loader.contains("Invoke-Expression $script"));
+        assert!(!windows.command.contains("repair-operation"));
+        let encoded_script = windows
+            .stdin_prelude
+            .as_deref()
+            .expect("Windows lock script stdin prelude");
+        let script = String::from_utf8(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded_script)
+                .expect("decode lock script stdin prelude"),
+        )
+        .expect("lock script is UTF-8");
+        assert_eq!(script, request.windows_script());
         assert!(script.contains("New-Item -ItemType Directory -Force -Path $lockRoot"));
         assert!(script.contains("[IO.Directory]::Move($pendingPath, $claimPath)"));
         assert!(!script.contains("host bootstrap-lock"));
@@ -8166,6 +8395,7 @@ mod tests {
         assert!(posix.contains("mutation_started"));
         assert!(posix.contains("mutation_phase"));
         assert!(posix.contains("mutation_attempt"));
+        assert!(posix.contains("commit_required=false"));
         assert!(posix.contains(attempt));
         assert!(posix.contains(MUTATION_EXECUTE));
         assert!(posix.contains("execution_started.$attempt"));
@@ -8196,6 +8426,7 @@ mod tests {
         assert!(script.contains("mutation_started"));
         assert!(script.contains("mutation_phase"));
         assert!(script.contains("mutation_attempt"));
+        assert!(script.contains("$commitRequired = $false"));
         assert!(script.contains(attempt));
         assert!(script.contains(MUTATION_EXECUTE));
         assert!(script.contains("execution_started."));
@@ -8218,6 +8449,29 @@ mod tests {
         assert!(script.contains("[IO.FileAttributes]::ReparsePoint"));
         assert!(!script.contains("$claims = @("));
         assert!(script.contains("Invoke-Expression $innerCommand"));
+
+        let commit_required_posix = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+            "repair-operation",
+            identity,
+            basename,
+            "identity_artifact_upload",
+            attempt,
+            "sh -c 'exit 0'",
+        );
+        assert!(commit_required_posix.contains("commit_required=true"));
+        let commit_required_windows = RemoteTarget::WindowsX64Msvc.fenced_mutation_command(
+            "repair-operation",
+            identity,
+            basename,
+            "identity_artifact_upload",
+            attempt,
+            "cmd.exe /d /c exit 0",
+        );
+        assert!(
+            decode_powershell_command(&commit_required_windows)
+                .expect("decode commit-required mutation")
+                .contains("$commitRequired = $true")
+        );
         assert_occurs_before(
             &script,
             "Invoke-Expression $innerCommand",
@@ -8410,7 +8664,9 @@ mod tests {
         fs::write(claim.join("state"), "mutation_started").expect("write claim state");
         fs::write(claim.join("mutation_phase"), "cache_upload").expect("write mutation phase");
 
-        let run = |attempt: &str, input: &[u8], output: &Path| {
+        let run = |phase: &str, attempt: &str, input: &[u8], output: &Path| {
+            fs::write(claim.join("state"), "mutation_started").expect("write claim state");
+            fs::write(claim.join("mutation_phase"), phase).expect("write mutation phase");
             fs::write(claim.join("mutation_attempt"), attempt).expect("write mutation attempt");
             let inner_command = format!(
                 "cat > {}",
@@ -8420,7 +8676,7 @@ mod tests {
                 operation_id,
                 identity,
                 basename,
-                "cache_upload",
+                phase,
                 attempt,
                 &inner_command,
             );
@@ -8444,6 +8700,7 @@ mod tests {
         let rejected_attempt = "missing-newline";
         let rejected_output = state.path().join("rejected-output");
         let rejected = run(
+            "cache_upload",
             rejected_attempt,
             MUTATION_EXECUTE.as_bytes(),
             &rejected_output,
@@ -8466,7 +8723,12 @@ mod tests {
         let payload = b"token-line\n\0binary-after-gate\xff\n";
         let mut valid_input = format!("{MUTATION_EXECUTE}\n").into_bytes();
         valid_input.extend_from_slice(payload);
-        let accepted = run(accepted_attempt, &valid_input, &accepted_output);
+        let accepted = run(
+            "cache_upload",
+            accepted_attempt,
+            &valid_input,
+            &accepted_output,
+        );
         assert!(accepted.success());
         assert_eq!(
             fs::read(accepted_output).expect("read accepted payload"),
@@ -8481,6 +8743,27 @@ mod tests {
             claim
                 .join(format!("execution_succeeded.{accepted_attempt}"))
                 .is_dir()
+        );
+
+        let commit_attempt = "commit-required";
+        let commit_output = state.path().join("commit-required-output");
+        let commit_required = run(
+            "identity_artifact_upload",
+            commit_attempt,
+            format!("{MUTATION_EXECUTE}\n").as_bytes(),
+            &commit_output,
+        );
+        assert!(commit_required.success());
+        assert!(
+            claim
+                .join(format!("execution_started.{commit_attempt}"))
+                .is_dir()
+        );
+        assert!(
+            !claim
+                .join(format!("execution_succeeded.{commit_attempt}"))
+                .exists(),
+            "a commit-required phase waits for the controller's verified commit"
         );
     }
 

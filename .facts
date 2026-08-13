@@ -1977,7 +1977,7 @@
 - raw app-server messages never enter normal logs, errors, events, or SQLite records @spec @mvp @implemented
 - satelle reports a typed incompatible-control-plane error when the remote Codex runtime cannot expose the required app-server protocol @implemented @mvp
 - satelle does not expose app-server over a public unauthenticated listener @spec @mvp @implemented
-- satelle MVP accepts the official OpenAI standalone Codex 0.144.0 runtime only when an owner-only Satelle receipt verifies its immutable package, binary, target, version, and Codex home; the Host launches only that receipt-recorded binary with that Codex home and never accepts npm-installed, mutable-alias, shim, or PATH-resolved Codex @spec @mvp @implemented
+- satelle MVP accepts an owner-authorized official OpenAI standalone Codex runtime at or above the minimum supported version only when an owner-only Satelle receipt verifies its immutable package, binary, target, version, release URL, digest, and Codex home and the runtime passes the stable capability and live-readiness gates; the Host launches only that receipt-recorded binary with that Codex home and never accepts npm-installed, mutable-alias, shim, or PATH-resolved Codex @spec @mvp @implemented
 - satelle target architecture includes a Satelle Host Daemon running on the controlled remote machine and a local satelle CLI acting as the client @spec @mvp @implemented
 - satelle Host Daemon binds to loopback by default even when installed as a persistent service @spec @mvp @implemented
 - satelle Host Daemon non-loopback binding is an explicit configuration choice that requires the direct transport security requirements @spec @mvp @implemented

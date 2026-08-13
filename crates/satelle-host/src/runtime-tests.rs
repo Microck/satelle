@@ -1607,6 +1607,42 @@ fn setup_provider_binding_failure_occurs_after_returned_native_evidence() {
 }
 
 #[test]
+fn explicit_host_binding_is_attached_before_native_readiness_key_resolution() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let mut config = host_config_with_provider_binding("UNUSED_PROVIDER_SECRET");
+    config
+        .provider_bindings
+        .get_mut("openai")
+        .and_then(|models| models.get_mut("review"))
+        .expect("the exact Host binding exists")
+        .auth_source = None;
+    let adapter =
+        ProviderProbeRecoveryAdapter::with_native_only_results([], [NativeProbeBehavior::Passed])
+            .requiring_resolved_explicit_binding();
+    let runtime = RuntimeHandle::new_with_provider_policy_and_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+        RuntimeProviderPolicy::from_host_config(&config),
+    );
+    let intent = ProviderComputerUseIntent::new(
+        Some(EffectiveModelRef::new("review").expect("valid model alias")),
+        Some(ProviderBindingRef::new("openai").expect("valid provider alias")),
+        false,
+    );
+
+    runtime
+        .run(
+            RunCommand::attached(LOCAL_DEMO_HOST, "use-the-explicit-host-binding")
+                .with_provider_intent(intent),
+        )
+        .expect("the resolved Host binding must be available to native readiness");
+
+    assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.execute_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn fresh_readiness_replacing_cached_candidate_reports_live_source() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let adapter =
@@ -2490,6 +2526,7 @@ struct ProviderProbeRecoveryAdapter {
     replace_cached_readiness: Arc<AtomicBool>,
     cached_replacement_calls: Arc<AtomicUsize>,
     native_only: bool,
+    require_resolved_explicit_binding: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2516,6 +2553,7 @@ impl ProviderProbeRecoveryAdapter {
             replace_cached_readiness: Arc::new(AtomicBool::new(false)),
             cached_replacement_calls: Arc::new(AtomicUsize::new(0)),
             native_only: false,
+            require_resolved_explicit_binding: false,
         }
     }
 
@@ -2618,8 +2656,17 @@ impl ProviderProbeRecoveryAdapter {
         self.replace_cached_readiness.store(true, Ordering::SeqCst);
     }
 
-    fn adapter_readiness(&self, evidence: ReadinessEvidence) -> AdapterReadiness {
-        let key = self.effective_key();
+    fn requiring_resolved_explicit_binding(mut self) -> Self {
+        self.require_resolved_explicit_binding = true;
+        self
+    }
+
+    fn adapter_readiness(
+        &self,
+        key: &ReadinessCacheKey,
+        evidence: ReadinessEvidence,
+        resolved_provider_binding: Option<satelle_core::ResolvedProviderBinding>,
+    ) -> AdapterReadiness {
         if self.native_only {
             return AdapterReadiness::ready(
                 key.adapter(),
@@ -2648,15 +2695,7 @@ impl ProviderProbeRecoveryAdapter {
             key.execution_policy().clone(),
             evidence,
             Some(provider_evidence),
-            Some(satelle_core::ResolvedProviderBinding::from_authorization(
-                satelle_core::ProviderBindingAuthorization::new(
-                    "provider-probe-model",
-                    "provider-probe",
-                    "provider-probe-model",
-                    "openai",
-                ),
-                satelle_core::ProviderBindingSource::HostOwned,
-            )),
+            resolved_provider_binding,
         )
         .unwrap()
     }
@@ -2676,6 +2715,13 @@ impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
         _host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        if self.require_resolved_explicit_binding
+            && provider_intent.model().is_some()
+            && provider_intent.provider().is_some()
+            && provider_intent.resolved_provider_binding().is_none()
+        {
+            return Err(super::model_provider_binding_missing(provider_intent));
+        }
         Ok(Some(
             provider_intent.resolved_provider_binding().map_or_else(
                 || self.effective_key(),
@@ -2686,19 +2732,34 @@ impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
 
     fn preflight_terminal(
         &self,
-        _host: &str,
+        host: &str,
         cached: Option<ReadinessEvidence>,
         _cached_provider: Option<super::ProviderSmokeResult>,
-        _provider_intent: &ProviderComputerUseIntent,
+        provider_intent: &ProviderComputerUseIntent,
     ) -> AdapterPreflight {
         let evidence = cached.expect("the runtime supplies live or reusable native evidence");
+        let key = self
+            .readiness_cache_key(host, provider_intent)
+            .expect("the fixture readiness key resolves")
+            .expect("the fixture has a readiness key");
+        let resolved_provider_binding = provider_intent.resolved_provider_binding().cloned();
         if self.replace_cached_readiness.load(Ordering::SeqCst) {
             self.cached_replacement_calls.fetch_add(1, Ordering::SeqCst);
-            return AdapterPreflight::Ready(
-                self.adapter_readiness(self.readiness_with_id("fresh-live-after-cached-candidate")),
-            );
+            let now = time::OffsetDateTime::now_utc();
+            let evidence = key
+                .evidence(
+                    "fresh-live-after-cached-candidate",
+                    now,
+                    now + time::Duration::minutes(5),
+                )
+                .expect("the exact resolved key forms fresh readiness evidence");
+            return AdapterPreflight::Ready(self.adapter_readiness(
+                &key,
+                evidence,
+                resolved_provider_binding,
+            ));
         }
-        AdapterPreflight::Ready(self.adapter_readiness(evidence))
+        AdapterPreflight::Ready(self.adapter_readiness(&key, evidence, resolved_provider_binding))
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {

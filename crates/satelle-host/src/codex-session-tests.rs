@@ -16,7 +16,15 @@ use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn keybd_event(virtual_key: u8, scan_code: u8, flags: u32, extra_info: usize);
+}
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("descendant") {
@@ -121,6 +129,7 @@ fn main() {
         "thread-1"
     };
     let thread_response = format!(r#"{{"id":2,"result":{{"thread":{{"id":"{thread_id}"}}}}}}"#);
+    let mut provider_probe_request = None;
 
     if scenario == "notification-first" {
         send(&mut output, &format!(r#"{{"method":"thread/started","params":{{"thread":{{"id":"{thread_id}"}}}}}}"#));
@@ -168,8 +177,11 @@ fn main() {
             let status = if scenario == "goal-active" { "active" } else { "paused" };
             send(&mut output, &format!(r#"{{"id":3,"result":{{"goal":{{"threadId":"thread-1","objective":"perform the harmless action PRIVATE_PROMPT_CANARY","status":"{status}","createdAt":1,"updatedAt":1,"tokensUsed":0,"timeUsedSeconds":0,"tokenBudget":null}}}}}}"#));
             receive(&mut input, &log);
-        } else if scenario == "provider-probe-responses" {
-            complete_provider_probe_drag(&next_request);
+        } else if matches!(
+            scenario.as_str(),
+            "provider-probe-responses" | "provider-probe-invalidated-after-callbacks"
+        ) {
+            provider_probe_request = Some(next_request);
         }
     }
 
@@ -205,6 +217,23 @@ fn main() {
         send(&mut output, r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted"}}}"#);
         send(&mut output, r#"{"id":4,"result":{}}"#);
         return;
+    }
+    if matches!(
+        scenario.as_str(),
+        "provider-probe-responses" | "provider-probe-invalidated-after-callbacks"
+    ) {
+        let next_request = provider_probe_request.as_deref().unwrap();
+        let script_start = next_request.find("cell: `").unwrap() + "cell: `".len();
+        let script_end = script_start + next_request[script_start..].find('`').unwrap();
+        let encoded_script = &next_request[script_start..script_end];
+        let item = format!(r#"{{"id":"item-native","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{{"code":"{encoded_script}"}},"status":"inProgress"}}"#);
+        send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{item}}}}}"#));
+        complete_provider_probe_actions(&next_request);
+        let item = item.replace(r#""status":"inProgress""#, r#""status":"completed""#);
+        send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{item}}}}}"#));
+        if scenario == "provider-probe-invalidated-after-callbacks" {
+            send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{{"id":"item-extra","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{{"code":"unexpected()"}},"status":"inProgress"}}}}}}"#));
+        }
     }
     if scenario == "server-requests" {
         send(&mut output, &format!(r#"{{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"additionalPermissions":{{"fileSystem":{{"entries":[]}}}},"availableDecisions":["accept","decline"]}}}}"#));
@@ -245,13 +274,24 @@ fn main() {
         send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{{"raw":"PRIVATE_RAW_CANARY"}}}}}}"#));
         send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{{"raw":"PRIVATE_RAW_CANARY"}}}}}}"#));
     }
-    if scenario == "descendant" {
-        Command::new(std::env::current_exe().unwrap())
+    let mut graceful_descendant = None;
+    if matches!(scenario.as_str(), "descendant" | "graceful-descendant") {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .arg("descendant")
             .arg(std::env::var_os("SATELLE_DESCENDANT_MARKER").unwrap())
             .arg(std::env::var_os("SATELLE_DESCENDANT_RELEASE_MARKER").unwrap())
-            .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::null())
-            .spawn().unwrap();
+            .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::null());
+        #[cfg(unix)]
+        if scenario == "graceful-descendant" {
+            // Model node_repl's sandboxed kernel, which creates a process
+            // group outside the app-server's direct containment group.
+            command.process_group(0);
+        }
+        let child = command.spawn().unwrap();
+        if scenario == "graceful-descendant" {
+            graceful_descendant = Some(child);
+        }
     }
     let status = match scenario.as_str() {
         "interrupted" => "interrupted",
@@ -265,6 +305,16 @@ fn main() {
         ""
     };
     send(&mut output, &format!(r#"{{"method":"turn/completed","params":{{"threadId":"{thread_id}","turn":{{"id":"{terminal_turn}","status":"{status}"{error}}}}}}}"#));
+    if let Some(mut descendant) = graceful_descendant {
+        // A real app-server shuts its MCP servers down after Satelle closes
+        // stdin. Give this fixture the same cleanup contract: the escaped
+        // kernel is stopped before the app-server leader exits.
+        let mut remaining = Vec::new();
+        input.read_to_end(&mut remaining).unwrap();
+        descendant.kill().unwrap();
+        descendant.wait().unwrap();
+        return;
+    }
     hang();
 }
 
@@ -324,10 +374,12 @@ fn wait_for(path: &Path) {
     }
 }
 
-fn complete_provider_probe_drag(turn_request: &str) {
+fn complete_provider_probe_actions(turn_request: &str) {
     let url_start = turn_request.find("http://127.0.0.1:").unwrap();
     let url_tail = &turn_request[url_start..];
-    let url_end = url_tail.find(" in the approved visible browser").unwrap();
+    let url_end = url_tail
+        .find(|character: char| character == '\'' || character.is_whitespace())
+        .unwrap();
     let url = &url_tail[..url_end];
     let without_scheme = url.strip_prefix("http://").unwrap();
     let (host, target) = without_scheme.split_once('/').unwrap();
@@ -343,9 +395,10 @@ fn complete_provider_probe_drag(turn_request: &str) {
     let mut page = String::new();
     page_stream.read_to_string(&mut page).unwrap();
     assert!(page.starts_with("HTTP/1.1 200 OK"));
-    assert!(page.contains("id=source draggable=true"));
+    assert!(page.contains("id=confirm type=button"));
+    assert!(page.contains("id=source type=range min=0 max=100 value=0"));
     assert!(page.contains("id=target"));
-    assert!(page.contains("addEventListener('drop'"));
+    assert!(page.contains("source.addEventListener('input',completeDrag)"));
 
     let nonce_start = page.find("<strong>").unwrap() + "<strong>".len();
     let nonce_end = nonce_start + page[nonce_start..].find("</strong>").unwrap();
@@ -354,21 +407,39 @@ fn complete_provider_probe_drag(turn_request: &str) {
     let completion_end =
         completion_start + page[completion_start..].find('\'').unwrap();
     let completion_target = &page[completion_start..completion_end];
-    let body = format!("nonce={nonce}&action=drag");
-
-    let mut completion_stream = TcpStream::connect(host).unwrap();
-    write!(
-        completion_stream,
-        "POST {completion_target} HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    completion_stream.flush().unwrap();
-    let mut completion = String::new();
-    completion_stream
-        .read_to_string(&mut completion)
+    for action in ["click", "drag"] {
+        record_native_input_for_probe_test();
+        let body = format!("nonce={nonce}&action={action}");
+        let mut completion_stream = TcpStream::connect(host).unwrap();
+        write!(
+            completion_stream,
+            "POST {completion_target} HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
         .unwrap();
-    assert!(completion.starts_with("HTTP/1.1 204 No Content"));
+        completion_stream.flush().unwrap();
+        let mut completion = String::new();
+        completion_stream
+            .read_to_string(&mut completion)
+            .unwrap();
+        assert!(completion.starts_with("HTTP/1.1 204 No Content"));
+    }
+}
+
+fn record_native_input_for_probe_test() {
+    #[cfg(windows)]
+    {
+        // Windows accepts a probe receipt only after the session's real input
+        // counter advances. Exercise that production gate with a balanced
+        // Shift press and release instead of bypassing it in this fixture.
+        const VIRTUAL_KEY_SHIFT: u8 = 0x10;
+        const KEY_EVENT_KEY_UP: u32 = 0x0002;
+        std::thread::sleep(Duration::from_millis(20));
+        unsafe {
+            keybd_event(VIRTUAL_KEY_SHIFT, 0, 0, 0);
+            keybd_event(VIRTUAL_KEY_SHIFT, 0, KEY_EVENT_KEY_UP, 0);
+        }
+    }
 }
 
 fn hang() -> ! {
@@ -698,8 +769,23 @@ fn first_thread_uses_exact_policy_order_and_persists_refs() {
         std::env::current_dir().unwrap()
     );
     assert_eq!(run.requests.len(), 6);
-    assert_eq!(run.requests[0]["id"], 1);
-    assert_eq!(run.requests[0]["method"], "initialize");
+    assert_eq!(
+        run.requests[0],
+        json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "satelle-host",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": false,
+                    "mcpServerOpenaiFormElicitation": true
+                }
+            }
+        })
+    );
     assert_eq!(run.requests[1], json!({"method": "initialized"}));
     assert_eq!(
         run.requests[2],
@@ -1369,6 +1455,25 @@ fn terminating_a_successful_session_contains_descendants() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(!escaped_marker.exists(), "a descendant escaped containment");
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_session_closes_stdin_before_forcing_process_group_shutdown() {
+    let run = run_scenario("graceful-descendant", None, Duration::from_secs(3));
+    let escaped_marker = run.directory.path().join("descendant-escaped");
+    let release_marker = run.directory.path().join("descendant-release");
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+
+    touch(&release_marker);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline && !escaped_marker.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !escaped_marker.exists(),
+        "an MCP kernel escaped because app-server stdin was not closed gracefully"
+    );
 }
 
 #[test]

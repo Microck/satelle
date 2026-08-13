@@ -657,8 +657,34 @@ impl ReadinessCacheKey {
         mut self,
         binding: &satelle_core::ResolvedProviderBinding,
     ) -> Self {
-        self.provider_config_fingerprint = Some(binding.binding_digest().to_string());
+        self.provider_config_fingerprint =
+            Some(self.provider_config_fingerprint_for_binding(Some(binding.binding_digest())));
         self
+    }
+
+    fn provider_config_fingerprint_for_binding(&self, binding_digest: Option<&str>) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"satelle-provider-smoke-runtime-v2\0");
+        if let Some(binding_digest) = binding_digest {
+            digest.update(binding_digest.as_bytes());
+        } else {
+            digest.update(self.execution_policy.provider_binding().as_str().as_bytes());
+            digest.update([0]);
+            digest.update(self.execution_policy.effective_model().as_str().as_bytes());
+        }
+        digest.update([0]);
+        digest.update(self.codex_version.as_bytes());
+        digest.update([0]);
+        digest.update(self.native_runtime_version.as_bytes());
+        digest.update([0]);
+        if let Some(plugin_version) = &self.plugin_version {
+            digest.update(plugin_version.as_bytes());
+        }
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     pub(crate) const fn adapter(&self) -> &'static str {
@@ -725,20 +751,7 @@ impl ReadinessCacheKey {
         if let Some(fingerprint) = &self.provider_config_fingerprint {
             return fingerprint.clone();
         }
-        let mut digest = Sha256::new();
-        digest.update(b"satelle-provider-smoke-v1\0");
-        digest.update(self.execution_policy.provider_binding().as_str().as_bytes());
-        digest.update([0]);
-        digest.update(self.execution_policy.effective_model().as_str().as_bytes());
-        digest.update([0]);
-        digest.update(self.codex_version.as_bytes());
-        digest.update([0]);
-        digest.update(self.native_runtime_version.as_bytes());
-        digest
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        self.provider_config_fingerprint_for_binding(None)
     }
 
     pub(crate) fn evidence(

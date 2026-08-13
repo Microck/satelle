@@ -1252,6 +1252,29 @@ fn validate_local_daemon_path_overrides(
     Ok(())
 }
 
+fn transport_proves_daemon_is_absent(error: &reqwest::Error) -> bool {
+    if error.is_connect() {
+        return true;
+    }
+    let mut cause = std::error::Error::source(error);
+    while let Some(current) = cause {
+        if current
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(|error| error.is_closed() || error.is_incomplete_message())
+        {
+            return true;
+        }
+        if current
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset)
+        {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
+}
+
 fn map_ssh_daemon_bootstrap_error(
     alias: &str,
     error: ssh_bootstrap::SshBootstrapError,
@@ -1769,20 +1792,12 @@ impl SshSetupTransport {
         .map_err(|error| direct_transport_error(&self.alias, error))?;
         if self.requires_first_trust {
             let discovered_identity =
-                client
-                    .discover_host_identity()
-                    .map_err(|error| match error {
-                        DaemonClientError::Api { status: _, error }
-                            if matches!(
-                                error.code(),
-                                ApiErrorCode::AuthenticationFailed
-                                    | ApiErrorCode::HostIdentityMismatch
-                            ) =>
-                        {
-                            self.unauthenticated_daemon_version_error()
-                        }
-                        error => direct_transport_error(&self.alias, error),
-                    })?;
+                match self.first_trust_discovered_identity(client.discover_host_identity())? {
+                    Some(identity) => identity,
+                    None => {
+                        return Ok(Self::missing_current_daemon_observation());
+                    }
+                };
             let token = ApiBearerToken::parse(
                 first_trust_token
                     .expect("first-trust probing retains its typed credential")
@@ -1799,6 +1814,45 @@ impl SshSetupTransport {
             return self.current_daemon_observation(client.capabilities());
         }
         self.current_daemon_observation(client.capabilities())
+    }
+
+    fn first_trust_discovered_identity(
+        &self,
+        response: Result<String, DaemonClientError>,
+    ) -> Result<Option<String>, SatelleError> {
+        match response {
+            Ok(identity) => Ok(Some(identity)),
+            // A first install has no daemon behind the SSH tunnel yet. SSH can
+            // still establish the forwarding listener, after which the HTTP
+            // client observes a closed or reset connection. Only that exact
+            // failure proves absence; timeouts and other transport failures
+            // leave the current Host state unknown and must fail closed.
+            Err(DaemonClientError::Transport(error))
+                if transport_proves_daemon_is_absent(&error) =>
+            {
+                Ok(None)
+            }
+            Err(DaemonClientError::Api { status: _, error })
+                if matches!(
+                    error.code(),
+                    ApiErrorCode::AuthenticationFailed | ApiErrorCode::HostIdentityMismatch
+                ) =>
+            {
+                Err(self.unauthenticated_daemon_version_error())
+            }
+            Err(error) => Err(direct_transport_error(&self.alias, error)),
+        }
+    }
+
+    fn missing_current_daemon_observation() -> CurrentDaemonArtifactObservation {
+        CurrentDaemonArtifactObservation {
+            current_version: None,
+            minimum_host_version: None,
+            protocol_compatible: true,
+            codex_update_evidence: None,
+            #[cfg(test)]
+            validated_host_identity: None,
+        }
     }
 
     fn current_daemon_observation<T: CurrentDaemonObservationContract>(
@@ -1856,14 +1910,7 @@ impl SshSetupTransport {
                 Err(self.unauthenticated_daemon_version_error())
             }
             Err(DaemonClientError::Transport(error)) if error.is_connect() => {
-                Ok(CurrentDaemonArtifactObservation {
-                    current_version: None,
-                    minimum_host_version: None,
-                    protocol_compatible: true,
-                    codex_update_evidence: None,
-                    #[cfg(test)]
-                    validated_host_identity: None,
-                })
+                Ok(Self::missing_current_daemon_observation())
             }
             Err(error) => Err(direct_transport_error(&self.alias, error)),
         }
@@ -2169,22 +2216,30 @@ impl SshSetupTransport {
     }
 
     fn token_file_exists(&self) -> Result<bool, SatelleError> {
-        let Some(ApiTokenSource::File { path }) = self.binding.api_token() else {
-            return Ok(false);
-        };
-        match fs::symlink_metadata(path) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(SatelleError::config_error(
-                format!(
-                    "could not inspect the durable API token path '{}': {error}",
-                    path.display()
-                ),
-                None,
-            )),
-        }
+        api_token_file_exists(self.binding.api_token())
     }
+}
 
+pub(crate) fn api_token_file_exists(
+    api_token: Option<&ApiTokenSource>,
+) -> Result<bool, SatelleError> {
+    let Some(ApiTokenSource::File { path }) = api_token else {
+        return Ok(false);
+    };
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(SatelleError::config_error(
+            format!(
+                "could not inspect the durable API token path '{}': {error}",
+                path.display()
+            ),
+            None,
+        )),
+    }
+}
+
+impl SshSetupTransport {
     fn verify_existing_token(
         &self,
         host_config: &satelle_core::HostConfig,
@@ -2839,33 +2894,20 @@ impl RemotePersistentSetupExecution<'_> {
             .service
             .as_ref()
             .expect("artifact action prepares service");
-        let (observed, reconciled) = (|| {
-            let observed = match service {
-                PreparedPersistentService::Windows { task, .. } => {
-                    remote.observe_windows_task(task)?
-                }
-                PreparedPersistentService::Launchd(definition) => {
-                    remote.observe_launchd(definition)?
-                }
-            };
-            match service {
-                PreparedPersistentService::Windows { task, .. } => {
-                    remote.register_windows_task(task)?
-                }
-                PreparedPersistentService::Launchd(definition) => {
-                    remote.register_launchd(definition)?
-                }
-            }
-            let reconciled = match service {
-                PreparedPersistentService::Windows { task, .. } => {
-                    remote.observe_windows_task(task)?
-                }
-                PreparedPersistentService::Launchd(definition) => {
-                    remote.observe_launchd(definition)?
-                }
-            };
-            Ok::<_, ssh_bootstrap::SshBootstrapError>((observed, reconciled))
-        })()
+        let observed = match service {
+            PreparedPersistentService::Windows { task, .. } => remote.observe_windows_task(task),
+            PreparedPersistentService::Launchd(definition) => remote.observe_launchd(definition),
+        }
+        .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?;
+        match service {
+            PreparedPersistentService::Windows { task, .. } => remote.register_windows_task(task),
+            PreparedPersistentService::Launchd(definition) => remote.register_launchd(definition),
+        }
+        .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?;
+        let reconciled = match service {
+            PreparedPersistentService::Windows { task, .. } => remote.observe_windows_task(task),
+            PreparedPersistentService::Launchd(definition) => remote.observe_launchd(definition),
+        }
         .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?;
         if reconciled != ssh_bootstrap::PersistentServiceObservation::Matching {
             return Err(SatelleError::host_unreachable(&self.transport.alias));
@@ -2876,6 +2918,29 @@ impl RemotePersistentSetupExecution<'_> {
     }
 
     fn apply_service_start(&mut self) -> Result<(), SatelleError> {
+        {
+            let host_config = self
+                .transport
+                .host_config_with_overrides(self.daemon_path_overrides);
+            let mut remote = ssh_bootstrap::PersistentServiceRemote::new(
+                self.transport.binding.destination(),
+                self.target,
+                &self.directories,
+                self.bootstrap_lock,
+            )
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?;
+            remote
+                .release_bootstrap_state_owner(
+                    self.artifact
+                        .as_ref()
+                        .expect("bootstrap handoff installs the persistent Host artifact"),
+                    &host_config,
+                )
+                .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?;
+        }
+        // State release is a self-verifying fenced phase: the remote command
+        // returns only after the daemon releases the store, and the fence
+        // records that successful exit before the next mutation can open.
         drop(self.bootstrap_process.take());
         drop(self.bootstrap_client.take());
         drop(self.bootstrap_tunnel.take());
@@ -3568,9 +3633,6 @@ pub(crate) fn apply_ssh_storage_maintenance(
             None
         };
         let artifact = remote.install_current_host_artifact()?;
-        if artifact.cache_changed() {
-            bootstrap_lock.commit_current_mutation()?;
-        }
         Ok::<_, ssh_bootstrap::SshBootstrapError>((overrides, windows_task, artifact))
     })();
     let (persisted_overrides, windows_task, artifact) = match prerequisites {
@@ -9289,54 +9351,48 @@ pub(crate) fn discover_ssh_host(
         SSH_DAEMON_REQUEST_TIMEOUT,
     )
     .map_err(|error| direct_transport_error(&host.alias, error))?;
-    match liveness_client.live() {
-        Ok(_) => {
-            let setup_transport = SshSetupTransport::new(host)?;
-            let token = setup_transport.read_configured_durable_token()?;
-            let raw_token = token.expose();
-            let discovery_client = DaemonClient::loopback_with_timeout(
-                tunnel.local_addr(),
-                token,
-                &probe_identity,
-                SSH_DAEMON_REQUEST_TIMEOUT,
-            )
-            .map_err(|error| direct_transport_error(&host.alias, error))?;
-            let identity =
-                discovery_client
-                    .discover_host_identity()
-                    .map_err(|error| match error {
-                        DaemonClientError::Api { status: _, error }
-                            if matches!(
-                                error.code(),
-                                ApiErrorCode::AuthenticationFailed
-                                    | ApiErrorCode::HostIdentityMismatch
-                            ) =>
-                        {
-                            setup_transport.unauthenticated_daemon_version_error()
-                        }
-                        error => direct_transport_error(&host.alias, error),
-                    })?;
-            let token = ApiBearerToken::parse(raw_token.as_str())
-                .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
-            let client = DaemonClient::loopback_with_timeout(
-                tunnel.local_addr(),
-                token,
-                &identity,
-                SSH_DAEMON_REQUEST_TIMEOUT,
-            )
-            .map_err(|error| direct_transport_error(&host.alias, error))?;
-            return Ok(PendingSshTrust::Live(Box::new(
-                PendingLiveSshTrustCandidate {
-                    alias: host.alias.clone(),
-                    identity,
-                    authenticated_user,
-                    client: Arc::new(client),
-                    _tunnel: tunnel,
-                },
-            )));
-        }
-        Err(DaemonClientError::Transport(error)) if error.is_connect() => {}
-        Err(error) => return Err(direct_transport_error(&host.alias, error)),
+    if first_trust_daemon_is_live(&host.alias, &liveness_client)? {
+        let setup_transport = SshSetupTransport::new(host)?;
+        let token = setup_transport.read_configured_durable_token()?;
+        let raw_token = token.expose();
+        let discovery_client = DaemonClient::loopback_with_timeout(
+            tunnel.local_addr(),
+            token,
+            &probe_identity,
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(&host.alias, error))?;
+        let identity = discovery_client
+            .discover_host_identity()
+            .map_err(|error| match error {
+                DaemonClientError::Api { status: _, error }
+                    if matches!(
+                        error.code(),
+                        ApiErrorCode::AuthenticationFailed | ApiErrorCode::HostIdentityMismatch
+                    ) =>
+                {
+                    setup_transport.unauthenticated_daemon_version_error()
+                }
+                error => direct_transport_error(&host.alias, error),
+            })?;
+        let token = ApiBearerToken::parse(raw_token.as_str())
+            .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
+        let client = DaemonClient::loopback_with_timeout(
+            tunnel.local_addr(),
+            token,
+            &identity,
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(&host.alias, error))?;
+        return Ok(PendingSshTrust::Live(Box::new(
+            PendingLiveSshTrustCandidate {
+                alias: host.alias.clone(),
+                identity,
+                authenticated_user,
+                client: Arc::new(client),
+                _tunnel: tunnel,
+            },
+        )));
     }
     drop(tunnel);
     let mut selected_host_config = host.config.clone();
@@ -9408,6 +9464,20 @@ pub(crate) fn discover_ssh_host(
         identity,
         operation_id,
     })))
+}
+
+fn first_trust_daemon_is_live(alias: &str, client: &DaemonClient) -> Result<bool, SatelleError> {
+    match client.live() {
+        Ok(_) => Ok(true),
+        // The SSH forwarding listener can accept the HTTP connection and then
+        // reset it when no daemon owns the remote loopback port. Only those
+        // typed absence signals permit durable-state inspection. A timeout or
+        // malformed response leaves daemon ownership unknown and fails closed.
+        Err(DaemonClientError::Transport(error)) if transport_proves_daemon_is_absent(&error) => {
+            Ok(false)
+        }
+        Err(error) => Err(direct_transport_error(alias, error)),
+    }
 }
 
 #[cfg(test)]
