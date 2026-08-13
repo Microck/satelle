@@ -76,6 +76,10 @@ test("installation docs freeze package identities, ownership, and cache contract
     "utf8",
   );
   const securityPolicy = readFileSync(path.join(repositoryRoot, "SECURITY.md"), "utf8");
+  const firstSessionTutorial = readFileSync(
+    path.join(repositoryRoot, "docs", "tutorial", "first-session.mdx"),
+    "utf8",
+  );
   const normalizedInstallationGuide = installationGuide.replace(/\s+/g, " ");
   const canonicalManifest = readJson(path.join(canonicalPackageRoot, "package.json"));
   const unscopedManifest = readJson(
@@ -207,6 +211,14 @@ test("installation docs freeze package identities, ownership, and cache contract
   assert.doesNotMatch(securityPolicy, /has not published a public release/);
   assert.doesNotMatch(readme, /\.\/target\/release\/satelle/);
   assert.match(readme, /satelle setup --host local-demo --dry-run/);
+  assert.match(
+    firstSessionTutorial,
+    /npm install --global @microck\/satelle --include=optional/,
+  );
+  assert.doesNotMatch(
+    firstSessionTutorial,
+    /Public npm packages are not available yet|The release has not been published to npm/,
+  );
 });
 
 function npmSpawnOptions(options = {}) {
