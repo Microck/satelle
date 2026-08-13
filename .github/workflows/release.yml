@@ -99,7 +99,7 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 1
           CARGO_PROFILE_RELEASE_DEBUG: 0
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo build --locked --release -p satelle-cli --target ${{ matrix.rust-target }}
 
       - name: Stage native npm package

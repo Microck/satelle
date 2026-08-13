@@ -3656,7 +3656,16 @@ test("release workflow gates draft publication on candidate validation and promo
     path.join(repositoryRoot, ".github", "workflows", "release.yml"),
     "utf8",
   ).replaceAll("\r\n", "\n");
+  const ciWorkflow = readFileSync(
+    path.join(repositoryRoot, ".github", "workflows", "ci.yml"),
+    "utf8",
+  ).replaceAll("\r\n", "\n");
   const draftRelease = workflowJob(workflow, "draft-release");
+  const buildRelease = workflowJob(workflow, "build");
+  const buildReleaseExecutable = workflowStep(
+    buildRelease,
+    "Build native release executable",
+  );
   const publishCandidates = workflowJob(workflow, "publish-candidates");
   const validateRegistryCandidates = workflowJob(workflow, "validate-registry-candidates");
   const promoteAndPublish = workflowJob(workflow, "promote-and-publish");
@@ -3734,6 +3743,14 @@ test("release workflow gates draft publication on candidate validation and promo
   );
 
   assert.match(workflow, /group: .*satelle-npm-release-writer/);
+  assert.match(
+    buildReleaseExecutable,
+    /RUSTFLAGS: \$\{\{ runner\.os == 'Windows' && '-D warnings -C target-feature=\+crt-static' \|\| '-D warnings' \}\}/,
+  );
+  assert.match(
+    workflowStep(workflowJob(ciWorkflow, "rust"), "Build release binaries"),
+    /RUSTFLAGS: \$\{\{ runner\.os == 'Windows' && '-D warnings -C target-feature=\+crt-static' \|\| '-D warnings' \}\}/,
+  );
   assert.match(draftRelease, /candidate_pattern=.*npm-candidate-v.*\[0-9\]\+/);
   assert.match(draftRelease, /promotion_pattern=.*npm-promotion-v.*\[0-9\]\+/);
   assert.doesNotMatch(draftRelease, /startswith\("npm-(?:candidate|promotion)-"\)/);

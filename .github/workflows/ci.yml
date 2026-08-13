@@ -91,7 +91,7 @@ jobs:
 
       - name: Build release binaries
         env:
-          RUSTFLAGS: -D warnings
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo build --workspace --release --locked
 
       - name: Smoke-test release binary contracts
