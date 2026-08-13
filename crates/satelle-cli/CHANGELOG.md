@@ -1,3 +1,10 @@
+## satelle-cli@0.1.3
+
+### Windows installation reliability
+
+Ship self-contained Windows binaries that run on clean systems without a separately installed
+Visual C++ runtime.
+
 ## satelle-cli@0.1.2
 
 ### Native acceptance and release reliability
