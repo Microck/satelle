@@ -40,7 +40,6 @@ const COMPUTER_USE_PLUGIN_ID: &str = "computer-use@openai-bundled";
 const MACOS_CODEX_APP_ID: &str = "com.openai.codex";
 #[cfg(target_os = "macos")]
 const MACOS_CODEX_CLI_ID: &str = "codex";
-#[cfg(target_os = "macos")]
 const MACOS_CODEX_APP_PATH: &str = "/Applications/ChatGPT.app";
 const MACOS_NODE_REPL_ROOT: &str = "/Applications/ChatGPT.app/Contents/Resources/cua_node";
 #[cfg(target_os = "macos")]
@@ -910,7 +909,7 @@ pub(crate) fn codex_isolation_plan_from_json(
     if computer_use.marketplace_name != "openai-bundled" || !computer_use.enabled {
         return Err(codex_isolation_error("computer_use_plugin_not_ready"));
     }
-    let expected_plugin_root = expected_computer_use_plugin_root(codex_home);
+    let expected_plugin_root = expected_computer_use_plugin_root(codex_home, platform);
     if computer_use.source.source != "local"
         || !path_is_absolute_for_platform(&computer_use.source.path, platform)
         || !same_path_for_platform(&computer_use.source.path, &expected_plugin_root, platform)
@@ -958,13 +957,27 @@ pub(crate) fn codex_isolation_plan_from_json(
     })
 }
 
-fn expected_computer_use_plugin_root(codex_home: &Path) -> PathBuf {
-    codex_home
-        .join(".tmp")
-        .join("bundled-marketplaces")
-        .join("openai-bundled")
-        .join("plugins")
-        .join("computer-use")
+fn expected_computer_use_plugin_root(codex_home: &Path, platform: &str) -> PathBuf {
+    match platform {
+        // The macOS runtime command and its enclosing app bundle have already
+        // passed the OpenAI code-signing requirement before inventory runs.
+        // Trust the current bundle-owned plugin and reject retired copied
+        // plugin trees under CODEX_HOME.
+        "macos" => Path::new(MACOS_CODEX_APP_PATH)
+            .join("Contents")
+            .join("Resources")
+            .join("plugins")
+            .join("openai-bundled")
+            .join("plugins")
+            .join("computer-use"),
+        "windows" => codex_home
+            .join(".tmp")
+            .join("bundled-marketplaces")
+            .join("openai-bundled")
+            .join("plugins")
+            .join("computer-use"),
+        _ => unreachable!("native Computer Use platform was validated above"),
+    }
 }
 
 fn component_version_is_valid(version: &str) -> bool {

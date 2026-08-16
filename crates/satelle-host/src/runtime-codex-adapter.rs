@@ -1359,10 +1359,10 @@ fn native_readiness_prompt(
             // coupling click delivery to window chrome geometry. The painted
             // drag surfaces have no accessibility elements, so bind their
             // fixed full-window coordinates to a fresh screenshot.
-            let script = "globalThis.sky ??= (await import('@oai/sky')).sky; var apps = await sky.list_apps(); var satelle = apps.find(app => app.id.toLowerCase().endsWith('satelle.exe')); if (!satelle) throw new Error('Satelle is unavailable'); var probeWindow = satelle.windows.find(window => window.title === 'Satelle native readiness probe'); if (!probeWindow) throw new Error('Satelle native readiness probe window is unavailable'); await sky.activate_window({ window: probeWindow }); var state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); var buttonLine = state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); var buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) }); await new Promise(resolve => setTimeout(resolve, 300)); state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); if (!state.accessibility.tree.includes('Click event observed')) throw new Error('native click event missing'); var screenshot = state.screenshots[0]; if (!screenshot) throw new Error('window screenshot missing after click'); await sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 668, to_y: 461, screenshotId: screenshot.id }); await new Promise(resolve => setTimeout(resolve, 500)); var finalState = await sky.get_window_state({ window: probeWindow, include_screenshot: false, include_text: true }); if (!finalState.accessibility.tree.includes('Drag event observed')) throw new Error('native drag event missing'); nodeRepl.write('Native click and drag actions observed');".to_string();
+            let script = "globalThis.sky ??= (await import('@oai/sky')).sky; var apps = await sky.list_apps(); var satelle = apps.find(app => app.id.toLowerCase().endsWith('satelle.exe')); if (!satelle) throw new Error('Satelle is unavailable'); var probeWindow = satelle.windows.find(window => window.title === 'Satelle native readiness probe'); if (!probeWindow) throw new Error('Satelle native readiness probe window is unavailable'); var state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); var buttonLine = state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); var buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) }); await new Promise(resolve => setTimeout(resolve, 300)); state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); if (!state.accessibility.tree.includes('Click event observed')) throw new Error('native click event missing'); var screenshot = state.screenshots[0]; if (!screenshot) throw new Error('window screenshot missing after click'); await sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 668, to_y: 461, screenshotId: screenshot.id }); await new Promise(resolve => setTimeout(resolve, 500)); var finalState = await sky.get_window_state({ window: probeWindow, include_screenshot: false, include_text: true }); if (!finalState.accessibility.tree.includes('Drag event observed')) throw new Error('native drag event missing'); nodeRepl.write('Native click and drag actions observed');".to_string();
             native_action_evidence.expect_script_for_app(&script, "satelle.exe");
             Ok(format!(
-                "Use the installed official Computer Use plugin through mcp__node_repl__js immediately. Do not search the tool catalog or read documentation. Make the call through functions.exec. Its source must begin exactly with `// @exec: {{\"yield_time_ms\": 30000, \"max_output_tokens\": 2000}}` so the nested call returns its terminal output instead of yielding early. Your first and only tool call inside functions.exec must invoke mcp__node_repl__js with the exact `code` argument containing this complete JavaScript in one persistent-kernel cell: `{script}`. The Satelle-owned window independently reports both native events to a private loopback capability, and the accessibility tree is formatted text. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list or inspect unrelated apps. Do not inspect Object.keys or probe API shapes. If functions.exec reports `Script running with cell ID`, call functions.wait for that same cell. Repeat only functions.wait while that same cell remains running, until that same cell reaches a terminal result. Do not invoke any other tool. Stop immediately after that same cell reaches a terminal result."
+                "Use the installed official Computer Use plugin immediately. If `mcp__node_repl__js` is not already available, use `tool_search` exactly once with query `node_repl js`. Call `mcp__node_repl__js` directly with the exact `code` argument containing this complete JavaScript in one persistent-kernel cell: `{script}`. Make no other discovery or tool calls. The Satelle-owned window independently reports both native events to a private loopback capability, and the accessibility tree is formatted text. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list or inspect unrelated apps. Do not inspect Object.keys or probe API shapes. Do not read documentation. Stop immediately after the JavaScript tool call reaches a terminal result."
             ))
         }
         crate::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
@@ -1375,10 +1375,19 @@ fn native_readiness_prompt(
             );
             native_action_evidence.expect_script_for_app(&script, "com.apple.Safari");
             Ok(format!(
-                "Use the installed official Computer Use plugin through mcp__node_repl__js immediately. Do not search the tool catalog or read documentation. Do not send commentary before the tool call. Make the call through functions.exec. Its source must begin exactly with `// @exec: {{\"yield_time_ms\": 30000, \"max_output_tokens\": 2000}}` so the nested call returns its terminal output instead of yielding early. Your first and only tool call inside functions.exec must invoke mcp__node_repl__js with the exact `code` argument containing this complete JavaScript in one persistent-kernel cell: `{script}`. The private loopback target independently verifies both native events. It rejects a missing click or drag. The target has a fixed 1024 by 678 readiness surface, so the app-window drag coordinates are part of this probe contract. Use only the authenticated sky Computer Use API. Do not use shell, file, generic browser automation, or other network tools. Do not print the app list or inspect unrelated apps. If functions.exec reports `Script running with cell ID`, call functions.wait for that same cell. Repeat only functions.wait while that same cell remains running, until that same cell reaches a terminal result. Do not invoke any other tool. Stop immediately after that same cell reaches a terminal result."
+                "Use the installed official Computer Use plugin immediately. If `mcp__node_repl__js` is not already available, use `tool_search` exactly once with query `node_repl js`. Call `mcp__node_repl__js` directly with the exact `code` argument containing this complete JavaScript in one persistent-kernel cell: `{script}`. Make no other discovery or tool calls. The private loopback target independently verifies both native events. It rejects a missing click or drag. The target has a fixed 1024 by 678 readiness surface, so the app-window drag coordinates are part of this probe contract. Use only the authenticated sky Computer Use API. Do not use shell, file, generic browser automation, or other network tools. Do not print the app list or inspect unrelated apps. Do not read documentation. Stop immediately after the JavaScript tool call reaches a terminal result."
             ))
         }
     }
+}
+
+fn native_computer_use_prompt(user_prompt: &str) -> String {
+    // The isolated MCP server exposes a generic JavaScript kernel. Name the
+    // trusted Sky entry point on every Turn so the model does not mistake the
+    // sandboxed shell for a desktop-control surface.
+    format!(
+        "Use the installed official Computer Use integration for every desktop-app interaction. If `mcp__node_repl__js` is not already available, use `tool_search` exactly once with query `node_repl js`. Call the `mcp__node_repl__js` JavaScript tool and begin with `globalThis.sky ??= (await import('@oai/sky')).sky;`; then use `sky` to inspect and control the requested app. Make no other discovery calls. Do not use shell commands, AppleScript, generic browser automation, or another integration for desktop interaction. Complete this user request: {user_prompt}"
+    )
 }
 
 struct NativePrerequisiteObservations {
@@ -2273,11 +2282,12 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                     crate::codex_capabilities::installed_computer_use_app_server(),
                 )?;
                 let expected_mcp_server_name = verified_app_server.native_mcp_server_name;
+                let prompt = native_computer_use_prompt(request.prompt());
                 let run = run_codex_session_with_timeout_cancellation(
                     verified_app_server.command,
                     CodexSessionRequest {
                         working_directory: &working_directory,
-                        prompt: request.prompt(),
+                        prompt: &prompt,
                         existing_thread_ref: request.upstream_thread_ref(),
                         model: model_override(policy.effective_model().as_str()),
                         model_provider,
@@ -4052,7 +4062,7 @@ mod tests {
                 let protocol =
                     std::fs::read_to_string(&protocol_log).expect("provider protocol log");
                 assert!(protocol.contains("http://127.0.0.1:"));
-                assert!(protocol.contains("first and only tool call"));
+                assert!(protocol.contains("Call `mcp__node_repl__js` directly"));
                 assert!(protocol.contains("import('@oai/sky')"));
                 let args = std::fs::read_to_string(&args_log).expect("provider child args");
                 assert!(
@@ -4389,10 +4399,9 @@ mod tests {
             &evidence,
         )
         .expect("the authenticated Windows node_repl path should form a direct plugin call");
-        assert!(
-            prompt.contains("official Computer Use plugin through mcp__node_repl__js immediately")
-        );
-        assert!(prompt.contains("Do not search the tool catalog or read documentation"));
+        assert!(prompt.contains("Use the installed official Computer Use plugin immediately"));
+        assert!(prompt.contains("use `tool_search` exactly once with query `node_repl js`"));
+        assert!(prompt.contains("Call `mcp__node_repl__js` directly"));
         assert!(prompt.contains("import('@oai/sky')"));
         assert!(!prompt.contains("registerHooks"));
         assert!(!prompt.contains("clientModuleUrl"));
@@ -4404,7 +4413,10 @@ mod tests {
         assert!(prompt.contains("app.id.toLowerCase().endsWith('satelle.exe')"));
         assert!(!prompt.contains("MSEdge"));
         assert!(prompt.contains("Satelle native readiness probe"));
-        assert!(prompt.contains("sky.activate_window({ window: probeWindow })"));
+        // Every native action is already bound to the captured window. A
+        // separate activation request is both redundant and unsupported for
+        // otherwise controllable Win32 windows in the signed Windows bridge.
+        assert!(!prompt.contains("sky.activate_window"));
         assert!(!prompt.contains("sky.type_text"));
         assert!(prompt.contains("sky.get_window_state({ window: probeWindow"));
         assert!(prompt.contains("finalState.accessibility.tree"));
@@ -4434,16 +4446,9 @@ mod tests {
             .expect("the probe must drag on the readiness surface");
         assert!(click < refreshed_state);
         assert!(refreshed_state < drag);
-        assert!(prompt.contains("first and only tool call"));
-        assert!(prompt.contains("through functions.exec"));
+        assert!(prompt.contains("Make no other discovery or tool calls"));
         assert!(prompt.contains("exact `code` argument"));
-        assert!(prompt.contains(
-            "If functions.exec reports `Script running with cell ID`, call functions.wait"
-        ));
-        assert!(prompt.contains("until that same cell reaches a terminal result"));
-        assert!(
-            prompt.contains("// @exec: {\"yield_time_ms\": 30000, \"max_output_tokens\": 2000}")
-        );
+        assert!(!prompt.contains("functions.exec"));
         assert!(prompt.contains("Click event observed"));
         assert!(prompt.contains("Drag event observed"));
         assert!(prompt.contains("native click event missing"));
@@ -4818,10 +4823,9 @@ mod tests {
         .expect("the macOS node_repl path does not require a client file URL");
 
         assert!(prompt.contains("mcp__node_repl__js"));
-        assert!(prompt.contains("first and only tool call"));
-        assert!(prompt.contains(
-            "If functions.exec reports `Script running with cell ID`, call functions.wait"
-        ));
+        assert!(prompt.contains("use `tool_search` exactly once with query `node_repl js`"));
+        assert!(prompt.contains("Make no other discovery or tool calls"));
+        assert!(!prompt.contains("functions.exec"));
         assert!(prompt.contains("import('@oai/sky')"));
         let initial_state = prompt
             .find("get_app_state({ app: 'Safari', disableDiff: true })")
@@ -4851,9 +4855,25 @@ mod tests {
         assert!(prompt.contains("from_x: 100, from_y: 320, to_x: 600, to_y: 425"));
         assert!(prompt.contains("sky.press_key({ app: 'Safari', key: 'super+w' })"));
         assert!(prompt.contains("independently verifies both native events"));
-        assert!(prompt.contains("Do not search the tool catalog"));
+        assert!(prompt.contains("Do not read documentation"));
         assert!(!prompt.contains("mcp__computer_use"));
         assert!(!prompt.contains("Helium"));
         assert!(!prompt.contains("Control_L"));
+    }
+
+    #[test]
+    fn native_turn_prompt_binds_desktop_work_to_the_isolated_sky_tool() {
+        let prompt = native_computer_use_prompt(
+            "Use Calculator to multiply 6 by 7 and leave the visible result at 42.",
+        );
+
+        assert!(prompt.contains("mcp__node_repl__js"));
+        assert!(prompt.contains("use `tool_search` exactly once with query `node_repl js`"));
+        assert!(prompt.contains("import('@oai/sky')"));
+        assert!(prompt.contains("Do not use shell commands"));
+        assert!(
+            prompt
+                .contains("Use Calculator to multiply 6 by 7 and leave the visible result at 42.")
+        );
     }
 }

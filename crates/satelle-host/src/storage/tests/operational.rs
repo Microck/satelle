@@ -2727,18 +2727,11 @@ fn host_native_readiness_invalidation_removes_every_native_key_only() {
         )
         .expect("preseed second native evidence");
 
-    let host_identity = storage
-        .host_identity()
-        .expect("load Host Identity")
-        .as_str()
-        .to_string();
     assert_eq!(
         2,
-        super::super::operational::invalidate_native_readiness_for_host(
-            storage.connection_for_test(),
-            &host_identity,
-        )
-        .expect("invalidate every native readiness tuple")
+        storage
+            .invalidate_all_native_readiness()
+            .expect("invalidate every native readiness tuple")
     );
     assert!(
         storage

@@ -933,6 +933,14 @@ impl Storage {
         invalidate_native_readiness_for_key(&self.connection, host_identity.as_str(), key)
     }
 
+    /// Removes every native readiness tuple for this daemon identity. Native
+    /// setup changes affect the shared desktop runtime, so retaining evidence
+    /// for another adapter would authorize execution against stale state.
+    pub(crate) fn invalidate_all_native_readiness(&mut self) -> Result<u64, StorageError> {
+        let host_identity = self.host_identity()?;
+        invalidate_native_readiness_for_host(&self.connection, host_identity.as_str())
+    }
+
     pub(crate) fn store_preflight_failure(
         &mut self,
         key: &ReadinessCacheKey,

@@ -2884,6 +2884,43 @@ fn native_refresh_marks_only_repair_owned_failures_repairable() {
 }
 
 #[test]
+fn native_refresh_projects_the_exact_isolation_failure_reason() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Macos,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    );
+    let mut error = SatelleError::computer_use_not_ready();
+    error.details.insert(
+        "reason".to_string(),
+        json!("native_bridge_launcher_untrusted"),
+    );
+    let mut report = production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
+
+    apply_native_refresh(
+        &mut report,
+        &Err(error),
+        "2026-08-18T13:00:00Z".to_string(),
+        "2026-08-18T13:00:01Z".to_string(),
+        Duration::from_secs(1),
+        true,
+    );
+
+    assert_eq!(
+        report.findings[0].evidence,
+        [
+            "code=computer-use-not-ready",
+            "reason=native_bridge_launcher_untrusted"
+        ]
+    );
+}
+
+#[test]
 fn endpointless_auth_sources_are_reserved_for_builtin_openai() {
     let openai = satelle_core::ProviderBindingAuthorization::new(
         "openai-model",

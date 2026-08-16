@@ -22,6 +22,9 @@ mod tailscale;
 #[path = "tailscale-serve.rs"]
 mod tailscale_serve;
 mod transport;
+#[cfg(windows)]
+#[path = "windows-interactive-bootstrap.rs"]
+mod windows_interactive_bootstrap;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use cliclack::{Theme, ThemeState};
@@ -87,7 +90,8 @@ use tailscale::{
 use transport::{
     AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, api_token_file_exists,
     authenticated_ssh_bootstrap_user, discover_direct_host_identity, discover_ssh_host,
-    transport_for, transport_for_setup, transport_for_with_ssh_bootstrap,
+    ssh_initial_state_requires_identity_discovery, transport_for, transport_for_setup,
+    transport_for_with_ssh_bootstrap, validate_api_token_file,
 };
 use uuid::Uuid;
 
@@ -657,6 +661,10 @@ struct HostStartCommand {
     /// retained only by this daemon process.
     #[arg(long, hide = true)]
     bootstrap_token_stdin: bool,
+    /// Internal Windows SSH boundary. Relaunch this bootstrap in the
+    /// authenticated user's active desktop session before reading stdin.
+    #[arg(long, hide = true, requires = "bootstrap_token_stdin")]
+    interactive_bootstrap: bool,
     /// Internal exact identity accepted by the Controller for a fresh SSH Host.
     #[arg(
         long,
@@ -1238,6 +1246,12 @@ struct CliFailure {
     error: SatelleError,
     history_session_id: Option<Box<SessionId>>,
     error_reported: bool,
+    exit_code_override: Option<u8>,
+}
+
+struct PreflightedCommand {
+    command: Command,
+    setup_exact_state_requires_identity_discovery: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -1303,7 +1317,9 @@ fn main() -> ExitCode {
             if !failure.error_reported {
                 print_error(&failure.error, error_format);
             }
-            process_exit_code(&failure.error)
+            failure
+                .exit_code_override
+                .map_or_else(|| process_exit_code(&failure.error), ExitCode::from)
         }
     }
 }
@@ -1674,8 +1690,13 @@ fn try_main(cli: Cli, error_format: &mut ErrorFormat) -> Result<(), CliFailure> 
         command,
     } = cli;
     let config = ConfigContext::new(profile.as_deref());
-    preflight_setup_before_history(&command, &config)?;
+    let setup_exact_state_requires_identity_discovery =
+        preflight_setup_before_history(&command, &config)?;
     let history = start_command_history(&command, &config);
+    let command = PreflightedCommand {
+        command,
+        setup_exact_state_requires_identity_discovery,
+    };
     let outcome = execute_command(
         command,
         no_color,
@@ -1707,9 +1728,9 @@ fn try_main(cli: Cli, error_format: &mut ErrorFormat) -> Result<(), CliFailure> 
 fn preflight_setup_before_history(
     command: &Command,
     config: &ConfigContext<'_>,
-) -> Result<(), CliFailure> {
+) -> Result<bool, CliFailure> {
     let Command::Setup(command) = command else {
-        return Ok(());
+        return Ok(false);
     };
     // Resolve configured precedence, then reject the built-in local backend
     // before command history can mutate operator state.
@@ -1724,7 +1745,7 @@ fn preflight_setup_before_history(
         )));
     }
     if command.dry_run {
-        return Ok(());
+        return Ok(false);
     }
     if let Some(expected) = command.expected_host_id.as_deref() {
         HostIdentityRef::new(expected).map_err(|error| {
@@ -1746,8 +1767,40 @@ fn preflight_setup_before_history(
         )));
     }
     let daemon_path_overrides = daemon_path_overrides(command, &host.config);
-    let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
-        && (host.config.expected_host_id.is_none() || !daemon_path_overrides.entries().is_empty());
+    let path_rebind = !daemon_path_overrides.entries().is_empty();
+    let ssh_transport = host.config.transport == satelle_core::TransportKind::Ssh;
+    let provider_auth_setup = setup_components
+        .iter()
+        .any(|component| component == "all" || component == "provider-auth");
+    let (host_setup_components, desktop_setup) =
+        partition_setup_components(&setup_components, ssh_transport, path_rebind);
+    if ssh_transport
+        && host_setup_components.is_empty()
+        && (desktop_setup || provider_auth_setup || command.verify)
+        && let Some(api_token) = host.config.api_token.as_ref()
+    {
+        // Reject an unavailable configured credential before any remote probe.
+        validate_api_token_file(api_token).map_err(failure)?;
+    }
+    let accepted_identity = accepted_setup_identity(command, &host.config);
+    let exact_state_requires_identity_discovery =
+        if ssh_transport && let Some(accepted_identity) = accepted_identity {
+            ssh_initial_state_requires_identity_discovery(
+                &host,
+                &daemon_path_overrides,
+                accepted_identity,
+            )
+            .map_err(failure)?
+        } else {
+            false
+        };
+    let unresolved_path_rebind = path_rebind && accepted_identity.is_none();
+    let first_ssh_trust = ssh_identity_discovery_required(
+        ssh_transport,
+        host.config.expected_host_id.is_none(),
+        unresolved_path_rebind,
+        exact_state_requires_identity_discovery,
+    );
     let setup_mode = setup_mode(command, &host.config)
         .map_err(failure)?
         .mode
@@ -1778,10 +1831,10 @@ fn preflight_setup_before_history(
         return Err(failure(error));
     }
     if !uses_production_local_setup_backend() {
-        return Ok(());
+        return Ok(exact_state_requires_identity_discovery);
     }
     if host.config.transport != satelle_core::TransportKind::Local {
-        return Ok(());
+        return Ok(exact_state_requires_identity_discovery);
     }
     // A production local Host has no Satelle-owned installer yet, but
     // `setup --verify` is still a live, read-only acceptance operation for an
@@ -1791,7 +1844,7 @@ fn preflight_setup_before_history(
         command,
         host.config.transport == satelle_core::TransportKind::Local,
     ) {
-        return Ok(());
+        return Ok(exact_state_requires_identity_discovery);
     }
 
     let setup_mode = if command.persistent {
@@ -1802,6 +1855,20 @@ fn preflight_setup_before_history(
     Err(failure(SatelleError::not_implemented(format!(
         "{setup_mode} setup mutations are not supported by the local Host transport"
     ))))
+}
+
+fn accepted_setup_identity<'a>(
+    command: &'a SetupCommand,
+    host_config: &'a HostConfig,
+) -> Option<&'a str> {
+    match (
+        command.expected_host_id.as_deref(),
+        host_config.expected_host_id.as_deref(),
+    ) {
+        (Some(requested), Some(configured)) if requested == configured => Some(requested),
+        (None, Some(configured)) => Some(configured),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -1831,7 +1898,7 @@ fn local_setup_verification_only(command: &SetupCommand, local_host: bool) -> bo
 }
 
 fn execute_command(
-    command: Command,
+    command: PreflightedCommand,
     no_color: bool,
     profile: Option<&str>,
     config: ConfigContext<'_>,
@@ -1839,6 +1906,10 @@ fn execute_command(
     error_format_configured: bool,
     log_verbosity: Option<DiagnosticVerbosity>,
 ) -> Result<Option<SessionId>, CliFailure> {
+    let PreflightedCommand {
+        command,
+        setup_exact_state_requires_identity_discovery,
+    } = command;
     let early_lifecycle_host = explicit_lifecycle_json_host(&command).map(str::to_owned);
     let (output_args, event_output) = command.output_request();
     let presentation_default_applies = matches!(
@@ -1894,7 +1965,13 @@ fn execute_command(
 
     match command {
         Command::Completions(command) => run_completions(command).map_err(failure).map(|_| None),
-        Command::Setup(command) => run_setup(command, config, output).map(|_| None),
+        Command::Setup(command) => run_setup(
+            command,
+            config,
+            output,
+            setup_exact_state_requires_identity_discovery,
+        )
+        .map(|_| None),
         Command::Repair(command) => run_repair(command, config, output).map(|_| None),
         Command::Doctor(command) => run_doctor(command, profile, config, output).map(|_| None),
         Command::Config { command } => run_config(command, config, output).map(|_| None),
@@ -2587,6 +2664,7 @@ mod history_target_tests {
                 foreground,
                 launchd_service: false,
                 bootstrap_token_stdin,
+                interactive_bootstrap: false,
                 initial_host_identity: None,
                 initial_identity_operation_id: None,
                 initial_identity_record: None,
@@ -3441,6 +3519,15 @@ const fn native_readiness_invalidation_before_setup(
         && authenticated_transport_available
 }
 
+const fn ssh_identity_discovery_required(
+    ssh_transport: bool,
+    expected_identity_missing: bool,
+    path_rebind: bool,
+    exact_pending_resume: bool,
+) -> bool {
+    ssh_transport && (expected_identity_missing || path_rebind || exact_pending_resume)
+}
+
 const fn authenticated_host_available_for_setup(
     first_ssh_trust: bool,
     ssh_transport: bool,
@@ -3451,17 +3538,23 @@ const fn authenticated_host_available_for_setup(
 }
 
 const fn authenticated_follow_up_after_host_setup(
-    first_ssh_trust: bool,
     ssh_transport: bool,
     api_token_descriptor_configured: bool,
     current_daemon_available: bool,
     host_setup_required: bool,
 ) -> bool {
-    !first_ssh_trust
-        && ssh_transport
+    ssh_transport
         && api_token_descriptor_configured
         && !current_daemon_available
         && host_setup_required
+}
+
+fn defer_first_ssh_windows_desktop_selection(
+    detected_platform: &str,
+    sessions_empty: bool,
+    host_setup_required: bool,
+) -> bool {
+    host_setup_required && sessions_empty && detected_platform.eq_ignore_ascii_case("windows")
 }
 
 fn add_deferred_desktop_selection_plan(
@@ -3498,7 +3591,8 @@ mod setup_native_invalidation_tests {
     use super::{
         add_deferred_desktop_selection_plan, authenticated_follow_up_after_host_setup,
         authenticated_host_available_for_setup, cli_owned_setup_report,
-        native_readiness_invalidation_before_setup, observe_current_daemon_for_setup,
+        defer_first_ssh_windows_desktop_selection, native_readiness_invalidation_before_setup,
+        observe_current_daemon_for_setup,
     };
 
     #[test]
@@ -3532,17 +3626,33 @@ mod setup_native_invalidation_tests {
 
     #[test]
     fn stopped_trusted_ssh_host_follows_up_when_setup_can_issue_its_configured_token() {
+        assert!(!authenticated_follow_up_after_host_setup(
+            false, true, false, true,
+        ));
+        assert!(!authenticated_follow_up_after_host_setup(
+            true, true, true, true,
+        ));
+        assert!(!authenticated_follow_up_after_host_setup(
+            true, false, false, true,
+        ));
         assert!(authenticated_follow_up_after_host_setup(
-            false, true, true, false, true,
+            true, true, false, true,
         ));
-        assert!(!authenticated_follow_up_after_host_setup(
-            false, true, true, true, true,
+    }
+
+    #[test]
+    fn first_ssh_windows_desktop_selection_waits_for_the_persistent_host() {
+        assert!(defer_first_ssh_windows_desktop_selection(
+            "windows", true, true,
         ));
-        assert!(!authenticated_follow_up_after_host_setup(
-            false, true, false, false, true,
+        assert!(!defer_first_ssh_windows_desktop_selection(
+            "windows", false, true,
         ));
-        assert!(!authenticated_follow_up_after_host_setup(
-            true, true, true, false, true,
+        assert!(!defer_first_ssh_windows_desktop_selection(
+            "macos", true, true,
+        ));
+        assert!(!defer_first_ssh_windows_desktop_selection(
+            "windows", true, false,
         ));
     }
 
@@ -3599,6 +3709,7 @@ fn run_setup(
     command: SetupCommand,
     config: ConfigContext<'_>,
     format: OutputFormat,
+    exact_state_requires_identity_discovery: bool,
 ) -> Result<(), CliFailure> {
     let json = format.is_json();
     if let Some(expected) = command.expected_host_id.as_deref() {
@@ -3632,9 +3743,26 @@ fn run_setup(
     {
         return Err(failure(SatelleError::host_identity_mismatch(&host.alias)));
     }
-    let first_ssh_trust = host.config.transport == satelle_core::TransportKind::Ssh
-        && (host.config.expected_host_id.is_none() || path_rebind);
+    let ssh_transport = host.config.transport == satelle_core::TransportKind::Ssh;
     let setup_components = setup_components(&command.component).map_err(failure)?;
+    let provider_auth_setup = setup_components
+        .iter()
+        .any(|component| component == "all" || component == "provider-auth");
+    let (host_setup_components, desktop_setup) =
+        partition_setup_components(&setup_components, ssh_transport, path_rebind);
+    let host_setup_required = !host_setup_components.is_empty();
+    // Configured path overrides describe both the current state root and a new
+    // rebind. Inspect a previously accepted exact identity so existing state
+    // resumes through the authenticated setup bootstrap, while fresh or
+    // pending state still enters the identity-commit flow.
+    let accepted_identity = accepted_setup_identity(&command, &host.config);
+    let unresolved_path_rebind = path_rebind && accepted_identity.is_none();
+    let first_ssh_trust = ssh_identity_discovery_required(
+        ssh_transport,
+        host.config.expected_host_id.is_none(),
+        unresolved_path_rebind,
+        exact_state_requires_identity_discovery,
+    );
     let local_verification_only = local_setup_verification_only(
         &command,
         host.config.transport == satelle_core::TransportKind::Local,
@@ -3645,12 +3773,6 @@ fn run_setup(
             "all" | "host" | "codex" | "computer-use" | "desktop"
         )
     });
-    let provider_auth_setup = setup_components
-        .iter()
-        .any(|component| component == "all" || component == "provider-auth");
-    let ssh_transport = host.config.transport == satelle_core::TransportKind::Ssh;
-    let (host_setup_components, desktop_setup) =
-        partition_setup_components(&setup_components, ssh_transport, path_rebind);
     let setup_mode_selection = setup_mode(&command, &host.config).map_err(failure)?;
     let local_service_decision = (host.config.transport == satelle_core::TransportKind::Local)
         .then(|| {
@@ -3674,7 +3796,6 @@ fn run_setup(
         .to_string();
     let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
         && tailscale_serve::applies_to(&host.config);
-    let host_setup_required = !host_setup_components.is_empty();
     let interactive_selection = !command.no_input && io::stdin().is_terminal();
     let trusted_consent =
         trusted_profile_allows_mutation(resolved, &host.alias, MutationCommandFamily::Setup);
@@ -3809,7 +3930,6 @@ fn run_setup(
         current_daemon_available,
     );
     let authenticated_follow_up_after_host_setup = authenticated_follow_up_after_host_setup(
-        first_ssh_trust,
         ssh_transport,
         host.config.api_token.is_some(),
         current_daemon_available,
@@ -4044,13 +4164,26 @@ fn run_setup(
                 report.planned_actions.push(action);
             }
             if desktop_setup {
-                desktop_selection = resolve_setup_desktop_selection(
+                let selection = resolve_setup_desktop_selection(
                     &discovery.sessions,
                     &host.config,
                     interactive_selection,
                     Some(&discovery.authenticated_user),
-                )
-                .map_err(failure)?;
+                );
+                desktop_selection = match selection {
+                    Ok(selection) => selection,
+                    Err(error)
+                        if error.code == ErrorCode::DesktopSessionUnavailable
+                            && defer_first_ssh_windows_desktop_selection(
+                                &discovery.sessions.detected_platform,
+                                discovery.sessions.sessions.is_empty(),
+                                host_setup_required,
+                            ) =>
+                    {
+                        None
+                    }
+                    Err(error) => return Err(failure(error)),
+                };
                 if let Some(selection) = &desktop_selection {
                     let action = selection.action(&host.alias);
                     if !report.planned_actions.contains(&action) {
@@ -5354,6 +5487,13 @@ fn setup_consent_recovery_command(
 #[cfg(test)]
 mod setup_consent_recovery_tests {
     use super::*;
+
+    #[test]
+    fn exact_pending_identity_resume_reenters_ssh_discovery() {
+        assert!(ssh_identity_discovery_required(true, false, false, true));
+        assert!(!ssh_identity_discovery_required(true, false, false, false));
+        assert!(!ssh_identity_discovery_required(false, false, false, true));
+    }
 
     #[test]
     fn first_ssh_trust_recovery_preserves_the_expected_host_identity() {
@@ -8487,6 +8627,48 @@ fn start_host_daemon(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
+    if command.interactive_bootstrap {
+        #[cfg(windows)]
+        {
+            validate_host_start_mode(&command).map_err(failure)?;
+            let status = windows_interactive_bootstrap::relaunch().map_err(|error| {
+                failure(SatelleError::config_error(
+                    format!("could not enter the authenticated Windows desktop session: {error}"),
+                    None,
+                ))
+            })?;
+            if status.success() {
+                return Ok(());
+            }
+            let exit_code = status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .ok_or_else(|| {
+                    failure(SatelleError::config_error(
+                        "interactive bootstrap relay ended without a portable exit status",
+                        None,
+                    ))
+                })?;
+            return Err(CliFailure {
+                error: SatelleError {
+                    code: ErrorCode::RemoteExecution,
+                    message: "interactive bootstrap command failed".to_string(),
+                    recovery_command: None,
+                    source_detail: None,
+                    details: BTreeMap::from([("relay_exit_code".to_string(), json!(exit_code))]),
+                },
+                history_session_id: None,
+                // The child relays its typed diagnostic through stderr.
+                error_reported: true,
+                exit_code_override: Some(exit_code),
+            });
+        }
+
+        #[cfg(not(windows))]
+        return Err(failure(SatelleError::invalid_usage(
+            "--interactive-bootstrap is supported only on Windows",
+        )));
+    }
     start_host_daemon_with(
         command,
         config,
@@ -9465,6 +9647,7 @@ mod daemon_tls_watcher_tests {
             foreground: true,
             launchd_service: false,
             bootstrap_token_stdin: false,
+            interactive_bootstrap: false,
             initial_host_identity: None,
             initial_identity_operation_id: None,
             initial_identity_record: None,
@@ -9992,6 +10175,7 @@ mod bootstrap_startup_tests {
             foreground: false,
             launchd_service: false,
             bootstrap_token_stdin: true,
+            interactive_bootstrap: false,
             initial_host_identity: None,
             initial_identity_operation_id: None,
             initial_identity_record: None,
@@ -13198,11 +13382,13 @@ fn run_prompt(
                     error,
                     history_session_id: history_session_id.clone(),
                     error_reported: false,
+                    exit_code_override: None,
                 })?;
             return Err(CliFailure {
                 error: attached_failure.into_error(),
                 history_session_id,
                 error_reported: false,
+                exit_code_override: None,
             });
         }
     };
@@ -13443,11 +13629,13 @@ fn steer_prompt(
                     error,
                     history_session_id: history_session_id.clone(),
                     error_reported: false,
+                    exit_code_override: None,
                 })?;
             return Err(CliFailure {
                 error: attached_failure.into_error(),
                 history_session_id,
                 error_reported: false,
+                exit_code_override: None,
             });
         }
     };
@@ -14298,6 +14486,7 @@ fn failure(error: SatelleError) -> CliFailure {
         error,
         history_session_id: None,
         error_reported: false,
+        exit_code_override: None,
     }
 }
 
@@ -14306,6 +14495,7 @@ fn reported_failure(error: SatelleError) -> CliFailure {
         error,
         history_session_id: None,
         error_reported: true,
+        exit_code_override: None,
     }
 }
 
@@ -14314,6 +14504,7 @@ fn failure_for_admitted_session(error: SatelleError, session_id: &SessionId) -> 
         error,
         history_session_id: Some(Box::new(session_id.clone())),
         error_reported: false,
+        exit_code_override: None,
     }
 }
 

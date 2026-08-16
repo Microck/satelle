@@ -1367,6 +1367,7 @@ fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
         vec!["transport".to_string()],
         DaemonPathOverrides::default(),
         SetupApplication::AppliedPendingActivation,
+        false,
     );
     assert!(report.mutated);
     assert_eq!(
@@ -1524,6 +1525,7 @@ fn reusable_setup_token_keeps_the_healthy_durable_daemon_running_without_bootstr
             vec!["transport".to_string()],
             DaemonPathOverrides::default(),
             SetupApplication::AppliedReusableToken,
+            false,
         );
         assert_eq!(report.status, "applied");
         assert!(!report.mutated);
@@ -4060,6 +4062,55 @@ fn ssh_setup_path_change_does_not_reuse_an_existing_store_token() {
     assert!(!report.mutated);
     assert_eq!(
         read_owner_only_secret_file(&token_path).expect("read preserved old-store token"),
+        raw_token
+    );
+}
+
+#[test]
+fn ssh_setup_unchanged_path_set_reuses_the_existing_store_token() {
+    let temporary_root = tempfile::tempdir().expect("temporary root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            temporary_root.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make temporary root owner-only");
+    }
+    let token_directory = temporary_root.path().join("owner-only");
+    drop(
+        satelle_core::open_or_create_owner_only_directory(&token_directory)
+            .expect("create owner-only token directory"),
+    );
+    let token_path = token_directory.join("existing-store.token");
+    let token = ApiBearerToken::generate().expect("generate existing API token");
+    let raw_token = token.expose();
+    persist_new_owner_only_secret_file(&token_path, raw_token.as_str())
+        .expect("persist existing store token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File {
+        path: token_path.clone(),
+    })))
+    .expect("construct setup");
+
+    let report = transport.setup_report(
+        false,
+        "on_demand".to_string(),
+        vec!["transport".to_string()],
+        DaemonPathOverrides {
+            state_dir: Some(temporary_root.path().join("same-remote-state")),
+            ..DaemonPathOverrides::default()
+        },
+        SetupApplication::Planned {
+            existing_token_file: true,
+        },
+        false,
+    );
+
+    assert_eq!(report.status, "planned");
+    assert!(report.required_input.is_empty());
+    assert_eq!(
+        read_owner_only_secret_file(&token_path).expect("read preserved token"),
         raw_token
     );
 }

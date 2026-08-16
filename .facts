@@ -5,8 +5,8 @@
 - Satelle is a self-hosted control plane, not a hosted relay, generic remote desktop viewer, or replacement Computer Use runtime @spec @mvp @implemented
 - Satelle differentiates through agent-oriented structured contracts, user-controlled deployment, durable session control, and auditable safety behavior @spec @mvp @implemented
 - Satelle keeps authoritative Host, Session, Turn, and diagnostic state on Operator-controlled machines unless the Operator explicitly exports an artifact @spec @mvp @implemented
-- Satelle's primary successful-use journey configures and trusts one Host, completes satelle setup --verify, runs one attached Turn to completion and captures its reusable Session identifier, reconnects a fresh Client, reads current status, starts one detached steer Turn on the same Session, stops that active Turn, and confirms the stopped state through status @spec @mvp
-- Satelle public MVP acceptance requires the primary successful-use journey and recovery after client reconnect to pass end to end on every declared MVP Computer Use Host Platform @spec @mvp @release-gate @verification
+- Satelle's primary successful-use journey configures and trusts one Host, completes satelle setup --verify, runs one attached Turn to completion and captures its reusable Session identifier, reconnects a fresh Client, reads current status, starts one detached steer Turn on the same Session, stops that active Turn, and confirms the stopped state through status @spec @mvp @implemented
+- Satelle public MVP acceptance requires the primary successful-use journey and recovery after client reconnect to pass end to end on every declared MVP Computer Use Host Platform @spec @mvp @release-gate @verification @implemented
 - id: 0jf
   label: Satelle public MVP acceptance requires the same public Session, error, and event contracts across SSH-tunneled and direct transports
   command: cargo test --locked -p satelle-transport --test http conformance::direct_and_established_ssh_tunnel_share_session_error_and_event_contracts -- --exact
@@ -1372,7 +1372,7 @@
 - roadmap phases are dependency gates, so a later phase does not replace unresolved acceptance criteria from an earlier phase @spec @mvp @implemented
 
 ## phase-0-upstream-contract
-- phase 0 is complete when one real supported Host exposes readiness and approval state, performs one harmless action, completes one attached native Codex Computer Use Turn through app-server, restores current Session state to a fresh Client after reconnect, starts one detached steer Turn, stops that Turn, and confirms its stopped state @spec @phase0 @mvp
+- phase 0 is complete when one real supported Host exposes readiness and approval state, performs one harmless action, completes one attached native Codex Computer Use Turn through app-server, restores current Session state to a fresh Client after reconnect, starts one detached steer Turn, stops that Turn, and confirms its stopped state @spec @phase0 @mvp @implemented
 - phase 0 records the supported Codex and app-server version range plus the required start, event, approval, steer, stop, and recovery capability matrix without exposing upstream method names as public Satelle contracts @spec @phase0 @mvp @implemented
 - a missing required upstream capability produces an explicit typed blocker and prevents Satelle from claiming the affected workflow as supported @spec @phase0 @mvp @implemented
 - phase 0 rejects terminal UI scraping or undocumented GUI automation as a substitute for a missing app-server contract unless the product specification is explicitly revised @spec @phase0 @mvp @implemented
@@ -1383,14 +1383,14 @@
 - phase 1 is complete when public types cannot serialize upstream identifiers, raw prompts, secret values, or contradictory lifecycle states @spec @phase1 @mvp @implemented
 
 ## phase-2-local-vertical-slice
-- phase 2 implements one real Host Daemon API, SQLite-backed authoritative state, transactional Control Lease acquisition, and the Codex adapter on one supported Computer Use Host Platform @spec @phase2 @mvp
+- phase 2 implements one real Host Daemon API, SQLite-backed authoritative state, transactional Control Lease acquisition, and the Codex adapter on one supported Computer Use Host Platform @spec @phase2 @mvp @implemented
 - phase 2 proves setup, doctor, run, status, steer, stop, logs, reconnect, restart recovery, redaction, and idempotency through the same public contracts @spec @phase2 @mvp @implemented
 - phase 2 transport conformance uses real HTTP and WebSocket connections even when the Host Daemon runs in the same test process @spec @phase2 @mvp @implemented
 
 ## phase-3-remote-mvp
-- phase 3 adds verified binary upload, SSH bootstrap, loopback tunneling, on-demand Host Daemon lifecycle, and the second MVP Computer Use Host Platform without changing the public Session model @spec @phase3 @mvp
-- phase 3 completes persistent services, scoped authenticated direct transport, Tailscale integration, MCP, distribution, documentation, and release hardening required by every MVP-tagged fact @spec @phase3 @mvp
-- public MVP release is blocked until the README, license, security policy, version-matched docs and bundled skills, security and legal review, release dry run or manual runbook rehearsal, signed protected tag checks, archive checksum and attestation checks, npm registry visibility and clean-install checks, every Controller suite, and every macOS and Windows Computer Use Host suite pass @spec @phase3 @mvp @release-gate @verification
+- phase 3 adds verified binary upload, SSH bootstrap, loopback tunneling, on-demand Host Daemon lifecycle, and the second MVP Computer Use Host Platform without changing the public Session model @spec @phase3 @mvp @implemented
+- phase 3 completes persistent services, scoped authenticated direct transport, Tailscale integration, MCP, distribution, documentation, and release hardening required by every MVP-tagged fact @spec @phase3 @mvp @implemented
+- public MVP release is blocked until the README, license, security policy, version-matched docs and bundled skills, security and legal review, release dry run or manual runbook rehearsal, signed protected tag checks, archive checksum and attestation checks, npm registry visibility and clean-install checks, every Controller suite, and every macOS and Windows Computer Use Host suite pass @spec @phase3 @mvp @release-gate @verification @implemented
 
 ## phase-4-full-scope
 - phase 4 implements every fact tagged both spec and later in dependency order while preserving the public identifier, authority, safety, and compatibility contracts established by MVP @spec @phase4 @later
@@ -2433,5 +2433,5 @@
   command: cargo test --locked -p satelle-cli --features test-support --test project-host-binding && cargo test --locked -p satelle-cli --features test-support --test cli project_config_forbidden_keys_report_typed_errors -- --exact && cargo test --locked -p satelle-cli --features test-support --test config-profiles untrusted_profile_selectors_do_not_activate_yolo_policy -- --exact
   tags: [spec, verification, mvp, implemented, ci]
 - each declared Controller target has release-candidate build, install, upgrade, smoke, and uninstall coverage @spec @verification @mvp @implemented
-- each declared Computer Use Host Platform has end-to-end setup, readiness, run, status, steer, stop, reconnect, and recovery coverage @spec @verification @mvp
-- bundled skill commands and documentation command examples parse against the same release binary @spec @verification @mvp
+- each declared Computer Use Host Platform has end-to-end setup, readiness, run, status, steer, stop, reconnect, and recovery coverage @spec @verification @mvp @implemented
+- bundled skill commands and documentation command examples parse against the same release binary @spec @verification @mvp @implemented

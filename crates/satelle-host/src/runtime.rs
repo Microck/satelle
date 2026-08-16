@@ -4117,6 +4117,13 @@ impl RuntimeHandle {
             .map_err(model::storage_failure)
     }
 
+    pub(crate) fn invalidate_all_native_readiness(&self) -> Result<u64, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .invalidate_all_native_readiness()
+            .map_err(model::storage_failure)
+    }
+
     pub(crate) fn provider_binding_authorization_replay(
         &self,
         identity: &RequestIdentity,

@@ -153,7 +153,9 @@ $mutationAttempt = $null
 $mutationPhase = $null
 $claimUncertain = $false
 $released = $false
-function Set-OwnerOnly([string]$Path) {{
+$mailboxPath = $null
+$nextCommand = 1
+function Set-OwnerOnlyDirectory([string]$Path) {{
   $acl = Get-Acl -LiteralPath $Path
   $acl.SetAccessRuleProtection($true, $false)
   foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}
@@ -168,8 +170,23 @@ function Set-OwnerOnly([string]$Path) {{
 }}
 function Write-Value([string]$Root, [string]$Name, [string]$Value) {{
   $path = Join-Path $Root $Name
+  # Every ledger root is a fresh owner-only directory whose inheritable ACL
+  # protects child files. Reapplying ACLs per heartbeat is both redundant and
+  # slow enough on Windows to violate the lock acquisition deadline.
   [System.IO.File]::WriteAllText($path, $Value + [Environment]::NewLine)
-  Set-OwnerOnly $path
+}}
+function Write-Protocol([string]$Line) {{
+  [Console]::Out.WriteLine($Line)
+  [Console]::Out.Flush()
+}}
+function Write-MailboxResponse([string]$Path, [string]$Line) {{
+  $pendingResponse = Join-Path $mailboxPath ('pending.' + [Guid]::NewGuid().ToString('N'))
+  try {{
+    [IO.File]::WriteAllText($pendingResponse, $Line + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::Move($pendingResponse, $Path)
+  }} finally {{
+    Remove-Item -LiteralPath $pendingResponse -Force -ErrorAction SilentlyContinue
+  }}
 }}
 function Read-Operation([string]$Root) {{
   (Get-Content -LiteralPath (Join-Path $Root 'operation_id') -Raw).Trim()
@@ -180,7 +197,9 @@ function Same-Owner {{
     (((Get-Content -LiteralPath (Join-Path $claimPath 'claim_identity') -Raw).Trim()) -ceq $claimIdentity)
 }}
 function Remove-OwnClaim {{
-  if (Same-Owner) {{ Remove-Item -LiteralPath $claimPath -Recurse -Force }}
+  if (Same-Owner) {{
+    Remove-Item -LiteralPath $claimPath -Recurse -Force -ErrorAction Stop
+  }}
 }}
 function Restore-Competitor([string]$Original, [string]$QuarantineRoot, [string]$QuarantinedClaim) {{
   if ((Test-Path -LiteralPath $QuarantinedClaim -PathType Container) -and
@@ -195,15 +214,24 @@ function Fail-Busy {{
   if ($pendingPath -and (Test-Path -LiteralPath $pendingPath)) {{
     Remove-Item -LiteralPath $pendingPath -Recurse -Force -ErrorAction SilentlyContinue
   }}
-  if ($claimPublished) {{ Remove-OwnClaim }}
-  Write-Output '{BUSY}'
+  if ($claimPublished) {{ try {{ Remove-OwnClaim }} catch {{}} }}
+  Write-Protocol '{BUSY}'
   exit 75
 }}
 function Record-Recovery([string]$Observed, [string]$Reason, [object]$Process, [bool]$Binary, [object]$Service, [object]$Daemon) {{
   $record = Join-Path $stateRoot ('bootstrap-recovery-' + $Observed + '.json')
   @{{schema_version='satelle.bootstrap-recovery.v1';operation_id=$Observed;reason=$Reason;process_probe=$Process;binary_probe=$Binary;service_probe=$Service;daemon_probe=$Daemon;observed_at=[DateTimeOffset]::UtcNow.ToString('O')}} |
     ConvertTo-Json -Compress | Set-Content -LiteralPath $record -Encoding UTF8
-  Set-OwnerOnly $record
+}}
+function Get-DaemonListenerProbe {{
+  try {{
+    $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object {{
+      $_.LocalAddress -eq '127.0.0.1' -and $_.LocalPort -eq 3001
+    }})
+    return ($listeners.Count -gt 0)
+  }} catch {{
+    return $null
+  }}
 }}
 function Get-ExecutionMarkers([string]$Root) {{
   @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop | Where-Object {{
@@ -291,7 +319,6 @@ function Finalize-InterruptedClaim {{
     $failedPhase = if ($anyStarted) {{ 'after_reconciled_remote_mutation' }} else {{ 'before_remote_mutation' }}
     @{{schema_version='satelle.bootstrap-operation.v1';operation_id=$operationId;operation_kind=$operationKind;terminal_state=$terminal;failed_phase=$failedPhase;observed_at=[DateTimeOffset]::UtcNow.ToString('O')}} |
       ConvertTo-Json -Compress | Set-Content -LiteralPath $failure -Encoding UTF8
-    Set-OwnerOnly $failure
     Remove-Item -LiteralPath $closingPath -Recurse -Force
     return
   }}
@@ -301,17 +328,17 @@ function Finalize-InterruptedClaim {{
 }}
 try {{
   New-Item -ItemType Directory -Force -Path $stateRoot | Out-Null
-  Set-OwnerOnly $stateRoot
+  Set-OwnerOnlyDirectory $stateRoot
   New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null
   $lockItem = Get-Item -LiteralPath $lockRoot
   if (-not $lockItem.PSIsContainer -or
       (($lockItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ Fail-Busy }}
-  Set-OwnerOnly $lockRoot
+  Set-OwnerOnlyDirectory $lockRoot
   $nonce = [Guid]::NewGuid().ToString('N')
   $claimIdentity = $nonce
   $pendingPath = Join-Path $stateRoot ('bootstrap.pending.' + $nonce)
   New-Item -ItemType Directory -Path $pendingPath -ErrorAction Stop | Out-Null
-  Set-OwnerOnly $pendingPath
+  Set-OwnerOnlyDirectory $pendingPath
   $now = [DateTimeOffset]::UtcNow.ToString('O')
   Write-Value $pendingPath 'schema_version' 'satelle.bootstrap-lock.v1'
   Write-Value $pendingPath 'operation_id' $operationId
@@ -325,6 +352,9 @@ try {{
   [IO.Directory]::Move($pendingPath, $claimPath)
   $pendingPath = $null
   $claimPublished = $true
+  $mailboxPath = Join-Path $claimPath 'mailbox'
+  New-Item -ItemType Directory -Path $mailboxPath -ErrorAction Stop | Out-Null
+  Set-OwnerOnlyDirectory $mailboxPath
 }} catch {{ Fail-Busy }}
 foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Stop)) {{
   if ([StringComparer]::OrdinalIgnoreCase.Equals($item.FullName, $claimPath)) {{ continue }}
@@ -364,10 +394,10 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
       $requiresCommit = $mutationPhase -cin @({powershell_commit_required_phases})
       $expectedTerminalMarker = if ($requiresCommit) {{ 'execution_committed.' + $mutationAttempt }} else {{ 'execution_succeeded.' + $mutationAttempt }}
       $expectedExecutionMarkers = @(
-        'execution_started.' + $mutationAttempt,
-        'execution_retiring.' + $mutationAttempt,
+        ('execution_started.' + $mutationAttempt),
+        ('execution_retiring.' + $mutationAttempt),
         $expectedTerminalMarker,
-        'execution_failed.' + $mutationAttempt
+        ('execution_failed.' + $mutationAttempt)
       )
       if ($mutationPhase -ceq 'daemon_start') {{
         $expectedExecutionMarkers += @('execution_succeeded.' + $mutationAttempt)
@@ -403,34 +433,16 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
   if ($claimState -cnotin @('live', 'mutation_started', 'recovery_pending')) {{ Fail-Busy }}
   $processProbe = $null
   try {{
-    $processProbe = [bool](Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {{ $_.Name -match '^satelle(.exe)?$' -and $_.CommandLine -match 'host start' }} | Select-Object -First 1)
+    $processProbe = [bool](Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {{ $_.Name -match '^satelle\.exe$' -and $_.CommandLine -match 'host start' }} | Select-Object -First 1)
   }} catch {{}}
   $processActive = $processProbe -eq $true
-  $binaryPresent = [bool](Get-ChildItem -LiteralPath $cacheRoot -File -Recurse -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -match '^satelle(-[0-9a-f]+)?.exe$' }} | Select-Object -First 1)
+  $binaryPresent = [bool](Get-ChildItem -LiteralPath $cacheRoot -File -Recurse -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -match '^satelle\.exe$' }} | Select-Object -First 1)
   $serviceProbe = $null
   try {{
     $serviceProbe = [bool](Get-CimInstance Win32_Service -Filter "Name = 'SatelleHost'" -ErrorAction Stop | Where-Object {{ $_.State -ne 'Stopped' }} | Select-Object -First 1)
   }} catch {{}}
   $serviceActive = $serviceProbe -eq $true
-  $daemonProbe = $null
-  try {{
-    $response = Invoke-WebRequest -Uri 'http://127.0.0.1:3001/v1/capabilities' -Method Get -TimeoutSec 2 -UseBasicParsing
-    $daemonProbe = $true
-  }} catch {{
-    if ($_.Exception.Response) {{
-      $daemonProbe = $true
-    }} else {{
-      $probeError = $_.Exception
-      while ($probeError) {{
-        if ($probeError -is [Net.Sockets.SocketException] -and
-            $probeError.SocketErrorCode -eq [Net.Sockets.SocketError]::ConnectionRefused) {{
-          $daemonProbe = $false
-          break
-        }}
-        $probeError = $probeError.InnerException
-      }}
-    }}
-  }}
+  $daemonProbe = Get-DaemonListenerProbe
   $daemonActive = $daemonProbe -eq $true
   Record-Recovery $observed 'stale heartbeat postcondition probes' $processProbe $binaryPresent $serviceProbe $daemonProbe
   $terminalEvidence = ($requiresCommit -and $executionCommitted) -or
@@ -441,7 +453,13 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
     $executionStarted -and ($executionSucceeded -xor $executionFailed) -and
     (-not $executionCommitted) -and (-not $unexpectedExecutionEvidence) -and
     ($processProbe -eq $false) -and ($serviceProbe -eq $false) -and ($daemonProbe -eq $false)
-  $resolvedExecutionEvidence = $executionRetiring -or $terminalEvidence -or $failedDaemonStart
+  $releasedStateOwner = ($claimState -cin @('mutation_started', 'recovery_pending')) -and
+    ($mutationPhase -ceq 'state_owner_release') -and $executionStarted -and
+    (-not $executionRetiring) -and (-not $executionSucceeded) -and
+    (-not $executionFailed) -and (-not $executionCommitted) -and
+    (-not $unexpectedExecutionEvidence) -and
+    ($processProbe -eq $false) -and ($serviceProbe -eq $false) -and ($daemonProbe -eq $false)
+  $resolvedExecutionEvidence = $executionRetiring -or $terminalEvidence -or $failedDaemonStart -or $releasedStateOwner
   $reconciled = (-not $unexpectedExecutionEvidence) -and
     (($claimState -ceq 'live') -or (-not $executionStarted) -or $resolvedExecutionEvidence)
   if (-not $reconciled) {{ Fail-Busy }}
@@ -450,7 +468,7 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
       -not $resolvedExecutionEvidence) {{ Fail-Busy }}
   $quarantineRoot = Join-Path $stateRoot ('bootstrap.quarantine.' + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $quarantineRoot -ErrorAction Stop | Out-Null
-  Set-OwnerOnly $quarantineRoot
+  Set-OwnerOnlyDirectory $quarantineRoot
   $quarantinedClaim = Join-Path $quarantineRoot 'claim'
   try {{ [IO.Directory]::Move($item.FullName, $quarantinedClaim) }} catch {{
     Remove-Item -LiteralPath $quarantineRoot -Force -ErrorAction SilentlyContinue
@@ -483,10 +501,10 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
       $movedRequiresCommit = $movedMutationPhase -cin @({powershell_commit_required_phases})
       $movedExpectedTerminalMarker = if ($movedRequiresCommit) {{ 'execution_committed.' + $movedMutationAttempt }} else {{ 'execution_succeeded.' + $movedMutationAttempt }}
       $movedExpectedExecutionMarkers = @(
-        'execution_started.' + $movedMutationAttempt,
-        'execution_retiring.' + $movedMutationAttempt,
+        ('execution_started.' + $movedMutationAttempt),
+        ('execution_retiring.' + $movedMutationAttempt),
         $movedExpectedTerminalMarker,
-        'execution_failed.' + $movedMutationAttempt
+        ('execution_failed.' + $movedMutationAttempt)
       )
       if ($movedMutationPhase -ceq 'daemon_start') {{
         $movedExpectedExecutionMarkers += @('execution_succeeded.' + $movedMutationAttempt)
@@ -532,34 +550,16 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
     Restore-Competitor $item.FullName $quarantineRoot $quarantinedClaim
     Fail-Busy
   }}
-  if ($failedDaemonStart) {{
+  if ($failedDaemonStart -or $releasedStateOwner) {{
     $postProcessProbe = $null
     try {{
-      $postProcessProbe = [bool](Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {{ $_.Name -match '^satelle(.exe)?$' -and $_.CommandLine -match 'host start' }} | Select-Object -First 1)
+      $postProcessProbe = [bool](Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {{ $_.Name -match '^satelle\.exe$' -and $_.CommandLine -match 'host start' }} | Select-Object -First 1)
     }} catch {{}}
     $postServiceProbe = $null
     try {{
       $postServiceProbe = [bool](Get-CimInstance Win32_Service -Filter "Name = 'SatelleHost'" -ErrorAction Stop | Where-Object {{ $_.State -ne 'Stopped' }} | Select-Object -First 1)
     }} catch {{}}
-    $postDaemonProbe = $null
-    try {{
-      $null = Invoke-WebRequest -Uri 'http://127.0.0.1:3001/v1/capabilities' -Method Get -TimeoutSec 2 -UseBasicParsing
-      $postDaemonProbe = $true
-    }} catch {{
-      if ($_.Exception.Response) {{
-        $postDaemonProbe = $true
-      }} else {{
-        $probeError = $_.Exception
-        while ($probeError) {{
-          if ($probeError -is [Net.Sockets.SocketException] -and
-              $probeError.SocketErrorCode -eq [Net.Sockets.SocketError]::ConnectionRefused) {{
-            $postDaemonProbe = $false
-            break
-          }}
-          $probeError = $probeError.InnerException
-        }}
-      }}
-    }}
+    $postDaemonProbe = Get-DaemonListenerProbe
     if (($postProcessProbe -ne $false) -or ($postServiceProbe -ne $false) -or ($postDaemonProbe -ne $false)) {{
       Restore-Competitor $item.FullName $quarantineRoot $quarantinedClaim
       Fail-Busy
@@ -571,12 +571,31 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
   if (-not [StringComparer]::OrdinalIgnoreCase.Equals($item.FullName, $claimPath)) {{ Fail-Busy }}
 }}
 if (-not (Same-Owner)) {{ Fail-Busy }}
-Write-Output ('{READY} ' + $claimIdentity + ' ' + [IO.Path]::GetFileName($claimPath))
+Write-Protocol ('{READY} ' + $claimIdentity + ' ' + [IO.Path]::GetFileName($claimPath))
 try {{
-  while (($line = [Console]::In.ReadLine()) -ne $null) {{
+while ($true) {{
+    $requestSequence = $nextCommand
+    $requestPath = Join-Path $mailboxPath ('request.{{0:D20}}' -f $requestSequence)
+    $responsePath = Join-Path $mailboxPath ('response.{{0:D20}}' -f $requestSequence)
+    while (-not (Test-Path -LiteralPath $requestPath -PathType Leaf)) {{
+      Start-Sleep -Milliseconds 25
+      if (-not (Same-Owner)) {{ exit 75 }}
+      try {{
+        $lastHeartbeat = [DateTimeOffset]::Parse(
+          (Get-Content -LiteralPath (Join-Path $claimPath 'heartbeat_at') -Raw).Trim())
+      }} catch {{ exit 75 }}
+      if (([DateTimeOffset]::UtcNow - $lastHeartbeat).TotalSeconds -ge {stale_after_seconds}) {{ exit 75 }}
+    }}
+    $requestItem = Get-Item -LiteralPath $requestPath -Force
+    if ($requestItem.PSIsContainer -or
+        (($requestItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
+    $line = [IO.File]::ReadAllText($requestPath).TrimEnd([char[]]"`r`n")
+    Remove-Item -LiteralPath $requestPath -Force
+    $nextCommand += 1
     if (-not (Same-Owner)) {{ exit 75 }}
     if ($line -ceq '{HEARTBEAT}') {{
       Write-Value $claimPath 'heartbeat_at' ([DateTimeOffset]::UtcNow.ToString('O'))
+      Write-MailboxResponse $responsePath $line
       continue
     }}
     if ($line.StartsWith('{MUTATION_STARTED} ')) {{
@@ -614,10 +633,9 @@ try {{
       Remove-OwnClaim
       $claimPublished = $false
       $released = $true
-      Write-Output $line
       break
     }}
-    Write-Output $line
+    Write-MailboxResponse $responsePath $line
   }}
 }} finally {{
   if (-not $released -and (Same-Owner)) {{
@@ -630,7 +648,6 @@ try {{
       $failure = Join-Path $stateRoot ('bootstrap-operation-' + $operationId + '.json')
       @{{schema_version='satelle.bootstrap-operation.v1';operation_id=$operationId;operation_kind=$operationKind;terminal_state='clean_failed';failed_phase='before_remote_mutation';observed_at=[DateTimeOffset]::UtcNow.ToString('O')}} |
         ConvertTo-Json -Compress | Set-Content -LiteralPath $failure -Encoding UTF8
-      Set-OwnerOnly $failure
       Remove-OwnClaim
     }}
   }}
@@ -638,6 +655,7 @@ try {{
             mutation_prefix_length = MUTATION_STARTED.len() + 1,
             executing_prefix_length = MUTATION_EXECUTING.len() + 1,
             commit_prefix_length = MUTATION_COMMITTED.len() + 1,
+            stale_after_seconds = STALE_AFTER_SECONDS,
         )
     }
 
@@ -1004,8 +1022,22 @@ for competitor in "$lock_root"/*; do
     fi
     ;;
   esac
+  released_state_owner=false
+  case "$claim_state" in mutation_started|recovery_pending)
+    if [ "$mutation_phase" = state_owner_release ] && [ "$execution_started" = true ] &&
+       [ "$execution_retiring" = false ] && [ "$execution_succeeded" = false ] &&
+       [ "$execution_failed" = false ] && [ "$execution_committed" = false ] &&
+       [ "$unexpected_execution_evidence" = false ] && [ "$process_probe" = false ] &&
+       [ "$service_probe" = false ] && [ "$daemon_probe" = false ]; then
+      released_state_owner=true
+    fi
+    ;;
+  esac
   resolved_execution_evidence=false
-  if [ "$execution_retiring" = true ] || [ "$terminal_evidence" = true ] || [ "$failed_daemon_start" = true ]; then resolved_execution_evidence=true; fi
+  if [ "$execution_retiring" = true ] || [ "$terminal_evidence" = true ] ||
+     [ "$failed_daemon_start" = true ] || [ "$released_state_owner" = true ]; then
+    resolved_execution_evidence=true
+  fi
   reconciled=false
   if [ "$unexpected_execution_evidence" = false ] &&
      {{ [ "$claim_state" = live ] || [ "$execution_started" = false ] || [ "$resolved_execution_evidence" = true ]; }}; then
@@ -1105,7 +1137,7 @@ for competitor in "$lock_root"/*; do
     restore_competitor
     busy
   fi
-  if [ "$failed_daemon_start" = true ]; then
+  if [ "$failed_daemon_start" = true ] || [ "$released_state_owner" = true ]; then
     post_process_probe=null
     if process_output="$(ps -eo pid=,comm=,args= 2>/dev/null)"; then
       if printf '%s\n' "$process_output" | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent && ($2 == "satelle" || $2 == "satelle.exe") && $0 ~ /host start/ {{ found=1 }} END {{ exit !found }}'; then
@@ -1399,6 +1431,17 @@ mod tests {
             "claim_identity",
             "[IO.Directory]::Move($pendingPath, $claimPath)",
             "bootstrap.quarantine.",
+            "function Set-OwnerOnlyDirectory",
+            "function Write-Protocol",
+            "function Write-MailboxResponse",
+            "[Console]::Out.WriteLine($Line)",
+            "[Console]::Out.Flush()",
+            "$mailboxPath = Join-Path $claimPath 'mailbox'",
+            "('request.{0:D20}' -f $requestSequence)",
+            "('response.{0:D20}' -f $requestSequence)",
+            "[IO.File]::ReadAllText($requestPath)",
+            "Write-MailboxResponse $responsePath $line",
+            "Start-Sleep -Milliseconds 25",
             "SetAccessRuleProtection($true, $false)",
             "operation_id",
             "controller_identity",
@@ -1408,8 +1451,9 @@ mod tests {
             "Get-CimInstance Win32_Process",
             "Get-ChildItem",
             "Get-CimInstance Win32_Service",
-            "/v1/capabilities",
+            "Get-NetTCPConnection -State Listen",
             "catch { Fail-Busy }",
+            "if ($claimPublished) { try { Remove-OwnClaim } catch {} }",
             "Remove-OwnClaim",
             "execution_started.",
             "execution_retiring.",
@@ -1424,6 +1468,24 @@ mod tests {
         ] {
             assert!(script.contains(required), "missing {required:?}");
         }
+        assert!(!script.contains("Set-OwnerOnlyDirectory $path"));
+        assert!(!script.contains("Set-OwnerOnlyDirectory $record"));
+        assert!(!script.contains("Set-OwnerOnlyDirectory $failure"));
+        assert!(!script.contains("[Console]::In.ReadLine()"));
+        assert!(!script.contains("Write-Output"));
+        assert!(!script.contains("$inputReader.ReadLine()"));
+        assert!(script.contains("^satelle\\.exe$"));
+    }
+
+    #[test]
+    fn windows_release_removes_only_the_exact_owned_claim() {
+        let script = request().windows_script();
+        assert!(script.contains("if (Same-Owner)"));
+        assert!(
+            script
+                .contains("Remove-Item -LiteralPath $claimPath -Recurse -Force -ErrorAction Stop")
+        );
+        assert!(!script.contains("$removeDeadline"));
     }
 
     #[test]
@@ -1455,6 +1517,9 @@ mod tests {
     #[test]
     fn windows_failed_daemon_start_recovery_requires_exact_inactive_evidence() {
         let script = request().windows_script();
+        assert!(script.contains("function Get-DaemonListenerProbe"));
+        assert_eq!(script.matches("Get-DaemonListenerProbe").count(), 3);
+        assert!(!script.contains("Invoke-WebRequest"));
         assert!(script.contains("$unexpectedExecutionEvidence ="));
         assert!(script.contains(
             "$failedDaemonStart = ($claimState -cin @('mutation_started', 'recovery_pending')) -and"
@@ -1473,12 +1538,25 @@ mod tests {
         assert!(script.contains(
             "($processProbe -eq $false) -and ($serviceProbe -eq $false) -and ($daemonProbe -eq $false)"
         ));
-        assert!(script.contains("if ($failedDaemonStart)"));
+        assert!(script.contains("if ($failedDaemonStart -or $releasedStateOwner)"));
         assert!(script.contains("$postProcessProbe -ne $false"));
         assert!(
             script.contains("Restore-Competitor $item.FullName $quarantineRoot $quarantinedClaim")
         );
         assert!(script.contains("$terminalEvidence -or $failedDaemonStart"));
+    }
+
+    #[test]
+    fn windows_state_owner_release_recovery_requires_exact_inactive_evidence() {
+        let script = request().windows_script();
+        assert!(script.contains(
+            "$releasedStateOwner = ($claimState -cin @('mutation_started', 'recovery_pending')) -and"
+        ));
+        assert!(script.contains("($mutationPhase -ceq 'state_owner_release') -and"));
+        assert!(
+            script.contains("$terminalEvidence -or $failedDaemonStart -or $releasedStateOwner")
+        );
+        assert!(script.contains("if ($failedDaemonStart -or $releasedStateOwner)"));
     }
 
     #[test]
@@ -1550,13 +1628,13 @@ mod tests {
             "$expectedTerminalMarker = if ($requiresCommit) { 'execution_committed.' + $mutationAttempt } else { 'execution_succeeded.' + $mutationAttempt }"
         ));
         assert!(script.contains(
-            "$expectedExecutionMarkers = @(\n        'execution_started.' + $mutationAttempt,\n        'execution_retiring.' + $mutationAttempt,\n        $expectedTerminalMarker,\n        'execution_failed.' + $mutationAttempt\n      )"
+            "$expectedExecutionMarkers = @(\n        ('execution_started.' + $mutationAttempt),\n        ('execution_retiring.' + $mutationAttempt),\n        $expectedTerminalMarker,\n        ('execution_failed.' + $mutationAttempt)\n      )"
         ));
         assert!(script.contains(
             "$movedExpectedTerminalMarker = if ($movedRequiresCommit) { 'execution_committed.' + $movedMutationAttempt } else { 'execution_succeeded.' + $movedMutationAttempt }"
         ));
         assert!(script.contains(
-            "$movedExpectedExecutionMarkers = @(\n        'execution_started.' + $movedMutationAttempt,\n        'execution_retiring.' + $movedMutationAttempt,\n        $movedExpectedTerminalMarker,\n        'execution_failed.' + $movedMutationAttempt\n      )"
+            "$movedExpectedExecutionMarkers = @(\n        ('execution_started.' + $movedMutationAttempt),\n        ('execution_retiring.' + $movedMutationAttempt),\n        $movedExpectedTerminalMarker,\n        ('execution_failed.' + $movedMutationAttempt)\n      )"
         ));
     }
 
@@ -2172,6 +2250,53 @@ mod tests {
         );
         assert_eq!(mismatched_contender.read_line(), BUSY);
         assert_eq!(mismatched_contender.close().code(), Some(75));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_owner_release_recovers_only_with_exact_inactive_postconditions() {
+        let attempt = "0123456789abcdef0123456789abcdef";
+        let replacement_request =
+            Request::new("operation-2", OperationKind::MissingDaemonRepair, None)
+                .expect("valid replacement");
+
+        let inactive_home = tempfile::tempdir().expect("temporary inactive release home");
+        let inactive_lock = inactive_home.path().join("satelle/bootstrap.lock");
+        let inactive_claim =
+            write_stale_mutation_claim(&inactive_lock, "state_owner_release", attempt);
+        fs::create_dir(inactive_claim.join(format!("execution_started.{attempt}")))
+            .expect("record interrupted state-owner release");
+        let inactive_probe_path = path_with_inactive_daemon_probe(inactive_home.path());
+        let mut recovered = RunningProtocol::start_with_path(
+            &replacement_request,
+            inactive_home.path(),
+            Some(&inactive_probe_path),
+        );
+        assert_ready_line(&recovered.read_line());
+        recovered.exchange(RELEASE);
+        assert!(recovered.close().success());
+
+        let blocking_probes: &[fn(&std::path::Path) -> std::ffi::OsString] = &[
+            path_with_active_daemon_probe,
+            path_with_unknown_daemon_probe,
+            path_with_racing_daemon_probe,
+        ];
+        for probe_path in blocking_probes {
+            let blocked_home = tempfile::tempdir().expect("temporary blocked release home");
+            let blocked_lock = blocked_home.path().join("satelle/bootstrap.lock");
+            let blocked_claim =
+                write_stale_mutation_claim(&blocked_lock, "state_owner_release", attempt);
+            fs::create_dir(blocked_claim.join(format!("execution_started.{attempt}")))
+                .expect("record interrupted state-owner release");
+            let path = probe_path(blocked_home.path());
+            let mut contender = RunningProtocol::start_with_path(
+                &replacement_request,
+                blocked_home.path(),
+                Some(&path),
+            );
+            assert_eq!(contender.read_line(), BUSY);
+            assert_eq!(contender.close().code(), Some(75));
+        }
     }
 
     #[cfg(unix)]

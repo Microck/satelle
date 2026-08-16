@@ -31,7 +31,17 @@ const APP_POLICY_MESSAGE_LIMIT: usize = 128;
 const APP_POLICY_LINE_LIMIT: u64 = 2 * 1024 * 1024;
 const APP_POLICY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const EFFECTIVE_DEFAULTS_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+// Windows Hosts commonly run inside a service or Task Scheduler job. Nested
+// job completion notifications can arrive well after the leader exits, so the
+// cleanup proof needs enough time to observe the terminal job packet.
+#[cfg(windows)]
+const APP_POLICY_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+#[cfg(not(windows))]
 const APP_POLICY_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+#[cfg(windows)]
+const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_secs(2);
+#[cfg(not(windows))]
+const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_millis(500);
 const LEGACY_APP_POLICY_LIMIT: u64 = 64 * 1024;
 const CURRENT_APP_POLICY_LIMIT: u64 = 1024 * 1024;
 const MACOS_APP_APPROVAL_LIMIT: u64 = 1024 * 1024;
@@ -1688,7 +1698,7 @@ pub(crate) fn wait_for_group_shutdown(child: &mut GroupChild, timeout: Duration)
 
 pub(crate) fn terminate_group(child: &mut GroupChild) -> bool {
     let group_id = child.id();
-    let deadline = Instant::now() + Duration::from_millis(500);
+    let deadline = Instant::now() + PROCESS_GROUP_TERMINATION_GRACE;
     let kill_result = retry_interrupted_until(deadline, || child.kill(), Instant::now);
 
     match &kill_result {

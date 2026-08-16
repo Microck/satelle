@@ -244,7 +244,7 @@ impl NativeGestureEvidence {
                     return false;
                 };
                 #[cfg(windows)]
-                let accepted = counter_advanced(previous_tick, current);
+                let accepted = counter_changed(previous_tick, current);
                 #[cfg(windows)]
                 if accepted {
                     *previous_input_tick = Some(current);
@@ -264,9 +264,10 @@ impl NativeGestureEvidence {
 }
 
 #[cfg(any(windows, test))]
-fn counter_advanced(previous: u32, current: u32) -> bool {
-    let delta = current.wrapping_sub(previous);
-    delta != 0 && delta < (1_u32 << 31)
+fn counter_changed(previous: u32, current: u32) -> bool {
+    // GetLastInputInfo is session-local evidence, but Windows does not promise
+    // a monotonic tick. SendInput may supply a tick older than the prior event.
+    current != previous
 }
 
 #[cfg(windows)]
@@ -633,7 +634,13 @@ fn serve_probe(
                     );
                     // A 204 acknowledges a callback only after its observation
                     // is durable, so later cancellation cannot overtake it.
-                    write_response(&mut stream, "204 No Content", "text/plain", "")?;
+                    // The native callback reads only the 204 status line. On
+                    // Windows it can then close with an abortive reset while
+                    // this side is still writing headers. The action and its
+                    // exact tool receipt are already durable, so a failed
+                    // acknowledgement must not erase that proof or prevent
+                    // the second action from arriving.
+                    let _ = write_response(&mut stream, "204 No Content", "text/plain", "");
                     if completed {
                         return Ok(());
                     }
@@ -1176,6 +1183,94 @@ mod tests {
         assert!(TcpStream::connect(address).is_err());
     }
 
+    #[cfg(windows)]
+    fn send_test_mouse_input(delta_x: i32) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput,
+        };
+
+        // The production callback requires a fresh session-local Windows input
+        // tick. Exercise that boundary with real injected mouse movement in the
+        // VM instead of weakening the probe for this regression.
+        std::thread::sleep(Duration::from_millis(20));
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: delta_x,
+                    dy: 0,
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        assert_eq!(
+            unsafe {
+                SendInput(
+                    1,
+                    &input,
+                    i32::try_from(std::mem::size_of::<INPUT>()).unwrap(),
+                )
+            },
+            1,
+            "Windows did not accept the native test input"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_status_line_client_close_preserves_click_and_drag_proof() {
+        let evidence = NativeActionEvidence::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let desktop_session_id = crate::windows_native_probe::current_process_desktop_session_id();
+        let probe = ProviderProbeSurface::start_with_requirements(
+            deadline,
+            None,
+            ProbeRequirements::ClickAndDrag,
+            Some(evidence.clone()),
+            Some(&desktop_session_id),
+        )
+        .unwrap();
+        // Starting a probe clears evidence from any prior Codex attempt. Feed
+        // the exact active item only after the new probe owns that clean state.
+        evidence.expect_script("exact native callback test");
+        evidence.observe_app_server_item(
+            "item/started",
+            &serde_json::json!({
+                "id": "item-1",
+                "type": "mcpToolCall",
+                "server": "node_repl",
+                "tool": "js",
+                "arguments": {"code": "exact native callback test"},
+                "status": "inProgress"
+            }),
+        );
+        let (address, page_target) = split_local_url(probe.page_url());
+        let page = get_page(&address, &page_target);
+        let nonce = between(&page, "Nonce: <strong>", "</strong>");
+        let completion_target = between(&page, "fetch('", "'");
+
+        for (action, delta_x) in [("click", 1), ("drag", -1)] {
+            send_test_mouse_input(delta_x);
+            let body = format!("nonce={nonce}&action={action}");
+            let request = format!(
+                "POST {completion_target} HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nContent-Type: {FORM_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let mut stream = TcpStream::connect(&address).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+            let mut status_line = [0_u8; b"HTTP/1.1 204 No Content".len()];
+            stream.read_exact(&mut status_line).unwrap();
+            assert_eq!(&status_line, b"HTTP/1.1 204 No Content");
+            drop(stream);
+        }
+
+        probe.wait_for_completion().unwrap();
+        assert!(evidence.completed());
+    }
+
     #[test]
     fn native_timeout_identifies_the_missing_drag_callback() {
         assert!(matches!(
@@ -1199,10 +1294,10 @@ mod tests {
     }
 
     #[test]
-    fn input_counter_comparison_handles_wraparound_and_rejects_stale_values() {
-        assert!(counter_advanced(u32::MAX - 1, 1));
-        assert!(!counter_advanced(42, 42));
-        assert!(!counter_advanced(42, 41));
+    fn input_counter_comparison_accepts_non_monotonic_windows_ticks() {
+        assert!(counter_changed(u32::MAX - 1, 1));
+        assert!(!counter_changed(42, 42));
+        assert!(counter_changed(42, 41));
     }
 
     #[test]
