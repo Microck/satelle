@@ -59,26 +59,32 @@ jobs:
             rust-target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             executable: satelle
+            glibc-version: "2.17"
           - target: linux-x64-gnu
             rust-target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             executable: satelle
+            glibc-version: "2.17"
           - target: darwin-arm64
             rust-target: aarch64-apple-darwin
             runner: macos-15
             executable: satelle
+            glibc-version: ""
           - target: darwin-x64
             rust-target: x86_64-apple-darwin
             runner: macos-15-intel
             executable: satelle
+            glibc-version: ""
           - target: win32-arm64-msvc
             rust-target: aarch64-pc-windows-msvc
             runner: windows-11-arm
             executable: satelle.exe
+            glibc-version: ""
           - target: win32-x64-msvc
             rust-target: x86_64-pc-windows-msvc
             runner: windows-2025
             executable: satelle.exe
+            glibc-version: ""
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -95,12 +101,86 @@ jobs:
         shell: bash
         run: rustup toolchain install 1.97.0 --profile minimal --target "${{ matrix.rust-target }}"
 
+      - name: Install pinned GNU cross-build toolchain
+        if: matrix.glibc-version != ''
+        shell: bash
+        run: |
+          # cargo-zigbuild v0.23.0 and Zig 0.15.2 keep GNU artifacts on one reviewed ABI path.
+          tool_root="$RUNNER_TEMP/satelle-gnu-toolchain"
+          mkdir -p "$tool_root"
+          case "$RUNNER_ARCH" in
+            ARM64)
+              host_arch=aarch64
+              cargo_zigbuild_sha=5917d5416884cba0f23c2653016f7f2df2ec04e74eb6b259598fecc066f8c429
+              zig_sha=958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f
+              ;;
+            X64)
+              host_arch=x86_64
+              cargo_zigbuild_sha=c636e4f72b6f40a40ddf0414c8c6056f78b87eea3be0edf01f08d65fa028a373
+              zig_sha=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+              ;;
+            *)
+              echo "unsupported GNU build runner architecture: $RUNNER_ARCH" >&2
+              exit 1
+              ;;
+          esac
+
+          cargo_zigbuild_archive="cargo-zigbuild-${host_arch}-unknown-linux-gnu.tar.xz"
+          zig_archive="zig-${host_arch}-linux-0.15.2.tar.xz"
+          curl --fail --location --retry 3 --connect-timeout 10 --max-time 300 \
+            --output "$tool_root/$cargo_zigbuild_archive" \
+            "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.0/$cargo_zigbuild_archive"
+          curl --fail --location --retry 3 --connect-timeout 10 --max-time 300 \
+            --output "$tool_root/$zig_archive" \
+            "https://ziglang.org/download/0.15.2/$zig_archive"
+          printf '%s  %s\n' "$cargo_zigbuild_sha" "$tool_root/$cargo_zigbuild_archive" \
+            | sha256sum --check --strict
+          printf '%s  %s\n' "$zig_sha" "$tool_root/$zig_archive" \
+            | sha256sum --check --strict
+          timeout 300 tar -xJf "$tool_root/$cargo_zigbuild_archive" -C "$tool_root"
+          timeout 300 tar -xJf "$tool_root/$zig_archive" -C "$tool_root"
+          printf '%s\n' \
+            "$tool_root/cargo-zigbuild-${host_arch}-unknown-linux-gnu" \
+            "$tool_root/zig-${host_arch}-linux-0.15.2" \
+            >> "$GITHUB_PATH"
+
+      - name: Build GNU release executable
+        if: matrix.glibc-version != ''
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: 1
+          CARGO_PROFILE_RELEASE_DEBUG: 0
+          RUSTFLAGS: -D warnings
+        run: >-
+          cargo zigbuild --locked --release -p satelle-cli
+          --target "${{ matrix.rust-target }}.${{ matrix.glibc-version }}"
+
       - name: Build native release executable
+        if: matrix.glibc-version == ''
         env:
           CARGO_BUILD_JOBS: 1
           CARGO_PROFILE_RELEASE_DEBUG: 0
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo build --locked --release -p satelle-cli --target ${{ matrix.rust-target }}
+
+      - name: Verify GNU ABI floor
+        if: matrix.glibc-version != ''
+        shell: bash
+        run: |
+          binary="target/${{ matrix.rust-target }}/release/${{ matrix.executable }}"
+          maximum_glibc=$(
+            readelf --version-info "$binary" \
+              | grep -Eo 'GLIBC_[0-9.]+' \
+              | sed 's/^GLIBC_//' \
+              | sort -V \
+              | tail -n 1
+          )
+          test -n "$maximum_glibc"
+          glibc_floor=${{ matrix.glibc-version }}
+          if [ "$(printf '%s\n%s\n' "$glibc_floor" "$maximum_glibc" | sort -V | tail -n 1)" != "$glibc_floor" ]; then
+            echo "GNU artifact requires GLIBC_$maximum_glibc, newer than GLIBC_$glibc_floor" >&2
+            exit 1
+          fi
 
       - name: Stage native npm package
         shell: bash
