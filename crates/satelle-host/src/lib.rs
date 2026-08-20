@@ -3198,8 +3198,8 @@ impl HostService {
         Ok(report)
     }
 
-    /// Invalidates the current Host identity's native readiness evidence while
-    /// leaving provider smoke evidence untouched.
+    /// Invalidates one native readiness tuple for the current Host identity
+    /// while leaving provider smoke evidence untouched.
     pub fn invalidate_native_readiness(
         &self,
         host: &str,
@@ -3207,6 +3207,12 @@ impl HostService {
     ) -> Result<u64, SatelleError> {
         self.runtime
             .invalidate_native_readiness(host, provider_intent)
+    }
+
+    /// Invalidates every native readiness tuple for the current Host identity
+    /// while leaving provider smoke evidence untouched.
+    pub fn invalidate_all_native_readiness(&self) -> Result<u64, SatelleError> {
+        self.runtime.invalidate_all_native_readiness()
     }
 
     /// Reports cached provider-auth evidence without resolving a secret, or
@@ -6007,6 +6013,9 @@ fn apply_native_refresh(
                 || error.details.get("status").and_then(Value::as_str)
                     == Some("manual_action_required");
             let mut evidence = vec![format!("code={}", error.code.as_str())];
+            if let Some(reason) = error.details.get("reason") {
+                evidence.push(format!("reason={}", json_scalar(reason)));
+            }
             if let Some(details) = error
                 .details
                 .get("native_readiness")

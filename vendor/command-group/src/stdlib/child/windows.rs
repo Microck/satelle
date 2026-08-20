@@ -12,10 +12,13 @@ use winapi::{
     um::{
         handleapi::CloseHandle,
         ioapiset::GetQueuedCompletionStatus,
-        jobapi2::TerminateJobObject,
+        jobapi2::{QueryInformationJobObject, TerminateJobObject},
         minwinbase::OVERLAPPED,
         winbase::INFINITE,
-        winnt::{HANDLE, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO},
+        winnt::{
+            HANDLE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO,
+            JobObjectBasicAccountingInformation,
+        },
     },
 };
 
@@ -99,13 +102,31 @@ impl ChildImp {
         }
     }
 
+    fn job_is_empty(&self) -> Result<bool> {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        res_bool(unsafe {
+            QueryInformationJobObject(
+                self.handles.job,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of_val(&info) as DWORD,
+                ptr::null_mut(),
+            )
+        })?;
+        Ok(info.ActiveProcesses == 0)
+    }
+
     pub fn wait(&mut self) -> Result<ExitStatus> {
         let _ = self.wait_imp(INFINITE)?;
         self.inner.wait()
     }
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
-        if self.wait_imp(0)? {
+        // Task Scheduler and service-owned parent jobs can delay the terminal
+        // completion-port packet for a nested job. The accounting query is an
+        // authoritative fallback and still proves that every assigned process,
+        // not only the leader, has exited.
+        if self.wait_imp(0)? || self.job_is_empty()? {
             self.inner.try_wait()
         } else {
             Ok(None)

@@ -284,6 +284,19 @@ pub(crate) use ssh_bootstrap::CacheCleanupReport;
 use ssh_bootstrap::SshBootstrapProcess;
 use ssh_tunnel::SshTunnel;
 
+#[cfg(windows)]
+pub(crate) fn windows_interactive_task_launch_script(
+    task_folder: &str,
+    task_name: &str,
+    principal_sid_expression: &str,
+) -> String {
+    ssh_bootstrap::windows_interactive_task_launch_script(
+        task_folder,
+        task_name,
+        principal_sid_expression,
+    )
+}
+
 pub(crate) fn probe_tailscale_serve(
     alias: &str,
     destination: &str,
@@ -940,11 +953,12 @@ impl TransportClient for LocalTransport {
 
     fn invalidate_native_readiness(
         &self,
-        request: &satelle_transport::SetupVerificationRequest,
+        _request: &satelle_transport::SetupVerificationRequest,
     ) -> Result<u64, SatelleError> {
-        let provider_intent = setup_provider_intent(request)?;
-        self.service
-            .invalidate_native_readiness(&self.alias, &provider_intent)
+        // Native-affecting setup invalidates the Host's native evidence before
+        // provider authorization may exist. Match the daemon API's host-wide
+        // invalidation instead of trying to resolve one provider-specific key.
+        self.service.invalidate_all_native_readiness()
     }
 
     fn validate_provider_descriptor(
@@ -1273,6 +1287,13 @@ fn transport_proves_daemon_is_absent(error: &reqwest::Error) -> bool {
         cause = current.source();
     }
     false
+}
+
+fn current_daemon_observation_for_listener(
+    listener: ssh_bootstrap::LoopbackListenerObservation,
+) -> Option<CurrentDaemonArtifactObservation> {
+    (listener == ssh_bootstrap::LoopbackListenerObservation::Absent)
+        .then(SshSetupTransport::missing_current_daemon_observation)
 }
 
 fn map_ssh_daemon_bootstrap_error(
@@ -1735,6 +1756,12 @@ impl SshSetupTransport {
         if let Some(observation) = self.current_daemon_artifact.as_ref() {
             return Ok(observation.clone());
         }
+        let target = self.remote_target()?;
+        let listener = ssh_bootstrap::observe_loopback_listener(self.binding.destination(), target)
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+        if let Some(observation) = current_daemon_observation_for_listener(listener) {
+            return Ok(observation);
+        }
         let tunnel = SshTunnel::open(self.binding.destination()).map_err(|error| match error {
             ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
                 SatelleError::ssh_host_key_verification_required(&self.alias)
@@ -1755,6 +1782,12 @@ impl SshSetupTransport {
     ) -> Result<CurrentDaemonArtifactObservation, SatelleError> {
         if let Some(observation) = self.current_daemon_artifact.as_ref() {
             return Ok(observation.clone());
+        }
+        let target = self.remote_target()?;
+        let listener = ssh_bootstrap::observe_loopback_listener(self.binding.destination(), target)
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
+        if let Some(observation) = current_daemon_observation_for_listener(listener) {
+            return Ok(observation);
         }
         let tunnel = SshTunnel::open(self.binding.destination()).map_err(|error| match error {
             ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
@@ -1950,18 +1983,6 @@ impl SshSetupTransport {
                 target.service_platform().as_str(),
             ));
         }
-        let mut report = self.setup_report(
-            dry_run,
-            decision.setup_mode.as_str().to_string(),
-            setup_components,
-            daemon_path_overrides.clone(),
-            application,
-        );
-        report.service_persistent = decision.service_persistent;
-        report.service_scope.clone_from(&decision.service_scope);
-        report.fallback_reason.clone_from(&decision.fallback_reason);
-        report.target_platform = Some(target.id().to_string());
-        report.service_plan = Some(DaemonServicePlan::from_decision(&decision));
         let remote_directories = self.remote_directories(target)?;
         let default_paths = remote_directories.resolved_path_set();
         let current_overrides = DaemonPathOverrides {
@@ -1974,6 +1995,20 @@ impl SshSetupTransport {
         };
         let current_paths = default_paths.with_service_overrides(&current_overrides);
         let planned_paths = current_paths.with_service_overrides(&daemon_path_overrides);
+        let path_set_changed = current_paths != planned_paths;
+        let mut report = self.setup_report(
+            dry_run,
+            decision.setup_mode.as_str().to_string(),
+            setup_components,
+            daemon_path_overrides.clone(),
+            application,
+            path_set_changed,
+        );
+        report.service_persistent = decision.service_persistent;
+        report.service_scope.clone_from(&decision.service_scope);
+        report.fallback_reason.clone_from(&decision.fallback_reason);
+        report.target_platform = Some(target.id().to_string());
+        report.service_plan = Some(DaemonServicePlan::from_decision(&decision));
         report.current_daemon_paths = Some(current_paths);
         report.planned_daemon_paths = Some(planned_paths);
         let release = self.release_artifact(target, env!("CARGO_PKG_VERSION"))?;
@@ -2028,6 +2063,7 @@ impl SshSetupTransport {
         setup_components: Vec<String>,
         daemon_path_overrides: DaemonPathOverrides,
         application: SetupApplication,
+        path_set_changed: bool,
     ) -> SetupReport {
         let action = match application {
             SetupApplication::AppliedPendingActivation => {
@@ -2055,7 +2091,7 @@ impl SshSetupTransport {
             SetupApplication::Planned {
                 existing_token_file: true
             }
-        ) && !path_override_entries.is_empty();
+        ) && path_set_changed;
         let mut required_input = missing_token_file
             .then(|| SetupRequiredInput {
                 component: "transport".to_string(),
@@ -2237,6 +2273,15 @@ pub(crate) fn api_token_file_exists(
             None,
         )),
     }
+}
+
+pub(crate) fn validate_api_token_file(api_token: &ApiTokenSource) -> Result<(), SatelleError> {
+    let ApiTokenSource::File { path } = api_token;
+    let raw_token =
+        read_owner_only_secret_file(path).map_err(|error| token_file_error(path, error))?;
+    ApiBearerToken::parse(raw_token.as_str())
+        .map(|_| ())
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))
 }
 
 impl SshSetupTransport {
@@ -7304,16 +7349,12 @@ impl TransportClient for DirectTransport {
 
     fn invalidate_native_readiness(
         &self,
-        request: &satelle_transport::SetupVerificationRequest,
+        _request: &satelle_transport::SetupVerificationRequest,
     ) -> Result<u64, SatelleError> {
-        let invalidation = satelle_transport::NativeReadinessInvalidationRequest::new(
-            request.model_alias().map(str::to_owned),
-            request.provider_alias().map(str::to_owned),
-            request.model_from_project(),
-            request.provider_from_project(),
-            request.experimental_provider_computer_use(),
-        )
-        .map_err(SatelleError::invalid_usage)?;
+        // Native-affecting setup can change the app, runtime, service, or
+        // desktop inputs shared by every provider intent. Invalidate the Host
+        // before deriving any new intent-specific key during verification.
+        let invalidation = satelle_transport::NativeReadinessInvalidationRequest::host();
         self.client
             .invalidate_native_readiness(
                 &invalidation,
@@ -9316,6 +9357,46 @@ pub(crate) fn authenticated_ssh_bootstrap_user(
         .to_string())
 }
 
+fn initial_host_state_requires_identity_discovery(
+    state: ssh_bootstrap::InitialHostState,
+    requested_identity: &str,
+) -> Result<bool, ()> {
+    match state {
+        ssh_bootstrap::InitialHostState::Fresh => Ok(true),
+        ssh_bootstrap::InitialHostState::Existing => Ok(false),
+        ssh_bootstrap::InitialHostState::PendingIdentityCommit(record)
+            if record.candidate_host_identity().as_str() == requested_identity =>
+        {
+            Ok(true)
+        }
+        ssh_bootstrap::InitialHostState::PendingIdentityCommit(_) => Err(()),
+    }
+}
+
+pub(crate) fn ssh_initial_state_requires_identity_discovery(
+    host: &SelectedHost,
+    daemon_path_overrides: &DaemonPathOverrides,
+    requested_identity: &str,
+) -> Result<bool, SatelleError> {
+    let transport = SshSetupTransport::new(host)?;
+    let target = transport.remote_target()?;
+    let directories = transport.remote_directories(target)?;
+    let mut host_config = host.config.clone();
+    host_config.daemon_home = daemon_path_overrides.home.clone();
+    host_config.daemon_config_file = daemon_path_overrides.config_file.clone();
+    host_config.daemon_state_dir = daemon_path_overrides.state_dir.clone();
+    host_config.daemon_cache_dir = daemon_path_overrides.cache_dir.clone();
+    host_config.daemon_log_dir = daemon_path_overrides.log_dir.clone();
+
+    initial_host_state_requires_identity_discovery(
+        target
+            .inspect_initial_host_state(transport.binding.destination(), &directories, &host_config)
+            .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?,
+        requested_identity,
+    )
+    .map_err(|()| SatelleError::host_identity_mismatch(&host.alias))
+}
+
 pub(crate) fn discover_ssh_host(
     host: &SelectedHost,
     daemon_path_overrides: &DaemonPathOverrides,
@@ -9483,6 +9564,24 @@ fn first_trust_daemon_is_live(alias: &str, client: &DaemonClient) -> Result<bool
 #[cfg(test)]
 mod bootstrap_ordering_tests {
     use super::*;
+
+    #[test]
+    fn exact_identity_recovery_discovers_fresh_state_but_bootstraps_existing_state() {
+        assert!(
+            initial_host_state_requires_identity_discovery(
+                ssh_bootstrap::InitialHostState::Fresh,
+                "host-accepted",
+            )
+            .expect("fresh state requires the accepted identity commit")
+        );
+        assert!(
+            !initial_host_state_requires_identity_discovery(
+                ssh_bootstrap::InitialHostState::Existing,
+                "host-accepted",
+            )
+            .expect("existing state continues through exact-identity setup bootstrap")
+        );
+    }
 
     #[derive(Default)]
     struct InMemoryPersistentSetupExecution {

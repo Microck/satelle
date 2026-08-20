@@ -1146,7 +1146,7 @@ fn macos_isolation_selects_the_official_node_repl_path() {
             "version": "2.0.0",
             "source": {
                 "source": "local",
-                "path": "/Users/operator/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use"
+                "path": "/Applications/ChatGPT.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use"
             }
         }]
     }))
@@ -1208,6 +1208,24 @@ fn macos_isolation_selects_the_official_node_repl_path() {
     assert_eq!(
         plan.native_mcp_binding.command,
         "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+    );
+
+    let mut legacy_plugins: serde_json::Value =
+        serde_json::from_slice(&plugins).expect("parse plugin fixture");
+    legacy_plugins["installed"][0]["source"]["path"] = json!(
+        "/Users/operator/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use"
+    );
+    let error = codex_isolation_plan_from_json(
+        &serde_json::to_vec(&legacy_plugins).expect("serialize legacy plugin fixture"),
+        &mcp_servers,
+        "macos",
+        Path::new("/Users/operator/.codex"),
+        Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+    )
+    .expect_err("the retired copied macOS plugin path must fail closed");
+    assert_eq!(
+        error.details["reason"],
+        json!("computer_use_plugin_source_untrusted")
     );
 
     mcp_inventory[1]["transport"]["env"]["SKY_CUA_SERVICE_PATH"] =
@@ -1293,7 +1311,7 @@ fn macos_isolation_rejects_a_malformed_plugin_version_or_relative_bridge_base() 
                 "version": version,
                 "source": {
                     "source": "local",
-                    "path": "/Users/operator/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use"
+                    "path": "/Applications/ChatGPT.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use"
                 }
             }]
         }))
@@ -1442,7 +1460,7 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
         ),
     ] {
         let plugin_path = if platform == "macos" {
-            "/Users/operator/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use"
+            "/Applications/ChatGPT.app/Contents/Resources/plugins/openai-bundled/plugins/computer-use"
         } else {
             "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use"
         };

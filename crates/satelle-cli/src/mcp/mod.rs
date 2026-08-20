@@ -82,6 +82,7 @@ fn mcp_failure(message: impl Into<String>) -> CliFailure {
         },
         history_session_id: None,
         error_reported: false,
+        exit_code_override: None,
     }
 }
 
