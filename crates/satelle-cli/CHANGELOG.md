@@ -1,3 +1,10 @@
+## satelle-cli@0.1.4
+
+### Native Computer Use setup
+
+Make authenticated setup and native Computer Use sessions work on current macOS and Windows
+runtimes, including reconnect, detached steering, stop, and recovery.
+
 ## satelle-cli@0.1.3
 
 ### Windows installation reliability
