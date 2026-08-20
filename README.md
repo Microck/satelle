@@ -5,7 +5,7 @@ Controller sends work to an operator-controlled Host, while the Host owns
 execution, Session state, logs, desktop access, and provider credentials.
 
 > [!IMPORTANT]
-> Satelle is pre-release software. The current release is 0.1.4. Native
+> Satelle is pre-release software. The current release is 0.1.5. Native
 > Computer Use Host support remains gated by the live readiness probe.
 
 The [installation guide](docs/how-to/install-satelle.mdx) covers the public npm

@@ -1,6 +1,6 @@
 {
   "name": "@microck/satelle-darwin-x64",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Satelle native CLI for macOS x64.",
   "license": "MIT",
   "repository": {
