@@ -3666,6 +3666,18 @@ test("release workflow gates draft publication on candidate validation and promo
     buildRelease,
     "Build native release executable",
   );
+  const buildGnuReleaseExecutable = workflowStep(
+    buildRelease,
+    "Build GNU release executable",
+  );
+  const installGnuToolchain = workflowStep(
+    buildRelease,
+    "Install pinned GNU cross-build toolchain",
+  );
+  const verifyGnuAbiFloor = workflowStep(
+    buildRelease,
+    "Verify GNU ABI floor",
+  );
   const publishCandidates = workflowJob(workflow, "publish-candidates");
   const validateRegistryCandidates = workflowJob(workflow, "validate-registry-candidates");
   const promoteAndPublish = workflowJob(workflow, "promote-and-publish");
@@ -3743,6 +3755,44 @@ test("release workflow gates draft publication on candidate validation and promo
   );
 
   assert.match(workflow, /group: .*satelle-npm-release-writer/);
+  assert.equal((buildRelease.match(/^            glibc-version: "2\.17"$/gm) ?? []).length, 2);
+  assert.equal((buildRelease.match(/^            glibc-version: ""$/gm) ?? []).length, 4);
+  assert.match(
+    installGnuToolchain,
+    /if: matrix\.glibc-version != ''/,
+  );
+  assert.match(
+    installGnuToolchain,
+    /rust-cross\/cargo-zigbuild\/releases\/download\/v0\.23\.0/,
+  );
+  assert.match(
+    installGnuToolchain,
+    /ziglang\.org\/download\/0\.15\.2/,
+  );
+  assert.equal(
+    (installGnuToolchain.match(/curl --fail --location --retry 3 --connect-timeout 10 --max-time 300/g) ?? []).length,
+    2,
+  );
+  assert.equal(
+    (installGnuToolchain.match(/timeout 300 tar -xJf/g) ?? []).length,
+    2,
+  );
+  assert.match(
+    installGnuToolchain,
+    /5917d5416884cba0f23c2653016f7f2df2ec04e74eb6b259598fecc066f8c429[\s\S]*c636e4f72b6f40a40ddf0414c8c6056f78b87eea3be0edf01f08d65fa028a373/,
+  );
+  assert.match(
+    installGnuToolchain,
+    /958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f[\s\S]*02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239/,
+  );
+  assert.match(
+    buildGnuReleaseExecutable,
+    /cargo zigbuild --locked --release -p satelle-cli[\s\S]*--target "\$\{\{ matrix\.rust-target \}\}\.\$\{\{ matrix\.glibc-version \}\}"/,
+  );
+  assert.match(
+    verifyGnuAbiFloor,
+    /readelf --version-info[\s\S]*GLIBC_\[0-9\.\]\+[\s\S]*sort -V[\s\S]*matrix\.glibc-version/,
+  );
   assert.match(
     buildReleaseExecutable,
     /RUSTFLAGS: \$\{\{ runner\.os == 'Windows' && '-D warnings -C target-feature=\+crt-static' \|\| '-D warnings' \}\}/,
