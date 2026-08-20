@@ -1,3 +1,9 @@
+## satelle-cli@0.1.5
+
+### Linux compatibility
+
+Run GNU Linux packages on glibc 2.17 and newer systems, including older supported distributions.
+
 ## satelle-cli@0.1.4
 
 ### Native Computer Use setup
