@@ -363,15 +363,16 @@ impl RuntimeEngine {
         let session_id = plan.work.subject.session_id().clone();
         let turn_id = plan.work.subject.turn_id().clone();
         let expected = model::expected_revisions(&plan.work.session, &turn_id)?;
-        let (running, running_committed) = self.commit_or_terminal_winner(
+        let (running, running_event) = self.commit_or_terminal_winner(
             &session_id,
             &turn_id,
             expected,
             TurnTransition::Running,
             model::monotonic_now(&plan.work.session),
+            None,
         )?;
         plan.work.session = running;
-        if !running_committed {
+        if running_event.is_none() {
             return Ok((model::turn_outcome(&plan.work.session, Vec::new()), None));
         }
 
@@ -380,12 +381,17 @@ impl RuntimeEngine {
         let persist_upstream_ref =
             |reference| self.persist_upstream_ref(&plan.work.subject, reference);
         // Live adapter state has two attached consumers. Remote transports
-        // receive it from the live hub while local attached commands receive
-        // the same body in their synchronous outcome. Each consumer assigns
-        // its own positive stream sequence.
+        // receive it from the live hub, bound to the durable Host Identity.
+        // Local attached commands receive the same body in their synchronous
+        // outcome under the selected Host Alias, like the committed terminal
+        // event below. Each consumer assigns its own positive stream sequence.
         let local_live_events = plan.live_events.clone();
         let publish_live_event = |event: satelle_core::SatelleEventBody| {
-            local_live_events.publish(event.clone());
+            let attached = event
+                .clone()
+                .with_host(&plan.host)
+                .expect("the admitted Host Alias is a valid event host");
+            local_live_events.publish(attached);
             self.live_events.publish(event);
         };
         let execution_policy = plan
@@ -459,7 +465,8 @@ impl RuntimeEngine {
                     &local_live_events,
                 );
             }
-            let events = prepend_runtime_events(None, local_live_events.snapshot(), Vec::new())?;
+            let events =
+                prepend_runtime_events(None, local_live_events.snapshot(), Vec::new(), None)?;
             return Ok((model::turn_outcome(&session, events), None));
         };
         if matches!(
@@ -482,12 +489,18 @@ impl RuntimeEngine {
                 );
             }
         };
-        let (session, execution_committed) = match self.commit_or_terminal_winner(
+        let failure_reason = result
+            .terminal_error()
+            .and_then(|error| error.details.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let (session, terminal_event) = match self.commit_or_terminal_winner(
             &session_id,
             &turn_id,
             expected,
             transition,
             model::monotonic_now(&plan.work.session),
+            failure_reason.as_deref(),
         ) {
             Ok(committed) => committed,
             Err(error) => {
@@ -498,6 +511,7 @@ impl RuntimeEngine {
                 );
             }
         };
+        let execution_committed = terminal_event.is_some();
         let terminal_error = execution_committed
             .then(|| result.terminal_error().cloned())
             .flatten();
@@ -511,10 +525,21 @@ impl RuntimeEngine {
         } else {
             None
         };
+        // The live hub remains bound to the durable Host Identity. The
+        // synchronous attached outcome uses the selected Host Alias, matching
+        // the adapter events returned for the same command.
+        let terminal_event = terminal_event
+            .map(|event| {
+                event
+                    .with_host(&plan.host)
+                    .map_err(|_| model::integrity_failure("runtime event Host Alias is invalid"))
+            })
+            .transpose()?;
         let events = prepend_runtime_events(
             provider_smoke_event,
             local_live_events.snapshot(),
             result_events,
+            terminal_event,
         )?;
         Ok((model::turn_outcome(&session, events), terminal_error))
     }
@@ -542,12 +567,17 @@ impl RuntimeEngine {
         expected: ExpectedRevisions,
         transition: TurnTransition,
         at: OffsetDateTime,
-    ) -> Result<(Session, bool), SatelleError> {
+        failure_reason: Option<&str>,
+    ) -> Result<(Session, Option<satelle_core::SatelleEventBody>), SatelleError> {
         let mut storage = self.lock_storage()?;
         match storage.commit_lifecycle(session_id, turn_id, expected, transition, at) {
             Ok(session) => {
-                self.publish_committed_turn(&session, turn_id);
-                Ok((session, true))
+                let committed_event = self.publish_committed_turn_with_failure_reason(
+                    &session,
+                    turn_id,
+                    failure_reason,
+                );
+                Ok((session, Some(committed_event)))
             }
             Err(error) if error.kind() == StorageErrorKind::StateConflict => {
                 let winner = storage
@@ -560,7 +590,7 @@ impl RuntimeEngine {
                 if !winner_turn.state().is_terminal() {
                     return Err(model::storage_failure(error));
                 }
-                Ok((winner, false))
+                Ok((winner, None))
             }
             Err(error) => Err(model::storage_failure(error)),
         }
@@ -614,11 +644,13 @@ fn prepend_runtime_events(
     provider_smoke_event: Option<satelle_core::SatelleEventBody>,
     live_events: Vec<satelle_core::SatelleEventBody>,
     events: Vec<SatelleEvent>,
+    terminal_event: Option<satelle_core::SatelleEventBody>,
 ) -> Result<Vec<SatelleEvent>, SatelleError> {
     provider_smoke_event
         .into_iter()
         .chain(live_events)
         .chain(events.into_iter().map(SatelleEvent::into_body))
+        .chain(terminal_event)
         .enumerate()
         .map(|(index, body)| {
             body.with_seq(u64::try_from(index + 1).expect("event count fits in u64"))
@@ -632,7 +664,12 @@ fn runtime_failure_with_events<T>(
     provider_smoke_event: Option<satelle_core::SatelleEventBody>,
     live_events: &LocalLiveEventBuffer,
 ) -> Result<T, RuntimeTurnFailure> {
-    let events = prepend_runtime_events(provider_smoke_event, live_events.snapshot(), Vec::new())?;
+    let events = prepend_runtime_events(
+        provider_smoke_event,
+        live_events.snapshot(),
+        Vec::new(),
+        None,
+    )?;
     Err(RuntimeTurnFailure::new(error, events))
 }
 

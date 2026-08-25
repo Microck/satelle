@@ -17,7 +17,7 @@ mod control_plane;
 pub(crate) use control_plane::{
     CodexImageInputMode, ControlPlaneAdmission, NativeComputerUseActionPath,
     VerifiedComputerUseAppServer, installed_computer_use_app_server,
-    installed_read_only_app_server_command,
+    installed_read_only_app_server_command, provision_native_computer_use,
 };
 
 #[cfg(test)]
@@ -25,7 +25,7 @@ pub(crate) use control_plane::{
 mod control_plane_tests;
 
 const VERSION_OUTPUT_LIMIT: u64 = 129;
-const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const APP_POLICY_MESSAGE_LIMIT: usize = 128;
 const APP_POLICY_LINE_LIMIT: u64 = 2 * 1024 * 1024;
@@ -555,16 +555,17 @@ impl Phase0Budget {
     }
 
     fn remaining(self, now: Instant, default: Duration) -> Result<Duration, Phase0BudgetFailure> {
+        self.deadline(now, default)
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+
+    fn deadline(self, now: Instant, default: Duration) -> Result<Instant, Phase0BudgetFailure> {
         match self {
-            Self::Defaults => Ok(default),
-            Self::Deadline(deadline) => {
-                let remaining = deadline.saturating_duration_since(now);
-                if remaining.is_zero() {
-                    Err(Phase0BudgetFailure::Exhausted)
-                } else {
-                    Ok(remaining)
-                }
-            }
+            Self::Defaults => now
+                .checked_add(default)
+                .ok_or(Phase0BudgetFailure::DeadlineOverflow),
+            Self::Deadline(deadline) if deadline > now => Ok(deadline),
+            Self::Deadline(_) => Err(Phase0BudgetFailure::Exhausted),
         }
     }
 
@@ -702,11 +703,37 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
             budget_failure: None,
         };
     };
+    // Phase 0 is one atomic runtime probe. Verify the managed binary once for
+    // every child command instead of re-hashing the same large executable at
+    // each sequential stage.
+    let Ok(
+        [
+            version_command,
+            control_mcp_command,
+            control_schema_command,
+            control_app_server_command,
+            policy_mcp_command,
+            policy_app_server_command,
+        ],
+    ) = runtime.commands()
+    else {
+        return Phase0Discovery {
+            evidence: Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Unavailable,
+                host_platform,
+                capabilities: CapabilityMatrix::unproven(),
+            },
+            control_plane_admission: control_plane::ControlPlaneAdmission::unavailable(
+                ControlPlaneFailureReason::VersionUnavailable,
+            ),
+            budget_failure: None,
+        };
+    };
     let version_timeout = match budget.remaining(Instant::now(), VERSION_PROBE_TIMEOUT) {
         Ok(timeout) => timeout,
         Err(failure) => return phase0_budget_failure(host_platform, failure),
     };
-    let codex_version = probe_codex_version(&runtime, version_timeout);
+    let codex_version = probe_codex_version(version_command, version_timeout);
     let (capabilities, control_plane_admission) = match codex_version {
         CodexVersionEvidence::Detected { version } if supports_codex_version(version) => {
             let control_plane_timeout = match budget.optional_remaining(Instant::now()) {
@@ -719,13 +746,17 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
                     );
                 }
             };
-            let probe =
-                control_plane::probe_installed_control_plane(&runtime, control_plane_timeout);
+            let probe = control_plane::probe_control_plane_commands(
+                control_mcp_command,
+                control_schema_command,
+                control_app_server_command,
+                control_plane_timeout,
+            );
             let mut capabilities = CapabilityMatrix::from_control_plane(probe);
             if host_platform == HostPlatform::Windows {
-                let app_policy_timeout =
-                    match budget.remaining(Instant::now(), APP_POLICY_PROBE_TIMEOUT) {
-                        Ok(timeout) => timeout,
+                let app_policy_deadline =
+                    match budget.deadline(Instant::now(), APP_POLICY_PROBE_TIMEOUT) {
+                        Ok(deadline) => deadline,
                         Err(failure) => {
                             return phase0_budget_failure_with_version(
                                 host_platform,
@@ -734,8 +765,11 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
                             );
                         }
                     };
-                capabilities.approval_observation.surface =
-                    probe_windows_app_policy(&runtime, app_policy_timeout);
+                capabilities.approval_observation.surface = probe_windows_app_policy(
+                    policy_mcp_command,
+                    policy_app_server_command,
+                    app_policy_deadline,
+                );
             }
             (
                 capabilities,
@@ -822,6 +856,10 @@ fn sequential_phase0_probes_consume_one_absolute_deadline() {
         Ok(Duration::from_secs(18))
     );
     assert_eq!(
+        budget.deadline(started + Duration::from_secs(12), Duration::ZERO),
+        Ok(started + Duration::from_secs(30))
+    );
+    assert_eq!(
         budget.remaining(started + Duration::from_secs(31), Duration::ZERO),
         Err(Phase0BudgetFailure::Exhausted)
     );
@@ -839,17 +877,27 @@ fn sequential_phase0_probes_consume_one_absolute_deadline() {
 /// its Windows app policy. No path or configured app identifier crosses this
 /// closed evidence boundary.
 fn probe_windows_app_policy(
-    runtime: &crate::codex_install::VerifiedCodexRuntime,
-    timeout: Duration,
+    mcp_command: Command,
+    app_server_command: Command,
+    deadline: Instant,
 ) -> EvidenceSurface {
-    let Ok(verified_app_server) = control_plane::verified_app_server_command(runtime) else {
+    let Ok(command) =
+        control_plane::read_only_app_server_command(mcp_command, app_server_command, deadline)
+    else {
         return EvidenceSurface::Incomplete;
     };
-    probe_windows_app_policy_with(verified_app_server.command, timeout)
+    probe_windows_app_policy_until(command, deadline)
 }
 
-fn probe_windows_app_policy_with(mut command: Command, timeout: Duration) -> EvidenceSurface {
-    let deadline = Instant::now() + timeout;
+#[cfg(test)]
+fn probe_windows_app_policy_with(command: Command, timeout: Duration) -> EvidenceSurface {
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return EvidenceSurface::Incomplete;
+    };
+    probe_windows_app_policy_until(command, deadline)
+}
+
+fn probe_windows_app_policy_until(mut command: Command, deadline: Instant) -> EvidenceSurface {
     if Instant::now() >= deadline {
         return EvidenceSurface::Incomplete;
     }
@@ -1000,11 +1048,29 @@ fn probe_effective_codex_defaults_with(
                 "params": {"includeLayers": false}
             }),
         );
-    let defaults = config_read_sent
+    let config_result = config_read_sent
         .then(|| next_app_policy_result(&receiver, 2, deadline))
-        .flatten()
+        .flatten();
+    let mut defaults = config_result
         .as_ref()
         .and_then(classify_effective_codex_defaults);
+    if defaults.is_none() && config_result.is_some() {
+        let thread_start_sent = write_json_line(
+            &mut stdin,
+            &serde_json::json!({
+                "id": 3,
+                "method": "thread/start",
+                "params": {"ephemeral": true}
+            }),
+        );
+        let thread_result = thread_start_sent
+            .then(|| next_app_policy_result(&receiver, 3, deadline))
+            .flatten();
+        defaults = config_result
+            .as_ref()
+            .zip(thread_result.as_ref())
+            .and_then(|(config, thread)| classify_resolved_codex_defaults(config, thread));
+    }
 
     let shutdown_deadline = Instant::now()
         + deadline
@@ -1040,6 +1106,43 @@ fn classify_effective_codex_defaults(result: &Value) -> Option<EffectiveCodexDef
         model_provider_origin: classify_codex_config_origin(
             origins.and_then(|value| value.get("model_provider")),
         ),
+    })
+}
+
+/// Resolves Codex's built-in defaults without inventing a provider or pinning a
+/// model in Satelle. An ephemeral thread is the app-server's public contract for
+/// the exact pair it would use, and it must not create a history path.
+fn classify_resolved_codex_defaults(
+    config_result: &Value,
+    thread_result: &Value,
+) -> Option<EffectiveCodexDefaults> {
+    let thread = thread_result.get("thread")?.as_object()?;
+    if thread.get("ephemeral").and_then(Value::as_bool) != Some(true)
+        || !thread.get("path").is_some_and(Value::is_null)
+    {
+        return None;
+    }
+    let model = thread_result.get("model")?.as_str()?.trim();
+    let model_provider = thread_result.get("modelProvider")?.as_str()?.trim();
+    if model.is_empty() || model_provider.is_empty() {
+        return None;
+    }
+
+    let config = config_result.get("config")?.as_object()?;
+    let origins = config_result.get("origins").and_then(Value::as_object);
+    let config_origin = |key: &str| {
+        config
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|_| classify_codex_config_origin(origins.and_then(|value| value.get(key))))
+            .unwrap_or(CodexConfigOriginClass::Default)
+    };
+    Some(EffectiveCodexDefaults {
+        model: model.to_string(),
+        model_provider: model_provider.to_string(),
+        model_origin: config_origin("model"),
+        model_provider_origin: config_origin("model_provider"),
     })
 }
 
@@ -1541,19 +1644,16 @@ fn blocker_for(
     }
 }
 
-fn probe_codex_version(
-    runtime: &crate::codex_install::VerifiedCodexRuntime,
-    timeout: Duration,
-) -> CodexVersionEvidence {
-    let Ok(mut command) = runtime.command() else {
-        return CodexVersionEvidence::Unavailable;
-    };
+fn probe_codex_version(mut command: Command, timeout: Duration) -> CodexVersionEvidence {
     command.arg("--version");
     tracing::debug!("probing Codex runtime version");
     probe_codex_version_command(command, timeout)
 }
 
-fn probe_codex_version_command(mut command: Command, timeout: Duration) -> CodexVersionEvidence {
+pub(crate) fn probe_codex_version_command(
+    mut command: Command,
+    timeout: Duration,
+) -> CodexVersionEvidence {
     let deadline = Instant::now() + timeout;
     let mut child = match command
         .stdin(Stdio::null())

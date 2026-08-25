@@ -12,14 +12,17 @@ test-support = ["satelle-core/test-support", "dep:tempfile"]
 base64.workspace = true
 command-group.workspace = true
 directories.workspace = true
+flate2.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
 rusqlite.workspace = true
+reqwest.workspace = true
 satelle-core = { path = "../satelle-core" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
+tar.workspace = true
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 time.workspace = true
@@ -45,6 +48,7 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Packaging_Appx",
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",

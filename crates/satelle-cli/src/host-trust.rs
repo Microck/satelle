@@ -1,5 +1,6 @@
 use satelle_core::{
-    DesktopSessionPreference, ErrorCode, ProviderSecretSource, SatelleError,
+    DesktopSessionPreference, ErrorCode, LOCAL_DEMO_HOST, ProviderSecretSource, SatelleConfig,
+    SatelleError, open_or_create_owner_only_directory, persist_new_owner_only_config_file,
     read_owner_controlled_config_file,
 };
 use serde::Serialize;
@@ -109,7 +110,7 @@ pub(crate) fn persist_host_identity(
         return Ok(false);
     }
     host.insert("expected_host_id", value(observed_identity));
-    persist_config(config_path, document.to_string().as_bytes())?;
+    persist_config(config_path, document.to_string().as_bytes(), None)?;
     Ok(true)
 }
 
@@ -118,39 +119,66 @@ pub(crate) fn persist_desktop_selection(
     host_alias: &str,
     desktop_user: &str,
     preference: Option<&DesktopSessionPreference>,
+    recovery_command: &str,
 ) -> Result<bool, SatelleError> {
-    let original = read_owner_controlled_config_file(config_path).map_err(|error| {
-        trust_config_error(
-            config_path,
-            "could not read the user configuration securely",
-            Some(error.to_string()),
-        )
-    })?;
-    let mut document = original.parse::<DocumentMut>().map_err(|error| {
-        trust_config_error(
-            config_path,
-            "could not parse the user configuration for desktop selection",
-            Some(error.to_string()),
-        )
-    })?;
+    let (original, new_config) = match read_owner_controlled_config_file(config_path) {
+        Ok(original) => (original, false),
+        Err(_)
+            if host_alias == LOCAL_DEMO_HOST
+                && matches!(fs::symlink_metadata(config_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            (String::new(), true)
+        }
+        Err(error) => {
+            return Err(config_error_with_recovery(
+                config_path,
+                "could not read the user configuration securely",
+                Some(error.to_string()),
+                recovery_command,
+            ));
+        }
+    };
+    let mut document = if new_config {
+        default_user_document(config_path, recovery_command)?
+    } else {
+        original.parse::<DocumentMut>().map_err(|error| {
+            config_error_with_recovery(
+                config_path,
+                "could not parse the user configuration for desktop selection",
+                Some(error.to_string()),
+                recovery_command,
+            )
+        })?
+    };
+    if host_alias == LOCAL_DEMO_HOST && document.get("hosts").is_none() {
+        let defaults = default_user_document(config_path, recovery_command)?;
+        document.insert("hosts", defaults["hosts"].clone());
+    }
     let hosts = document
         .get_mut("hosts")
         .and_then(toml_edit::Item::as_table_like_mut)
         .ok_or_else(|| {
-            trust_config_error(
+            config_error_with_recovery(
                 config_path,
                 "the user configuration does not contain a hosts table",
                 None,
+                recovery_command,
             )
         })?;
+    if host_alias == LOCAL_DEMO_HOST && hosts.get(host_alias).is_none() {
+        let defaults = default_user_document(config_path, recovery_command)?;
+        let local = defaults["hosts"][LOCAL_DEMO_HOST].clone();
+        hosts.insert(host_alias, local);
+    }
     let host = hosts
         .get_mut(host_alias)
         .and_then(toml_edit::Item::as_table_like_mut)
         .ok_or_else(|| {
-            trust_config_error(
+            config_error_with_recovery(
                 config_path,
                 &format!("the user configuration does not contain Host Binding {host_alias}"),
                 None,
+                recovery_command,
             )
         })?;
     let preference = preference.map(|value| match value {
@@ -175,8 +203,113 @@ pub(crate) fn persist_desktop_selection(
         host.remove("desktop_session_preference");
     }
     host.remove("desktop_session_native_selector");
-    persist_config(config_path, document.to_string().as_bytes())?;
+    let contents = document.to_string();
+    if new_config {
+        persist_new_config(config_path, contents.as_bytes(), recovery_command)?;
+    } else {
+        persist_config(config_path, contents.as_bytes(), Some(recovery_command))?;
+    }
     Ok(true)
+}
+
+fn default_user_document(
+    config_path: &Path,
+    recovery_command: &str,
+) -> Result<DocumentMut, SatelleError> {
+    let encoded = toml::to_string(&SatelleConfig::defaults()).map_err(|error| {
+        config_error_with_recovery(
+            config_path,
+            "could not serialize the built-in local Host Binding",
+            Some(error.to_string()),
+            recovery_command,
+        )
+    })?;
+    encoded.parse::<DocumentMut>().map_err(|error| {
+        config_error_with_recovery(
+            config_path,
+            "could not prepare the built-in local Host Binding",
+            Some(error.to_string()),
+            recovery_command,
+        )
+    })
+}
+
+fn persist_new_config(
+    config_path: &Path,
+    contents: &[u8],
+    recovery_command: &str,
+) -> Result<(), SatelleError> {
+    let parent = config_path.parent().ok_or_else(|| {
+        config_error_with_recovery(
+            config_path,
+            "the user configuration has no parent directory",
+            None,
+            recovery_command,
+        )
+    })?;
+    create_owner_only_directory_tree(parent, config_path, recovery_command)?;
+    persist_new_owner_only_config_file(config_path, contents).map_err(|error| {
+        config_error_with_recovery(
+            config_path,
+            "could not atomically create the owner-only user configuration",
+            Some(error.to_string()),
+            recovery_command,
+        )
+    })
+}
+
+fn create_owner_only_directory_tree(
+    directory: &Path,
+    config_path: &Path,
+    recovery_command: &str,
+) -> Result<(), SatelleError> {
+    let mut missing = Vec::new();
+    let mut current = directory;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(current);
+                current = current.parent().ok_or_else(|| {
+                    config_error_with_recovery(
+                        config_path,
+                        "the user configuration directory has no existing ancestor",
+                        None,
+                        recovery_command,
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(config_error_with_recovery(
+                    config_path,
+                    "could not inspect the user configuration directory",
+                    Some(error.to_string()),
+                    recovery_command,
+                ));
+            }
+        }
+    }
+    for path in missing.into_iter().rev() {
+        drop(open_or_create_owner_only_directory(path).map_err(|error| {
+            config_error_with_recovery(
+                config_path,
+                "could not create the owner-only user configuration directory",
+                Some(error.to_string()),
+                recovery_command,
+            )
+        })?);
+    }
+    drop(
+        open_or_create_owner_only_directory(directory).map_err(|error| {
+            config_error_with_recovery(
+                config_path,
+                "could not open the owner-only user configuration directory",
+                Some(error.to_string()),
+                recovery_command,
+            )
+        })?,
+    );
+    Ok(())
 }
 
 pub(crate) fn persist_provider_auth_descriptor(
@@ -244,7 +377,7 @@ pub(crate) fn persist_provider_auth_descriptor(
         return Ok(false);
     }
     provider_auth.insert(auth_source_name, descriptor);
-    persist_config(config_path, document.to_string().as_bytes())?;
+    persist_config(config_path, document.to_string().as_bytes(), None)?;
     Ok(true)
 }
 
@@ -282,94 +415,92 @@ fn provider_secret_source_item(descriptor: &ProviderSecretSource) -> Item {
     Item::Table(table)
 }
 
-fn persist_config(config_path: &Path, contents: &[u8]) -> Result<(), SatelleError> {
-    let metadata = fs::symlink_metadata(config_path).map_err(|error| {
-        trust_config_error(
+fn persist_config(
+    config_path: &Path,
+    contents: &[u8],
+    recovery_command: Option<&str>,
+) -> Result<(), SatelleError> {
+    let config_error = |message: &str, source_detail: Option<String>| {
+        config_error_with_recovery(
             config_path,
+            message,
+            source_detail,
+            recovery_command
+                .unwrap_or("repair the user-level Host Binding and retry satelle host trust"),
+        )
+    };
+    let metadata = fs::symlink_metadata(config_path).map_err(|error| {
+        config_error(
             "could not inspect the user configuration",
             Some(error.to_string()),
         )
     })?;
     if !metadata.file_type().is_file() {
-        return Err(trust_config_error(
-            config_path,
+        return Err(config_error(
             "the user configuration is not a regular file",
             None,
         ));
     }
     #[cfg(windows)]
     let original_security = windows_security(config_path).map_err(|error| {
-        trust_config_error(
-            config_path,
+        config_error(
             "could not preserve the user configuration owner and DACL",
             Some(error.to_string()),
         )
     })?;
-    let parent = config_path.parent().ok_or_else(|| {
-        trust_config_error(
-            config_path,
-            "the user configuration has no parent directory",
-            None,
-        )
-    })?;
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| config_error("the user configuration has no parent directory", None))?;
     #[cfg(windows)]
     let mut temporary = windows_staging_file(parent, &original_security).map_err(|error| {
-        trust_config_error(
-            config_path,
+        config_error(
             "could not create a restricted temporary user configuration",
             Some(error.to_string()),
         )
     })?;
     #[cfg(not(windows))]
     let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
-        trust_config_error(
-            config_path,
+        config_error(
             "could not create a temporary user configuration",
             Some(error.to_string()),
         )
     })?;
     temporary.write_all(contents).map_err(|error| {
-        trust_config_error(
-            config_path,
+        config_error(
             "could not write the temporary user configuration",
             Some(error.to_string()),
         )
     })?;
     #[cfg(unix)]
     preserve_permissions(temporary.as_file(), metadata.permissions()).map_err(|error| {
-        trust_config_error(
-            config_path,
+        config_error(
             "could not preserve user configuration permissions",
             Some(error.to_string()),
         )
     })?;
     temporary.as_file().sync_all().map_err(|error| {
-        trust_config_error(
-            config_path,
+        config_error(
             "could not synchronize the temporary user configuration",
             Some(error.to_string()),
         )
     })?;
     #[cfg(unix)]
     temporary.persist(config_path).map_err(|error| {
-        trust_config_error(
-            config_path,
+        config_error(
             "could not atomically replace the user configuration",
             Some(error.error.to_string()),
         )
     })?;
     #[cfg(windows)]
     persist_windows_config(temporary, config_path, &original_security).map_err(|error| {
-        trust_config_error(
-            config_path,
+        config_error(
             "could not atomically replace the user configuration while preserving its owner and DACL",
             Some(error.to_string()),
         )
     })?;
     #[cfg(not(any(unix, windows)))]
     temporary.persist(config_path).map_err(|error| {
-        trust_config_error(
-            config_path,
+        config_error(
             "could not atomically replace the user configuration",
             Some(error.error.to_string()),
         )
@@ -684,12 +815,24 @@ fn trust_config_error(
     message: &str,
     source_detail: Option<String>,
 ) -> SatelleError {
+    config_error_with_recovery(
+        config_path,
+        message,
+        source_detail,
+        "repair the user-level Host Binding and retry satelle host trust",
+    )
+}
+
+fn config_error_with_recovery(
+    config_path: &Path,
+    message: &str,
+    source_detail: Option<String>,
+    recovery_command: &str,
+) -> SatelleError {
     SatelleError {
         code: ErrorCode::ConfigError,
         message: format!("{message}: {}", config_path.display()),
-        recovery_command: Some(
-            "repair the user-level Host Binding and retry satelle host trust".to_string(),
-        ),
+        recovery_command: Some(recovery_command.to_string()),
         source_detail,
         details: Default::default(),
     }
@@ -700,10 +843,13 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use satelle_core::open_or_create_owner_only_directory;
+    use satelle_core::{open_owner_only_directory, read_owner_only_secret_config_file};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    fn secure_config(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    const SETUP_RECOVERY: &str = "satelle setup --host local-demo --on-demand --component computer-use --no-input --json --yes";
+
+    fn secure_temporary_parent() -> tempfile::TempDir {
         let parent = tempfile::tempdir().expect("create temporary config parent");
         #[cfg(target_os = "macos")]
         {
@@ -717,6 +863,11 @@ mod tests {
         #[cfg(unix)]
         std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700))
             .expect("secure temporary config parent");
+        parent
+    }
+
+    fn secure_config(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let parent = secure_temporary_parent();
         let directory = parent.path().join("config");
         #[cfg(unix)]
         drop(
@@ -756,6 +907,126 @@ mod tests {
             );
         }
         (parent, path)
+    }
+
+    fn missing_config_path() -> (tempfile::TempDir, std::path::PathBuf) {
+        let parent = secure_temporary_parent();
+        let path = parent
+            .path()
+            .join("Microck")
+            .join("Satelle")
+            .join("config")
+            .join("config.toml");
+        (parent, path)
+    }
+
+    #[test]
+    fn desktop_selection_materializes_the_builtin_local_host_config() {
+        let (_directory, config) = missing_config_path();
+
+        assert!(
+            persist_desktop_selection(
+                &config,
+                LOCAL_DEMO_HOST,
+                "desktop-user",
+                Some(&DesktopSessionPreference::Console),
+                SETUP_RECOVERY,
+            )
+            .unwrap()
+        );
+        let persisted = read_owner_controlled_config_file(&config)
+            .expect("read the materialized owner-controlled config");
+        let parsed = toml::from_str::<SatelleConfig>(&persisted)
+            .expect("load the materialized config through the typed contract");
+        let local = &parsed.hosts[LOCAL_DEMO_HOST];
+        let default_local = &SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST];
+        assert_eq!(local.transport, default_local.transport);
+        assert_eq!(local.adapter, default_local.adapter);
+        assert_eq!(local.desktop_user.as_deref(), Some("desktop-user"));
+        assert_eq!(
+            local.desktop_session_preference,
+            Some(DesktopSessionPreference::Console)
+        );
+        assert!(local.desktop_session_native_selector.is_none());
+        read_owner_only_secret_config_file(&config)
+            .expect("materialized config must be owner-only");
+        drop(
+            open_owner_only_directory(config.parent().expect("config has a parent"))
+                .expect("materialized config directory must be owner-only"),
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(config.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        assert!(
+            !persist_desktop_selection(
+                &config,
+                LOCAL_DEMO_HOST,
+                "desktop-user",
+                Some(&DesktopSessionPreference::Console),
+                SETUP_RECOVERY,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn desktop_selection_does_not_materialize_a_remote_host_config() {
+        let (_directory, config) = missing_config_path();
+
+        let error = persist_desktop_selection(
+            &config,
+            "remote",
+            "desktop-user",
+            Some(&DesktopSessionPreference::Console),
+            SETUP_RECOVERY,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ConfigError);
+        assert_eq!(error.recovery_command.as_deref(), Some(SETUP_RECOVERY));
+        assert!(!config.exists());
+    }
+
+    #[test]
+    fn desktop_selection_adds_the_builtin_local_host_to_an_existing_config() {
+        let (_directory, config) = secure_config("command_history = false\n");
+
+        assert!(
+            persist_desktop_selection(
+                &config,
+                LOCAL_DEMO_HOST,
+                "desktop-user",
+                Some(&DesktopSessionPreference::Only),
+                SETUP_RECOVERY,
+            )
+            .unwrap()
+        );
+        let persisted = read_owner_controlled_config_file(&config)
+            .expect("read the updated owner-controlled config");
+        let parsed = toml::from_str::<SatelleConfig>(&persisted)
+            .expect("load the updated config through the typed contract");
+        let local = &parsed.hosts[LOCAL_DEMO_HOST];
+        let default_local = &SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST];
+        assert_eq!(parsed.command_history, Some(false));
+        assert_eq!(local.transport, default_local.transport);
+        assert_eq!(local.adapter, default_local.adapter);
+        assert_eq!(local.desktop_user.as_deref(), Some("desktop-user"));
+        assert_eq!(
+            local.desktop_session_preference,
+            Some(DesktopSessionPreference::Only)
+        );
     }
 
     #[test]

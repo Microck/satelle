@@ -13,6 +13,22 @@ const INBOUND_QUEUE_CAPACITY: usize = 8;
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
+fn join_after_cancelling_io<T>(thread: thread::JoinHandle<T>) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::IO::CancelSynchronousIo;
+
+        // Windows anonymous pipes use synchronous I/O. A descendant outside
+        // the managed job can retain either pipe after the verified Codex
+        // process exits, so cancel the joining thread's pending I/O first.
+        unsafe {
+            CancelSynchronousIo(thread.as_raw_handle());
+        }
+    }
+    thread.join().is_ok()
+}
+
 pub(super) trait CodexExchange {
     type Output;
 
@@ -89,7 +105,7 @@ pub(super) fn run_exchange<E: CodexExchange>(
             drop(writer);
             let _ = crate::codex_capabilities::terminate_group(&mut child);
             drop(receiver);
-            let _ = reader.join();
+            let _ = join_after_cancelling_io(reader);
             return Err(CodexSessionFailure::before_turn_dispatch(
                 CodexSessionError::Spawn,
             ));
@@ -108,9 +124,7 @@ pub(super) fn run_exchange<E: CodexExchange>(
     let successful_exchange = exchange_result.is_ok();
     let writer_stopped = if successful_exchange {
         drop(writer.take());
-        let writer_stopped = writer_thread
-            .take()
-            .is_some_and(|writer_thread| writer_thread.join().is_ok());
+        let writer_stopped = writer_thread.take().is_some_and(join_after_cancelling_io);
         if writer_stopped {
             let _ = crate::codex_capabilities::wait_for_group_shutdown(
                 &mut child,
@@ -129,14 +143,12 @@ pub(super) fn run_exchange<E: CodexExchange>(
     // Release a reader blocked on the bounded queue before joining either pipe
     // owner. A completed reader retains stdout in its JoinHandle until join.
     drop(receiver);
-    let reader_stopped = reader.join().is_ok();
+    let reader_stopped = join_after_cancelling_io(reader);
     let writer_stopped = if successful_exchange {
         writer_stopped
     } else {
         drop(writer.take());
-        writer_thread
-            .take()
-            .is_some_and(|writer_thread| writer_thread.join().is_ok())
+        writer_thread.take().is_some_and(join_after_cancelling_io)
     };
     if !group_stopped || !reader_stopped || !writer_stopped {
         return Err(CodexSessionFailure::after_exchange(

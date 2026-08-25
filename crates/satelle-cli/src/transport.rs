@@ -1,4 +1,6 @@
 use crate::{CliFailure, SelectedHost, bootstrap_lock, failure, on_demand_idle_timeout};
+#[cfg(feature = "test-support")]
+use satelle_core::AdapterKind;
 use satelle_core::daemon_service::{
     DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentHostStoragePolicy,
     PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV4, WindowsTaskDefinition,
@@ -6,12 +8,14 @@ use satelle_core::daemon_service::{
 use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
-    ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions, DoctorReport, ErrorCode,
-    HostSessionsReport, HostSessionsSchemaVersion, LOCAL_DEMO_HOST, SatelleError, SatelleEvent,
-    SecureFileError, SessionId, SetupReadinessSummary, SetupReport, SetupRequiredInput,
-    SetupSchemaVersion, SshHostBinding, StopResult, TransportKind, TurnId,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file,
-    persist_new_owner_only_secret_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    ApiRateLimits, ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions,
+    DoctorReport, ErrorCode, HostConfig, HostSessionsReport, HostSessionsSchemaVersion,
+    LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SecureFileError, SessionId, SetupReadinessSummary,
+    SetupReport, SetupRequiredInput, SetupSchemaVersion, SshHostBinding, StopResult, TransportKind,
+    TurnId, load_user_api_rate_limits, open_or_create_owner_only_directory,
+    open_or_create_owner_only_file, persist_new_owner_only_config_file,
+    persist_new_owner_only_secret_file, read_owner_only_secret_config_file,
+    read_owner_only_secret_file, read_trusted_ca_bundle_file, resolve_path_set,
 };
 use satelle_host::{
     AdmissionCancellation, ApiBearerToken, ApiScopes, ControllerTransportProbe, DaemonLogPage,
@@ -22,22 +26,44 @@ use satelle_transport::{
     ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
     DaemonServer, DaemonServerConfig, DaemonShutdownHandle, TurnRequest,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Unix spawns the managed local daemon directly. Windows hands it through a
+// Task Scheduler launch into the interactive desktop session, which starts two
+// PowerShell hosts before the daemon process exists; on a cold or contended
+// desktop that hop alone has been measured at well over a minute.
+#[cfg(not(windows))]
+const LOCAL_DAEMON_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const LOCAL_DAEMON_LAUNCH_TIMEOUT: Duration = Duration::from_secs(180);
+// Once the daemon has consumed its launch descriptor it owns the store and is
+// initializing: restart recovery reads every unresolved Turn through Codex,
+// each bounded at two minutes, before the listener opens. A started daemon is
+// therefore waited for under this longer bound instead of the launch budget.
+const LOCAL_DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
+const LOCAL_DAEMON_LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const LOCAL_DAEMON_TOKEN_FILE: &str = "local-daemon.token";
+const LOCAL_DAEMON_ENDPOINT_FILE: &str = "local-daemon-endpoint.json";
 const HOST_UPDATE_ACTIONS: [&str; 5] = [
     "install-host-artifact",
     "publish-host-service",
@@ -513,19 +539,6 @@ impl LocalTransport {
             alias,
             service,
             desktop_binding: None,
-            provider_secret_bridge: Mutex::new(None),
-        }
-    }
-
-    fn for_selected_host(host: &SelectedHost, service: HostService) -> Self {
-        let desktop_binding = host.config.desktop_user.as_deref().map(|desktop_user| {
-            satelle_core::session::DesktopBindingRef::new(desktop_user)
-                .expect("resolved Host configuration contains a validated desktop binding")
-        });
-        Self {
-            alias: host.alias.clone(),
-            service,
-            desktop_binding,
             provider_secret_bridge: Mutex::new(None),
         }
     }
@@ -1300,6 +1313,7 @@ fn map_ssh_daemon_bootstrap_error(
     alias: &str,
     error: ssh_bootstrap::SshBootstrapError,
 ) -> SatelleError {
+    tracing::debug!(host = alias, error = ?error, "SSH bootstrap operation failed");
     match error {
         ssh_bootstrap::SshBootstrapError::HostKeyVerificationRequired => {
             SatelleError::ssh_host_key_verification_required(alias)
@@ -1394,6 +1408,147 @@ struct DirectTransport {
     _bootstrap: Option<SshBootstrapProcess>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LocalDaemonLaunchConfig {
+    schema_version: String,
+    host_config: HostConfig,
+    api_rate_limits: ApiRateLimits,
+    host_identity: String,
+    launch_id: String,
+    endpoint_path: PathBuf,
+}
+
+impl LocalDaemonLaunchConfig {
+    fn new(
+        host_config: HostConfig,
+        api_rate_limits: ApiRateLimits,
+        host_identity: String,
+        state_root: &Path,
+    ) -> Self {
+        Self {
+            schema_version: "satelle.local-daemon-launch.v1".to_string(),
+            host_config,
+            api_rate_limits,
+            host_identity,
+            launch_id: Uuid::now_v7().to_string(),
+            endpoint_path: state_root.join(LOCAL_DAEMON_ENDPOINT_FILE),
+        }
+    }
+
+    pub(super) fn host_config(&self) -> &HostConfig {
+        &self.host_config
+    }
+
+    pub(super) const fn api_rate_limits(&self) -> &ApiRateLimits {
+        &self.api_rate_limits
+    }
+
+    pub(super) fn endpoint_path(&self) -> &Path {
+        &self.endpoint_path
+    }
+
+    fn endpoint(&self, bind: SocketAddr) -> LocalDaemonEndpoint {
+        LocalDaemonEndpoint {
+            schema_version: "satelle.local-daemon-endpoint.v3".to_string(),
+            bind,
+            host_identity: self.host_identity.clone(),
+            launch_id: self.launch_id.clone(),
+            config_identity: LocalDaemonConfigIdentity::new(
+                self.host_config.clone(),
+                self.api_rate_limits,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalDaemonConfigIdentity {
+    host_config: HostConfig,
+    api_rate_limits: ApiRateLimits,
+    test_support_adapter: Option<String>,
+}
+
+impl LocalDaemonConfigIdentity {
+    fn new(mut host_config: HostConfig, api_rate_limits: ApiRateLimits) -> Self {
+        // One state store has one local daemon even when several Controller
+        // aliases select it. Keep only settings consumed by that daemon so
+        // alias routing and trust metadata do not force a needless relaunch.
+        host_config.address = None;
+        host_config.network = None;
+        host_config.ssh_bootstrap = None;
+        host_config.allow_project_selection = false;
+        host_config.expected_host_id = None;
+        host_config.api_token = None;
+        host_config.ca_bundle = None;
+        #[cfg(feature = "test-support")]
+        let test_support_adapter = std::env::var(TEST_SUPPORT_ADAPTER_ENV).ok();
+        #[cfg(not(feature = "test-support"))]
+        let test_support_adapter = None;
+        #[cfg(feature = "test-support")]
+        if test_support_adapter.is_some() {
+            // The selected test adapter replaces the configured adapter in
+            // local_host_service, so bind identity to that real selection.
+            host_config.adapter = AdapterKind::Fake;
+        }
+        Self {
+            host_config,
+            api_rate_limits,
+            test_support_adapter,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalDaemonEndpoint {
+    schema_version: String,
+    bind: SocketAddr,
+    host_identity: String,
+    launch_id: String,
+    config_identity: LocalDaemonConfigIdentity,
+}
+
+pub(super) fn read_local_daemon_launch_config(
+    path: &Path,
+) -> Result<LocalDaemonLaunchConfig, SatelleError> {
+    let encoded = read_owner_only_secret_config_file(path)
+        .map_err(|error| local_daemon_artifact_error(path, error))?;
+    let launch = serde_json::from_str::<LocalDaemonLaunchConfig>(&encoded)
+        .map_err(|_| local_daemon_artifact_error(path, SecureFileError::UnsafeOrUnavailable))?;
+    if launch.schema_version != "satelle.local-daemon-launch.v1"
+        || launch.endpoint_path.is_relative()
+        || launch.host_identity.is_empty()
+        || launch.launch_id.is_empty()
+    {
+        return Err(local_daemon_artifact_error(
+            path,
+            SecureFileError::UnsafeOrUnavailable,
+        ));
+    }
+    Ok(launch)
+}
+
+pub(super) fn publish_local_daemon_endpoint(
+    launch: &LocalDaemonLaunchConfig,
+    bind: SocketAddr,
+) -> Result<(), SatelleError> {
+    let encoded = serde_json::to_vec(&launch.endpoint(bind))
+        .map_err(|_| SatelleError::host_unreachable(LOCAL_DEMO_HOST))?;
+    persist_new_owner_only_config_file(launch.endpoint_path(), &encoded)
+        .map_err(|error| local_daemon_artifact_error(launch.endpoint_path(), error))
+}
+
+pub(super) fn remove_local_daemon_endpoint(launch: &LocalDaemonLaunchConfig) {
+    let Ok(current) = read_local_daemon_endpoint(launch.endpoint_path()) else {
+        return;
+    };
+    if current.launch_id == launch.launch_id {
+        let _ = fs::remove_file(launch.endpoint_path());
+    }
+}
+
 impl DirectTransport {
     fn unsupported(&self, operation: &str) -> SatelleError {
         SatelleError::not_implemented(format!(
@@ -1446,7 +1601,6 @@ struct SshSetupTransport {
 
 #[derive(Debug, Eq, PartialEq)]
 enum ExistingTokenVerification {
-    Reusable,
     ActivatedPending,
     AuthenticationRejected { token_id: String },
 }
@@ -1466,26 +1620,38 @@ enum SetupApplication {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PersistentSetupAction {
+enum SetupAction {
     BootstrapHandoff,
+    ManagedCodex,
+    NativeComputerUse,
     PathSetDirectories,
     ServiceConfig,
     ServiceRegistration,
     ServiceStartOrRestart,
 }
 
-const PERSISTENT_SERVICE_ACTIONS: [PersistentSetupAction; 5] = [
-    PersistentSetupAction::BootstrapHandoff,
-    PersistentSetupAction::PathSetDirectories,
-    PersistentSetupAction::ServiceConfig,
-    PersistentSetupAction::ServiceRegistration,
-    PersistentSetupAction::ServiceStartOrRestart,
+const PERSISTENT_SERVICE_ACTIONS: [SetupAction; 7] = [
+    SetupAction::BootstrapHandoff,
+    SetupAction::ManagedCodex,
+    SetupAction::NativeComputerUse,
+    SetupAction::PathSetDirectories,
+    SetupAction::ServiceConfig,
+    SetupAction::ServiceRegistration,
+    SetupAction::ServiceStartOrRestart,
 ];
 
-impl PersistentSetupAction {
+const ON_DEMAND_SETUP_ACTIONS: [SetupAction; 3] = [
+    SetupAction::BootstrapHandoff,
+    SetupAction::ManagedCodex,
+    SetupAction::NativeComputerUse,
+];
+
+impl SetupAction {
     const fn id(self) -> &'static str {
         match self {
             Self::BootstrapHandoff => "bootstrap-handoff",
+            Self::ManagedCodex => "managed-codex",
+            Self::NativeComputerUse => "native-computer-use",
             Self::PathSetDirectories => "path-set-directories",
             Self::ServiceConfig => "service-config",
             Self::ServiceRegistration => "service-registration",
@@ -1496,24 +1662,70 @@ impl PersistentSetupAction {
     const fn is_pre_start(self) -> bool {
         !matches!(self, Self::ServiceStartOrRestart)
     }
+
+    const fn setup_component(self) -> Option<&'static str> {
+        match self {
+            Self::ManagedCodex => Some("codex"),
+            Self::NativeComputerUse => Some("computer-use"),
+            _ => None,
+        }
+    }
 }
 
-trait PersistentSetupExecution {
-    type Output;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SetupActionDisposition {
+    Absent,
+    Apply,
+    Skip,
+}
 
+fn managed_setup_action_disposition(
+    action: SetupAction,
+    managed_codex: bool,
+    native_computer_use: bool,
+) -> SetupActionDisposition {
+    match action {
+        SetupAction::ManagedCodex if managed_codex => SetupActionDisposition::Apply,
+        SetupAction::NativeComputerUse if native_computer_use => SetupActionDisposition::Apply,
+        SetupAction::NativeComputerUse if managed_codex => SetupActionDisposition::Skip,
+        SetupAction::ManagedCodex | SetupAction::NativeComputerUse => {
+            SetupActionDisposition::Absent
+        }
+        _ => SetupActionDisposition::Apply,
+    }
+}
+
+trait SetupExecution {
     fn begin(&mut self) -> Result<(), SatelleError>;
-    fn start(&mut self, action: PersistentSetupAction) -> Result<(), SatelleError>;
-    fn apply(&mut self, action: PersistentSetupAction) -> Result<(), SatelleError>;
-    fn complete(&mut self, action: PersistentSetupAction) -> Result<(), SatelleError>;
-    fn fail(&mut self, action: PersistentSetupAction, source: SatelleError) -> SatelleError;
-    fn finish(&mut self) -> Result<Self::Output, SatelleError>;
+    fn action_disposition(&self, action: SetupAction) -> SetupActionDisposition;
+    fn start(&mut self, action: SetupAction) -> Result<(), SatelleError>;
+    fn skip(&mut self, action: SetupAction) -> Result<(), SatelleError>;
+    fn apply(&mut self, action: SetupAction) -> Result<(), SatelleError>;
+    fn complete(&mut self, action: SetupAction) -> Result<(), SatelleError>;
+    fn fail(&mut self, action: SetupAction, source: SatelleError) -> SatelleError;
+    fn finish(&mut self) -> Result<SetupExecutionOutcome, SatelleError>;
 }
 
-fn coordinate_persistent_setup(
-    execution: &mut impl PersistentSetupExecution<Output = SetupApplication>,
-) -> Result<SetupApplication, SatelleError> {
+#[derive(Clone, Copy)]
+struct SetupExecutionOutcome {
+    application: SetupApplication,
+    managed_changed: bool,
+}
+
+fn coordinate_setup(
+    execution: &mut impl SetupExecution,
+    actions: &[SetupAction],
+) -> Result<SetupExecutionOutcome, SatelleError> {
     execution.begin()?;
-    for action in PERSISTENT_SERVICE_ACTIONS {
+    for &action in actions {
+        match execution.action_disposition(action) {
+            SetupActionDisposition::Absent => continue,
+            SetupActionDisposition::Skip => {
+                execution.skip(action)?;
+                continue;
+            }
+            SetupActionDisposition::Apply => {}
+        }
         execution.start(action)?;
         if let Err(source) = execution.apply(action) {
             return if action.is_pre_start() {
@@ -1603,6 +1815,16 @@ struct CurrentDaemonArtifactObservation {
     codex_update_evidence: Option<satelle_core::host_update::CodexUpdateEvidence>,
     #[cfg(test)]
     validated_host_identity: Option<String>,
+}
+
+struct RemoteSetupReportInput<'a> {
+    dry_run: bool,
+    setup_mode: SetupModeSelection,
+    target: ssh_bootstrap::RemoteTarget,
+    setup_components: Vec<String>,
+    daemon_path_overrides: DaemonPathOverrides,
+    outcome: SetupExecutionOutcome,
+    current_daemon: &'a CurrentDaemonArtifactObservation,
 }
 
 trait CurrentDaemonObservationContract {
@@ -1704,12 +1926,46 @@ impl SshSetupTransport {
     }
 
     fn validate_setup_request(&self, setup_components: &[String]) -> Result<(), SatelleError> {
-        if setup_components != ["transport"] {
-            return Err(self.unsupported(
-                "components other than the on-demand transport token handoff; rerun with --on-demand --component transport",
-            ));
+        if setup_components.is_empty()
+            || (setup_components.iter().any(|component| component == "all")
+                && setup_components != ["all"])
+            || setup_components.iter().any(|component| {
+                !matches!(
+                    component.as_str(),
+                    "all" | "transport" | "host" | "codex" | "computer-use"
+                )
+            })
+        {
+            return Err(self.unsupported("the selected SSH setup components"));
         }
         Ok(())
+    }
+
+    fn setup_components_for_target(
+        &self,
+        target: ssh_bootstrap::RemoteTarget,
+        setup_components: Vec<String>,
+    ) -> Result<Vec<String>, SatelleError> {
+        if setup_components == ["all"] {
+            return Ok(match target.service_platform() {
+                DaemonServicePlatform::Linux => vec!["transport".to_string()],
+                DaemonServicePlatform::Macos | DaemonServicePlatform::Windows => vec![
+                    "transport".to_string(),
+                    "codex".to_string(),
+                    "computer-use".to_string(),
+                ],
+            });
+        }
+        if target.service_platform() == DaemonServicePlatform::Linux
+            && setup_components
+                .iter()
+                .any(|component| matches!(component.as_str(), "codex" | "computer-use"))
+        {
+            return Err(
+                self.unsupported("managed Codex and native Computer Use on a Linux SSH Host")
+            );
+        }
+        Ok(setup_components)
     }
 
     fn remote_target(&self) -> Result<ssh_bootstrap::RemoteTarget, SatelleError> {
@@ -1966,17 +2222,19 @@ impl SshSetupTransport {
         self
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn setup_report_for_target(
         &self,
-        dry_run: bool,
-        setup_mode: SetupModeSelection,
-        target: ssh_bootstrap::RemoteTarget,
-        setup_components: Vec<String>,
-        daemon_path_overrides: DaemonPathOverrides,
-        application: SetupApplication,
-        current_daemon: &CurrentDaemonArtifactObservation,
+        input: RemoteSetupReportInput<'_>,
     ) -> Result<SetupReport, SatelleError> {
+        let RemoteSetupReportInput {
+            dry_run,
+            setup_mode,
+            target,
+            setup_components,
+            daemon_path_overrides,
+            outcome,
+            current_daemon,
+        } = input;
         let decision = PersistentServiceDecision::resolve(setup_mode, target.service_platform());
         if decision.explicit_persistent_unsupported {
             return Err(SatelleError::persistent_service_unsupported(
@@ -2001,7 +2259,7 @@ impl SshSetupTransport {
             decision.setup_mode.as_str().to_string(),
             setup_components,
             daemon_path_overrides.clone(),
-            application,
+            outcome,
             path_set_changed,
         );
         report.service_persistent = decision.service_persistent;
@@ -2046,7 +2304,7 @@ impl SshSetupTransport {
                 decision.service_manager.as_str(),
                 decision.service_scope,
             ));
-            if !matches!(application, SetupApplication::Planned { .. }) {
+            if !matches!(outcome.application, SetupApplication::Planned { .. }) {
                 report.applied_actions.push(format!(
                     "reconciled the unprivileged {} Host service and verified authenticated loopback readiness",
                     decision.service_manager.as_str(),
@@ -2062,9 +2320,19 @@ impl SshSetupTransport {
         setup_mode: String,
         setup_components: Vec<String>,
         daemon_path_overrides: DaemonPathOverrides,
-        application: SetupApplication,
+        outcome: SetupExecutionOutcome,
         path_set_changed: bool,
     ) -> SetupReport {
+        let SetupExecutionOutcome {
+            application,
+            managed_changed,
+        } = outcome;
+        let managed_codex = setup_components
+            .iter()
+            .any(|component| matches!(component.as_str(), "codex" | "computer-use"));
+        let native_computer_use = setup_components
+            .iter()
+            .any(|component| component == "computer-use");
         let action = match application {
             SetupApplication::AppliedPendingActivation => {
                 "activate the existing pending durable control-scoped API token"
@@ -2145,6 +2413,18 @@ impl SshSetupTransport {
                 .push("discover and explicitly trust the reachable Host Identity".to_string());
         }
         planned_actions.push(action.clone());
+        if managed_codex {
+            planned_actions.push(
+                "download, verify, install, and attest the official standalone Codex package"
+                    .to_string(),
+            );
+        }
+        if native_computer_use {
+            planned_actions.push(
+                "install the official bundled Computer Use plugin and native bridge binding"
+                    .to_string(),
+            );
+        }
         if !path_override_entries.is_empty() {
             planned_actions.push(if service_persistent {
                 "persist daemon path overrides in Satelle-owned service configuration, create or verify every planned daemon directory before restart, preserve old storage directories without migration, and record each override in the setup action ledger"
@@ -2161,6 +2441,18 @@ impl SshSetupTransport {
                     .to_string(),
             );
             applied_actions.push(action);
+            if managed_codex {
+                applied_actions.push(
+                    "installed or verified and attested the official standalone Codex package"
+                        .to_string(),
+                );
+            }
+            if native_computer_use {
+                applied_actions.push(
+                    "installed or verified the official bundled Computer Use plugin and native bridge binding"
+                        .to_string(),
+                );
+            }
             if !path_override_entries.is_empty() {
                 applied_actions.push(if service_persistent {
                     "persisted explicit daemon path overrides in Satelle-owned service configuration after verifying every planned directory"
@@ -2209,8 +2501,16 @@ impl SshSetupTransport {
                 } else {
                     "not_checked".to_string()
                 },
-                codex_runtime: "not_checked".to_string(),
-                native_computer_use: "not_checked".to_string(),
+                codex_runtime: if managed_codex && applied {
+                    "installed_pending_verification".to_string()
+                } else {
+                    "not_checked".to_string()
+                },
+                native_computer_use: if native_computer_use && applied {
+                    "installed_pending_verification".to_string()
+                } else {
+                    "not_checked".to_string()
+                },
                 provider_auth: "not_checked".to_string(),
             },
             descriptor_configured: false,
@@ -2220,6 +2520,7 @@ impl SshSetupTransport {
             daemon_path_overrides: path_override_entries,
             changed: applied
                 && (service_persistent
+                    || managed_changed
                     || matches!(
                         application,
                         SetupApplication::AppliedNewToken
@@ -2227,6 +2528,7 @@ impl SshSetupTransport {
                     )),
             mutated: applied
                 && (service_persistent
+                    || managed_changed
                     || matches!(
                         application,
                         SetupApplication::AppliedNewToken
@@ -2282,283 +2584,6 @@ pub(crate) fn validate_api_token_file(api_token: &ApiTokenSource) -> Result<(), 
     ApiBearerToken::parse(raw_token.as_str())
         .map(|_| ())
         .map_err(|error| SatelleError::config_error(error.to_string(), None))
-}
-
-impl SshSetupTransport {
-    fn verify_existing_token(
-        &self,
-        host_config: &satelle_core::HostConfig,
-        bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
-    ) -> Result<ExistingTokenVerification, SatelleError> {
-        let ApiTokenSource::File { path } = self
-            .binding
-            .api_token()
-            .expect("existing token verification requires a file descriptor");
-        let raw_token =
-            read_owner_only_secret_file(path).map_err(|error| token_file_error(path, error))?;
-        let http_token = ApiBearerToken::parse(raw_token.as_str())
-            .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
-        let token_id = http_token.token_id().to_string();
-        let activation_idempotency_key = Uuid::now_v7().to_string();
-        // An existing durable token belongs to the canonical daemon. Verify it
-        // there before entering bootstrap, because launching an ephemeral Host
-        // may release the canonical state owner even when that daemon is healthy.
-        let tunnel = SshTunnel::open(self.binding.destination()).map_err(|error| match error {
-            ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
-                SatelleError::ssh_host_key_verification_required(&self.alias)
-            }
-            _ => SatelleError::host_unreachable(&self.alias),
-        })?;
-        let durable_client = DaemonClient::loopback_with_timeout(
-            tunnel.local_addr(),
-            http_token,
-            self.binding.expected_host_identity().to_string(),
-            SSH_DAEMON_REQUEST_TIMEOUT,
-        )
-        .map_err(|error| direct_transport_error(&self.alias, error))?;
-
-        self.verify_existing_token_with_bootstrap_fallback(
-            &durable_client,
-            &token_id,
-            &activation_idempotency_key,
-            bootstrap_lock,
-            |bootstrap_lock| {
-                let http_token = ApiBearerToken::parse(raw_token.as_str())
-                    .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
-                let (bootstrap_client, bootstrap_tunnel, _bootstrap, _handoff_token) =
-                    setup_bootstrap_client(
-                        &self.alias,
-                        self.binding.destination(),
-                        &self.binding.expected_host_identity().to_string(),
-                        &self.host_config,
-                        host_config,
-                        SshBootstrapScope::Read,
-                        bootstrap_lock,
-                    )?;
-                let durable_client = DaemonClient::loopback_with_timeout(
-                    bootstrap_tunnel.local_addr(),
-                    http_token,
-                    self.binding.expected_host_identity().to_string(),
-                    SSH_DAEMON_REQUEST_TIMEOUT,
-                )
-                .map_err(|error| direct_transport_error(&self.alias, error))?;
-                let verification =
-                    match inspect_durable_setup_token(&durable_client, token_id.as_str())
-                        .map_err(|error| direct_transport_error(&self.alias, error))?
-                    {
-                        ExistingTokenInspection::Reusable => ExistingTokenVerification::Reusable,
-                        ExistingTokenInspection::RequiresActivation => {
-                            bootstrap_lock
-                                .mark_mutation_started("durable_token_verification")
-                                .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-                            let verification = activate_durable_setup_token(
-                                &durable_client,
-                                token_id.clone(),
-                                &activation_idempotency_key,
-                            )
-                            .map_err(|error| direct_transport_error(&self.alias, error))?;
-                            // Both activation and an explicit authentication rejection
-                            // are known terminal outcomes for this exact attempt.
-                            commit_verified_bootstrap_mutation(&self.alias, bootstrap_lock)?;
-                            verification
-                        }
-                    };
-                if !matches!(
-                    verification,
-                    ExistingTokenVerification::AuthenticationRejected { .. }
-                ) {
-                    complete_bootstrap_handoff(&self.alias, &bootstrap_client, bootstrap_lock)?;
-                }
-                Ok(verification)
-            },
-        )
-    }
-
-    fn verify_existing_token_with_bootstrap_fallback(
-        &self,
-        durable_client: &DaemonClient,
-        token_id: &str,
-        activation_idempotency_key: &str,
-        bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
-        bootstrap_verification: impl FnOnce(
-            &mut ssh_bootstrap::SshBootstrapLock,
-        ) -> Result<ExistingTokenVerification, SatelleError>,
-    ) -> Result<ExistingTokenVerification, SatelleError> {
-        match inspect_durable_setup_token(durable_client, token_id) {
-            Ok(ExistingTokenInspection::Reusable) => Ok(ExistingTokenVerification::Reusable),
-            Ok(ExistingTokenInspection::RequiresActivation) => {
-                bootstrap_lock
-                    .mark_mutation_started("durable_token_verification")
-                    .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-                let verification = activate_durable_setup_token(
-                    durable_client,
-                    token_id.to_string(),
-                    activation_idempotency_key,
-                )
-                .map_err(|error| direct_transport_error(&self.alias, error))?;
-                // An explicit rejection proves that this activation attempt did
-                // not mutate the daemon. Commit that known outcome before the
-                // bootstrap fallback opens its next fenced phase.
-                commit_verified_bootstrap_mutation(&self.alias, bootstrap_lock)?;
-                match verification {
-                    ExistingTokenVerification::AuthenticationRejected { .. } => {
-                        bootstrap_verification(bootstrap_lock)
-                    }
-                    verification => Ok(verification),
-                }
-            }
-            Err(DaemonClientError::Transport(_)) => bootstrap_verification(bootstrap_lock),
-            Err(error) => Err(direct_transport_error(&self.alias, error)),
-        }
-    }
-
-    fn recover_interrupted_token(
-        &self,
-        token_id: &str,
-        host_config: &satelle_core::HostConfig,
-        bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
-    ) -> Result<(), SatelleError> {
-        let ApiTokenSource::File { path } = self
-            .binding
-            .api_token()
-            .expect("setup recovery requires a file descriptor");
-        let (bootstrap_client, _tunnel, _bootstrap, _handoff_token) = setup_bootstrap_client(
-            &self.alias,
-            self.binding.destination(),
-            &self.binding.expected_host_identity().to_string(),
-            &self.host_config,
-            host_config,
-            SshBootstrapScope::Admin,
-            bootstrap_lock,
-        )?;
-        rollback_setup_token(
-            &bootstrap_client,
-            token_id,
-            path,
-            &self.alias,
-            &Uuid::now_v7().to_string(),
-        )
-    }
-
-    fn provision_token(
-        &self,
-        host_config: &satelle_core::HostConfig,
-        bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
-    ) -> Result<(), SatelleError> {
-        let ApiTokenSource::File { path } = self
-            .binding
-            .api_token()
-            .expect("setup apply follows a plan with a token-file descriptor");
-        let (bootstrap_client, tunnel, _bootstrap, _handoff_token) = setup_bootstrap_client(
-            &self.alias,
-            self.binding.destination(),
-            &self.binding.expected_host_identity().to_string(),
-            &self.host_config,
-            host_config,
-            SshBootstrapScope::Admin,
-            bootstrap_lock,
-        )?;
-        let issuance_idempotency_key = Uuid::now_v7().to_string();
-        let issuance = bootstrap_client
-            .issue_durable_setup_token(&issuance_idempotency_key)
-            .map_err(|error| direct_transport_error(&self.alias, error))?;
-        let token_id = issuance.token_id().to_string();
-        let abort_idempotency_key = Uuid::now_v7().to_string();
-        if time::OffsetDateTime::parse(
-            issuance.pending_expires_at(),
-            &time::format_description::well_known::Rfc3339,
-        )
-        .is_err()
-        {
-            let _ = bootstrap_client.abort_durable_setup_token(&token_id, &abort_idempotency_key);
-            return Err(SatelleError::host_unreachable(&self.alias));
-        }
-        let Some(raw_token) = issuance.into_bearer_token() else {
-            let _ = bootstrap_client.abort_durable_setup_token(&token_id, &abort_idempotency_key);
-            return Err(SatelleError::host_unreachable(&self.alias));
-        };
-        let verification_token = match ApiBearerToken::parse(raw_token.as_str()) {
-            Ok(token) => token,
-            Err(_) => {
-                let _ =
-                    bootstrap_client.abort_durable_setup_token(&token_id, &abort_idempotency_key);
-                return Err(SatelleError::host_unreachable(&self.alias));
-            }
-        };
-        if verification_token.token_id() != token_id {
-            let _ = bootstrap_client.abort_durable_setup_token(&token_id, &abort_idempotency_key);
-            return Err(SatelleError::host_unreachable(&self.alias));
-        }
-        if let Err(error) = persist_new_owner_only_secret_file(path, raw_token.as_str()) {
-            // A published file that could not be removed still contains the
-            // pending recovery credential. Keep its remote token recoverable;
-            // aborting would strand a revoked file at the no-replace path.
-            if error != SecureFileError::PublishedCleanupFailed {
-                let _ =
-                    bootstrap_client.abort_durable_setup_token(&token_id, &abort_idempotency_key);
-            }
-            return Err(token_file_error(path, error));
-        }
-
-        let activation_idempotency_key = Uuid::now_v7().to_string();
-        let activated = bootstrap_client
-            .activate_durable_setup_token(&token_id, &activation_idempotency_key)
-            .map_err(|error| direct_transport_error(&self.alias, error))
-            .map_err(|error| {
-                rollback_setup_token(
-                    &bootstrap_client,
-                    &token_id,
-                    path,
-                    &self.alias,
-                    &abort_idempotency_key,
-                )
-                .err()
-                .unwrap_or(error)
-            })?;
-        if !activated.active() || activated.token_id() != token_id {
-            let error = SatelleError::host_unreachable(&self.alias);
-            return Err(rollback_setup_token(
-                &bootstrap_client,
-                &token_id,
-                path,
-                &self.alias,
-                &abort_idempotency_key,
-            )
-            .err()
-            .unwrap_or(error));
-        }
-        let durable_client = DaemonClient::loopback_with_timeout(
-            tunnel.local_addr(),
-            verification_token,
-            self.binding.expected_host_identity().to_string(),
-            SSH_DAEMON_REQUEST_TIMEOUT,
-        )
-        .map_err(|error| direct_transport_error(&self.alias, error))
-        .map_err(|error| {
-            rollback_setup_token(
-                &bootstrap_client,
-                &token_id,
-                path,
-                &self.alias,
-                &abort_idempotency_key,
-            )
-            .err()
-            .unwrap_or(error)
-        })?;
-        if let Err(error) = durable_client.capabilities() {
-            let error = direct_transport_error(&self.alias, error);
-            return Err(rollback_setup_token(
-                &bootstrap_client,
-                &token_id,
-                path,
-                &self.alias,
-                &abort_idempotency_key,
-            )
-            .err()
-            .unwrap_or(error));
-        }
-        complete_bootstrap_handoff(&self.alias, &bootstrap_client, bootstrap_lock)
-    }
 }
 
 impl SshSetupTransport {
@@ -2690,9 +2715,6 @@ impl SshSetupTransport {
                     self.issue_persistent_durable_token(bootstrap_client, tunnel_addr)
                         .map(|token| (SetupApplication::AppliedNewToken, token))
                 }
-                ExistingTokenVerification::Reusable => {
-                    Err(SatelleError::host_unreachable(&self.alias))
-                }
             },
         }
     }
@@ -2736,13 +2758,17 @@ impl SshSetupTransport {
 
     fn apply_persistent_setup(
         &self,
-        target: ssh_bootstrap::RemoteTarget,
-        host_config: &satelle_core::HostConfig,
-        daemon_path_overrides: &DaemonPathOverrides,
-        existing_token_file: bool,
-        required_directories: Vec<String>,
+        input: PersistentSetupInput<'_>,
         bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
-    ) -> Result<SetupApplication, SatelleError> {
+    ) -> Result<SetupExecutionOutcome, SatelleError> {
+        let PersistentSetupInput {
+            target,
+            host_config,
+            daemon_path_overrides,
+            setup_components,
+            existing_token_file,
+            required_directories,
+        } = input;
         let directories = self.remote_directories(target)?;
         let (bootstrap_client, bootstrap_tunnel, bootstrap_process, _handoff_token) =
             setup_bootstrap_client(
@@ -2754,7 +2780,7 @@ impl SshSetupTransport {
                 SshBootstrapScope::Admin,
                 bootstrap_lock,
             )?;
-        let mut execution = RemotePersistentSetupExecution {
+        let mut execution = RemoteSetupExecution {
             transport: self,
             target,
             daemon_path_overrides,
@@ -2772,8 +2798,51 @@ impl SshSetupTransport {
             previous_observation: None,
             durable_tunnel: None,
             durable_client: None,
+            managed_codex: setup_components
+                .iter()
+                .any(|component| matches!(component.as_str(), "codex" | "computer-use")),
+            native_computer_use: setup_components
+                .iter()
+                .any(|component| component == "computer-use"),
+            managed_changed: false,
         };
-        coordinate_persistent_setup(&mut execution)
+        coordinate_setup(&mut execution, &PERSISTENT_SERVICE_ACTIONS)
+    }
+
+    fn apply_on_demand_setup(
+        &self,
+        host_config: &satelle_core::HostConfig,
+        setup_components: &[String],
+        existing_token_file: bool,
+        bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    ) -> Result<SetupExecutionOutcome, SatelleError> {
+        let (bootstrap_client, bootstrap_tunnel, bootstrap_process, _handoff_token) =
+            setup_bootstrap_client(
+                &self.alias,
+                self.binding.destination(),
+                &self.binding.expected_host_identity().to_string(),
+                &self.host_config,
+                host_config,
+                SshBootstrapScope::Admin,
+                bootstrap_lock,
+            )?;
+        let mut execution = RemoteOnDemandSetupExecution {
+            transport: self,
+            bootstrap_lock,
+            bootstrap_client,
+            bootstrap_tunnel,
+            _bootstrap_process: bootstrap_process,
+            existing_token_file,
+            application: None,
+            managed_codex: setup_components
+                .iter()
+                .any(|component| matches!(component.as_str(), "codex" | "computer-use")),
+            native_computer_use: setup_components
+                .iter()
+                .any(|component| component == "computer-use"),
+            managed_changed: false,
+        };
+        coordinate_setup(&mut execution, &ON_DEMAND_SETUP_ACTIONS)
     }
 
     fn read_configured_durable_token(&self) -> Result<ApiBearerToken, SatelleError> {
@@ -2810,7 +2879,7 @@ impl SshSetupTransport {
     }
 }
 
-struct RemotePersistentSetupExecution<'a> {
+struct RemoteSetupExecution<'a> {
     transport: &'a SshSetupTransport,
     target: ssh_bootstrap::RemoteTarget,
     daemon_path_overrides: &'a DaemonPathOverrides,
@@ -2828,9 +2897,87 @@ struct RemotePersistentSetupExecution<'a> {
     previous_observation: Option<ssh_bootstrap::PersistentServiceObservation>,
     durable_tunnel: Option<SshTunnel>,
     durable_client: Option<DaemonClient>,
+    managed_codex: bool,
+    native_computer_use: bool,
+    managed_changed: bool,
 }
 
-impl RemotePersistentSetupExecution<'_> {
+struct PersistentSetupInput<'a> {
+    target: ssh_bootstrap::RemoteTarget,
+    host_config: &'a satelle_core::HostConfig,
+    daemon_path_overrides: &'a DaemonPathOverrides,
+    setup_components: &'a [String],
+    existing_token_file: bool,
+    required_directories: Vec<String>,
+}
+
+struct RemoteOnDemandSetupExecution<'a> {
+    transport: &'a SshSetupTransport,
+    bootstrap_lock: &'a mut ssh_bootstrap::SshBootstrapLock,
+    bootstrap_client: Arc<DaemonClient>,
+    bootstrap_tunnel: SshTunnel,
+    _bootstrap_process: SshBootstrapProcess,
+    existing_token_file: bool,
+    application: Option<SetupApplication>,
+    managed_codex: bool,
+    native_computer_use: bool,
+    managed_changed: bool,
+}
+
+fn apply_remote_managed_setup(
+    alias: &str,
+    client: &DaemonClient,
+    bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    action: SetupAction,
+    setup_mode: satelle_core::SetupMode,
+) -> Result<bool, SatelleError> {
+    let operation_id = bootstrap_lock.operation_id().to_string();
+    bootstrap_lock
+        .mark_mutation_started("managed_setup")
+        .map_err(|_| SatelleError::host_unreachable(alias))?;
+    let response = match client.apply_bootstrap_managed_setup_action(&operation_id, action.id()) {
+        Ok(response) => response,
+        Err(error @ DaemonClientError::Api { .. }) => {
+            let DaemonClientError::Api {
+                error: api_error, ..
+            } = &error
+            else {
+                unreachable!("the match arm accepted only API errors")
+            };
+            tracing::debug!(
+                host = alias,
+                error = ?api_error,
+                "direct Host transport operation failed"
+            );
+            let api_code = api_error.code();
+            if managed_setup_rejection_precedes_mutation(&error) {
+                commit_verified_bootstrap_mutation(alias, bootstrap_lock)?;
+            }
+            if api_code == ApiErrorCode::ComputerUseNotReady {
+                return Err(map_api_error(alias, api_error));
+            }
+            return Err(SatelleError::remote_managed_setup_error(
+                alias,
+                setup_mode,
+                action
+                    .setup_component()
+                    .expect("only managed setup actions reach the managed endpoint"),
+                api_code.as_str(),
+            ));
+        }
+        Err(error) => return Err(direct_transport_error(alias, error)),
+    };
+    validate_setup_maintenance_response(
+        alias,
+        &operation_id,
+        response.reconciled(),
+        response.operation_id(),
+    )?;
+    commit_verified_bootstrap_mutation(alias, bootstrap_lock)?;
+    Ok(response.changed())
+}
+
+impl RemoteSetupExecution<'_> {
     fn bootstrap_client(&self) -> &DaemonClient {
         self.bootstrap_client
             .as_deref()
@@ -2901,6 +3048,23 @@ impl RemotePersistentSetupExecution<'_> {
             .ensure_owner_only_directories(&self.required_directories)
             .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?;
         commit_verified_bootstrap_mutation(&self.transport.alias, self.bootstrap_lock)
+    }
+
+    fn apply_managed_setup(&mut self, action: SetupAction) -> Result<(), SatelleError> {
+        let client = Arc::clone(
+            self.bootstrap_client
+                .as_ref()
+                .expect("the bootstrap daemon remains available for managed setup"),
+        );
+        let changed = apply_remote_managed_setup(
+            &self.transport.alias,
+            &client,
+            self.bootstrap_lock,
+            action,
+            satelle_core::SetupMode::Persistent,
+        )?;
+        self.managed_changed |= changed;
+        Ok(())
     }
 
     fn apply_service_config(&mut self) -> Result<(), SatelleError> {
@@ -3016,47 +3180,167 @@ impl RemotePersistentSetupExecution<'_> {
             }
             .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?;
         }
-        let durable_tunnel =
-            SshTunnel::open(self.transport.binding.destination()).map_err(|error| match error {
-                ssh_tunnel::SshTunnelError::HostKeyVerificationRequired => {
-                    SatelleError::ssh_host_key_verification_required(&self.transport.alias)
-                }
-                _ => SatelleError::host_unreachable(&self.transport.alias),
-            })?;
-        let durable_client = DaemonClient::loopback_with_timeout(
-            durable_tunnel.local_addr(),
-            self.transport.read_configured_durable_token()?,
-            self.transport.binding.expected_host_identity().to_string(),
-            SSH_DAEMON_REQUEST_TIMEOUT,
-        )
-        .map_err(|error| direct_transport_error(&self.transport.alias, error))?;
+        let (durable_tunnel, durable_client) = self.transport.durable_service_client()?;
         wait_for_durable_daemon(&self.transport.alias, || durable_client.capabilities())?;
         commit_verified_bootstrap_mutation(&self.transport.alias, self.bootstrap_lock)?;
-        begin_persistent_maintenance(&self.transport.alias, &durable_client, self.bootstrap_lock)?;
+        begin_setup_maintenance(
+            &self.transport.alias,
+            &durable_client,
+            self.bootstrap_lock,
+            satelle_core::SetupMode::Persistent,
+            self.managed_codex,
+        )?;
         self.durable_tunnel = Some(durable_tunnel);
         self.durable_client = Some(durable_client);
         Ok(())
     }
 }
 
-impl PersistentSetupExecution for RemotePersistentSetupExecution<'_> {
-    type Output = SetupApplication;
+impl SetupExecution for RemoteOnDemandSetupExecution<'_> {
+    fn begin(&mut self) -> Result<(), SatelleError> {
+        begin_setup_maintenance(
+            &self.transport.alias,
+            &self.bootstrap_client,
+            self.bootstrap_lock,
+            satelle_core::SetupMode::OnDemand,
+            self.managed_codex,
+        )
+    }
 
+    fn action_disposition(&self, action: SetupAction) -> SetupActionDisposition {
+        managed_setup_action_disposition(action, self.managed_codex, self.native_computer_use)
+    }
+
+    fn start(&mut self, action: SetupAction) -> Result<(), SatelleError> {
+        start_setup_action(
+            &self.transport.alias,
+            &self.bootstrap_client,
+            self.bootstrap_lock,
+            action.id(),
+        )
+    }
+
+    fn skip(&mut self, action: SetupAction) -> Result<(), SatelleError> {
+        skip_maintenance_action(
+            &self.transport.alias,
+            &self.bootstrap_client,
+            self.bootstrap_lock,
+            action.id(),
+        )
+    }
+
+    fn apply(&mut self, action: SetupAction) -> Result<(), SatelleError> {
+        match action {
+            SetupAction::BootstrapHandoff => {
+                let (application, _active_token) = self.transport.persistent_durable_token(
+                    &self.bootstrap_client,
+                    self.bootstrap_tunnel.local_addr(),
+                    self.existing_token_file,
+                )?;
+                self.application = Some(application);
+                Ok(())
+            }
+            SetupAction::ManagedCodex | SetupAction::NativeComputerUse => {
+                let changed = apply_remote_managed_setup(
+                    &self.transport.alias,
+                    &self.bootstrap_client,
+                    self.bootstrap_lock,
+                    action,
+                    satelle_core::SetupMode::OnDemand,
+                )?;
+                self.managed_changed |= changed;
+                Ok(())
+            }
+            SetupAction::PathSetDirectories
+            | SetupAction::ServiceConfig
+            | SetupAction::ServiceRegistration
+            | SetupAction::ServiceStartOrRestart => Err(SatelleError::state_conflict()),
+        }
+    }
+
+    fn complete(&mut self, action: SetupAction) -> Result<(), SatelleError> {
+        complete_setup_action(
+            &self.transport.alias,
+            &self.bootstrap_client,
+            self.bootstrap_lock,
+            action.id(),
+        )
+    }
+
+    fn fail(&mut self, action: SetupAction, source: SatelleError) -> SatelleError {
+        if matches!(
+            action,
+            SetupAction::ManagedCodex | SetupAction::NativeComputerUse
+        ) && !self.bootstrap_lock.current_mutation_is_committed()
+        {
+            return source;
+        }
+        let _ = record_setup_action_failure(
+            &self.transport.alias,
+            &self.bootstrap_client,
+            self.bootstrap_lock,
+            action.id(),
+            "remote_command_failed",
+        )
+        .and_then(|()| {
+            finish_setup_maintenance(
+                &self.transport.alias,
+                &self.bootstrap_client,
+                self.bootstrap_lock,
+            )
+        })
+        .and_then(|()| {
+            self.bootstrap_lock
+                .release_committed_handoff()
+                .map_err(|_| SatelleError::host_unreachable(&self.transport.alias))
+        });
+        source
+    }
+
+    fn finish(&mut self) -> Result<SetupExecutionOutcome, SatelleError> {
+        finish_setup_maintenance(
+            &self.transport.alias,
+            &self.bootstrap_client,
+            self.bootstrap_lock,
+        )?;
+        self.bootstrap_lock
+            .release_committed_handoff()
+            .map_err(|_| SatelleError::host_unreachable(&self.transport.alias))?;
+        self.application
+            .map(|application| SetupExecutionOutcome {
+                application,
+                managed_changed: self.managed_changed,
+            })
+            .ok_or_else(|| SatelleError::host_unreachable(&self.transport.alias))
+    }
+}
+
+impl SetupExecution for RemoteSetupExecution<'_> {
     fn begin(&mut self) -> Result<(), SatelleError> {
         let client = self
             .bootstrap_client
             .as_deref()
             .expect("the bootstrap daemon remains available before service startup");
-        begin_persistent_maintenance(&self.transport.alias, client, self.bootstrap_lock)
+        begin_setup_maintenance(
+            &self.transport.alias,
+            client,
+            self.bootstrap_lock,
+            satelle_core::SetupMode::Persistent,
+            self.managed_codex,
+        )
     }
 
-    fn start(&mut self, action: PersistentSetupAction) -> Result<(), SatelleError> {
+    fn action_disposition(&self, action: SetupAction) -> SetupActionDisposition {
+        managed_setup_action_disposition(action, self.managed_codex, self.native_computer_use)
+    }
+
+    fn start(&mut self, action: SetupAction) -> Result<(), SatelleError> {
         let client = self
             .durable_client
             .as_ref()
             .or(self.bootstrap_client.as_deref())
             .expect("maintenance requires a live bootstrap or durable daemon");
-        start_persistent_action(
+        start_setup_action(
             &self.transport.alias,
             client,
             self.bootstrap_lock,
@@ -3064,23 +3348,39 @@ impl PersistentSetupExecution for RemotePersistentSetupExecution<'_> {
         )
     }
 
-    fn apply(&mut self, action: PersistentSetupAction) -> Result<(), SatelleError> {
+    fn skip(&mut self, action: SetupAction) -> Result<(), SatelleError> {
+        let client = self
+            .bootstrap_client
+            .as_deref()
+            .expect("managed setup actions run before persistent service startup");
+        skip_maintenance_action(
+            &self.transport.alias,
+            client,
+            self.bootstrap_lock,
+            action.id(),
+        )
+    }
+
+    fn apply(&mut self, action: SetupAction) -> Result<(), SatelleError> {
         match action {
-            PersistentSetupAction::BootstrapHandoff => self.apply_bootstrap_handoff(),
-            PersistentSetupAction::PathSetDirectories => self.apply_directories(),
-            PersistentSetupAction::ServiceConfig => self.apply_service_config(),
-            PersistentSetupAction::ServiceRegistration => self.apply_service_registration(),
-            PersistentSetupAction::ServiceStartOrRestart => self.apply_service_start(),
+            SetupAction::BootstrapHandoff => self.apply_bootstrap_handoff(),
+            SetupAction::ManagedCodex | SetupAction::NativeComputerUse => {
+                self.apply_managed_setup(action)
+            }
+            SetupAction::PathSetDirectories => self.apply_directories(),
+            SetupAction::ServiceConfig => self.apply_service_config(),
+            SetupAction::ServiceRegistration => self.apply_service_registration(),
+            SetupAction::ServiceStartOrRestart => self.apply_service_start(),
         }
     }
 
-    fn complete(&mut self, action: PersistentSetupAction) -> Result<(), SatelleError> {
+    fn complete(&mut self, action: SetupAction) -> Result<(), SatelleError> {
         let client = self
             .durable_client
             .as_ref()
             .or(self.bootstrap_client.as_deref())
             .expect("maintenance requires a live bootstrap or durable daemon");
-        complete_persistent_action(
+        complete_setup_action(
             &self.transport.alias,
             client,
             self.bootstrap_lock,
@@ -3088,20 +3388,25 @@ impl PersistentSetupExecution for RemotePersistentSetupExecution<'_> {
         )
     }
 
-    fn fail(&mut self, action: PersistentSetupAction, source: SatelleError) -> SatelleError {
+    fn fail(&mut self, action: SetupAction, source: SatelleError) -> SatelleError {
+        if matches!(
+            action,
+            SetupAction::ManagedCodex | SetupAction::NativeComputerUse
+        ) && !self.bootstrap_lock.current_mutation_is_committed()
+        {
+            return source;
+        }
         let Some(client) = self.bootstrap_client.as_deref() else {
             return source;
         };
-        let _ = record_persistent_action_failure(
+        let _ = record_setup_action_failure(
             &self.transport.alias,
             client,
             self.bootstrap_lock,
             action.id(),
             "remote_command_failed",
         )
-        .and_then(|()| {
-            finish_persistent_maintenance(&self.transport.alias, client, self.bootstrap_lock)
-        })
+        .and_then(|()| finish_setup_maintenance(&self.transport.alias, client, self.bootstrap_lock))
         .and_then(|()| {
             self.bootstrap_lock
                 .release_committed_handoff()
@@ -3113,8 +3418,8 @@ impl PersistentSetupExecution for RemotePersistentSetupExecution<'_> {
         source
     }
 
-    fn finish(&mut self) -> Result<Self::Output, SatelleError> {
-        finish_persistent_maintenance(
+    fn finish(&mut self) -> Result<SetupExecutionOutcome, SatelleError> {
+        finish_setup_maintenance(
             &self.transport.alias,
             self.durable_client
                 .as_ref()
@@ -3125,6 +3430,10 @@ impl PersistentSetupExecution for RemotePersistentSetupExecution<'_> {
             .release_committed_handoff()
             .map_err(|_| SatelleError::host_unreachable(&self.transport.alias))?;
         self.application
+            .map(|application| SetupExecutionOutcome {
+                application,
+                managed_changed: self.managed_changed,
+            })
             .ok_or_else(|| SatelleError::host_unreachable(&self.transport.alias))
     }
 }
@@ -3195,7 +3504,7 @@ pub(crate) fn manage_ssh_persistent_service(
         &mut bootstrap_lock,
         lifecycle,
     )?;
-    start_persistent_action(
+    start_setup_action(
         &transport.alias,
         &durable_client,
         &mut bootstrap_lock,
@@ -3221,7 +3530,7 @@ pub(crate) fn manage_ssh_persistent_service(
     };
     if let Err(source) = lifecycle_result {
         if durable_client.capabilities().is_ok()
-            && record_persistent_action_failure(
+            && record_setup_action_failure(
                 &transport.alias,
                 &durable_client,
                 &mut bootstrap_lock,
@@ -3229,11 +3538,7 @@ pub(crate) fn manage_ssh_persistent_service(
                 "remote_command_failed",
             )
             .and_then(|()| {
-                finish_persistent_maintenance(
-                    &transport.alias,
-                    &durable_client,
-                    &mut bootstrap_lock,
-                )
+                finish_setup_maintenance(&transport.alias, &durable_client, &mut bootstrap_lock)
             })
             .and_then(|()| {
                 bootstrap_lock
@@ -4672,7 +4977,7 @@ fn apply_host_update_with_operation(
     };
 
     if let Some(old_client) = old_client
-        && let Err(source) = start_persistent_action(
+        && let Err(source) = start_setup_action(
             &transport.alias,
             old_client,
             &mut bootstrap_lock,
@@ -4786,7 +5091,7 @@ fn apply_host_update_with_operation(
         }
     };
     if let Some(old_client) = old_client
-        && let Err(source) = complete_persistent_action(
+        && let Err(source) = complete_setup_action(
             &transport.alias,
             old_client,
             &mut bootstrap_lock,
@@ -4803,7 +5108,7 @@ fn apply_host_update_with_operation(
 
     if publish_service {
         if let Some(old_client) = old_client
-            && let Err(source) = start_persistent_action(
+            && let Err(source) = start_setup_action(
                 &transport.alias,
                 old_client,
                 &mut bootstrap_lock,
@@ -4915,7 +5220,7 @@ fn apply_host_update_with_operation(
             finish_confirmed_host_update_action(&mut report, "publish-host-service", || {
                 commit_verified_bootstrap_mutation(&transport.alias, &mut bootstrap_lock)?;
                 old_client.map_or(Ok(()), |old_client| {
-                    complete_persistent_action(
+                    complete_setup_action(
                         &transport.alias,
                         old_client,
                         &mut bootstrap_lock,
@@ -4948,7 +5253,7 @@ fn apply_host_update_with_operation(
     }
 
     if let Some(old_client) = old_client
-        && let Err(source) = start_persistent_action(
+        && let Err(source) = start_setup_action(
             &transport.alias,
             old_client,
             &mut bootstrap_lock,
@@ -5085,7 +5390,7 @@ fn apply_host_update_with_operation(
                 ));
             }
         };
-        if let Err(source) = validate_persistent_maintenance_response(
+        if let Err(source) = validate_setup_maintenance_response(
             &transport.alias,
             &operation_id,
             adopted.reconciled(),
@@ -5101,7 +5406,7 @@ fn apply_host_update_with_operation(
     }
     if let Err(source) =
         finish_confirmed_host_update_action(&mut report, "restart-host-daemon", || {
-            complete_persistent_action(
+            complete_setup_action(
                 &transport.alias,
                 &new_client,
                 &mut bootstrap_lock,
@@ -5117,7 +5422,7 @@ fn apply_host_update_with_operation(
         ));
     }
 
-    if let Err(source) = start_persistent_action(
+    if let Err(source) = start_setup_action(
         &transport.alias,
         &new_client,
         &mut bootstrap_lock,
@@ -5148,7 +5453,7 @@ fn apply_host_update_with_operation(
     report
         .invalidated_caches
         .push("native_computer_use".to_string());
-    if let Err(source) = complete_persistent_action(
+    if let Err(source) = complete_setup_action(
         &transport.alias,
         &new_client,
         &mut bootstrap_lock,
@@ -5181,7 +5486,7 @@ fn apply_host_update_with_operation(
     ] {
         report = report.with_postcheck(HostUpdatePostcheck::passed(check_id, summary));
     }
-    if let Err(source) = start_persistent_action(
+    if let Err(source) = start_setup_action(
         &transport.alias,
         &new_client,
         &mut bootstrap_lock,
@@ -5245,7 +5550,7 @@ fn adopt_bootstrap_repair_actions(
     let adopted = client
         .begin_repair_maintenance(&operation_id, recovery_identity)
         .map_err(|error| direct_transport_error(host, error))?;
-    validate_persistent_maintenance_response(
+    validate_setup_maintenance_response(
         host,
         &operation_id,
         adopted.reconciled(),
@@ -5256,11 +5561,11 @@ fn adopt_bootstrap_repair_actions(
         if action_id == "publish-host-service" && !published_service {
             skip_maintenance_action(host, client, bootstrap_lock, action_id)?;
         } else {
-            start_persistent_action(host, client, bootstrap_lock, action_id)?;
-            complete_persistent_action(host, client, bootstrap_lock, action_id)?;
+            start_setup_action(host, client, bootstrap_lock, action_id)?;
+            complete_setup_action(host, client, bootstrap_lock, action_id)?;
         }
     }
-    start_persistent_action(host, client, bootstrap_lock, "restart-host-daemon")
+    start_setup_action(host, client, bootstrap_lock, "restart-host-daemon")
 }
 
 fn finish_confirmed_host_update_action(
@@ -5348,7 +5653,7 @@ fn finish_unmodified_host_update(
         let response = client
             .skip_maintenance_action(operation_id, action_id)
             .map_err(|error| direct_transport_error(host, error))?;
-        validate_persistent_maintenance_response(
+        validate_setup_maintenance_response(
             host,
             operation_id,
             response.reconciled(),
@@ -5358,7 +5663,7 @@ fn finish_unmodified_host_update(
     let response = client
         .finish_maintenance_plan(operation_id)
         .map_err(|error| direct_transport_error(host, error))?;
-    validate_persistent_maintenance_response(
+    validate_setup_maintenance_response(
         host,
         operation_id,
         response.reconciled(),
@@ -5409,7 +5714,7 @@ fn begin_host_update_maintenance_with_revalidation(
         }
     }
     .map_err(|error| host_update_maintenance_begin_error(host, operation_id, error))?;
-    if let Err(source) = validate_persistent_maintenance_response(
+    if let Err(source) = validate_setup_maintenance_response(
         host,
         operation_id,
         begin.reconciled(),
@@ -5503,7 +5808,7 @@ fn finish_locked_unmodified_host_update(
     for action_id in HOST_UPDATE_ACTIONS {
         skip_maintenance_action(host, client, bootstrap_lock, action_id)?;
     }
-    finish_persistent_maintenance(host, client, bootstrap_lock)?;
+    finish_setup_maintenance(host, client, bootstrap_lock)?;
     bootstrap_lock
         .release_committed_handoff()
         .map_err(|_| SatelleError::host_unreachable(host))
@@ -5536,7 +5841,7 @@ fn finish_unmodified_after_uncertain_first_action_start(
         "remote_command_failed",
     ) {
         Ok(response) => {
-            validate_persistent_maintenance_response(
+            validate_setup_maintenance_response(
                 host,
                 &operation_id,
                 response.reconciled(),
@@ -5564,7 +5869,7 @@ fn finish_unmodified_after_uncertain_first_action_start(
             skip_maintenance_action(host, client, bootstrap_lock, action_id)?;
         }
     }
-    finish_persistent_maintenance(host, client, bootstrap_lock)?;
+    finish_setup_maintenance(host, client, bootstrap_lock)?;
     bootstrap_lock
         .release_committed_handoff()
         .map_err(|_| SatelleError::host_unreachable(host))
@@ -5606,7 +5911,7 @@ fn fail_host_update_action(
         .iter()
         .position(|candidate| *candidate == action_id)
         .expect("failed Host update actions belong to the ordered maintenance plan");
-    let recorded_failure = record_persistent_action_failure(
+    let recorded_failure = record_setup_action_failure(
         host,
         client,
         bootstrap_lock,
@@ -5622,7 +5927,7 @@ fn fail_host_update_action(
         );
     }
     let cleanup = recorded_failure
-        .and_then(|()| finish_persistent_maintenance(host, client, bootstrap_lock))
+        .and_then(|()| finish_setup_maintenance(host, client, bootstrap_lock))
         .and_then(|()| {
             bootstrap_lock
                 .release_committed_handoff()
@@ -5706,7 +6011,7 @@ fn recover_later_host_update_action_start(
             skip_remaining_host_update_actions(report, action_index, |remaining| {
                 skip_maintenance_action(host, client, bootstrap_lock, remaining)
             })?;
-            finish_persistent_maintenance(host, client, bootstrap_lock)?;
+            finish_setup_maintenance(host, client, bootstrap_lock)?;
             bootstrap_lock
                 .release_committed_handoff()
                 .map_err(|_| SatelleError::host_unreachable(host))
@@ -6493,13 +6798,13 @@ fn restart_persistent_service(
         bootstrap_lock,
         SshPersistentServiceLifecycle::Restart,
     )?;
-    complete_persistent_action(
+    complete_setup_action(
         &transport.alias,
         &durable_client,
         bootstrap_lock,
         SshPersistentServiceLifecycle::Restart.action_id(),
     )?;
-    finish_persistent_maintenance(&transport.alias, &durable_client, bootstrap_lock)?;
+    finish_setup_maintenance(&transport.alias, &durable_client, bootstrap_lock)?;
     drop(durable_client);
     drop(durable_tunnel);
     Ok(())
@@ -6549,13 +6854,13 @@ fn stop_persistent_service(
         windows_task,
         false,
     )?;
-    complete_persistent_action(
+    complete_setup_action(
         &transport.alias,
         &bootstrap_client,
         bootstrap_lock,
         SshPersistentServiceLifecycle::Stop.action_id(),
     )?;
-    finish_persistent_maintenance(&transport.alias, &bootstrap_client, bootstrap_lock)?;
+    finish_setup_maintenance(&transport.alias, &bootstrap_client, bootstrap_lock)?;
     drop(bootstrap_process);
     drop(bootstrap_client);
     drop(bootstrap_tunnel);
@@ -6675,7 +6980,7 @@ fn begin_service_lifecycle_maintenance(
         },
         bootstrap_lock,
     )?;
-    validate_persistent_maintenance_response(
+    validate_setup_maintenance_response(
         host,
         &operation_id,
         response.reconciled(),
@@ -6684,24 +6989,34 @@ fn begin_service_lifecycle_maintenance(
     commit_verified_bootstrap_mutation(host, bootstrap_lock)
 }
 
-fn begin_persistent_maintenance(
+fn begin_setup_maintenance(
     host: &str,
     client: &DaemonClient,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
+    setup_mode: satelle_core::SetupMode,
+    managed_setup: bool,
 ) -> Result<(), SatelleError> {
     let operation_id = bootstrap_lock.operation_id().to_string();
     bootstrap_lock
-        .mark_mutation_started("persistent_maintenance_begin")
+        .mark_mutation_started("setup_maintenance_begin")
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let response = reconcile_bootstrap_maintenance_response(
         host,
-        client.begin_persistent_service_maintenance(
-            &operation_id,
-            bootstrap_lock.operation_kind().as_str(),
-        ),
+        match setup_mode {
+            satelle_core::SetupMode::Persistent => client.begin_persistent_service_maintenance(
+                &operation_id,
+                bootstrap_lock.operation_kind().as_str(),
+                managed_setup,
+            ),
+            satelle_core::SetupMode::OnDemand => client.begin_on_demand_setup_maintenance(
+                &operation_id,
+                bootstrap_lock.operation_kind().as_str(),
+                managed_setup,
+            ),
+        },
         bootstrap_lock,
     )?;
-    validate_persistent_maintenance_response(
+    validate_setup_maintenance_response(
         host,
         &operation_id,
         response.reconciled(),
@@ -6710,7 +7025,7 @@ fn begin_persistent_maintenance(
     commit_verified_bootstrap_mutation(host, bootstrap_lock)
 }
 
-fn start_persistent_action(
+fn start_setup_action(
     host: &str,
     client: &DaemonClient,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
@@ -6718,14 +7033,14 @@ fn start_persistent_action(
 ) -> Result<(), SatelleError> {
     let operation_id = bootstrap_lock.operation_id().to_string();
     bootstrap_lock
-        .mark_mutation_started("persistent_action_start")
+        .mark_mutation_started("setup_action_start")
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let response = reconcile_bootstrap_maintenance_response(
         host,
         client.start_maintenance_action(&operation_id, action_id),
         bootstrap_lock,
     )?;
-    validate_persistent_maintenance_response(
+    validate_setup_maintenance_response(
         host,
         &operation_id,
         response.reconciled(),
@@ -6734,7 +7049,7 @@ fn start_persistent_action(
     commit_verified_bootstrap_mutation(host, bootstrap_lock)
 }
 
-fn complete_persistent_action(
+fn complete_setup_action(
     host: &str,
     client: &DaemonClient,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
@@ -6742,14 +7057,14 @@ fn complete_persistent_action(
 ) -> Result<(), SatelleError> {
     let operation_id = bootstrap_lock.operation_id().to_string();
     bootstrap_lock
-        .mark_mutation_started("persistent_action_complete")
+        .mark_mutation_started("setup_action_complete")
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let response = reconcile_bootstrap_maintenance_response(
         host,
         client.complete_maintenance_action(&operation_id, action_id),
         bootstrap_lock,
     )?;
-    validate_persistent_maintenance_response(
+    validate_setup_maintenance_response(
         host,
         &operation_id,
         response.reconciled(),
@@ -6766,14 +7081,14 @@ fn skip_maintenance_action(
 ) -> Result<(), SatelleError> {
     let operation_id = bootstrap_lock.operation_id().to_string();
     bootstrap_lock
-        .mark_mutation_started("persistent_action_skip")
+        .mark_mutation_started("setup_action_skip")
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let response = reconcile_bootstrap_maintenance_response(
         host,
         client.skip_maintenance_action(&operation_id, action_id),
         bootstrap_lock,
     )?;
-    validate_persistent_maintenance_response(
+    validate_setup_maintenance_response(
         host,
         &operation_id,
         response.reconciled(),
@@ -6782,21 +7097,21 @@ fn skip_maintenance_action(
     commit_verified_bootstrap_mutation(host, bootstrap_lock)
 }
 
-fn finish_persistent_maintenance(
+fn finish_setup_maintenance(
     host: &str,
     client: &DaemonClient,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
 ) -> Result<(), SatelleError> {
     let operation_id = bootstrap_lock.operation_id().to_string();
     bootstrap_lock
-        .mark_mutation_started("persistent_maintenance_finish")
+        .mark_mutation_started("setup_maintenance_finish")
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let response = reconcile_bootstrap_maintenance_response(
         host,
         client.finish_maintenance_plan(&operation_id),
         bootstrap_lock,
     )?;
-    validate_persistent_maintenance_response(
+    validate_setup_maintenance_response(
         host,
         &operation_id,
         response.reconciled(),
@@ -6805,7 +7120,7 @@ fn finish_persistent_maintenance(
     commit_verified_bootstrap_mutation(host, bootstrap_lock)
 }
 
-fn validate_persistent_maintenance_response(
+fn validate_setup_maintenance_response(
     host: &str,
     operation_id: &str,
     reconciled: bool,
@@ -6821,7 +7136,7 @@ fn validate_persistent_maintenance_response(
     }
 }
 
-fn record_persistent_action_failure(
+fn record_setup_action_failure(
     host: &str,
     client: &DaemonClient,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
@@ -6831,12 +7146,12 @@ fn record_persistent_action_failure(
     commit_verified_bootstrap_mutation(host, bootstrap_lock)?;
     let operation_id = bootstrap_lock.operation_id().to_string();
     bootstrap_lock
-        .mark_mutation_started("persistent_action_fail")
+        .mark_mutation_started("setup_action_fail")
         .map_err(|_| SatelleError::host_unreachable(host))?;
     let response = client
         .fail_maintenance_action(&operation_id, action_id, failure_kind)
         .map_err(|error| direct_transport_error(host, error))?;
-    validate_persistent_maintenance_response(
+    validate_setup_maintenance_response(
         host,
         &operation_id,
         response.reconciled(),
@@ -7017,20 +7332,24 @@ impl TransportClient for SshSetupTransport {
     ) -> Result<SetupReport, SatelleError> {
         self.validate_setup_request(&setup_components)?;
         let target = self.remote_target()?;
+        let setup_components = self.setup_components_for_target(target, setup_components)?;
         let host_config = self.host_config_with_overrides(&daemon_path_overrides);
         let existing_token_file = self.token_file_exists()?;
         let current_daemon = self.observe_current_daemon_artifact(existing_token_file)?;
-        let plan = self.setup_report_for_target(
+        let plan = self.setup_report_for_target(RemoteSetupReportInput {
             dry_run,
             setup_mode,
             target,
-            setup_components.clone(),
-            daemon_path_overrides.clone(),
-            SetupApplication::Planned {
-                existing_token_file,
+            setup_components: setup_components.clone(),
+            daemon_path_overrides: daemon_path_overrides.clone(),
+            outcome: SetupExecutionOutcome {
+                application: SetupApplication::Planned {
+                    existing_token_file,
+                },
+                managed_changed: false,
             },
-            &current_daemon,
-        )?;
+            current_daemon: &current_daemon,
+        })?;
         if dry_run || !plan.required_input.is_empty() {
             return Ok(plan);
         }
@@ -7078,60 +7397,47 @@ impl TransportClient for SshSetupTransport {
                 .as_ref()
                 .expect("persistent setup reports its resolved path set")
                 .required_directories();
-            let application = self.apply_persistent_setup(
-                target,
-                &host_config,
-                &daemon_path_overrides,
-                existing_token_file,
-                required_directories,
+            let outcome = self.apply_persistent_setup(
+                PersistentSetupInput {
+                    target,
+                    host_config: &host_config,
+                    daemon_path_overrides: &daemon_path_overrides,
+                    setup_components: &setup_components,
+                    existing_token_file,
+                    required_directories,
+                },
                 &mut bootstrap_lock,
             )?;
-            return self.setup_report_for_target(
-                false,
+            return self.setup_report_for_target(RemoteSetupReportInput {
+                dry_run: false,
                 setup_mode,
                 target,
                 setup_components,
                 daemon_path_overrides,
-                application,
-                &current_daemon,
-            );
+                outcome,
+                current_daemon: &current_daemon,
+            });
         }
         // Planning intentionally does not lock or mutate. Re-read only after
         // acquiring both the token-path lock and the remote Host lock so another
         // completed setup is reused and a rollback cannot delete that process's
         // replacement credential.
         let existing_token_file = self.token_file_exists()?;
-        let application = if existing_token_file {
-            match self.verify_existing_token(&host_config, &mut bootstrap_lock)? {
-                ExistingTokenVerification::Reusable => SetupApplication::AppliedReusableToken,
-                ExistingTokenVerification::ActivatedPending => {
-                    SetupApplication::AppliedPendingActivation
-                }
-                ExistingTokenVerification::AuthenticationRejected { token_id } => {
-                    // The owner-local release handshake stops any daemon that
-                    // still owns the canonical store before admin recovery.
-                    self.recover_interrupted_token(&token_id, &host_config, &mut bootstrap_lock)?;
-                    self.provision_token(&host_config, &mut bootstrap_lock)?;
-                    SetupApplication::AppliedNewToken
-                }
-            }
-        } else {
-            self.provision_token(&host_config, &mut bootstrap_lock)?;
-            SetupApplication::AppliedNewToken
-        };
-        confirm_bootstrap_lock(&self.alias, &mut bootstrap_lock)?;
-        bootstrap_lock
-            .release_committed_handoff()
-            .map_err(|_| SatelleError::host_unreachable(&self.alias))?;
-        self.setup_report_for_target(
-            false,
+        let outcome = self.apply_on_demand_setup(
+            &host_config,
+            &setup_components,
+            existing_token_file,
+            &mut bootstrap_lock,
+        )?;
+        self.setup_report_for_target(RemoteSetupReportInput {
+            dry_run: false,
             setup_mode,
             target,
             setup_components,
             daemon_path_overrides,
-            application,
-            &current_daemon,
-        )
+            outcome,
+            current_daemon: &current_daemon,
+        })
     }
 
     fn doctor(
@@ -7288,22 +7594,48 @@ impl TransportClient for DirectTransport {
 
     fn setup(
         &self,
-        _dry_run: bool,
-        _setup_mode: SetupModeSelection,
-        _setup_components: Vec<String>,
-        _daemon_path_overrides: DaemonPathOverrides,
+        dry_run: bool,
+        setup_mode: SetupModeSelection,
+        setup_components: Vec<String>,
+        daemon_path_overrides: DaemonPathOverrides,
     ) -> Result<SetupReport, SatelleError> {
-        Err(self.unsupported("setup"))
+        if self.mode != "local" {
+            return Err(self.unsupported("setup"));
+        }
+        validate_local_daemon_path_overrides(&daemon_path_overrides)?;
+        self.client
+            .local_setup_operation(
+                &self.alias,
+                dry_run,
+                setup_mode.mode.as_str(),
+                setup_components,
+                daemon_path_overrides,
+                &Self::idempotency_key(),
+            )
+            .map_err(|error| direct_transport_error(&self.alias, error))?
     }
 
     fn doctor(
         &self,
-        _scope_selection: &DoctorScopeSelection,
+        scope_selection: &DoctorScopeSelection,
         _transport_probe: Arc<dyn ControllerTransportProbe>,
-        _options: DoctorOptions,
-        _provider_intent: &satelle_host::ProviderComputerUseIntent,
+        options: DoctorOptions,
+        provider_intent: &satelle_host::ProviderComputerUseIntent,
     ) -> DoctorExecutionResult {
-        Err(DoctorExecutionFailure::from(self.unsupported("doctor")))
+        if self.mode != "local" {
+            return Err(DoctorExecutionFailure::from(self.unsupported("doctor")));
+        }
+        self.client
+            .local_doctor_operation(
+                &self.alias,
+                scope_selection,
+                options,
+                provider_intent,
+                &Self::idempotency_key(),
+            )
+            .map_err(|error| {
+                DoctorExecutionFailure::from(direct_transport_error(&self.alias, error))
+            })?
     }
 
     fn verify_setup(
@@ -7540,7 +7872,7 @@ impl TransportClient for DirectTransport {
         self.client
             .stop_session(session_id, &Self::idempotency_key())
             .map(|response| response.result().clone())
-            .map_err(|error| direct_transport_error(&self.alias, error))
+            .map_err(|error| direct_session_resource_error(&self.alias, session_id, error))
     }
 
     fn logs(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
@@ -8394,6 +8726,7 @@ fn direct_run_event_error(host: &str, error: DaemonEventError) -> SatelleError {
 }
 
 fn direct_transport_error(host: &str, error: DaemonClientError) -> SatelleError {
+    tracing::debug!(host, error = ?error, "direct Host transport operation failed");
     match error {
         DaemonClientError::Api { error, .. } => map_api_error(host, &error),
         DaemonClientError::ResponseHostIdentityMismatch => {
@@ -8496,6 +8829,9 @@ fn response_connection_lost(error: &reqwest::Error) -> bool {
 // safely. Validate that recovery boundary at the transport boundary instead
 // of collapsing it into the generic remote API error used for other codes.
 fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
+    if error.code() == ApiErrorCode::HostBusy {
+        return map_host_busy_api_error(host, error);
+    }
     if error.code() == ApiErrorCode::StopNotConfirmed {
         return map_stop_not_confirmed_api_error(host, error);
     }
@@ -8510,6 +8846,26 @@ fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
             | ApiErrorCode::DesktopSessionNativeSelectorUnmatched
     ) {
         return map_desktop_selection_api_error(host, error);
+    }
+    if error.code() == ApiErrorCode::ComputerUseNotReady {
+        return map_computer_use_not_ready_api_error(host, error);
+    }
+    if error.code() == ApiErrorCode::SetupLedgerUnavailable {
+        // The daemon publishes exactly the closed `run_id` detail; the client
+        // rebuilds the same typed CLI error the embedded Host returns.
+        return match error.details().and_then(serde_json::Value::as_object) {
+            Some(details)
+                if details.len() == 1
+                    && details
+                        .get("run_id")
+                        .is_some_and(serde_json::Value::is_string) =>
+            {
+                SatelleError::setup_ledger_unavailable(
+                    details["run_id"].as_str().expect("run_id is a string"),
+                )
+            }
+            _ => SatelleError::remote_api_error(host, "invalid-daemon-response"),
+        };
     }
     if error.code() != ApiErrorCode::LogsCursorExpired {
         return api_code_error(host, error.code());
@@ -8541,6 +8897,82 @@ fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
         earliest_available_cursor.map(|cursor| cursor.to_string()),
         resume_cursor.to_string(),
     )
+}
+
+fn map_host_busy_api_error(host: &str, error: &ApiError) -> SatelleError {
+    let Some(details) = error.details().and_then(serde_json::Value::as_object) else {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    };
+    if details.len() != 2
+        || details
+            .get("host")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    }
+    let Some(active_session_id) = details
+        .get("active_session_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| SessionId::parse(value).ok())
+    else {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    };
+    SatelleError::host_busy(host, &active_session_id)
+}
+
+fn map_computer_use_not_ready_api_error(host: &str, error: &ApiError) -> SatelleError {
+    let Some(details) = error.details().and_then(serde_json::Value::as_object) else {
+        return SatelleError::computer_use_not_ready();
+    };
+    // The daemon publishes exactly two closed shapes: the macOS manual-setup
+    // pair and a bare snake_case `reason` token. Rebuild either verbatim so the
+    // CLI reports the same readiness cause the embedded Host would.
+    if !is_closed_macos_manual_computer_use_error(error)
+        && !is_closed_computer_use_reason_detail(details)
+    {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    }
+    let mut mapped = SatelleError::computer_use_not_ready();
+    mapped.details.extend(details.clone());
+    mapped
+}
+
+fn is_closed_computer_use_reason_detail(
+    details: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    details.len() == 1
+        && details
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reason| {
+                !reason.is_empty()
+                    && reason.len() <= 64
+                    && reason.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            })
+}
+
+fn is_closed_macos_manual_computer_use_error(error: &ApiError) -> bool {
+    let Some(details) = error.details().and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    details.len() == 2
+        && details.get("status").and_then(serde_json::Value::as_str)
+            == Some("manual_action_required")
+        && details.get("reason").and_then(serde_json::Value::as_str)
+            == Some("macos_native_computer_use_prerequisite_missing")
+}
+
+fn managed_setup_rejection_precedes_mutation(error: &DaemonClientError) -> bool {
+    bootstrap_maintenance_rejection_precedes_mutation(error)
+        || matches!(
+            error,
+            DaemonClientError::Api { error, .. }
+                if error.code() == ApiErrorCode::ComputerUseNotReady
+                    && is_closed_macos_manual_computer_use_error(error)
+        )
 }
 
 fn map_desktop_selection_api_error(host: &str, error: &ApiError) -> SatelleError {
@@ -8807,6 +9239,15 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
         ApiErrorCode::HostIdentityMismatch => SatelleError::host_identity_mismatch(host),
         ApiErrorCode::HostUnreachable => SatelleError::host_unreachable(host),
         ApiErrorCode::StateConflict => SatelleError::state_conflict(),
+        ApiErrorCode::StorageIntegrityFailed => SatelleError {
+            code: ErrorCode::StorageIntegrityFailed,
+            message: "the Host state failed an integrity requirement".to_string(),
+            recovery_command: Some(
+                "inspect the configured Host state paths and owner permissions".to_string(),
+            ),
+            source_detail: None,
+            details: std::collections::BTreeMap::new(),
+        },
         ApiErrorCode::NativeReadinessTimeout => SatelleError::native_readiness_timeout(),
         ApiErrorCode::YoloNotSupported => SatelleError::yolo_not_supported(),
         ApiErrorCode::YoloBlockedByNativeApproval => {
@@ -8878,42 +9319,567 @@ fn provider_secret_api_error(host: &str, code: ErrorCode, message: &str) -> Sate
     }
 }
 
-fn local_host_service(host_config: &satelle_core::HostConfig) -> Result<HostService, CliFailure> {
-    #[cfg(feature = "test-support")]
+#[cfg(feature = "test-support")]
+fn selected_test_support_adapter() -> Result<Option<String>, CliFailure> {
     match std::env::var(TEST_SUPPORT_ADAPTER_ENV) {
-        Ok(value) if value == "fake" => {
+        Ok(value)
+            if matches!(
+                value.as_str(),
+                "fake" | "pending" | "failing" | "readiness-failing" | "resolved-secret-canary"
+            ) =>
+        {
+            Ok(Some(value))
+        }
+        Ok(_) => Err(failure(SatelleError::invalid_usage(
+            "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake', 'pending', 'failing', 'readiness-failing', 'resolved-secret-canary', or unset",
+        ))),
+        Err(std::env::VarError::NotUnicode(_)) => Err(failure(SatelleError::invalid_usage(
+            "SATELLE_TEST_SUPPORT_ADAPTER must contain valid UTF-8",
+        ))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+    }
+}
+
+pub(crate) fn plan_local_setup(
+    host: &str,
+    dry_run: bool,
+    setup_mode: String,
+    setup_components: Vec<String>,
+    daemon_path_overrides: DaemonPathOverrides,
+) -> Result<SetupReport, CliFailure> {
+    validate_local_daemon_path_overrides(&daemon_path_overrides).map_err(failure)?;
+    #[cfg(feature = "test-support")]
+    if selected_test_support_adapter()?.is_some() {
+        return Ok(satelle_host::local_setup_plan_for_tests(
+            host,
+            dry_run,
+            setup_mode,
+            setup_components,
+            daemon_path_overrides,
+        ));
+    }
+    satelle_host::local_setup_plan(
+        host,
+        dry_run,
+        setup_mode,
+        setup_components,
+        daemon_path_overrides,
+    )
+    .map_err(failure)
+}
+
+pub(crate) fn local_setup_host_sessions(host: &str) -> Result<HostSessionsReport, CliFailure> {
+    #[cfg(feature = "test-support")]
+    if selected_test_support_adapter()?.is_some() {
+        return Ok(HostSessionsReport {
+            schema_version: HostSessionsSchemaVersion::V1,
+            host: host.to_string(),
+            detected_platform: "local-demo".to_string(),
+            connection_mode: "direct".to_string(),
+            bootstrapped: false,
+            bootstrap_actions: Vec::new(),
+            host_daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            sessions: satelle_host::local_desktop_sessions_for_setup_tests(),
+        });
+    }
+    satelle_host::local_desktop_sessions_for_setup()
+        .map(|sessions| HostSessionsReport {
+            schema_version: HostSessionsSchemaVersion::V1,
+            host: host.to_string(),
+            detected_platform: std::env::consts::OS.to_string(),
+            connection_mode: "direct".to_string(),
+            bootstrapped: false,
+            bootstrap_actions: Vec::new(),
+            host_daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            sessions,
+        })
+        .map_err(failure)
+}
+
+pub(crate) fn local_read_only_doctor(
+    host: &SelectedHost,
+    scope_selection: &DoctorScopeSelection,
+    transport_probe: Arc<dyn ControllerTransportProbe>,
+    options: DoctorOptions,
+    provider_intent: &satelle_host::ProviderComputerUseIntent,
+) -> Result<DoctorExecutionResult, CliFailure> {
+    let service = local_host_service(&host.config)?;
+    Ok(LocalTransport::new(host.alias.clone(), service).doctor(
+        scope_selection,
+        transport_probe,
+        options,
+        provider_intent,
+    ))
+}
+
+pub(super) fn local_host_service(
+    host_config: &satelle_core::HostConfig,
+) -> Result<HostService, CliFailure> {
+    #[cfg(feature = "test-support")]
+    match selected_test_support_adapter()?.as_deref() {
+        Some("fake") => {
             return HostService::local_demo_for_tests().map_err(failure);
         }
-        Ok(value) if value == "pending" => {
+        Some("pending") => {
             return HostService::pending_local_demo_for_tests().map_err(failure);
         }
-        Ok(value) if value == "failing" => {
+        Some("failing") => {
             return HostService::failing_local_demo_for_tests().map_err(failure);
         }
-        Ok(value) if value == "readiness-failing" => {
+        Some("readiness-failing") => {
             return HostService::readiness_failing_local_demo_for_tests().map_err(failure);
         }
-        Ok(value) if value == "resolved-secret-canary" => {
+        Some("resolved-secret-canary") => {
             return HostService::resolved_secret_canary_local_demo_for_tests().map_err(failure);
         }
-        Ok(_) => {
-            return Err(failure(SatelleError::invalid_usage(
-                "SATELLE_TEST_SUPPORT_ADAPTER must be exactly 'fake', 'pending', 'failing', 'readiness-failing', 'resolved-secret-canary', or unset",
-            )));
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(failure(SatelleError::invalid_usage(
-                "SATELLE_TEST_SUPPORT_ADAPTER must contain valid UTF-8",
-            )));
-        }
-        Err(std::env::VarError::NotPresent) => {}
+        None => {}
+        Some(_) => unreachable!("test-support adapter selection is closed"),
     }
 
     Ok(HostService::production_for_host(host_config))
 }
 
+fn local_daemon_artifact_error(path: &Path, error: SecureFileError) -> SatelleError {
+    SatelleError::config_error(
+        format!(
+            "the managed local daemon artifact '{}' is invalid: {error}",
+            path.display()
+        ),
+        Some("stop the local Host Daemon, remove the named artifact, and retry".to_string()),
+    )
+}
+
+fn read_local_daemon_endpoint(path: &Path) -> Result<LocalDaemonEndpoint, SatelleError> {
+    let encoded = read_owner_only_secret_config_file(path)
+        .map_err(|error| local_daemon_artifact_error(path, error))?;
+    let endpoint = serde_json::from_str::<LocalDaemonEndpoint>(&encoded)
+        .map_err(|_| local_daemon_artifact_error(path, SecureFileError::UnsafeOrUnavailable))?;
+    if endpoint.schema_version != "satelle.local-daemon-endpoint.v3"
+        || !endpoint.bind.ip().is_loopback()
+        || endpoint.bind.port() == 0
+        || HostIdentityRef::new(endpoint.host_identity.clone()).is_err()
+        || Uuid::parse_str(&endpoint.launch_id).is_err()
+    {
+        return Err(local_daemon_artifact_error(
+            path,
+            SecureFileError::UnsafeOrUnavailable,
+        ));
+    }
+    Ok(endpoint)
+}
+
+fn optional_local_daemon_endpoint(
+    path: &Path,
+) -> Result<Option<LocalDaemonEndpoint>, SatelleError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => read_local_daemon_endpoint(path).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(local_daemon_artifact_error(
+            path,
+            SecureFileError::UnsafeOrUnavailable,
+        )),
+    }
+}
+
+fn remove_stale_local_daemon_endpoint(
+    path: &Path,
+    stale: &LocalDaemonEndpoint,
+) -> Result<(), SatelleError> {
+    let Some(current) = optional_local_daemon_endpoint(path)? else {
+        return Ok(());
+    };
+    if &current == stale {
+        fs::remove_file(path)
+            .map_err(|_| local_daemon_artifact_error(path, SecureFileError::UnsafeOrUnavailable))?;
+    }
+    Ok(())
+}
+
+fn effective_local_host_config(
+    host: &SelectedHost,
+) -> Result<(HostConfig, PathBuf, ApiRateLimits), SatelleError> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let paths = resolve_path_set(&cwd)?;
+    let mut config = host.config.clone();
+    config
+        .daemon_config_file
+        .get_or_insert_with(|| paths.config_file.clone());
+    config
+        .daemon_state_dir
+        .get_or_insert_with(|| paths.state_root.clone());
+    config
+        .daemon_cache_dir
+        .get_or_insert_with(|| paths.cache_root.clone());
+    config
+        .daemon_log_dir
+        .get_or_insert_with(|| paths.operator_log_root.clone());
+    #[cfg(feature = "test-support")]
+    if std::env::var_os(TEST_SUPPORT_ADAPTER_ENV).is_some() && config.daemon_idle_timeout.is_none()
+    {
+        config.daemon_idle_timeout = satelle_core::ExplicitDuration::parse("250ms");
+    }
+    let state_root = config
+        .daemon_state_dir
+        .clone()
+        .expect("effective local Host config always has a state root");
+    let api_rate_limits = load_user_api_rate_limits(&paths.config_file)?;
+    Ok((config, state_root, api_rate_limits))
+}
+
+fn local_daemon_token(state_root: &Path) -> Result<Zeroizing<String>, SatelleError> {
+    let token_path = state_root.join(LOCAL_DAEMON_TOKEN_FILE);
+    match fs::symlink_metadata(&token_path) {
+        Ok(_) => {
+            return read_owner_only_secret_file(&token_path)
+                .map_err(|error| local_daemon_artifact_error(&token_path, error));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(local_daemon_artifact_error(
+                &token_path,
+                SecureFileError::UnsafeOrUnavailable,
+            ));
+        }
+    }
+
+    let token =
+        ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(LOCAL_DEMO_HOST))?;
+    let generated = token.expose();
+    match persist_new_owner_only_secret_file(&token_path, generated.as_str()) {
+        Ok(()) => Ok(generated),
+        Err(_) if token_path.exists() => read_owner_only_secret_file(&token_path)
+            .map_err(|error| local_daemon_artifact_error(&token_path, error)),
+        Err(error) => Err(local_daemon_artifact_error(&token_path, error)),
+    }
+}
+
+fn initialize_local_daemon_credentials(
+    host_config: &HostConfig,
+    state_root: &Path,
+) -> Result<(Zeroizing<String>, String), SatelleError> {
+    // Storage creates and validates the complete configured state-root chain.
+    // Pin that resulting owner-only boundary before placing controller secrets.
+    // Read status only: restart recovery belongs to the daemon, and running it
+    // here would block the Controller for minutes on unresolved Turns.
+    let service = local_host_service(host_config).map_err(|failure| failure.error)?;
+    let status = service.daemon_runtime_status()?;
+    drop(
+        open_or_create_owner_only_directory(state_root)
+            .map_err(|error| local_daemon_artifact_error(state_root, error))?,
+    );
+    let raw_token = local_daemon_token(state_root)?;
+    let token = ApiBearerToken::parse(raw_token.as_str()).map_err(|_| {
+        local_daemon_artifact_error(
+            &state_root.join(LOCAL_DAEMON_TOKEN_FILE),
+            SecureFileError::UnsafeOrUnavailable,
+        )
+    })?;
+    // One state store has one local daemon and one controller credential, even
+    // when several Controller aliases select it. Re-registering the same token
+    // under an alias-specific principal is rejected as a conflicting request.
+    service.register_api_token(&token, "local-controller", ApiScopes::ADMIN, None)?;
+    Ok((raw_token, status.host_identity().to_string()))
+}
+
+fn build_local_direct_transport(
+    host: &SelectedHost,
+    host_config: &HostConfig,
+    endpoint: &LocalDaemonEndpoint,
+    raw_token: &str,
+) -> Result<DirectTransport, SatelleError> {
+    let http_token = ApiBearerToken::parse(raw_token)
+        .map_err(|_| SatelleError::authentication_failed(&host.alias))?;
+    let event_token = ApiBearerToken::parse(raw_token)
+        .map_err(|_| SatelleError::authentication_failed(&host.alias))?;
+    let client = Arc::new(
+        DaemonClient::loopback_with_timeout(
+            endpoint.bind,
+            http_token,
+            &endpoint.host_identity,
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| direct_transport_error(&host.alias, error))?
+        .with_admission_timeout(admission_request_timeout(host_config)),
+    );
+    let event_client =
+        DaemonEventClient::loopback(endpoint.bind, event_token, endpoint.host_identity.clone())
+            .map_err(|error| direct_event_error(&host.alias, error))?;
+    let event_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| SatelleError::host_unreachable(&host.alias))?;
+    Ok(DirectTransport {
+        alias: host.alias.clone(),
+        mode: "local",
+        host_identity: endpoint.host_identity.clone(),
+        client,
+        event_client,
+        event_runtime,
+        _tunnel: None,
+        _bootstrap: None,
+    })
+}
+
+fn probe_local_daemon(
+    host: &SelectedHost,
+    host_config: &HostConfig,
+    endpoint: &LocalDaemonEndpoint,
+    raw_token: &str,
+) -> Result<Option<DirectTransport>, SatelleError> {
+    let transport = build_local_direct_transport(host, host_config, endpoint, raw_token)?;
+    match transport.client.capabilities() {
+        Ok(readiness) => {
+            let readiness = DurableReadinessSnapshot {
+                daemon_version: readiness.daemon_version().to_string(),
+                host_identity: readiness.host_identity().to_string(),
+            };
+            require_exact_durable_readiness(&host.alias, &endpoint.host_identity, &readiness)?;
+            Ok(Some(transport))
+        }
+        Err(DaemonClientError::Transport(error)) if error.is_connect() => Ok(None),
+        Err(error) => Err(direct_transport_error(&host.alias, error)),
+    }
+}
+
+fn write_local_daemon_launch_config(
+    state_root: &Path,
+    launch: &LocalDaemonLaunchConfig,
+) -> Result<PathBuf, SatelleError> {
+    let path = state_root.join(format!("local-daemon-launch-{}.json", launch.launch_id));
+    let encoded =
+        serde_json::to_vec(launch).map_err(|_| SatelleError::host_unreachable(LOCAL_DEMO_HOST))?;
+    persist_new_owner_only_config_file(&path, &encoded)
+        .map_err(|error| local_daemon_artifact_error(&path, error))?;
+    Ok(path)
+}
+
+fn launch_local_daemon_process(
+    launch_path: &Path,
+    idle_timeout: Duration,
+    host_config: &HostConfig,
+) -> Result<(), SatelleError> {
+    // Unix spawns the daemon as a child, so it inherits every variable the
+    // Controller can see. The Windows interactive-session launch starts from
+    // a scheduled task with a curated environment, so environment-sourced
+    // provider secrets must be forwarded by name or the daemon cannot
+    // resolve them.
+    #[cfg(windows)]
+    let provider_environment = host_config
+        .provider_auth
+        .values()
+        .filter_map(|source| match source {
+            satelle_core::ProviderSecretSource::Environment { variable } => Some(variable.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    #[cfg(not(windows))]
+    let _ = host_config;
+    let idle_timeout_ms = u64::try_from(idle_timeout.as_millis())
+        .map_err(|_| SatelleError::host_unreachable(LOCAL_DEMO_HOST))?;
+    let arguments = vec![
+        "host".into(),
+        "start".into(),
+        "--bind".into(),
+        "127.0.0.1:0".into(),
+        "--local-daemon-config".into(),
+        launch_path.as_os_str().to_owned(),
+        "--on-demand-idle-timeout-ms".into(),
+        idle_timeout_ms.to_string().into(),
+        "--json".into(),
+    ];
+
+    #[cfg(windows)]
+    {
+        crate::windows_interactive_bootstrap::launch_detached_local_daemon(
+            &arguments,
+            &provider_environment,
+        )
+        .map_err(|error| {
+            // The envelope keeps launcher stderr as private diagnostics;
+            // the closed reason tells the operator which step failed.
+            let mut unreachable = SatelleError::host_unreachable(LOCAL_DEMO_HOST);
+            unreachable.details.insert(
+                "reason".to_string(),
+                serde_json::Value::String("local_daemon_launch_failed".to_string()),
+            );
+            unreachable.source_detail = Some(error.to_string());
+            unreachable
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new(
+            std::env::current_exe().map_err(|_| SatelleError::host_unreachable(LOCAL_DEMO_HOST))?,
+        )
+        .args(&arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| SatelleError::host_unreachable(LOCAL_DEMO_HOST))
+    }
+}
+
+fn wait_for_local_daemon(
+    host: &SelectedHost,
+    host_config: &HostConfig,
+    expected_config_identity: Option<&LocalDaemonConfigIdentity>,
+    state_root: &Path,
+    launch_descriptor: Option<&Path>,
+) -> Result<DirectTransport, SatelleError> {
+    let endpoint_path = state_root.join(LOCAL_DAEMON_ENDPOINT_FILE);
+    let started = Instant::now();
+    let mut deadline = started + LOCAL_DAEMON_LAUNCH_TIMEOUT;
+    let mut daemon_started = false;
+    loop {
+        // The daemon deletes its launch descriptor as its first act, which
+        // proves the process exists even though nothing listens yet.
+        if !daemon_started
+            && let Some(path) = launch_descriptor
+            && !path.exists()
+        {
+            daemon_started = true;
+            deadline = started + LOCAL_DAEMON_STARTUP_TIMEOUT;
+        }
+        if let Some(endpoint) = optional_local_daemon_endpoint(&endpoint_path)? {
+            let raw_token = local_daemon_token(state_root)?;
+            if let Some(transport) = probe_local_daemon(host, host_config, &endpoint, &raw_token)?
+                && expected_config_identity
+                    .is_none_or(|expected| &endpoint.config_identity == expected)
+            {
+                return Ok(transport);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(SatelleError::host_unreachable(&host.alias));
+        }
+        thread::sleep(LOCAL_DAEMON_LAUNCH_POLL_INTERVAL);
+    }
+}
+
+fn wait_for_local_daemon_endpoint_change(
+    endpoint_path: &Path,
+    previous_launch_id: &str,
+) -> Result<(), SatelleError> {
+    let deadline = Instant::now() + LOCAL_DAEMON_LAUNCH_TIMEOUT;
+    loop {
+        match optional_local_daemon_endpoint(endpoint_path)? {
+            None => return Ok(()),
+            Some(endpoint) if endpoint.launch_id != previous_launch_id => return Ok(()),
+            Some(_) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(SatelleError::state_conflict());
+        }
+        thread::sleep(LOCAL_DAEMON_LAUNCH_POLL_INTERVAL);
+    }
+}
+
+fn local_daemon_transport_with_config_policy(
+    host: &SelectedHost,
+    require_config_match: bool,
+) -> Result<DirectTransport, SatelleError> {
+    let (host_config, state_root, api_rate_limits) = effective_local_host_config(host)?;
+    let config_identity = LocalDaemonConfigIdentity::new(host_config.clone(), api_rate_limits);
+    let expected_config_identity = require_config_match.then_some(&config_identity);
+    let endpoint_path = state_root.join(LOCAL_DAEMON_ENDPOINT_FILE);
+    let mut requested_relaunch = false;
+    while let Some(endpoint) = optional_local_daemon_endpoint(&endpoint_path)? {
+        let raw_token = local_daemon_token(&state_root)?;
+        if let Some(transport) = probe_local_daemon(host, &host_config, &endpoint, &raw_token)? {
+            let config_matches = expected_config_identity
+                .is_none_or(|expected| &endpoint.config_identity == expected);
+            if config_matches {
+                return Ok(transport);
+            }
+            if requested_relaunch {
+                return Err(SatelleError::state_conflict());
+            }
+            let relaunch_key = format!("local-relaunch-{}", endpoint.launch_id);
+            transport
+                .client
+                .relaunch_local_daemon_if_idle(&relaunch_key)
+                .map_err(|error| direct_transport_error(&host.alias, error))?;
+            drop(transport);
+            wait_for_local_daemon_endpoint_change(&endpoint_path, &endpoint.launch_id)?;
+            requested_relaunch = true;
+            continue;
+        }
+        remove_stale_local_daemon_endpoint(&endpoint_path, &endpoint)?;
+        break;
+    }
+
+    // The store can be held by a daemon that is still publishing its endpoint
+    // or by one that is shutting down after `host release-state`. Poll both
+    // outcomes under one deadline: adopt an endpoint that appears, or take the
+    // store ourselves once it is released and launch the daemon.
+    let deadline = Instant::now() + LOCAL_DAEMON_LAUNCH_TIMEOUT;
+    let (raw_token, host_identity) = loop {
+        match initialize_local_daemon_credentials(&host_config, &state_root) {
+            Ok(credentials) => break credentials,
+            Err(error) if error.code == ErrorCode::StoreInUse => {
+                if let Some(endpoint) = optional_local_daemon_endpoint(&endpoint_path)? {
+                    let raw_token = local_daemon_token(&state_root)?;
+                    if let Some(transport) =
+                        probe_local_daemon(host, &host_config, &endpoint, &raw_token)?
+                        && expected_config_identity
+                            .is_none_or(|expected| &endpoint.config_identity == expected)
+                    {
+                        return Ok(transport);
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(SatelleError::host_unreachable(&host.alias));
+                }
+                thread::sleep(LOCAL_DAEMON_LAUNCH_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let launch = LocalDaemonLaunchConfig::new(
+        host_config.clone(),
+        api_rate_limits,
+        host_identity,
+        &state_root,
+    );
+    let launch_path = write_local_daemon_launch_config(&state_root, &launch)?;
+    launch_local_daemon_process(
+        &launch_path,
+        on_demand_idle_timeout(&host_config),
+        &host_config,
+    )?;
+
+    // Retain the raw token until the daemon has authenticated this launch. It
+    // is zeroized when the transport takes fresh parsed copies below.
+    drop(raw_token);
+    wait_for_local_daemon(
+        host,
+        &host_config,
+        expected_config_identity,
+        &state_root,
+        Some(&launch_path),
+    )
+}
+
+fn local_daemon_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError> {
+    local_daemon_transport_with_config_policy(host, true)
+}
+
 pub(crate) fn transport_for(host: &SelectedHost) -> Result<Box<dyn TransportClient>, CliFailure> {
     transport_for_with_ssh_launch_policy(host, SshDaemonLaunchPolicy::DurableOnly)
+}
+
+pub(crate) fn transport_for_session_control(
+    host: &SelectedHost,
+) -> Result<Box<dyn TransportClient>, CliFailure> {
+    if host.config.transport == TransportKind::Local {
+        return local_daemon_transport_with_config_policy(host, false)
+            .map(|transport| Box::new(transport) as Box<dyn TransportClient>)
+            .map_err(failure);
+    }
+    transport_for(host)
 }
 
 pub(crate) fn transport_for_setup(
@@ -9044,9 +10010,9 @@ pub(crate) fn host_paths_for_inspection(
             SshDaemonLaunchPolicy::Bootstrap(SshBootstrapScope::Read),
         )
         .and_then(|transport| transport.host_paths()),
-        TransportKind::Local => local_host_service(&host.config)
-            .map_err(|failure| failure.error)
-            .and_then(|service| LocalTransport::new(host.alias.clone(), service).host_paths()),
+        TransportKind::Local => {
+            local_daemon_transport(host).and_then(|transport| transport.host_paths())
+        }
     };
     result.map_err(failure)
 }
@@ -9056,8 +10022,9 @@ fn transport_for_with_ssh_launch_policy(
     launch_policy: SshDaemonLaunchPolicy,
 ) -> Result<Box<dyn TransportClient>, CliFailure> {
     match host.config.transport {
-        TransportKind::Local => local_host_service(&host.config)
-            .map(|service| Box::new(LocalTransport::for_selected_host(host, service)) as _),
+        TransportKind::Local => local_daemon_transport(host)
+            .map(|transport| Box::new(transport) as _)
+            .map_err(failure),
         TransportKind::Direct => direct_transport(host)
             .map(|transport| Box::new(transport) as _)
             .map_err(failure),
@@ -9125,11 +10092,29 @@ impl SshHostDiscovery {
             return Ok(());
         };
         let finalized = (|| {
-            complete_bootstrap_handoff(
-                &finalization.alias,
-                &finalization.client,
-                &mut finalization.bootstrap_lock,
-            )?;
+            if !finalization.handoff_completed {
+                complete_bootstrap_handoff(
+                    &finalization.alias,
+                    &finalization.client,
+                    &mut finalization.bootstrap_lock,
+                )?;
+                finalization.handoff_completed = true;
+            }
+            if !finalization.state_owner_released {
+                finalization
+                    .target
+                    .release_identity_operation_state_owner(
+                        &finalization.destination,
+                        &finalization.record,
+                        &mut finalization.bootstrap_lock,
+                    )
+                    .map_err(|error| map_ssh_daemon_bootstrap_error(&finalization.alias, error))?;
+                finalization.state_owner_released = true;
+            }
+            // state_owner_release is the remote lifecycle proof. Retire the
+            // controller-side transport only after that proof; Windows
+            // OpenSSH can retain an otherwise completed exec channel.
+            drop(finalization.bootstrap.take());
             finalization
                 .target
                 .cleanup_identity_operation_artifact(
@@ -9222,8 +10207,10 @@ struct SshTrustFinalization {
     record: satelle_core::SshIdentityCommitRecord,
     client: Arc<DaemonClient>,
     _tunnel: SshTunnel,
-    _bootstrap: SshBootstrapProcess,
+    bootstrap: Option<SshBootstrapProcess>,
     bootstrap_lock: ssh_bootstrap::SshBootstrapLock,
+    handoff_completed: bool,
+    state_owner_released: bool,
 }
 
 pub(crate) struct PendingSshTrustCandidate {
@@ -9339,8 +10326,10 @@ impl PendingSshTrustCandidate {
                 record,
                 client,
                 _tunnel: tunnel,
-                _bootstrap: bootstrap,
+                bootstrap: Some(bootstrap),
                 bootstrap_lock,
+                handoff_completed: false,
+                state_owner_released: false,
             }),
         })
     }
@@ -9584,35 +10573,44 @@ mod bootstrap_ordering_tests {
     }
 
     #[derive(Default)]
-    struct InMemoryPersistentSetupExecution {
+    struct InMemorySetupExecution {
         events: Vec<String>,
         mutation_attempts: usize,
         fence_commits: usize,
-        fail_during: Option<PersistentSetupAction>,
+        fail_during: Option<SetupAction>,
         readiness_uncertain: bool,
         partial_failure: bool,
         recovery_pending: bool,
         mutation_pending: bool,
+        managed_codex: bool,
+        native_computer_use: bool,
     }
 
-    impl PersistentSetupExecution for InMemoryPersistentSetupExecution {
-        type Output = SetupApplication;
-
+    impl SetupExecution for InMemorySetupExecution {
         fn begin(&mut self) -> Result<(), SatelleError> {
             self.events.push("begin".to_string());
             Ok(())
         }
 
-        fn start(&mut self, action: PersistentSetupAction) -> Result<(), SatelleError> {
+        fn action_disposition(&self, action: SetupAction) -> SetupActionDisposition {
+            managed_setup_action_disposition(action, self.managed_codex, self.native_computer_use)
+        }
+
+        fn start(&mut self, action: SetupAction) -> Result<(), SatelleError> {
             self.events.push(format!("start:{}", action.id()));
             Ok(())
         }
 
-        fn apply(&mut self, action: PersistentSetupAction) -> Result<(), SatelleError> {
+        fn skip(&mut self, action: SetupAction) -> Result<(), SatelleError> {
+            self.events.push(format!("skip:{}", action.id()));
+            Ok(())
+        }
+
+        fn apply(&mut self, action: SetupAction) -> Result<(), SatelleError> {
             self.events.push(format!("mutate:{}", action.id()));
             self.mutation_attempts += 1;
             self.mutation_pending = true;
-            if action == PersistentSetupAction::ServiceStartOrRestart {
+            if action == SetupAction::ServiceStartOrRestart {
                 self.events.push("authenticated-readiness".to_string());
                 if self.readiness_uncertain {
                     self.recovery_pending = true;
@@ -9627,12 +10625,12 @@ mod bootstrap_ordering_tests {
             Ok(())
         }
 
-        fn complete(&mut self, action: PersistentSetupAction) -> Result<(), SatelleError> {
+        fn complete(&mut self, action: SetupAction) -> Result<(), SatelleError> {
             self.events.push(format!("complete:{}", action.id()));
             Ok(())
         }
 
-        fn fail(&mut self, action: PersistentSetupAction, source: SatelleError) -> SatelleError {
+        fn fail(&mut self, action: SetupAction, source: SatelleError) -> SatelleError {
             if self.mutation_pending {
                 self.fence_commits += 1;
                 self.mutation_pending = false;
@@ -9642,9 +10640,12 @@ mod bootstrap_ordering_tests {
             source
         }
 
-        fn finish(&mut self) -> Result<Self::Output, SatelleError> {
+        fn finish(&mut self) -> Result<SetupExecutionOutcome, SatelleError> {
             self.events.push("finish".to_string());
-            Ok(SetupApplication::AppliedReusableToken)
+            Ok(SetupExecutionOutcome {
+                application: SetupApplication::AppliedReusableToken,
+                managed_changed: false,
+            })
         }
     }
 
@@ -9682,9 +10683,10 @@ mod bootstrap_ordering_tests {
 
     #[test]
     fn persistent_setup_driver_runs_exact_actions_and_commits_each_mutation_once() {
-        let mut execution = InMemoryPersistentSetupExecution::default();
+        let mut execution = InMemorySetupExecution::default();
 
-        coordinate_persistent_setup(&mut execution).expect("coordinate persistent setup");
+        coordinate_setup(&mut execution, &PERSISTENT_SERVICE_ACTIONS)
+            .expect("coordinate persistent setup");
 
         let mutations = execution
             .events
@@ -9695,6 +10697,12 @@ mod bootstrap_ordering_tests {
             mutations,
             PERSISTENT_SERVICE_ACTIONS
                 .iter()
+                .filter(|action| {
+                    !matches!(
+                        action,
+                        SetupAction::ManagedCodex | SetupAction::NativeComputerUse
+                    )
+                })
                 .map(|action| action.id())
                 .collect::<Vec<_>>()
         );
@@ -9720,13 +10728,156 @@ mod bootstrap_ordering_tests {
     }
 
     #[test]
-    fn persistent_setup_driver_records_pre_start_failure_as_partial() {
-        let mut execution = InMemoryPersistentSetupExecution {
-            fail_during: Some(PersistentSetupAction::ServiceConfig),
-            ..InMemoryPersistentSetupExecution::default()
+    fn persistent_setup_driver_keeps_managed_components_in_the_ordered_maintenance_plan() {
+        let mut execution = InMemorySetupExecution {
+            managed_codex: true,
+            native_computer_use: true,
+            ..InMemorySetupExecution::default()
         };
 
-        assert!(coordinate_persistent_setup(&mut execution).is_err());
+        coordinate_setup(&mut execution, &PERSISTENT_SERVICE_ACTIONS)
+            .expect("coordinate managed setup");
+
+        let mutations = execution
+            .events
+            .iter()
+            .filter_map(|event| event.strip_prefix("mutate:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mutations,
+            PERSISTENT_SERVICE_ACTIONS
+                .iter()
+                .map(|action| action.id())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(execution.mutation_attempts, 7);
+        assert_eq!(execution.fence_commits, 7);
+    }
+
+    #[test]
+    fn on_demand_setup_driver_runs_selected_managed_actions_without_service_actions() {
+        let mut execution = InMemorySetupExecution {
+            managed_codex: true,
+            native_computer_use: true,
+            ..InMemorySetupExecution::default()
+        };
+
+        coordinate_setup(&mut execution, &ON_DEMAND_SETUP_ACTIONS)
+            .expect("coordinate on-demand managed setup");
+
+        let mutations = execution
+            .events
+            .iter()
+            .filter_map(|event| event.strip_prefix("mutate:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mutations,
+            ["bootstrap-handoff", "managed-codex", "native-computer-use"]
+        );
+        assert_eq!(execution.mutation_attempts, 3);
+        assert_eq!(execution.fence_commits, 3);
+        assert_eq!(execution.events.last().map(String::as_str), Some("finish"));
+        for service_action in [
+            "path-set-directories",
+            "service-config",
+            "service-registration",
+            "service-start-or-restart",
+        ] {
+            assert!(
+                !execution
+                    .events
+                    .iter()
+                    .any(|event| event.contains(service_action)),
+                "on-demand setup must omit service action {service_action}"
+            );
+        }
+    }
+
+    #[test]
+    fn on_demand_codex_only_records_native_computer_use_as_skipped() {
+        let mut execution = InMemorySetupExecution {
+            managed_codex: true,
+            ..InMemorySetupExecution::default()
+        };
+
+        coordinate_setup(&mut execution, &ON_DEMAND_SETUP_ACTIONS)
+            .expect("coordinate Codex-only on-demand setup");
+
+        let mutations = execution
+            .events
+            .iter()
+            .filter_map(|event| event.strip_prefix("mutate:"))
+            .collect::<Vec<_>>();
+        assert_eq!(mutations, ["bootstrap-handoff", "managed-codex"]);
+        let codex_complete = execution
+            .events
+            .iter()
+            .position(|event| event == "complete:managed-codex")
+            .expect("managed Codex completion");
+        let computer_use_skip = execution
+            .events
+            .iter()
+            .position(|event| event == "skip:native-computer-use")
+            .expect("native Computer Use skip");
+        assert!(codex_complete < computer_use_skip);
+        assert!(
+            !execution
+                .events
+                .iter()
+                .any(|event| event == "mutate:native-computer-use")
+        );
+    }
+
+    #[test]
+    fn on_demand_managed_failure_stops_before_later_actions_and_finish() {
+        let mut execution = InMemorySetupExecution {
+            managed_codex: true,
+            native_computer_use: true,
+            fail_during: Some(SetupAction::ManagedCodex),
+            ..InMemorySetupExecution::default()
+        };
+
+        assert!(coordinate_setup(&mut execution, &ON_DEMAND_SETUP_ACTIONS).is_err());
+
+        assert_eq!(
+            execution.events.last().map(String::as_str),
+            Some("failed:managed-codex")
+        );
+        assert!(
+            !execution.events.iter().any(|event| {
+                event.contains("native-computer-use") || event.as_str() == "finish"
+            })
+        );
+    }
+
+    #[test]
+    fn on_demand_managed_change_marks_a_reused_token_report_changed() {
+        let transport = setup_transport_for_report();
+        for (managed_changed, expected_changed) in [(false, false), (true, true)] {
+            let report = transport.setup_report(
+                false,
+                "on_demand".to_string(),
+                vec!["codex".to_string()],
+                DaemonPathOverrides::default(),
+                SetupExecutionOutcome {
+                    application: SetupApplication::AppliedReusableToken,
+                    managed_changed,
+                },
+                false,
+            );
+            assert_eq!(report.changed, expected_changed);
+            assert_eq!(report.mutated, expected_changed);
+        }
+    }
+
+    #[test]
+    fn persistent_setup_driver_records_pre_start_failure_as_partial() {
+        let mut execution = InMemorySetupExecution {
+            fail_during: Some(SetupAction::ServiceConfig),
+            ..InMemorySetupExecution::default()
+        };
+
+        assert!(coordinate_setup(&mut execution, &PERSISTENT_SERVICE_ACTIONS).is_err());
 
         assert!(execution.partial_failure);
         assert!(!execution.recovery_pending);
@@ -9740,12 +10891,12 @@ mod bootstrap_ordering_tests {
 
     #[test]
     fn persistent_setup_driver_keeps_post_start_readiness_uncertainty_recovery_pending() {
-        let mut execution = InMemoryPersistentSetupExecution {
+        let mut execution = InMemorySetupExecution {
             readiness_uncertain: true,
-            ..InMemoryPersistentSetupExecution::default()
+            ..InMemorySetupExecution::default()
         };
 
-        assert!(coordinate_persistent_setup(&mut execution).is_err());
+        assert!(coordinate_setup(&mut execution, &PERSISTENT_SERVICE_ACTIONS).is_err());
 
         assert!(!execution.partial_failure);
         assert!(execution.recovery_pending);
@@ -9772,20 +10923,23 @@ mod bootstrap_ordering_tests {
         };
 
         let report = transport
-            .setup_report_for_target(
-                true,
-                SetupModeSelection::new(
+            .setup_report_for_target(RemoteSetupReportInput {
+                dry_run: true,
+                setup_mode: SetupModeSelection::new(
                     satelle_core::SetupMode::Persistent,
                     satelle_core::daemon_service::SetupModeSource::SetupFlag,
                 ),
-                ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
-                vec!["transport".to_string()],
-                DaemonPathOverrides::default(),
-                SetupApplication::Planned {
-                    existing_token_file: true,
+                target: ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
+                setup_components: vec!["transport".to_string()],
+                daemon_path_overrides: DaemonPathOverrides::default(),
+                outcome: SetupExecutionOutcome {
+                    application: SetupApplication::Planned {
+                        existing_token_file: true,
+                    },
+                    managed_changed: false,
                 },
-                &observation,
-            )
+                current_daemon: &observation,
+            })
             .expect("build setup report");
         let artifact = report.host_artifact.expect("artifact plan");
         assert_eq!(artifact.current_version.as_deref(), Some("0.0.0"));
@@ -9806,20 +10960,23 @@ mod bootstrap_ordering_tests {
             validated_host_identity: None,
         };
         let newer_error = transport
-            .setup_report_for_target(
-                true,
-                SetupModeSelection::new(
+            .setup_report_for_target(RemoteSetupReportInput {
+                dry_run: true,
+                setup_mode: SetupModeSelection::new(
                     satelle_core::SetupMode::Persistent,
                     satelle_core::daemon_service::SetupModeSource::SetupFlag,
                 ),
-                ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
-                vec!["transport".to_string()],
-                DaemonPathOverrides::default(),
-                SetupApplication::Planned {
-                    existing_token_file: true,
+                target: ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
+                setup_components: vec!["transport".to_string()],
+                daemon_path_overrides: DaemonPathOverrides::default(),
+                outcome: SetupExecutionOutcome {
+                    application: SetupApplication::Planned {
+                        existing_token_file: true,
+                    },
+                    managed_changed: false,
                 },
-                &newer,
-            )
+                current_daemon: &newer,
+            })
             .expect_err("setup must not downgrade a newer Host");
         assert_eq!(
             newer_error.code,
@@ -9879,6 +11036,63 @@ mod bootstrap_ordering_tests {
             verifier_unavailable.details["remote_platform"],
             serde_json::json!("darwin-arm64")
         );
+    }
+
+    #[test]
+    fn computer_use_not_ready_reason_token_survives_the_daemon_round_trip() {
+        let api_error = |details: serde_json::Value| {
+            serde_json::from_value::<ApiError>(serde_json::json!({
+                "schema_version": "satelle.error.v1",
+                "request_id": "01890a5d-ac96-7b7c-8f89-37c3d0a66e01",
+                "host_identity": null,
+                "code": "computer-use-not-ready",
+                "category": "readiness",
+                "retryable": false,
+                "message": "native Computer Use is not ready on this Host",
+                "details": details,
+                "docs_url": null,
+                "suggested_commands": []
+            }))
+            .expect("closed daemon error payload")
+        };
+
+        let mapped = map_api_error(
+            "local-demo",
+            &api_error(serde_json::json!({
+                "reason": "native_readiness_action_evidence_unavailable"
+            })),
+        );
+        assert_eq!(mapped.code, satelle_core::ErrorCode::ComputerUseNotReady);
+        assert_eq!(
+            mapped.details["reason"],
+            serde_json::json!("native_readiness_action_evidence_unavailable")
+        );
+
+        // The macOS manual-setup pair keeps working unchanged.
+        let manual = map_api_error(
+            "local-demo",
+            &api_error(serde_json::json!({
+                "reason": "macos_native_computer_use_prerequisite_missing",
+                "status": "manual_action_required"
+            })),
+        );
+        assert_eq!(manual.code, satelle_core::ErrorCode::ComputerUseNotReady);
+        assert_eq!(manual.details.len(), 2);
+
+        // Anything outside the two closed shapes is an invalid daemon response.
+        for details in [
+            serde_json::json!({ "reason": "Free text with spaces" }),
+            serde_json::json!({ "reason": "ok_token", "extra": true }),
+            serde_json::json!({ "reason": "" }),
+        ] {
+            let rejected = map_api_error("local-demo", &api_error(details));
+            assert_eq!(rejected.code, satelle_core::ErrorCode::RemoteExecution);
+        }
+
+        // No details still maps to the bare readiness error.
+        let bare = map_api_error("local-demo", &api_error(serde_json::Value::Null));
+        assert_eq!(bare.code, satelle_core::ErrorCode::ComputerUseNotReady);
+        assert!(bare.details.is_empty());
     }
 
     #[test]
@@ -10098,20 +11312,23 @@ mod bootstrap_ordering_tests {
         assert_eq!(observation.validated_host_identity, None);
 
         let report = transport
-            .setup_report_for_target(
-                true,
-                SetupModeSelection::new(
+            .setup_report_for_target(RemoteSetupReportInput {
+                dry_run: true,
+                setup_mode: SetupModeSelection::new(
                     satelle_core::SetupMode::Persistent,
                     satelle_core::daemon_service::SetupModeSource::SetupFlag,
                 ),
-                ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
-                vec!["transport".to_string()],
-                DaemonPathOverrides::default(),
-                SetupApplication::Planned {
-                    existing_token_file: true,
+                target: ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
+                setup_components: vec!["transport".to_string()],
+                daemon_path_overrides: DaemonPathOverrides::default(),
+                outcome: SetupExecutionOutcome {
+                    application: SetupApplication::Planned {
+                        existing_token_file: true,
+                    },
+                    managed_changed: false,
                 },
-                &observation,
-            )
+                current_daemon: &observation,
+            })
             .expect("build setup report");
         let artifact = report.host_artifact.expect("artifact plan");
         assert_eq!(
@@ -10132,18 +11349,21 @@ mod bootstrap_ordering_tests {
         };
 
         let report = transport
-            .setup_report_for_target(
-                false,
-                SetupModeSelection::new(
+            .setup_report_for_target(RemoteSetupReportInput {
+                dry_run: false,
+                setup_mode: SetupModeSelection::new(
                     satelle_core::SetupMode::Persistent,
                     satelle_core::daemon_service::SetupModeSource::SetupFlag,
                 ),
-                ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
-                vec!["transport".to_string()],
-                DaemonPathOverrides::default(),
-                SetupApplication::AppliedReusableToken,
-                &observation,
-            )
+                target: ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
+                setup_components: vec!["transport".to_string()],
+                daemon_path_overrides: DaemonPathOverrides::default(),
+                outcome: SetupExecutionOutcome {
+                    application: SetupApplication::AppliedReusableToken,
+                    managed_changed: false,
+                },
+                current_daemon: &observation,
+            })
             .expect("build applied setup report");
         let artifact = report.host_artifact.expect("artifact plan");
         assert_eq!(artifact.current_version.as_deref(), Some("0.0.0"));

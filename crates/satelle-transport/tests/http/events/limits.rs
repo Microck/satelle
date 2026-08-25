@@ -287,7 +287,7 @@ async fn failing_sockets_do_not_interrupt_an_unrelated_live_subscriber() {
     .await;
 
     let mut events = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..7 {
         events.push(
             serde_json::from_str::<SatelleEvent>(&next_text(&mut subscriber).await)
                 .expect("decode live event after unrelated socket failures"),
@@ -303,12 +303,14 @@ async fn failing_sockets_do_not_interrupt_an_unrelated_live_subscriber() {
             EventType::TurnStarted,
             EventType::ProviderSmoke,
             EventType::TurnProgress,
+            EventType::Preflight,
+            EventType::Readiness,
             EventType::TurnCompleted,
         ]
     );
     assert_eq!(
         events.iter().map(SatelleEvent::seq).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5]
+        [1, 2, 3, 4, 5, 6, 7]
     );
     let readiness = &events[0];
     assert_eq!(readiness.data()["source"], "live");

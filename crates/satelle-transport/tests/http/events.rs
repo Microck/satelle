@@ -289,7 +289,7 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
     let admitted: SessionResponse = admitted.json().await.expect("decode admitted Session");
 
     let mut events = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..7 {
         let frame = next_text(&mut socket).await;
         assert_privacy_canaries_absent(
             "WebSocket raw event frame",
@@ -308,12 +308,14 @@ async fn event_socket_streams_only_post_subscription_commits_in_order() {
             EventType::TurnStarted,
             EventType::ProviderSmoke,
             EventType::TurnProgress,
+            EventType::Preflight,
+            EventType::Readiness,
             EventType::TurnCompleted,
         ]
     );
     assert_eq!(
         events.iter().map(SatelleEvent::seq).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5]
+        [1, 2, 3, 4, 5, 6, 7]
     );
     let readiness = &events[0];
     assert_eq!(readiness.data()["source"], "live");
@@ -635,7 +637,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
         .await
         .expect("admit visible follow-up for prior scope");
     assert_eq!(prior_follow_up.status(), StatusCode::ACCEPTED);
-    for expected_sequence in 1..=5 {
+    for expected_sequence in 1..=7 {
         let event = serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
             .expect("decode prior matching event");
         assert_eq!(event.seq(), expected_sequence);
@@ -688,7 +690,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
     assert_eq!(follow_up.status(), StatusCode::ACCEPTED);
 
     let mut events = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..7 {
         events.push(
             serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
                 .expect("decode matching event"),
@@ -696,7 +698,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
     }
     assert_eq!(
         events.iter().map(SatelleEvent::seq).collect::<Vec<_>>(),
-        [6, 7, 8, 9, 10]
+        [8, 9, 10, 11, 12, 13, 14]
     );
     assert!(
         events
@@ -745,7 +747,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
         .expect("admit overlapping-scope follow-up");
     assert_eq!(overlap_follow_up.status(), StatusCode::ACCEPTED);
     let mut overlap_events = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..7 {
         overlap_events.push(
             serde_json::from_str::<SatelleEvent>(&next_text(&mut socket).await)
                 .expect("decode overlapping-scope event"),
@@ -756,7 +758,7 @@ async fn replacing_event_subscriptions_filters_live_events_without_resetting_seq
             .iter()
             .map(SatelleEvent::seq)
             .collect::<Vec<_>>(),
-        [11, 12, 13, 14, 15]
+        [15, 16, 17, 18, 19, 20, 21]
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(100), next_text(&mut socket))
@@ -903,6 +905,22 @@ async fn daemon_event_client_validates_the_subscription_and_event_stream() {
             .expect("receive running event")
             .event_type(),
         EventType::TurnProgress
+    );
+    assert_eq!(
+        events
+            .next_event()
+            .await
+            .expect("receive adapter preflight event")
+            .event_type(),
+        EventType::Preflight
+    );
+    assert_eq!(
+        events
+            .next_event()
+            .await
+            .expect("receive adapter readiness event")
+            .event_type(),
+        EventType::Readiness
     );
     assert_eq!(
         events

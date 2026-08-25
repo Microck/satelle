@@ -10,9 +10,11 @@ mod setup;
 use crate::contract::{
     ApiError, ApiErrorCategory, ApiErrorCode, CapabilitiesResponse, EffectiveLimits,
     HostDesktopSessionsResponse, HostPathsResponse, HostStatusResponse, LiveResponse,
-    MaintenanceUpdateEvidenceResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId,
-    effective_limits,
+    LocalDaemonRelaunchResponse, LocalDoctorOperationRequest, LocalDoctorOperationResponse,
+    LocalSetupOperationRequest, LocalSetupOperationResponse, MaintenanceUpdateEvidenceResponse,
+    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, effective_limits,
 };
+use api_json::ApiJson;
 use auth::{AuthorizedRequest, REQUEST_ID_HEADER};
 use axum::Router;
 use axum::extract::{Extension, State};
@@ -54,6 +56,7 @@ pub struct DaemonServerConfig {
     idle_timeout: Option<Duration>,
     trusted_proxies: Arc<[TrustedProxy]>,
     api_rate_limits: ApiRateLimits,
+    local_relaunch: bool,
 }
 
 impl DaemonServerConfig {
@@ -65,6 +68,7 @@ impl DaemonServerConfig {
             idle_timeout: None,
             trusted_proxies: Arc::from([]),
             api_rate_limits: ApiRateLimits::default(),
+            local_relaunch: false,
         }
     }
 
@@ -85,6 +89,13 @@ impl DaemonServerConfig {
 
     pub const fn with_api_rate_limits(mut self, api_rate_limits: ApiRateLimits) -> Self {
         self.api_rate_limits = api_rate_limits;
+        self
+    }
+
+    /// Enables the private loopback lifecycle route used by the managed local
+    /// daemon when its daemon-owned configuration changes.
+    pub const fn with_local_relaunch(mut self) -> Self {
+        self.local_relaunch = true;
         self
     }
 
@@ -478,6 +489,7 @@ impl DaemonServer {
             setup_mutations: Mutex::new(HashMap::new()),
             provider_secret_uploads: Mutex::new(HashMap::new()),
             shutdown: shutdown.clone(),
+            local_relaunch: config.local_relaunch,
         });
         let router = router(Arc::clone(&state));
         let (listener, tls_reloader) = match tls {
@@ -504,7 +516,12 @@ impl DaemonServer {
             .with_graceful_shutdown(async move {
                 tokio::select! {
                     () = wait_for_shutdown(&mut receiver) => {}
-                    () = wait_for_idle(idle_service, connection_activity, idle_timeout) => {}
+                    () = wait_for_idle(
+                        idle_service,
+                        connection_activity,
+                        idle_timeout,
+                        config.local_relaunch,
+                    ) => {}
                 }
             })
             .await
@@ -627,10 +644,15 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Longest time an on-demand daemon waits for its launching client before the
+/// idle timeout may retire it. Matches the Controller's launch budget class.
+const STARTUP_IDLE_GRACE: Duration = Duration::from_secs(30);
+
 async fn wait_for_idle(
     service: Arc<HostService>,
     connections: ConnectionActivity,
     idle_timeout: Option<Duration>,
+    launched_on_demand: bool,
 ) {
     let Some(idle_timeout) = idle_timeout else {
         std::future::pending::<()>().await;
@@ -638,6 +660,18 @@ async fn wait_for_idle(
     };
     let poll_interval = idle_timeout.min(Duration::from_secs(1));
     let confirmation_interval = idle_timeout.min(Duration::from_millis(10));
+    // A Controller-launched daemon serves a client that has not connected
+    // yet. Until the first connection arrives, a short idle timeout would
+    // race that client's initial probe, so the idle clock waits out a
+    // startup grace period that is never shorter than the idle timeout.
+    // Daemons started any other way keep the plain idle contract.
+    let startup_grace = if launched_on_demand {
+        idle_timeout.max(STARTUP_IDLE_GRACE)
+    } else {
+        Duration::ZERO
+    };
+    let booted_at = tokio::time::Instant::now();
+    let (_, initial_connection_generation) = connections.snapshot();
     let mut observed_generation = None;
     let mut idle_since = None;
     let mut expiry_candidate = None;
@@ -648,6 +682,8 @@ async fn wait_for_idle(
             tokio::task::spawn_blocking(move || activity_service.daemon_activity_snapshot()).await;
         let (connected_clients, connection_generation) = connections.snapshot();
         let now = tokio::time::Instant::now();
+        let awaiting_first_client = connection_generation == initial_connection_generation
+            && now.duration_since(booted_at) < startup_grace;
 
         match host_activity {
             Ok(Ok(host_activity)) => {
@@ -658,7 +694,7 @@ async fn wait_for_idle(
                     expiry_candidate = None;
                 }
 
-                if host_activity.is_idle() && connected_clients == 0 {
+                if host_activity.is_idle() && connected_clients == 0 && !awaiting_first_client {
                     let started = idle_since.get_or_insert(now);
                     if now.duration_since(*started) >= idle_timeout {
                         if expiry_candidate == Some(generation) {
@@ -800,6 +836,7 @@ pub(super) struct DaemonState {
     >,
     provider_secret_uploads: Mutex<HashMap<String, setup::PendingProviderSecretUpload>>,
     shutdown: watch::Sender<bool>,
+    local_relaunch: bool,
 }
 
 fn router(state: Arc<DaemonState>) -> Router {
@@ -891,6 +928,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         .route(
             "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/start",
             post(setup::start_maintenance_action),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/apply-managed-setup",
+            post(setup::apply_managed_setup_action),
         )
         .route(
             "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/complete",
@@ -1003,6 +1044,33 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_control,
         ));
+    // These operations are used only by the managed local daemon. They keep
+    // setup and Doctor behind the same durable state owner as session control.
+    let local_setup_operation_route = Router::new()
+        .route("/v1/local/setup", post(local_setup_operation))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
+    let local_doctor_operation_route = Router::new()
+        .route("/v1/local/doctor", post(local_doctor_operation))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
+    let local_daemon_relaunch_route = if state.local_relaunch {
+        Router::new()
+            .route(
+                "/v1/local/relaunch-if-idle",
+                post(local_daemon_relaunch_if_idle),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth::require_admin_mutation,
+            ))
+    } else {
+        Router::new()
+    };
     let control_routes = Router::new()
         .route("/v1/sessions", post(sessions::create_session))
         .route(
@@ -1028,6 +1096,9 @@ fn router(state: Arc<DaemonState>) -> Router {
         .merge(setup_verification_route)
         .merge(setup_repair_plan_route)
         .merge(native_readiness_invalidation_route)
+        .merge(local_setup_operation_route)
+        .merge(local_doctor_operation_route)
+        .merge(local_daemon_relaunch_route)
         .merge(control_routes)
         .method_not_allowed_fallback(protected_method_not_allowed)
         .fallback(protected_not_found)
@@ -1125,6 +1196,100 @@ async fn maintenance_update_evidence(
         HeaderValue::from_static(PROTOCOL_VERSION),
     );
     response
+}
+
+async fn local_setup_operation(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    ApiJson(request): ApiJson<LocalSetupOperationRequest>,
+) -> Response {
+    let (host, dry_run, setup_mode, setup_components, daemon_path_overrides) = request.into_parts();
+    let service = Arc::clone(&state.service);
+    let result = match tokio::task::spawn_blocking(move || {
+        service.setup(
+            &host,
+            dry_run,
+            setup_mode,
+            setup_components,
+            daemon_path_overrides,
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = LocalSetupOperationResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        result,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn local_doctor_operation(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    ApiJson(request): ApiJson<LocalDoctorOperationRequest>,
+) -> Response {
+    let (host, scope_selection, options, provider_intent) = match request.into_inputs() {
+        Ok(inputs) => inputs,
+        Err(error) => return host_error::response(&state, &authorized, &error),
+    };
+    let service = Arc::clone(&state.service);
+    let result = match tokio::task::spawn_blocking(move || {
+        service.doctor_with_ready_controller_transport(
+            &host,
+            &scope_selection,
+            options,
+            &provider_intent,
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = LocalDoctorOperationResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        result,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn local_daemon_relaunch_if_idle(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    match state.service.daemon_workers_idle() {
+        Ok(true) => {
+            let response = LocalDaemonRelaunchResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+            );
+            let response = authenticated_json_response(
+                StatusCode::OK,
+                &response,
+                authorized.request_id(),
+                &state.host_identity,
+            );
+            let _ = state.shutdown.send(true);
+            response
+        }
+        Ok(false) => host_error::response(&state, &authorized, &SatelleError::state_conflict()),
+        Err(error) => host_error::response(&state, &authorized, &error),
+    }
 }
 
 async fn host_status(

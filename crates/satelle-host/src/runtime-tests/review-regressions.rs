@@ -663,8 +663,20 @@ fn terminal_stop_race_preserves_live_events_but_discards_losing_result_events() 
         .expect("terminal execution should return the stop winner");
 
     assert_eq!(latest_turn_state(&outcome.session), TurnState::Stopped);
-    assert_eq!(outcome.events.len(), 1);
-    assert_eq!(outcome.events[0].event_type(), EventType::ActionRequired);
+    // Every live adapter event survives, but the losing execution commits no
+    // terminal event, so no TurnCompleted reaches the attached outcome.
+    assert_eq!(
+        outcome
+            .events
+            .iter()
+            .map(|event| event.event_type())
+            .collect::<Vec<_>>(),
+        [
+            EventType::ActionRequired,
+            EventType::Preflight,
+            EventType::Readiness,
+        ]
+    );
     deadlock_guard.complete();
 }
 

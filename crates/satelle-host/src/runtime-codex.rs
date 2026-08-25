@@ -40,6 +40,7 @@ const COMPUTER_USE_PLUGIN_ID: &str = "computer-use@openai-bundled";
 const MACOS_CODEX_APP_ID: &str = "com.openai.codex";
 #[cfg(target_os = "macos")]
 const MACOS_CODEX_CLI_ID: &str = "codex";
+#[cfg(target_os = "macos")]
 const MACOS_CODEX_APP_PATH: &str = "/Applications/ChatGPT.app";
 const MACOS_NODE_REPL_ROOT: &str = "/Applications/ChatGPT.app/Contents/Resources/cua_node";
 #[cfg(target_os = "macos")]
@@ -52,6 +53,8 @@ const MACOS_COMPUTER_USE_SERVICE_EXECUTABLE: &str = "SkyComputerUseService";
 const CODEX_PACKAGE_FAMILY: &str = "OpenAI.Codex_2p2nqsd0c76g0";
 #[cfg(windows)]
 const CODEX_PACKAGE_NODE_REPL: &str = "app/resources/cua_node/bin/node_repl.exe";
+#[cfg(windows)]
+const CODEX_PACKAGE_MARKETPLACE: &str = "app/resources/plugins/openai-bundled";
 const NATIVE_BRIDGE_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const MACOS_NATIVE_LAUNCHER_FILE_LIMIT: u64 = 256 * 1024 * 1024;
@@ -240,16 +243,14 @@ impl super::CapabilityMatrix {
     }
 }
 
-pub(super) fn probe_installed_control_plane(
-    runtime: &crate::codex_install::VerifiedCodexRuntime,
+pub(super) fn probe_control_plane_commands(
+    mut mcp_command: Command,
+    mut schema_command: Command,
+    mut app_server_command: Command,
     timeout: Option<Duration>,
 ) -> ControlPlaneProbe {
     let timeout = timeout.unwrap_or(PROBE_TIMEOUT);
     let Some(deadline) = Instant::now().checked_add(timeout) else {
-        return ControlPlaneProbe::unavailable();
-    };
-    let Ok([mut mcp_command, mut schema_command, mut app_server_command]) = runtime.commands()
-    else {
         return ControlPlaneProbe::unavailable();
     };
     mcp_command = configure_mcp_inventory_command(mcp_command);
@@ -345,10 +346,18 @@ pub(crate) fn installed_read_only_app_server_command(
     deadline: Instant,
 ) -> Result<Command, SatelleError> {
     let runtime = crate::codex_install::admit_managed_codex_for_current_process()?;
-    // Build both commands from one post-admission identity verification. The
-    // inventory subprocess then consumes the same recovery deadline before
-    // the already-verified app-server command can be returned.
-    let [mut mcp_command, app_server_command] = runtime.commands()?;
+    // Recovery must read the exact receipt-recorded home that execution used.
+    let [mcp_command, app_server_command] = computer_use_runtime_commands(&runtime, deadline)?;
+    read_only_app_server_command(mcp_command, app_server_command, deadline)
+}
+
+pub(super) fn read_only_app_server_command(
+    mut mcp_command: Command,
+    app_server_command: Command,
+    deadline: Instant,
+) -> Result<Command, SatelleError> {
+    // The inventory subprocess consumes the caller's existing deadline before
+    // the app-server command from the same verified batch can be returned.
     mcp_command = configure_mcp_inventory_command(mcp_command);
     let mcp_output = bounded_inventory_command_output(
         mcp_command,
@@ -366,7 +375,7 @@ pub(crate) fn installed_read_only_app_server_command(
 pub(crate) fn installed_computer_use_app_server()
 -> Result<VerifiedComputerUseAppServer, SatelleError> {
     let runtime = crate::codex_install::admit_managed_codex_for_current_process()?;
-    verified_computer_use_app_server(&runtime)
+    verified_app_server_command(&runtime)
 }
 
 pub(crate) fn verified_app_server_command(
@@ -381,21 +390,20 @@ fn verified_computer_use_app_server(
     let isolation_deadline = Instant::now()
         .checked_add(NATIVE_ISOLATION_TIMEOUT)
         .ok_or_else(|| codex_isolation_error("inventory_deadline_invalid"))?;
+    let computer_use_codex_home = runtime.codex_home();
     let [plugin_command, mcp_command, app_server_command] =
         computer_use_runtime_commands(runtime, isolation_deadline)?;
     let (mut isolation, trusted_native_bridge_root, isolation_deadline) =
         configured_codex_isolation(
-            runtime.codex_home(),
+            computer_use_codex_home,
             plugin_command,
             mcp_command,
             isolation_deadline,
         )?;
     // The Windows desktop app creates a new named pipe on every launch and
-    // rewrites the interactive user's Codex config with that address. The
-    // isolated managed home can therefore retain a retired pipe after an app
-    // restart. Refresh only this short-lived, strictly shaped address from the
-    // current app-updated config; all executable and code-path trust still comes
-    // from the authenticated managed inventory below.
+    // rewrites the receipt-recorded user config with that address. Refresh
+    // only this short-lived, strictly shaped address; executable and code-path
+    // trust still comes from the authenticated inventory below.
     refresh_windows_native_pipe_binding(
         &mut isolation.native_mcp_binding,
         &isolation.native_mcp_server_name,
@@ -404,7 +412,7 @@ fn verified_computer_use_app_server(
         Path::new(&isolation.native_mcp_binding.command),
         &trusted_native_bridge_root,
         std::env::consts::OS,
-        runtime.codex_home(),
+        computer_use_codex_home,
         &mut isolation.native_mcp_binding.env,
         isolation_deadline,
     )?;
@@ -466,6 +474,10 @@ pub(crate) fn configure_app_server_command(
     // user-level feature override cannot remove that approval path from the
     // Host-owned private app-server process.
     command.args([
+        "--config",
+        "features.code_mode=true",
+        "--config",
+        "features.code_mode_host=true",
         "--config",
         "features.auth_elicitation=true",
         "--config",
@@ -597,6 +609,28 @@ struct PluginInventory {
     installed: Vec<InstalledPlugin>,
 }
 
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketplaceAddResult {
+    marketplace_name: String,
+    installed_root: PathBuf,
+    already_added: bool,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Deserialize)]
+struct MarketplaceInventory {
+    marketplaces: Vec<ConfiguredMarketplace>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Deserialize)]
+struct ConfiguredMarketplace {
+    name: String,
+    root: PathBuf,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InstalledPlugin {
@@ -657,17 +691,460 @@ fn configured_codex_isolation(
         "mcp_inventory_failed",
     )?;
 
-    let trusted_native_bridge_root = official_native_bridge_root(std::env::consts::OS, codex_home)?;
+    let platform = std::env::consts::OS;
+    let trusted_computer_use_plugin_root = official_computer_use_plugin_root(platform, codex_home)?;
+    let trusted_native_bridge_root = official_native_bridge_root(platform, codex_home)?;
     let isolation = codex_isolation_plan_from_json(
         &plugin_output,
         &mcp_output,
-        std::env::consts::OS,
+        platform,
         codex_home,
+        &trusted_computer_use_plugin_root,
         &trusted_native_bridge_root,
     )?;
     #[cfg(target_os = "macos")]
     authenticate_macos_computer_use_service(codex_home, deadline)?;
     Ok((isolation, trusted_native_bridge_root, deadline))
+}
+
+/// Establishes the platform's official Computer Use integration. Windows
+/// installs the official plugin and binding. macOS verifies the complete
+/// signed desktop stack because Satelle cannot manufacture Apple-signed app
+/// components. Linux is not a native Computer Use Host.
+pub(crate) fn provision_native_computer_use(
+    runtime: &crate::codex_install::VerifiedCodexRuntime,
+) -> Result<bool, SatelleError> {
+    #[cfg(windows)]
+    {
+        provision_windows_computer_use(runtime)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        validate_macos_computer_use_prerequisites(runtime)
+            .map_err(macos_setup_prerequisite_error)?;
+        Ok(false)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = runtime;
+        Err(codex_isolation_error("native_bridge_platform_unsupported"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_computer_use_prerequisites(
+    runtime: &crate::codex_install::VerifiedCodexRuntime,
+) -> Result<(), SatelleError> {
+    let deadline = Instant::now()
+        .checked_add(NATIVE_ISOLATION_TIMEOUT)
+        .ok_or_else(|| codex_isolation_error("inventory_deadline_invalid"))?;
+    let computer_use_codex_home = runtime.codex_home();
+    let [plugin_command, mcp_command] = computer_use_runtime_commands(runtime, deadline)?;
+    let (isolation, trusted_native_bridge_root, deadline) = configured_codex_isolation(
+        computer_use_codex_home,
+        plugin_command,
+        mcp_command,
+        deadline,
+    )?;
+    authenticated_macos_native_bridge_cdhash(
+        Path::new(&isolation.native_mcp_binding.command),
+        &trusted_native_bridge_root,
+        deadline,
+    )?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn macos_setup_prerequisite_error(error: SatelleError) -> SatelleError {
+    let missing = error
+        .details
+        .get("reason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| {
+            matches!(
+                reason,
+                "codex_app_runtime_missing"
+                    | "computer_use_service_missing"
+                    | "computer_use_plugin_missing"
+                    | "computer_use_plugin_not_ready"
+                    | "native_bridge_missing"
+            )
+        });
+    if !missing {
+        return error;
+    }
+
+    SatelleError {
+        code: satelle_core::ErrorCode::ComputerUseNotReady,
+        message: "macOS Computer Use requires the current signed ChatGPT desktop components"
+            .to_string(),
+        recovery_command: Some("satelle doctor --scope computer-use --refresh --json".to_string()),
+        source_detail: None,
+        details: BTreeMap::from([
+            (
+                "reason".to_string(),
+                json!("macos_native_computer_use_prerequisite_missing"),
+            ),
+            ("status".to_string(), json!("manual_action_required")),
+        ]),
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_config_with_allowed_app(
+    contents: &str,
+    app_id: &str,
+) -> Result<Option<String>, SatelleError> {
+    let mut config = toml::from_str::<toml::Value>(contents)
+        .map_err(|_| codex_isolation_error("native_app_approval_config_untrusted"))?;
+    let root = config
+        .as_table_mut()
+        .ok_or_else(|| codex_isolation_error("native_app_approval_config_untrusted"))?;
+    let computer_use = root
+        .entry("computer_use")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| codex_isolation_error("native_app_approval_config_untrusted"))?;
+    let windows = computer_use
+        .entry("windows")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| codex_isolation_error("native_app_approval_config_untrusted"))?;
+    let allowed = windows
+        .entry("always_allowed_app_ids")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| codex_isolation_error("native_app_approval_config_untrusted"))?;
+    if allowed.iter().any(|value| value.as_str() == Some(app_id)) {
+        return Ok(None);
+    }
+    allowed.push(toml::Value::String(app_id.to_string()));
+    toml::to_string_pretty(&config)
+        .map(Some)
+        .map_err(|_| codex_isolation_error("native_app_approval_config_unavailable"))
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn configured_windows_marketplace_root(
+    inventory: &[u8],
+) -> Result<Option<PathBuf>, SatelleError> {
+    let inventory = serde_json::from_slice::<MarketplaceInventory>(inventory)
+        .map_err(|_| codex_isolation_error("plugin_marketplace_inventory_malformed"))?;
+    let mut roots = inventory
+        .marketplaces
+        .into_iter()
+        .filter_map(|marketplace| {
+            (marketplace.name == "openai-bundled").then_some(marketplace.root)
+        });
+    let root = roots.next();
+    if roots.next().is_some() {
+        return Err(codex_isolation_error(
+            "plugin_marketplace_inventory_ambiguous",
+        ));
+    }
+    Ok(root)
+}
+
+#[cfg(windows)]
+fn ensure_windows_readiness_app_allowed(codex_home: &Path) -> Result<bool, SatelleError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let config_path = codex_home.join("config.toml");
+    let metadata = fs::symlink_metadata(&config_path)
+        .map_err(|_| codex_isolation_error("native_app_approval_config_unavailable"))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > SCHEMA_FILE_LIMIT
+    {
+        return Err(codex_isolation_error(
+            "native_app_approval_config_untrusted",
+        ));
+    }
+    let contents = fs::read_to_string(&config_path)
+        .map_err(|_| codex_isolation_error("native_app_approval_config_unavailable"))?;
+    let Some(updated) = windows_config_with_allowed_app(&contents, "satelle.exe")? else {
+        return Ok(false);
+    };
+
+    // Replace only from a new sibling file. A failed write or replacement
+    // leaves the complete prior Codex authorization state untouched.
+    let staged_path = codex_home.join(format!(".config.toml.{}.tmp", uuid::Uuid::now_v7()));
+    let write_result = (|| -> Result<(), SatelleError> {
+        let mut staged = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged_path)
+            .map_err(|_| codex_isolation_error("native_app_approval_config_unavailable"))?;
+        staged
+            .write_all(updated.as_bytes())
+            .and_then(|()| staged.sync_all())
+            .map_err(|_| codex_isolation_error("native_app_approval_config_unavailable"))?;
+        drop(staged);
+
+        let staged_wide = staged_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let config_wide = config_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let status = unsafe {
+            MoveFileExW(
+                staged_wide.as_ptr(),
+                config_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if status == 0 {
+            return Err(codex_isolation_error(
+                "native_app_approval_config_unavailable",
+            ));
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(staged_path);
+    }
+    write_result.map(|()| true)
+}
+
+#[cfg(windows)]
+fn provision_windows_computer_use(
+    runtime: &crate::codex_install::VerifiedCodexRuntime,
+) -> Result<bool, SatelleError> {
+    let deadline = Instant::now()
+        .checked_add(NATIVE_ISOLATION_TIMEOUT)
+        .ok_or_else(|| codex_isolation_error("inventory_deadline_invalid"))?;
+    let marketplace_root = official_windows_computer_use_marketplace_root()?;
+    let trusted_computer_use_plugin_root = marketplace_root.join("plugins").join("computer-use");
+    let trusted_bridge_root = official_native_bridge_root("windows", runtime.codex_home())?;
+
+    // Resolve the complete desired desktop binding before any marketplace or
+    // MCP mutation. The desktop app and managed Codex share this config, so a
+    // failed preflight must leave the prior binding intact for repair.
+    let mcp_inventory_command = configure_mcp_inventory_command(runtime.command()?);
+    let mcp_inventory = bounded_inventory_command_output(
+        mcp_inventory_command,
+        deadline,
+        "mcp_inventory_unavailable",
+        "mcp_inventory_failed",
+    )?;
+    let servers = configured_mcp_servers_from_json(&mcp_inventory)?;
+    let existing_native_bridge = servers.iter().find(|server| server.name == "node_repl");
+    let replacement_native_bridge = match existing_native_bridge {
+        Some(server)
+            if trusted_native_mcp_binding(
+                server,
+                "windows",
+                &trusted_bridge_root,
+                runtime.codex_home(),
+            )
+            .is_some() =>
+        {
+            None
+        }
+        Some(_) | None => Some(current_windows_desktop_native_binding(
+            runtime.codex_home(),
+            &trusted_bridge_root,
+        )?),
+    };
+    let remove_native_bridge =
+        existing_native_bridge.is_some() && replacement_native_bridge.is_some();
+
+    // Codex refuses to add the current signed AppX bundle while the same name
+    // points anywhere else. Remove only that conflicting registration, then
+    // establish and verify the one canonical signed source.
+    let mut marketplace_inventory_command = runtime.command()?;
+    marketplace_inventory_command.args(["plugin", "marketplace", "list", "--json"]);
+    let marketplace_inventory = bounded_inventory_command_output(
+        marketplace_inventory_command,
+        deadline,
+        "plugin_marketplace_inventory_unavailable",
+        "plugin_marketplace_inventory_failed",
+    )?;
+    let configured_marketplace = configured_windows_marketplace_root(&marketplace_inventory)?;
+    let marketplace_matches = configured_marketplace
+        .as_deref()
+        .is_some_and(|configured_root| {
+            same_path_for_platform(configured_root, &marketplace_root, "windows")
+        });
+    let mut changed = false;
+    if configured_marketplace.is_some() && !marketplace_matches {
+        let mut marketplace_remove_command = runtime
+            .command()
+            .map_err(|error| mark_provision_changed(error, changed))?;
+        marketplace_remove_command.args([
+            "plugin",
+            "marketplace",
+            "remove",
+            "openai-bundled",
+            "--json",
+        ]);
+        bounded_mutation_command_output(
+            marketplace_remove_command,
+            deadline,
+            "plugin_marketplace_remove_unavailable",
+            "plugin_marketplace_remove_failed",
+        )
+        .map_err(|error| mark_provision_changed(error, true))?;
+        changed = true;
+    }
+    if !marketplace_matches {
+        let mut marketplace_add_command = runtime
+            .command()
+            .map_err(|error| mark_provision_changed(error, changed))?;
+        marketplace_add_command
+            .args(["plugin", "marketplace", "add"])
+            .arg(&marketplace_root)
+            .arg("--json");
+        let marketplace_output = bounded_mutation_command_output(
+            marketplace_add_command,
+            deadline,
+            "plugin_marketplace_unavailable",
+            "plugin_marketplace_install_failed",
+        )
+        .map_err(|error| mark_provision_changed(error, true))?;
+        let marketplace_result =
+            serde_json::from_slice::<MarketplaceAddResult>(&marketplace_output).map_err(|_| {
+                mark_provision_changed(
+                    codex_isolation_error("plugin_marketplace_result_malformed"),
+                    true,
+                )
+            })?;
+        if marketplace_result.marketplace_name != "openai-bundled"
+            || !same_path_for_platform(
+                &marketplace_result.installed_root,
+                &marketplace_root,
+                "windows",
+            )
+            || marketplace_result.already_added
+        {
+            return Err(mark_provision_changed(
+                codex_isolation_error("plugin_marketplace_result_untrusted"),
+                true,
+            ));
+        }
+        changed = true;
+    }
+
+    let mut plugin_inventory_command = runtime
+        .command()
+        .map_err(|error| mark_provision_changed(error, changed))?;
+    plugin_inventory_command.args(["plugin", "list", "--available", "--json"]);
+    let plugin_inventory = bounded_inventory_command_output(
+        plugin_inventory_command,
+        deadline,
+        "plugin_inventory_unavailable",
+        "plugin_inventory_failed",
+    )
+    .map_err(|error| mark_provision_changed(error, changed))?;
+    let plugin_inventory =
+        serde_json::from_slice::<PluginInventory>(&plugin_inventory).map_err(|_| {
+            mark_provision_changed(codex_isolation_error("plugin_inventory_malformed"), changed)
+        })?;
+    let installed_plugin = plugin_inventory
+        .installed
+        .iter()
+        .find(|plugin| plugin.plugin_id == COMPUTER_USE_PLUGIN_ID && plugin.installed);
+    if let Some(plugin) = installed_plugin {
+        if plugin.marketplace_name != "openai-bundled"
+            || !plugin.enabled
+            || plugin
+                .version
+                .as_deref()
+                .is_none_or(|version| !component_version_is_valid(version))
+        {
+            return Err(mark_provision_changed(
+                codex_isolation_error("computer_use_plugin_not_ready"),
+                changed,
+            ));
+        }
+        if !computer_use_plugin_source_is_trusted(
+            plugin,
+            "windows",
+            &trusted_computer_use_plugin_root,
+        ) {
+            return Err(mark_provision_changed(
+                codex_isolation_error("computer_use_plugin_source_untrusted"),
+                changed,
+            ));
+        }
+    } else {
+        let mut plugin_add_command = runtime
+            .command()
+            .map_err(|error| mark_provision_changed(error, changed))?;
+        plugin_add_command.args(["plugin", "add", COMPUTER_USE_PLUGIN_ID, "--json"]);
+        if let Err(error) = bounded_mutation_command_output(
+            plugin_add_command,
+            deadline,
+            "computer_use_plugin_unavailable",
+            "computer_use_plugin_install_failed",
+        ) {
+            return Err(mark_provision_changed(error, true));
+        }
+        changed = true;
+    }
+
+    if remove_native_bridge {
+        // `mcp add` does not overwrite an existing name. The replacement was
+        // admitted before mutation, so removing this failed binding cannot
+        // destroy the only recovery source.
+        let mut mcp_remove_command = runtime
+            .command()
+            .map_err(|error| mark_provision_changed(error, changed))?;
+        mcp_remove_command.args(["mcp", "remove", "node_repl"]);
+        if let Err(error) = bounded_mutation_command_output(
+            mcp_remove_command,
+            deadline,
+            "native_bridge_remove_unavailable",
+            "native_bridge_remove_failed",
+        ) {
+            return Err(mark_provision_changed(error, true));
+        }
+        changed = true;
+    }
+    if let Some(binding) = replacement_native_bridge {
+        let mut mcp_add_command = runtime
+            .command()
+            .map_err(|error| mark_provision_changed(error, changed))?;
+        mcp_add_command.args(["mcp", "add", "node_repl"]);
+        for (key, value) in &binding.env {
+            mcp_add_command.arg("--env").arg(format!("{key}={value}"));
+        }
+        mcp_add_command.arg("--").arg(&binding.command);
+        if let Err(error) = bounded_mutation_command_output(
+            mcp_add_command,
+            deadline,
+            "native_bridge_install_unavailable",
+            "native_bridge_install_failed",
+        ) {
+            return Err(mark_provision_changed(error, true));
+        }
+        changed = true;
+    }
+
+    changed = ensure_windows_readiness_app_allowed(runtime.codex_home())
+        .map_err(|error| mark_provision_changed(error, changed))?
+        || changed;
+
+    let [plugin_command, mcp_command] = runtime
+        .commands()
+        .map_err(|error| mark_provision_changed(error, changed))?;
+    configured_codex_isolation(runtime.codex_home(), plugin_command, mcp_command, deadline)
+        .map_err(|error| mark_provision_changed(error, changed))?;
+    Ok(changed)
+}
+
+#[cfg(windows)]
+fn mark_provision_changed(mut error: SatelleError, changed: bool) -> SatelleError {
+    error.details.insert("changed".to_string(), json!(changed));
+    error
 }
 
 fn computer_use_runtime_commands<const COUNT: usize>(
@@ -676,6 +1153,7 @@ fn computer_use_runtime_commands<const COUNT: usize>(
 ) -> Result<[Command; COUNT], SatelleError> {
     #[cfg(target_os = "macos")]
     {
+        let _ = runtime;
         // The signed macOS Computer Use service authenticates the node_repl
         // process and its Codex ancestor as one desktop release family. A
         // separately installed standalone Codex binary is signed by OpenAI,
@@ -693,6 +1171,75 @@ fn computer_use_runtime_commands<const COUNT: usize>(
 }
 
 pub(super) fn bounded_inventory_command_output(
+    command: Command,
+    deadline: Instant,
+    unavailable_reason: &'static str,
+    failed_reason: &'static str,
+) -> Result<Vec<u8>, SatelleError> {
+    bounded_command_output(command, deadline, unavailable_reason, failed_reason)
+}
+
+#[cfg(windows)]
+pub(super) fn bounded_mutation_command_output(
+    mut command: Command,
+    deadline: Instant,
+    unavailable_reason: &'static str,
+    failed_reason: &'static str,
+) -> Result<Vec<u8>, SatelleError> {
+    if Instant::now() >= deadline {
+        return Err(codex_isolation_error(unavailable_reason));
+    }
+    // The official Windows Codex CLI does not commit configuration mutations
+    // when assigned to Satelle's nested job object. It is synchronous, so run
+    // the signed CLI as a plain bounded child and kill that child on timeout.
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| codex_isolation_error(unavailable_reason))?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(codex_isolation_error(unavailable_reason));
+    };
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let output = read_inventory_output(stdout, deadline);
+        let _ = sender.send(output);
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break super::GroupWaitOutcome::Exited(status),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) => break super::GroupWaitOutcome::Deadline,
+            Err(_) => break super::GroupWaitOutcome::Error,
+        }
+    };
+    let process_stopped = match status {
+        super::GroupWaitOutcome::Exited(_) => true,
+        super::GroupWaitOutcome::Deadline | super::GroupWaitOutcome::Error => {
+            let _ = child.kill();
+            child.wait().is_ok()
+        }
+    };
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(10));
+    let output = receiver.recv_timeout(remaining);
+    let reader_stopped = output.is_ok() && reader.join().is_ok();
+    finish_inventory_output(
+        status,
+        process_stopped && reader_stopped,
+        output.ok().and_then(Result::ok),
+        unavailable_reason,
+        failed_reason,
+    )
+}
+
+fn bounded_command_output(
     mut command: Command,
     deadline: Instant,
     unavailable_reason: &'static str,
@@ -716,10 +1263,6 @@ pub(super) fn bounded_inventory_command_output(
         let output = read_inventory_output(stdout, deadline);
         let _ = sender.send(output);
     });
-    // Inventory success belongs to the command leader. Codex may leave
-    // background helpers in the Windows job after that leader has emitted
-    // complete JSON and exited. Waiting for the full job here consumes the
-    // probe deadline; terminate and verify descendants immediately instead.
     let status = super::wait_for_leader(&mut child, deadline);
     let group_stopped = super::terminate_group(&mut child);
     let remaining = deadline
@@ -865,6 +1408,7 @@ pub(crate) fn codex_isolation_plan_from_json(
     mcp_json: &[u8],
     platform: &str,
     codex_home: &Path,
+    trusted_computer_use_plugin_root: &Path,
     trusted_native_bridge_root: &Path,
 ) -> Result<CodexIsolationPlan, SatelleError> {
     let inventory = serde_json::from_slice::<PluginInventory>(plugin_json)
@@ -909,11 +1453,11 @@ pub(crate) fn codex_isolation_plan_from_json(
     if computer_use.marketplace_name != "openai-bundled" || !computer_use.enabled {
         return Err(codex_isolation_error("computer_use_plugin_not_ready"));
     }
-    let expected_plugin_root = expected_computer_use_plugin_root(codex_home, platform);
-    if computer_use.source.source != "local"
-        || !path_is_absolute_for_platform(&computer_use.source.path, platform)
-        || !same_path_for_platform(&computer_use.source.path, &expected_plugin_root, platform)
-    {
+    if !computer_use_plugin_source_is_trusted(
+        computer_use,
+        platform,
+        trusted_computer_use_plugin_root,
+    ) {
         return Err(codex_isolation_error(
             "computer_use_plugin_source_untrusted",
         ));
@@ -944,7 +1488,6 @@ pub(crate) fn codex_isolation_plan_from_json(
         codex_home,
     )
     .ok_or_else(|| codex_isolation_error("native_bridge_untrusted"))?;
-
     Ok(CodexIsolationPlan {
         disabled_mcp_server_names: servers
             .into_iter()
@@ -957,26 +1500,44 @@ pub(crate) fn codex_isolation_plan_from_json(
     })
 }
 
-fn expected_computer_use_plugin_root(codex_home: &Path, platform: &str) -> PathBuf {
+fn computer_use_plugin_source_is_trusted(
+    plugin: &InstalledPlugin,
+    platform: &str,
+    trusted_computer_use_plugin_root: &Path,
+) -> bool {
+    if plugin.source.source != "local"
+        || !path_is_absolute_for_platform(&plugin.source.path, platform)
+    {
+        return false;
+    }
+
+    matches!(platform, "windows" | "macos")
+        && same_path_for_platform(
+            &plugin.source.path,
+            trusted_computer_use_plugin_root,
+            platform,
+        )
+}
+
+fn official_computer_use_plugin_root(
+    platform: &str,
+    codex_home: &Path,
+) -> Result<PathBuf, SatelleError> {
     match platform {
-        // The macOS runtime command and its enclosing app bundle have already
-        // passed the OpenAI code-signing requirement before inventory runs.
-        // Trust the current bundle-owned plugin and reject retired copied
-        // plugin trees under CODEX_HOME.
-        "macos" => Path::new(MACOS_CODEX_APP_PATH)
-            .join("Contents")
-            .join("Resources")
-            .join("plugins")
-            .join("openai-bundled")
-            .join("plugins")
-            .join("computer-use"),
-        "windows" => codex_home
+        #[cfg(windows)]
+        "windows" => official_windows_computer_use_marketplace_root()
+            .map(|root| root.join("plugins").join("computer-use")),
+        // The authenticated desktop CLI materializes its bundled marketplace
+        // under the interactive user's Codex home before reporting inventory.
+        // Admit only that exact app-managed snapshot, never an arbitrary local
+        // plugin tree.
+        "macos" => Ok(codex_home
             .join(".tmp")
             .join("bundled-marketplaces")
             .join("openai-bundled")
             .join("plugins")
-            .join("computer-use"),
-        _ => unreachable!("native Computer Use platform was validated above"),
+            .join("computer-use")),
+        _ => Err(codex_isolation_error("native_bridge_platform_unsupported")),
     }
 }
 
@@ -1047,9 +1608,14 @@ fn prepare_native_bridge(
             })
         }
         "macos" => {
-            validate_native_bridge_filesystem(path, trusted_root, platform)?;
             #[cfg(target_os = "macos")]
-            return prepare_macos_native_bridge(path, codex_home, native_env, deadline);
+            return prepare_macos_native_bridge(
+                path,
+                trusted_root,
+                codex_home,
+                native_env,
+                deadline,
+            );
             #[cfg(not(target_os = "macos"))]
             Ok(PreparedNativeBridge {
                 // Non-macOS unit tests can inspect the closed launcher
@@ -1096,6 +1662,7 @@ impl NativeSessionResources {
 #[cfg(target_os = "macos")]
 fn prepare_macos_native_bridge(
     bridge: &Path,
+    trusted_root: &Path,
     codex_home: &Path,
     _native_env: &mut BTreeMap<String, String>,
     deadline: Instant,
@@ -1109,9 +1676,7 @@ fn prepare_macos_native_bridge(
     if !macos_process_signature_valid(std::process::id()) {
         return Err(codex_isolation_error("native_bridge_launcher_untrusted"));
     }
-    let bridge_cdhash = macos_path_cdhash(bridge)
-        .filter(|_| macos_path_matches_openai_signature(bridge, deadline))
-        .ok_or_else(|| codex_isolation_error("native_bridge_untrusted"))?;
+    let bridge_cdhash = authenticated_macos_native_bridge_cdhash(bridge, trusted_root, deadline)?;
     // Admission executes three independently signed native components. Bind
     // every executable identity into readiness so a partial Desktop update
     // cannot reuse proof collected for a different app-server or service.
@@ -1193,6 +1758,18 @@ fn prepare_macos_native_bridge(
             _macos: Some(native_resources),
         },
     })
+}
+
+#[cfg(target_os = "macos")]
+fn authenticated_macos_native_bridge_cdhash(
+    bridge: &Path,
+    trusted_root: &Path,
+    deadline: Instant,
+) -> Result<String, SatelleError> {
+    validate_native_bridge_filesystem(bridge, trusted_root, "macos")?;
+    macos_path_cdhash(bridge)
+        .filter(|_| macos_path_matches_openai_signature(bridge, deadline))
+        .ok_or_else(|| codex_isolation_error("native_bridge_untrusted"))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1415,10 +1992,20 @@ pub(super) fn windows_powershell_path() -> Result<PathBuf, SatelleError> {
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(super) fn validate_macos_codex_app_layout(bundle: &Path) -> Result<PathBuf, SatelleError> {
-    let canonical_bundle = fs::canonicalize(bundle)
-        .map_err(|_| codex_isolation_error("codex_app_runtime_untrusted"))?;
-    let bundle_metadata = fs::symlink_metadata(bundle)
-        .map_err(|_| codex_isolation_error("codex_app_runtime_untrusted"))?;
+    let canonical_bundle = fs::canonicalize(bundle).map_err(|error| {
+        codex_isolation_path_error(
+            error,
+            "codex_app_runtime_missing",
+            "codex_app_runtime_untrusted",
+        )
+    })?;
+    let bundle_metadata = fs::symlink_metadata(bundle).map_err(|error| {
+        codex_isolation_path_error(
+            error,
+            "codex_app_runtime_missing",
+            "codex_app_runtime_untrusted",
+        )
+    })?;
     if !bundle_metadata.is_dir()
         || bundle_metadata.file_type().is_symlink()
         || canonical_bundle != bundle
@@ -1426,10 +2013,20 @@ pub(super) fn validate_macos_codex_app_layout(bundle: &Path) -> Result<PathBuf, 
         return Err(codex_isolation_error("codex_app_runtime_untrusted"));
     }
     let executable = bundle.join("Contents").join("Resources").join("codex");
-    let executable_metadata = fs::symlink_metadata(&executable)
-        .map_err(|_| codex_isolation_error("codex_app_runtime_untrusted"))?;
-    let canonical_executable = fs::canonicalize(&executable)
-        .map_err(|_| codex_isolation_error("codex_app_runtime_untrusted"))?;
+    let executable_metadata = fs::symlink_metadata(&executable).map_err(|error| {
+        codex_isolation_path_error(
+            error,
+            "codex_app_runtime_missing",
+            "codex_app_runtime_untrusted",
+        )
+    })?;
+    let canonical_executable = fs::canonicalize(&executable).map_err(|error| {
+        codex_isolation_path_error(
+            error,
+            "codex_app_runtime_missing",
+            "codex_app_runtime_untrusted",
+        )
+    })?;
     if !executable_metadata.is_file()
         || executable_metadata.file_type().is_symlink()
         || canonical_executable != canonical_bundle.join("Contents/Resources/codex")
@@ -1492,8 +2089,13 @@ pub(super) fn validate_macos_computer_use_service_layout(
         .join("MacOS")
         .join(MACOS_COMPUTER_USE_SERVICE_EXECUTABLE);
     for directory in [&service_root, &bundle, &contents, &contents.join("MacOS")] {
-        let metadata = fs::symlink_metadata(directory)
-            .map_err(|_| codex_isolation_error("computer_use_service_untrusted"))?;
+        let metadata = fs::symlink_metadata(directory).map_err(|error| {
+            codex_isolation_path_error(
+                error,
+                "computer_use_service_missing",
+                "computer_use_service_untrusted",
+            )
+        })?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(codex_isolation_error("computer_use_service_untrusted"));
         }
@@ -1502,8 +2104,13 @@ pub(super) fn validate_macos_computer_use_service_layout(
         (&info, MACOS_SERVICE_INFO_LIMIT),
         (&executable, NATIVE_BRIDGE_FILE_LIMIT),
     ] {
-        let metadata = fs::symlink_metadata(file)
-            .map_err(|_| codex_isolation_error("computer_use_service_untrusted"))?;
+        let metadata = fs::symlink_metadata(file).map_err(|error| {
+            codex_isolation_path_error(
+                error,
+                "computer_use_service_missing",
+                "computer_use_service_untrusted",
+            )
+        })?;
         if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > size_limit {
             return Err(codex_isolation_error("computer_use_service_untrusted"));
         }
@@ -1511,10 +2118,20 @@ pub(super) fn validate_macos_computer_use_service_layout(
     let expected_bundle = canonical_home
         .join("computer-use")
         .join("Codex Computer Use.app");
-    let canonical_bundle = fs::canonicalize(&bundle)
-        .map_err(|_| codex_isolation_error("computer_use_service_untrusted"))?;
-    let canonical_executable = fs::canonicalize(&executable)
-        .map_err(|_| codex_isolation_error("computer_use_service_untrusted"))?;
+    let canonical_bundle = fs::canonicalize(&bundle).map_err(|error| {
+        codex_isolation_path_error(
+            error,
+            "computer_use_service_missing",
+            "computer_use_service_untrusted",
+        )
+    })?;
+    let canonical_executable = fs::canonicalize(&executable).map_err(|error| {
+        codex_isolation_path_error(
+            error,
+            "computer_use_service_missing",
+            "computer_use_service_untrusted",
+        )
+    })?;
     if canonical_bundle != expected_bundle
         || canonical_executable
             != expected_bundle
@@ -1666,6 +2283,114 @@ fn windows_package_roots(package_family: &str) -> Result<Vec<PathBuf>, SatelleEr
     Ok(roots)
 }
 
+#[cfg(windows)]
+fn official_windows_computer_use_marketplace_root() -> Result<PathBuf, SatelleError> {
+    windows_package_roots(CODEX_PACKAGE_FAMILY)?
+        .into_iter()
+        .filter_map(|package_root| {
+            let version = windows_package_version_from_root(&package_root)?;
+            let marketplace_root = package_root.join(CODEX_PACKAGE_MARKETPLACE);
+            let marketplace_manifest = marketplace_root
+                .join(".agents")
+                .join("plugins")
+                .join("marketplace.json");
+            let plugin_manifest = marketplace_root
+                .join("plugins")
+                .join("computer-use")
+                .join(".codex-plugin")
+                .join("plugin.json");
+            let root_metadata = fs::symlink_metadata(&marketplace_root).ok()?;
+            let marketplace_metadata = fs::symlink_metadata(&marketplace_manifest).ok()?;
+            let plugin_metadata = fs::symlink_metadata(&plugin_manifest).ok()?;
+            if !root_metadata.is_dir()
+                || root_metadata.file_type().is_symlink()
+                || !marketplace_metadata.is_file()
+                || marketplace_metadata.file_type().is_symlink()
+                || !plugin_metadata.is_file()
+                || plugin_metadata.file_type().is_symlink()
+            {
+                return None;
+            }
+            Some((version, marketplace_root))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, root)| root)
+        .ok_or_else(|| codex_isolation_error("plugin_marketplace_untrusted"))
+}
+
+#[cfg(windows)]
+fn windows_package_version_from_root(root: &Path) -> Option<[u64; 4]> {
+    let package_name = root.file_name()?.to_str()?;
+    let mut components = package_name.split('_').nth(1)?.split('.');
+    let version = [
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+    ];
+    components.next().is_none().then_some(version)
+}
+
+#[cfg(windows)]
+fn current_windows_desktop_native_binding(
+    managed_codex_home: &Path,
+    trusted_root: &Path,
+) -> Result<NativeMcpBinding, SatelleError> {
+    let profile = std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| codex_isolation_error("native_bridge_inventory_unavailable"))?;
+    let profile = PathBuf::from(profile);
+    let desktop_codex_home = profile.join(".codex");
+    let config_path = desktop_codex_home.join("config.toml");
+    let metadata = fs::symlink_metadata(&config_path)
+        .map_err(|_| codex_isolation_error("native_bridge_inventory_unavailable"))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > SCHEMA_FILE_LIMIT
+    {
+        return Err(codex_isolation_error("native_bridge_inventory_untrusted"));
+    }
+    let config = fs::read_to_string(config_path)
+        .map_err(|_| codex_isolation_error("native_bridge_inventory_unavailable"))?;
+    let config = toml::from_str::<toml::Value>(&config)
+        .map_err(|_| codex_isolation_error("native_bridge_inventory_untrusted"))?;
+    let mut transport_value = config
+        .get("mcp_servers")
+        .and_then(|servers| servers.get("node_repl"))
+        .cloned()
+        .ok_or_else(|| codex_isolation_error("native_bridge_missing"))?;
+    // Codex stores a stdio MCP table without the inventory-only `type` field.
+    // Add that one derived discriminator before applying the same closed
+    // transport validator used for live `mcp list` output.
+    let transport_table = transport_value
+        .as_table_mut()
+        .ok_or_else(|| codex_isolation_error("native_bridge_inventory_untrusted"))?;
+    if transport_table.contains_key("url") {
+        return Err(codex_isolation_error("native_bridge_inventory_untrusted"));
+    }
+    transport_table.insert("type".to_string(), toml::Value::String("stdio".to_string()));
+    let transport: ConfiguredMcpTransport = transport_value
+        .try_into()
+        .map_err(|_| codex_isolation_error("native_bridge_inventory_untrusted"))?;
+    let server = ConfiguredMcpServer {
+        name: "node_repl".to_string(),
+        transport,
+    };
+    let mut binding =
+        trusted_native_mcp_binding(&server, "windows", trusted_root, &desktop_codex_home)
+            .ok_or_else(|| codex_isolation_error("native_bridge_inventory_untrusted"))?;
+    let code_paths = windows_node_repl_code_paths(Path::new(&binding.command), managed_codex_home)
+        .ok_or_else(|| codex_isolation_error("native_bridge_inventory_untrusted"))?;
+    binding
+        .env
+        .insert("NODE_REPL_TRUSTED_CODE_PATHS".to_string(), code_paths);
+    binding.env.insert(
+        "CODEX_HOME".to_string(),
+        managed_codex_home.to_string_lossy().to_string(),
+    );
+    Ok(binding)
+}
+
 #[cfg(any(windows, test))]
 pub(super) fn windows_package_full_name_has_valid_version(package_name: &str) -> bool {
     package_name.split('_').nth(1).is_some_and(|version| {
@@ -1762,29 +2487,24 @@ fn trusted_native_mcp_binding(
             let native_pipe = reported_env.get("SKY_CUA_NATIVE_PIPE")?;
             let native_pipe_directory = reported_env.get("SKY_CUA_NATIVE_PIPE_DIRECTORY")?;
             let build_flavor = reported_env.get("BROWSER_USE_CODEX_APP_BUILD_FLAVOR")?;
-            let trusted_code_paths =
-                trusted_windows_node_repl_code_paths(reported_env, Path::new(command), codex_home)?;
             if native_pipe != "1" || native_pipe_directory.is_empty() || build_flavor != "prod" {
                 return None;
             }
+            let mut env =
+                trusted_windows_node_repl_env(reported_env, Path::new(command), codex_home)?;
+            env.insert(
+                "BROWSER_USE_CODEX_APP_BUILD_FLAVOR".to_string(),
+                build_flavor.clone(),
+            );
+            env.insert("SKY_CUA_NATIVE_PIPE".to_string(), native_pipe.clone());
+            env.insert(
+                "SKY_CUA_NATIVE_PIPE_DIRECTORY".to_string(),
+                native_pipe_directory.clone(),
+            );
             Some(NativeMcpBinding {
                 command: command.to_string(),
                 args: server.transport.args.clone(),
-                env: BTreeMap::from([
-                    (
-                        "BROWSER_USE_CODEX_APP_BUILD_FLAVOR".to_string(),
-                        build_flavor.clone(),
-                    ),
-                    (
-                        "NODE_REPL_TRUSTED_CODE_PATHS".to_string(),
-                        trusted_code_paths,
-                    ),
-                    ("SKY_CUA_NATIVE_PIPE".to_string(), native_pipe.clone()),
-                    (
-                        "SKY_CUA_NATIVE_PIPE_DIRECTORY".to_string(),
-                        native_pipe_directory.clone(),
-                    ),
-                ]),
+                env,
             })
         }
         "macos" => {
@@ -1795,26 +2515,7 @@ fn trusted_native_mcp_binding(
                 return None;
             }
             let reported_env = server.transport.env.as_ref()?;
-            let app_version = reported_env
-                .get("BROWSER_USE_CODEX_APP_VERSION")
-                .filter(|version| component_version_is_valid(version))?;
-            // This digest is a bridge-declared client handshake fingerprint,
-            // not Satelle's executable trust anchor. Carry the one exact
-            // current value from the verified runtime inventory so official
-            // updates can rotate it. The fixed root, signed node_repl binary,
-            // exact remaining environment, and live proof retain authority.
-            let browser_client_sha256 = reported_env
-                .get("NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S")
-                .filter(|digest| sha256_is_valid(digest))?;
-            let expected_env = trusted_macos_node_repl_env(
-                codex_home,
-                trusted_root,
-                app_version,
-                browser_client_sha256,
-            );
-            if server.transport.env.as_ref() != Some(&expected_env) {
-                return None;
-            }
+            let expected_env = trusted_macos_node_repl_env(reported_env, codex_home, trusted_root)?;
             Some(NativeMcpBinding {
                 // This function can validate a macOS inventory on another
                 // host during release conformance. Keep the admitted macOS
@@ -1832,29 +2533,44 @@ fn trusted_native_mcp_binding(
     }
 }
 
-fn trusted_macos_node_repl_env(
+pub(super) fn trusted_macos_node_repl_env(
+    reported_env: &BTreeMap<String, String>,
     codex_home: &Path,
     trusted_root: &Path,
-    app_version: &str,
-    browser_client_sha256: &str,
-) -> BTreeMap<String, String> {
+) -> Option<BTreeMap<String, String>> {
+    let app_version = reported_env
+        .get("BROWSER_USE_CODEX_APP_VERSION")
+        .map(String::as_str)
+        .filter(|version| component_version_is_valid(version))?;
     let codex_home = codex_home.to_string_lossy();
     let trusted_root = trusted_root.to_string_lossy();
-    // Release conformance can validate a macOS inventory on Windows. Build
-    // the serialized guest path with macOS separators instead of the host's.
+    // Release conformance can validate a macOS inventory on another host.
+    // Derive the signed service bundle from the authenticated user's Codex
+    // home with macOS separators instead of trusting an inventory path or the
+    // validating host's path rules.
     let computer_use_service = format!(
         "{}/computer-use/Codex Computer Use.app",
         codex_home.trim_end_matches('/')
     );
     let node_modules = format!("{trusted_root}/lib/node_modules");
-    BTreeMap::from([
+    let browser_service = format!(
+        "{}/plugins/cache/openai-bundled/browser/{app_version}/scripts/browser-service.mjs",
+        codex_home.trim_end_matches('/')
+    );
+    let trusted_services =
+        serde_json::from_str::<Value>(reported_env.get("NODE_REPL_TRUSTED_SERVICES")?).ok()?;
+    let trusted_services = trusted_services.as_object()?;
+    if trusted_services.len() != 2
+        || trusted_services.get("browser").and_then(Value::as_str) != Some(browser_service.as_str())
+        || trusted_services.get("sky").and_then(Value::as_str) != Some("@oai/sky/service")
+    {
+        return None;
+    }
+
+    let expected_reported_env = BTreeMap::from([
         (
             "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS".to_string(),
             "1000".to_string(),
-        ),
-        (
-            "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S".to_string(),
-            browser_client_sha256.to_string(),
         ),
         (
             "BROWSER_USE_CODEX_APP_VERSION".to_string(),
@@ -1876,6 +2592,7 @@ fn trusted_macos_node_repl_env(
             "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
             "chrome,iab".to_string(),
         ),
+        ("BROWSER_USE_TINYSKY_ENABLED".to_string(), "0".to_string()),
         ("CODEX_HOME".to_string(), codex_home.to_string()),
         (
             "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER".to_string(),
@@ -1899,11 +2616,19 @@ fn trusted_macos_node_repl_env(
             "/Applications/ChatGPT.app/Contents/Resources/codex".to_string(),
         ),
         ("SKY_CUA_SERVICE_PATH".to_string(), computer_use_service),
-    ])
-}
+    ]);
+    let mut reported_without_services = reported_env.clone();
+    reported_without_services.remove("NODE_REPL_TRUSTED_SERVICES");
+    if reported_without_services != expected_reported_env {
+        return None;
+    }
 
-fn sha256_is_valid(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    let mut admitted_env = expected_reported_env;
+    admitted_env.insert(
+        "NODE_REPL_TRUSTED_SERVICES".to_string(),
+        r#"{"sky":"@oai/sky/service"}"#.to_string(),
+    );
+    Some(admitted_env)
 }
 
 fn trusted_windows_node_repl_code_paths(
@@ -1911,6 +2636,108 @@ fn trusted_windows_node_repl_code_paths(
     command: &Path,
     codex_home: &Path,
 ) -> Option<String> {
+    let expected = windows_node_repl_code_paths(command, codex_home)?;
+    let reported = reported_env.get("NODE_REPL_TRUSTED_CODE_PATHS")?;
+    let paths = reported.split(';').collect::<Vec<_>>();
+    let expected = expected.split(';').collect::<Vec<_>>();
+    if paths.len() != 2
+        || expected.len() != 2
+        || !same_path_for_platform(Path::new(paths[0]), Path::new(expected[0]), "windows")
+        || !same_path_for_platform(Path::new(paths[1]), Path::new(expected[1]), "windows")
+    {
+        return None;
+    }
+    Some(reported.clone())
+}
+
+pub(super) fn trusted_windows_node_repl_env(
+    reported_env: &BTreeMap<String, String>,
+    command: &Path,
+    codex_home: &Path,
+) -> Option<BTreeMap<String, String>> {
+    let trusted_code_paths =
+        trusted_windows_node_repl_code_paths(reported_env, command, codex_home)?;
+    let (node_modules, node) = windows_node_repl_runtime_paths(command)?;
+    if reported_env.get("NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS")? != "1000"
+        || !same_path_for_platform(
+            Path::new(reported_env.get("NODE_REPL_NODE_MODULE_DIRS")?),
+            Path::new(&node_modules),
+            "windows",
+        )
+        || !same_path_for_platform(
+            Path::new(reported_env.get("NODE_REPL_NODE_PATH")?),
+            Path::new(&node),
+            "windows",
+        )
+        || !same_path_for_platform(
+            Path::new(reported_env.get("CODEX_HOME")?),
+            codex_home,
+            "windows",
+        )
+        || reported_env.get("BROWSER_USE_AVAILABLE_BACKENDS")? != "chrome,iab"
+    {
+        return None;
+    }
+    // The official app flips this boolean between releases (26.825 wrote "0",
+    // 26.901 writes "1"). Admit only the two boolean spellings and pass the
+    // reported value through unchanged.
+    let tinysky_enabled = reported_env
+        .get("BROWSER_USE_TINYSKY_ENABLED")
+        .filter(|value| matches!(value.as_str(), "0" | "1"))?;
+    let app_version = reported_env
+        .get("BROWSER_USE_CODEX_APP_VERSION")
+        .filter(|version| component_version_is_valid(version))?;
+    let trusted_services =
+        serde_json::from_str::<Value>(reported_env.get("NODE_REPL_TRUSTED_SERVICES")?).ok()?;
+    if trusted_services
+        .as_object()?
+        .get("sky")
+        .and_then(Value::as_str)
+        != Some("@oai/sky/service")
+    {
+        return None;
+    }
+
+    Some(BTreeMap::from([
+        (
+            "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS".to_string(),
+            "1000".to_string(),
+        ),
+        ("NODE_REPL_NODE_MODULE_DIRS".to_string(), node_modules),
+        ("NODE_REPL_NODE_PATH".to_string(), node),
+        (
+            "NODE_REPL_TRUSTED_CODE_PATHS".to_string(),
+            trusted_code_paths,
+        ),
+        (
+            "CODEX_HOME".to_string(),
+            codex_home.to_string_lossy().to_string(),
+        ),
+        (
+            "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
+            "chrome,iab".to_string(),
+        ),
+        (
+            "BROWSER_USE_TINYSKY_ENABLED".to_string(),
+            tinysky_enabled.clone(),
+        ),
+        (
+            "BROWSER_USE_CODEX_APP_VERSION".to_string(),
+            app_version.clone(),
+        ),
+        (
+            "NODE_REPL_TRUSTED_SERVICES".to_string(),
+            r#"{"sky":"@oai/sky/service"}"#.to_string(),
+        ),
+    ]))
+}
+
+fn windows_node_repl_code_paths(command: &Path, codex_home: &Path) -> Option<String> {
+    let (node_modules, _) = windows_node_repl_runtime_paths(command)?;
+    Some(format!("{};{}", codex_home.to_string_lossy(), node_modules))
+}
+
+fn windows_node_repl_runtime_paths(command: &Path) -> Option<(String, String)> {
     let command = normalized_windows_drive_path(command)?;
     const NODE_REPL_SUFFIX: &str = "/node_repl.exe";
     let suffix_start = command.len().checked_sub(NODE_REPL_SUFFIX.len())?;
@@ -1920,17 +2747,11 @@ fn trusted_windows_node_repl_code_paths(
     {
         return None;
     }
-    let runtime_bin = &command[..suffix_start];
-    let node_modules = format!("{runtime_bin}/node_modules");
-    let reported = reported_env.get("NODE_REPL_TRUSTED_CODE_PATHS")?;
-    let paths = reported.split(';').collect::<Vec<_>>();
-    if paths.len() != 2
-        || !same_path_for_platform(Path::new(paths[0]), codex_home, "windows")
-        || !same_path_for_platform(Path::new(paths[1]), Path::new(&node_modules), "windows")
-    {
-        return None;
-    }
-    Some(reported.clone())
+    let bin = &command[..suffix_start];
+    Some((
+        format!("{bin}/node_modules").replace('/', "\\"),
+        format!("{bin}/node.exe").replace('/', "\\"),
+    ))
 }
 
 fn trusted_windows_bridge_path(command: &Path, trusted_root: &Path) -> bool {
@@ -2038,13 +2859,20 @@ fn validate_native_bridge_filesystem(
     trusted_root: &Path,
     platform: &str,
 ) -> Result<(), SatelleError> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|_| codex_isolation_error("native_bridge_untrusted"))?;
+    let missing_reason = if platform == "macos" {
+        "native_bridge_missing"
+    } else {
+        "native_bridge_untrusted"
+    };
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        codex_isolation_path_error(error, missing_reason, "native_bridge_untrusted")
+    })?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(codex_isolation_error("native_bridge_untrusted"));
     }
-    let canonical_path =
-        fs::canonicalize(path).map_err(|_| codex_isolation_error("native_bridge_untrusted"))?;
+    let canonical_path = fs::canonicalize(path).map_err(|error| {
+        codex_isolation_path_error(error, missing_reason, "native_bridge_untrusted")
+    })?;
     let trusted = match platform {
         "windows" => trusted_windows_bridge_path(&canonical_path, trusted_root),
         "macos" => trusted_macos_node_repl_path(&canonical_path, trusted_root),
@@ -2055,6 +2883,18 @@ fn validate_native_bridge_filesystem(
     } else {
         Err(codex_isolation_error("native_bridge_untrusted"))
     }
+}
+
+fn codex_isolation_path_error(
+    error: std::io::Error,
+    missing_reason: &'static str,
+    untrusted_reason: &'static str,
+) -> SatelleError {
+    codex_isolation_error(if error.kind() == std::io::ErrorKind::NotFound {
+        missing_reason
+    } else {
+        untrusted_reason
+    })
 }
 
 fn codex_isolation_error(reason: &'static str) -> SatelleError {
@@ -2098,7 +2938,7 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if !run_to_completion(&mut command, deadline) {
+    if !run_schema_generation_to_completion(&mut command, deadline) {
         return ControlPlaneProbe::unavailable();
     }
 
@@ -2485,6 +3325,7 @@ fn classify_initialize_message(line: &[u8]) -> InitializeMessage {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn run_to_completion(command: &mut Command, deadline: Instant) -> bool {
     if Instant::now() >= deadline {
         return false;
@@ -2493,6 +3334,21 @@ fn run_to_completion(command: &mut Command, deadline: Instant) -> bool {
         return false;
     };
     let status = super::wait_for_group(&mut child, deadline);
+    let group_stopped = super::terminate_group(&mut child);
+    matches!(status, super::GroupWaitOutcome::Exited(status) if status.success()) && group_stopped
+}
+
+fn run_schema_generation_to_completion(command: &mut Command, deadline: Instant) -> bool {
+    if Instant::now() >= deadline {
+        return false;
+    }
+    let Ok(mut child) = command.group_spawn() else {
+        return false;
+    };
+    // The successful leader proves that every schema file has been written.
+    // Managed Codex helpers can remain in the job after that point, so close
+    // them before parsing instead of consuming the probe deadline on job exit.
+    let status = super::wait_for_leader(&mut child, deadline);
     let group_stopped = super::terminate_group(&mut child);
     matches!(status, super::GroupWaitOutcome::Exited(status) if status.success()) && group_stopped
 }

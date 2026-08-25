@@ -27,6 +27,7 @@ struct NativeActionState {
     expected_script: Option<String>,
     expected_app_id: Option<String>,
     active_item: Option<String>,
+    active_item_completed: bool,
     observed_actions: u8,
     invalidated: bool,
 }
@@ -46,6 +47,7 @@ impl NativeActionEvidence {
         state.expected_script = None;
         state.expected_app_id = None;
         state.active_item = None;
+        state.active_item_completed = false;
         state.observed_actions = 0;
         state.invalidated = false;
     }
@@ -73,6 +75,14 @@ impl NativeActionEvidence {
             .expected_script
             .clone()
             .zip(state.expected_app_id.clone())
+    }
+
+    pub(crate) fn invalidated(&self) -> bool {
+        let (state, _) = &*self.state;
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidated
     }
 
     fn wait_for(&self, action: NativeAction) -> bool {
@@ -127,18 +137,27 @@ impl NativeActionEvidence {
                     && !state.invalidated =>
             {
                 state.active_item = Some(id.to_string());
+                state.active_item_completed = false;
                 changed.notify_all();
             }
             "item/completed"
                 if trusted_call
                     && state.active_item.as_deref() == Some(id)
                     && item.get("status").and_then(serde_json::Value::as_str)
-                        == Some("completed") => {}
+                        == Some("completed") =>
+            {
+                // Callback receipts can arrive before the MCP item terminal.
+                // Do not stop the turn until Codex has also recorded the exact
+                // trusted tool call as successful.
+                state.active_item_completed = true;
+                changed.notify_all();
+            }
             "item/started" | "item/completed" if is_mcp_tool_call => {
                 // Native readiness permits one exact tool call. Any other MCP
                 // item can stage effects that make later callbacks untrustworthy.
                 state.invalidated = true;
                 state.active_item = None;
+                state.active_item_completed = false;
                 state.observed_actions = 0;
                 changed.notify_all();
             }
@@ -153,8 +172,19 @@ impl NativeActionEvidence {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         !state.invalidated
             && state.active_item.is_some()
+            && state.active_item_completed
             && state.observed_actions & (CLICK_OBSERVED | DRAG_OBSERVED)
                 == CLICK_OBSERVED | DRAG_OBSERVED
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_click_for_test(&self) -> bool {
+        self.wait_for(NativeAction::Click)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_drag_for_test(&self) -> bool {
+        self.wait_for(NativeAction::Drag)
     }
 }
 
@@ -945,7 +975,7 @@ mod tests {
 
         assert!(evidence.wait_for(NativeAction::Click));
         assert!(evidence.wait_for(NativeAction::Drag));
-        assert!(evidence.completed());
+        assert!(!evidence.completed());
 
         let completed = serde_json::json!({
             "id": "item-1",
@@ -1268,6 +1298,19 @@ mod tests {
         }
 
         probe.wait_for_completion().unwrap();
+        evidence.observe_app_server_item(
+            "item/completed",
+            &serde_json::json!({
+                "id": "item-1",
+                "type": "mcpToolCall",
+                "server": "node_repl",
+                "tool": "js",
+                "arguments": {"code": "exact native callback test"},
+                "status": "completed",
+                "result": {"content": [{"type": "text", "text": "ok"}]},
+                "error": null
+            }),
+        );
         assert!(evidence.completed());
     }
 

@@ -25,7 +25,6 @@ use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver};
 #[cfg(target_os = "linux")]
 use std::thread::{self, JoinHandle};
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 #[path = "support/test-file.rs"]
@@ -57,6 +56,17 @@ fn production_satelle() -> Command {
     command.env_remove(TEST_SUPPORT_ADAPTER_ENV);
     command
 }
+
+#[cfg(unix)]
+fn make_test_directory_owner_only(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .expect("make test boundary owner-only");
+}
+
+#[cfg(not(unix))]
+fn make_test_directory_owner_only(_path: &std::path::Path) {}
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -435,7 +445,54 @@ variable = "FIXTURE_PROVIDER_TOKEN"
         .args(["host", "release-state"])
         .assert()
         .success();
+    let endpoint = state.path().join("local-daemon-endpoint.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while endpoint.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !endpoint.exists(),
+        "managed local daemon did not release the test state store"
+    );
     config_file
+}
+
+fn wait_for_turn_state(
+    state: &TestStateDir,
+    cache: &std::path::Path,
+    provider_config: &std::path::Path,
+    session_id: &str,
+    turn_index: usize,
+    expected_state: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let output = satelle()
+            .env("SATELLE_CONFIG_FILE", provider_config)
+            .env("SATELLE_STATE_DIR", state.path())
+            .env("SATELLE_CACHE_DIR", cache)
+            .args(["status", session_id, "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let status = parse_json_output(&output.stdout);
+        let observed = status["turns"][turn_index]["state"]
+            .as_str()
+            .expect("status must contain the requested Turn state");
+        assert_ne!(
+            observed, "recovery_pending",
+            "a fresh local client must not recover work owned by the managed daemon"
+        );
+        if observed == expected_state {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Turn {turn_index} remained {observed} instead of reaching {expected_state}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn absolute_test_path(components: &[&str]) -> std::path::PathBuf {
@@ -600,12 +657,10 @@ fn ordinary_production_run_is_blocked_without_fake_completion_or_state_mutation(
         .clone();
     let combined = command_output_text(&output);
 
-    // This production invocation closes before adapter execution. Linux can
-    // additionally prove the stable unsupported-Host diagnostic; supported
-    // desktop targets may fail on different private runtime prerequisites.
+    // This production invocation closes before adapter execution. The daemon
+    // boundary preserves the public storage error without exposing its private
+    // platform reason.
     assert!(combined.contains("storage-integrity-failed"));
-    #[cfg(target_os = "linux")]
-    assert!(combined.contains("unsupported_host_target"));
     assert!(!combined.contains("fake"));
     assert!(!combined.contains("completed"));
     assert!(!combined.contains("PRODUCTION_ADMISSION_PROMPT_CANARY"));
@@ -1524,6 +1579,15 @@ fn corrupt_sqlite_fails_closed_without_mutating_or_leaking_state() {
         .unwrap()
         .to_string();
     let database_path = state.path().join("satelle.sqlite3");
+    let daemon_endpoint = state.path().join("local-daemon-endpoint.json");
+    let daemon_exit_deadline = Instant::now() + Duration::from_secs(5);
+    while daemon_endpoint.exists() && Instant::now() < daemon_exit_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !daemon_endpoint.exists(),
+        "the local daemon must close SQLite before the corruption probe"
+    );
     let corruption_canary = "SQLITE_CORRUPTION_PRIVATE_CANARY";
     let mut corrupted = fs::read(&database_path).expect("canonical SQLite state should exist");
     assert!(corrupted.starts_with(b"SQLite format 3\0"));
@@ -1692,6 +1756,7 @@ fn stopping_detached_turn_returns_exact_stop_contract() {
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_turn_state(&state, &cache, &provider_config, &session_id, 0, "running");
 
     let stop_output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -1721,7 +1786,7 @@ fn stopping_detached_turn_returns_exact_stop_contract() {
     assert_eq!(stopped["outcome"], "stopped");
     assert_eq!(stopped["session_id"], session_id);
     assert_eq!(stopped["turn_id"], turn_id);
-    assert_eq!(stopped["previous_state"], "recovery_pending");
+    assert_eq!(stopped["previous_state"], "running");
     assert_eq!(stopped["current_state"], "stopped");
     assert_eq!(stopped["changed"], true);
     assert!(stopped["stopped_at"].as_str().is_some());
@@ -1847,7 +1912,7 @@ fn events_json_emits_newline_delimited_satelle_events() {
         .map(|line| serde_json::from_str::<Value>(line).expect("event line should be JSON"))
         .collect::<Vec<_>>();
 
-    assert_eq!(events.len(), 7);
+    assert_eq!(events.len(), 8);
     assert_eq!(events[0]["type"], "preflight");
     assert_eq!(events[0]["source"], "cli");
     assert_eq!(events[0]["data"]["yolo"]["active"], true);
@@ -1864,7 +1929,14 @@ fn events_json_emits_newline_delimited_satelle_events() {
     assert!(events[0]["session_id"].is_null());
     assert!(events[0]["turn_id"].is_null());
     assert!(events.iter().any(|event| event["type"] == "provider_smoke"));
-    assert_eq!(events[6]["type"], "turn_completed");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "preflight")
+            .count(),
+        2
+    );
+    assert_eq!(events[7]["type"], "turn_completed");
     let session_id = events[1]["session_id"].as_str().unwrap().to_string();
     for (index, event) in events.iter().enumerate() {
         assert_eq!(event["schema_version"], "satelle.events.v2");
@@ -1899,7 +1971,7 @@ fn events_json_emits_newline_delimited_satelle_events() {
         .get_output()
         .clone();
     let steer_events = parse_json_lines(&output.stdout);
-    assert_eq!(steer_events.len(), 7);
+    assert_eq!(steer_events.len(), 8);
     assert_eq!(steer_events[0]["type"], "preflight");
     assert_eq!(steer_events[0]["source"], "cli");
     assert!(
@@ -1907,14 +1979,21 @@ fn events_json_emits_newline_delimited_satelle_events() {
             .iter()
             .any(|event| event["type"] == "provider_smoke")
     );
-    assert_eq!(steer_events[6]["type"], "turn_completed");
-    assert_eq!(steer_events[6]["session_id"], session_id);
+    assert_eq!(
+        steer_events
+            .iter()
+            .filter(|event| event["type"] == "preflight")
+            .count(),
+        2
+    );
+    assert_eq!(steer_events[7]["type"], "turn_completed");
+    assert_eq!(steer_events[7]["session_id"], session_id);
     assert_eq!(
         steer_events
             .iter()
             .map(|event| event["seq"].as_u64().unwrap())
             .collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6, 7]
+        [1, 2, 3, 4, 5, 6, 7, 8]
     );
 }
 
@@ -2456,7 +2535,7 @@ fn run_and_steer_reject_conflicting_interrupt_modes_before_admission() {
 }
 
 #[test]
-fn detach_returns_starting_session_without_event_streaming() {
+fn local_detached_turn_survives_cli_exit_and_fresh_clients_control_it() {
     let state = state_dir();
     let cache = state.path().join("cache");
     let provider_config = authorize_default_provider_binding(&state);
@@ -2485,49 +2564,14 @@ fn detach_returns_starting_session_without_event_streaming() {
     assert_eq!(session["turns"][0]["state"], "starting");
     assert!(session["turns"][0]["terminal_at"].is_null());
 
-    let status_output = satelle()
-        .env("SATELLE_CONFIG_FILE", &provider_config)
-        .env("SATELLE_STATE_DIR", state.path())
-        .env("SATELLE_CACHE_DIR", &cache)
-        .args(["status", &session_id, "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let status = parse_json_output(&status_output.stdout);
-    assert_eq!(status["status"], "recovery_pending");
-
-    let logs_output = satelle()
-        .env("SATELLE_CONFIG_FILE", &provider_config)
-        .env("SATELLE_STATE_DIR", state.path())
-        .env("SATELLE_CACHE_DIR", &cache)
-        .args(["logs", "--session", &session_id, "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let entries = parse_json_lines(&logs_output.stdout);
-    let recovery_cursor = entries
-        .iter()
-        .find(|entry| entry["event"] == "restart_recovery_pending")
-        .and_then(|entry| entry["cursor"].as_str())
-        .expect("restart recovery should be recorded with an opaque cursor");
-    assert!(
-        entries
-            .iter()
-            .filter(|entry| entry["event"] == "turn_state_committed")
-            .all(|entry| {
-                entry["cursor"]
-                    .as_str()
-                    .is_some_and(|cursor| cursor < recovery_cursor)
-            }),
-        "read-only commands must not commit liveness after recovery begins"
-    );
+    let status = wait_for_turn_state(&state, &cache, &provider_config, &session_id, 0, "running");
+    assert_eq!(status["status"], "running");
 
     let busy_output = satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_CACHE_DIR", &cache)
+        .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args([
             "run",
             "--host",
@@ -2548,6 +2592,7 @@ fn detach_returns_starting_session_without_event_streaming() {
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_CACHE_DIR", &cache)
+        .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args([
             "steer",
             &session_id,
@@ -2562,18 +2607,24 @@ fn detach_returns_starting_session_without_event_streaming() {
     assert_eq!(busy_error["code"], "host-busy");
     assert_eq!(busy_error["details"]["active_session_id"], session_id);
 
-    satelle()
+    let stop_output = satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_CACHE_DIR", &cache)
         .args(["stop", &session_id, "--json"])
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .clone();
+    let stopped = parse_json_output(&stop_output.stdout);
+    assert_eq!(stopped["previous_state"], "running");
+    assert_eq!(stopped["current_state"], "stopped");
 
     let steer_output = satelle()
         .env("SATELLE_CONFIG_FILE", &provider_config)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_CACHE_DIR", &cache)
+        .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args([
             "steer",
             &session_id,
@@ -2591,6 +2642,25 @@ fn detach_returns_starting_session_without_event_streaming() {
     assert_eq!(steered["turns"].as_array().unwrap().len(), 2);
     assert_eq!(steered["turns"][1]["state"], "starting");
     assert!(steered["turns"][1]["terminal_at"].is_null());
+
+    wait_for_turn_state(&state, &cache, &provider_config, &session_id, 1, "running");
+    let stop_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &provider_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
+        .args(["stop", &session_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stopped = parse_json_output(&stop_output.stdout);
+    assert_eq!(stopped["previous_state"], "running");
+    assert_eq!(stopped["current_state"], "stopped");
+
+    let status = wait_for_turn_state(&state, &cache, &provider_config, &session_id, 1, "stopped");
+    assert_eq!(status["turns"].as_array().unwrap().len(), 2);
+    assert_eq!(status["turns"][0]["state"], "stopped");
+    assert_eq!(status["turns"][1]["state"], "stopped");
 }
 
 #[test]
@@ -3019,12 +3089,32 @@ adapter = "codex"
             .as_array()
             .is_some_and(|actions| !actions.is_empty())
     );
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(report["setup_components"], serde_json::json!(["all"]));
+        let planned_actions = report["planned_actions"]
+            .as_array()
+            .expect("planned actions are an array");
+        for unsupported_action in [
+            "download the official standalone Codex package and checksum manifest",
+            "verify and publish the immutable Codex package",
+            "write the owner-only managed Codex installation receipt after a live version check",
+            "install the official bundled Computer Use plugin and native bridge binding",
+        ] {
+            assert!(
+                !planned_actions
+                    .iter()
+                    .any(|action| action.as_str() == Some(unsupported_action)),
+                "Linux aggregate setup must omit unsupported Host-owned mutation: {unsupported_action}"
+            );
+        }
+    }
     assert_eq!(report["applied_actions"], serde_json::json!([]));
     assert_eq!(report["mutated"], false);
 }
 
 #[test]
-fn production_setup_with_default_host_fails_closed_before_operator_state_is_touched() {
+fn production_setup_with_default_host_reaches_native_readiness_before_operator_state_is_touched() {
     let sandbox = state_dir();
     let operator_home = sandbox.path().join("operator/home");
     let operator_config_file = operator_home.join("config/config.toml");
@@ -3045,34 +3135,53 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "codex"
+desktop_user = "missing-user"
 "#,
     )
     .expect("production config should be written");
-
-    let output = assert_directory_tree_unchanged(
-        "satelle setup --yes with the unsupported default local host",
-        sandbox.path(),
-        || {
-            production_satelle()
-                .env("SATELLE_HOME", &operator_home)
-                .env("SATELLE_CONFIG_FILE", &operator_config_file)
-                .env("SATELLE_STATE_DIR", &operator_state_dir)
-                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
-                .env("SATELLE_LOG_DIR", &operator_log_dir)
-                .args(["setup", "--yes", "--json"])
-                .assert()
-                .code(70)
-                .get_output()
-                .clone()
-        },
+    make_test_directory_owner_only(
+        operator_home
+            .parent()
+            .expect("operator home has an operator parent"),
     );
+
+    let config_before = fs::read(&operator_config_file).expect("read production config");
+    let output = production_satelle()
+        .env("SATELLE_HOME", &operator_home)
+        .env("SATELLE_CONFIG_FILE", &operator_config_file)
+        .env("SATELLE_STATE_DIR", &operator_state_dir)
+        .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+        .env("SATELLE_LOG_DIR", &operator_log_dir)
+        .args(["setup", "--yes", "--json"])
+        .assert()
+        .code(75)
+        .get_output()
+        .clone();
     let error = parse_json_output(&output.stderr);
 
-    assert_eq!(error["code"], "not-implemented");
+    assert_eq!(error["code"], "desktop-session-unavailable");
+    assert_eq!(
+        error["suggested_commands"],
+        serde_json::json!(["satelle host sessions --host <alias> --json"])
+    );
     assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("setup mutations are not supported"))
+        operator_cache_dir
+            .join("command-history/command-history.sqlite3")
+            .is_file(),
+        "a supported setup attempt records its typed readiness outcome"
+    );
+    assert!(
+        !operator_state_dir.exists(),
+        "readiness did not mutate Host state"
+    );
+    assert!(
+        !operator_log_dir.exists(),
+        "readiness did not create Host logs"
+    );
+    assert_eq!(
+        fs::read(&operator_config_file).expect("reread production config"),
+        config_before,
+        "readiness did not rewrite the Host binding"
     );
 
     let output = assert_directory_tree_unchanged(
@@ -3127,6 +3236,11 @@ adapter = "codex"
 "#,
     )
     .expect("production config should be written");
+    make_test_directory_owner_only(
+        operator_home
+            .parent()
+            .expect("operator home has an operator parent"),
+    );
 
     let config_before = fs::read(&operator_config_file).expect("production config should be read");
     let output = production_satelle()
@@ -3154,6 +3268,136 @@ adapter = "codex"
 }
 
 #[test]
+fn production_local_provider_auth_uses_the_managed_setup_backend() {
+    let sandbox = state_dir();
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created");
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "local-demo"
+model_alias = "review"
+provider_alias = "openai"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+
+[hosts.local-demo.provider_bindings.openai.review]
+model = "gpt-5.2"
+model_provider = "openai"
+"#,
+    )
+    .expect("production provider config should be written");
+    make_test_directory_owner_only(
+        operator_home
+            .parent()
+            .expect("operator home has an operator parent"),
+    );
+
+    let output = production_satelle()
+        .env("SATELLE_HOME", &operator_home)
+        .env("SATELLE_CONFIG_FILE", &operator_config_file)
+        .env("SATELLE_STATE_DIR", &operator_state_dir)
+        .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+        .env("SATELLE_LOG_DIR", &operator_log_dir)
+        .env("SATELLE_COMMAND_HISTORY", "0")
+        .args([
+            "setup",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+
+    assert_eq!(
+        report["setup_components"],
+        serde_json::json!(["provider-auth"])
+    );
+    assert_eq!(report["provider_auth_validation"]["outcome"], "resolved");
+    assert_eq!(
+        report["provider_auth_validation"]["resolved_codex_model"],
+        "gpt-5.2"
+    );
+    assert_eq!(
+        report["provider_auth_validation"]["resolved_model_provider"],
+        "openai"
+    );
+}
+
+#[test]
+fn production_local_provider_auth_validates_implicit_codex_defaults() {
+    let sandbox = state_dir();
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created");
+    make_test_directory_owner_only(&sandbox.path().join("operator"));
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+"#,
+    )
+    .expect("production Host-owned provider config should be written");
+
+    let output = production_satelle()
+        .env("SATELLE_HOME", &operator_home)
+        .env("SATELLE_CONFIG_FILE", &operator_config_file)
+        .env("SATELLE_STATE_DIR", &operator_state_dir)
+        .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+        .env("SATELLE_LOG_DIR", &operator_log_dir)
+        .env("SATELLE_COMMAND_HISTORY", "0")
+        .args([
+            "setup",
+            "--component",
+            "provider-auth",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "storage-integrity-failed");
+    assert_eq!(
+        error["message"],
+        "the Host state failed an integrity requirement"
+    );
+    assert!(error["details"].is_null());
+}
+
+#[test]
 fn production_setup_verify_does_not_discard_explicit_local_mutation_intent() {
     let sandbox = state_dir();
     let operator_home = sandbox.path().join("operator/home");
@@ -3176,17 +3420,25 @@ adapter = "codex"
     )
     .expect("production config should be written");
 
-    for (description, extra_arguments) in [
-        (
-            "an explicit setup component",
-            vec!["--component", "computer-use"],
-        ),
+    let cases = [
         (
             "an explicit daemon path",
             vec!["--daemon-home", "/operator/managed/satelle"],
+            70,
+            "not-implemented",
+            "setup mutations are not supported",
         ),
-        ("an explicit service mode", vec!["--persistent"]),
-    ] {
+        #[cfg(target_os = "linux")]
+        (
+            "an explicit service mode",
+            vec!["--persistent"],
+            64,
+            "persistent-service-unsupported",
+            "persistent Host Daemon services are not supported",
+        ),
+    ];
+
+    for (description, extra_arguments, expected_exit, expected_code, expected_message) in cases {
         let output = assert_directory_tree_unchanged(description, sandbox.path(), || {
             production_satelle()
                 .env("SATELLE_HOME", &operator_home)
@@ -3197,24 +3449,88 @@ adapter = "codex"
                         .chain(extra_arguments.iter().copied()),
                 )
                 .assert()
-                .code(70)
+                .code(expected_exit)
                 .get_output()
                 .clone()
         });
 
         let error = parse_json_output(&output.stderr);
-        assert_eq!(error["code"], "not-implemented", "{description}");
+        assert_eq!(error["code"], expected_code, "{description}");
         assert!(
             error["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("setup mutations are not supported")),
+                .is_some_and(|message| message.contains(expected_message)),
             "{description}"
         );
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn production_setup_with_aliased_local_host_fails_before_operator_state_is_touched() {
+fn production_setup_rejects_explicit_native_computer_use_before_installer_mutation() {
+    let sandbox = state_dir();
+    let operator_home = sandbox.path().join("operator/home");
+    let operator_config_file = operator_home.join("config/config.toml");
+    let operator_state_dir = sandbox.path().join("operator/state");
+    let operator_cache_dir = sandbox.path().join("operator/cache");
+    let operator_log_dir = sandbox.path().join("operator/logs");
+    fs::create_dir_all(
+        operator_config_file
+            .parent()
+            .expect("config file has a parent"),
+    )
+    .expect("operator config directory should be created");
+    write_user_config(
+        &operator_config_file,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+"#,
+    )
+    .expect("production config should be written");
+
+    let output = assert_directory_tree_unchanged(
+        "satelle setup --component computer-use",
+        sandbox.path(),
+        || {
+            production_satelle()
+                .env("SATELLE_HOME", &operator_home)
+                .env("SATELLE_CONFIG_FILE", &operator_config_file)
+                .env("SATELLE_STATE_DIR", &operator_state_dir)
+                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+                .env("SATELLE_LOG_DIR", &operator_log_dir)
+                .env("SATELLE_COMMAND_HISTORY", "0")
+                .args([
+                    "setup",
+                    "--no-input",
+                    "--yes",
+                    "--json",
+                    "--component",
+                    "computer-use",
+                ])
+                .assert()
+                .code(70)
+                .get_output()
+                .clone()
+        },
+    );
+
+    assert!(output.stdout.is_empty());
+    let error = parse_json_output(&output.stderr);
+    assert_eq!(error["code"], "not-implemented");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unsupported on the linux Controller platform"))
+    );
+}
+
+#[test]
+fn production_setup_with_aliased_local_host_reaches_native_readiness_before_operator_state_is_touched()
+ {
     let sandbox = state_dir();
     let operator_home = sandbox.path().join("operator/home");
     let operator_config_file = operator_home.join("config/config.toml");
@@ -3235,29 +3551,52 @@ default_host = "workstation"
 [hosts.workstation]
 transport = "local"
 adapter = "codex"
+desktop_user = "missing-user"
 "#,
     )
     .expect("production config should be written");
-
-    let output = assert_directory_tree_unchanged(
-        "satelle setup with an aliased local Host",
-        sandbox.path(),
-        || {
-            production_satelle()
-                .env("SATELLE_HOME", &operator_home)
-                .env("SATELLE_CONFIG_FILE", &operator_config_file)
-                .env("SATELLE_STATE_DIR", &operator_state_dir)
-                .env("SATELLE_CACHE_DIR", &operator_cache_dir)
-                .env("SATELLE_LOG_DIR", &operator_log_dir)
-                .args(["setup", "--yes", "--json"])
-                .assert()
-                .code(70)
-                .get_output()
-                .clone()
-        },
+    make_test_directory_owner_only(
+        operator_home
+            .parent()
+            .expect("operator home has an operator parent"),
     );
 
-    assert_eq!(parse_json_output(&output.stderr)["code"], "not-implemented");
+    let config_before = fs::read(&operator_config_file).expect("read production config");
+    let output = production_satelle()
+        .env("SATELLE_HOME", &operator_home)
+        .env("SATELLE_CONFIG_FILE", &operator_config_file)
+        .env("SATELLE_STATE_DIR", &operator_state_dir)
+        .env("SATELLE_CACHE_DIR", &operator_cache_dir)
+        .env("SATELLE_LOG_DIR", &operator_log_dir)
+        .args(["setup", "--yes", "--json"])
+        .assert()
+        .code(75)
+        .get_output()
+        .clone();
+
+    assert_eq!(
+        parse_json_output(&output.stderr)["code"],
+        "desktop-session-unavailable"
+    );
+    assert!(
+        operator_cache_dir
+            .join("command-history/command-history.sqlite3")
+            .is_file(),
+        "the aliased setup attempt records its typed readiness outcome"
+    );
+    assert!(
+        !operator_state_dir.exists(),
+        "readiness did not mutate Host state"
+    );
+    assert!(
+        !operator_log_dir.exists(),
+        "readiness did not create Host logs"
+    );
+    assert_eq!(
+        fs::read(&operator_config_file).expect("reread production config"),
+        config_before,
+        "readiness did not rewrite the aliased Host binding"
+    );
 }
 
 #[test]
@@ -7012,8 +7351,7 @@ auth_source = "operator-auth"
             .clone();
         let error = parse_json_output(&output.stderr);
         assert_eq!(error["code"], "model-provider-binding-missing");
-        assert_eq!(error["details"]["requested_model_alias"], "review");
-        assert_eq!(error["details"]["requested_provider_alias"], "openai");
+        assert!(error["details"].is_null());
     }
 }
 
@@ -7648,13 +7986,21 @@ adapter = "fake"
 
 #[test]
 fn run_and_steer_fail_before_admission_when_desktop_selection_is_invalid() {
-    let state = state_dir();
-    let cache = state.path().join("cache");
-    let user_config = state.path().join("user-config.toml");
+    let unmatched_native_selector = format!(
+        r#"
+desktop_user = "local-demo-user"
+
+[hosts.local-demo.desktop_session_native_selector]
+platform = "{}"
+kind = "console"
+value = "inactive"
+"#,
+        std::env::consts::OS
+    );
     let cases = [
         (
             "unavailable binding",
-            r#"desktop_user = "another-user""#,
+            r#"desktop_user = "another-user""#.to_string(),
             "desktop-session-unavailable",
         ),
         (
@@ -7662,7 +8008,8 @@ fn run_and_steer_fail_before_admission_when_desktop_selection_is_invalid() {
             r#"
 desktop_user = "another-user"
 desktop_session_preference = "only"
-"#,
+"#
+            .to_string(),
             "desktop-session-preference-unmatched",
         ),
         (
@@ -7670,36 +8017,43 @@ desktop_session_preference = "only"
             r#"
 desktop_user = "another-user"
 desktop_session_preference = "console"
-"#,
+"#
+            .to_string(),
             "desktop-session-console-unavailable",
         ),
         (
             "wrong native selector platform",
-            r#"
+            // The selector must name a platform other than the one running
+            // the test, or the daemon correctly reports it as unmatched.
+            format!(
+                r#"
 desktop_user = "local-demo-user"
 
 [hosts.local-demo.desktop_session_native_selector]
-platform = "windows"
-kind = "wts-session"
+platform = "{}"
+kind = "{}"
 value = "7"
 "#,
+                if cfg!(windows) { "macos" } else { "windows" },
+                if cfg!(windows) {
+                    "cg-session"
+                } else {
+                    "wts-session"
+                },
+            ),
             "desktop-session-native-selector-wrong-platform",
         ),
         (
             "unmatched native selector",
-            r#"
-desktop_user = "local-demo-user"
-
-[hosts.local-demo.desktop_session_native_selector]
-platform = "local-demo"
-kind = "console"
-value = "inactive"
-"#,
+            unmatched_native_selector,
             "desktop-session-native-selector-unmatched",
         ),
     ];
 
     for (case, desktop_config, expected_code) in cases {
+        let state = state_dir();
+        let cache = state.path().join("cache");
+        let user_config = state.path().join("user-config.toml");
         write_user_config(
             &user_config,
             format!(
@@ -7728,23 +8082,23 @@ adapter = "fake"
         assert_eq!(error["code"], expected_code, "{case}");
     }
 
+    let state = state_dir();
+    let cache = state.path().join("cache");
+    let user_config = authorize_default_provider_binding(&state);
+    let provider_config = fs::read_to_string(&user_config).expect("read provider config fixture");
     write_user_config(
         &user_config,
-        r#"
-default_host = "local-demo"
-
-[hosts.local-demo]
-transport = "local"
-adapter = "fake"
-desktop_user = "local-demo-user"
-desktop_session_preference = "only"
-"#,
+        provider_config.replace(
+            "adapter = \"fake\"",
+            "adapter = \"fake\"\ndesktop_user = \"local-demo-user\"\ndesktop_session_preference = \"only\"",
+        ),
     )
     .expect("user config should be written");
     let output = satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_CACHE_DIR", &cache)
+        .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args(["run", "--detach", "--json", "Open the browser"])
         .assert()
         .success()
@@ -7757,14 +8111,10 @@ desktop_session_preference = "only"
 
     write_user_config(
         &user_config,
-        r#"
-default_host = "local-demo"
-
-[hosts.local-demo]
-transport = "local"
-adapter = "fake"
-desktop_user = "another-user"
-"#,
+        provider_config.replace(
+            "adapter = \"fake\"",
+            "adapter = \"fake\"\ndesktop_user = \"another-user\"",
+        ),
     )
     .expect("user config should be written");
     let output = satelle()
@@ -7777,7 +8127,22 @@ desktop_user = "another-user"
         .get_output()
         .clone();
     let error = parse_json_output(&output.stderr);
-    assert_eq!(error["code"], "desktop-session-unavailable");
+    assert_eq!(error["code"], "state-conflict");
+
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
+        .args(["status", &session_id, "--json"])
+        .assert()
+        .success();
+    satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env("SATELLE_CACHE_DIR", &cache)
+        .args(["stop", &session_id, "--json"])
+        .assert()
+        .success();
 }
 
 #[test]
@@ -9455,7 +9820,7 @@ command_families = ["setup"]
                 "Provider descriptor configured: true",
                 "Provider secret provisioned: true",
                 "Provider validation: resolved",
-                "Provider smoke test: not_checked",
+                "Provider smoke test: not_required",
             ] {
                 assert!(
                     rendered.contains(field),
@@ -10398,5 +10763,5 @@ auth_source = "openai"
     assert_eq!(report["descriptor_configured"], true);
     assert_eq!(report["secret_provisioned"], false);
     assert_eq!(report["validation_status"], "deferred");
-    assert_eq!(report["provider_smoke_test_status"], "not_checked");
+    assert_eq!(report["provider_smoke_test_status"], "not_required");
 }

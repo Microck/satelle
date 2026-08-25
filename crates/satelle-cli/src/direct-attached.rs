@@ -22,6 +22,7 @@ const MAX_RECONCILIATION_ATTEMPTS: usize = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const INTERRUPTED_EVENT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const RECONCILIATION_LOG_LIMIT: usize = 10_000;
+const TERMINAL_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(30);
 
 impl DirectTransport {
     fn invalid_response(&self) -> SatelleError {
@@ -122,15 +123,12 @@ impl DirectTransport {
         turn_id: &TurnId,
         minimum_revision: Option<TurnStateRevision>,
     ) -> Result<Option<PublicSession>, SatelleError> {
-        let query = LogPageQuery::tail(RECONCILIATION_LOG_LIMIT)
-            .map_err(|_| SatelleError::remote_api_error(&self.alias, "invalid-log-query"))?
-            .with_session(session_id.clone());
         let session_id = session_id.clone();
-        let (session, logs) = self
+        let session = self
             .blocking_http(move |client| {
-                let session = client.read_session(&session_id)?;
-                let logs = client.logs(&query)?;
-                Ok((session.session().clone(), logs.page().clone()))
+                client
+                    .read_session(&session_id)
+                    .map(|response| response.session().clone())
             })
             .await?;
         let turn = self.target_turn(&session, turn_id)?;
@@ -139,6 +137,30 @@ impl DirectTransport {
         {
             return Err(self.invalid_response());
         }
+        // A Turn that needs restart recovery has no live owner to attach to.
+        // Waiting would block until reconciliation or an explicit stop, so the
+        // attached command ends here with the durable handles.
+        if turn.state() == TurnState::RecoveryPending {
+            return Err(SatelleError::turn_recovery_pending(
+                &self.alias,
+                session.session_id(),
+                turn_id,
+            ));
+        }
+        if !turn.state().is_terminal() {
+            return Ok(None);
+        }
+
+        // Logs prove that the terminal revision was durably committed. Active turns do not need
+        // this heavier read, so periodic reconciliation remains one cheap status request.
+        let query = LogPageQuery::tail(RECONCILIATION_LOG_LIMIT)
+            .map_err(|_| SatelleError::remote_api_error(&self.alias, "invalid-log-query"))?
+            .with_session(session.session_id().clone());
+        let logs = self
+            .blocking_http(move |client| {
+                client.logs(&query).map(|response| response.page().clone())
+            })
+            .await?;
         let has_matching_log = logs.entries().iter().any(|entry| {
             matches!(
                 entry.subject(),
@@ -197,6 +219,28 @@ impl DirectTransport {
             admitted,
             &mut buffered_events,
             &mut initial_connection_error,
+            TERMINAL_RECONCILIATION_INTERVAL,
+            on_event,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn follow_turn_with_reconciliation_interval(
+        &self,
+        mut stream: DaemonEventStream,
+        admitted: PublicSession,
+        reconciliation_interval: Duration,
+        on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
+    ) -> Result<AttachedTurnOutcome, SatelleError> {
+        let mut buffered_events = VecDeque::new();
+        let mut initial_connection_error = None;
+        self.follow_turn_with_state(
+            &mut stream,
+            admitted,
+            &mut buffered_events,
+            &mut initial_connection_error,
+            reconciliation_interval,
             on_event,
         )
         .await
@@ -208,6 +252,54 @@ impl DirectTransport {
         admitted: PublicSession,
         buffered_events: &mut VecDeque<SatelleEvent>,
         initial_connection_error: &mut Option<DaemonEventError>,
+        reconciliation_interval: Duration,
+        on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
+    ) -> Result<AttachedTurnOutcome, SatelleError> {
+        // The embedded Host returns a failed Turn as an error carrying the
+        // adapter's closed reason. Over the daemon only the committed
+        // TurnFailed event carries that reason, so capture it while every
+        // event is still delivered to the caller, then fail the same way.
+        let mut failure_reason: Option<String> = None;
+        let outcome = {
+            let mut observe = |event: SatelleEvent| -> Result<(), SatelleError> {
+                if event.event_type() == EventType::TurnFailed {
+                    failure_reason = event
+                        .data()
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                }
+                on_event(event)
+            };
+            self.follow_turn_events(
+                stream,
+                admitted,
+                buffered_events,
+                initial_connection_error,
+                reconciliation_interval,
+                &mut observe,
+            )
+            .await?
+        };
+        let turn = self.target_turn(&outcome.session, &outcome.turn_id)?;
+        if turn.state() == TurnState::Failed {
+            return Err(SatelleError::turn_failed(
+                &self.alias,
+                outcome.session.session_id(),
+                &outcome.turn_id,
+                failure_reason.as_deref(),
+            ));
+        }
+        Ok(outcome)
+    }
+
+    async fn follow_turn_events(
+        &self,
+        stream: &mut DaemonEventStream,
+        admitted: PublicSession,
+        buffered_events: &mut VecDeque<SatelleEvent>,
+        initial_connection_error: &mut Option<DaemonEventError>,
+        reconciliation_interval: Duration,
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
     ) -> Result<AttachedTurnOutcome, SatelleError> {
         let session_id = admitted.session_id().clone();
@@ -221,12 +313,59 @@ impl DirectTransport {
         let mut previous_stream_sequence = 0_u64;
         let mut reconnect_attempts = 0_usize;
         let mut provider_smoke = None;
+        let mut pending_reconciled_terminal = None;
+        let mut reconciliation_clock = tokio::time::interval(reconciliation_interval);
+        reconciliation_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `interval` ticks immediately. The first durable check belongs after one full interval.
+        reconciliation_clock.tick().await;
         loop {
+            if buffered_events.is_empty()
+                && let Some(session) = pending_reconciled_terminal.take()
+            {
+                on_event(self.reconciled_terminal_event(&session, &turn_id)?)?;
+                return Ok(AttachedTurnOutcome {
+                    session,
+                    turn_id,
+                    provider_smoke,
+                });
+            }
             let next_event = match buffered_events.pop_front() {
                 Some(event) => Ok(event),
                 None => match initial_connection_error.take() {
                     Some(error) => Err(error),
-                    None => stream.next_event().await,
+                    None => tokio::select! {
+                        event = stream.next_event() => event,
+                        _ = reconciliation_clock.tick() => {
+                            let session = match self
+                                .reconcile_retaining_stream(
+                                    &session_id,
+                                    &turn_id,
+                                    highest_event_revision,
+                                )
+                                .await
+                            {
+                                Ok(session) => session,
+                                // A periodic status probe must not kill a healthy event stream.
+                                Err(error) if reconciliation_error_allows_retry(&error) => continue,
+                                Err(error) => return Err(error),
+                            };
+                            let Some(session) = session else {
+                                continue;
+                            };
+
+                            // A real terminal or provider-smoke event can arrive while the durable
+                            // reads are in flight. Process every already-ready authenticated event
+                            // before falling back to the synthetic terminal.
+                            if let Ok(ready_events) = stream
+                                .drain_events_for(INTERRUPTED_EVENT_DRAIN_TIMEOUT)
+                                .await
+                            {
+                                buffered_events.extend(ready_events);
+                            }
+                            pending_reconciled_terminal = Some(session);
+                            continue;
+                        }
+                    },
                 },
             };
             match next_event {
@@ -296,6 +435,22 @@ impl DirectTransport {
                     let terminal = event.event_type().is_terminal();
                     if highest_event_revision.is_none_or(|highest| revision > highest) {
                         highest_event_revision = Some(revision);
+                    }
+                    // The Host announces restart recovery as a committed
+                    // lifecycle observation. Confirm it durably, then stop
+                    // attaching instead of waiting on a Turn nobody executes.
+                    let announces_recovery = event.event_type() == EventType::ActionRequired
+                        && event.source() == EventSource::HostDaemon
+                        && event
+                            .data()
+                            .get("state")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("recovery_pending");
+                    if announces_recovery {
+                        on_event(event)?;
+                        self.reconcile(&session_id, &turn_id, Some(revision))
+                            .await?;
+                        continue;
                     }
                     if terminal {
                         let session = self
@@ -555,6 +710,7 @@ impl DirectTransport {
                 admitted,
                 &mut buffered_events,
                 &mut initial_connection_error,
+                TERMINAL_RECONCILIATION_INTERVAL,
                 on_event,
             );
             tokio::pin!(following);
@@ -746,6 +902,7 @@ impl DirectTransport {
                 admitted,
                 &mut buffered_events,
                 &mut initial_connection_error,
+                TERMINAL_RECONCILIATION_INTERVAL,
                 on_event,
             );
             tokio::pin!(following);
@@ -958,14 +1115,17 @@ fn target_event_revision(
 }
 
 // Turn revisions order committed state, while stream-local sequences order distinct live events.
-// An approval observation can therefore follow TurnProgress at the same committed revision.
+// Adapter preflight and approval observations can therefore follow TurnProgress
+// at the same committed revision.
 fn event_revision_is_deliverable(
     event_type: EventType,
     revision: TurnStateRevision,
     highest_revision: Option<TurnStateRevision>,
 ) -> bool {
     highest_revision.is_none_or(|highest| {
-        revision > highest || (revision == highest && event_type == EventType::ActionRequired)
+        revision > highest
+            || (revision == highest
+                && matches!(event_type, EventType::ActionRequired | EventType::Preflight))
     })
 }
 
@@ -1031,6 +1191,17 @@ mod interrupt_output_tests {
         ));
         assert!(!event_revision_is_deliverable(
             EventType::TurnProgress,
+            revision,
+            Some(revision)
+        ));
+    }
+
+    #[test]
+    fn same_revision_preflight_remains_deliverable_after_progress() {
+        let revision = TurnStateRevision::new(2).unwrap();
+
+        assert!(event_revision_is_deliverable(
+            EventType::Preflight,
             revision,
             Some(revision)
         ));

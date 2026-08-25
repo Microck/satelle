@@ -5,6 +5,9 @@ pub(super) const RELEASE: &str = "satelle-bootstrap-release-v1";
 pub(super) const MUTATION_STARTED: &str = "satelle-bootstrap-mutation-started-v1";
 pub(super) const MUTATION_COMMITTED: &str = "satelle-bootstrap-mutation-committed-v1";
 pub(super) const MUTATION_EXECUTING: &str = "satelle-bootstrap-mutation-executing-v1";
+pub(super) const MUTATION_RESULT_REQUEST: &str = "satelle-bootstrap-mutation-result-v1";
+pub(super) const MUTATION_RESULT_RESPONSE: &str = "satelle-bootstrap-mutation-result-response-v1";
+pub(super) const MUTATION_ABANDON_REQUEST: &str = "satelle-bootstrap-mutation-abandon-v1";
 const STALE_AFTER_SECONDS: u64 = 30;
 const COMMIT_REQUIRED_MUTATION_PHASES: &[&str] = &[
     "daemon_start",
@@ -21,12 +24,13 @@ const COMMIT_REQUIRED_MUTATION_PHASES: &[&str] = &[
     "persistent_service_restart",
     "persistent_service_stop",
     "service_lifecycle_maintenance_begin",
-    "persistent_maintenance_begin",
-    "persistent_action_start",
-    "persistent_action_complete",
-    "persistent_action_skip",
-    "persistent_action_fail",
-    "persistent_maintenance_finish",
+    "setup_maintenance_begin",
+    "setup_action_start",
+    "setup_action_complete",
+    "setup_action_skip",
+    "setup_action_fail",
+    "managed_setup",
+    "setup_maintenance_finish",
 ];
 const SUCCESS_MUTATION_PHASES: &[&str] = &[
     "cache_directory_creation",
@@ -152,6 +156,7 @@ $mutationStarted = $false
 $mutationAttempt = $null
 $mutationPhase = $null
 $claimUncertain = $false
+$claimUncertainReason = 'phase advance found uncertain execution evidence'
 $released = $false
 $mailboxPath = $null
 $nextCommand = 1
@@ -159,13 +164,15 @@ function Set-OwnerOnlyDirectory([string]$Path) {{
   $acl = Get-Acl -LiteralPath $Path
   $acl.SetAccessRuleProtection($true, $false)
   foreach ($rule in @($acl.Access)) {{ [void]$acl.RemoveAccessRuleAll($rule) }}
+  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
   $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-    [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+    $identity.Name,
     'FullControl',
     'ContainerInherit,ObjectInherit',
     'None',
     'Allow')
   $acl.SetAccessRule($rule)
+  $acl.SetOwner($identity.User)
   Set-Acl -LiteralPath $Path -AclObject $acl
 }}
 function Write-Value([string]$Root, [string]$Name, [string]$Value) {{
@@ -571,6 +578,7 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
   if (-not [StringComparer]::OrdinalIgnoreCase.Equals($item.FullName, $claimPath)) {{ Fail-Busy }}
 }}
 if (-not (Same-Owner)) {{ Fail-Busy }}
+Write-Value $claimPath 'ready' $claimIdentity
 Write-Protocol ('{READY} ' + $claimIdentity + ' ' + [IO.Path]::GetFileName($claimPath))
 try {{
 while ($true) {{
@@ -619,6 +627,27 @@ while ($true) {{
       $mutationStarted = $true
       $mutationPhase = $phase
       $mutationAttempt = $attempt
+    }} elseif ($line.StartsWith('{MUTATION_RESULT_REQUEST} ')) {{
+      $parts = @($line.Substring({result_prefix_length}).Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+      if ($parts.Count -ne 2 -or $parts[0] -cne $mutationPhase -or $parts[1] -cne $mutationAttempt) {{ exit 75 }}
+      $resultPath = Join-Path $mailboxPath ('mutation-result.' + $mutationAttempt)
+      if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {{
+        Write-MailboxResponse $responsePath ('{MUTATION_RESULT_RESPONSE} ' + $mutationPhase + ' ' + $mutationAttempt + ' pending')
+        continue
+      }}
+      $resultItem = Get-Item -LiteralPath $resultPath -Force
+      if ($resultItem.PSIsContainer -or (($resultItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
+      $status = [IO.File]::ReadAllText($resultPath).Trim()
+      if ($status -cnotin @('0', '1', '65', '75')) {{ exit 75 }}
+      Write-MailboxResponse $responsePath ('{MUTATION_RESULT_RESPONSE} ' + $mutationPhase + ' ' + $mutationAttempt + ' ' + $status)
+      continue
+    }} elseif ($line.StartsWith('{MUTATION_ABANDON_REQUEST} ')) {{
+      $parts = @($line.Substring({abandon_prefix_length}).Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+      if ($parts.Count -ne 2 -or $parts[0] -cne $mutationPhase -or $parts[1] -cne $mutationAttempt) {{ exit 75 }}
+      $claimUncertainReason = 'controller abandoned an uncertain remote mutation result'
+      $claimUncertain = $true
+      Write-MailboxResponse $responsePath $line
+      exit 75
     }} elseif ($line.StartsWith('{MUTATION_EXECUTING} ')) {{
       $parts = @($line.Substring({executing_prefix_length}).Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
       if ($parts.Count -ne 2 -or $parts[0] -cne $mutationPhase -or $parts[1] -cne $mutationAttempt) {{ exit 75 }}
@@ -630,6 +659,18 @@ while ($true) {{
       [IO.File]::Open((Join-Path $claimPath ('execution_committed.' + $mutationAttempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
     }} elseif ($line -ceq '{RELEASE}') {{
       if (-not (Same-Owner)) {{ exit 75 }}
+      Write-MailboxResponse $responsePath $line
+      $releaseDeadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
+      $nextReleaseHeartbeat = [DateTimeOffset]::UtcNow
+      while (Test-Path -LiteralPath $responsePath) {{
+        $now = [DateTimeOffset]::UtcNow
+        if (-not (Same-Owner) -or $now -ge $releaseDeadline) {{ exit 75 }}
+        if ($now -ge $nextReleaseHeartbeat) {{
+          Write-Value $claimPath 'heartbeat_at' ($now.ToString('O'))
+          $nextReleaseHeartbeat = $now.AddSeconds(1)
+        }}
+        Start-Sleep -Milliseconds 25
+      }}
       Remove-OwnClaim
       $claimPublished = $false
       $released = $true
@@ -641,7 +682,7 @@ while ($true) {{
   if (-not $released -and (Same-Owner)) {{
     if ($claimUncertain) {{
       Write-Value $claimPath 'state' 'recovery_pending'
-      Write-Value $claimPath 'recovery_reason' 'phase advance found uncertain execution evidence'
+      Write-Value $claimPath 'recovery_reason' $claimUncertainReason
     }} elseif ($mutationStarted) {{
       Finalize-InterruptedClaim
     }} else {{
@@ -653,6 +694,8 @@ while ($true) {{
   }}
 }}"#,
             mutation_prefix_length = MUTATION_STARTED.len() + 1,
+            result_prefix_length = MUTATION_RESULT_REQUEST.len() + 1,
+            abandon_prefix_length = MUTATION_ABANDON_REQUEST.len() + 1,
             executing_prefix_length = MUTATION_EXECUTING.len() + 1,
             commit_prefix_length = MUTATION_COMMITTED.len() + 1,
             stale_after_seconds = STALE_AFTER_SECONDS,
@@ -1281,27 +1324,35 @@ fn powershell_quote(value: &str) -> String {
 }
 
 pub(super) fn mutation_started_line(phase: &str, attempt: &str) -> Result<String, InvalidRequest> {
+    mutation_line(MUTATION_STARTED, phase, attempt)
+}
+
+fn mutation_line(prefix: &str, phase: &str, attempt: &str) -> Result<String, InvalidRequest> {
     let phase = validated_token(phase.to_string(), "mutation phase")?;
     let attempt = validated_identity(attempt, "mutation attempt")?;
-    Ok(format!("{MUTATION_STARTED} {phase} {attempt}"))
+    Ok(format!("{prefix} {phase} {attempt}"))
 }
 
 pub(super) fn mutation_committed_line(
     phase: &str,
     attempt: &str,
 ) -> Result<String, InvalidRequest> {
-    let phase = validated_token(phase.to_string(), "mutation phase")?;
-    let attempt = validated_identity(attempt, "mutation attempt")?;
-    Ok(format!("{MUTATION_COMMITTED} {phase} {attempt}"))
+    mutation_line(MUTATION_COMMITTED, phase, attempt)
 }
 
 pub(super) fn mutation_executing_line(
     phase: &str,
     attempt: &str,
 ) -> Result<String, InvalidRequest> {
-    let phase = validated_token(phase.to_string(), "mutation phase")?;
-    let attempt = validated_identity(attempt, "mutation attempt")?;
-    Ok(format!("{MUTATION_EXECUTING} {phase} {attempt}"))
+    mutation_line(MUTATION_EXECUTING, phase, attempt)
+}
+
+pub(super) fn mutation_result_line(phase: &str, attempt: &str) -> Result<String, InvalidRequest> {
+    mutation_line(MUTATION_RESULT_REQUEST, phase, attempt)
+}
+
+pub(super) fn mutation_abandon_line(phase: &str, attempt: &str) -> Result<String, InvalidRequest> {
+    mutation_line(MUTATION_ABANDON_REQUEST, phase, attempt)
 }
 
 fn validated_identity<'a>(value: &'a str, field: &'static str) -> Result<&'a str, InvalidRequest> {
@@ -1443,6 +1494,7 @@ mod tests {
             "Write-MailboxResponse $responsePath $line",
             "Start-Sleep -Milliseconds 25",
             "SetAccessRuleProtection($true, $false)",
+            "$acl.SetOwner($identity.User)",
             "operation_id",
             "controller_identity",
             "acquired_at",
@@ -1460,6 +1512,11 @@ mod tests {
             "execution_succeeded.",
             "execution_failed.",
             "execution_committed.",
+            MUTATION_RESULT_REQUEST,
+            MUTATION_RESULT_RESPONSE,
+            MUTATION_ABANDON_REQUEST,
+            "pending')",
+            "controller abandoned an uncertain remote mutation result",
             "$executionStarted -and",
             "$terminalEvidence",
             "Finalize-InterruptedClaim",
@@ -1472,9 +1529,48 @@ mod tests {
         assert!(!script.contains("Set-OwnerOnlyDirectory $record"));
         assert!(!script.contains("Set-OwnerOnlyDirectory $failure"));
         assert!(!script.contains("[Console]::In.ReadLine()"));
+        assert!(!script.contains("$resultDeadline"));
+        assert!(!script.contains("$status = '75'"));
         assert!(!script.contains("Write-Output"));
         assert!(!script.contains("$inputReader.ReadLine()"));
         assert!(script.contains("^satelle\\.exe$"));
+
+        let result_branch = script
+            .split("} elseif ($line.StartsWith('satelle-bootstrap-mutation-result-v1 ')) {")
+            .nth(1)
+            .and_then(|branch| {
+                branch
+                    .split(
+                        "} elseif ($line.StartsWith('satelle-bootstrap-mutation-abandon-v1 ')) {",
+                    )
+                    .next()
+            })
+            .expect("bounded mutation-result branch");
+        assert!(result_branch.contains("pending"));
+        assert!(!result_branch.contains("Start-Sleep"));
+        assert!(!result_branch.contains("heartbeat_at"));
+
+        let abandon_branch = script
+            .split("} elseif ($line.StartsWith('satelle-bootstrap-mutation-abandon-v1 ')) {")
+            .nth(1)
+            .and_then(|branch| {
+                branch
+                    .split(
+                        "} elseif ($line.StartsWith('satelle-bootstrap-mutation-executing-v1 ')) {",
+                    )
+                    .next()
+            })
+            .expect("bounded mutation-abandon branch");
+        let reason = abandon_branch
+            .find("$claimUncertainReason =")
+            .expect("abandon records the recovery reason");
+        let uncertain = abandon_branch
+            .find("$claimUncertain = $true")
+            .expect("abandon marks the claim uncertain");
+        let response = abandon_branch
+            .find("Write-MailboxResponse $responsePath $line")
+            .expect("abandon acknowledges the controller");
+        assert!(reason < uncertain && uncertain < response);
     }
 
     #[test]
@@ -1676,6 +1772,16 @@ mod tests {
             mutation_executing_line("maintenance_handoff_begin", attempt).unwrap(),
             format!("satelle-bootstrap-mutation-executing-v1 maintenance_handoff_begin {attempt}")
         );
+        assert_eq!(
+            mutation_result_line("setup_action_start", attempt).unwrap(),
+            format!("satelle-bootstrap-mutation-result-v1 setup_action_start {attempt}")
+        );
+        assert_eq!(
+            mutation_abandon_line("setup_action_start", attempt).unwrap(),
+            format!("satelle-bootstrap-mutation-abandon-v1 setup_action_start {attempt}")
+        );
+        assert!(mutation_abandon_line("invalid phase", attempt).is_err());
+        assert!(mutation_abandon_line("setup_action_start", "invalid").is_err());
         assert_eq!(RELEASE, "satelle-bootstrap-release-v1");
     }
 
@@ -2902,12 +3008,13 @@ mod tests {
                 "persistent_service_restart",
                 "persistent_service_stop",
                 "service_lifecycle_maintenance_begin",
-                "persistent_maintenance_begin",
-                "persistent_action_start",
-                "persistent_action_complete",
-                "persistent_action_skip",
-                "persistent_action_fail",
-                "persistent_maintenance_finish",
+                "setup_maintenance_begin",
+                "setup_action_start",
+                "setup_action_complete",
+                "setup_action_skip",
+                "setup_action_fail",
+                "managed_setup",
+                "setup_maintenance_finish",
             ]
         );
         assert_eq!(

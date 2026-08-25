@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 
 use base64::Engine;
 use uuid::Uuid;
@@ -60,6 +60,114 @@ pub(super) fn relaunch() -> io::Result<ExitStatus> {
         );
     }
     run_result
+}
+
+/// Starts the managed local Host Daemon in the authenticated user's desktop
+/// session. The scheduled task remains the daemon's process owner until the
+/// daemon exits, so a short-lived controller cannot tear down detached work.
+pub(super) fn launch_detached_local_daemon(
+    arguments: &[OsString],
+    forwarded_environment: &[String],
+) -> io::Result<()> {
+    let nonce = Uuid::now_v7().simple().to_string();
+    let task_name = format!("SatelleLocalDaemon-{nonce}");
+    let script_directory = env::temp_dir().join(format!("satelle-local-daemon-{nonce}"));
+    let parent_path = script_directory.join("local-daemon-parent.ps1");
+    let executable = env::current_exe()?;
+    let working_directory = env::current_dir()?;
+    let child = detached_local_daemon_script(
+        &task_name,
+        executable.as_os_str(),
+        working_directory.as_os_str(),
+        arguments,
+        forwarded_environment,
+    );
+    let parent = detached_local_daemon_parent_script(&task_name, &child);
+    let script_directory_guard =
+        satelle_core::open_or_create_owner_only_directory(&script_directory)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+    let run_result = (|| {
+        write_windows_powershell_script(&parent_path, &parent)?;
+        // Keep the launcher's diagnostics: when Task Scheduler registration or
+        // the interactive-session handoff fails, its message is the only
+        // evidence, so it travels with the error instead of being discarded.
+        let output = Command::new(windows_powershell_path()?)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&parent_path)
+            .stdin(Stdio::null())
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        Err(io::Error::other(format!(
+            "the managed local daemon task did not start (exit {}): {detail}",
+            output.status
+        )))
+    })();
+    drop(script_directory_guard);
+    if let Err(error) = fs::remove_dir_all(&script_directory) {
+        eprintln!(
+            "warning: failed to remove local daemon launch script at {}: {error}",
+            script_directory.display()
+        );
+    }
+    run_result
+}
+
+fn detached_local_daemon_script(
+    task_name: &str,
+    executable: &OsStr,
+    working_directory: &OsStr,
+    arguments: &[OsString],
+    forwarded_environment: &[String],
+) -> String {
+    let mut environment_names = DAEMON_PATH_ENVIRONMENT_VARIABLES.to_vec();
+    environment_names.push("SATELLE_TEST_SUPPORT_ADAPTER");
+    environment_names.extend(forwarded_environment.iter().map(String::as_str));
+    let environment = environment_names
+        .into_iter()
+        .map(|name| {
+            let value = env::var_os(name)
+                .map(|value| format!("'{}'", utf16_base64(&value)))
+                .unwrap_or_else(|| "$null".to_owned());
+            format!("    '{name}' = {value}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    DETACHED_LOCAL_DAEMON_TEMPLATE
+        .replace("__TASK_NAME__", task_name)
+        .replace("__EXECUTABLE__", &utf16_base64(executable))
+        .replace("__WORKING_DIRECTORY__", &utf16_base64(working_directory))
+        .replace("__ARGUMENTS__", &utf16_base64(&quoted_arguments(arguments)))
+        .replace("__ENVIRONMENT__", &environment)
+}
+
+fn detached_local_daemon_parent_script(task_name: &str, child: &str) -> String {
+    let encoded_child = utf16_base64(OsStr::new(child));
+    let interactive_launch = crate::transport::windows_interactive_task_launch_script(
+        r"\",
+        task_name,
+        "$identity.User.Value",
+    );
+    DETACHED_LOCAL_DAEMON_PARENT_TEMPLATE
+        .replace("__TASK_NAME__", task_name)
+        .replace("__ENCODED_CHILD__", &encoded_child)
+        .replace("__INTERACTIVE_LAUNCH__", &interactive_launch)
 }
 
 fn windows_powershell_path() -> io::Result<PathBuf> {
@@ -176,6 +284,62 @@ fn append_quoted_argument(command_line: &mut Vec<u16>, argument: &OsStr) {
     command_line.extend(std::iter::repeat_n('\\' as u16, backslashes * 2));
     command_line.push('"' as u16);
 }
+
+const DETACHED_LOCAL_DAEMON_PARENT_TEMPLATE: &str = r#"$ErrorActionPreference = 'Stop'
+$taskName = '__TASK_NAME__'
+$encodedChild = '__ENCODED_CHILD__'
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+$powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedChild"
+$action = New-ScheduledTaskAction -Execute $powerShellPath -Argument $arguments
+$principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings | Out-Null
+try {
+    __INTERACTIVE_LAUNCH__
+} catch {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    throw
+}
+"#;
+
+const DETACHED_LOCAL_DAEMON_TEMPLATE: &str = r#"$ErrorActionPreference = 'Stop'
+$taskName = '__TASK_NAME__'
+$decode = {
+    param([string]$Value)
+    [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Value))
+}
+try {
+    $environment = @{
+__ENVIRONMENT__
+    }
+    foreach ($name in $environment.Keys) {
+        if ($null -eq $environment[$name]) {
+            [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+        } else {
+            [Environment]::SetEnvironmentVariable($name, (& $decode $environment[$name]), 'Process')
+        }
+    }
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = & $decode '__EXECUTABLE__'
+    $start.WorkingDirectory = & $decode '__WORKING_DIRECTORY__'
+    $start.Arguments = & $decode '__ARGUMENTS__'
+    $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $false
+    $start.RedirectStandardOutput = $false
+    $start.RedirectStandardError = $false
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $start
+    if (-not $process.Start()) {
+        throw 'The managed local daemon process did not start.'
+    }
+    $process.WaitForExit()
+    exit $process.ExitCode
+} finally {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+}
+"#;
 
 const PARENT_SCRIPT_TEMPLATE: &str = r#"$ErrorActionPreference = 'Stop'
 $taskName = '__TASK_NAME__'

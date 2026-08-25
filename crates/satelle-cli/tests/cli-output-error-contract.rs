@@ -2,9 +2,6 @@ use assert_cmd::Command;
 use satelle_test_contract::assert_error_process;
 use serde_json::Value;
 
-#[path = "support/test-file.rs"]
-mod test_file;
-
 fn satelle() -> Command {
     let mut command = Command::cargo_bin("satelle").expect("satelle binary should build");
     for name in [
@@ -27,23 +24,14 @@ fn satelle() -> Command {
 #[test]
 fn internal_failures_keep_their_typed_cause_and_exit_with_the_internal_class() {
     let sandbox = tempfile::tempdir().expect("temporary Satelle home should be created");
-    let config_file = sandbox.path().join("config.toml");
-    test_file::write_user_controlled(
-        &config_file,
-        r#"default_host = "local-demo"
-
-[hosts.local-demo]
-transport = "local"
-adapter = "codex"
-"#,
-    )
-    .expect("production config should be written securely");
+    let bundle_path = sandbox.path().join("support-bundle.zip");
 
     let output = satelle()
-        .env("SATELLE_CONFIG_FILE", config_file)
         .env("SATELLE_STATE_DIR", sandbox.path())
         .env("SATELLE_LOG", "satelle=debug")
-        .args(["setup", "--yes", "--host", "local-demo", "--json"])
+        .args(["support", "bundle", "--output"])
+        .arg(bundle_path)
+        .arg("--json")
         .assert()
         .code(70)
         .get_output()

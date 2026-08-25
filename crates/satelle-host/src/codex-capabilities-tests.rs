@@ -44,7 +44,7 @@ fn main() {
     line.clear();
     input.read_line(&mut line).expect("read config request");
     assert!(line.contains("\"method\":\"config/read\""));
-    if mode == "defaults" {
+    if matches!(mode.as_str(), "defaults" | "implicit-defaults") {
         assert!(line.contains("\"includeLayers\":false"));
     } else {
         assert!(line.contains("\"includeLayers\":true"));
@@ -62,6 +62,7 @@ fn main() {
             r#"{"model":{"type":"user","file":"PRIVATE_PATH_CANARY"},"model_provider":{"type":"sessionFlags","hash":"PRIVATE_HASH_CANARY"}}"#,
             r#"{"private_flattened_canary":"PRIVATE_LAYER_CANARY"}"#,
         ),
+        "implicit-defaults" => ("{}", "{}", "{}"),
         _ => std::process::exit(2),
     };
     let config_file = std::path::Path::new(&codex_home).join("config.toml");
@@ -72,6 +73,19 @@ fn main() {
     )
     .expect("write config response");
     output.flush().expect("flush config response");
+
+    if mode == "implicit-defaults" {
+        line.clear();
+        input.read_line(&mut line).expect("read thread start request");
+        assert!(line.contains("\"method\":\"thread/start\""));
+        assert!(line.contains("\"ephemeral\":true"));
+        writeln!(
+            output,
+            "{{\"id\":3,\"result\":{{\"thread\":{{\"ephemeral\":true,\"path\":null}},\"model\":\"gpt-builtin\",\"modelProvider\":\"openai\"}}}}"
+        )
+        .expect("write ephemeral thread response");
+        output.flush().expect("flush ephemeral thread response");
+    }
 
     let mut rest = String::new();
     input.read_to_string(&mut rest).expect("wait for probe shutdown");
@@ -124,7 +138,10 @@ fn compile_windows_app_policy_fixture() -> CompiledWindowsAppPolicyFixture {
         .group_spawn()
         .expect("spawn Windows app-policy fixture compiler");
     let compile_deadline = Instant::now() + WINDOWS_APP_POLICY_FIXTURE_COMPILE_TIMEOUT;
-    let output_status = match wait_for_group(&mut compiler, compile_deadline) {
+    // The compiler leader reports the completed compile and link. Waiting for
+    // the Windows job itself can stall inside an enclosing Task Scheduler job;
+    // the termination proof below still closes every remaining descendant.
+    let output_status = match wait_for_leader(&mut compiler, compile_deadline) {
         GroupWaitOutcome::Exited(status) => status,
         GroupWaitOutcome::Deadline => {
             assert!(
@@ -208,6 +225,25 @@ fn effective_defaults_probe_keeps_only_the_model_pair_and_closed_origins() {
     assert!(!debug.contains("PRIVATE_PATH_CANARY"));
     assert!(!debug.contains("PRIVATE_HASH_CANARY"));
     assert!(!debug.contains("PRIVATE_LAYER_CANARY"));
+}
+
+#[test]
+fn effective_defaults_probe_uses_an_ephemeral_thread_for_builtin_defaults() {
+    let fixture = compile_windows_app_policy_fixture();
+    let codex_home = tempfile::tempdir().expect("create deterministic Codex home");
+    let defaults = probe_effective_codex_defaults_with(
+        windows_app_policy_fixture_command(&fixture, "implicit-defaults", codex_home.path()),
+        Duration::from_secs(3),
+    )
+    .expect("resolve built-in Codex defaults");
+
+    assert_eq!(defaults.model(), "gpt-builtin");
+    assert_eq!(defaults.model_provider(), "openai");
+    assert_eq!(defaults.model_origin(), CodexConfigOriginClass::Default);
+    assert_eq!(
+        defaults.model_provider_origin(),
+        CodexConfigOriginClass::Default
+    );
 }
 
 #[test]
@@ -605,6 +641,25 @@ fn process_probe_resolves_codex_home_before_classifying_legacy_input() {
     assert_eq!(
         probe_windows_app_policy_with(command, Duration::from_secs(2)),
         EvidenceSurface::Private
+    );
+}
+
+#[test]
+fn windows_app_policy_probe_does_not_restart_an_existing_deadline() {
+    let fixture = compile_windows_app_policy_fixture();
+    let codex_home = tempfile::tempdir().expect("create deterministic Codex home");
+    let command = windows_app_policy_fixture_command(&fixture, "stable", codex_home.path());
+    let deadline = Instant::now() + Duration::from_millis(25);
+    thread::sleep(Duration::from_millis(30));
+    let started = Instant::now();
+
+    assert_eq!(
+        probe_windows_app_policy_until(command, deadline),
+        EvidenceSurface::Incomplete
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the app-policy probe restarted an expired Phase0 deadline"
     );
 }
 

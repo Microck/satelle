@@ -58,12 +58,14 @@ pub use secure_file::{
     OwnerOnlyDirectory, OwnerOnlySecretFilePaths, SecureFileError, SshIdentityCommitRecord,
     cleanup_owner_only_secret_file, keyed_owner_only_secret_file_comparison_digest,
     keyed_secret_comparison_digest, open_new_owner_only_file, open_or_create_owner_only_directory,
-    open_or_create_owner_only_file, open_owner_only_directory,
-    owner_only_secret_destination_exists, persist_new_owner_only_secret_file,
-    publish_new_owner_only_directory, publish_owner_only_secret_file,
-    read_bounded_regular_file_no_follow, read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
-    rollback_owner_only_secret_file, stage_owner_only_secret_file, sync_owner_only_directory,
+    open_or_create_owner_only_file, open_or_create_user_or_administrator_controlled_directory,
+    open_owner_only_directory, open_user_or_administrator_controlled_directory,
+    owner_only_secret_destination_exists, persist_new_owner_only_config_file,
+    persist_new_owner_only_secret_file, publish_new_owner_only_directory,
+    publish_owner_only_secret_file, read_bounded_regular_file_no_follow,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file,
+    read_owner_only_secret_file, read_trusted_ca_bundle_file, rollback_owner_only_secret_file,
+    stage_owner_only_secret_file, sync_owner_only_directory,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";
@@ -5454,6 +5456,91 @@ impl SatelleError {
         }
     }
 
+    /// An attached command cannot wait for a Turn that needs restart recovery:
+    /// no live execution owns it until reconciliation or an explicit stop, so
+    /// the client returns immediately with the durable handles it can act on.
+    pub fn turn_recovery_pending(alias: &str, session_id: &SessionId, turn_id: &TurnId) -> Self {
+        let recovery_command = format!(
+            "satelle status {} --host {} --json",
+            session_id.as_str(),
+            shell_argument(alias)
+        );
+        Self {
+            code: ErrorCode::RemoteExecution,
+            message: format!(
+                "turn '{}' of session '{}' on host '{alias}' requires recovery before it can continue",
+                turn_id.as_str(),
+                session_id.as_str()
+            ),
+            recovery_command: Some(recovery_command.clone()),
+            source_detail: None,
+            details: BTreeMap::from([
+                ("host".to_string(), Value::String(alias.to_string())),
+                (
+                    "session_id".to_string(),
+                    Value::String(session_id.as_str().to_string()),
+                ),
+                (
+                    "turn_id".to_string(),
+                    Value::String(turn_id.as_str().to_string()),
+                ),
+                (
+                    "reason".to_string(),
+                    Value::String("turn_recovery_pending".to_string()),
+                ),
+                (
+                    "recovery_command".to_string(),
+                    Value::String(recovery_command),
+                ),
+            ]),
+        }
+    }
+
+    /// The attached command followed its Turn to a committed terminal failure.
+    /// The Host publishes only a closed failure reason, so the client rebuilds
+    /// the same remote-execution error class the embedded path returns.
+    pub fn turn_failed(
+        alias: &str,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        reason: Option<&str>,
+    ) -> Self {
+        let recovery_command = format!(
+            "satelle status {} --host {} --json",
+            session_id.as_str(),
+            shell_argument(alias)
+        );
+        let mut details = BTreeMap::from([
+            ("host".to_string(), Value::String(alias.to_string())),
+            (
+                "session_id".to_string(),
+                Value::String(session_id.as_str().to_string()),
+            ),
+            (
+                "turn_id".to_string(),
+                Value::String(turn_id.as_str().to_string()),
+            ),
+            (
+                "recovery_command".to_string(),
+                Value::String(recovery_command.clone()),
+            ),
+        ]);
+        if let Some(reason) = reason {
+            details.insert("reason".to_string(), Value::String(reason.to_string()));
+        }
+        Self {
+            code: ErrorCode::RemoteExecution,
+            message: format!(
+                "turn '{}' of session '{}' on host '{alias}' failed",
+                turn_id.as_str(),
+                session_id.as_str()
+            ),
+            recovery_command: Some(recovery_command),
+            source_detail: None,
+            details,
+        }
+    }
+
     pub fn bootstrap_busy(alias: &str, operation_id: Option<&str>) -> Self {
         let mut details = BTreeMap::new();
         details.insert("host".to_string(), Value::String(alias.to_string()));
@@ -5615,6 +5702,40 @@ impl SatelleError {
             recovery_command: Some("satelle doctor --scope transport --json".to_string()),
             source_detail: None,
             details,
+        }
+    }
+
+    pub fn remote_managed_setup_error(
+        alias: &str,
+        setup_mode: SetupMode,
+        component: &str,
+        remote_code: &str,
+    ) -> Self {
+        let setup_mode_flag = match setup_mode {
+            SetupMode::OnDemand => "on-demand",
+            SetupMode::Persistent => "persistent",
+        };
+        let recovery_command = format!(
+            "satelle setup --host {} --{setup_mode_flag} --component {} --no-input --json --yes",
+            shell_argument(alias),
+            shell_argument(component),
+        );
+        Self {
+            code: ErrorCode::RemoteExecution,
+            message: "the Host rejected the managed setup action".to_string(),
+            recovery_command: Some(recovery_command.clone()),
+            source_detail: None,
+            details: BTreeMap::from([
+                ("host".to_string(), Value::String(alias.to_string())),
+                (
+                    "remote_code".to_string(),
+                    Value::String(remote_code.to_string()),
+                ),
+                (
+                    "recovery_command".to_string(),
+                    Value::String(recovery_command),
+                ),
+            ]),
         }
     }
 
@@ -6307,6 +6428,35 @@ impl SatelleError {
                 shell_argument(&report.host)
             ))
         });
+        Self::setup_partially_applied_actions(
+            &report.host,
+            report.completed_actions.clone(),
+            failed_action,
+            report.skipped_actions.clone(),
+            report
+                .preserved_state
+                .clone()
+                .unwrap_or_else(|| "completed setup actions were preserved".to_string()),
+            recovery_command,
+            source,
+        )
+    }
+
+    pub fn setup_partially_applied_actions(
+        host: &str,
+        completed_actions: Vec<String>,
+        failed_action: &str,
+        skipped_actions: Vec<String>,
+        preserved_state: impl Into<String>,
+        recovery_command: Option<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        let recovery_command = recovery_command.or_else(|| {
+            Some(format!(
+                "satelle repair --host {} --no-input --yes",
+                shell_argument(host)
+            ))
+        });
         Self {
             code: ErrorCode::SetupPartiallyApplied,
             message: format!(
@@ -6319,10 +6469,13 @@ impl SatelleError {
                     "status".to_string(),
                     Value::String("partial_failure".to_string()),
                 ),
-                ("changed".to_string(), Value::Bool(report.changed)),
+                (
+                    "changed".to_string(),
+                    Value::Bool(!completed_actions.is_empty()),
+                ),
                 (
                     "completed_actions".to_string(),
-                    serde_json::to_value(&report.completed_actions).unwrap_or(Value::Null),
+                    serde_json::to_value(&completed_actions).unwrap_or(Value::Null),
                 ),
                 (
                     "failed_action".to_string(),
@@ -6330,11 +6483,11 @@ impl SatelleError {
                 ),
                 (
                     "skipped_actions".to_string(),
-                    serde_json::to_value(&report.skipped_actions).unwrap_or(Value::Null),
+                    serde_json::to_value(&skipped_actions).unwrap_or(Value::Null),
                 ),
                 (
                     "preserved_state".to_string(),
-                    serde_json::to_value(&report.preserved_state).unwrap_or(Value::Null),
+                    Value::String(preserved_state.into()),
                 ),
                 (
                     "recovery_command".to_string(),
@@ -6694,6 +6847,129 @@ mod error_contract_tests {
     }
 
     #[test]
+    fn turn_failed_keeps_the_closed_reason_and_durable_handles() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let error = SatelleError::turn_failed(
+            "remote",
+            &session_id,
+            &turn_id,
+            Some("native_action_unavailable"),
+        );
+        assert_eq!(error.code, ErrorCode::RemoteExecution);
+        assert_eq!(
+            error.details.keys().collect::<Vec<_>>(),
+            vec![
+                "host",
+                "reason",
+                "recovery_command",
+                "session_id",
+                "turn_id"
+            ]
+        );
+        assert_eq!(
+            error.details["reason"],
+            Value::String("native_action_unavailable".to_string())
+        );
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some(
+                format!(
+                    "satelle status {} --host remote --json",
+                    session_id.as_str()
+                )
+                .as_str()
+            )
+        );
+
+        let unexplained = SatelleError::turn_failed("remote", &session_id, &turn_id, None);
+        assert!(!unexplained.details.contains_key("reason"));
+    }
+
+    #[test]
+    fn turn_recovery_pending_points_the_client_at_durable_status() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let error = SatelleError::turn_recovery_pending("remote host", &session_id, &turn_id);
+        let expected_command = format!(
+            "satelle status {} --host 'remote host' --json",
+            session_id.as_str()
+        );
+        assert_eq!(error.code, ErrorCode::RemoteExecution);
+        assert_eq!(error.exit_code(), ErrorCode::RemoteExecution.exit_code());
+        assert_eq!(
+            error.recovery_command.as_deref(),
+            Some(expected_command.as_str())
+        );
+        assert_eq!(
+            error.details.keys().collect::<Vec<_>>(),
+            vec![
+                "host",
+                "reason",
+                "recovery_command",
+                "session_id",
+                "turn_id"
+            ]
+        );
+        assert_eq!(
+            error.details["reason"],
+            Value::String("turn_recovery_pending".to_string())
+        );
+        assert_eq!(
+            error.details["session_id"],
+            Value::String(session_id.as_str().to_string())
+        );
+        assert_eq!(
+            error.details["turn_id"],
+            Value::String(turn_id.as_str().to_string())
+        );
+    }
+
+    #[test]
+    fn remote_managed_setup_error_reruns_the_quoted_component() {
+        let error = SatelleError::remote_managed_setup_error(
+            "remote host",
+            SetupMode::OnDemand,
+            "computer use'; touch /tmp/pwn",
+            "codex_download_failed",
+        );
+        let recovery_command = "satelle setup --host 'remote host' --on-demand --component 'computer use'\"'\"'; touch /tmp/pwn' --no-input --json --yes";
+        assert_eq!(error.code, ErrorCode::RemoteExecution);
+        assert_eq!(error.exit_code(), ErrorCode::RemoteExecution.exit_code());
+        assert_eq!(error.message, "the Host rejected the managed setup action");
+        assert_eq!(error.recovery_command.as_deref(), Some(recovery_command));
+        assert_eq!(
+            error.details.keys().collect::<Vec<_>>(),
+            vec!["host", "recovery_command", "remote_code"]
+        );
+        assert_eq!(
+            error.details["host"],
+            Value::String("remote host".to_string())
+        );
+        assert_eq!(
+            error.details["remote_code"],
+            Value::String("codex_download_failed".to_string())
+        );
+        assert_eq!(
+            error.details["recovery_command"],
+            Value::String(recovery_command.to_string())
+        );
+
+        let persistent = SatelleError::remote_managed_setup_error(
+            "remote",
+            SetupMode::Persistent,
+            "codex",
+            "codex_checksum_mismatch",
+        );
+        assert_eq!(
+            persistent.recovery_command.as_deref(),
+            Some(
+                "satelle setup --host remote --persistent --component codex --no-input --json --yes"
+            )
+        );
+    }
+
+    #[test]
     fn host_update_recovery_commands_quote_host_aliases() {
         let host = "remote host'; touch /tmp/pwn";
         let repair_command =
@@ -6791,6 +7067,30 @@ mod error_contract_tests {
         assert_eq!(
             partial.details["completed_actions"],
             serde_json::json!(["repair-host-daemon"])
+        );
+
+        let native_partial = SatelleError::setup_partially_applied_actions(
+            "remote",
+            vec!["managed-codex".to_string()],
+            "native-computer-use",
+            Vec::new(),
+            "the installed and attested managed Codex package was preserved",
+            Some("satelle setup --host remote --component computer-use".to_string()),
+            "native setup failed",
+        );
+        assert_eq!(native_partial.code, ErrorCode::SetupPartiallyApplied);
+        assert_eq!(native_partial.details["changed"], true);
+        assert_eq!(
+            native_partial.details["completed_actions"],
+            serde_json::json!(["managed-codex"])
+        );
+        assert_eq!(
+            native_partial.details["failed_action"],
+            "native-computer-use"
+        );
+        assert_eq!(
+            native_partial.details["preserved_state"],
+            "the installed and attested managed Codex package was preserved"
         );
 
         let storage_partial = SatelleError::storage_maintenance_partially_applied(

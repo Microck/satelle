@@ -2699,6 +2699,8 @@ mod tests {
                 satelle_core::EventType::TurnStarted,
                 satelle_core::EventType::ProviderSmoke,
                 satelle_core::EventType::TurnProgress,
+                satelle_core::EventType::Preflight,
+                satelle_core::EventType::Readiness,
                 satelle_core::EventType::TurnCompleted,
             ]
         );
