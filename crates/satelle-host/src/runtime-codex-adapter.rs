@@ -10,7 +10,7 @@ use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
     CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexTurnReadRequest,
     CodexTurnStatus, TimedCodexSessionRun, read_codex_turn,
-    run_codex_session_with_timeout_cancellation,
+    run_codex_session_with_native_action_completion, run_codex_session_with_timeout_cancellation,
 };
 use crate::provider_auth::{
     ProviderAuthResolutionError, ProviderHostPlatform, ProviderSmokeCredentialFingerprinter,
@@ -571,7 +571,7 @@ impl ProductionComputerUseAdapter {
         )
         .map_err(native_smoke_failure)?;
         let expected_mcp_server_name = verified_app_server.native_mcp_server_name;
-        let run = run_codex_session_with_timeout_cancellation(
+        let run = run_codex_session_with_native_action_completion(
             verified_app_server.command,
             CodexSessionRequest {
                 working_directory: &working_directory,
@@ -588,7 +588,7 @@ impl ProductionComputerUseAdapter {
                 persist_thread_ref,
                 persist_turn_ref,
                 observe_native_approval: None,
-                native_action_evidence: Some(native_action_evidence.clone()),
+                native_action_evidence: None,
                 expected_mcp_server_name: &expected_mcp_server_name,
                 computer_use_allowed_app_ids: allowed_app_ids,
                 control: None,
@@ -596,6 +596,7 @@ impl ProductionComputerUseAdapter {
                 image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
                 attachments: &[],
             },
+            native_action_evidence.clone(),
             READINESS_CANCELLATION_GRACE,
             cancellation.cloned(),
         );
@@ -843,6 +844,12 @@ impl ProductionComputerUseAdapter {
             READINESS_CANCELLATION_GRACE,
             persistence.cancellation.cloned(),
         );
+        if native_action_evidence.invalidated() {
+            return Err(mark_probe_dispatch_possible(
+                provider_smoke_failure(crate::provider_probe::ProviderProbeError::InvalidRequest),
+                false,
+            ));
+        }
         match classify_provider_probe_run(run)? {
             CodexSessionTerminal::Completed => {}
             CodexSessionTerminal::Interrupted
@@ -1337,6 +1344,13 @@ fn javascript_single_quoted(value: &str) -> String {
     literal
 }
 
+fn node_repl_exec_source(script: &str) -> String {
+    let code = serde_json::to_string(script).expect("a Rust string always serializes as JSON");
+    format!(
+        "const nativeResult = await tools.mcp__node_repl__js({{code:{code}}}); text(JSON.stringify(nativeResult));"
+    )
+}
+
 fn native_readiness_prompt(
     page_url: &str,
     action_path: &crate::codex_capabilities::NativeComputerUseActionPath,
@@ -1355,14 +1369,26 @@ fn native_readiness_prompt(
                 return Err("native_app_approval_unavailable");
             }
             // The signed bridge exposes the Win32 button through its stable
-            // accessibility label. Resolve its current index instead of
-            // coupling click delivery to window chrome geometry. The painted
-            // drag surfaces have no accessibility elements, so bind their
-            // fixed full-window coordinates to a fresh screenshot.
-            let script = "globalThis.sky ??= (await import('@oai/sky')).sky; var apps = await sky.list_apps(); var satelle = apps.find(app => app.id.toLowerCase().endsWith('satelle.exe')); if (!satelle) throw new Error('Satelle is unavailable'); var probeWindow = satelle.windows.find(window => window.title === 'Satelle native readiness probe'); if (!probeWindow) throw new Error('Satelle native readiness probe window is unavailable'); var state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); var buttonLine = state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); var buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) }); await new Promise(resolve => setTimeout(resolve, 300)); state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); if (!state.accessibility.tree.includes('Click event observed')) throw new Error('native click event missing'); var screenshot = state.screenshots[0]; if (!screenshot) throw new Error('window screenshot missing after click'); await sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 668, to_y: 461, screenshotId: screenshot.id }); await new Promise(resolve => setTimeout(resolve, 500)); var finalState = await sky.get_window_state({ window: probeWindow, include_screenshot: false, include_text: true }); if (!finalState.accessibility.tree.includes('Drag event observed')) throw new Error('native drag event missing'); nodeRepl.write('Native click and drag actions observed');".to_string();
+            // accessibility label. Use the exact window returned by
+            // list_apps, then keep the fresh binding returned by every state
+            // observation. The explicit get_window and activate_window paths
+            // both require foreground activation, while input methods activate
+            // their target automatically. The painted drag surfaces have no
+            // accessibility elements, so bind their fixed full-window
+            // coordinates to a fresh screenshot.
+            let script = "globalThis.sky ??= (await import('@oai/sky')).sky; var apps = await sky.list_apps(); var satelle = apps.find(app => app.id.toLowerCase().endsWith('satelle.exe')); if (!satelle) throw new Error('Satelle is unavailable'); var probeWindow = satelle.windows.find(window => window.title === 'Satelle native readiness probe'); if (!probeWindow) throw new Error('Satelle native readiness probe window is unavailable'); var state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); probeWindow = state.window; var buttonLine = state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); var buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) }); await new Promise(resolve => setTimeout(resolve, 300)); state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); probeWindow = state.window; if (!state.accessibility.tree.includes('Click event observed')) throw new Error('native click event missing'); var screenshot = state.screenshots[0]; if (!screenshot) throw new Error('window screenshot missing after click'); await sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 578, to_y: 406, screenshotId: screenshot.id }); await new Promise(resolve => setTimeout(resolve, 500)); var finalState = await sky.get_window_state({ window: probeWindow, include_screenshot: false, include_text: true }); if (!finalState.accessibility.tree.includes('Drag event observed')) throw new Error('native drag event missing'); nodeRepl.write('Native click and drag actions observed');".to_string();
+            // The `exec` tool yields after roughly ten seconds and reports a
+            // background cell instead of a result. On slow hosts the readiness
+            // script outlives that window, and a model that obeys "no other
+            // tool calls" then ends the Turn before the nested node_repl item
+            // completes, so the exact-call evidence never lands even though
+            // the click and drag reached the loopback target. Allow only the
+            // `wait` call that drains that cell; `wait` is a top-level tool, not
+            // an MCP item, so it cannot invalidate the evidence observer.
             native_action_evidence.expect_script_for_app(&script, "satelle.exe");
+            let exec_source = node_repl_exec_source(&script);
             Ok(format!(
-                "Use the installed official Computer Use plugin immediately. If `mcp__node_repl__js` is not already available, use `tool_search` exactly once with query `node_repl js`. Call `mcp__node_repl__js` directly with the exact `code` argument containing this complete JavaScript in one persistent-kernel cell: `{script}`. Make no other discovery or tool calls. The Satelle-owned window independently reports both native events to a private loopback capability, and the accessibility tree is formatted text. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list or inspect unrelated apps. Do not inspect Object.keys or probe API shapes. Do not read documentation. Stop immediately after the JavaScript tool call reaches a terminal result."
+                "Use the installed official Computer Use plugin immediately. Call the top-level `exec` tool exactly once with this exact JavaScript source: `{exec_source}`. That source calls the nested `mcp__node_repl__js` tool exactly once with the complete readiness script as the exact `code` argument. The tools are already available; do not call `tool_search` or inspect the tool inventory. Make no other discovery or tool calls. The Satelle-owned window independently reports both native events to a private loopback capability, and the accessibility tree is formatted text. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list or inspect unrelated apps. Do not inspect Object.keys or probe API shapes. Do not read documentation. If the `exec` result reports that the script is still running with a cell ID instead of a terminal result, call the top-level `wait` tool with that `cell_id` and `yield_time_ms` of 10000, repeating only until the cell returns a terminal result. That `wait` call is the only other tool call permitted. Stop immediately after the `exec` tool call reaches a terminal result."
             ))
         }
         crate::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
@@ -1374,19 +1400,31 @@ fn native_readiness_prompt(
                 "globalThis.sky ??= (await import('@oai/sky')).sky; var state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); await sky.press_key({{ app: 'Safari', key: 'super+n' }}); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var addressLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('text field') && line.includes('ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD')); var addressMatch = addressLine && addressLine.trim().match(/^([0-9]+)/); if (!addressMatch) throw new Error('Safari address field missing'); await sky.set_value({{ app: 'Safari', element_index: Number(addressMatch[1]), value: {page_url} }}); await sky.press_key({{ app: 'Safari', key: 'Return' }}); var buttonMatch = null; for (var attempt = 0; attempt < 8 && !buttonMatch; attempt++) {{ await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1000 : 500)); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var buttonLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); }} if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({{ app: 'Safari', element_index: Number(buttonMatch[1]) }}); await sky.drag({{ app: 'Safari', from_x: 100, from_y: 320, to_x: 600, to_y: 425 }}); await sky.press_key({{ app: 'Safari', key: 'super+w' }}); nodeRepl.write('Native click and drag actions dispatched');"
             );
             native_action_evidence.expect_script_for_app(&script, "com.apple.Safari");
+            let exec_source = node_repl_exec_source(&script);
             Ok(format!(
-                "Use the installed official Computer Use plugin immediately. If `mcp__node_repl__js` is not already available, use `tool_search` exactly once with query `node_repl js`. Call `mcp__node_repl__js` directly with the exact `code` argument containing this complete JavaScript in one persistent-kernel cell: `{script}`. Make no other discovery or tool calls. The private loopback target independently verifies both native events. It rejects a missing click or drag. The target has a fixed 1024 by 678 readiness surface, so the app-window drag coordinates are part of this probe contract. Use only the authenticated sky Computer Use API. Do not use shell, file, generic browser automation, or other network tools. Do not print the app list or inspect unrelated apps. Do not read documentation. Stop immediately after the JavaScript tool call reaches a terminal result."
+                "Use the installed official Computer Use plugin immediately. Call the top-level `exec` tool exactly once with this exact JavaScript source: `{exec_source}`. That source calls the nested `mcp__node_repl__js` tool exactly once with the complete readiness script as the exact `code` argument. The tools are already available; do not call `tool_search` or inspect the tool inventory. Make no other discovery or tool calls. The private loopback target independently verifies both native events. It rejects a missing click or drag. The target has a fixed 1024 by 678 readiness surface, so the app-window drag coordinates are part of this probe contract. Use only the authenticated sky Computer Use API. Do not use shell, file, generic browser automation, or other network tools. Do not print the app list or inspect unrelated apps. Do not read documentation. If the `exec` result reports that the script is still running with a cell ID instead of a terminal result, call the top-level `wait` tool with that `cell_id` and `yield_time_ms` of 10000, repeating only until the cell returns a terminal result. That `wait` call is the only other tool call permitted. Stop immediately after the `exec` tool call reaches a terminal result."
             ))
         }
     }
 }
 
-fn native_computer_use_prompt(user_prompt: &str) -> String {
+fn native_computer_use_prompt(
+    user_prompt: &str,
+    action_path: &crate::codex_capabilities::NativeComputerUseActionPath,
+) -> String {
     // The isolated MCP server exposes a generic JavaScript kernel. Name the
     // trusted Sky entry point on every Turn so the model does not mistake the
     // sandboxed shell for a desktop-control surface.
+    let api = match action_path {
+        crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl => {
+            "Use only the supported Windows window API: `list_apps()`, `launch_app({app})`, `list_windows()`, `get_window_state({window, include_screenshot, include_text})`, `activate_window({window})`, `click({window, element_index})` or screenshot coordinates, `set_value({window, element_index, value})`, `type_text({window, text})`, `press_key({window, key})`, `scroll(...)`, and `drag(...)`. Select a canonical app id from `list_apps()`. Every action must use a current `window` object returned by `list_apps()` or `list_windows()`; after `launch_app`, list again to obtain its window. Refresh `get_window_state` after each UI transition. Method names are snake_case."
+        }
+        crate::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
+            "Use only the supported macOS window API: `list_apps()`, `get_app_state({app, disableDiff: true})`, `click({app, element_index})` or app-window coordinates, `set_value({app, element_index, value})`, `type_text({app, text})`, `press_key({app, key})`, `scroll(...)`, `drag(...)`, `paste(...)`, and `select_text(...)`. Select a canonical app id from `list_apps()` and pass it as `app` to every action. Refresh `get_app_state` after each UI transition. Method names are snake_case."
+        }
+    };
     format!(
-        "Use the installed official Computer Use integration for every desktop-app interaction. If `mcp__node_repl__js` is not already available, use `tool_search` exactly once with query `node_repl js`. Call the `mcp__node_repl__js` JavaScript tool and begin with `globalThis.sky ??= (await import('@oai/sky')).sky;`; then use `sky` to inspect and control the requested app. Make no other discovery calls. Do not use shell commands, AppleScript, generic browser automation, or another integration for desktop interaction. Complete this user request: {user_prompt}"
+        "Use the installed official Computer Use integration for every desktop-app interaction. Call the top-level `exec` tool for each persistent JavaScript cell. Inside each `exec` cell, call `await tools.mcp__node_repl__js({{code: ...}})` exactly once and pass that cell's JavaScript source in `code`. Begin the first native cell with `globalThis.sky ??= (await import('@oai/sky')).sky;`. {api} The tools are already available. Do not call `tool_search`, inspect the tool inventory, inspect object keys or prototypes, read API documentation, or make other discovery calls. Do not use shell commands, AppleScript, generic browser automation, or another integration for desktop interaction. Complete this user request: {user_prompt}"
     )
 }
 
@@ -1946,6 +1984,10 @@ fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
             ErrorCode::ComputerUseNotReady,
             "provider_smoke_control_failed",
         ),
+        CodexSessionError::NativeActionUnavailable => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_native_action_unavailable",
+        ),
     };
     provider_smoke_error(code, reason)
 }
@@ -2282,7 +2324,10 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                     crate::codex_capabilities::installed_computer_use_app_server(),
                 )?;
                 let expected_mcp_server_name = verified_app_server.native_mcp_server_name;
-                let prompt = native_computer_use_prompt(request.prompt());
+                let prompt = native_computer_use_prompt(
+                    request.prompt(),
+                    &verified_app_server.native_action_path,
+                );
                 let run = run_codex_session_with_timeout_cancellation(
                     verified_app_server.command,
                     CodexSessionRequest {
@@ -2622,6 +2667,15 @@ fn terminal_result(
         Err(failure) if !failure.turn_dispatch_attempted() => {
             Ok(ExecuteResult::new(TurnTransition::Failed, Vec::new()))
         }
+        // Codex reported `turn/completed` without one successful correlated
+        // native tool item. Upstream is terminal, so nothing owns the desktop
+        // and recovery could only relabel the missing evidence as success.
+        // Commit a typed terminal failure that keeps the evidence reason.
+        Err(failure) if failure.error() == CodexSessionError::NativeActionUnavailable => {
+            Ok(ExecuteResult::terminal_failure(session_failure(
+                CodexSessionError::NativeActionUnavailable,
+            )))
+        }
         Err(failure) => Err(session_failure(failure.error())),
     }
 }
@@ -2697,6 +2751,7 @@ fn session_failure(error: CodexSessionError) -> SatelleError {
         CodexSessionError::Persistence => "persistence_failed",
         CodexSessionError::Containment => "containment_failed",
         CodexSessionError::Control => "control_failed",
+        CodexSessionError::NativeActionUnavailable => "native_action_unavailable",
     };
     adapter_failure(reason)
 }
@@ -3993,8 +4048,8 @@ mod tests {
             (
                 "provider-probe-text-only",
                 Some((
-                    ErrorCode::ProviderSmokeTestTimeout,
-                    "provider_smoke_test_timed_out",
+                    ErrorCode::ComputerUseNotReady,
+                    "provider_smoke_native_action_unavailable",
                 )),
             ),
             (
@@ -4062,7 +4117,9 @@ mod tests {
                 let protocol =
                     std::fs::read_to_string(&protocol_log).expect("provider protocol log");
                 assert!(protocol.contains("http://127.0.0.1:"));
-                assert!(protocol.contains("Call `mcp__node_repl__js` directly"));
+                assert!(protocol.contains("Call the top-level `exec` tool exactly once"));
+                assert!(protocol.contains("await tools.mcp__node_repl__js({code:"));
+                assert!(protocol.contains("exact `code` argument"));
                 assert!(protocol.contains("import('@oai/sky')"));
                 let args = std::fs::read_to_string(&args_log).expect("provider child args");
                 assert!(
@@ -4095,6 +4152,24 @@ mod tests {
                 .unwrap()
                 .transition()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn completed_turn_without_native_evidence_is_a_typed_terminal_failure() {
+        let result = terminal_result(Err(CodexSessionFailure::after_exchange(
+            CodexSessionError::NativeActionUnavailable,
+            true,
+        )))
+        .expect("an upstream-terminal Turn must not become recovery_pending");
+        assert_eq!(result.transition(), Some(TurnTransition::Failed));
+        let error = result
+            .terminal_error()
+            .expect("the missing evidence reason must stay typed");
+        assert_eq!(error.code, ErrorCode::RemoteExecution);
+        assert_eq!(
+            error.details["reason"],
+            serde_json::json!("native_action_unavailable")
         );
     }
 
@@ -4398,10 +4473,12 @@ mod tests {
             &BTreeSet::from(["satelle.exe".to_string()]),
             &evidence,
         )
-        .expect("the authenticated Windows node_repl path should form a direct plugin call");
+        .expect("the authenticated Windows node_repl path should form a nested plugin call");
         assert!(prompt.contains("Use the installed official Computer Use plugin immediately"));
-        assert!(prompt.contains("use `tool_search` exactly once with query `node_repl js`"));
-        assert!(prompt.contains("Call `mcp__node_repl__js` directly"));
+        assert!(prompt.contains("Call the top-level `exec` tool exactly once"));
+        assert!(prompt.contains("await tools.mcp__node_repl__js({code:"));
+        assert!(prompt.contains("exact JavaScript source"));
+        assert!(prompt.contains("do not call `tool_search`"));
         assert!(prompt.contains("import('@oai/sky')"));
         assert!(!prompt.contains("registerHooks"));
         assert!(!prompt.contains("clientModuleUrl"));
@@ -4413,9 +4490,10 @@ mod tests {
         assert!(prompt.contains("app.id.toLowerCase().endsWith('satelle.exe')"));
         assert!(!prompt.contains("MSEdge"));
         assert!(prompt.contains("Satelle native readiness probe"));
-        // Every native action is already bound to the captured window. A
-        // separate activation request is both redundant and unsupported for
-        // otherwise controllable Win32 windows in the signed Windows bridge.
+        // Keep the exact returned window. The rehydration and activation calls
+        // both require foreground activation, while input methods activate
+        // their selected target automatically.
+        assert!(!prompt.contains("sky.get_window({"));
         assert!(!prompt.contains("sky.activate_window"));
         assert!(!prompt.contains("sky.type_text"));
         assert!(prompt.contains("sky.get_window_state({ window: probeWindow"));
@@ -4431,7 +4509,7 @@ mod tests {
             )
         );
         assert!(prompt.contains(
-            "sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 668, to_y: 461"
+            "sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 578, to_y: 406"
         ));
         assert!(prompt.contains("screenshotId: screenshot.id"));
         let click = prompt
@@ -4447,7 +4525,9 @@ mod tests {
         assert!(click < refreshed_state);
         assert!(refreshed_state < drag);
         assert!(prompt.contains("Make no other discovery or tool calls"));
-        assert!(prompt.contains("exact `code` argument"));
+        assert!(prompt.contains("call the top-level `wait` tool with that `cell_id`"));
+        assert!(prompt.contains("only other tool call permitted"));
+        assert!(prompt.contains("complete readiness script as the exact `code` argument"));
         assert!(!prompt.contains("functions.exec"));
         assert!(prompt.contains("Click event observed"));
         assert!(prompt.contains("Drag event observed"));
@@ -4794,7 +4874,7 @@ mod tests {
             &BTreeSet::from(["satelle.exe".to_string()]),
             &evidence,
         )
-        .expect("the authenticated Windows node_repl path should form a direct plugin call");
+        .expect("the authenticated Windows node_repl path should form a nested plugin call");
 
         assert!(prompt.contains("private"));
         assert!(prompt.contains("click"));
@@ -4822,9 +4902,12 @@ mod tests {
         )
         .expect("the macOS node_repl path does not require a client file URL");
 
-        assert!(prompt.contains("mcp__node_repl__js"));
-        assert!(prompt.contains("use `tool_search` exactly once with query `node_repl js`"));
+        assert!(prompt.contains("await tools.mcp__node_repl__js({code:"));
+        assert!(prompt.contains("Call the top-level `exec` tool exactly once"));
+        assert!(prompt.contains("do not call `tool_search`"));
         assert!(prompt.contains("Make no other discovery or tool calls"));
+        assert!(prompt.contains("call the top-level `wait` tool with that `cell_id`"));
+        assert!(prompt.contains("only other tool call permitted"));
         assert!(!prompt.contains("functions.exec"));
         assert!(prompt.contains("import('@oai/sky')"));
         let initial_state = prompt
@@ -4865,15 +4948,37 @@ mod tests {
     fn native_turn_prompt_binds_desktop_work_to_the_isolated_sky_tool() {
         let prompt = native_computer_use_prompt(
             "Use Calculator to multiply 6 by 7 and leave the visible result at 42.",
+            &crate::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl,
         );
 
-        assert!(prompt.contains("mcp__node_repl__js"));
-        assert!(prompt.contains("use `tool_search` exactly once with query `node_repl js`"));
+        assert!(prompt.contains("top-level `exec` tool"));
+        assert!(prompt.contains("tools.mcp__node_repl__js({code:"));
+        assert!(prompt.contains("Do not call `tool_search`"));
+        assert!(prompt.contains("inspect the tool inventory"));
         assert!(prompt.contains("import('@oai/sky')"));
+        assert!(prompt.contains("list_apps()"));
+        assert!(prompt.contains("launch_app({app})"));
+        assert!(prompt.contains("get_window_state({window"));
+        assert!(prompt.contains("Every action must use a current `window` object"));
+        assert!(prompt.contains("Method names are snake_case"));
+        assert!(prompt.contains("inspect object keys or prototypes"));
         assert!(prompt.contains("Do not use shell commands"));
         assert!(
             prompt
                 .contains("Use Calculator to multiply 6 by 7 and leave the visible result at 42.")
         );
+    }
+
+    #[test]
+    fn native_macos_turn_prompt_names_the_supported_app_api() {
+        let prompt = native_computer_use_prompt(
+            "Open TextEdit and type a short note.",
+            &crate::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl,
+        );
+
+        assert!(prompt.contains("get_app_state({app, disableDiff: true})"));
+        assert!(prompt.contains("Select a canonical app id from `list_apps()`"));
+        assert!(prompt.contains("pass it as `app` to every action"));
+        assert!(!prompt.contains("launch_app({app})"));
     }
 }

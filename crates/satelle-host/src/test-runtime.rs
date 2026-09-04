@@ -52,7 +52,7 @@ impl HostService {
         setup_components: Vec<String>,
         daemon_path_overrides: DaemonPathOverrides,
     ) -> Result<SetupReport, SatelleError> {
-        Ok(diagnostics::setup(
+        Ok(setup_plan(
             host,
             dry_run,
             setup_mode,
@@ -62,19 +62,39 @@ impl HostService {
     }
 
     pub(super) fn desktop_sessions_fake(&self) -> Vec<DesktopSessionRecord> {
-        vec![DesktopSessionRecord {
-            session_id: "local-demo-console".to_string(),
-            desktop_user: "local-demo-user".to_string(),
-            state: "active".to_string(),
-            session_kind: "visible_desktop".to_string(),
-            is_console: true,
-            is_remote: false,
-            display_summary: "active local demo visible desktop".to_string(),
-            portable_selectors: vec!["console".to_string(), "active".to_string()],
-            native_selectors: vec!["local-demo:console:active".to_string()],
-            selected_by_current_config: false,
-        }]
+        desktop_sessions()
     }
+}
+
+pub(super) fn setup_plan(
+    host: &str,
+    dry_run: bool,
+    setup_mode: String,
+    setup_components: Vec<String>,
+    daemon_path_overrides: DaemonPathOverrides,
+) -> SetupReport {
+    diagnostics::setup(
+        host,
+        dry_run,
+        setup_mode,
+        setup_components,
+        daemon_path_overrides,
+    )
+}
+
+pub(super) fn desktop_sessions() -> Vec<DesktopSessionRecord> {
+    vec![DesktopSessionRecord {
+        session_id: "local-demo-console".to_string(),
+        desktop_user: "local-demo-user".to_string(),
+        state: "active".to_string(),
+        session_kind: "visible_desktop".to_string(),
+        is_console: true,
+        is_remote: false,
+        display_summary: "active local demo visible desktop".to_string(),
+        portable_selectors: vec!["console".to_string(), "active".to_string()],
+        native_selectors: vec!["local-demo:console:active".to_string()],
+        selected_by_current_config: false,
+    }]
 }
 
 #[derive(Clone, Debug)]
@@ -351,10 +371,10 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
             "local test adapter detached execution marker"
         );
         let _private_prompt = request.prompt();
-        Ok(ExecuteResult::new(
-            TurnTransition::Completed,
-            events(request.host(), subject),
-        ))
+        for event in events(&request) {
+            request.publish_live_event(event.into_body());
+        }
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
     }
 
     fn observe_stop(&self, _subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
@@ -371,69 +391,47 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
     }
 }
 
-fn events(host: &str, subject: AdapterSubject<'_>) -> Vec<SatelleEvent> {
+// Adapter live events are sideband observations. Lifecycle types such as
+// TurnStarted, TurnProgress, and TurnCompleted belong to the Host's committed
+// state transitions, and attached followers drop adapter copies of them at an
+// already-delivered revision.
+fn events(request: &ExecuteRequest<'_>) -> Vec<SatelleEvent> {
     vec![
         event(
+            request,
             EventType::Preflight,
             1,
-            host,
-            subject,
             "resolved local demo host",
             json!({"transport": "local", "adapter": "fake"}),
         ),
         event(
+            request,
             EventType::Readiness,
             2,
-            host,
-            subject,
             "fake computer-use adapter is ready",
             json!({"ready": true}),
-        ),
-        event(
-            EventType::TurnStarted,
-            3,
-            host,
-            subject,
-            "started fake computer-use turn",
-            json!({}),
-        ),
-        event(
-            EventType::TurnProgress,
-            4,
-            host,
-            subject,
-            "fake adapter observed a visible desktop",
-            json!({"observation": "browser title would be read by a real adapter"}),
-        ),
-        event(
-            EventType::TurnCompleted,
-            5,
-            host,
-            subject,
-            "completed fake computer-use turn",
-            json!({"summary": "fake computer-use turn completed"}),
         ),
     ]
 }
 
 fn event(
+    request: &ExecuteRequest<'_>,
     event_type: EventType,
     seq: u64,
-    host: &str,
-    subject: AdapterSubject<'_>,
     message: &str,
     data: Value,
 ) -> SatelleEvent {
+    let subject = request.subject();
     SatelleEventBody::new(
         event_type,
         EventSource::HostDaemon,
         OffsetDateTime::now_utc(),
-        host,
+        subject.host_identity().as_str(),
         Some(EventSubject::Turn {
             session_id: subject.session_id().clone(),
             turn_id: subject.turn_id().clone(),
-            session_state_revision: subject.session_state_revision(),
-            turn_state_revision: subject.turn_state_revision(),
+            session_state_revision: request.committed_session_revision(),
+            turn_state_revision: request.committed_turn_revision(),
         }),
         message,
         data,

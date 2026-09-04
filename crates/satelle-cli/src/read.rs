@@ -1,5 +1,5 @@
 use super::output::StatusReport;
-use super::transport::transport_for;
+use super::transport::{transport_for, transport_for_session_control};
 use super::{
     CONFIG_CHECK_SCHEMA_VERSION, CONFIG_EXPLAIN_SCHEMA_VERSION, CliFailure, ConfigContext,
     HostSessionsReport, LOCAL_DEMO_HOST, PATHS_SCHEMA_VERSION, PublicSession, SessionId,
@@ -338,7 +338,9 @@ pub(super) fn status_for_host(
     session_id: &SessionId,
     host: &super::SelectedHost,
 ) -> Result<PublicSession, CliFailure> {
-    let session = transport_for(host)?.status(session_id).map_err(failure)?;
+    let session = transport_for_session_control(host)?
+        .status(session_id)
+        .map_err(failure)?;
     Ok(session)
 }
 

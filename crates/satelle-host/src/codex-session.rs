@@ -4,9 +4,10 @@ use base64::Engine as _;
 use satelle_core::session::StopObservation;
 use satelle_core::session::TurnExecutionMode;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -152,6 +153,10 @@ pub(crate) struct CodexSessionControl {
 struct CodexSessionControlInner {
     sender: mpsc::Sender<ControlCommand>,
     receiver: Mutex<Option<mpsc::Receiver<ControlCommand>>>,
+    // Set when an interrupt arrives before any session claims the receiver.
+    // The claiming session must then skip dispatch: no Codex process owns the
+    // Turn yet, and the stop was already confirmed to the caller.
+    stopped_before_dispatch: AtomicBool,
     deadline: Instant,
 }
 
@@ -169,12 +174,32 @@ impl CodexSessionControl {
             inner: Arc::new(CodexSessionControlInner {
                 sender,
                 receiver: Mutex::new(Some(receiver)),
+                stopped_before_dispatch: AtomicBool::new(false),
                 deadline,
             }),
         }
     }
 
     pub(crate) fn interrupt(&self) -> StopObservation {
+        {
+            // Execution registers its control before the slow pre-dispatch
+            // work (control-plane verification, readiness probes), so a stop
+            // can arrive while nobody polls the channel yet. Nothing upstream
+            // exists to interrupt in that window; confirm the inactive upstream
+            // now and make the eventual claim skip dispatch. The check and the
+            // flag share the receiver lock so a concurrent claim cannot miss it.
+            let unclaimed = self
+                .inner
+                .receiver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if unclaimed.is_some() {
+                self.inner
+                    .stopped_before_dispatch
+                    .store(true, Ordering::Release);
+                return StopObservation::UpstreamInactiveConfirmed;
+            }
+        }
         let (reply, response) = mpsc::channel();
         if self
             .inner
@@ -203,6 +228,38 @@ impl CodexSessionControl {
             .map_err(|_| CodexSessionError::Control)?
             .take()
             .ok_or(CodexSessionError::Control)
+    }
+
+    fn stopped_before_dispatch(&self) -> bool {
+        self.inner.stopped_before_dispatch.load(Ordering::Acquire)
+    }
+}
+
+/// Holds a Turn whose stop was confirmed before any Codex process started.
+/// The caller has already been told the upstream is inactive, so this only
+/// answers later interrupts the same way and waits for the durable stop
+/// commit before reporting the controlled stop; dispatching now would create
+/// exactly the upstream work the caller was promised does not exist.
+fn wait_for_stop_commit_before_dispatch(
+    receiver: &mpsc::Receiver<ControlCommand>,
+    deadline: Instant,
+) -> Result<CodexSessionTerminal, CodexSessionFailure> {
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now()).ok_or(
+            CodexSessionFailure::before_turn_dispatch(CodexSessionError::Timeout),
+        )?;
+        match receiver.recv_timeout(remaining) {
+            Ok(ControlCommand::Interrupt { reply }) => {
+                let _ = reply.send(StopObservation::UpstreamInactiveConfirmed);
+            }
+            Ok(ControlCommand::StopCommitted) => return Ok(CodexSessionTerminal::StoppedByControl),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(CodexSessionFailure::before_turn_dispatch(
+                    CodexSessionError::Control,
+                ));
+            }
+        }
     }
 }
 
@@ -236,6 +293,8 @@ pub(crate) enum CodexSessionError {
     Containment,
     #[error("the private Codex app-server control channel failed")]
     Control,
+    #[error("the native Computer Use turn completed without successful action evidence")]
+    NativeActionUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -344,6 +403,9 @@ fn run_codex_session_bound(
     let deadline = request.deadline;
     let control = match request.control.as_ref() {
         Some(control) => match control.claim_receiver() {
+            Ok(receiver) if control.stopped_before_dispatch() => {
+                return wait_for_stop_commit_before_dispatch(&receiver, deadline);
+            }
             Ok(receiver) => Some(receiver),
             Err(error) => return Err(CodexSessionFailure::before_turn_dispatch(error)),
         },
@@ -359,9 +421,56 @@ fn run_codex_session_bound(
 /// the Turn is no longer active.
 pub(crate) fn run_codex_session_with_timeout_cancellation(
     command: Command,
+    request: CodexSessionRequest<'_>,
+    cancellation_grace: Duration,
+    admission_cancellation: Option<crate::AdmissionCancellation>,
+) -> TimedCodexSessionRun {
+    run_timed_codex_session(
+        command,
+        request,
+        cancellation_grace,
+        admission_cancellation,
+        None,
+    )
+}
+
+/// Runs native readiness until either the turn ends or its exact successful
+/// tool item and both OS action callbacks are observed. The latter still uses
+/// the normal correlated interrupt path and requires terminal stop evidence.
+pub(crate) fn run_codex_session_with_native_action_completion(
+    command: Command,
+    mut request: CodexSessionRequest<'_>,
+    native_action_evidence: NativeActionEvidence,
+    cancellation_grace: Duration,
+    admission_cancellation: Option<crate::AdmissionCancellation>,
+) -> TimedCodexSessionRun {
+    request.native_action_evidence = Some(native_action_evidence.clone());
+    run_timed_codex_session(
+        command,
+        request,
+        cancellation_grace,
+        admission_cancellation,
+        Some(native_action_evidence),
+    )
+}
+
+fn interrupt_and_commit(control: &CodexSessionControl) -> StopObservation {
+    let observation = control.interrupt();
+    if matches!(
+        observation,
+        StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed
+    ) {
+        control.stop_committed();
+    }
+    observation
+}
+
+fn run_timed_codex_session(
+    command: Command,
     mut request: CodexSessionRequest<'_>,
     cancellation_grace: Duration,
     admission_cancellation: Option<crate::AdmissionCancellation>,
+    native_action_completion: Option<NativeActionEvidence>,
 ) -> TimedCodexSessionRun {
     let timeout_deadline = request.deadline;
     let cancellation_deadline = timeout_deadline
@@ -378,31 +487,24 @@ pub(crate) fn run_codex_session_with_timeout_cancellation(
     let cancellation_control = control.clone();
     let watchdog = std::thread::spawn(move || {
         loop {
+            // A fully successful native item plus both callback receipts is
+            // already durable action proof. Stop its otherwise irrelevant
+            // model follow-up before considering later timeout cancellation.
+            if native_action_completion
+                .as_ref()
+                .is_some_and(NativeActionEvidence::completed)
+            {
+                return Some(interrupt_and_commit(&cancellation_control));
+            }
             if admission_cancellation
                 .as_ref()
                 .is_some_and(crate::AdmissionCancellation::is_requested)
             {
-                let observation = cancellation_control.interrupt();
-                if matches!(
-                    observation,
-                    StopObservation::CancellationConfirmed
-                        | StopObservation::UpstreamInactiveConfirmed
-                ) {
-                    cancellation_control.stop_committed();
-                }
-                return Some(observation);
+                return Some(interrupt_and_commit(&cancellation_control));
             }
             let now = Instant::now();
             if now >= timeout_deadline {
-                let observation = cancellation_control.interrupt();
-                if matches!(
-                    observation,
-                    StopObservation::CancellationConfirmed
-                        | StopObservation::UpstreamInactiveConfirmed
-                ) {
-                    cancellation_control.stop_committed();
-                }
-                return Some(observation);
+                return Some(interrupt_and_commit(&cancellation_control));
             }
             let wait = timeout_deadline
                 .saturating_duration_since(now)
@@ -453,7 +555,6 @@ struct SessionExchange<'a> {
     thread_ref: Option<String>,
     thread_observed: bool,
     expected_mcp_ready: bool,
-    mcp_inventory_dispatch_attempted: bool,
     plugin_inventory_dispatch_attempted: bool,
     turn_ref: Option<String>,
     turn_dispatch_attempted: bool,
@@ -464,6 +565,8 @@ struct SessionExchange<'a> {
     interrupt_sent: bool,
     controlled_stop: bool,
     stop_committed: bool,
+    active_native_tools: BTreeMap<String, String>,
+    native_tool_succeeded: bool,
 }
 
 struct ServerResponse {
@@ -482,7 +585,6 @@ impl<'a> SessionExchange<'a> {
             responses: [false; 8],
             thread_observed: false,
             expected_mcp_ready: false,
-            mcp_inventory_dispatch_attempted: false,
             plugin_inventory_dispatch_attempted: false,
             turn_ref: None,
             turn_dispatch_attempted: false,
@@ -493,6 +595,8 @@ impl<'a> SessionExchange<'a> {
             interrupt_sent: false,
             controlled_stop: false,
             stop_committed: false,
+            active_native_tools: BTreeMap::new(),
+            native_tool_succeeded: false,
         }
     }
 
@@ -523,12 +627,6 @@ impl<'a> SessionExchange<'a> {
             if !self.controlled_stop
                 && self.thread_observed
                 && self.expected_mcp_ready
-                && !self.mcp_inventory_dispatch_attempted
-            {
-                self.write_mcp_inventory_request(writer)?;
-            }
-            if !self.controlled_stop
-                && self.responses[6]
                 && !self.plugin_inventory_dispatch_attempted
             {
                 self.write_plugin_inventory_request(writer)?;
@@ -701,18 +799,18 @@ impl<'a> SessionExchange<'a> {
                 .native_action_evidence
                 .as_ref()
                 .and_then(NativeActionEvidence::expected_authorization);
-            let (result, authorized) = codex_approval::computer_use_elicitation_result(
+            let (result, authorization) = codex_approval::computer_use_elicitation_result(
                 object,
                 self.request.computer_use_allowed_app_ids,
                 expected_native_action
                     .as_ref()
-                    .map(|(script, _authorized_app_id)| script.as_str()),
+                    .map(|(script, app_id)| (script.as_str(), app_id.as_str())),
                 self.thread_ref.as_deref(),
                 self.turn_ref.as_deref(),
             )?;
             return Ok(ServerResponse {
                 body: json!({"id": id, "result": result}),
-                observe_native_approval: !authorized,
+                observe_native_approval: !authorization.accepted(),
             });
         }
         if let Some(result) = codex_approval::approval_result(
@@ -770,7 +868,10 @@ impl<'a> SessionExchange<'a> {
             .get("id")
             .and_then(Value::as_u64)
             .and_then(|id| usize::try_from(id).ok())
-            .filter(|id| (1..=7).contains(id))
+            .ok_or(CodexSessionError::UnexpectedResponse)?;
+        let id = (1..=7)
+            .contains(&id)
+            .then_some(id)
             .ok_or(CodexSessionError::UnexpectedResponse)?;
         if self.responses[id] {
             return Err(CodexSessionError::DuplicateResponse);
@@ -799,9 +900,6 @@ impl<'a> SessionExchange<'a> {
                 let thread_ref = nested_id(result, "thread")?;
                 self.observe_thread(thread_ref)?;
             }
-            6 if self.mcp_inventory_dispatch_attempted => {
-                self.validate_mcp_inventory(result)?;
-            }
             7 if self.plugin_inventory_dispatch_attempted => {
                 self.validate_plugin_inventory(result)?;
             }
@@ -829,42 +927,6 @@ impl<'a> SessionExchange<'a> {
             _ => return Err(CodexSessionError::UnexpectedResponse),
         }
         self.responses[id] = true;
-        Ok(())
-    }
-
-    fn validate_mcp_inventory(&self, result: &Map<String, Value>) -> Result<(), CodexSessionError> {
-        if result.get("nextCursor") != Some(&Value::Null) {
-            return Err(CodexSessionError::MalformedMessage);
-        }
-        let servers = result
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or(CodexSessionError::MalformedMessage)?;
-        let mut expected_count = 0;
-        for server in servers {
-            let server = server
-                .as_object()
-                .ok_or(CodexSessionError::MalformedMessage)?;
-            let name = required_string(server, "name")?;
-            if name == self.request.expected_mcp_server_name {
-                expected_count += 1;
-                continue;
-            }
-            let active = server
-                .get("serverInfo")
-                .is_some_and(|value| !value.is_null())
-                || server
-                    .get("tools")
-                    .and_then(Value::as_object)
-                    .is_some_and(|tools| !tools.is_empty())
-                || server.get("authStatus").and_then(Value::as_str) != Some("unsupported");
-            if active {
-                return Err(CodexSessionError::ConflictingIdentity);
-            }
-        }
-        if expected_count != 1 {
-            return Err(CodexSessionError::ConflictingIdentity);
-        }
         Ok(())
     }
 
@@ -920,7 +982,10 @@ impl<'a> SessionExchange<'a> {
         match method {
             "mcpServer/startupStatus/updated" => {
                 let params = required_object(object, "params")?;
-                self.correlate_thread(required_string(params, "threadId")?)?;
+                // Codex can report MCP startup before its thread/start response.
+                // Treat the first thread-scoped notification as an observation,
+                // then require the later response and notifications to match it.
+                self.observe_thread(required_string(params, "threadId")?)?;
                 if required_string(params, "name")? != self.request.expected_mcp_server_name {
                     return Err(CodexSessionError::ConflictingIdentity);
                 }
@@ -954,7 +1019,14 @@ impl<'a> SessionExchange<'a> {
                 let turn_ref = required_string(turn, "id")?;
                 self.observe_turn(turn_ref)?;
                 let terminal = match required_string(turn, "status")? {
-                    "completed" => CodexSessionTerminal::Completed,
+                    "completed" => {
+                        if self.requires_native_action_evidence()
+                            && (!self.active_native_tools.is_empty() || !self.native_tool_succeeded)
+                        {
+                            return Err(CodexSessionError::NativeActionUnavailable);
+                        }
+                        CodexSessionTerminal::Completed
+                    }
                     "interrupted" => CodexSessionTerminal::Interrupted,
                     "failed" => CodexSessionTerminal::Failed(failed_turn_kind(turn)),
                     _ => return Err(CodexSessionError::MalformedMessage),
@@ -972,12 +1044,19 @@ impl<'a> SessionExchange<'a> {
             }
             "item/started" | "item/completed" if self.turn_dispatch_attempted => {
                 self.validate_item_correlation(object)?;
-                if let Some(evidence) = self.request.native_action_evidence.as_ref() {
+                if self.requires_native_action_evidence()
+                    || self.request.native_action_evidence.is_some()
+                {
                     let params = required_object(object, "params")?;
                     let item = params
                         .get("item")
                         .ok_or(CodexSessionError::MalformedMessage)?;
-                    evidence.observe_app_server_item(method, item);
+                    if self.requires_native_action_evidence() {
+                        self.observe_native_tool_item(method, item)?;
+                    }
+                    if let Some(evidence) = self.request.native_action_evidence.as_ref() {
+                        evidence.observe_app_server_item(method, item);
+                    }
                 }
                 Ok(())
             }
@@ -1060,6 +1139,74 @@ impl<'a> SessionExchange<'a> {
             .ok_or(CodexSessionError::ConflictingIdentity)
     }
 
+    fn requires_native_action_evidence(&self) -> bool {
+        !self.request.computer_use_allowed_app_ids.is_empty()
+    }
+
+    fn observe_native_tool_item(
+        &mut self,
+        method: &str,
+        item: &Value,
+    ) -> Result<(), CodexSessionError> {
+        let item = item
+            .as_object()
+            .ok_or(CodexSessionError::MalformedMessage)?;
+        let is_native_script = item.get("type").and_then(Value::as_str) == Some("mcpToolCall")
+            && item.get("server").and_then(Value::as_str) == Some("node_repl")
+            && item.get("tool").and_then(Value::as_str) == Some("js");
+        if !is_native_script {
+            return Ok(());
+        }
+
+        let item_id = required_string(item, "id")?;
+        let script = item
+            .get("arguments")
+            .and_then(Value::as_object)
+            .and_then(|arguments| arguments.get("code"))
+            .and_then(Value::as_str)
+            .filter(|script| !script.is_empty())
+            .ok_or(CodexSessionError::MalformedMessage)?;
+        match method {
+            "item/started" => {
+                if item.get("status").and_then(Value::as_str) != Some("inProgress") {
+                    return Err(CodexSessionError::MalformedMessage);
+                }
+                if self
+                    .active_native_tools
+                    .insert(item_id.to_owned(), script.to_owned())
+                    .is_some()
+                {
+                    return Err(CodexSessionError::ConflictingIdentity);
+                }
+            }
+            "item/completed" => {
+                let status = required_string(item, "status")?;
+                if !matches!(status, "completed" | "failed" | "cancelled") {
+                    return Err(CodexSessionError::MalformedMessage);
+                }
+                let expected_script = self
+                    .active_native_tools
+                    .remove(item_id)
+                    .ok_or(CodexSessionError::ConflictingIdentity)?;
+                if expected_script != script {
+                    return Err(CodexSessionError::ConflictingIdentity);
+                }
+                if status == "completed" {
+                    // Official Codex maps an MCP error result to a failed item
+                    // and emits `completed` only for a successful call. Its
+                    // result metadata is intentionally opaque and currently
+                    // contains timing data, not a stable per-app authority
+                    // field. Admission freezes app authority for this exact
+                    // Turn, while this correlated lifecycle proves that its
+                    // generated native script completed successfully.
+                    self.native_tool_succeeded = true;
+                }
+            }
+            _ => return Err(CodexSessionError::MalformedMessage),
+        }
+        Ok(())
+    }
+
     fn write_initialize(&self, writer: &ProtocolWriter) -> Result<(), CodexSessionError> {
         writer.write(&json!({
             "id": 1,
@@ -1100,26 +1247,6 @@ impl<'a> SessionExchange<'a> {
             "thread/start"
         };
         writer.write(&json!({"id": 2, "method": method, "params": params}))
-    }
-
-    fn write_mcp_inventory_request(
-        &mut self,
-        writer: &ProtocolWriter,
-    ) -> Result<(), CodexSessionError> {
-        let thread_ref = self.thread_ref.as_deref().ok_or(CodexSessionError::Write)?;
-        writer.write_after_queue(
-            &json!({
-                "id": 6,
-                "method": "mcpServerStatus/list",
-                "params": {
-                    "threadId": thread_ref,
-                    "cursor": null,
-                    "limit": 100,
-                    "detail": "toolsAndAuthOnly"
-                }
-            }),
-            || self.mcp_inventory_dispatch_attempted = true,
-        )
     }
 
     fn write_plugin_inventory_request(

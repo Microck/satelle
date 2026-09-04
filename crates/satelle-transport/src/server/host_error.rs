@@ -184,13 +184,28 @@ fn failure(error: &SatelleError) -> ApiFailure {
                     .unwrap_or(serde_json::Value::Null)
             })),
         },
-        ErrorCode::BootstrapBusy | ErrorCode::HostBusy => ApiFailure {
+        ErrorCode::BootstrapBusy => ApiFailure {
             status: StatusCode::CONFLICT,
             code: ApiErrorCode::HostBusy,
             category: ApiErrorCategory::Conflict,
             retryable: true,
             message: "the Host is already controlling its authorized desktop",
             details: None,
+        },
+        ErrorCode::HostBusy => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::HostBusy,
+            category: ApiErrorCategory::Conflict,
+            retryable: true,
+            message: "the Host is already controlling its authorized desktop",
+            details: Some(serde_json::json!({
+                "host": error.details.get("host").cloned().unwrap_or(serde_json::Value::Null),
+                "active_session_id": error
+                    .details
+                    .get("active_session_id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            })),
         },
         ErrorCode::StoreInUse => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -230,7 +245,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
             category: ApiErrorCategory::Readiness,
             retryable: false,
             message: "native Computer Use is not ready on this Host",
-            details: None,
+            details: validated_computer_use_not_ready_details(error),
         },
         ErrorCode::YoloNotSupported => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -561,6 +576,39 @@ fn validated_optional_desktop_user_details(error: &SatelleError) -> Option<serde
     validated_string_details(error, &["desktop_user"])
 }
 
+/// Publishes the closed readiness detail shapes. The Host records why native
+/// Computer Use is not ready as a snake_case `reason` token; without it the
+/// client can only print the generic message and an operator cannot tell a
+/// failed readiness probe from an isolation or recovery block. Any other
+/// detail stays private.
+fn validated_computer_use_not_ready_details(error: &SatelleError) -> Option<serde_json::Value> {
+    if let Some(details) = validated_manual_computer_use_setup_details(error) {
+        return Some(details);
+    }
+    let reason = error.details.get("reason")?.as_str()?;
+    is_closed_reason_token(reason).then(|| serde_json::json!({ "reason": reason }))
+}
+
+/// Accepts only the identifier form every Host reason uses, so free text or
+/// interpolated private values never reach the wire.
+fn is_closed_reason_token(reason: &str) -> bool {
+    !reason.is_empty()
+        && reason.len() <= 64
+        && reason
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validated_manual_computer_use_setup_details(error: &SatelleError) -> Option<serde_json::Value> {
+    let details = validated_string_details(error, &["reason", "status"])?;
+    (details
+        == serde_json::json!({
+            "reason": "macos_native_computer_use_prerequisite_missing",
+            "status": "manual_action_required"
+        }))
+    .then_some(details)
+}
+
 fn validated_string_details(error: &SatelleError, keys: &[&str]) -> Option<serde_json::Value> {
     if error.details.len() != keys.len() {
         return None;
@@ -588,6 +636,67 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn computer_use_not_ready_exposes_only_a_closed_reason_token() {
+        let mut error = SatelleError::computer_use_not_ready();
+        error.details.insert(
+            "reason".to_string(),
+            json!("native_readiness_action_evidence_unavailable"),
+        );
+        error.details.insert(
+            "native_readiness".to_string(),
+            json!({ "status": "failed", "private": "PRIVATE_DETAILS_CANARY" }),
+        );
+        assert_eq!(
+            failure(&error).details,
+            Some(json!({ "reason": "native_readiness_action_evidence_unavailable" }))
+        );
+
+        for reason in [
+            "",
+            "Native Readiness Failed",
+            "PRIVATE/path",
+            &"a".repeat(65),
+        ] {
+            let mut error = SatelleError::computer_use_not_ready();
+            error.details.insert("reason".to_string(), json!(reason));
+            assert_eq!(failure(&error).details, None, "reason {reason:?}");
+        }
+
+        let mut error = SatelleError::computer_use_not_ready();
+        error.details.insert("reason".to_string(), json!(42));
+        assert_eq!(failure(&error).details, None);
+    }
+
+    #[test]
+    fn manual_macos_setup_exposes_only_the_closed_public_details() {
+        let mut error = SatelleError::computer_use_not_ready();
+        error.details.insert(
+            "reason".to_string(),
+            json!("macos_native_computer_use_prerequisite_missing"),
+        );
+        error
+            .details
+            .insert("status".to_string(), json!("manual_action_required"));
+        let mapped = failure(&error);
+        assert_eq!(
+            mapped.details,
+            Some(json!({
+                "reason": "macos_native_computer_use_prerequisite_missing",
+                "status": "manual_action_required"
+            }))
+        );
+
+        // An unexpected extra key breaks the closed manual-setup pair. Only the
+        // reason token stays public; the private key and the now-unpaired
+        // status never reach the wire.
+        error.details.insert("private".to_string(), json!(true));
+        assert_eq!(
+            failure(&error).details,
+            Some(json!({ "reason": "macos_native_computer_use_prerequisite_missing" }))
+        );
+    }
 
     #[test]
     fn incompatible_control_plane_is_a_sanitized_readiness_failure() {
@@ -871,6 +980,27 @@ mod tests {
         assert_eq!(mapped.category, ApiErrorCategory::Storage);
         assert!(mapped.retryable);
         assert_eq!(mapped.details, None);
+    }
+
+    #[test]
+    fn host_busy_preserves_only_the_public_active_session_details() {
+        let session_id = SessionId::new();
+        let mut error = SatelleError::host_busy("local-demo", &session_id);
+        error
+            .details
+            .insert("private".to_string(), json!("must-not-cross"));
+
+        let mapped = failure(&error);
+
+        assert_eq!(mapped.status, StatusCode::CONFLICT);
+        assert_eq!(mapped.code, ApiErrorCode::HostBusy);
+        assert_eq!(
+            mapped.details,
+            Some(json!({
+                "host": "local-demo",
+                "active_session_id": session_id,
+            }))
+        );
     }
 
     #[test]

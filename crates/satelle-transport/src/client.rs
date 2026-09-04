@@ -2,8 +2,10 @@ use crate::contract::{
     AdmissionCancellationResponse, ApiError, ApiErrorCode, AuthenticatedResponseContract,
     BootstrapMaintenanceResponse, CapabilitiesResponse, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostDesktopSessionsResponse,
-    HostPathsResponse, HostStatusResponse, LiveResponse, LogsPageResponse,
-    MaintenanceUpdateEvidenceResponse, NativeReadinessInvalidationRequest,
+    HostPathsResponse, HostStatusResponse, LiveResponse, LocalDaemonRelaunchResponse,
+    LocalDoctorOperationRequest, LocalDoctorOperationResponse, LocalSetupOperationRequest,
+    LocalSetupOperationResponse, LogsPageResponse, MaintenanceUpdateEvidenceResponse,
+    ManagedSetupActionResponse, NativeReadinessInvalidationRequest,
     NativeReadinessInvalidationResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
     PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
@@ -303,6 +305,70 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
+    pub fn local_setup_operation(
+        &self,
+        host: &str,
+        dry_run: bool,
+        setup_mode: &str,
+        setup_components: Vec<String>,
+        daemon_path_overrides: satelle_core::DaemonPathOverrides,
+        idempotency_key: &str,
+    ) -> Result<Result<satelle_core::SetupReport, satelle_core::SatelleError>, DaemonClientError>
+    {
+        let request = LocalSetupOperationRequest::new(
+            host,
+            dry_run,
+            setup_mode,
+            setup_components,
+            daemon_path_overrides,
+        );
+        let (http_request, request_id) =
+            self.mutation_request("/v1/local/setup", idempotency_key)?;
+        // Managed setup verifies the Codex package and runs plugin and MCP
+        // inventories inside the daemon; that is admission-scale work, not a
+        // short control request, so it gets the admission deadline like Doctor.
+        self.send_authenticated::<LocalSetupOperationResponse>(
+            self.admission_request(http_request.json(&request)),
+            request_id,
+            StatusCode::OK,
+        )
+        .map(LocalSetupOperationResponse::into_result)
+    }
+
+    pub fn local_doctor_operation(
+        &self,
+        host: &str,
+        scope_selection: &satelle_core::doctor::DoctorScopeSelection,
+        options: satelle_core::DoctorOptions,
+        provider_intent: &satelle_host::ProviderComputerUseIntent,
+        idempotency_key: &str,
+    ) -> Result<satelle_host::DoctorExecutionResult, DaemonClientError> {
+        let request =
+            LocalDoctorOperationRequest::new(host, scope_selection, options, provider_intent);
+        let (http_request, request_id) =
+            self.mutation_request("/v1/local/doctor", idempotency_key)?;
+        self.send_authenticated::<LocalDoctorOperationResponse>(
+            self.admission_request(http_request.json(&request)),
+            request_id,
+            StatusCode::OK,
+        )
+        .map(LocalDoctorOperationResponse::into_result)
+    }
+
+    pub fn relaunch_local_daemon_if_idle(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<(), DaemonClientError> {
+        let (request, request_id) =
+            self.mutation_request("/v1/local/relaunch-if-idle", idempotency_key)?;
+        self.send_authenticated::<LocalDaemonRelaunchResponse>(
+            request,
+            request_id,
+            StatusCode::OK,
+        )?;
+        Ok(())
+    }
+
     pub fn issue_durable_setup_token(
         &self,
         idempotency_key: &str,
@@ -504,6 +570,19 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
+    pub fn apply_bootstrap_managed_setup_action(
+        &self,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<ManagedSetupActionResponse, DaemonClientError> {
+        let path = format!(
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/apply-managed-setup"
+        );
+        let idempotency_key = format!("{operation_id}:{action_id}:apply-managed-setup");
+        let (request, request_id) = self.mutation_request(&path, &idempotency_key)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
     pub fn begin_bootstrap_maintenance(
         &self,
         operation_id: &str,
@@ -516,14 +595,35 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
+    pub fn begin_on_demand_setup_maintenance(
+        &self,
+        operation_id: &str,
+        operation_kind: &str,
+        managed_setup: bool,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        if !managed_setup {
+            return self.begin_bootstrap_maintenance(operation_id, operation_kind);
+        }
+        let plan_kind = "on_demand_handoff_with_managed_setup";
+        let path =
+            format!("/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/{plan_kind}/begin");
+        let (request, request_id) = self.mutation_request(&path, operation_id)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
     pub fn begin_persistent_service_maintenance(
         &self,
         operation_id: &str,
         operation_kind: &str,
+        managed_setup: bool,
     ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
-        let path = format!(
-            "/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/persistent_host_service/begin"
-        );
+        let plan_kind = if managed_setup {
+            "persistent_host_service_with_managed_setup"
+        } else {
+            "persistent_host_service"
+        };
+        let path =
+            format!("/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/{plan_kind}/begin");
         let (request, request_id) = self.mutation_request(&path, operation_id)?;
         self.send_authenticated(request, request_id, StatusCode::OK)
     }

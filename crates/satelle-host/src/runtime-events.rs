@@ -54,11 +54,33 @@ impl RuntimeEngine {
     /// Publishes one live observation of state that SQLite has already
     /// committed. Callers retain the storage mutex through this synchronous,
     /// nonblocking send so events preserve commit order across workers.
-    pub(super) fn publish_committed_turn(&self, session: &Session, turn_id: &TurnId) {
+    pub(super) fn publish_committed_turn(
+        &self,
+        session: &Session,
+        turn_id: &TurnId,
+    ) -> SatelleEventBody {
+        self.publish_committed_turn_with_failure_reason(session, turn_id, None)
+    }
+
+    /// Like `publish_committed_turn`, but a terminal failure also carries the
+    /// adapter's closed failure reason. Remote attached clients only see this
+    /// event, so it is their single source for why the Turn failed.
+    pub(super) fn publish_committed_turn_with_failure_reason(
+        &self,
+        session: &Session,
+        turn_id: &TurnId,
+        failure_reason: Option<&str>,
+    ) -> SatelleEventBody {
         let turn = session
             .turn(turn_id)
             .expect("a committed lifecycle mutation retains its Turn");
         let (event_type, message, state) = event_for_state(turn.state());
+        let data = match failure_reason {
+            Some(reason) if turn.state() == TurnState::Failed => {
+                json!({"state": state, "reason": reason})
+            }
+            _ => json!({"state": state}),
+        };
         let event = SatelleEventBody::new(
             event_type,
             EventSource::HostDaemon,
@@ -71,10 +93,11 @@ impl RuntimeEngine {
                 turn_state_revision: turn.turn_state_revision(),
             }),
             message,
-            json!({"state": state}),
+            data,
         )
         .expect("a committed Session produces a valid safe lifecycle event");
-        self.live_events.publish(event);
+        self.live_events.publish(event.clone());
+        event
     }
 
     /// Publishes normalized provider preflight provenance without exposing the

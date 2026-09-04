@@ -44,7 +44,7 @@ use satelle_core::daemon_service::{
     DaemonServicePlatform, PersistentHostStoragePolicy, PersistentServiceDecision,
     SetupModeSelection, SetupModeSource,
 };
-use satelle_core::doctor::{DoctorScopeSelection, DoctorScopeSelectionError};
+use satelle_core::doctor::{DoctorScope, DoctorScopeSelection, DoctorScopeSelectionError};
 use satelle_core::session::{
     EffectiveModelRef, HostIdentityRef, ProviderBindingRef, PublicSession, PublicTurn,
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
@@ -109,19 +109,19 @@ const MACOS_NATIVE_BRIDGE_LAUNCHER: &str = "__satelle-launch-macos-native-bridge
 #[cfg(any(target_os = "macos", test))]
 const MACOS_NATIVE_BRIDGE_ENVIRONMENT: [&str; 14] = [
     "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS",
-    "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S",
-    "SKY_CUA_SERVICE_PATH",
     "BROWSER_USE_CODEX_APP_VERSION",
     "NODE_REPL_TRUSTED_CODE_PATHS",
     "NODE_REPL_NODE_MODULE_DIRS",
     "NODE_REPL_NODE_PATH",
     "BROWSER_USE_AVAILABLE_BACKENDS",
+    "BROWSER_USE_TINYSKY_ENABLED",
     "CODEX_HOME",
     "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER",
     "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME",
     "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE",
     "BROWSER_USE_CODEX_APP_BUILD_FLAVOR",
     "CODEX_CLI_PATH",
+    "NODE_REPL_TRUSTED_SERVICES",
 ];
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -653,7 +653,8 @@ struct HostStartCommand {
             "bootstrap_scope",
             "bootstrap_native_readiness_timeout_ms",
             "bootstrap_provider_smoke_timeout_ms",
-            "on_demand_idle_timeout_ms"
+            "on_demand_idle_timeout_ms",
+            "local_daemon_config"
         ]
     )]
     launchd_service: bool,
@@ -707,6 +708,9 @@ struct HostStartCommand {
     /// Internal Controller-resolved idle timeout for a durable SSH launch.
     #[arg(long, hide = true, value_name = "MILLISECONDS")]
     on_demand_idle_timeout_ms: Option<u64>,
+    /// Internal owner-only launch descriptor for the managed local daemon.
+    #[arg(long, hide = true, value_name = "PATH")]
+    local_daemon_config: Option<PathBuf>,
     /// Internal resolved setup-ledger retention for a persistent launchd service.
     #[arg(
         long,
@@ -1637,10 +1641,25 @@ mod process_boundary_tests {
     use super::*;
 
     #[test]
-    fn macos_launcher_environment_includes_the_verified_service_path() {
-        assert!(
-            MACOS_NATIVE_BRIDGE_ENVIRONMENT.contains(&"SKY_CUA_SERVICE_PATH"),
-            "the authenticated launcher must forward the verified Computer Use service path"
+    fn macos_launcher_environment_matches_the_current_native_binding() {
+        assert_eq!(
+            MACOS_NATIVE_BRIDGE_ENVIRONMENT,
+            [
+                "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS",
+                "BROWSER_USE_CODEX_APP_VERSION",
+                "NODE_REPL_TRUSTED_CODE_PATHS",
+                "NODE_REPL_NODE_MODULE_DIRS",
+                "NODE_REPL_NODE_PATH",
+                "BROWSER_USE_AVAILABLE_BACKENDS",
+                "BROWSER_USE_TINYSKY_ENABLED",
+                "CODEX_HOME",
+                "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER",
+                "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME",
+                "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE",
+                "BROWSER_USE_CODEX_APP_BUILD_FLAVOR",
+                "CODEX_CLI_PATH",
+                "NODE_REPL_TRUSTED_SERVICES",
+            ]
         );
     }
 
@@ -1801,9 +1820,25 @@ fn preflight_setup_before_history(
         unresolved_path_rebind,
         exact_state_requires_identity_discovery,
     );
-    let setup_mode = setup_mode(command, &host.config)
-        .map_err(failure)?
-        .mode
+    let setup_mode_selection = setup_mode(command, &host.config).map_err(failure)?;
+    let local_service_decision = (host.config.transport == satelle_core::TransportKind::Local)
+        .then(|| {
+            PersistentServiceDecision::resolve(
+                setup_mode_selection,
+                current_daemon_service_platform(),
+            )
+        });
+    if local_service_decision
+        .as_ref()
+        .is_some_and(|decision| decision.explicit_persistent_unsupported)
+    {
+        return Err(failure(SatelleError::persistent_service_unsupported(
+            current_daemon_service_platform().as_str(),
+        )));
+    }
+    let setup_mode = local_service_decision
+        .as_ref()
+        .map_or(setup_mode_selection.mode, |decision| decision.setup_mode)
         .as_str()
         .to_string();
     let trusted_consent =
@@ -1836,14 +1871,17 @@ fn preflight_setup_before_history(
     if host.config.transport != satelle_core::TransportKind::Local {
         return Ok(exact_state_requires_identity_discovery);
     }
-    // A production local Host has no Satelle-owned installer yet, but
-    // `setup --verify` is still a live, read-only acceptance operation for an
-    // Operator-prepared Host. Let it reach the Host verifier without
-    // misclassifying the checks as an unsupported setup mutation.
+    // Verification without component selection remains read-only. Component-
+    // selected Codex setup uses the Satelle-owned package installer below.
     if local_setup_verification_only(
         command,
         host.config.transport == satelle_core::TransportKind::Local,
     ) {
+        return Ok(exact_state_requires_identity_discovery);
+    }
+
+    let local_codex_setup = local_setup_uses_managed_backend(path_rebind, &setup_components);
+    if local_codex_setup {
         return Ok(exact_state_requires_identity_discovery);
     }
 
@@ -1855,6 +1893,37 @@ fn preflight_setup_before_history(
     Err(failure(SatelleError::not_implemented(format!(
         "{setup_mode} setup mutations are not supported by the local Host transport"
     ))))
+}
+
+fn local_setup_uses_managed_backend(path_rebind: bool, setup_components: &[String]) -> bool {
+    !path_rebind
+        && setup_components.iter().all(|component| {
+            matches!(
+                component.as_str(),
+                "all" | "codex" | "computer-use" | "provider-auth"
+            )
+        })
+}
+
+#[cfg(test)]
+#[test]
+fn default_local_setup_uses_the_managed_backend() {
+    assert!(local_setup_uses_managed_backend(
+        false,
+        &["all".to_string()]
+    ));
+    assert!(local_setup_uses_managed_backend(
+        false,
+        &["provider-auth".to_string()]
+    ));
+    assert!(!local_setup_uses_managed_backend(
+        true,
+        &["all".to_string()]
+    ));
+    assert!(!local_setup_uses_managed_backend(
+        false,
+        &["host".to_string()]
+    ));
 }
 
 fn accepted_setup_identity<'a>(
@@ -2244,6 +2313,9 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             command: HostCommand::ReleaseState,
         } => return None,
         Command::Host {
+            command: HostCommand::Start(command),
+        } if command.local_daemon_config.is_some() => return None,
+        Command::Host {
             command: HostCommand::OfflineStorageMaintenance(_),
         } => return None,
         Command::Host {
@@ -2259,6 +2331,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                     !command.foreground
                         && !command.bootstrap_token_stdin
                         && command.service_config.is_none()
+                        && command.local_daemon_config.is_none()
                 }
                 HostCommand::Update(command) => command.host.len() == 1 && !command.all_remotes,
                 _ => true,
@@ -2672,6 +2745,7 @@ mod history_target_tests {
                 bootstrap_native_readiness_timeout_ms: None,
                 bootstrap_provider_smoke_timeout_ms: None,
                 on_demand_idle_timeout_ms: None,
+                local_daemon_config: None,
                 setup_ledger_retention_ms: None,
                 session_metadata_retention_hours: None,
                 sqlite_log_retention_hours: None,
@@ -2703,6 +2777,20 @@ mod history_target_tests {
                 .expect("SSH bootstrap target")
                 .selects_host
         );
+    }
+
+    #[test]
+    fn managed_local_daemon_start_is_excluded_from_command_history() {
+        let mut command = host_start(false, false);
+        let Command::Host {
+            command: HostCommand::Start(start),
+        } = &mut command
+        else {
+            unreachable!("host_start returns a Host start command");
+        };
+        start.local_daemon_config = Some(PathBuf::from("local-daemon-launch.json"));
+
+        assert!(history_target(&command).is_none());
     }
 
     #[test]
@@ -3116,12 +3204,7 @@ fn partition_setup_components(
         .filter(|component| !matches!(component.as_str(), "desktop" | "provider-auth"))
         .cloned()
         .collect::<Vec<_>>();
-    if ssh_transport && host_components == ["all"] {
-        // SSH setup currently owns only the authenticated transport handoff.
-        // Keep the user-facing `all` selection intact in the final report, but
-        // do not send that aggregate CLI selector to the transport-only backend.
-        host_components = vec!["transport".to_string()];
-    } else if ssh_transport && path_rebind && host_components.is_empty() {
+    if ssh_transport && path_rebind && host_components.is_empty() {
         // Selecting new daemon paths requires the transport handoff even when
         // desktop selection is the only explicit setup component.
         host_components.push("transport".to_string());
@@ -3781,9 +3864,12 @@ fn run_setup(
                 current_daemon_service_platform(),
             )
         });
-    if local_service_decision
-        .as_ref()
-        .is_some_and(|decision| decision.explicit_persistent_unsupported)
+    // Dry runs deliberately leave pre-history setup preflight early. Validate
+    // their explicit service choice here without duplicating the applying path.
+    if command.dry_run
+        && local_service_decision
+            .as_ref()
+            .is_some_and(|decision| decision.explicit_persistent_unsupported)
     {
         return Err(failure(SatelleError::persistent_service_unsupported(
             current_daemon_service_platform().as_str(),
@@ -3801,6 +3887,12 @@ fn run_setup(
         trusted_profile_allows_mutation(resolved, &host.alias, MutationCommandFamily::Setup);
     let mut provider_selection =
         resolve_provider_selection(resolved, &host, None, None, false, false)?;
+    if provider_auth_setup
+        && host.config.transport == satelle_core::TransportKind::Local
+        && let Some(authorization) = provider_selection.authorization.as_ref()
+    {
+        satelle_host::validate_provider_binding_authorization(authorization).map_err(failure)?;
+    }
     let provider_probe_required = if command.verify {
         doctor_provider_intent(resolved, &host.config, true, None)
             .map_err(failure)?
@@ -3827,7 +3919,8 @@ fn run_setup(
     ) {
         return Err(failure(error));
     }
-    let mut transport = if tailscale_serve_setup || !host_setup_required {
+    let local_transport = host.config.transport == satelle_core::TransportKind::Local;
+    let mut transport = if tailscale_serve_setup || local_transport || !host_setup_required {
         None
     } else {
         setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?
@@ -3841,6 +3934,14 @@ fn run_setup(
             &setup_mode,
         )
         .map_err(failure)?
+    } else if local_transport {
+        transport::plan_local_setup(
+            &host.alias,
+            true,
+            setup_mode.clone(),
+            host_setup_components.clone(),
+            daemon_path_overrides.clone(),
+        )?
     } else {
         run_host_setup_if_required(
             host_setup_required,
@@ -3947,7 +4048,12 @@ fn run_setup(
             .then(|| authenticated_ssh_bootstrap_user(&host))
             .transpose()
             .map_err(failure)?;
-        let sessions = transport_for(&host)?.host_sessions(true).map_err(failure)?;
+        let sessions = if local_transport {
+            transport::local_setup_host_sessions(&host.alias).map_err(|failure| failure.error)
+        } else {
+            transport_for(&host)?.host_sessions(true)
+        }
+        .map_err(failure)?;
         desktop_selection = resolve_setup_desktop_selection(
             &sessions,
             &host.config,
@@ -3997,97 +4103,93 @@ fn run_setup(
         && !command.dry_run
         && report.required_input.is_empty()
     {
-        let provider_aliases = match (
-            provider_selection.requested_model_alias.as_deref(),
-            provider_selection.requested_provider_alias.as_deref(),
-        ) {
-            (Some(model_alias), Some(provider_alias)) => Some((model_alias, provider_alias)),
-            _ => {
-                report.readiness_summary.provider_auth = "host_owned".to_string();
-                None
-            }
-        };
-        if let Some((model_alias, provider_alias)) = provider_aliases {
-            if !authenticated_host_available {
-                report.planned_actions.push(format!(
-                    "validate provider binding '{provider_alias}/{model_alias}' on Host '{}'",
-                    host.alias
-                ));
-            } else {
-                let provider_transport = transport_for(&host)?;
-                match provider_transport.validate_provider_descriptor(
-                    model_alias,
-                    provider_alias,
-                    provider_selection.model_alias_from_project,
-                    provider_selection.provider_alias_from_project,
-                    satelle_core::ProviderAuthValidationMode::Cached,
-                    provider_selection.experimental_provider_computer_use,
-                ) {
-                    Ok(validation)
-                        if validation.validation.outcome()
-                            == satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret =>
-                    {
-                        pending_provider_secret_authorization =
-                            Some(plan_provider_secret_provisioning(
-                                &mut report,
-                                &provider_selection,
-                                &host.alias,
-                            )?);
-                    }
-                    Ok(validation) => {
-                        provider_auth_validation = accept_setup_provider_auth_validation(
+        let implicit_provider_defaults = provider_selection.uses_implicit_provider_defaults();
+        let (model_alias, provider_alias) = provider_selection.validation_aliases();
+        if !authenticated_host_available || (local_transport && report.mutation_planned) {
+            report.planned_actions.push(format!(
+                "validate provider binding '{provider_alias}/{model_alias}' on Host '{}'",
+                host.alias
+            ));
+        } else {
+            let validation = transport_for(&host)?.validate_provider_descriptor(
+                model_alias,
+                provider_alias,
+                provider_selection.model_alias_from_project,
+                provider_selection.provider_alias_from_project,
+                satelle_core::ProviderAuthValidationMode::Cached,
+                provider_selection.experimental_provider_computer_use,
+            );
+            match validation {
+                Ok(validation)
+                    if validation.validation.outcome()
+                        == satelle_core::ProviderAuthValidationOutcome::UnresolvedHostSecret =>
+                {
+                    pending_provider_secret_authorization =
+                        Some(plan_provider_secret_provisioning(
                             &mut report,
                             &provider_selection,
-                            validation,
-                        )?;
-                    }
-                    Err(error) if error.code == ErrorCode::ModelProviderBindingMissing => {
-                        provider_selection =
-                            resolve_provider_selection(resolved, &host, None, None, false, true)?;
-                    }
-                    Err(error) => return Err(failure(error)),
+                            &host.alias,
+                        )?);
                 }
-            }
-
-            if provider_auth_validation.is_none()
-                && report.required_input.is_empty()
-                && provider_selection.authorization.is_some()
-            {
-                if interactive_selection
-                    && provider_selection
-                        .authorization
-                        .as_ref()
-                        .and_then(ProviderBindingAuthorization::auth_source)
-                        .is_none()
-                    && let Some(auth_source_name) = provider_selection.auth_source_name.clone()
+                Ok(validation) => {
+                    provider_auth_validation = accept_setup_provider_auth_validation(
+                        &mut report,
+                        &provider_selection,
+                        validation,
+                    )?;
+                }
+                // Explicit bindings can be authorized by the setup below. Implicit defaults
+                // can only be deferred when a Host setup subplan will install their runtime
+                // before the second validation site.
+                Err(error)
+                    if error.code == ErrorCode::ModelProviderBindingMissing
+                        && (!implicit_provider_defaults || host_setup_required) =>
                 {
-                    let descriptor = prompt_provider_auth_descriptor(&auth_source_name)?;
-                    host.config
-                        .provider_auth
-                        .insert(auth_source_name.clone(), descriptor.clone());
-                    pending_provider_auth = Some((auth_source_name.clone(), descriptor));
-                    report.mutation_planned = true;
-                    report.planned_actions.push(format!(
-                        "save provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
-                        host.alias
-                    ));
                     provider_selection =
                         resolve_provider_selection(resolved, &host, None, None, false, true)?;
                 }
-                add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
-                if report.required_input.is_empty()
-                    && pending_provider_secret_authorization.is_none()
-                    && let Some(authorization) = provider_selection.authorization.as_ref()
-                {
-                    pending_provider_binding_authorization = Some(authorization.clone());
-                    report.mutation_planned = true;
-                    report.planned_actions.push(format!(
-                        "authorize provider binding '{}/{}' on Host '{}'",
-                        authorization.requested_provider_alias(),
-                        authorization.requested_model_alias(),
-                        host.alias
-                    ));
-                }
+                Err(error) => return Err(failure(error)),
+            }
+        }
+
+        if provider_auth_validation.is_none()
+            && report.required_input.is_empty()
+            && provider_selection.authorization.is_some()
+        {
+            if interactive_selection
+                && provider_selection
+                    .authorization
+                    .as_ref()
+                    .and_then(ProviderBindingAuthorization::auth_source)
+                    .is_none()
+                && let Some(auth_source_name) = provider_selection.auth_source_name.clone()
+            {
+                let descriptor = prompt_provider_auth_descriptor(&auth_source_name)?;
+                host.config
+                    .provider_auth
+                    .insert(auth_source_name.clone(), descriptor.clone());
+                pending_provider_auth = Some((auth_source_name.clone(), descriptor));
+                report.mutation_planned = true;
+                report.planned_actions.push(format!(
+                    "save provider authentication descriptor reference '{auth_source_name}' for Host '{}'",
+                    host.alias
+                ));
+                provider_selection =
+                    resolve_provider_selection(resolved, &host, None, None, false, true)?;
+            }
+            add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
+            if report.required_input.is_empty()
+                && pending_provider_secret_authorization.is_none()
+                && let Some(authorization) = provider_selection.authorization.as_ref()
+            {
+                pending_provider_binding_authorization = Some(authorization.clone());
+                report.mutation_planned = true;
+                report.planned_actions.push(format!(
+                    "authorize provider binding '{}/{}' on Host '{}'",
+                    authorization.requested_provider_alias(),
+                    authorization.requested_model_alias(),
+                    host.alias
+                ));
             }
         }
     }
@@ -4111,17 +4213,17 @@ fn run_setup(
     let mut verification_cache_updates = Vec::new();
     let mut native_invalidation_action = None;
     if !command.dry_run && report.required_input.is_empty() && report.mutation_planned {
+        let exact_setup_recovery_command = setup_consent_recovery_command(
+            &command,
+            config.flag_profile,
+            &report.setup_mode,
+            &daemon_path_overrides,
+            first_ssh_trust,
+        );
         if !command.yes && !trusted_consent && (command.no_input || !io::stdin().is_terminal()) {
-            let consent_recovery_command = setup_consent_recovery_command(
-                &command,
-                config.flag_profile,
-                &report.setup_mode,
-                &daemon_path_overrides,
-                first_ssh_trust,
-            );
             return Err(failure(SatelleError::setup_consent_required(
                 &report.planned_actions,
-                &consent_recovery_command,
+                &exact_setup_recovery_command,
             )));
         }
 
@@ -4151,6 +4253,10 @@ fn run_setup(
             if !confirmed {
                 return finish_cancelled_setup(&mut report, json);
             }
+        }
+
+        if local_transport {
+            transport = setup_transport_if_required(true, || transport_for_setup(&host))?;
         }
 
         if first_ssh_trust {
@@ -4248,6 +4354,7 @@ fn run_setup(
                     &host.alias,
                     &selection.desktop_user,
                     Some(&selection.preference),
+                    &exact_setup_recovery_command,
                 )
                 .map_err(failure)?;
                 host.config.desktop_user = Some(selection.desktop_user.clone());
@@ -4384,6 +4491,7 @@ fn run_setup(
                         &host.alias,
                         &selection.desktop_user,
                         Some(&selection.preference),
+                        &exact_setup_recovery_command,
                     )
                     .map_err(failure)?;
                     host.config.desktop_user = Some(selection.desktop_user.clone());
@@ -4398,11 +4506,8 @@ fn run_setup(
             && report.required_input.is_empty()
             && provider_auth_validation.is_none()
             && !provider_secret_setup_completed
-            && let (Some(model_alias), Some(provider_alias)) = (
-                provider_selection.requested_model_alias.as_deref(),
-                provider_selection.requested_provider_alias.as_deref(),
-            )
         {
+            let (model_alias, provider_alias) = provider_selection.validation_aliases();
             let provider_transport = if host.config.transport == satelle_core::TransportKind::Ssh {
                 transport_for_with_ssh_bootstrap(&host, Some(SshBootstrapScope::Admin))?
             } else {
@@ -6196,7 +6301,6 @@ fn execute_doctor_diagnostics(
         .map_err(DoctorExecutionFailure::from));
     }
 
-    let transport = transport_for(host)?;
     let provider_intent = doctor_provider_intent(
         resolved_config,
         &host.config,
@@ -6204,6 +6308,22 @@ fn execute_doctor_diagnostics(
         options.probe_timeout(),
     )
     .map_err(failure)?;
+    if host.config.transport == satelle_core::TransportKind::Local
+        && scope_selection.scopes() == [DoctorScope::Config]
+    {
+        if emit_events {
+            print_doctor_started_event(&host.alias, scope_selection).map_err(failure)?;
+        }
+        return transport::local_read_only_doctor(
+            host,
+            scope_selection,
+            Arc::new(transport_probe),
+            options,
+            &provider_intent,
+        );
+    }
+
+    let transport = transport_for(host)?;
     if emit_events {
         print_doctor_started_event(&host.alias, scope_selection).map_err(failure)?;
     }
@@ -7733,8 +7853,23 @@ struct ProviderSelection {
 }
 
 impl ProviderSelection {
+    fn validation_aliases(&self) -> (&str, &str) {
+        (
+            self.requested_model_alias
+                .as_deref()
+                .unwrap_or("codex-default"),
+            self.requested_provider_alias
+                .as_deref()
+                .unwrap_or("codex-default"),
+        )
+    }
+
+    fn uses_implicit_provider_defaults(&self) -> bool {
+        self.requested_model_alias.is_none() && self.requested_provider_alias.is_none()
+    }
+
     fn provider_smoke_status(&self, refresh: bool) -> &'static str {
-        if self.requested_model_alias.is_none() && self.requested_provider_alias.is_none() {
+        if self.uses_implicit_provider_defaults() {
             "host_owned"
         } else if refresh {
             "refresh_required"
@@ -8507,6 +8642,7 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.bootstrap_native_readiness_timeout_ms.is_some()
             || command.bootstrap_provider_smoke_timeout_ms.is_some()
             || command.on_demand_idle_timeout_ms.is_some()
+            || command.local_daemon_config.is_some()
             || command.setup_ledger_retention_ms.is_none()
             || command.session_metadata_retention_hours.is_none()
             || command.sqlite_log_retention_hours.is_none()
@@ -8526,6 +8662,7 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.bootstrap_native_readiness_timeout_ms.is_some()
             || command.bootstrap_provider_smoke_timeout_ms.is_some()
             || command.on_demand_idle_timeout_ms.is_some()
+            || command.local_daemon_config.is_some()
             || command.setup_ledger_retention_ms.is_some()
             || command.session_metadata_retention_hours.is_some()
             || command.sqlite_log_retention_hours.is_some()
@@ -8538,6 +8675,20 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
     if command.foreground && command.bootstrap_token_stdin {
         return Err(SatelleError::invalid_usage(
             "SSH bootstrap tokens are valid only for on-demand Host Daemons",
+        ));
+    }
+    if command.local_daemon_config.is_some()
+        && (command.foreground
+            || command.bootstrap_token_stdin
+            || command.bootstrap_scope.is_some()
+            || command.initial_host_identity.is_some()
+            || command.initial_identity_operation_id.is_some()
+            || command.initial_identity_record.is_some()
+            || command.tls_cert.is_some()
+            || command.tls_key.is_some())
+    {
+        return Err(SatelleError::invalid_usage(
+            "the managed local daemon launch descriptor cannot be combined with foreground, SSH bootstrap, identity bootstrap, or TLS inputs",
         ));
     }
     if command.bootstrap_token_stdin && (command.tls_cert.is_some() || command.tls_key.is_some()) {
@@ -8691,6 +8842,23 @@ fn start_host_daemon_with(
     ) -> HostService,
 ) -> Result<(), CliFailure> {
     validate_host_start_mode(&command).map_err(failure)?;
+    let local_daemon_launch = command
+        .local_daemon_config
+        .as_deref()
+        .map(transport::read_local_daemon_launch_config)
+        .transpose()
+        .map_err(failure)?;
+    if let Some(path) = command.local_daemon_config.as_deref() {
+        fs::remove_file(path).map_err(|error| {
+            failure(SatelleError::config_error(
+                format!(
+                    "could not consume the managed local daemon launch descriptor '{}': {error}",
+                    path.display()
+                ),
+                None,
+            ))
+        })?;
+    }
     let (service_path_overrides, service_storage_policy) =
         if let Some(_service_config_path) = command.service_config.as_deref() {
             #[cfg(not(windows))]
@@ -8798,7 +8966,10 @@ fn start_host_daemon_with(
     let tls = daemon_tls_config(&command)?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let user_config_path = resolve_path_set(&cwd).map_err(failure)?.config_file;
-    let api_rate_limits = load_user_api_rate_limits(&user_config_path).map_err(failure)?;
+    let api_rate_limits = match local_daemon_launch.as_ref() {
+        Some(launch) => *launch.api_rate_limits(),
+        None => load_user_api_rate_limits(&user_config_path).map_err(failure)?,
+    };
 
     // Durable SSH relaunch must reopen the same default state store used by
     // bootstrap token issuance. The Controller has already resolved the idle
@@ -8806,13 +8977,16 @@ fn start_host_daemon_with(
     // could redirect the daemon to another daemon_state_dir and strand the
     // durable credential.
     let durable_ssh_launch = command.on_demand_idle_timeout_ms.is_some();
-    let on_demand_host = should_resolve_on_demand_host(
-        command.foreground,
-        command.bootstrap_token_stdin,
-        durable_ssh_launch,
-    )
-    .then(|| config.resolve_host(None))
-    .transpose()?;
+    let on_demand_host = if local_daemon_launch.is_none()
+        && should_resolve_on_demand_host(
+            command.foreground,
+            command.bootstrap_token_stdin,
+            durable_ssh_launch,
+        ) {
+        Some(config.resolve_host(None)?)
+    } else {
+        None
+    };
     let idle_timeout = if let Some(milliseconds) = command.on_demand_idle_timeout_ms {
         Some(Duration::from_millis(milliseconds))
     } else if command.bootstrap_token_stdin {
@@ -8834,6 +9008,11 @@ fn start_host_daemon_with(
     let state_release_root = on_demand_host
         .as_ref()
         .and_then(|host| host.config.daemon_state_dir.clone())
+        .or_else(|| {
+            local_daemon_launch
+                .as_ref()
+                .and_then(|launch| launch.host_config().daemon_state_dir.clone())
+        })
         .map_or_else(satelle_core::state_dir, Ok)
         .map_err(failure)?;
     if initial_identity.is_none()
@@ -8844,15 +9023,21 @@ fn start_host_daemon_with(
             Some("rerun SSH setup with the exact previously accepted Host Identity".to_string()),
         )));
     }
-    let service = match (on_demand_host.as_ref(), bootstrap_token.as_ref()) {
-        (_, None) if service_path_overrides.is_some() => HostService::production_for_service(
+    let service = match (
+        local_daemon_launch.as_ref(),
+        on_demand_host.as_ref(),
+        bootstrap_token.as_ref(),
+    ) {
+        (Some(launch), _, None) => transport::local_host_service(launch.host_config())?,
+        (Some(_), _, Some(_)) => unreachable!("local daemon launch rejects bootstrap tokens"),
+        (None, _, None) if service_path_overrides.is_some() => HostService::production_for_service(
             service_path_overrides
                 .as_ref()
                 .expect("persistent service path overrides were checked"),
             service_storage_policy.expect("persistent service storage policy was checked"),
         )
         .map_err(failure)?,
-        (_, Some(token)) => {
+        (None, _, Some(token)) => {
             let mut host_config = satelle_core::SatelleConfig::defaults()
                 .hosts
                 .remove(LOCAL_DEMO_HOST)
@@ -8873,8 +9058,8 @@ fn start_host_daemon_with(
                 &host_config,
             )
         }
-        (Some(host), None) => HostService::production_for_host(&host.config),
-        (None, None) => match forwarded_readiness_timeouts {
+        (None, Some(host), None) => HostService::production_for_host(&host.config),
+        (None, None, None) => match forwarded_readiness_timeouts {
             Some(timeouts) => {
                 let mut host_config = satelle_core::SatelleConfig::defaults()
                     .hosts
@@ -8903,10 +9088,18 @@ fn start_host_daemon_with(
     runtime.block_on(async move {
         let mut server_config =
             DaemonServerConfig::loopback(bind_addr).with_api_rate_limits(api_rate_limits);
+        if local_daemon_launch.is_some() {
+            server_config = server_config.with_local_relaunch();
+        }
         if let Some(idle_timeout) = idle_timeout {
             server_config = server_config.with_idle_timeout(idle_timeout);
         }
         let (server, _tls_reload_watcher) = bind_host_daemon(service, server_config, tls).await?;
+
+        if let Some(launch) = local_daemon_launch.as_ref() {
+            transport::publish_local_daemon_endpoint(launch, server.local_addr())
+                .map_err(failure)?;
+        }
 
         let ready = json!({
             "schema_version": "satelle.host.start.v1",
@@ -8963,6 +9156,9 @@ fn start_host_daemon_with(
             server_wait.await.map_err(daemon_server_failure)
         };
         state_release_task.abort();
+        if let Some(launch) = local_daemon_launch.as_ref() {
+            transport::remove_local_daemon_endpoint(launch);
+        }
         emit_daemon_process_notice(if result.is_ok() {
             DaemonProcessNotice::Shutdown
         } else {
@@ -9655,6 +9851,7 @@ mod daemon_tls_watcher_tests {
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: None,
+            local_daemon_config: None,
             setup_ledger_retention_ms: None,
             session_metadata_retention_hours: None,
             sqlite_log_retention_hours: None,
@@ -10183,6 +10380,7 @@ mod bootstrap_startup_tests {
             bootstrap_native_readiness_timeout_ms: None,
             bootstrap_provider_smoke_timeout_ms: None,
             on_demand_idle_timeout_ms: Some(75_000),
+            local_daemon_config: None,
             setup_ledger_retention_ms: None,
             session_metadata_retention_hours: None,
             sqlite_log_retention_hours: None,
@@ -13702,7 +13900,7 @@ fn stop_session(
     let session_id =
         SessionId::from_str(&command.session_id).map_err(|error| failure(error.into()))?;
     let host = config.resolve_session_host(command.host.as_deref(), &session_id)?;
-    let transport = transport_for(&host)?;
+    let transport = transport::transport_for_session_control(&host)?;
     let result = transport.stop(&session_id).map_err(failure)?;
 
     if json {
@@ -14651,10 +14849,10 @@ mod setup_desktop_binding_tests {
     }
 
     #[test]
-    fn ssh_all_and_path_rebind_normalize_to_the_transport_subplan() {
+    fn ssh_all_defers_platform_specific_expansion_to_the_ssh_transport() {
         assert_eq!(
             partition_setup_components(&["all".to_string()], true, false),
-            (vec!["transport".to_string()], true)
+            (vec!["all".to_string()], true)
         );
         assert_eq!(
             partition_setup_components(&["desktop".to_string()], true, true),

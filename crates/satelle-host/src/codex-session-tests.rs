@@ -23,7 +23,31 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 #[link(name = "user32")]
 unsafe extern "system" {
-    fn keybd_event(virtual_key: u8, scan_code: u8, flags: u32, extra_info: usize);
+    fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct MouseInput {
+    dx: i32,
+    dy: i32,
+    mouse_data: u32,
+    flags: u32,
+    time: u32,
+    extra_info: usize,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+union InputValue {
+    mouse: std::mem::ManuallyDrop<MouseInput>,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Input {
+    kind: u32,
+    value: InputValue,
 }
 
 fn main() {
@@ -131,13 +155,12 @@ fn main() {
     let thread_response = format!(r#"{{"id":2,"result":{{"thread":{{"id":"{thread_id}"}}}}}}"#);
     let mut provider_probe_request = None;
 
-    if scenario == "notification-first" {
-        send(&mut output, &format!(r#"{{"method":"thread/started","params":{{"thread":{{"id":"{thread_id}"}}}}}}"#));
+    if matches!(scenario.as_str(), "notification-first" | "mcp-notification-first") {
+        if scenario == "notification-first" {
+            send(&mut output, &format!(r#"{{"method":"thread/started","params":{{"thread":{{"id":"{thread_id}"}}}}}}"#));
+        }
         send_mcp_ready(&mut output, thread_id);
         wait_for(&thread_marker);
-        let inventory_request = receive(&mut input, &log);
-        assert_mcp_inventory_request(&inventory_request, thread_id);
-        send_mcp_inventory(&mut output);
         let plugin_request = receive(&mut input, &log);
         assert_plugin_inventory_request(&plugin_request);
         send_plugin_inventory(&mut output, false);
@@ -158,9 +181,6 @@ fn main() {
         }
         send_mcp_ready(&mut output, thread_id);
         if thread_id == "thread-1" { wait_for(&thread_marker); }
-        let inventory_request = receive(&mut input, &log);
-        assert_mcp_inventory_request(&inventory_request, thread_id);
-        send_mcp_inventory(&mut output);
         let plugin_request = receive(&mut input, &log);
         assert_plugin_inventory_request(&plugin_request);
         if scenario == "unexpected-plugin" {
@@ -208,7 +228,84 @@ fn main() {
         send(&mut output, &format!(r#"{{"id":"approval-write-failure","method":"item/commandExecution/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"additionalPermissions":{{"fileSystem":{{"entries":[]}}}},"availableDecisions":["accept","decline"]}}}}"#));
         std::process::exit(0);
     }
+    if scenario.starts_with("native-task-") {
+        let script = r#"globalThis.sky ??= (await import('@oai/sky')).sky; sky.list_apps()"#;
+        if !matches!(
+            scenario.as_str(),
+            "native-task-no-approval"
+        ) {
+            send(&mut output, &format!(r#"{{"id":"native-script","method":"mcpServer/elicitation/request","params":{{"_meta":{{"codex_approval_kind":"mcp_tool_call","persist":["session","always"],"tool_description":"Run JavaScript in a persistent Node-backed kernel.","tool_params":{{"code":"{script}"}},"tool_params_display":[{{"name":"code","display_name":"code","value":"{script}"}}]}},"message":"Allow the node_repl MCP server to run tool \"js\"?","mode":"form","requestedSchema":{{"type":"object","properties":{{}}}},"serverName":"node_repl","threadId":"{thread_id}","turnId":"turn-1"}}}}"#));
+            let approval = receive(&mut input, &log);
+            assert!(approval.contains(r#""action":"accept""#));
+        }
+
+        if matches!(
+            scenario.as_str(),
+            "native-task-success"
+                | "native-task-failed"
+                | "native-task-failed-then-success"
+                | "native-task-no-approval"
+                | "native-task-script-conflict"
+                | "native-task-thread-conflict"
+        ) {
+            let item_prefix = format!(r#"{{"id":"native-item","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{{"code":"{script}"}}"#);
+            let started = format!(r#"{item_prefix},"status":"inProgress"}}"#);
+            send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{started}}}}}"#));
+            let terminal_status = if matches!(
+                scenario.as_str(),
+                "native-task-success"
+                    | "native-task-no-approval"
+                    | "native-task-script-conflict"
+                    | "native-task-thread-conflict"
+            ) {
+                "completed"
+            } else {
+                "failed"
+            };
+            let mut completed = started.replace(
+                r#""status":"inProgress""#,
+                &format!(r#""status":"{terminal_status}""#),
+            );
+            if scenario == "native-task-script-conflict" {
+                completed = completed.replace(&script, "different script");
+            }
+            completed.pop();
+            completed.push_str(r#","result":{"content":[],"structuredContent":null,"_meta":{"codex/nodeReplExecutionDurationMs":7}}}"#);
+            let item_thread = if scenario == "native-task-thread-conflict" {
+                "thread-conflict"
+            } else {
+                thread_id
+            };
+            send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{item_thread}","turnId":"turn-1","item":{completed}}}}}"#));
+            if scenario == "native-task-failed-then-success" {
+                let retry_prefix = item_prefix.replace("native-item", "native-item-retry");
+                let retry = format!(r#"{retry_prefix},"status":"inProgress"}}"#);
+                send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{retry}}}}}"#));
+                let mut retry = retry.replace(
+                    r#""status":"inProgress""#,
+                    r#""status":"completed""#,
+                );
+                retry.pop();
+                retry.push_str(r#","result":{"content":[],"structuredContent":null,"_meta":{"codex/nodeReplExecutionDurationMs":5}}}"#);
+                send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{retry}}}}}"#));
+            }
+        }
+    }
     if scenario == "controlled-interrupt" {
+        let interrupt = receive(&mut input, &log);
+        assert!(interrupt.contains(r#""id":4"#));
+        assert!(interrupt.contains(r#""method":"turn/interrupt""#));
+        assert!(interrupt.contains(r#""threadId":"thread-1""#));
+        assert!(interrupt.contains(r#""turnId":"turn-1""#));
+        send(&mut output, r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted"}}}"#);
+        send(&mut output, r#"{"id":4,"result":{}}"#);
+        return;
+    }
+    if scenario == "native-controlled-interrupt" {
+        let started = r#"{"id":"item-native","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{"code":"PRIVATE_NATIVE_SCRIPT"},"status":"inProgress"}"#;
+        send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"thread-1","turnId":"turn-1","item":{started}}}}}"#));
+        let completed = started.replace(r#""status":"inProgress""#, r#""status":"completed""#);
+        send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"thread-1","turnId":"turn-1","item":{completed}}}}}"#));
         let interrupt = receive(&mut input, &log);
         assert!(interrupt.contains(r#""id":4"#));
         assert!(interrupt.contains(r#""method":"turn/interrupt""#));
@@ -223,13 +320,18 @@ fn main() {
         "provider-probe-responses" | "provider-probe-invalidated-after-callbacks"
     ) {
         let next_request = provider_probe_request.as_deref().unwrap();
-        let script_start = next_request.find("cell: `").unwrap() + "cell: `".len();
-        let script_end = script_start + next_request[script_start..].find('`').unwrap();
+        let script_start = next_request.find("globalThis.sky ??=").unwrap();
+        let script_end = script_start
+            + next_request[script_start..]
+                .find(r#"\""#)
+                .expect("provider probe script must end at the JSON string boundary");
         let encoded_script = &next_request[script_start..script_end];
         let item = format!(r#"{{"id":"item-native","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{{"code":"{encoded_script}"}},"status":"inProgress"}}"#);
         send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{item}}}}}"#));
         complete_provider_probe_actions(&next_request);
-        let item = item.replace(r#""status":"inProgress""#, r#""status":"completed""#);
+        let mut item = item.replace(r#""status":"inProgress""#, r#""status":"completed""#);
+        item.pop();
+        item.push_str(r#", "result":{"content":[],"structuredContent":null,"_meta":{"codex/nodeReplExecutionDurationMs":5}}}"#);
         send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{item}}}}}"#));
         if scenario == "provider-probe-invalidated-after-callbacks" {
             send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{{"id":"item-extra","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{{"code":"unexpected()"}},"status":"inProgress"}}}}}}"#));
@@ -331,17 +433,6 @@ fn send(output: &mut impl Write, line: &str) {
     output.flush().unwrap();
 }
 
-fn assert_mcp_inventory_request(request: &str, thread_id: &str) {
-    assert!(request.contains(r#""id":6"#));
-    assert!(request.contains(r#""method":"mcpServerStatus/list""#));
-    assert!(request.contains(&format!(r#""threadId":"{thread_id}""#)));
-    assert!(request.contains(r#""detail":"toolsAndAuthOnly""#));
-}
-
-fn send_mcp_inventory(output: &mut impl Write) {
-    send(output, r#"{"id":6,"result":{"data":[{"name":"computer-use","serverInfo":null,"tools":{},"authStatus":"unsupported"},{"name":"disabled-server","serverInfo":null,"tools":{},"authStatus":"unsupported"}],"nextCursor":null}}"#);
-}
-
 fn send_mcp_ready(output: &mut impl Write, thread_id: &str) {
     send(output, &format!(r#"{{"method":"mcpServer/startupStatus/updated","params":{{"threadId":"{thread_id}","name":"computer-use","status":"ready","error":null,"failureReason":null}}}}"#));
 }
@@ -407,8 +498,8 @@ fn complete_provider_probe_actions(turn_request: &str) {
     let completion_end =
         completion_start + page[completion_start..].find('\'').unwrap();
     let completion_target = &page[completion_start..completion_end];
-    for action in ["click", "drag"] {
-        record_native_input_for_probe_test();
+    for (action, delta_x) in [("click", 1), ("drag", -1)] {
+        record_native_input_for_probe_test(delta_x);
         let body = format!("nonce={nonce}&action={action}");
         let mut completion_stream = TcpStream::connect(host).unwrap();
         write!(
@@ -426,19 +517,39 @@ fn complete_provider_probe_actions(turn_request: &str) {
     }
 }
 
-fn record_native_input_for_probe_test() {
+fn record_native_input_for_probe_test(_delta_x: i32) {
     #[cfg(windows)]
     {
         // Windows accepts a probe receipt only after the session's real input
-        // counter advances. Exercise that production gate with a balanced
-        // Shift press and release instead of bypassing it in this fixture.
-        const VIRTUAL_KEY_SHIFT: u8 = 0x10;
-        const KEY_EVENT_KEY_UP: u32 = 0x0002;
+        // counter advances. Use the same checked SendInput mouse movement as
+        // the direct native probe test instead of a second fixture-only path.
+        const INPUT_MOUSE: u32 = 0;
+        const MOUSE_EVENT_MOVE: u32 = 0x0001;
         std::thread::sleep(Duration::from_millis(20));
-        unsafe {
-            keybd_event(VIRTUAL_KEY_SHIFT, 0, 0, 0);
-            keybd_event(VIRTUAL_KEY_SHIFT, 0, KEY_EVENT_KEY_UP, 0);
-        }
+        let input = Input {
+            kind: INPUT_MOUSE,
+            value: InputValue {
+                mouse: std::mem::ManuallyDrop::new(MouseInput {
+                    dx: _delta_x,
+                    dy: 0,
+                    mouse_data: 0,
+                    flags: MOUSE_EVENT_MOVE,
+                    time: 0,
+                    extra_info: 0,
+                }),
+            },
+        };
+        assert_eq!(
+            unsafe {
+                SendInput(
+                    1,
+                    &input,
+                    i32::try_from(std::mem::size_of::<Input>()).unwrap(),
+                )
+            },
+            1,
+            "Windows did not accept the provider fixture input"
+        );
     }
 }
 
@@ -507,11 +618,13 @@ enum PersistFailure {
     Turn,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ScenarioExecution {
     mode: TurnExecutionMode,
     approval_policy: CodexApprovalPolicy,
     sandbox_policy: CodexSandboxPolicy,
+    native_apps_allowed: bool,
+    native_action_evidence: Option<NativeActionEvidence>,
 }
 
 impl ScenarioExecution {
@@ -519,12 +632,24 @@ impl ScenarioExecution {
         mode: TurnExecutionMode::Standard,
         approval_policy: CodexApprovalPolicy::OnRequest,
         sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+        native_apps_allowed: false,
+        native_action_evidence: None,
     };
 
     const YOLO: Self = Self {
         mode: TurnExecutionMode::Yolo,
         approval_policy: CodexApprovalPolicy::Never,
         sandbox_policy: CodexSandboxPolicy::DangerFullAccess,
+        native_apps_allowed: false,
+        native_action_evidence: None,
+    };
+
+    const NATIVE: Self = Self {
+        mode: TurnExecutionMode::Standard,
+        approval_policy: CodexApprovalPolicy::OnRequest,
+        sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+        native_apps_allowed: true,
+        native_action_evidence: None,
     };
 
     const fn new(
@@ -536,6 +661,8 @@ impl ScenarioExecution {
             mode,
             approval_policy,
             sandbox_policy,
+            native_apps_allowed: false,
+            native_action_evidence: None,
         }
     }
 }
@@ -579,6 +706,17 @@ fn run_yolo_scenario(scenario: &str, timeout: Duration) -> ScenarioResult {
         "perform the harmless action PRIVATE_PROMPT_CANARY",
         PersistFailure::None,
         ScenarioExecution::YOLO,
+    )
+}
+
+fn run_native_scenario(scenario: &str, timeout: Duration) -> ScenarioResult {
+    run_scenario_with_options(
+        scenario,
+        None,
+        timeout,
+        "perform the native action PRIVATE_PROMPT_CANARY",
+        PersistFailure::None,
+        ScenarioExecution::NATIVE,
     )
 }
 
@@ -662,6 +800,11 @@ fn run_scenario_with_options(
         .images()
         .first()
         .map(|image| image.path().to_path_buf());
+    let computer_use_allowed_app_ids = if execution.native_apps_allowed {
+        BTreeSet::from(["calculator.exe".to_string()])
+    } else {
+        BTreeSet::default()
+    };
     let session_started = Instant::now();
     let session_result = run_codex_session(
         command,
@@ -680,9 +823,9 @@ fn run_scenario_with_options(
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: Some(&mut observe_native_approval),
-            native_action_evidence: None,
+            native_action_evidence: execution.native_action_evidence,
             expected_mcp_server_name: "computer-use",
-            computer_use_allowed_app_ids: &BTreeSet::new(),
+            computer_use_allowed_app_ids: &computer_use_allowed_app_ids,
             control: None,
             goal_set_supported: scenario.starts_with("goal"),
             image_input_mode: if uses_local_image {
@@ -768,7 +911,7 @@ fn first_thread_uses_exact_policy_order_and_persists_refs() {
         run.child_working_directory,
         std::env::current_dir().unwrap()
     );
-    assert_eq!(run.requests.len(), 6);
+    assert_eq!(run.requests.len(), 5);
     assert_eq!(
         run.requests[0],
         json!({
@@ -795,16 +938,11 @@ fn first_thread_uses_exact_policy_order_and_persists_refs() {
     );
     assert_eq!(
         run.requests[3],
-        json!({"id":6,"method":"mcpServerStatus/list","params":{
-            "threadId":"thread-1","cursor":null,"limit":100,"detail":"toolsAndAuthOnly"}})
-    );
-    assert_eq!(
-        run.requests[4],
         json!({"id":7,"method":"plugin/list","params":{
             "cwds":[run.directory.path()]}})
     );
     assert_eq!(
-        run.requests[5],
+        run.requests[4],
         json!({"id":3,"method":"turn/start","params":{
         "input":[{"type":"text","text":"perform the harmless action PRIVATE_PROMPT_CANARY"}],
         "threadId":"thread-1","model":"gpt-fixture","approvalPolicy":"on-request",
@@ -1020,40 +1158,40 @@ fn builtin_openai_provider_secret_is_process_scoped_and_shell_excluded() {
 fn supported_goal_is_confirmed_before_the_first_turn() {
     let run = run_scenario("goal", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
-    assert_eq!(run.requests.len(), 7);
+    assert_eq!(run.requests.len(), 6);
     assert_eq!(run.requests[2]["method"], "thread/start");
-    assert_eq!(run.requests[5]["id"], 3);
-    assert_eq!(run.requests[5]["method"], "thread/goal/set");
-    assert_eq!(run.requests[5]["params"]["threadId"], "thread-1");
+    assert_eq!(run.requests[4]["id"], 3);
+    assert_eq!(run.requests[4]["method"], "thread/goal/set");
+    assert_eq!(run.requests[4]["params"]["threadId"], "thread-1");
     assert_eq!(
-        run.requests[5]["params"]["objective"],
+        run.requests[4]["params"]["objective"],
         "perform the harmless action PRIVATE_PROMPT_CANARY"
     );
-    assert_eq!(run.requests[5]["params"]["status"], "paused");
-    assert_eq!(run.requests[6]["id"], 4);
-    assert_eq!(run.requests[6]["method"], "turn/start");
+    assert_eq!(run.requests[4]["params"]["status"], "paused");
+    assert_eq!(run.requests[5]["id"], 4);
+    assert_eq!(run.requests[5]["method"], "turn/start");
 }
 
 #[test]
 fn active_goal_response_blocks_the_competing_explicit_turn() {
     let run = run_scenario("goal-active", None, Duration::from_secs(3));
     assert_eq!(run.result, Err(CodexSessionError::MalformedMessage));
-    assert_eq!(run.requests.len(), 6);
-    assert_eq!(run.requests[5]["method"], "thread/goal/set");
+    assert_eq!(run.requests.len(), 5);
+    assert_eq!(run.requests[4]["method"], "thread/goal/set");
 }
 
 #[test]
 fn staged_images_are_sent_as_daemon_local_image_inputs() {
     let run = run_scenario("local-image", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
-    assert_eq!(run.requests[5]["method"], "turn/start");
-    assert_eq!(run.requests[5]["params"]["input"][0]["type"], "text");
-    assert_eq!(run.requests[5]["params"]["input"][1]["type"], "localImage");
-    let image_path = run.requests[5]["params"]["input"][1]["path"]
+    assert_eq!(run.requests[4]["method"], "turn/start");
+    assert_eq!(run.requests[4]["params"]["input"][0]["type"], "text");
+    assert_eq!(run.requests[4]["params"]["input"][1]["type"], "localImage");
+    let image_path = run.requests[4]["params"]["input"][1]["path"]
         .as_str()
         .expect("local image path");
     assert!(Path::new(image_path).starts_with(run.directory.path()));
-    assert!(!run.requests[5].to_string().contains("data:image"));
+    assert!(!run.requests[4].to_string().contains("data:image"));
 }
 
 #[test]
@@ -1080,12 +1218,20 @@ fn resume_uses_persisted_thread_without_persisting_it_again() {
     assert_eq!(run.persisted_turns, ["turn-1"]);
     assert_eq!(run.requests[2]["method"], "thread/resume");
     assert_eq!(run.requests[2]["params"]["threadId"], "thread-existing");
-    assert_eq!(run.requests[5]["params"]["threadId"], "thread-existing");
+    assert_eq!(run.requests[4]["params"]["threadId"], "thread-existing");
 }
 
 #[test]
 fn notifications_may_precede_correlated_responses() {
     let run = run_scenario("notification-first", None, Duration::from_secs(3));
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.persisted_threads, ["thread-1"]);
+    assert_eq!(run.persisted_turns, ["turn-1"]);
+}
+
+#[test]
+fn mcp_startup_notification_may_establish_the_new_thread_identity() {
+    let run = run_scenario("mcp-notification-first", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
     assert_eq!(run.persisted_threads, ["thread-1"]);
     assert_eq!(run.persisted_turns, ["turn-1"]);
@@ -1111,6 +1257,25 @@ fn terminal_status_is_closed() {
         assert!(!debug.contains("PRIVATE_PROVIDER_ERROR_CANARY"));
         assert!(!debug.contains("PRIVATE_PROVIDER_DETAILS_CANARY"));
     }
+}
+
+#[test]
+fn configured_native_action_evidence_still_requires_a_native_tool() {
+    let native_action_evidence = NativeActionEvidence::new();
+    native_action_evidence.expect_script("PRIVATE_NATIVE_SCRIPT");
+    let run = run_scenario_with_options(
+        "completed",
+        None,
+        Duration::from_secs(3),
+        "perform the native action PRIVATE_PROMPT_CANARY",
+        PersistFailure::None,
+        ScenarioExecution {
+            native_action_evidence: Some(native_action_evidence),
+            ..ScenarioExecution::NATIVE
+        },
+    );
+
+    assert_eq!(run.result, Err(CodexSessionError::NativeActionUnavailable));
 }
 
 #[test]
@@ -1191,6 +1356,71 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
 }
 
 #[test]
+fn interrupt_before_any_session_claims_control_confirms_inactive_upstream_and_skips_dispatch() {
+    let directory = tempfile::tempdir().expect("early stop scenario directory");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let control = CodexSessionControl::new(deadline);
+
+    // The stop arrives during pre-dispatch work, before any process exists.
+    assert_eq!(
+        control.interrupt(),
+        StopObservation::UpstreamInactiveConfirmed
+    );
+
+    // A missing executable proves the session never tried to dispatch.
+    let command = Command::new(directory.path().join("codex-must-not-start"));
+    let session_control = control.clone();
+    let session_directory = directory.path().to_path_buf();
+    let session = std::thread::spawn(move || {
+        let mut persist_thread = |_: &str| Ok(());
+        let mut persist_turn = |_: &str| Ok(());
+        run_codex_session(
+            command,
+            CodexSessionRequest {
+                working_directory: &session_directory,
+                prompt: "PRIVATE_EARLY_STOP_PROMPT",
+                existing_thread_ref: None,
+                model: Some("gpt-fixture"),
+                model_provider: Some("fixture-provider"),
+                provider_endpoint: None,
+                provider_secret: None,
+                execution_mode: TurnExecutionMode::Standard,
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+                deadline,
+                persist_thread_ref: &mut persist_thread,
+                persist_turn_ref: &mut persist_turn,
+                observe_native_approval: None,
+                native_action_evidence: None,
+                expected_mcp_server_name: "computer-use",
+                computer_use_allowed_app_ids: &BTreeSet::new(),
+                control: Some(session_control),
+                goal_set_supported: false,
+                image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
+                attachments: &[],
+            },
+        )
+    });
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !session.is_finished(),
+        "execution must wait until the stopped state is durable"
+    );
+    // A repeated stop during the wait gets the same confirmed answer.
+    assert_eq!(
+        control.interrupt(),
+        StopObservation::UpstreamInactiveConfirmed
+    );
+    control.stop_committed();
+
+    assert_eq!(
+        session.join().expect("join early stopped execution"),
+        Ok(CodexSessionTerminal::StoppedByControl)
+    );
+}
+
+#[test]
 fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
     let fixture = compile_fixture();
     let directory = tempfile::tempdir().expect("provider timeout scenario directory");
@@ -1260,6 +1490,91 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
         Err(CodexSessionError::Control)
     ));
     let requests = read_to_string(log_path).expect("provider timeout protocol log");
+    assert!(requests.contains(r#""method":"turn/interrupt""#));
+    assert!(requests.contains(r#""threadId":"thread-1""#));
+    assert!(requests.contains(r#""turnId":"turn-1""#));
+}
+
+#[test]
+fn native_action_completion_requests_correlated_upstream_cancellation() {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("native completion scenario directory");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("SATELLE_FIXTURE_SCENARIO", "native-controlled-interrupt")
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env(
+            "SATELLE_DESCENDANT_MARKER",
+            directory.path().join("unused-descendant"),
+        );
+    let mut persist_thread = |_: &str| {
+        touch(&thread_marker);
+        Ok(())
+    };
+    let mut persist_turn = |_: &str| {
+        touch(&turn_marker);
+        Ok(())
+    };
+    let native_action_evidence = NativeActionEvidence::new();
+    native_action_evidence.expect_script("PRIVATE_NATIVE_SCRIPT");
+    let action_driver = native_action_evidence.clone();
+    let actions = std::thread::spawn(move || {
+        assert!(action_driver.observe_click_for_test());
+        assert!(action_driver.observe_drag_for_test());
+    });
+    let timeout = process_startup_timeout(Duration::from_secs(3));
+    let timeout_deadline = Instant::now() + timeout;
+    let cancellation_grace = Duration::from_secs(1);
+    let registered_control = CodexSessionControl::new(timeout_deadline + cancellation_grace);
+    let started_at = Instant::now();
+
+    let run = run_codex_session_with_native_action_completion(
+        command,
+        CodexSessionRequest {
+            working_directory: directory.path(),
+            prompt: "PRIVATE_NATIVE_PROMPT",
+            existing_thread_ref: None,
+            model: Some("gpt-fixture"),
+            model_provider: Some("fixture-provider"),
+            provider_endpoint: None,
+            provider_secret: None,
+            execution_mode: TurnExecutionMode::Standard,
+            approval_policy: CodexApprovalPolicy::OnRequest,
+            sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+            deadline: timeout_deadline,
+            persist_thread_ref: &mut persist_thread,
+            persist_turn_ref: &mut persist_turn,
+            observe_native_approval: None,
+            native_action_evidence: None,
+            expected_mcp_server_name: "computer-use",
+            computer_use_allowed_app_ids: &BTreeSet::new(),
+            control: Some(registered_control),
+            goal_set_supported: false,
+            image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
+            attachments: &[],
+        },
+        native_action_evidence,
+        cancellation_grace,
+        None,
+    );
+    actions.join().expect("join native action driver");
+
+    assert!(started_at.elapsed() < timeout);
+    assert_eq!(
+        run.cancellation,
+        Some(StopObservation::UpstreamInactiveConfirmed)
+    );
+    assert_eq!(run.result, Ok(CodexSessionTerminal::StoppedByControl));
+    assert!(thread_marker.exists());
+    assert!(turn_marker.exists());
+    let requests = read_to_string(log_path).expect("native completion protocol log");
     assert!(requests.contains(r#""method":"turn/interrupt""#));
     assert!(requests.contains(r#""threadId":"thread-1""#));
     assert!(requests.contains(r#""turnId":"turn-1""#));
@@ -1395,7 +1710,7 @@ fn persistence_failure_stops_before_dependent_protocol_work() {
     );
     assert_eq!(turn_failure.result, Err(CodexSessionError::Persistence));
     assert!(turn_failure.turn_dispatch_attempted);
-    assert_eq!(turn_failure.requests.len(), 6);
+    assert_eq!(turn_failure.requests.len(), 5);
     assert_eq!(turn_failure.persisted_threads, ["thread-1"]);
     assert!(turn_failure.persisted_turns.is_empty());
 }
@@ -1430,7 +1745,7 @@ fn notification_flood_is_backpressured_and_cleanup_remains_bounded() {
 fn unknown_and_item_payloads_are_discarded_without_leaking_canaries() {
     let run = run_scenario("unknown-canary", None, Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
-    assert_eq!(run.requests.len(), 6);
+    assert_eq!(run.requests.len(), 5);
     assert_eq!(run.persisted_threads, ["thread-1"]);
     assert_eq!(run.persisted_turns, ["turn-1"]);
 

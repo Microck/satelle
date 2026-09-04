@@ -1185,6 +1185,57 @@ impl AuthenticatedResponseContract for BootstrapMaintenanceResponse {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSetupActionResponse {
+    schema_version: BootstrapMaintenanceSchema,
+    request_id: RequestId,
+    host_identity: String,
+    operation_id: String,
+    reconciled: bool,
+    changed: bool,
+}
+
+impl ManagedSetupActionResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        operation_id: String,
+        changed: bool,
+    ) -> Self {
+        Self {
+            schema_version: BootstrapMaintenanceSchema,
+            request_id,
+            host_identity,
+            operation_id,
+            reconciled: true,
+            changed,
+        }
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub const fn reconciled(&self) -> bool {
+        self.reconciled
+    }
+
+    pub const fn changed(&self) -> bool {
+        self.changed
+    }
+}
+
+impl AuthenticatedResponseContract for ManagedSetupActionResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct DurableTokenIssuanceResponse {
     schema_version: DurableTokenIssuanceSchema,
@@ -1624,5 +1675,41 @@ mod tests {
         );
         assert_eq!(encoded["operation_id"], "bootstrap-operation-1");
         assert_eq!(encoded["reconciled"], true);
+    }
+
+    #[test]
+    fn managed_setup_action_schema_carries_the_changed_outcome() {
+        for changed in [false, true] {
+            let response = ManagedSetupActionResponse::new(
+                RequestId::new(),
+                "host-test".to_string(),
+                "managed-operation-1".to_string(),
+                changed,
+            );
+            let encoded = serde_json::to_value(&response).expect("encode managed setup response");
+            assert_eq!(
+                encoded["schema_version"],
+                "satelle.bootstrap-maintenance.v1"
+            );
+            assert_eq!(encoded["operation_id"], "managed-operation-1");
+            assert_eq!(encoded["reconciled"], true);
+            assert_eq!(encoded["changed"], changed);
+
+            let decoded: ManagedSetupActionResponse =
+                serde_json::from_value(encoded.clone()).expect("decode managed setup response");
+            assert_eq!(decoded.changed(), changed);
+
+            let mut missing_changed = encoded;
+            missing_changed
+                .as_object_mut()
+                .expect("response is an object")
+                .remove("changed");
+            assert!(serde_json::from_value::<ManagedSetupActionResponse>(missing_changed).is_err());
+
+            let mut unknown_field = serde_json::to_value(&response)
+                .expect("encode managed setup response for strict decoding");
+            unknown_field["unexpected"] = serde_json::json!(true);
+            assert!(serde_json::from_value::<ManagedSetupActionResponse>(unknown_field).is_err());
+        }
     }
 }

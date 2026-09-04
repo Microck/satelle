@@ -229,7 +229,9 @@ impl SetupPostconditionObserver for OfflineStoragePostcondition<'_> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootstrapMaintenancePlanKind {
     OnDemandHandoff,
+    OnDemandHandoffWithManagedSetup,
     PersistentHostService,
+    PersistentHostServiceWithManagedSetup,
     PersistentHostStop,
     PersistentHostRestart,
     HostUpdate,
@@ -240,7 +242,11 @@ impl BootstrapMaintenancePlanKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OnDemandHandoff => "on_demand_handoff",
+            Self::OnDemandHandoffWithManagedSetup => "on_demand_handoff_with_managed_setup",
             Self::PersistentHostService => "persistent_host_service",
+            Self::PersistentHostServiceWithManagedSetup => {
+                "persistent_host_service_with_managed_setup"
+            }
             Self::PersistentHostStop => "persistent_host_stop",
             Self::PersistentHostRestart => "persistent_host_restart",
             Self::HostUpdate => "host_update",
@@ -251,7 +257,11 @@ impl BootstrapMaintenancePlanKind {
     pub fn parse(value: &str) -> Result<Self, SatelleError> {
         match value {
             "on_demand_handoff" => Ok(Self::OnDemandHandoff),
+            "on_demand_handoff_with_managed_setup" => Ok(Self::OnDemandHandoffWithManagedSetup),
             "persistent_host_service" => Ok(Self::PersistentHostService),
+            "persistent_host_service_with_managed_setup" => {
+                Ok(Self::PersistentHostServiceWithManagedSetup)
+            }
             "persistent_host_stop" => Ok(Self::PersistentHostStop),
             "persistent_host_restart" => Ok(Self::PersistentHostRestart),
             "host_update" => Ok(Self::HostUpdate),
@@ -264,34 +274,72 @@ impl BootstrapMaintenancePlanKind {
 
     fn actions(self) -> Result<Vec<SetupActionPlan>, SatelleError> {
         let actions = match self {
-            Self::OnDemandHandoff => vec![SetupActionPlan::new(
-                "bootstrap-handoff",
-                "Bootstrap Lock handoff",
-                true,
-            )?],
-            Self::PersistentHostService => vec![
-                SetupActionPlan::new("bootstrap-handoff", "Bootstrap Lock handoff", true)?,
-                SetupActionPlan::new(
-                    "path-set-directories",
-                    "Create the resolved daemon directories",
+            Self::OnDemandHandoff | Self::OnDemandHandoffWithManagedSetup => {
+                let mut actions = vec![SetupActionPlan::new(
+                    "bootstrap-handoff",
+                    "Bootstrap Lock handoff",
                     true,
-                )?,
-                SetupActionPlan::new(
-                    "service-config",
-                    "Publish the owner-only service configuration",
+                )?];
+                if self == Self::OnDemandHandoffWithManagedSetup {
+                    actions.extend([
+                        SetupActionPlan::new(
+                            "managed-codex",
+                            "Install and attest the managed Codex runtime",
+                            true,
+                        )?,
+                        SetupActionPlan::new(
+                            "native-computer-use",
+                            "Install the native Computer Use components",
+                            true,
+                        )?,
+                    ]);
+                }
+                actions
+            }
+            Self::PersistentHostService | Self::PersistentHostServiceWithManagedSetup => {
+                let mut actions = vec![SetupActionPlan::new(
+                    "bootstrap-handoff",
+                    "Bootstrap Lock handoff",
                     true,
-                )?,
-                SetupActionPlan::new(
-                    "service-registration",
-                    "Reconcile the user service registration",
-                    true,
-                )?,
-                SetupActionPlan::new(
-                    "service-start-or-restart",
-                    "Start or restart the registered Host service",
-                    true,
-                )?,
-            ],
+                )?];
+                if self == Self::PersistentHostServiceWithManagedSetup {
+                    actions.extend([
+                        SetupActionPlan::new(
+                            "managed-codex",
+                            "Install and attest the managed Codex runtime",
+                            true,
+                        )?,
+                        SetupActionPlan::new(
+                            "native-computer-use",
+                            "Install the native Computer Use components",
+                            true,
+                        )?,
+                    ]);
+                }
+                actions.extend([
+                    SetupActionPlan::new(
+                        "path-set-directories",
+                        "Create the resolved daemon directories",
+                        true,
+                    )?,
+                    SetupActionPlan::new(
+                        "service-config",
+                        "Publish the owner-only service configuration",
+                        true,
+                    )?,
+                    SetupActionPlan::new(
+                        "service-registration",
+                        "Reconcile the user service registration",
+                        true,
+                    )?,
+                    SetupActionPlan::new(
+                        "service-start-or-restart",
+                        "Start or restart the registered Host service",
+                        true,
+                    )?,
+                ]);
+                actions
+            }
             Self::PersistentHostStop => vec![SetupActionPlan::new(
                 "service-stop",
                 "Stop the registered Host service",
@@ -335,7 +383,10 @@ impl BootstrapMaintenancePlanKind {
             Self::PersistentHostRestart => operation_kind == SetupOperationKind::ServiceRestart,
             Self::HostUpdate => operation_kind == SetupOperationKind::HostUpdate,
             Self::Repair => operation_kind == SetupOperationKind::Repair,
-            Self::OnDemandHandoff | Self::PersistentHostService => !matches!(
+            Self::OnDemandHandoff
+            | Self::OnDemandHandoffWithManagedSetup
+            | Self::PersistentHostService
+            | Self::PersistentHostServiceWithManagedSetup => !matches!(
                 operation_kind,
                 SetupOperationKind::ServiceStop | SetupOperationKind::ServiceRestart
             ),
@@ -501,6 +552,97 @@ mod bootstrap_maintenance_tests {
                 .is_err(),
             "service_restart must not admit the multi-action setup plan"
         );
+    }
+
+    #[test]
+    fn managed_setup_plan_orders_install_before_service_publication() {
+        let actions = BootstrapMaintenancePlanKind::PersistentHostServiceWithManagedSetup
+            .actions()
+            .expect("build managed Computer Use setup plan")
+            .into_iter()
+            .map(|action| action.action_id().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actions,
+            [
+                "bootstrap-handoff",
+                "managed-codex",
+                "native-computer-use",
+                "path-set-directories",
+                "service-config",
+                "service-registration",
+                "service-start-or-restart",
+            ]
+        );
+        assert!(
+            BootstrapMaintenancePlanKind::PersistentHostServiceWithManagedSetup
+                .accepts_operation_kind(SetupOperationKind::Setup)
+        );
+        assert!(
+            !BootstrapMaintenancePlanKind::PersistentHostServiceWithManagedSetup
+                .accepts_operation_kind(SetupOperationKind::ServiceRestart)
+        );
+    }
+
+    #[test]
+    fn on_demand_managed_setup_plan_omits_every_service_action() {
+        let actions = BootstrapMaintenancePlanKind::OnDemandHandoffWithManagedSetup
+            .actions()
+            .expect("build on-demand managed setup plan")
+            .into_iter()
+            .map(|action| action.action_id().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actions,
+            ["bootstrap-handoff", "managed-codex", "native-computer-use"]
+        );
+        assert!(
+            BootstrapMaintenancePlanKind::OnDemandHandoffWithManagedSetup
+                .accepts_operation_kind(SetupOperationKind::Setup)
+        );
+        assert!(
+            !BootstrapMaintenancePlanKind::OnDemandHandoffWithManagedSetup
+                .accepts_operation_kind(SetupOperationKind::ServiceRestart)
+        );
+    }
+
+    #[test]
+    fn production_setup_components_follow_the_native_host_platform_matrix() {
+        let all = vec!["all".to_string()];
+        let explicit_codex = vec!["codex".to_string()];
+        let explicit_computer_use = vec!["computer-use".to_string()];
+
+        for platform in [
+            codex_capabilities::HostPlatform::Linux,
+            codex_capabilities::HostPlatform::Other,
+        ] {
+            assert!(
+                production_setup_components_for_platform(platform, &all)
+                    .expect("aggregate setup omits unsupported Host-owned components")
+                    .is_empty()
+            );
+            assert!(production_setup_components_for_platform(platform, &explicit_codex).is_err());
+            assert!(
+                production_setup_components_for_platform(platform, &explicit_computer_use).is_err()
+            );
+        }
+        for platform in [
+            codex_capabilities::HostPlatform::Macos,
+            codex_capabilities::HostPlatform::Windows,
+        ] {
+            assert_eq!(
+                production_setup_components_for_platform(platform, &all)
+                    .expect("native Host accepts aggregate setup"),
+                all.clone()
+            );
+            assert_eq!(
+                production_setup_components_for_platform(platform, &explicit_computer_use)
+                    .expect("native Host accepts explicit Computer Use setup"),
+                explicit_computer_use.clone()
+            );
+        }
     }
 
     #[test]
@@ -1662,7 +1804,9 @@ fn provider_secret_overwrite_error() -> SatelleError {
     }
 }
 
-pub(crate) fn validate_provider_binding_authorization(
+/// Validates a provider binding against the current Host platform without
+/// resolving or reading its Secret Source.
+pub fn validate_provider_binding_authorization(
     authorization: &ProviderBindingAuthorization,
 ) -> Result<(), SatelleError> {
     if authorization.requested_model_alias().trim().is_empty()
@@ -2348,6 +2492,64 @@ impl HostService {
             .start_setup_action(operation, action_id, time::OffsetDateTime::now_utc())
     }
 
+    /// Applies the two Satelle-owned Computer Use setup actions only while the
+    /// matching Bootstrap maintenance action is durably started. The
+    /// Controller owns action transitions; this boundary owns the local file
+    /// mutation and its postcondition checks.
+    pub fn apply_bootstrap_managed_setup_action(
+        &self,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<bool, SatelleError> {
+        let slot = self
+            .bootstrap_maintenance
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let operation = slot.as_ref().ok_or_else(SatelleError::state_conflict)?;
+        if operation.operation_id() != operation_id {
+            return Err(SatelleError::state_conflict());
+        }
+        let run = self
+            .runtime
+            .load_setup_run(operation_id)?
+            .ok_or_else(SatelleError::state_conflict)?;
+        let action = run
+            .actions()
+            .iter()
+            .find(|action| action.action_id() == action_id)
+            .ok_or_else(SatelleError::state_conflict)?;
+        if action.status() != SetupActionStatus::Started {
+            return Err(SatelleError::state_conflict());
+        }
+
+        let state_root = match &self.mode {
+            HostMode::Production { daemon_paths, .. } => daemon_paths
+                .as_ref()
+                .as_ref()
+                .map_err(Clone::clone)?
+                .state_root
+                .as_str(),
+            #[cfg(any(test, feature = "test-support"))]
+            HostMode::TestFake { .. } => {
+                return Err(SatelleError::not_implemented(
+                    "managed Computer Use setup requires a production Host",
+                ));
+            }
+        };
+        match action_id {
+            "managed-codex" => codex_install::install_baseline_managed_codex(Path::new(state_root))
+                .map(|outcome| outcome.changed()),
+            "native-computer-use" => {
+                let runtime =
+                    codex_install::admit_managed_codex_from_state_root(Path::new(state_root))?;
+                codex_capabilities::provision_native_computer_use(&runtime)
+            }
+            _ => Err(SatelleError::invalid_usage(
+                "invalid managed Computer Use setup action",
+            )),
+        }
+    }
+
     pub fn complete_bootstrap_maintenance_action(
         &self,
         operation_id: &str,
@@ -2980,6 +3182,25 @@ impl HostService {
                 )
                 .map_err(DoctorExecutionFailure::from),
         }
+    }
+
+    /// Runs Host-owned diagnostics when the controller is connected over a
+    /// proven local loopback channel. Remote controllers keep their existing
+    /// controller-side transport probe because only they can observe that path.
+    pub fn doctor_with_ready_controller_transport(
+        &self,
+        host: &str,
+        scope_selection: &DoctorScopeSelection,
+        options: DoctorOptions,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> DoctorExecutionResult {
+        self.doctor_with_provider_intent(
+            host,
+            scope_selection,
+            Arc::new(ReadyControllerTransportProbe),
+            options,
+            provider_intent,
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3765,19 +3986,84 @@ impl HostService {
         daemon_path_overrides: DaemonPathOverrides,
     ) -> Result<SetupReport, SatelleError> {
         match &self.mode {
-            HostMode::Production { .. } => {
-                if !dry_run {
-                    return Err(SatelleError::not_implemented(format!(
-                        "{setup_mode} setup mutations are not supported by the local Host transport"
-                    )));
-                }
-                Ok(production_setup_report(
+            HostMode::Production { daemon_paths, .. } => {
+                let managed_setup_components = production_setup_components_for_platform(
+                    codex_capabilities::HostPlatform::current(),
+                    &setup_components,
+                )?;
+                let computer_use_selected = managed_setup_components
+                    .iter()
+                    .any(|component| matches!(component.as_str(), "all" | "computer-use"));
+                let mut report = production_setup_report(
                     host,
                     dry_run,
                     setup_mode,
                     setup_components,
+                    &managed_setup_components,
                     daemon_path_overrides,
-                ))
+                );
+                if dry_run || !report.mutation_planned {
+                    return Ok(report);
+                }
+                let paths = daemon_paths.as_ref().as_ref().map_err(Clone::clone)?;
+                let outcome =
+                    codex_install::install_baseline_managed_codex(Path::new(&paths.state_root))?;
+                let computer_use_changed = if computer_use_selected {
+                    let native_setup = codex_install::admit_managed_codex_from_state_root(
+                        Path::new(&paths.state_root),
+                    )
+                    .and_then(|runtime| {
+                        codex_capabilities::provision_native_computer_use(&runtime)
+                    });
+                    match native_setup {
+                        Ok(changed) => changed,
+                        Err(error) if outcome.changed() => {
+                            return Err(SatelleError::setup_partially_applied_actions(
+                                host,
+                                vec!["managed-codex".to_string()],
+                                "native-computer-use",
+                                Vec::new(),
+                                "the installed and attested managed Codex package was preserved",
+                                error.recovery_command.clone(),
+                                error.to_string(),
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    false
+                };
+                let changed = outcome.changed() || computer_use_changed;
+                report.status = if changed {
+                    "applied".to_string()
+                } else {
+                    "unchanged".to_string()
+                };
+                report.changed = changed;
+                report.mutated = changed;
+                report.applied_actions = vec![if outcome.changed() {
+                    "installed and attested the official standalone Codex package".to_string()
+                } else {
+                    "verified the existing Satelle-managed standalone Codex package".to_string()
+                }];
+                if computer_use_selected {
+                    report.applied_actions.push(if computer_use_changed {
+                        "installed the official bundled Computer Use plugin and native bridge binding"
+                            .to_string()
+                    } else {
+                        "verified the official bundled Computer Use plugin and native bridge binding"
+                            .to_string()
+                    });
+                }
+                report.readiness_summary.codex_runtime =
+                    "installed_pending_verification".to_string();
+                if computer_use_selected {
+                    report.readiness_summary.native_computer_use =
+                        "installed_pending_verification".to_string();
+                    report.native_computer_use_readiness = "not_checked".to_string();
+                }
+                report.next_command = setup_verification_command(host);
+                Ok(report)
             }
             #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake { .. } => self.setup_fake(
@@ -6365,6 +6651,13 @@ fn doctor_shell_argument(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn setup_verification_command(host: &str) -> String {
+    format!(
+        "satelle setup --host {} --verify --no-input",
+        doctor_shell_argument(host)
+    )
+}
+
 fn production_doctor_probes(
     scopes: &[DoctorScope],
     probe_timeout: Option<std::time::Duration>,
@@ -6642,26 +6935,37 @@ fn production_setup_report(
     dry_run: bool,
     setup_mode: String,
     setup_components: Vec<String>,
+    managed_setup_components: &[String],
     daemon_path_overrides: DaemonPathOverrides,
 ) -> SetupReport {
     let service_persistent = setup_mode == "persistent";
-    let mutation_planned = setup_components.iter().any(|component| {
-        matches!(
-            component.as_str(),
-            "all" | "host" | "codex" | "computer-use"
-        )
-    });
+    let mutation_planned = managed_setup_components
+        .iter()
+        .any(|component| matches!(component.as_str(), "all" | "codex" | "computer-use"));
     let service_scope = if service_persistent {
         "user"
     } else {
         "on_demand"
     };
     let daemon_path_overrides = daemon_path_overrides.entries();
-    let mut planned_actions = vec![
-        "resolve the configured local host".to_string(),
-        "report the current standalone Codex admission state".to_string(),
-        "keep native Computer Use blocked until stable schema and live-host proof pass".to_string(),
-    ];
+    let mut planned_actions = vec!["resolve the configured local host".to_string()];
+    if mutation_planned {
+        planned_actions.extend([
+            "download the official standalone Codex package and checksum manifest".to_string(),
+            "verify and publish the immutable Codex package".to_string(),
+            "write the owner-only managed Codex installation receipt after a live version check"
+                .to_string(),
+        ]);
+    }
+    if managed_setup_components
+        .iter()
+        .any(|component| matches!(component.as_str(), "all" | "computer-use"))
+    {
+        planned_actions.push(
+            "install the official bundled Computer Use plugin and native bridge binding"
+                .to_string(),
+        );
+    }
     planned_actions.extend(daemon_path_overrides.iter().map(|override_entry| {
         format!(
             "map {}={} in Satelle-owned service configuration",
@@ -6708,6 +7012,82 @@ fn production_setup_report(
         native_computer_use_readiness: "blocked_pending_acceptance".to_string(),
         next_command: "satelle doctor --scope computer-use --refresh --json".to_string(),
     }
+}
+
+/// Builds a local production setup plan without opening Host storage. The
+/// caller may inspect and confirm this report before starting the sole daemon
+/// that owns the applying path.
+pub fn local_setup_plan(
+    host: &str,
+    dry_run: bool,
+    setup_mode: String,
+    setup_components: Vec<String>,
+    daemon_path_overrides: DaemonPathOverrides,
+) -> Result<SetupReport, SatelleError> {
+    let managed_setup_components = production_setup_components_for_platform(
+        codex_capabilities::HostPlatform::current(),
+        &setup_components,
+    )?;
+    Ok(production_setup_report(
+        host,
+        dry_run,
+        setup_mode,
+        setup_components,
+        &managed_setup_components,
+        daemon_path_overrides,
+    ))
+}
+
+#[doc(hidden)]
+#[cfg(feature = "test-support")]
+pub fn local_setup_plan_for_tests(
+    host: &str,
+    dry_run: bool,
+    setup_mode: String,
+    setup_components: Vec<String>,
+    daemon_path_overrides: DaemonPathOverrides,
+) -> SetupReport {
+    test_runtime::setup_plan(
+        host,
+        dry_run,
+        setup_mode,
+        setup_components,
+        daemon_path_overrides,
+    )
+}
+
+/// Discovers current desktop sessions without opening Host storage.
+pub fn local_desktop_sessions_for_setup()
+-> Result<Vec<satelle_core::DesktopSessionRecord>, SatelleError> {
+    desktop_sessions::discover()
+}
+
+#[doc(hidden)]
+#[cfg(feature = "test-support")]
+pub fn local_desktop_sessions_for_setup_tests() -> Vec<satelle_core::DesktopSessionRecord> {
+    test_runtime::desktop_sessions()
+}
+
+fn production_setup_components_for_platform(
+    platform: codex_capabilities::HostPlatform,
+    setup_components: &[String],
+) -> Result<Vec<String>, SatelleError> {
+    if platform.supports_native_computer_use() {
+        return Ok(setup_components.to_vec());
+    }
+    if setup_components == ["all"] {
+        return Ok(Vec::new());
+    }
+    if setup_components
+        .iter()
+        .any(|component| matches!(component.as_str(), "codex" | "computer-use"))
+    {
+        return Err(SatelleError::not_implemented(format!(
+            "managed Codex and native Computer Use setup are unsupported on the {} Controller platform",
+            platform.as_str()
+        )));
+    }
+    Ok(setup_components.to_vec())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -6872,6 +7252,10 @@ mod packet17_doctor_tests {
         assert_eq!(
             doctor_shell_argument("demo'; touch /tmp/canary"),
             r#"'demo'"'"'; touch /tmp/canary'"#,
+        );
+        assert_eq!(
+            setup_verification_command("office mac"),
+            "satelle setup --host 'office mac' --verify --no-input"
         );
     }
 

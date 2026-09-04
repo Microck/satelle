@@ -82,17 +82,29 @@ pub(super) fn approval_result(
     Ok(Some(result))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ComputerUseAuthorization {
+    Declined,
+    App,
+    Script(String),
+}
+
+impl ComputerUseAuthorization {
+    pub(super) const fn accepted(&self) -> bool {
+        !matches!(self, Self::Declined)
+    }
+}
+
 /// Accepts only a supported Computer Use prompt bound to either an app in the
-/// canonical allowlist or the exact readiness script whose app authority was
-/// checked before generation. Every other MCP elicitation remains a
-/// manual-action blocker.
+/// canonical allowlist or an exact-Turn script whose app authority was frozen
+/// at admission. Readiness keeps the stricter exact-script and exact-app check.
 pub(super) fn computer_use_elicitation_result(
     object: &Map<String, Value>,
     allowed_app_ids: &BTreeSet<String>,
-    expected_native_script: Option<&str>,
+    expected_native_action: Option<(&str, &str)>,
     expected_thread: Option<&str>,
     expected_turn: Option<&str>,
-) -> Result<(Value, bool), CodexSessionError> {
+) -> Result<(Value, ComputerUseAuthorization), CodexSessionError> {
     let params = object
         .get("params")
         .and_then(Value::as_object)
@@ -110,22 +122,35 @@ pub(super) fn computer_use_elicitation_result(
 
     let app_authorized = (params.get("turnId").is_none_or(Value::is_null) || turn_matches)
         && exact_computer_use_app_prompt(params, allowed_app_ids);
-    let script_authorized = turn_matches
-        && expected_native_script.is_some_and(|expected_script| {
-            exact_computer_use_script_prompt(params, expected_script)
+    let authorized_script = turn_matches
+        .then(|| validated_computer_use_script(params))
+        .flatten()
+        .filter(|script| {
+            expected_native_action.map_or_else(
+                || !allowed_app_ids.is_empty(),
+                |(expected_script, expected_app_id)| {
+                    allowed_app_ids.contains(expected_app_id) && *script == expected_script
+                },
+            )
         });
-    let authorized = app_authorized || script_authorized;
+    let authorization = if app_authorized {
+        ComputerUseAuthorization::App
+    } else if let Some(script) = authorized_script {
+        ComputerUseAuthorization::Script(script.to_owned())
+    } else {
+        ComputerUseAuthorization::Declined
+    };
     Ok((
         json!({
-            "action": if authorized { "accept" } else { "decline" },
+            "action": if authorization.accepted() { "accept" } else { "decline" },
             "content": null,
             "_meta": null,
         }),
-        authorized,
+        authorization,
     ))
 }
 
-fn exact_computer_use_script_prompt(params: &Map<String, Value>, expected_script: &str) -> bool {
+fn validated_computer_use_script(params: &Map<String, Value>) -> Option<&str> {
     const REQUIRED_PARAM_KEYS: [&str; 7] = [
         "_meta",
         "message",
@@ -145,12 +170,10 @@ fn exact_computer_use_script_prompt(params: &Map<String, Value>, expected_script
             != Some("Allow the node_repl MCP server to run tool \"js\"?")
         || params.get("requestedSchema") != Some(&json!({"type": "object", "properties": {}}))
     {
-        return false;
+        return None;
     }
 
-    let Some(metadata) = params.get("_meta").and_then(Value::as_object) else {
-        return false;
-    };
+    let metadata = params.get("_meta").and_then(Value::as_object)?;
     const REQUIRED_METADATA_KEYS: [&str; 5] = [
         "codex_approval_kind",
         "persist",
@@ -169,36 +192,30 @@ fn exact_computer_use_script_prompt(params: &Map<String, Value>, expected_script
             .and_then(Value::as_str)
             .is_some_and(|description| !description.is_empty())
     {
-        return false;
+        return None;
     }
 
-    let Some(tool_params) = metadata.get("tool_params").and_then(Value::as_object) else {
-        return false;
-    };
-    if tool_params.get("code").and_then(Value::as_str) != Some(expected_script) {
-        return false;
-    }
+    let tool_params = metadata.get("tool_params").and_then(Value::as_object)?;
+    let script = tool_params
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|script| !script.is_empty())?;
     let title = match tool_params.get("title") {
-        Some(title) => match title.as_str().filter(|title| !title.is_empty()) {
-            Some(title) => Some(title),
-            None => return false,
-        },
+        Some(title) => Some(title.as_str().filter(|title| !title.is_empty())?),
         None => None,
     };
     let expected_param_count = if title.is_some() { 2 } else { 1 };
     if tool_params.len() != expected_param_count {
-        return false;
+        return None;
     }
 
-    let Some(display) = metadata
+    let display = metadata
         .get("tool_params_display")
         .and_then(Value::as_array)
-        .filter(|display| display.len() == expected_param_count)
-    else {
-        return false;
-    };
-    exact_tool_param_display(&display[0], "code", expected_script)
-        && title.is_none_or(|title| exact_tool_param_display(&display[1], "title", title))
+        .filter(|display| display.len() == expected_param_count)?;
+    (exact_tool_param_display(&display[0], "code", script)
+        && title.is_none_or(|title| exact_tool_param_display(&display[1], "title", title)))
+    .then_some(script)
 }
 
 fn exact_tool_param_display(display: &Value, name: &str, value: &str) -> bool {
@@ -639,6 +656,26 @@ mod tests {
     }
 
     #[test]
+    fn admitted_app_policy_authorizes_a_generated_script_for_the_exact_turn() {
+        let script = "generated native task script";
+        let request = computer_use_script_prompt(script, "Use Calculator");
+
+        assert_eq!(
+            computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &BTreeSet::from(["calculator.exe".to_string()]),
+                None,
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            Ok((
+                json!({"action": "accept", "content": null, "_meta": null}),
+                ComputerUseAuthorization::Script(script.to_string())
+            ))
+        );
+    }
+
+    #[test]
     fn exact_preapproved_computer_use_script_elicitation_uses_carried_authority() {
         let script = "exact native readiness script";
         let request = computer_use_script_prompt(script, "Activate Microsoft Edge");
@@ -646,14 +683,14 @@ mod tests {
         assert_eq!(
             computer_use_elicitation_result(
                 request.as_object().unwrap(),
-                &BTreeSet::new(),
-                Some(script),
+                &BTreeSet::from(["MSEdge".to_string()]),
+                Some((script, "MSEdge")),
                 Some("thread-1"),
                 Some("turn-1"),
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
-                true
+                ComputerUseAuthorization::Script(script.to_string())
             ))
         );
     }
@@ -674,14 +711,14 @@ mod tests {
         assert_eq!(
             computer_use_elicitation_result(
                 request.as_object().unwrap(),
-                &BTreeSet::new(),
-                Some(script),
+                &BTreeSet::from(["MSEdge".to_string()]),
+                Some((script, "MSEdge")),
                 Some("thread-1"),
                 Some("turn-1"),
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
-                true
+                ComputerUseAuthorization::Script(script.to_string())
             ))
         );
     }
@@ -695,8 +732,8 @@ mod tests {
 
             let result = computer_use_elicitation_result(
                 request.as_object().unwrap(),
-                &BTreeSet::new(),
-                Some(script),
+                &BTreeSet::from(["MSEdge".to_string()]),
+                Some((script, "MSEdge")),
                 Some("thread-1"),
                 Some("turn-1"),
             );
@@ -705,7 +742,7 @@ mod tests {
                     result,
                     Ok((
                         json!({"action": "decline", "content": null, "_meta": null}),
-                        false,
+                        ComputerUseAuthorization::Declined,
                     ))
                 );
             } else {
@@ -778,13 +815,13 @@ mod tests {
                 computer_use_elicitation_result(
                     request.as_object().unwrap(),
                     &allowed,
-                    Some(script),
+                    Some((script, "MSEdge")),
                     Some("thread-1"),
                     Some("turn-1"),
                 ),
                 Ok((
                     json!({"action": "decline", "content": null, "_meta": null}),
-                    false
+                    ComputerUseAuthorization::Declined
                 ))
             );
         }
@@ -800,7 +837,21 @@ mod tests {
             ),
             Ok((
                 json!({"action": "decline", "content": null, "_meta": null}),
-                false
+                ComputerUseAuthorization::Declined
+            ))
+        );
+
+        assert_eq!(
+            computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &BTreeSet::from(["calculator.exe".to_string()]),
+                Some((script, "MSEdge")),
+                Some("thread-1"),
+                Some("turn-1"),
+            ),
+            Ok((
+                json!({"action": "decline", "content": null, "_meta": null}),
+                ComputerUseAuthorization::Declined
             ))
         );
     }
@@ -820,7 +871,7 @@ mod tests {
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
-                true
+                ComputerUseAuthorization::App
             ))
         );
         request["params"]["_meta"]["riskLevel"] = json!("high");
@@ -834,7 +885,7 @@ mod tests {
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
-                true
+                ComputerUseAuthorization::App
             )),
             "risk presentation must not override an exact prior app decision"
         );
@@ -857,7 +908,7 @@ mod tests {
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
-                true
+                ComputerUseAuthorization::App
             ))
         );
     }
@@ -884,7 +935,7 @@ mod tests {
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
-                true
+                ComputerUseAuthorization::App
             ))
         );
     }
@@ -926,7 +977,7 @@ mod tests {
                 ),
                 Ok((
                     json!({"action": "decline", "content": null, "_meta": null}),
-                    false
+                    ComputerUseAuthorization::Declined
                 ))
             );
         }

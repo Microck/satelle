@@ -273,7 +273,49 @@ pub fn persist_new_owner_only_secret_file(
     path: &Path,
     secret: &str,
 ) -> Result<(), SecureFileError> {
-    if secret.len() > MAX_SECRET_FILE_BYTES {
+    persist_new_owner_only_file_with_verification(
+        path,
+        secret.as_bytes(),
+        MAX_SECRET_FILE_BYTES,
+        |published_path| {
+            let stored = read_owner_only_secret_file(published_path)?;
+            (stored.as_str() == secret)
+                .then_some(())
+                .ok_or(SecureFileError::UnsafeOrUnavailable)
+        },
+    )
+}
+
+/// Atomically publishes a new owner-only configuration file and verifies its
+/// exact bytes. The live path never exposes a partial document.
+pub fn persist_new_owner_only_config_file(
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), SecureFileError> {
+    persist_new_owner_only_file_with_verification(
+        path,
+        contents,
+        MAX_CONFIG_FILE_BYTES,
+        |published_path| {
+            let stored = read_secure_file(
+                published_path,
+                SecurityPolicy::OwnerOnly,
+                MAX_CONFIG_FILE_BYTES,
+            )?;
+            (stored.as_slice() == contents)
+                .then_some(())
+                .ok_or(SecureFileError::UnsafeOrUnavailable)
+        },
+    )
+}
+
+fn persist_new_owner_only_file_with_verification(
+    path: &Path,
+    contents: &[u8],
+    maximum_bytes: usize,
+    verify: impl FnOnce(&Path) -> Result<(), SecureFileError>,
+) -> Result<(), SecureFileError> {
+    if contents.len() > maximum_bytes {
         return Err(SecureFileError::TooLarge);
     }
     let parent = path.parent().ok_or(SecureFileError::UnsafeOrUnavailable)?;
@@ -290,7 +332,7 @@ pub fn persist_new_owner_only_secret_file(
     let persisted = (|| {
         let mut temporary = open_or_create_owner_only_file(&temporary_path)?;
         temporary
-            .write_all(secret.as_bytes())
+            .write_all(contents)
             .and_then(|()| temporary.sync_all())
             .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
         // Windows owner-only handles intentionally deny delete sharing. Close
@@ -299,15 +341,12 @@ pub fn persist_new_owner_only_secret_file(
         publish_new_file_without_replace(&temporary_path, path, &directory)?;
         published = true;
         sync_owner_only_directory(parent, &directory)?;
-        let stored = read_owner_only_secret_file(path)?;
-        (stored.as_str() == secret)
-            .then_some(())
-            .ok_or(SecureFileError::UnsafeOrUnavailable)
+        verify(path)
     })();
     match persisted {
         Ok(()) => Ok(()),
         Err(error) => {
-            cleanup_failed_new_secret(&temporary_path, path, published)?;
+            cleanup_failed_new_file(&temporary_path, path, published)?;
             Err(error)
         }
     }
@@ -1107,7 +1146,7 @@ fn remove_sibling_file(
     }
 }
 
-fn cleanup_failed_new_secret(
+fn cleanup_failed_new_file(
     temporary_path: &Path,
     path: &Path,
     published: bool,
@@ -1396,20 +1435,41 @@ pub fn open_new_owner_only_file(path: &Path) -> Result<File, SecureFileError> {
 pub fn open_or_create_owner_only_directory(
     path: &Path,
 ) -> Result<OwnerOnlyDirectory, SecureFileError> {
-    open_owner_only_directory_impl(path, true)
+    open_directory_impl(path, true, SecurityPolicy::OwnerOnly)
+}
+
+/// Opens or creates a directory that only the current user or an operating
+/// system administrator may modify. New directories still start owner-only.
+/// This is for existing user-managed boundaries whose platform ACLs commonly
+/// grant administrative access while rejecting unrelated writers.
+#[cfg(unix)]
+pub fn open_or_create_user_or_administrator_controlled_directory(
+    path: &Path,
+) -> Result<OwnerOnlyDirectory, SecureFileError> {
+    open_directory_impl(path, true, SecurityPolicy::UserOrAdministratorControlled)
+}
+
+/// Opens an existing directory under the current-user-or-administrator writer
+/// policy without creating a missing boundary.
+#[cfg(unix)]
+pub fn open_user_or_administrator_controlled_directory(
+    path: &Path,
+) -> Result<OwnerOnlyDirectory, SecureFileError> {
+    open_directory_impl(path, false, SecurityPolicy::UserOrAdministratorControlled)
 }
 
 /// Opens an existing owner-only directory with the same ancestry guarantees as
 /// `open_or_create_owner_only_directory`, but never creates a missing path.
 #[cfg(unix)]
 pub fn open_owner_only_directory(path: &Path) -> Result<OwnerOnlyDirectory, SecureFileError> {
-    open_owner_only_directory_impl(path, false)
+    open_directory_impl(path, false, SecurityPolicy::OwnerOnly)
 }
 
 #[cfg(unix)]
-fn open_owner_only_directory_impl(
+fn open_directory_impl(
     path: &Path,
     create_if_missing: bool,
+    policy: SecurityPolicy,
 ) -> Result<File, SecureFileError> {
     use rustix::fs::{AtFlags, FileType, Mode};
     use std::path::Component;
@@ -1468,17 +1528,35 @@ fn open_owner_only_directory_impl(
         };
         let metadata =
             rustix::fs::fstat(&child).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+        let final_component_is_safe = !final_component
+            || match policy {
+                SecurityPolicy::OwnerOnly => {
+                    metadata.st_uid == effective_user
+                        && (created || metadata.st_mode & 0o777 == 0o700)
+                }
+                SecurityPolicy::UserOrAdministratorControlled => {
+                    (metadata.st_uid == 0 || metadata.st_uid == effective_user)
+                        && metadata.st_mode & 0o022 == 0
+                }
+                SecurityPolicy::OwnerPrivate | SecurityPolicy::OwnerControlled => false,
+            };
         if FileType::from_raw_mode(metadata.st_mode) != FileType::Directory
             || (metadata.st_uid != 0 && metadata.st_uid != effective_user)
-            || (final_component
-                && (metadata.st_uid != effective_user
-                    || (!created && metadata.st_mode & 0o777 != 0o700)))
+            || !final_component_is_safe
         {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
         directory = child;
     }
-    require_no_macos_extended_acl(&directory)?;
+    match policy {
+        SecurityPolicy::OwnerOnly => require_no_macos_extended_acl(&directory)?,
+        SecurityPolicy::UserOrAdministratorControlled => {
+            require_unix_directory_replacement_safety(&directory, effective_user)?;
+        }
+        SecurityPolicy::OwnerPrivate | SecurityPolicy::OwnerControlled => {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+    }
     Ok(File::from(directory))
 }
 
@@ -1726,6 +1804,20 @@ pub fn open_or_create_owner_only_directory(
 }
 
 #[cfg(windows)]
+pub fn open_or_create_user_or_administrator_controlled_directory(
+    path: &Path,
+) -> Result<OwnerOnlyDirectory, SecureFileError> {
+    windows::open_or_create_user_or_administrator_controlled_directory(path)
+}
+
+#[cfg(windows)]
+pub fn open_user_or_administrator_controlled_directory(
+    path: &Path,
+) -> Result<OwnerOnlyDirectory, SecureFileError> {
+    windows::open_user_or_administrator_controlled_directory(path)
+}
+
+#[cfg(windows)]
 pub fn open_owner_only_directory(path: &Path) -> Result<OwnerOnlyDirectory, SecureFileError> {
     windows::open_owner_only_directory(path)
 }
@@ -1744,6 +1836,20 @@ pub fn open_new_owner_only_file(_path: &Path) -> Result<File, SecureFileError> {
 
 #[cfg(not(any(unix, windows)))]
 pub fn open_or_create_owner_only_directory(
+    _path: &Path,
+) -> Result<OwnerOnlyDirectory, SecureFileError> {
+    Err(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn open_or_create_user_or_administrator_controlled_directory(
+    _path: &Path,
+) -> Result<OwnerOnlyDirectory, SecureFileError> {
+    Err(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn open_user_or_administrator_controlled_directory(
     _path: &Path,
 ) -> Result<OwnerOnlyDirectory, SecureFileError> {
     Err(SecureFileError::UnsafeOrUnavailable)
@@ -1965,18 +2071,31 @@ mod windows {
     pub(super) fn open_or_create_owner_only_directory(
         path: &Path,
     ) -> Result<OwnerOnlyDirectory, SecureFileError> {
-        open_owner_only_directory_impl(path, true)
+        open_directory_impl(path, true, SecurityPolicy::OwnerOnly)
+    }
+
+    pub(super) fn open_or_create_user_or_administrator_controlled_directory(
+        path: &Path,
+    ) -> Result<OwnerOnlyDirectory, SecureFileError> {
+        open_directory_impl(path, true, SecurityPolicy::UserOrAdministratorControlled)
+    }
+
+    pub(super) fn open_user_or_administrator_controlled_directory(
+        path: &Path,
+    ) -> Result<OwnerOnlyDirectory, SecureFileError> {
+        open_directory_impl(path, false, SecurityPolicy::UserOrAdministratorControlled)
     }
 
     pub(super) fn open_owner_only_directory(
         path: &Path,
     ) -> Result<OwnerOnlyDirectory, SecureFileError> {
-        open_owner_only_directory_impl(path, false)
+        open_directory_impl(path, false, SecurityPolicy::OwnerOnly)
     }
 
-    fn open_owner_only_directory_impl(
+    fn open_directory_impl(
         path: &Path,
         create_if_missing: bool,
+        policy: SecurityPolicy,
     ) -> Result<OwnerOnlyDirectory, SecureFileError> {
         let process_sid = current_user_sid()?;
         let descriptor = PrivateDescriptor::new(&process_sid, "OICI")?;
@@ -2004,13 +2123,24 @@ mod windows {
             ancestors.push(File::from(directory));
             directory = child;
         }
-        // NtCreateFile applies the protected DACL only when FILE_OPEN_IF creates
-        // the final directory. Existing namespaces must already satisfy it.
-        verify_owner_only_security(
-            &directory,
-            &process_sid,
-            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
-        )?;
+        // NtCreateFile applies the protected owner-only DACL only when
+        // FILE_OPEN_IF creates the final directory. Existing user-managed
+        // boundaries must already satisfy the selected writer policy.
+        match policy {
+            SecurityPolicy::OwnerOnly => verify_owner_only_security(
+                &directory,
+                &process_sid,
+                (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+            )?,
+            SecurityPolicy::UserOrAdministratorControlled => verify_security(
+                &directory,
+                &process_sid,
+                SecurityPolicy::UserOrAdministratorControlled,
+            )?,
+            SecurityPolicy::OwnerPrivate | SecurityPolicy::OwnerControlled => {
+                return Err(SecureFileError::UnsafeOrUnavailable);
+            }
+        }
         Ok(OwnerOnlyDirectory {
             _directory: File::from(directory),
             _ancestors: ancestors,
@@ -3251,6 +3381,40 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn new_config_persistence_preserves_exact_bytes_and_never_replaces() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create owner-only directory"));
+        let config = directory.join("config.toml");
+        let first = b"[hosts.local-demo]\ntransport = \"local\"\n";
+
+        persist_new_owner_only_config_file(&config, first).expect("persist first config");
+        let persisted = read_secure_file(&config, SecurityPolicy::OwnerOnly, MAX_CONFIG_FILE_BYTES)
+            .expect("read exact persisted config");
+        assert_eq!(persisted.as_slice(), first);
+        assert_eq!(
+            persist_new_owner_only_config_file(&config, b"replacement = true\n"),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        let retained = read_secure_file(&config, SecurityPolicy::OwnerOnly, MAX_CONFIG_FILE_BYTES)
+            .expect("read original after rejected replacement");
+        assert_eq!(retained.as_slice(), first);
+        assert!(
+            std::fs::read_dir(&directory)
+                .expect("inspect config directory")
+                .all(|entry| !entry
+                    .expect("read config directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")),
+            "atomic publication must consume or clean every staging name"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn journaled_secret_paths_are_deterministic_and_reject_unsafe_identifiers() {
         let destination = Path::new("/private/provider-token");
         let paths = OwnerOnlySecretFilePaths::new(destination, "019abc-operation_4")
@@ -3573,7 +3737,7 @@ mod tests {
         fs::create_dir(&published).expect("create unremovable file-shaped path");
 
         assert_eq!(
-            cleanup_failed_new_secret(&staged, &published, true),
+            cleanup_failed_new_file(&staged, &published, true),
             Err(SecureFileError::PublishedCleanupFailed)
         );
         assert!(!staged.exists(), "staging cleanup remains best effort");
@@ -3643,6 +3807,38 @@ mod tests {
                 .expect("create owner-only boundary explicitly"),
         );
         drop(open_owner_only_directory(&boundary).expect("reopen existing owner-only boundary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_or_administrator_controlled_directory_rejects_unrelated_writers() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        secure_test_root(directory.path());
+        let boundary = directory.path().join(".codex");
+        assert!(matches!(
+            open_user_or_administrator_controlled_directory(&boundary),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
+        assert!(!boundary.exists(), "existing-only open must not create");
+        fs::create_dir(&boundary).expect("create user-managed directory");
+        fs::set_permissions(&boundary, fs::Permissions::from_mode(0o750))
+            .expect("allow trusted read-only group access");
+
+        drop(
+            open_or_create_user_or_administrator_controlled_directory(&boundary)
+                .expect("accept a directory without unrelated writers"),
+        );
+        assert!(matches!(
+            open_owner_only_directory(&boundary),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
+
+        fs::set_permissions(&boundary, fs::Permissions::from_mode(0o770))
+            .expect("grant an unrelated writer");
+        assert!(matches!(
+            open_or_create_user_or_administrator_controlled_directory(&boundary),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
     }
 
     #[cfg(all(
@@ -4066,6 +4262,51 @@ mod tests {
             Err(SecureFileError::UnsafeOrUnavailable)
         ));
         fs::remove_dir(&junction).expect("remove test junction");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_user_or_administrator_controlled_directory_accepts_system_only_as_a_trusted_writer()
+    {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let boundary = directory.path().join(".codex");
+        assert!(matches!(
+            open_user_or_administrator_controlled_directory(&boundary),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
+        assert!(!boundary.exists(), "existing-only open must not create");
+        fs::create_dir(&boundary).expect("create user-managed directory");
+        let user = current_windows_user_sid();
+        set_windows_owner(&boundary, &user);
+        set_windows_acl(
+            &boundary,
+            &[
+                format!("*{user}:(OI)(CI)(F)"),
+                "*S-1-5-18:(OI)(CI)(F)".to_string(),
+            ],
+        );
+
+        drop(
+            open_or_create_user_or_administrator_controlled_directory(&boundary)
+                .expect("accept current-user and SYSTEM writers"),
+        );
+        assert!(matches!(
+            open_owner_only_directory(&boundary),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
+
+        set_windows_acl(
+            &boundary,
+            &[
+                format!("*{user}:(OI)(CI)(F)"),
+                "*S-1-5-18:(OI)(CI)(F)".to_string(),
+                "*S-1-1-0:(OI)(CI)(M)".to_string(),
+            ],
+        );
+        assert!(matches!(
+            open_or_create_user_or_administrator_controlled_directory(&boundary),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        ));
     }
 
     #[cfg(windows)]

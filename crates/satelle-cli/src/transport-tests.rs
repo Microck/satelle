@@ -9,8 +9,8 @@ use satelle_core::session::{
     StopObservation, TimeoutPolicy, TurnAdmissionPhase, TurnState, TurnTransition,
 };
 use satelle_core::{
-    ApiTokenSource, ErrorCode, EventSource, EventSubject, EventType, HostConfig, SatelleConfig,
-    SatelleEventBody, TransportKind,
+    ApiRateLimits, ApiTokenSource, ErrorCode, EventSource, EventSubject, EventType, HostConfig,
+    SatelleConfig, SatelleEventBody, TransportKind,
 };
 use satelle_host::{
     AdapterReadiness, AdapterSubject, ApiScopes, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
@@ -23,6 +23,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, mpsc};
@@ -32,6 +33,45 @@ use std::time::Duration;
 // These waits synchronize test threads; they do not define a product timeout.
 // Native CI can take several seconds to schedule a freshly admitted worker.
 const INTERRUPT_TEST_COORDINATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[test]
+fn local_daemon_config_identity_tracks_host_config_and_rate_limits() {
+    let host_config = SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .expect("built-in local Host config");
+    let identity = LocalDaemonConfigIdentity::new(host_config.clone(), ApiRateLimits::default());
+    let encoded = serde_json::to_vec(&identity).expect("serialize local daemon config identity");
+    let decoded = serde_json::from_slice::<LocalDaemonConfigIdentity>(&encoded)
+        .expect("deserialize local daemon config identity");
+    assert_eq!(decoded, identity);
+
+    let mut controller_alias_config = host_config.clone();
+    controller_alias_config.allow_project_selection = true;
+    controller_alias_config.address = Some("controller-only-address".to_string());
+    assert_eq!(
+        LocalDaemonConfigIdentity::new(controller_alias_config, ApiRateLimits::default()),
+        identity
+    );
+
+    let mut changed_host_config = host_config.clone();
+    changed_host_config.desktop_user = Some("another-user".to_string());
+    assert_ne!(
+        LocalDaemonConfigIdentity::new(changed_host_config, ApiRateLimits::default()),
+        identity
+    );
+
+    let changed_rate_limits = ApiRateLimits::new(
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(3).unwrap(),
+        NonZeroUsize::new(4).unwrap(),
+    );
+    assert_ne!(
+        LocalDaemonConfigIdentity::new(host_config, changed_rate_limits),
+        identity
+    );
+}
 
 #[test]
 fn storage_maintenance_recovery_commands_and_phase_evidence_are_exact() {
@@ -1366,7 +1406,10 @@ fn persisted_pending_setup_token_self_activates_on_the_running_daemon() {
         "on_demand".to_string(),
         vec!["transport".to_string()],
         DaemonPathOverrides::default(),
-        SetupApplication::AppliedPendingActivation,
+        SetupExecutionOutcome {
+            application: SetupApplication::AppliedPendingActivation,
+            managed_changed: false,
+        },
         false,
     );
     assert!(report.mutated);
@@ -1442,237 +1485,6 @@ fn durable_verification_and_bootstrap_handoff_use_distinct_clients() {
     assert!(completed.reconciled());
 
     drop(server);
-}
-
-#[cfg(unix)]
-#[test]
-fn reusable_setup_token_keeps_the_healthy_durable_daemon_running_without_bootstrap() {
-    with_bootstrap_handoff_test_context(|_, fake_ssh, _, _, _| {
-        let state = TestStateDir::new().expect("temporary durable state directory");
-        let service = HostService::local_demo_for_tests_at(state.path())
-            .expect("construct durable Host service");
-        let initialized = service.initialize_daemon().expect("initialize Host state");
-        let host_identity = initialized.host_identity().to_string();
-        let (durable_token, durable_principal) = service
-            .issue_pending_api_token(
-                ApiScopes::CONTROL,
-                time::OffsetDateTime::now_utc() + time::Duration::minutes(5),
-            )
-            .expect("issue durable setup token");
-        let durable_token_id = durable_principal.token_id().to_string();
-        service
-            .activate_api_token(&durable_token_id)
-            .expect("activate durable setup token");
-        let raw_token = durable_token.expose();
-        let token_path = state.path().join("reusable-setup.token");
-        persist_new_owner_only_secret_file(&token_path, raw_token.as_str())
-            .expect("persist reusable setup token");
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("construct durable daemon runtime");
-        let server = runtime
-            .block_on(DaemonServer::bind(
-                service,
-                DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-            ))
-            .expect("bind durable loopback daemon");
-        let durable_client = DaemonClient::loopback(
-            server.local_addr(),
-            ApiBearerToken::parse(raw_token.as_str()).expect("parse reusable setup token"),
-            &host_identity,
-        )
-        .expect("construct durable setup client");
-        let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File {
-            path: token_path,
-        })))
-        .expect("construct SSH setup transport");
-        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
-            "reusable-token-host",
-            "fake-ssh-host",
-            "verify-reusable-token-before-bootstrap".to_string(),
-            bootstrap_lock::OperationKind::InitialSetup,
-            fake_ssh,
-        )
-        .expect("acquire setup lock");
-        let bootstrap_called = AtomicBool::new(false);
-
-        let verification = transport
-            .verify_existing_token_with_bootstrap_fallback(
-                &durable_client,
-                &durable_token_id,
-                "verify-reusable-token",
-                &mut bootstrap_lock,
-                |_| {
-                    bootstrap_called.store(true, Ordering::SeqCst);
-                    Err(SatelleError::host_unreachable("reusable-token-host"))
-                },
-            )
-            .expect("reuse the healthy durable daemon token");
-
-        assert_eq!(verification, ExistingTokenVerification::Reusable);
-        assert!(!bootstrap_called.load(Ordering::SeqCst));
-        assert!(bootstrap_lock.exchanged_lock_lines().iter().all(|line| {
-            !line.contains("maintenance_handoff") && !line.contains("daemon_start")
-        }));
-        bootstrap_lock
-            .release_committed_handoff()
-            .expect("release the committed durable verification");
-        let report = transport.setup_report(
-            false,
-            "on_demand".to_string(),
-            vec!["transport".to_string()],
-            DaemonPathOverrides::default(),
-            SetupApplication::AppliedReusableToken,
-            false,
-        );
-        assert_eq!(report.status, "applied");
-        assert!(!report.mutated);
-        durable_client
-            .capabilities()
-            .expect("the canonical durable daemon remains reachable after the report");
-
-        drop(server);
-    });
-}
-
-#[cfg(unix)]
-#[test]
-fn authentication_rejected_by_live_daemon_enters_bootstrap_fallback() {
-    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _, _| {
-        let state = TestStateDir::new().expect("temporary durable state directory");
-        let service = HostService::local_demo_for_tests_at(state.path())
-            .expect("construct durable Host service");
-        let initialized = service.initialize_daemon().expect("initialize Host state");
-        let host_identity = initialized.host_identity().to_string();
-        let (_runtime, server) = spawn_loopback_daemon(service);
-        let unissued_token = ApiBearerToken::generate().expect("generate valid unissued token");
-        let unissued_token_id = unissued_token.token_id().to_string();
-        let unissued_client =
-            DaemonClient::loopback(server.local_addr(), unissued_token, &host_identity)
-                .expect("construct unissued-token client");
-        let transport =
-            SshSetupTransport::new(&ssh_setup_host(None)).expect("construct SSH setup transport");
-        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
-            "bootstrap-required-host",
-            "fake-ssh-host",
-            "bootstrap-after-durable-rejection".to_string(),
-            bootstrap_lock::OperationKind::InitialSetup,
-            fake_ssh,
-        )
-        .expect("acquire setup lock");
-        let bootstrap_called = AtomicBool::new(false);
-
-        let verification = transport
-            .verify_existing_token_with_bootstrap_fallback(
-                &unissued_client,
-                unissued_token_id.as_str(),
-                "reject-bootstrap-token-as-durable",
-                &mut bootstrap_lock,
-                |bootstrap_lock| {
-                    bootstrap_called.store(true, Ordering::SeqCst);
-                    bootstrap_lock
-                        .mark_mutation_started("daemon_start")
-                        .map_err(|_| SatelleError::host_unreachable("bootstrap-required-host"))?;
-                    commit_verified_bootstrap_mutation("bootstrap-required-host", bootstrap_lock)?;
-                    complete_bootstrap_handoff(
-                        "bootstrap-required-host",
-                        bootstrap_client,
-                        bootstrap_lock,
-                    )?;
-                    Ok(ExistingTokenVerification::Reusable)
-                },
-            )
-            .expect("enter bootstrap after durable authentication rejection");
-
-        assert_eq!(verification, ExistingTokenVerification::Reusable);
-        assert!(bootstrap_called.load(Ordering::SeqCst));
-        let durable_commit = format!(
-            "{} durable_token_verification ",
-            bootstrap_lock::MUTATION_COMMITTED
-        );
-        assert!(
-            bootstrap_lock
-                .exchanged_lock_lines()
-                .iter()
-                .any(|line| line.starts_with(&durable_commit)),
-            "the live daemon's explicit rejection must close the activation attempt"
-        );
-        assert!(
-            bootstrap_lock
-                .exchanged_lock_lines()
-                .iter()
-                .any(|line| line.contains("maintenance_handoff_complete"))
-        );
-        bootstrap_lock
-            .release_committed_handoff()
-            .expect("release the completed bootstrap handoff");
-
-        drop(server);
-    });
-}
-
-#[cfg(unix)]
-#[test]
-fn durable_confirmation_transport_failure_falls_back_without_open_mutation() {
-    with_bootstrap_handoff_test_context(|bootstrap_client, fake_ssh, _, _, _| {
-        let transport =
-            SshSetupTransport::new(&ssh_setup_host(None)).expect("construct SSH setup transport");
-        let unavailable_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .expect("reserve unavailable durable daemon address");
-        let unavailable_address = unavailable_listener
-            .local_addr()
-            .expect("read unavailable durable daemon address");
-        drop(unavailable_listener);
-        let unavailable_durable_client = DaemonClient::loopback_with_timeout(
-            unavailable_address,
-            ApiBearerToken::generate().expect("generate unavailable durable token"),
-            "unavailable-durable-host-identity",
-            Duration::from_secs(1),
-        )
-        .expect("construct unavailable durable client");
-        let mut bootstrap_lock = acquire_bootstrap_lock_for_operation_with_ssh(
-            "transport-fallback-host",
-            "fake-ssh-host",
-            "bootstrap-after-durable-transport".to_string(),
-            bootstrap_lock::OperationKind::InitialSetup,
-            fake_ssh,
-        )
-        .expect("acquire setup lock");
-
-        let verification = transport
-            .verify_existing_token_with_bootstrap_fallback(
-                &unavailable_durable_client,
-                "unavailable-durable-token-id",
-                "transport-bootstrap-token",
-                &mut bootstrap_lock,
-                |bootstrap_lock| {
-                    bootstrap_lock
-                        .mark_mutation_started("daemon_start")
-                        .map_err(|_| SatelleError::host_unreachable("transport-fallback-host"))?;
-                    commit_verified_bootstrap_mutation("transport-fallback-host", bootstrap_lock)?;
-                    complete_bootstrap_handoff(
-                        "transport-fallback-host",
-                        bootstrap_client,
-                        bootstrap_lock,
-                    )?;
-                    Ok(ExistingTokenVerification::Reusable)
-                },
-            )
-            .expect("enter bootstrap after read-only durable transport failure");
-
-        assert_eq!(verification, ExistingTokenVerification::Reusable);
-        assert!(
-            bootstrap_lock
-                .exchanged_lock_lines()
-                .iter()
-                .all(|line| { !line.contains("durable_token_verification") })
-        );
-        bootstrap_lock
-            .release_committed_handoff()
-            .expect("release the completed bootstrap handoff");
-    });
 }
 
 #[cfg(unix)]
@@ -1807,7 +1619,7 @@ fn uncertain_first_host_update_action_start_closes_the_unmodified_operation() {
             // The Host commits the start, but the Controller loses that response.
             // No artifact or managed process mutation has begun.
             bootstrap_lock
-                .mark_mutation_started("persistent_action_start")
+                .mark_mutation_started("setup_action_start")
                 .expect("record the uncertain action-start attempt");
             client
                 .start_maintenance_action(operation_id, "install-host-artifact")
@@ -1897,7 +1709,7 @@ fn rejected_first_host_update_action_start_closes_the_unmodified_operation() {
 
             // Starting an out-of-order action returns a pre-mutation conflict.
             // Response reconciliation commits that exact nonmutation attempt.
-            start_persistent_action(
+            start_setup_action(
                 "host-update-clean-rejection-host",
                 client,
                 &mut bootstrap_lock,
@@ -1956,7 +1768,7 @@ fn lost_first_host_update_action_start_closes_the_still_planned_operation() {
             // Model a transport loss before the Host receives the start. The
             // attempt is unresolved locally, while the Host action stays planned.
             bootstrap_lock
-                .mark_mutation_started("persistent_action_start")
+                .mark_mutation_started("setup_action_start")
                 .expect("record the unresolved action-start attempt");
 
             finish_unmodified_after_uncertain_first_action_start(
@@ -2133,7 +1945,7 @@ fn failed_prechange_action_cleanup_reports_the_recovery_pending_operation() {
             bootstrap_lock
                 .confirm_ownership()
                 .expect("confirm Bootstrap Lock ownership");
-            start_persistent_action(
+            start_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
@@ -2195,7 +2007,7 @@ fn failed_first_action_start_cleanup_keeps_the_operation_unmodified() {
             service
                 .revoke_api_token(bootstrap_token_id)
                 .expect("revoke authority before the first action starts");
-            let source = start_persistent_action(
+            let source = start_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
@@ -2293,7 +2105,7 @@ fn failed_postchange_action_cleanup_retains_the_partial_operation_identity() {
             bootstrap_lock
                 .confirm_ownership()
                 .expect("confirm Bootstrap Lock ownership");
-            start_persistent_action(
+            start_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
@@ -2358,21 +2170,21 @@ fn confirmed_action_failure_records_dependency_skips() {
             bootstrap_lock
                 .confirm_ownership()
                 .expect("confirm Bootstrap Lock ownership");
-            start_persistent_action(
+            start_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
                 "install-host-artifact",
             )
             .expect("start artifact installation");
-            complete_persistent_action(
+            complete_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
                 "install-host-artifact",
             )
             .expect("complete artifact installation");
-            start_persistent_action(
+            start_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
@@ -2525,14 +2337,14 @@ fn rejected_later_action_start_retains_the_partial_operation_identity() {
             bootstrap_lock
                 .confirm_ownership()
                 .expect("confirm Bootstrap Lock ownership");
-            start_persistent_action(
+            start_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
                 "install-host-artifact",
             )
             .expect("start the first Host update action");
-            complete_persistent_action(
+            complete_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
@@ -2543,7 +2355,7 @@ fn rejected_later_action_start_retains_the_partial_operation_identity() {
             service
                 .revoke_api_token(bootstrap_token_id)
                 .expect("revoke authority before the later action");
-            let source = start_persistent_action(
+            let source = start_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
@@ -2604,14 +2416,14 @@ fn lost_later_action_start_response_retains_the_partial_operation_identity() {
             bootstrap_lock
                 .confirm_ownership()
                 .expect("confirm Bootstrap Lock ownership");
-            start_persistent_action(
+            start_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
                 "install-host-artifact",
             )
             .expect("start the first Host update action");
-            complete_persistent_action(
+            complete_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
@@ -2620,7 +2432,7 @@ fn lost_later_action_start_response_retains_the_partial_operation_identity() {
             .expect("complete the first Host update action");
 
             bootstrap_lock.lose_next_mutation_start_response_for_tests();
-            let source = start_persistent_action(
+            let source = start_setup_action(
                 "office",
                 client,
                 &mut bootstrap_lock,
@@ -3824,26 +3636,84 @@ fn committed_prior_mutation_recovers_after_controller_loss_for_both_phase_shapes
 }
 
 #[test]
-fn ssh_setup_rejects_unimplemented_components_before_mutating() {
+fn ssh_setup_rejects_components_outside_the_remote_host_boundary() {
     let path = std::env::temp_dir().join("satelle-unsupported-setup.token");
     let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File { path })))
         .expect("construct setup");
 
     for components in [
-        vec!["all".to_string()],
+        Vec::new(),
         vec!["provider-auth".to_string()],
-        vec!["transport".to_string(), "host".to_string()],
+        vec!["desktop".to_string()],
+        vec!["all".to_string(), "transport".to_string()],
     ] {
         let error = transport
-            .setup(
-                false,
-                setup_selection(satelle_core::SetupMode::OnDemand),
-                components,
-                DaemonPathOverrides::default(),
-            )
-            .expect_err("partial SSH setup must be rejected");
+            .validate_setup_request(&components)
+            .expect_err("unsupported SSH components must be rejected");
 
         assert_eq!(error.code, ErrorCode::NotImplemented);
+    }
+}
+
+#[test]
+fn ssh_setup_accepts_the_components_owned_by_the_remote_host_boundary() {
+    let path = std::env::temp_dir().join("satelle-supported-setup.token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File { path })))
+        .expect("construct setup");
+
+    for components in [
+        vec!["all".to_string()],
+        vec!["transport".to_string()],
+        vec!["host".to_string()],
+        vec!["codex".to_string()],
+        vec!["computer-use".to_string()],
+        vec![
+            "transport".to_string(),
+            "host".to_string(),
+            "codex".to_string(),
+            "computer-use".to_string(),
+        ],
+    ] {
+        transport
+            .validate_setup_request(&components)
+            .expect("the SSH Host boundary owns the selected components");
+    }
+}
+
+#[test]
+fn ssh_all_selects_only_components_supported_by_the_remote_platform() {
+    let path = std::env::temp_dir().join("satelle-platform-components.token");
+    let transport = SshSetupTransport::new(&ssh_setup_host(Some(ApiTokenSource::File { path })))
+        .expect("construct setup");
+
+    for target in [
+        ssh_bootstrap::RemoteTarget::LinuxArm64Gnu,
+        ssh_bootstrap::RemoteTarget::LinuxX64Gnu,
+    ] {
+        assert_eq!(
+            transport
+                .setup_components_for_target(target, vec!["all".to_string()])
+                .expect("Linux aggregate selection"),
+            ["transport"]
+        );
+        assert!(
+            transport
+                .setup_components_for_target(target, vec!["computer-use".to_string()])
+                .is_err()
+        );
+    }
+    for target in [
+        ssh_bootstrap::RemoteTarget::DarwinArm64,
+        ssh_bootstrap::RemoteTarget::DarwinX64,
+        ssh_bootstrap::RemoteTarget::WindowsArm64Msvc,
+        ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
+    ] {
+        assert_eq!(
+            transport
+                .setup_components_for_target(target, vec!["all".to_string()])
+                .expect("native aggregate selection"),
+            ["transport", "codex", "computer-use"]
+        );
     }
 }
 
@@ -4101,8 +3971,11 @@ fn ssh_setup_unchanged_path_set_reuses_the_existing_store_token() {
             state_dir: Some(temporary_root.path().join("same-remote-state")),
             ..DaemonPathOverrides::default()
         },
-        SetupApplication::Planned {
-            existing_token_file: true,
+        SetupExecutionOutcome {
+            application: SetupApplication::Planned {
+                existing_token_file: true,
+            },
+            managed_changed: false,
         },
         false,
     );
@@ -6248,6 +6121,8 @@ fn direct_attached_run_and_steer_follow_committed_host_events() {
             EventType::TurnStarted,
             EventType::ProviderSmoke,
             EventType::TurnProgress,
+            EventType::Preflight,
+            EventType::Readiness,
             EventType::TurnCompleted,
         ]
     );
@@ -6353,6 +6228,8 @@ fn direct_attached_run_and_steer_follow_committed_host_events() {
             EventType::TurnStarted,
             EventType::ProviderSmoke,
             EventType::TurnProgress,
+            EventType::Preflight,
+            EventType::Readiness,
             EventType::TurnCompleted,
         ]
     );
@@ -6738,6 +6615,134 @@ fn stop_not_confirmed_api_details_are_validated_and_preserved() {
             mapped.details.get("remote_code"),
             Some(&serde_json::json!("invalid-daemon-response"))
         );
+    }
+}
+
+#[test]
+fn host_busy_api_details_preserve_the_active_session_contract() {
+    let active_session_id = SessionId::new();
+    let api_error = |details: serde_json::Value| {
+        serde_json::from_value::<satelle_transport::ApiError>(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle_transport::RequestId::new().to_string(),
+            "host_identity": "host-direct-test",
+            "code": "host-busy",
+            "category": "conflict",
+            "retryable": true,
+            "message": "the Host is busy",
+            "details": details,
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize host-busy API error")
+    };
+
+    let mapped = map_api_error(
+        "direct-test",
+        &api_error(serde_json::json!({
+            "host": "local-demo",
+            "active_session_id": active_session_id,
+        })),
+    );
+    assert_eq!(mapped.code, ErrorCode::HostBusy);
+    assert_eq!(mapped.details["host"], "direct-test");
+    assert_eq!(
+        mapped.details["active_session_id"],
+        active_session_id.as_str()
+    );
+
+    let mapped = map_api_error(
+        "direct-test",
+        &api_error(serde_json::json!({
+            "host": "local-demo",
+            "active_session_id": "not-a-session",
+        })),
+    );
+    assert_eq!(mapped.code, ErrorCode::RemoteExecution);
+    assert_eq!(mapped.details["remote_code"], "invalid-daemon-response");
+}
+
+#[test]
+fn manual_macos_setup_details_round_trip_only_in_the_closed_shape() {
+    let api_error = |code: &str, details: serde_json::Value| {
+        serde_json::from_value::<satelle_transport::ApiError>(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle_transport::RequestId::new().to_string(),
+            "host_identity": "host-direct-test",
+            "code": code,
+            "category": "readiness",
+            "retryable": false,
+            "message": "native Computer Use is not ready",
+            "details": details,
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize computer-use-not-ready API error")
+    };
+    let details = serde_json::json!({
+        "reason": "macos_native_computer_use_prerequisite_missing",
+        "status": "manual_action_required"
+    });
+
+    let exact_manual_error = api_error("computer-use-not-ready", details.clone());
+    assert!(managed_setup_rejection_precedes_mutation(
+        &DaemonClientError::Api {
+            status: reqwest::StatusCode::CONFLICT,
+            error: Box::new(exact_manual_error.clone()),
+        }
+    ));
+    let generic_internal_error = api_error("internal-error", serde_json::json!({}));
+    assert!(!managed_setup_rejection_precedes_mutation(
+        &DaemonClientError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            error: Box::new(generic_internal_error),
+        }
+    ));
+
+    let mapped = map_api_error("clean-mac", &exact_manual_error);
+    assert_eq!(mapped.code, ErrorCode::ComputerUseNotReady);
+    assert_eq!(mapped.details["status"], "manual_action_required");
+
+    for invalid in [
+        serde_json::json!({
+            "reason": "native_bridge_untrusted",
+            "status": "manual_action_required"
+        }),
+        serde_json::json!({
+            "reason": "macos_native_computer_use_prerequisite_missing",
+            "status": "ready"
+        }),
+        {
+            let mut extra = details;
+            extra["private"] = serde_json::json!("must-not-cross");
+            extra
+        },
+    ] {
+        let mapped = map_api_error("clean-mac", &api_error("computer-use-not-ready", invalid));
+        assert_eq!(mapped.code, ErrorCode::RemoteExecution);
+        assert_eq!(mapped.details["remote_code"], "invalid-daemon-response");
+    }
+}
+
+#[test]
+fn managed_setup_api_failures_rerun_the_exact_failed_setup_selection() {
+    for (mode, component) in [
+        (satelle_core::SetupMode::Persistent, "codex"),
+        (satelle_core::SetupMode::OnDemand, "computer-use"),
+    ] {
+        let error = SatelleError::remote_managed_setup_error(
+            "clean mac'; touch /tmp/pwn",
+            mode,
+            component,
+            "internal-error",
+        );
+        let mode_flag = mode.as_str().replace('_', "-");
+        let expected = format!(
+            "satelle setup --host 'clean mac'\"'\"'; touch /tmp/pwn' --{mode_flag} --component {component} --no-input --json --yes"
+        );
+        assert_eq!(error.recovery_command.as_deref(), Some(expected.as_str()));
+        assert_eq!(error.details["recovery_command"], expected);
+        assert_eq!(error.details["remote_code"], "internal-error");
     }
 }
 

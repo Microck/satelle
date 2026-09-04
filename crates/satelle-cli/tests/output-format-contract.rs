@@ -390,7 +390,9 @@ fn stop_json_v1_has_one_closed_contract_for_stopped_and_already_terminal_turns()
             "fake",
             ("already_terminal", "completed", "completed", false),
         ),
-        ("pending", ("stopped", "recovery_pending", "stopped", true)),
+        // A detached local Turn is owned by the durable local Host Daemon, so
+        // it is still running when a fresh CLI process stops it.
+        ("pending", ("stopped", "running", "stopped", true)),
     ] {
         let state = state_dir();
         let cache = state.path().join("cache");

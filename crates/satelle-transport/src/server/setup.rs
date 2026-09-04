@@ -896,7 +896,9 @@ pub(super) async fn begin_bootstrap_maintenance(
         satelle_host::BootstrapMaintenancePlanKind::OnDemandHandoff => {
             bootstrap_maintenance_principal_is_authorized(&authorized)
         }
-        satelle_host::BootstrapMaintenancePlanKind::PersistentHostService
+        satelle_host::BootstrapMaintenancePlanKind::OnDemandHandoffWithManagedSetup
+        | satelle_host::BootstrapMaintenancePlanKind::PersistentHostService
+        | satelle_host::BootstrapMaintenancePlanKind::PersistentHostServiceWithManagedSetup
         | satelle_host::BootstrapMaintenancePlanKind::PersistentHostStop
         | satelle_host::BootstrapMaintenancePlanKind::PersistentHostRestart
         | satelle_host::BootstrapMaintenancePlanKind::HostUpdate
@@ -1005,6 +1007,37 @@ pub(super) async fn start_maintenance_action(
         move |service, operation| service.start_bootstrap_maintenance_action(operation, &action_id),
     )
     .await
+}
+
+pub(super) async fn apply_managed_setup_action(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path((operation_id, action_id)): Path<(String, String)>,
+) -> Response {
+    if !persistent_service_maintenance_principal_is_authorized(&authorized) {
+        return bootstrap_maintenance_principal_required(&state, &authorized);
+    }
+    let service = Arc::clone(&state.service);
+    let operation = operation_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        service.apply_bootstrap_managed_setup_action(&operation, &action_id)
+    })
+    .await
+    {
+        Ok(Ok(changed)) => authenticated_json_response(
+            StatusCode::OK,
+            &crate::contract::ManagedSetupActionResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                operation_id,
+                changed,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
 }
 
 pub(super) async fn complete_maintenance_action(

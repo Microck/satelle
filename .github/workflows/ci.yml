@@ -63,7 +63,8 @@ jobs:
   rust:
     name: Rust quality gates (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # Windows release builds of the workspace exceed 20 minutes on a cold cache.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -88,6 +89,14 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked --no-fail-fast
+
+      # CLI tests launch on-demand Host Daemons from the debug binary. A daemon
+      # that still owns an unresolved recovery lease does not idle out, and on
+      # Windows a running daemon blocks Cargo from replacing that binary in the
+      # later steps.
+      - name: Stop on-demand test daemons
+        shell: pwsh
+        run: Get-Process satelle -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
       - name: Build release binaries
         env:

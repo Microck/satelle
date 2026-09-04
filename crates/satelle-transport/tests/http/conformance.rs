@@ -271,8 +271,8 @@ async fn assert_transport_conformance(
     .await
     .expect("join blocking API conformance runner");
 
-    let mut events = Vec::with_capacity(5);
-    for _ in 0..5 {
+    let mut events = Vec::with_capacity(7);
+    for _ in 0..7 {
         events.push(
             event_stream
                 .next_event()
@@ -290,12 +290,14 @@ async fn assert_transport_conformance(
             EventType::TurnStarted,
             EventType::ProviderSmoke,
             EventType::TurnProgress,
+            EventType::Preflight,
+            EventType::Readiness,
             EventType::TurnCompleted,
         ]
     );
     assert_eq!(
         events.iter().map(|event| event.seq()).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5]
+        [1, 2, 3, 4, 5, 6, 7]
     );
     let readiness = &events[0];
     assert_eq!(readiness.data()["source"], "live");

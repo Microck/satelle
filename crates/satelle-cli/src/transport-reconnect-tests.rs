@@ -3,7 +3,7 @@ use satelle_core::session::PublicSession;
 use satelle_transport::{DaemonEventStream, EventSubscription, WsCloseReason};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -80,15 +80,16 @@ impl DirectFixture {
     }
 }
 
-struct DropFirstHttpConnection {
+struct DropHttpConnections {
     address: SocketAddr,
     serving: Receiver<()>,
     shutdown: Sender<()>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl DropFirstHttpConnection {
-    fn start(service: HostService) -> Self {
+impl DropHttpConnections {
+    fn start(service: HostService, connections_to_drop: usize) -> Self {
+        assert!(connections_to_drop > 0);
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .expect("bind transient HTTP listener");
         listener
@@ -98,12 +99,18 @@ impl DropFirstHttpConnection {
         let (serving_sender, serving) = mpsc::channel();
         let (shutdown, shutdown_receiver) = mpsc::channel();
         let thread = thread::spawn(move || {
-            // Keep the first real client connection open while replacing this listener. Closing
-            // it only after the real daemon binds makes the resulting retry deterministic: the
-            // client cannot observe a connection-refused gap between the two listeners.
-            let first_connection = loop {
+            // Drop the requested attempts, but retain the final connection while replacing this
+            // listener. This keeps the retry deterministic: the client cannot observe a
+            // connection-refused gap between the transient listener and the real daemon.
+            let mut accepted = 0_usize;
+            let final_connection = loop {
                 match listener.accept() {
-                    Ok((connection, _)) => break connection,
+                    Ok((connection, _)) => {
+                        accepted += 1;
+                        if accepted == connections_to_drop {
+                            break connection;
+                        }
+                    }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {
                         match shutdown_receiver.try_recv() {
                             Ok(()) | Err(TryRecvError::Disconnected) => return,
@@ -123,7 +130,7 @@ impl DropFirstHttpConnection {
                 let server = DaemonServer::bind(service, DaemonServerConfig::loopback(address))
                     .await
                     .expect("start real HTTP daemon after transient failure");
-                drop(first_connection);
+                drop(final_connection);
                 serving_sender
                     .send(())
                     .expect("report transient HTTP daemon readiness");
@@ -169,7 +176,7 @@ impl DropFirstHttpConnection {
     }
 }
 
-impl Drop for DropFirstHttpConnection {
+impl Drop for DropHttpConnections {
     fn drop(&mut self) {
         let _ = self.stop_inner();
     }
@@ -542,6 +549,162 @@ fn server_restart_reconciles_the_exact_attached_turn_once() {
 }
 
 #[test]
+fn silent_terminal_event_loss_reconciles_without_waiting_for_socket_failure() {
+    let fixture = DirectFixture::start();
+    let mut stream = fixture.connect_host_stream();
+    let admitted = fixture.complete_while_server_is_down("complete before event drain");
+    let expected_session_id = admitted.session_id().clone();
+    let expected_turn_id = admitted
+        .turns()
+        .last()
+        .expect("admitted Session contains the target Turn")
+        .turn_id()
+        .clone();
+
+    let discarded = fixture
+        .transport()
+        .event_runtime
+        .block_on(stream.drain_events_for(Duration::from_millis(100)))
+        .expect("drain the live-only event stream without closing it");
+    assert!(
+        discarded
+            .iter()
+            .any(|event| event.event_type() == EventType::TurnCompleted),
+        "the fixture must discard the real terminal event"
+    );
+
+    // Keep the Host-scoped socket busy with unrelated real Session events. An inactivity timeout
+    // would never reconcile the target, while an independent reconciliation clock still does.
+    let stop_noise = Arc::new(AtomicBool::new(false));
+    let noise_stopped = Arc::clone(&stop_noise);
+    let noise_runs = Arc::new(AtomicUsize::new(0));
+    let published_noise_runs = Arc::clone(&noise_runs);
+    let (five_runs_published, five_runs_ready) = mpsc::channel();
+    let noise_service = fixture.service.clone();
+    let noise = thread::spawn(move || {
+        let mut index = 0_u64;
+        while !noise_stopped.load(Ordering::Acquire) {
+            let intent = satelle_host::TurnIntent::new(
+                format!("unrelated Host event {index}"),
+                satelle_core::session::TurnExecutionMode::Standard,
+            )
+            .expect("construct unrelated Turn intent");
+            noise_service
+                .run(satelle_core::LOCAL_DEMO_HOST, &intent)
+                .expect("publish unrelated real Session events");
+            let run_count = published_noise_runs.fetch_add(1, Ordering::Release) + 1;
+            if run_count == 5 {
+                five_runs_published
+                    .send(())
+                    .expect("publish deterministic noise barrier");
+            }
+            index += 1;
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+    // This barrier only orders the fixture: each noise run is a real daemon
+    // round trip, so slow CI runners need more than a few hundred
+    // milliseconds to finish five of them. It is not a latency assertion.
+    five_runs_ready
+        .recv_timeout(Duration::from_secs(30))
+        .expect("publish five unrelated real Sessions before reconciliation");
+
+    let mut events = Vec::new();
+    let outcome = fixture
+        .transport()
+        .event_runtime
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                fixture
+                    .transport()
+                    .follow_turn_with_reconciliation_interval(
+                        stream,
+                        admitted,
+                        Duration::from_millis(25),
+                        &mut |event| {
+                            events.push(event);
+                            Ok(())
+                        },
+                    ),
+            )
+            .await
+            .expect("unrelated Host traffic must not postpone reconciliation")
+        })
+        .expect("durable status must terminate a silent live stream");
+    stop_noise.store(true, Ordering::Release);
+    noise.join().expect("join unrelated event producer");
+
+    assert_eq!(outcome.session.session_id(), &expected_session_id);
+    assert_eq!(outcome.turn_id, expected_turn_id);
+    assert!(
+        noise_runs.load(Ordering::Acquire) >= 5,
+        "the Host stream must stay busy across the reconciliation interval"
+    );
+    let target_events = events
+        .iter()
+        .filter(|event| {
+            event.session_id() == Some(&expected_session_id)
+                && event.turn_id() == Some(&outcome.turn_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(target_events.len(), 1);
+    assert_eq!(target_events[0].event_type(), EventType::TurnCompleted);
+    assert_eq!(target_events[0].source(), EventSource::Cli);
+    assert_eq!(target_events[0].data()["reconciled"], true);
+}
+
+#[test]
+fn periodic_http_failure_does_not_abort_a_healthy_event_stream() {
+    let mut fixture = DirectFixture::start();
+    let mut stream = fixture.connect_host_stream();
+    let admitted = fixture.complete_while_server_is_down("complete before HTTP outage");
+    let expected_session_id = admitted.session_id().clone();
+
+    let discarded = fixture
+        .transport()
+        .event_runtime
+        .block_on(stream.drain_events_for(Duration::from_millis(100)))
+        .expect("discard the target terminal without closing its stream");
+    assert!(
+        discarded
+            .iter()
+            .any(|event| event.event_type() == EventType::TurnCompleted)
+    );
+
+    // Exhaust one complete three-attempt periodic probe. The next clock tick must retain the same
+    // live stream, reach the restored real HTTP daemon, and reconcile the committed target.
+    let transient_http = DropHttpConnections::start(fixture.service.clone(), 3);
+    fixture.replace_http_client(transient_http.address(), "principal-cli-periodic-http-test");
+    let mut events = Vec::new();
+    let outcome = fixture
+        .transport()
+        .event_runtime
+        .block_on(
+            fixture
+                .transport()
+                .follow_turn_with_reconciliation_interval(
+                    stream,
+                    admitted,
+                    Duration::from_millis(25),
+                    &mut |event| {
+                        events.push(event);
+                        Ok(())
+                    },
+                ),
+        )
+        .expect("retry the periodic status probe while retaining the live stream");
+    transient_http.wait_until_serving();
+    transient_http.stop();
+
+    assert_eq!(outcome.session.session_id(), &expected_session_id);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type(), EventType::TurnCompleted);
+    assert_eq!(events[0].source(), EventSource::Cli);
+    assert_eq!(events[0].data()["reconciled"], true);
+}
+
+#[test]
 fn transient_http_reconciliation_failure_retains_the_reconnected_stream() {
     let mut fixture = DirectFixture::start();
     let stream = fixture.connect_host_stream();
@@ -558,7 +721,7 @@ fn transient_http_reconciliation_failure_retains_the_reconnected_stream() {
     // One connection admits the replacement WSS but rejects any buggy attempt to reacquire it.
     // HTTP uses a separate real loopback daemon that drops only its first TCP connection.
     fixture.restart_server_with_connection_limit(1);
-    let transient_http = DropFirstHttpConnection::start(fixture.service.clone());
+    let transient_http = DropHttpConnections::start(fixture.service.clone(), 1);
     fixture.replace_http_client(
         transient_http.address(),
         "principal-cli-transient-http-test",

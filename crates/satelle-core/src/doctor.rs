@@ -244,7 +244,8 @@ pub struct DoctorProbeExecutionRecord {
     pub status: DoctorProbeStatus,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "event")]
 pub enum DoctorProbeScheduleEvent {
     Started { probe_id: String, timestamp: String },
     Finished { probe_id: String, timestamp: String },

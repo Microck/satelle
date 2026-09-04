@@ -2146,22 +2146,36 @@ fn adapter_receives_committed_policy_and_resumes_the_private_thread_reference() 
     let adapter = BoundaryInspectingAdapter::default();
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
 
-    let session_id = runtime
+    let initial_outcome = runtime
         .run(RunCommand::attached(
             LOCAL_DEMO_HOST,
             "PRIVATE_INITIAL_POLICY_PROMPT",
         ))
-        .expect("initial Turn should execute through the adapter boundary")
-        .session
-        .session_id()
-        .clone();
-    runtime
+        .expect("initial Turn should execute through the adapter boundary");
+    let session_id = initial_outcome.session.session_id().clone();
+    let follow_up_outcome = runtime
         .steer(SteerCommand::attached(
             session_id,
             "PRIVATE_FOLLOW_UP_POLICY_PROMPT",
         ))
         .expect("follow-up Turn should reuse the persisted private thread reference");
 
+    for outcome in [&initial_outcome, &follow_up_outcome] {
+        assert_eq!(
+            outcome
+                .events
+                .iter()
+                .filter(|event| event.event_type() == EventType::TurnCompleted)
+                .count(),
+            1,
+            "an attached outcome must contain exactly one committed terminal event"
+        );
+        assert_eq!(
+            outcome.events.last().map(|event| event.event_type()),
+            Some(EventType::TurnCompleted),
+            "the committed terminal event must be the final attached event"
+        );
+    }
     assert_eq!(adapter.execute_calls.load(Ordering::SeqCst), 2);
 }
 

@@ -1,12 +1,11 @@
 use crate::self_update;
 use base64::Engine as _;
-use flate2::{Compression, write::GzEncoder};
 use satelle_core::session::HostIdentityRef;
 use satelle_core::{DaemonPathOverrides, HostConfig, SshIdentityCommitRecord};
 use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 #[cfg(all(test, unix))]
 use std::fs;
@@ -39,9 +38,9 @@ const START_OUTPUT_LIMIT: u64 = 16 * 1024;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const BOOTSTRAP_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const MUTATION_EXECUTE: &str = "satelle-bootstrap-execute-v1";
-const WINDOWS_MUTATION_INPUT: &str = "satelle-bootstrap-mutation-input-v1";
 const BOOTSTRAP_LOCK_EXIT_GRACE: Duration = Duration::from_millis(500);
 const BOOTSTRAP_LOCK_EXIT_POLL: Duration = Duration::from_millis(10);
+const WINDOWS_MUTATION_RESULT_POLL: Duration = Duration::from_millis(250);
 const CACHE_CLEANUP_PROTOCOL: &str = "satelle-cache-cleanup-v1";
 const STAGED_DIGEST_MISMATCH_EXIT_CODE: i32 = 65;
 const POSIX_CACHE_DIRECTORY_GUARD: &str = r#"safe_cache_directory() {
@@ -91,6 +90,7 @@ const DAEMON_PATH_ENVIRONMENT_VARIABLES: [&str; 5] = [
 ];
 pub(super) struct SshBootstrapLock {
     child: Child,
+    _windows_script: Option<StagedWindowsPowerShellScript>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     windows_mailbox: Option<Arc<Mutex<WindowsBootstrapMailbox>>>,
     response_receiver: mpsc::Receiver<String>,
@@ -114,58 +114,125 @@ pub(super) struct SshBootstrapLock {
 
 struct WindowsBootstrapMailbox {
     destination: String,
-    ssh_program: OsString,
-    operation_id: String,
-    claim_identity: String,
-    claim_basename: String,
+    mailbox_path: String,
     next_sequence: u64,
+}
+
+enum WindowsMutationResult {
+    Pending,
+    Ready(RemoteExitStatus),
+}
+
+struct StagedWindowsPowerShellScript {
+    destination: String,
+    pending_path: String,
+    remote_path: String,
+    remote_command: String,
+}
+
+impl Drop for StagedWindowsPowerShellScript {
+    fn drop(&mut self) {
+        let Ok(pending) = sftp_batch_quote(&self.pending_path) else {
+            return;
+        };
+        let Ok(remote) = sftp_batch_quote(&self.remote_path) else {
+            return;
+        };
+        let _ = run_sftp_batch(&self.destination, &format!("-rm {pending}\n-rm {remote}\n"));
+    }
 }
 
 impl WindowsBootstrapMailbox {
     fn send(&mut self, challenge: &str) -> Result<(), SshBootstrapError> {
-        let command = windows_bootstrap_mailbox_command(
-            &self.operation_id,
-            &self.claim_identity,
-            &self.claim_basename,
+        let response = self.exchange(challenge)?;
+        if std::str::from_utf8(&response)
+            .map_err(|_| SshBootstrapError::InvalidBootstrapLockResponse)?
+            .trim_end()
+            != challenge
+        {
+            return Err(SshBootstrapError::BootstrapLockLost);
+        }
+        Ok(())
+    }
+
+    fn exchange(&mut self, challenge: &str) -> Result<Vec<u8>, SshBootstrapError> {
+        self.exchange_with_timeout(challenge, PROCESS_TIMEOUT)
+    }
+
+    fn exchange_with_timeout(
+        &mut self,
+        challenge: &str,
+        response_timeout: Duration,
+    ) -> Result<Vec<u8>, SshBootstrapError> {
+        let response = windows_bootstrap_mailbox_exchange(
+            &self.destination,
+            &self.mailbox_path,
             self.next_sequence,
             challenge,
+            response_timeout,
         );
-        let output = run_ssh_command_with_program(&self.ssh_program, &self.destination, &command)?;
-        if !output.status.success() {
-            return Err(if output.stderr.host_key_verification_failed() {
-                SshBootstrapError::HostKeyVerificationRequired
-            } else {
-                SshBootstrapError::BootstrapLockLost
-            });
-        }
+        // Once a request has been attempted, later recovery traffic must use
+        // the next sequence. If publication itself failed, the heartbeat
+        // expiry remains the deterministic recovery fallback.
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
             .ok_or(SshBootstrapError::BootstrapLockLost)?;
-        Ok(())
+        response
     }
 
-    fn input_paths(
-        &self,
+    fn input_paths(&self, attempt: &str) -> WindowsFencedInputPaths {
+        let mailbox = self.mailbox_path.trim_end_matches(['\\', '/']);
+        WindowsFencedInputPaths {
+            pending: format!(r"{mailbox}\pending-input.{attempt}"),
+            published: format!(r"{mailbox}\input.{attempt}"),
+            result: format!(r"{mailbox}\mutation-result.{attempt}"),
+            stdout: format!(r"{mailbox}\mutation-stdout.{attempt}"),
+            stderr: format!(r"{mailbox}\mutation-stderr.{attempt}"),
+            ready: format!(r"{mailbox}\start-ready.{attempt}"),
+        }
+    }
+
+    fn mutation_result(
+        &mut self,
         phase: &str,
         attempt: &str,
-    ) -> Result<WindowsFencedInputPaths, SshBootstrapError> {
-        let command = windows_bootstrap_input_paths_command(
-            &self.operation_id,
-            &self.claim_identity,
-            &self.claim_basename,
-            phase,
-            attempt,
+        response_timeout: Duration,
+    ) -> Result<WindowsMutationResult, SshBootstrapError> {
+        let challenge = bootstrap_lock::mutation_result_line(phase, attempt)
+            .map_err(SshBootstrapError::InvalidBootstrapLockRequest)?;
+        let response = self.exchange_with_timeout(&challenge, response_timeout)?;
+        let response = std::str::from_utf8(&response)
+            .map_err(|_| SshBootstrapError::InvalidBootstrapLockResponse)?
+            .trim_end();
+        let expected_prefix = format!(
+            "{} {phase} {attempt} ",
+            bootstrap_lock::MUTATION_RESULT_RESPONSE
         );
-        let output = run_ssh_command_with_program(&self.ssh_program, &self.destination, &command)?;
-        if !output.status.success() {
-            return Err(if output.stderr.host_key_verification_failed() {
-                SshBootstrapError::HostKeyVerificationRequired
-            } else {
-                SshBootstrapError::BootstrapLockLost
-            });
+        let status = response
+            .strip_prefix(&expected_prefix)
+            .ok_or(SshBootstrapError::InvalidBootstrapLockResponse)?;
+        if status == "pending" {
+            return Ok(WindowsMutationResult::Pending);
         }
-        parse_windows_fenced_input_paths(&output.stdout)
+        let status = status
+            .parse::<i32>()
+            .ok()
+            .filter(|status| matches!(*status, 0 | 1 | STAGED_DIGEST_MISMATCH_EXIT_CODE | 75))
+            .ok_or(SshBootstrapError::InvalidBootstrapLockResponse)?;
+        Ok(WindowsMutationResult::Ready(RemoteExitStatus::from_code(
+            status,
+        )))
+    }
+
+    fn abandon_mutation_result(
+        &mut self,
+        phase: &str,
+        attempt: &str,
+    ) -> Result<(), SshBootstrapError> {
+        let challenge = bootstrap_lock::mutation_abandon_line(phase, attempt)
+            .map_err(SshBootstrapError::InvalidBootstrapLockRequest)?;
+        self.send(&challenge)
     }
 }
 
@@ -273,10 +340,17 @@ impl SshBootstrapLock {
     ) -> Result<Self, SshBootstrapError> {
         let target = RemoteTarget::probe_with_program(destination, ssh_program)?;
         let command = target.bootstrap_lock_command(&request);
+        let windows_script = target
+            .is_windows()
+            .then(|| stage_windows_powershell_script(destination, &command, "bootstrap-lock"))
+            .transpose()?;
+        let remote_command = windows_script
+            .as_ref()
+            .map_or(command.as_str(), |script| script.remote_command.as_str());
         let mut child = Command::new(ssh_program)
             .arg("-T")
             .arg(destination)
-            .arg(&command)
+            .arg(remote_command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -302,13 +376,22 @@ impl SshBootstrapLock {
             .spawn(move || drain_bootstrap_lock_stdout(stdout, ready_sender, response_sender))
             .map_err(|error| terminate_child(&mut child, SshBootstrapError::ReaderThread(error)))?;
 
-        let ready = match ready_receiver.recv_timeout(PROCESS_TIMEOUT) {
-            Ok(ready) => ready,
-            Err(_) => {
-                let error = terminate_child(&mut child, SshBootstrapError::BootstrapLockTimedOut);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(error);
+        // A Windows OpenSSH server configured with PowerShell as its default
+        // shell buffers nested native-process stdout until that process exits.
+        // The lock process must stay alive, so use its owner-only ready marker
+        // through the same bounded filesystem protocol as later exchanges.
+        let ready = if target.is_windows() {
+            wait_for_windows_bootstrap_ready(ssh_program, destination, request.operation_id())
+        } else {
+            match ready_receiver.recv_timeout(PROCESS_TIMEOUT) {
+                Ok(ready) => ready,
+                Err(_) => {
+                    let error =
+                        terminate_child(&mut child, SshBootstrapError::BootstrapLockTimedOut);
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(error);
+                }
             }
         };
         let ready_claim = match ready {
@@ -334,17 +417,27 @@ impl SshBootstrapLock {
             });
         }
 
-        let windows_mailbox = target.is_windows().then(|| {
+        let windows_mailbox_path = if target.is_windows() {
+            Some(
+                ready_claim
+                    .mailbox_path
+                    .clone()
+                    .ok_or(SshBootstrapError::InvalidBootstrapLockResponse)?,
+            )
+        } else {
+            None
+        };
+        let windows_mailbox = windows_mailbox_path.map(|mailbox_path| {
             Arc::new(Mutex::new(WindowsBootstrapMailbox {
                 destination: destination.to_string(),
-                ssh_program: ssh_program.to_os_string(),
-                operation_id: request.operation_id().to_string(),
-                claim_identity: ready_claim.identity.clone(),
-                claim_basename: ready_claim.basename.clone(),
+                mailbox_path,
                 next_sequence: 1,
             }))
         });
-        let stdin = Arc::new(Mutex::new((!target.is_windows()).then_some(stdin)));
+        // Windows exchanges use the owner-only mailbox, but the remote lock
+        // still treats SSH stdin EOF as a disconnected controller. Retain the
+        // handle without writing to it until this lock is dropped.
+        let stdin = Arc::new(Mutex::new(Some(stdin)));
         let heartbeat_stop = Arc::new(AtomicBool::new(false));
         let exchange_failed = Arc::new(AtomicBool::new(false));
         let heartbeat_stdin = Arc::clone(&stdin);
@@ -396,6 +489,7 @@ impl SshBootstrapLock {
 
         Ok(Self {
             child,
+            _windows_script: windows_script,
             stdin,
             windows_mailbox,
             response_receiver,
@@ -467,6 +561,25 @@ impl SshBootstrapLock {
         phase: &str,
         command: &str,
     ) -> Result<FencedMutationCommand, SshBootstrapError> {
+        self.fenced_command_with_windows_result(target, phase, command, true)
+    }
+
+    fn fenced_streaming_command(
+        &mut self,
+        target: RemoteTarget,
+        phase: &str,
+        command: &str,
+    ) -> Result<FencedMutationCommand, SshBootstrapError> {
+        self.fenced_command_with_windows_result(target, phase, command, false)
+    }
+
+    fn fenced_command_with_windows_result(
+        &mut self,
+        target: RemoteTarget,
+        phase: &str,
+        command: &str,
+        windows_file_backed_result: bool,
+    ) -> Result<FencedMutationCommand, SshBootstrapError> {
         let attempt = Uuid::now_v7().simple().to_string();
         self.mark_mutation_attempt_started(phase, &attempt)?;
         let windows_input_paths = self
@@ -475,19 +588,31 @@ impl SshBootstrapLock {
             .map(|mailbox| {
                 mailbox
                     .lock()
-                    .map_err(|_| SshBootstrapError::BootstrapLockLost)?
-                    .input_paths(phase, &attempt)
+                    .map_err(|_| SshBootstrapError::BootstrapLockLost)
+                    .map(|mailbox| mailbox.input_paths(&attempt))
             })
             .transpose()?;
+        let mutation = FencedMutationContext::new(
+            &self.operation_id,
+            &self.claim_identity,
+            &self.claim_basename,
+            phase,
+            &attempt,
+            command,
+            windows_file_backed_result,
+        );
         Ok(FencedMutationCommand {
-            remote_command: target.fenced_mutation_command(
-                &self.operation_id,
-                &self.claim_identity,
-                &self.claim_basename,
-                phase,
-                &attempt,
-                command,
-            ),
+            remote_command: target.fenced_mutation_command(mutation),
+            windows_result_probe: windows_input_paths
+                .as_ref()
+                .filter(|_| windows_file_backed_result)
+                .and(self.windows_mailbox.as_ref())
+                .map(|mailbox| WindowsFencedResultProbe {
+                    mailbox: Arc::clone(mailbox),
+                    exchange_failed: Arc::clone(&self.exchange_failed),
+                    phase: phase.to_string(),
+                    attempt: attempt.clone(),
+                }),
             windows_input_paths,
         })
     }
@@ -617,6 +742,7 @@ impl Drop for SshBootstrapLock {
 
 pub(super) struct SshBootstrapProcess {
     child: Child,
+    _windows_script: Option<StagedWindowsPowerShellScript>,
     remote_addr: SocketAddr,
     stdout_reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<SshStderrClassification>>,
@@ -729,7 +855,7 @@ impl SshBootstrapProcess {
             require_success(run_fenced_ssh_command(destination, target, command, None)?)?;
         }
         let start_command =
-            bootstrap_lock.fenced_command(target, "daemon_start", &start_command)?;
+            bootstrap_lock.fenced_streaming_command(target, "daemon_start", &start_command)?;
         Self::spawn(
             destination,
             start_command,
@@ -787,18 +913,31 @@ impl SshBootstrapProcess {
         let FencedMutationCommand {
             remote_command,
             windows_input_paths,
+            windows_result_probe,
         } = start_command;
+        debug_assert!(windows_result_probe.is_none());
         let windows = windows_input_paths.is_some();
         if let Some(input_paths) = &windows_input_paths {
             let mut input = token.map(FencedMutationInput::BootstrapToken);
             let prepared_input = prepare_windows_fenced_mutation_input(&mut input)?;
             publish_windows_fenced_mutation_input(destination, prepared_input.path(), input_paths)?;
         }
+        let windows_script = windows
+            .then(|| stage_windows_powershell_script(destination, &remote_command, "mutation"))
+            .transpose()?;
+        let remote_program = windows_script
+            .as_ref()
+            .map_or(remote_command.as_str(), |script| {
+                script.remote_command.as_str()
+            });
         let mut command = Command::new("ssh");
+        command.arg("-T");
+        if windows {
+            command.arg("-n");
+        }
         command
-            .arg("-T")
             .arg(destination)
-            .arg(remote_command)
+            .arg(remote_program)
             .stdin(if windows {
                 Stdio::null()
             } else {
@@ -820,8 +959,14 @@ impl SshBootstrapProcess {
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let stdout_reader = match thread::Builder::new()
             .name("satelle-ssh-bootstrap-stdout".to_string())
-            .spawn(move || drain_bootstrap_stdout(stdout, ready_sender))
-        {
+            .spawn(move || {
+                if windows {
+                    let mut stdout = stdout;
+                    let _ = io::copy(&mut stdout, &mut io::sink());
+                } else {
+                    drain_bootstrap_stdout(stdout, ready_sender);
+                }
+            }) {
             Ok(reader) => reader,
             Err(error) => {
                 let error = terminate_child(&mut child, SshBootstrapError::ReaderThread(error));
@@ -851,12 +996,20 @@ impl SshBootstrapProcess {
             drop(stdin);
         }
 
-        let ready = ready_receiver
-            .recv_timeout(PROCESS_TIMEOUT)
-            .map_err(|_| terminate_child(&mut child, SshBootstrapError::StartTimedOut))?;
-        let ready = match ready {
-            Ok(ready) => ready,
-            Err(error) => return Err(terminate_child(&mut child, error)),
+        let ready = if windows {
+            let paths = windows_input_paths
+                .as_ref()
+                .expect("Windows bootstrap starts always have mailbox paths");
+            wait_for_windows_bootstrap_start(destination, paths)
+                .map_err(|error| terminate_child(&mut child, error))?
+        } else {
+            let ready = ready_receiver
+                .recv_timeout(PROCESS_TIMEOUT)
+                .map_err(|_| terminate_child(&mut child, SshBootstrapError::StartTimedOut))?;
+            match ready {
+                Ok(ready) => ready,
+                Err(error) => return Err(terminate_child(&mut child, error)),
+            }
         };
         let Some(remote_addr) = validated_start_address(&ready, expected_port) else {
             return Err(terminate_child(
@@ -878,6 +1031,7 @@ impl SshBootstrapProcess {
 
         Ok(Self {
             child,
+            _windows_script: windows_script,
             remote_addr,
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
@@ -983,12 +1137,7 @@ impl RemoteTarget {
         directories: &RemoteUserDirectories,
         host_config: &HostConfig,
     ) -> Result<InitialHostState, SshBootstrapError> {
-        let state_root = host_config
-            .daemon_state_dir
-            .as_ref()
-            .map(|path| path.as_os_str().to_string_lossy().into_owned())
-            .unwrap_or_else(|| directories.resolved_path_set().state_root);
-        self.validate_daemon_path("SATELLE_STATE_DIR", Path::new(&state_root))?;
+        let state_root = self.resolved_daemon_state_root(directories, host_config)?;
         let journal = join_target_path(self, &state_root, ".satelle-ssh-identity-commit");
         let command = if self.is_windows() {
             let database = join_target_path(self, &state_root, "satelle.sqlite3");
@@ -1045,12 +1194,7 @@ impl RemoteTarget {
             InitialHostStateProbe::PendingIdentityCommit(encoded) => {
                 let record = SshIdentityCommitRecord::parse(encoded)
                     .map_err(|_| SshBootstrapError::InvalidProbe)?;
-                let cache_root = host_config
-                    .daemon_cache_dir
-                    .as_ref()
-                    .map(|path| path.as_os_str().to_string_lossy().into_owned())
-                    .unwrap_or_else(|| directories.resolved_path_set().cache_root);
-                self.validate_daemon_path("SATELLE_CACHE_DIR", Path::new(&cache_root))?;
+                let cache_root = self.resolved_daemon_cache_root(directories, host_config)?;
                 let operation_directory = join_target_path(
                     self,
                     &cache_root,
@@ -1083,6 +1227,54 @@ impl RemoteTarget {
         }
     }
 
+    fn resolved_daemon_state_root(
+        self,
+        directories: &RemoteUserDirectories,
+        host_config: &HostConfig,
+    ) -> Result<String, SshBootstrapError> {
+        self.resolved_daemon_directory(
+            host_config.daemon_state_dir.as_deref(),
+            host_config.daemon_home.as_deref(),
+            "state",
+            &directories.resolved_path_set().state_root,
+            "SATELLE_STATE_DIR",
+        )
+    }
+
+    fn resolved_daemon_cache_root(
+        self,
+        directories: &RemoteUserDirectories,
+        host_config: &HostConfig,
+    ) -> Result<String, SshBootstrapError> {
+        self.resolved_daemon_directory(
+            host_config.daemon_cache_dir.as_deref(),
+            host_config.daemon_home.as_deref(),
+            "cache",
+            &directories.resolved_path_set().cache_root,
+            "SATELLE_CACHE_DIR",
+        )
+    }
+
+    fn resolved_daemon_directory(
+        self,
+        explicit: Option<&Path>,
+        home: Option<&Path>,
+        home_leaf: &str,
+        os_default: &str,
+        environment_variable: &'static str,
+    ) -> Result<String, SshBootstrapError> {
+        let resolved = explicit
+            .map(|path| path.as_os_str().to_string_lossy().into_owned())
+            .or_else(|| {
+                home.map(|home| {
+                    join_target_path(self, &home.as_os_str().to_string_lossy(), home_leaf)
+                })
+            })
+            .unwrap_or_else(|| os_default.to_string());
+        self.validate_daemon_path(environment_variable, Path::new(&resolved))?;
+        Ok(resolved)
+    }
+
     pub(super) fn prepare_identity_operation(
         self,
         directories: &RemoteUserDirectories,
@@ -1094,18 +1286,8 @@ impl RemoteTarget {
         let binary_digest = sha256_file(artifact.path())?;
         let binary_sha256 = digest_hex(&binary_digest);
         let archive_sha256 = digest_hex(&artifact.release_digest());
-        let state_root = host_config
-            .daemon_state_dir
-            .as_ref()
-            .map(|path| path.as_os_str().to_string_lossy().into_owned())
-            .unwrap_or_else(|| directories.resolved_path_set().state_root);
-        self.validate_daemon_path("SATELLE_STATE_DIR", Path::new(&state_root))?;
-        let cache_root = host_config
-            .daemon_cache_dir
-            .as_ref()
-            .map(|path| path.as_os_str().to_string_lossy().into_owned())
-            .unwrap_or_else(|| directories.resolved_path_set().cache_root);
-        self.validate_daemon_path("SATELLE_CACHE_DIR", Path::new(&cache_root))?;
+        let state_root = self.resolved_daemon_state_root(directories, host_config)?;
+        let cache_root = self.resolved_daemon_cache_root(directories, host_config)?;
         let operation_directory = join_target_path(
             self,
             &cache_root,
@@ -1168,6 +1350,24 @@ impl RemoteTarget {
             bootstrap_lock.fenced_command(self, "identity_operation_artifact_cleanup", &cleanup)?;
         require_success(run_fenced_ssh_command(destination, self, command, None)?)?;
         bootstrap_lock.commit_current_mutation()
+    }
+
+    /// Requests coordinated retirement of the Host that is running the exact
+    /// first-trust artifact. The release command returns only after that Host
+    /// has relinquished the canonical state store.
+    pub(super) fn release_identity_operation_state_owner(
+        self,
+        destination: &str,
+        record: &SshIdentityCommitRecord,
+        bootstrap_lock: &mut SshBootstrapLock,
+    ) -> Result<(), SshBootstrapError> {
+        let state_root = Path::new(record.canonical_state_root());
+        self.validate_daemon_path("SATELLE_STATE_DIR", state_root)?;
+        let environment = [("SATELLE_STATE_DIR", state_root)];
+        let release =
+            self.release_state_command_with_environment(record.exact_remote_path(), &environment);
+        let command = bootstrap_lock.fenced_command(self, "state_owner_release", &release)?;
+        require_success(run_fenced_ssh_command(destination, self, command, None)?)
     }
 
     fn cleanup_identity_operation_artifact_command(
@@ -1420,7 +1620,7 @@ sync"#,
         destination: &str,
         ssh_program: &OsStr,
     ) -> Result<Self, SshBootstrapError> {
-        let windows = run_ssh_command_with_program(
+        let windows = run_windows_platform_probe_with_program(
             ssh_program,
             destination,
             "cmd.exe /d /c \"echo satelle-platform-v1&&echo windows&&echo %PROCESSOR_ARCHITECTURE%\"",
@@ -1616,21 +1816,22 @@ sync"#,
 
     fn bootstrap_lock_command(self, request: &bootstrap_lock::Request) -> String {
         if self.is_windows() {
-            compressed_powershell_command(&request.windows_script())
+            request.windows_script()
         } else {
             request.posix_command()
         }
     }
 
-    fn fenced_mutation_command(
-        self,
-        operation_id: &str,
-        claim_identity: &str,
-        claim_basename: &str,
-        phase: &str,
-        attempt: &str,
-        command: &str,
-    ) -> String {
+    fn fenced_mutation_command(self, mutation: FencedMutationContext<'_>) -> String {
+        let FencedMutationContext {
+            operation_id,
+            claim_identity,
+            claim_basename,
+            phase,
+            attempt,
+            command,
+            windows_file_backed_result,
+        } = mutation;
         let commit_required = bootstrap_lock::mutation_phase_requires_commit(phase);
         if self.is_windows() {
             let operation_id = powershell_quote(operation_id);
@@ -1639,7 +1840,7 @@ sync"#,
             let phase = powershell_quote(phase);
             let attempt = powershell_quote(attempt);
             let command = powershell_quote(command);
-            return compressed_powershell_command(&format!(
+            return format!(
                 r#"$ErrorActionPreference = 'Stop'
 $operationId = {operation_id}
 $claimIdentity = {claim_identity}
@@ -1647,6 +1848,7 @@ $claimBasename = {claim_basename}
 $phase = {phase}
 $attempt = {attempt}
 $commitRequired = {commit_required}
+$fileBackedResult = {file_backed_result}
 $innerCommand = {command}
 $stateRoot = if ($env:SATELLE_STATE_DIR) {{ $env:SATELLE_STATE_DIR }} else {{ Join-Path $env:LOCALAPPDATA 'Satelle\state' }}
 $lockRoot = Join-Path $stateRoot 'bootstrap.lock'
@@ -1666,10 +1868,22 @@ if (-not $mailboxItem.PSIsContainer -or
     (($mailboxItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
 $pendingPayloadPath = Join-Path $mailboxPath ('pending-input.' + $attempt)
 $payloadPath = Join-Path $mailboxPath ('input.' + $attempt)
+$stdoutPath = Join-Path $mailboxPath ('mutation-stdout.' + $attempt)
+$stderrPath = Join-Path $mailboxPath ('mutation-stderr.' + $attempt)
+$pendingResultPath = Join-Path $mailboxPath ('pending-result.' + $attempt)
+$resultPath = Join-Path $mailboxPath ('mutation-result.' + $attempt)
+$pendingReadyPath = Join-Path $mailboxPath ('pending-ready.' + $attempt)
+$readyPath = Join-Path $mailboxPath ('start-ready.' + $attempt)
 $payloadItem = Get-Item -LiteralPath $payloadPath -Force -ErrorAction Stop
 if ($payloadItem.PSIsContainer -or
     (($payloadItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
-    (Test-Path -LiteralPath $pendingPayloadPath)) {{ exit 75 }}
+    (Test-Path -LiteralPath $pendingPayloadPath) -or
+    ($fileBackedResult -and ((Test-Path -LiteralPath $stdoutPath) -or
+      (Test-Path -LiteralPath $stderrPath) -or
+      (Test-Path -LiteralPath $pendingResultPath) -or
+      (Test-Path -LiteralPath $resultPath))) -or
+    ((-not $fileBackedResult) -and ((Test-Path -LiteralPath $pendingReadyPath) -or
+      (Test-Path -LiteralPath $readyPath)))) {{ exit 75 }}
 try {{
   [IO.File]::Open((Join-Path $claimPath ('execution_started.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
   $status = 0
@@ -1677,44 +1891,84 @@ try {{
   if (-not $innerCommand.StartsWith($commandPrefix, [StringComparison]::Ordinal)) {{ exit 75 }}
   $encodedCommand = $innerCommand.Substring($commandPrefix.Length)
   if ($encodedCommand -notmatch '^[A-Za-z0-9+/]+={{0,2}}$') {{ exit 75 }}
-  # Start-Process keeps its redirected input file open after the child exits on
-  # Windows PowerShell 5. Use an anonymous pipe so the fenced payload can be
-  # removed before waiting and can never block release of its containing claim.
-  $startInfo = [Diagnostics.ProcessStartInfo]::new()
-  $startInfo.FileName = 'powershell.exe'
-  $startInfo.Arguments = '-NoProfile -NonInteractive -EncodedCommand ' + $encodedCommand
-  $startInfo.UseShellExecute = $false
-  $startInfo.CreateNoWindow = $true
-  $startInfo.RedirectStandardInput = $true
-  $process = [Diagnostics.Process]::new()
-  $process.StartInfo = $startInfo
-  $processStarted = $false
-  try {{
-    if (-not $process.Start()) {{ throw 'could not start fenced mutation' }}
-    $processStarted = $true
-    $payloadStream = [IO.File]::OpenRead($payloadPath)
-    try {{
-      $payloadStream.CopyTo($process.StandardInput.BaseStream)
-      $process.StandardInput.BaseStream.Flush()
-    }} finally {{
-      $process.StandardInput.Close()
-      $payloadStream.Dispose()
-    }}
-    Remove-Item -LiteralPath $payloadPath -Force -ErrorAction Stop
-    $process.WaitForExit()
+  if ($fileBackedResult) {{
+    # File redirection avoids the anonymous-pipe wait that Windows OpenSSH can
+    # retain after the child exits. Dispose the Process before removing input;
+    # Windows PowerShell 5 otherwise keeps that redirected file handle open.
+    $process = Start-Process -FilePath 'powershell.exe' `
+      -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand) `
+      -RedirectStandardInput $payloadPath `
+      -RedirectStandardOutput $stdoutPath `
+      -RedirectStandardError $stderrPath `
+      -WindowStyle Hidden -Wait -PassThru
     $status = $process.ExitCode
-  }} finally {{
-    if ($processStarted -and -not $process.HasExited) {{
-      $process.Kill()
-      $process.WaitForExit()
-    }}
     $process.Dispose()
+  }} else {{
+    # A foreground daemon must keep streaming its ready line and later output.
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'powershell.exe'
+    $startInfo.Arguments = '-NoProfile -NonInteractive -EncodedCommand ' + $encodedCommand
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $processStarted = $false
+    try {{
+      if (-not $process.Start()) {{ throw 'could not start fenced mutation' }}
+      $processStarted = $true
+      $stderrDrain = $process.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)
+      $payloadStream = [IO.File]::OpenRead($payloadPath)
+      try {{
+        $payloadStream.CopyTo($process.StandardInput.BaseStream)
+        $process.StandardInput.BaseStream.Flush()
+      }} finally {{
+        $process.StandardInput.Close()
+        $payloadStream.Dispose()
+      }}
+      Remove-Item -LiteralPath $payloadPath -Force -ErrorAction Stop
+      $readyBytes = [Collections.Generic.List[byte]]::new()
+      $readyTerminated = $false
+      while ($readyBytes.Count -le {start_output_limit}) {{
+        $value = $process.StandardOutput.BaseStream.ReadByte()
+        if ($value -lt 0) {{ break }}
+        if ($value -eq 10) {{ $readyTerminated = $true; break }}
+        if ($value -ne 13) {{ [void]$readyBytes.Add([byte]$value) }}
+      }}
+      if ((-not $readyTerminated) -or ($readyBytes.Count -gt {start_output_limit})) {{
+        throw 'invalid Host ready frame'
+      }}
+      $readyLine = [Text.Encoding]::UTF8.GetString($readyBytes.ToArray())
+      [IO.File]::WriteAllText($pendingReadyPath, $readyLine + "`n", (New-Object Text.UTF8Encoding($false)))
+      [IO.File]::Move($pendingReadyPath, $readyPath)
+      $stdoutDrain = $process.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null)
+      $process.WaitForExit()
+      $stdoutDrain.GetAwaiter().GetResult()
+      $stderrDrain.GetAwaiter().GetResult()
+      $status = $process.ExitCode
+    }} finally {{
+      if ($processStarted -and -not $process.HasExited) {{
+        $process.Kill()
+        $process.WaitForExit()
+      }}
+      $process.Dispose()
+    }}
   }}
 }} catch {{
   $status = 1
 }} finally {{
   Remove-Item -LiteralPath $pendingPayloadPath -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $pendingReadyPath -Force -ErrorAction SilentlyContinue
+}}
+if ($fileBackedResult) {{
+  foreach ($outputPath in @($stdoutPath, $stderrPath)) {{
+    if (-not (Test-Path -LiteralPath $outputPath)) {{
+      [IO.File]::Open($outputPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+    }}
+  }}
 }}
 $terminalClaimExact = $false
 try {{
@@ -1766,13 +2020,28 @@ if ($terminalClaimExact) {{
             ($phase -ceq 'offline_storage_maintenance')) {{
     [IO.File]::Open((Join-Path $claimPath ('execution_failed.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
   }}
+  if ($fileBackedResult) {{
+    $effectiveStatus = if ($stateOwnerReleased -or ($status -eq 0)) {{ 0 }} elseif ($status -eq {digest_mismatch_exit_code}) {{ {digest_mismatch_exit_code} }} else {{ 1 }}
+    try {{
+      [IO.File]::WriteAllText($pendingResultPath, [string]$effectiveStatus, (New-Object Text.UTF8Encoding($false)))
+      [IO.File]::Move($pendingResultPath, $resultPath)
+    }} finally {{
+      Remove-Item -LiteralPath $pendingResultPath -Force -ErrorAction SilentlyContinue
+    }}
+  }}
 }}
 if ($stateOwnerReleased -or ($status -eq 0)) {{ exit 0 }}
 if ($status -eq {digest_mismatch_exit_code}) {{ exit {digest_mismatch_exit_code} }}
 exit 1"#,
                 digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
                 commit_required = if commit_required { "$true" } else { "$false" },
-            ));
+                file_backed_result = if windows_file_backed_result {
+                    "$true"
+                } else {
+                    "$false"
+                },
+                start_output_limit = START_OUTPUT_LIMIT,
+            );
         }
 
         let operation_id = posix_quote(operation_id);
@@ -2340,18 +2609,80 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             )
         });
         if self.is_windows() {
-            let identity_args = initial_identity.map_or_else(String::new, |initial| {
-                format!(
-                    " --initial-host-identity {} --initial-identity-operation-id {} --initial-identity-record {}",
-                    powershell_quote(initial.host_identity.as_str()),
-                    powershell_quote(initial.operation_id),
-                    powershell_quote(&initial.record.encode()),
-                )
-            });
+            let mut arguments = vec![
+                "host".to_string(),
+                "start".to_string(),
+                "--interactive-bootstrap".to_string(),
+                "--bootstrap-token-stdin".to_string(),
+                "--bind".to_string(),
+                bind.to_string(),
+                "--bootstrap-scope".to_string(),
+                bootstrap_scope.as_cli_value().to_string(),
+                "--bootstrap-native-readiness-timeout-ms".to_string(),
+                readiness_timeouts.native.as_millis().to_string(),
+                "--bootstrap-provider-smoke-timeout-ms".to_string(),
+                readiness_timeouts.provider.as_millis().to_string(),
+            ];
+            if let Some(initial) = initial_identity {
+                arguments.extend([
+                    "--initial-host-identity".to_string(),
+                    initial.host_identity.as_str().to_string(),
+                    "--initial-identity-operation-id".to_string(),
+                    initial.operation_id.to_string(),
+                    "--initial-identity-record".to_string(),
+                    initial.record.encode(),
+                ]);
+            }
+            arguments.push("--json".to_string());
+            let arguments = arguments
+                .iter()
+                .map(|argument| windows_command_line_argument(argument))
+                .collect::<Vec<_>>()
+                .join(" ");
             let script = format!(
-                "{}& {} host start --interactive-bootstrap --bootstrap-token-stdin {timeout_args}{identity_args} --json; exit $LASTEXITCODE",
+                concat!(
+                    "{}$binary = (Resolve-Path -LiteralPath {}).Path; ",
+                    "$startInfo = [Diagnostics.ProcessStartInfo]::new(); ",
+                    "$startInfo.FileName = $binary; $startInfo.Arguments = {}; ",
+                    "$startInfo.UseShellExecute = $false; $startInfo.CreateNoWindow = $true; ",
+                    "$startInfo.RedirectStandardInput = $true; ",
+                    "$startInfo.RedirectStandardOutput = $true; ",
+                    "$startInfo.RedirectStandardError = $true; ",
+                    "$process = [Diagnostics.Process]::new(); $process.StartInfo = $startInfo; ",
+                    "$processStarted = $false; try {{ ",
+                    "if (-not $process.Start()) {{ throw 'could not start Host' }}; ",
+                    "$processStarted = $true; ",
+                    "$stderrPath = Join-Path $env:TEMP 'satelle-host-start-diagnostic.err'; ",
+                    "$stderrFile = [IO.File]::Open($stderrPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read); ",
+                    "$stderrDrain = $process.StandardError.BaseStream.CopyToAsync($stderrFile); ",
+                    "$token = [Console]::In.ReadLine(); ",
+                    "if ([String]::IsNullOrEmpty($token)) {{ throw 'missing bootstrap token' }}; ",
+                    "$process.StandardInput.WriteLine($token); $process.StandardInput.Close(); ",
+                    "$readyBytes = [Collections.Generic.List[byte]]::new(); ",
+                    "$readyTerminated = $false; ",
+                    "while ($readyBytes.Count -le {start_output_limit}) {{ ",
+                    "$value = $process.StandardOutput.BaseStream.ReadByte(); ",
+                    "if ($value -lt 0) {{ break }}; ",
+                    "if ($value -eq 10) {{ $readyTerminated = $true; break }}; ",
+                    "if ($value -ne 13) {{ [void]$readyBytes.Add([byte]$value) }} }}; ",
+                    "if ((-not $readyTerminated) -or ($readyBytes.Count -gt {start_output_limit})) {{ ",
+                    "throw 'invalid Host ready frame' }}; ",
+                    "$readyLine = [Text.Encoding]::UTF8.GetString($readyBytes.ToArray()); ",
+                    "[Console]::Out.WriteLine($readyLine); [Console]::Out.Flush(); ",
+                    "$stdoutDrain = $process.StandardOutput.BaseStream.CopyToAsync([IO.Stream]::Null); ",
+                    "$process.WaitForExit(); ",
+                    "[void]$stdoutDrain.GetAwaiter().GetResult(); ",
+                    "[void]$stderrDrain.GetAwaiter().GetResult(); ",
+                    "exit $process.ExitCode ",
+                    "}} finally {{ ",
+                    "if ($processStarted -and -not $process.HasExited) {{ ",
+                    "$process.Kill(); $process.WaitForExit() }}; $process.Dispose(); ",
+                    "if ($stderrFile) {{ $stderrFile.Dispose() }} }}"
+                ),
                 powershell_environment(environment),
                 powershell_quote(remote_binary),
+                powershell_quote(&arguments),
+                start_output_limit = START_OUTPUT_LIMIT,
             );
             powershell_encoded_command(&script)
         } else if initial_identity.is_some() {
@@ -2577,6 +2908,134 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         } else {
             "sh -c 'exec tailscale serve get-config --all'"
         }
+    }
+}
+
+#[cfg(not(windows))]
+fn run_windows_platform_probe_with_program(
+    ssh_program: &OsStr,
+    destination: &str,
+    remote_command: &str,
+) -> Result<CommandOutput, SshBootstrapError> {
+    run_ssh_command_with_program(ssh_program, destination, remote_command)
+}
+
+#[cfg(windows)]
+fn run_windows_platform_probe_with_program(
+    ssh_program: &OsStr,
+    destination: &str,
+    remote_command: &str,
+) -> Result<CommandOutput, SshBootstrapError> {
+    if ssh_program != OsStr::new("ssh") {
+        return run_ssh_command_with_program(ssh_program, destination, remote_command);
+    }
+    let directory = tempfile::tempdir().map_err(SshBootstrapError::LocalFile)?;
+    let probe_id = Uuid::now_v7().simple().to_string();
+    let script_name = format!(".satelle-platform-probe-{probe_id}.ps1");
+    let result_name = format!(".satelle-platform-probe-{probe_id}.txt");
+    let local_script_path = directory.path().join("probe.ps1");
+    let local_result_path = directory.path().join("result.txt");
+    let script = format!(
+        "$frame = \"satelle-platform-v1`r`nwindows`r`n$env:PROCESSOR_ARCHITECTURE`r`n\"\r\n[IO.File]::WriteAllText((Join-Path $env:USERPROFILE '{result_name}'), $frame, (New-Object Text.UTF8Encoding($false)))\r\n"
+    );
+    let mut local_script =
+        File::create(&local_script_path).map_err(SshBootstrapError::LocalFile)?;
+    local_script
+        .write_all(script.as_bytes())
+        .and_then(|()| local_script.flush())
+        .map_err(SshBootstrapError::LocalFile)?;
+    let local_script = sftp_batch_quote(&local_script_path.to_string_lossy())?;
+    let remote_script = sftp_batch_quote(&script_name)?;
+    let upload = format!("put {local_script} {remote_script}\n");
+    let (uploaded, classification) = run_sftp_batch(destination, &upload)?;
+    if !uploaded {
+        return Err(if classification.host_key_verification_failed() {
+            SshBootstrapError::HostKeyVerificationRequired
+        } else {
+            SshBootstrapError::PlatformProbeFailed
+        });
+    }
+
+    let remote_command = format!(
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\\{script_name}"
+    );
+    let mut stdout = tempfile::tempfile().map_err(SshBootstrapError::LocalFile)?;
+    let mut stderr = tempfile::tempfile().map_err(SshBootstrapError::LocalFile)?;
+    let mut child = Command::new(ssh_program)
+        .args(["-T", "-n", destination, &remote_command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            stdout.try_clone().map_err(SshBootstrapError::LocalFile)?,
+        ))
+        .stderr(Stdio::from(
+            stderr.try_clone().map_err(SshBootstrapError::LocalFile)?,
+        ))
+        .spawn()
+        .map_err(SshBootstrapError::SpawnSsh)?;
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    let local_result = sftp_batch_quote(&local_result_path.to_string_lossy())?;
+    let remote_result = sftp_batch_quote(&result_name)?;
+    let receive =
+        format!("get {remote_result} {local_result}\nrm {remote_result}\nrm {remote_script}\n");
+    let mut child_status = None;
+    loop {
+        if child_status.is_none() {
+            child_status = child.try_wait().map_err(SshBootstrapError::WaitSsh)?;
+        }
+        if let Some(status) = child_status.filter(|status| !status.success()) {
+            let cleanup = format!("-rm {remote_script}\n-rm {remote_result}\n");
+            let _ = run_sftp_batch(destination, &cleanup);
+            stdout
+                .seek(SeekFrom::Start(0))
+                .map_err(SshBootstrapError::ReadProcess)?;
+            stderr
+                .seek(SeekFrom::Start(0))
+                .map_err(SshBootstrapError::ReadProcess)?;
+            return Ok(CommandOutput {
+                status: status.into(),
+                stdout: read_bounded(stdout, PROBE_OUTPUT_LIMIT)?,
+                stderr: classify_stderr(stderr),
+            });
+        }
+        // A fast Windows shell can exit immediately after publishing the
+        // file-backed result. A successful child exit does not supersede that
+        // result, so keep polling until the controller has fetched it.
+        let (received, classification) = run_sftp_batch(destination, &receive)?;
+        if received {
+            if child_status.is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let probe = read_bounded(
+                File::open(local_result_path).map_err(SshBootstrapError::LocalFile)?,
+                PROBE_OUTPUT_LIMIT,
+            )?;
+            if !matches!(RemoteTarget::parse_probe(&probe), Ok(target) if target.is_windows()) {
+                return Err(SshBootstrapError::InvalidProbe);
+            }
+            stderr
+                .seek(SeekFrom::Start(0))
+                .map_err(SshBootstrapError::ReadProcess)?;
+            return Ok(CommandOutput {
+                status: RemoteExitStatus::from_code(0),
+                stdout: probe,
+                stderr: classify_stderr(stderr),
+            });
+        }
+        if classification.host_key_verification_failed() {
+            return Err(terminate_child(
+                &mut child,
+                SshBootstrapError::HostKeyVerificationRequired,
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(if child_status.is_some() {
+                SshBootstrapError::PlatformProbeFailed
+            } else {
+                terminate_child(&mut child, SshBootstrapError::PlatformProbeFailed)
+            });
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -5126,6 +5585,31 @@ fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn windows_command_line_argument(value: &str) -> String {
+    if !value.is_empty() && !value.contains([' ', '\t', '"']) {
+        return value.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for character in value.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if character == '"' {
+            quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+        } else {
+            quoted.extend(std::iter::repeat_n('\\', backslashes));
+        }
+        quoted.push(character);
+        backslashes = 0;
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
 fn remote_parent(remote_path: &str) -> &str {
     remote_path
         .rfind(['/', '\\'])
@@ -5133,105 +5617,69 @@ fn remote_parent(remote_path: &str) -> &str {
         .expect("remote cache paths always contain a parent directory")
 }
 
-fn windows_bootstrap_mailbox_command(
-    operation_id: &str,
-    claim_identity: &str,
-    claim_basename: &str,
-    sequence: u64,
-    challenge: &str,
-) -> String {
+fn windows_bootstrap_ready_command(operation_id: &str) -> String {
     let operation_id = powershell_quote(operation_id);
-    let claim_identity = powershell_quote(claim_identity);
-    let claim_basename = powershell_quote(claim_basename);
-    let request_name = powershell_quote(&format!("request.{sequence:020}"));
-    let response_name = powershell_quote(&format!("response.{sequence:020}"));
-    let release = if challenge == bootstrap_lock::RELEASE {
-        "$true"
-    } else {
-        "$false"
-    };
-    let challenge = base64::engine::general_purpose::STANDARD.encode(challenge.as_bytes());
+    let ready = bootstrap_lock::READY;
+    let ready_timeout_seconds = PROCESS_TIMEOUT.as_secs().saturating_sub(5);
     let script = format!(
         r#"$ErrorActionPreference = 'Stop'
 $stateRoot = if ($env:SATELLE_STATE_DIR) {{ $env:SATELLE_STATE_DIR }} else {{ Join-Path $env:LOCALAPPDATA 'Satelle\state' }}
-$claimPath = Join-Path (Join-Path $stateRoot 'bootstrap.lock') {claim_basename}
-$claimItem = Get-Item -LiteralPath $claimPath -Force -ErrorAction Stop
-if (-not $claimItem.PSIsContainer -or (($claimItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
-if (((Get-Content -LiteralPath (Join-Path $claimPath 'operation_id') -Raw).Trim()) -cne {operation_id}) {{ exit 75 }}
-if (((Get-Content -LiteralPath (Join-Path $claimPath 'claim_identity') -Raw).Trim()) -cne {claim_identity}) {{ exit 75 }}
-$claimState = (Get-Content -LiteralPath (Join-Path $claimPath 'state') -Raw).Trim()
-if ($claimState -cne 'live' -and $claimState -cne 'mutation_started') {{ exit 75 }}
-$mailboxPath = Join-Path $claimPath 'mailbox'
-$mailboxItem = Get-Item -LiteralPath $mailboxPath -Force -ErrorAction Stop
-if (-not $mailboxItem.PSIsContainer -or (($mailboxItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
-$requestPath = Join-Path $mailboxPath {request_name}
-$responsePath = Join-Path $mailboxPath {response_name}
-$pendingPath = Join-Path $mailboxPath ('pending.' + [Guid]::NewGuid().ToString('N'))
-$line = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{challenge}'))
-try {{
-  [IO.File]::WriteAllText($pendingPath, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
-  [IO.File]::Move($pendingPath, $requestPath)
-}} finally {{
-  Remove-Item -LiteralPath $pendingPath -Force -ErrorAction SilentlyContinue
-}}
-$deadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
-if ({release}) {{
-  while (Test-Path -LiteralPath $claimPath) {{
-    if ([DateTimeOffset]::UtcNow -ge $deadline) {{ exit 75 }}
-    Start-Sleep -Milliseconds 25
+$lockRoot = Join-Path $stateRoot 'bootstrap.lock'
+$deadline = [DateTimeOffset]::UtcNow.AddSeconds({ready_timeout_seconds})
+while ([DateTimeOffset]::UtcNow -lt $deadline) {{
+  if (Test-Path -LiteralPath $lockRoot -PathType Container) {{
+    $readyClaims = @()
+    foreach ($claim in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Stop)) {{
+      if (-not $claim.PSIsContainer -or (($claim.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ continue }}
+      try {{
+        $operation = (Get-Content -LiteralPath (Join-Path $claim.FullName 'operation_id') -Raw).Trim()
+        $identity = (Get-Content -LiteralPath (Join-Path $claim.FullName 'claim_identity') -Raw).Trim()
+        $state = (Get-Content -LiteralPath (Join-Path $claim.FullName 'state') -Raw).Trim()
+        $readyPath = Join-Path $claim.FullName 'ready'
+        $readyItem = Get-Item -LiteralPath $readyPath -Force -ErrorAction Stop
+        $ready = (Get-Content -LiteralPath $readyPath -Raw).Trim()
+        $mailbox = Get-Item -LiteralPath (Join-Path $claim.FullName 'mailbox') -Force -ErrorAction Stop
+      }} catch {{ continue }}
+      if ($operation -cne {operation_id} -or $state -cne 'live' -or
+          $identity -notmatch '^[0-9a-f]{{32}}$' -or $ready -cne $identity -or
+          $readyItem.PSIsContainer -or (($readyItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+          -not $mailbox.PSIsContainer -or (($mailbox.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+          $claim.Name -notmatch '^claim\.[A-Za-z0-9_.@-]{{1,128}}\.[0-9a-f]{{32}}$') {{ continue }}
+      $readyClaims += [pscustomobject]@{{ identity = $identity; name = $claim.Name; mailbox = $mailbox.FullName }}
+    }}
+    if ($readyClaims.Count -eq 1) {{
+      $mailboxFrame = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($readyClaims[0].mailbox))
+      [Console]::Out.WriteLine('{ready} ' + $readyClaims[0].identity + ' ' + $readyClaims[0].name + ' ' + $mailboxFrame)
+      [Console]::Out.Flush()
+      exit 0
+    }}
+    if ($readyClaims.Count -gt 1) {{ exit 75 }}
   }}
-  exit 0
-}}
-while (-not (Test-Path -LiteralPath $responsePath -PathType Leaf)) {{
-  if (-not (Test-Path -LiteralPath $claimPath -PathType Container)) {{ exit 75 }}
-  if (((Get-Content -LiteralPath (Join-Path $claimPath 'operation_id') -Raw).Trim()) -cne {operation_id}) {{ exit 75 }}
-  if (((Get-Content -LiteralPath (Join-Path $claimPath 'claim_identity') -Raw).Trim()) -cne {claim_identity}) {{ exit 75 }}
-  if ([DateTimeOffset]::UtcNow -ge $deadline) {{ exit 75 }}
   Start-Sleep -Milliseconds 25
 }}
-$responseItem = Get-Item -LiteralPath $responsePath -Force
-if ($responseItem.PSIsContainer -or (($responseItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
-$response = [IO.File]::ReadAllText($responsePath).TrimEnd([char[]]"`r`n")
-Remove-Item -LiteralPath $responsePath -Force
-if ($response -cne $line) {{ exit 75 }}"#,
+exit 75"#,
     );
     powershell_encoded_command(&script)
 }
 
-fn windows_bootstrap_input_paths_command(
+fn wait_for_windows_bootstrap_ready(
+    ssh_program: &OsStr,
+    destination: &str,
     operation_id: &str,
-    claim_identity: &str,
-    claim_basename: &str,
-    phase: &str,
-    attempt: &str,
-) -> String {
-    let operation_id = powershell_quote(operation_id);
-    let claim_identity = powershell_quote(claim_identity);
-    let claim_basename = powershell_quote(claim_basename);
-    let phase = powershell_quote(phase);
-    let attempt = powershell_quote(attempt);
-    let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-$stateRoot = if ($env:SATELLE_STATE_DIR) {{ $env:SATELLE_STATE_DIR }} else {{ Join-Path $env:LOCALAPPDATA 'Satelle\state' }}
-$claimPath = Join-Path (Join-Path $stateRoot 'bootstrap.lock') {claim_basename}
-$claimItem = Get-Item -LiteralPath $claimPath -Force -ErrorAction Stop
-if (-not $claimItem.PSIsContainer -or (($claimItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
-if (((Get-Content -LiteralPath (Join-Path $claimPath 'operation_id') -Raw).Trim()) -cne {operation_id}) {{ exit 75 }}
-if (((Get-Content -LiteralPath (Join-Path $claimPath 'claim_identity') -Raw).Trim()) -cne {claim_identity}) {{ exit 75 }}
-if (((Get-Content -LiteralPath (Join-Path $claimPath 'state') -Raw).Trim()) -cne 'mutation_started') {{ exit 75 }}
-if (((Get-Content -LiteralPath (Join-Path $claimPath 'mutation_phase') -Raw).Trim()) -cne {phase}) {{ exit 75 }}
-if (((Get-Content -LiteralPath (Join-Path $claimPath 'mutation_attempt') -Raw).Trim()) -cne {attempt}) {{ exit 75 }}
-$mailboxPath = Join-Path $claimPath 'mailbox'
-$mailboxItem = Get-Item -LiteralPath $mailboxPath -Force -ErrorAction Stop
-if (-not $mailboxItem.PSIsContainer -or (($mailboxItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {{ exit 75 }}
-$pendingPayloadPath = Join-Path $mailboxPath ('pending-input.' + {attempt})
-$payloadPath = Join-Path $mailboxPath ('input.' + {attempt})
-if ((Test-Path -LiteralPath $pendingPayloadPath) -or (Test-Path -LiteralPath $payloadPath)) {{ exit 75 }}
-$pendingPayloadFrame = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pendingPayloadPath))
-$payloadFrame = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payloadPath))
-[Console]::Out.WriteLine('{WINDOWS_MUTATION_INPUT} ' + $pendingPayloadFrame + ' ' + $payloadFrame)"#,
-    );
-    powershell_encoded_command(&script)
+) -> Result<BootstrapLockReady, SshBootstrapError> {
+    let output = run_ssh_command_with_program(
+        ssh_program,
+        destination,
+        &windows_bootstrap_ready_command(operation_id),
+    )?;
+    if !output.status.success() {
+        return Err(if output.stderr.host_key_verification_failed() {
+            SshBootstrapError::HostKeyVerificationRequired
+        } else {
+            SshBootstrapError::BootstrapLockTimedOut
+        });
+    }
+    read_bootstrap_lock_ready(&mut output.stdout.as_slice())
 }
 
 fn powershell_encoded_command(script: &str) -> String {
@@ -5245,19 +5693,47 @@ fn powershell_encoded_command(script: &str) -> String {
     )
 }
 
-fn compressed_powershell_command(script: &str) -> String {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(script.as_bytes())
-        .expect("compressing an in-memory PowerShell program cannot fail");
-    let compressed = encoder
-        .finish()
-        .expect("finishing an in-memory PowerShell program cannot fail");
-    let payload = base64::engine::general_purpose::STANDARD.encode(compressed);
-    let loader = format!(
-        "$ErrorActionPreference='Stop'\n$memory=[IO.MemoryStream]::new([Convert]::FromBase64String('{payload}'),$false)\n$gzip=[IO.Compression.GzipStream]::new($memory,[IO.Compression.CompressionMode]::Decompress,$false)\n$reader=[IO.StreamReader]::new($gzip,[Text.Encoding]::UTF8,$true)\ntry {{ $script=$reader.ReadToEnd() }} finally {{ $reader.Dispose() }}\n$program=[scriptblock]::Create($script)\n& $program"
-    );
-    powershell_encoded_command(&loader)
+fn stage_windows_powershell_script(
+    destination: &str,
+    script: &str,
+    purpose: &str,
+) -> Result<StagedWindowsPowerShellScript, SshBootstrapError> {
+    let directory = tempfile::tempdir().map_err(SshBootstrapError::LocalFile)?;
+    let local_path = directory.path().join("script.ps1");
+    let mut local_script = File::create(&local_path).map_err(SshBootstrapError::LocalFile)?;
+    // Windows PowerShell 5.1 needs the UTF-8 BOM to decode non-ASCII paths and
+    // identities consistently. The program itself never contains credentials.
+    local_script
+        .write_all(&[0xef, 0xbb, 0xbf])
+        .and_then(|()| local_script.write_all(script.as_bytes()))
+        .and_then(|()| local_script.flush())
+        .map_err(SshBootstrapError::LocalFile)?;
+
+    let script_id = Uuid::now_v7().simple();
+    let pending_path = format!(".satelle-{purpose}-{script_id}.pending");
+    let remote_path = format!(".satelle-{purpose}-{script_id}.ps1");
+    let local = sftp_batch_quote(&local_path.to_string_lossy())?;
+    let pending = sftp_batch_quote(&pending_path)?;
+    let remote = sftp_batch_quote(&remote_path)?;
+    let upload = format!("put {local} {pending}\nrename {pending} {remote}\n");
+    let (uploaded, classification) = run_sftp_batch(destination, &upload)?;
+    if !uploaded {
+        let _ = run_sftp_batch(destination, &format!("-rm {pending}\n-rm {remote}\n"));
+        return Err(if classification.host_key_verification_failed() {
+            SshBootstrapError::HostKeyVerificationRequired
+        } else {
+            SshBootstrapError::RemoteOperationFailed
+        });
+    }
+
+    Ok(StagedWindowsPowerShellScript {
+        destination: destination.to_string(),
+        pending_path,
+        remote_command: format!(
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\\{remote_path}"
+        ),
+        remote_path,
+    })
 }
 
 fn encode_base64(bytes: &[u8]) -> String {
@@ -5322,23 +5798,6 @@ fn decode_powershell_command(command: &str) -> Option<String> {
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
     String::from_utf16(&units).ok()
-}
-
-#[cfg(test)]
-fn decode_compressed_powershell_command(command: &str) -> Option<String> {
-    let loader = decode_powershell_command(command)?;
-    let payload = loader
-        .split_once("FromBase64String('")?
-        .1
-        .split_once("')")?
-        .0;
-    let compressed = base64::engine::general_purpose::STANDARD
-        .decode(payload)
-        .ok()?;
-    let mut decoder = flate2::read::GzDecoder::new(compressed.as_slice());
-    let mut script = String::new();
-    decoder.read_to_string(&mut script).ok()?;
-    Some(script)
 }
 
 pub(super) fn probe_tailscale_serve(
@@ -5827,19 +6286,117 @@ fn parse_digest_output(output: &[u8]) -> Result<[u8; 32], SshBootstrapError> {
 }
 
 struct CommandOutput {
-    status: ExitStatus,
+    status: RemoteExitStatus,
     stdout: Vec<u8>,
     stderr: SshStderrClassification,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RemoteExitStatus(Option<i32>);
+
+impl RemoteExitStatus {
+    const fn from_code(code: i32) -> Self {
+        Self(Some(code))
+    }
+
+    const fn success(self) -> bool {
+        matches!(self.0, Some(0))
+    }
+
+    const fn code(self) -> Option<i32> {
+        self.0
+    }
+}
+
+impl From<ExitStatus> for RemoteExitStatus {
+    fn from(status: ExitStatus) -> Self {
+        Self(status.code())
+    }
+}
+
+struct FencedMutationContext<'a> {
+    operation_id: &'a str,
+    claim_identity: &'a str,
+    claim_basename: &'a str,
+    phase: &'a str,
+    attempt: &'a str,
+    command: &'a str,
+    windows_file_backed_result: bool,
+}
+
+impl<'a> FencedMutationContext<'a> {
+    const fn new(
+        operation_id: &'a str,
+        claim_identity: &'a str,
+        claim_basename: &'a str,
+        phase: &'a str,
+        attempt: &'a str,
+        command: &'a str,
+        windows_file_backed_result: bool,
+    ) -> Self {
+        Self {
+            operation_id,
+            claim_identity,
+            claim_basename,
+            phase,
+            attempt,
+            command,
+            windows_file_backed_result,
+        }
+    }
 }
 
 struct WindowsFencedInputPaths {
     pending: String,
     published: String,
+    result: String,
+    stdout: String,
+    stderr: String,
+    ready: String,
 }
 
 struct FencedMutationCommand {
     remote_command: String,
     windows_input_paths: Option<WindowsFencedInputPaths>,
+    windows_result_probe: Option<WindowsFencedResultProbe>,
+}
+
+struct WindowsFencedResultProbe {
+    mailbox: Arc<Mutex<WindowsBootstrapMailbox>>,
+    exchange_failed: Arc<AtomicBool>,
+    phase: String,
+    attempt: String,
+}
+
+fn wait_for_windows_mutation_result(
+    deadline: Instant,
+    exchange_failed: &AtomicBool,
+    mut poll: impl FnMut(Duration) -> Result<WindowsMutationResult, SshBootstrapError>,
+    mut abandon: impl FnMut() -> Result<(), SshBootstrapError>,
+) -> Result<RemoteExitStatus, SshBootstrapError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            exchange_failed.store(true, Ordering::SeqCst);
+            let _ = abandon();
+            return Err(SshBootstrapError::BootstrapLockLost);
+        }
+
+        match poll(remaining) {
+            Ok(WindowsMutationResult::Ready(status)) => return Ok(status),
+            Ok(WindowsMutationResult::Pending) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() {
+                    thread::sleep(WINDOWS_MUTATION_RESULT_POLL.min(remaining));
+                }
+            }
+            Err(error) => {
+                exchange_failed.store(true, Ordering::SeqCst);
+                let _ = abandon();
+                return Err(error);
+            }
+        }
+    }
 }
 
 enum FencedMutationInput<'a> {
@@ -5916,17 +6473,32 @@ fn run_fenced_ssh_command_with_output_limit(
     let FencedMutationCommand {
         remote_command,
         windows_input_paths,
+        windows_result_probe,
     } = command;
     let result = (|| {
         if let Some(input_paths) = &windows_input_paths {
             let prepared_input = prepare_windows_fenced_mutation_input(&mut input)?;
             publish_windows_fenced_mutation_input(destination, prepared_input.path(), input_paths)?;
         }
+        let windows_script = target
+            .is_windows()
+            .then(|| stage_windows_powershell_script(destination, &remote_command, "mutation"))
+            .transpose()?;
+        let remote_program = windows_script
+            .as_ref()
+            .map_or(remote_command.as_str(), |script| {
+                script.remote_command.as_str()
+            });
         let mut command = Command::new("ssh");
+        command.arg("-T");
+        if target.is_windows() {
+            // Windows mutations consume their payload from the owned mailbox.
+            // Keep stdin detached so credentials or caller input cannot leak in.
+            command.arg("-n");
+        }
         command
-            .arg("-T")
             .arg(destination)
-            .arg(&remote_command)
+            .arg(remote_program)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.stdin(if target.is_windows() {
@@ -5968,6 +6540,54 @@ fn run_fenced_ssh_command_with_output_limit(
             }
             drop(stdin);
         }
+        if let Some(probe) = &windows_result_probe {
+            // Windows OpenSSH can retain this exec channel after every remote
+            // process has exited. The wrapper publishes its bounded output and
+            // exact exit code before that point, so consume the authenticated
+            // mailbox result and then retire only the stuck transport process.
+            let output = (|| {
+                let status = wait_for_windows_mutation_result(
+                    Instant::now() + PROCESS_TIMEOUT,
+                    &probe.exchange_failed,
+                    |remaining| {
+                        probe
+                            .mailbox
+                            .lock()
+                            .map_err(|_| SshBootstrapError::BootstrapLockLost)?
+                            .mutation_result(&probe.phase, &probe.attempt, remaining)
+                    },
+                    || {
+                        probe
+                            .mailbox
+                            .lock()
+                            .map_err(|_| SshBootstrapError::BootstrapLockLost)?
+                            .abandon_mutation_result(&probe.phase, &probe.attempt)
+                    },
+                )?;
+                if status.code() == Some(75) {
+                    return Ok(CommandOutput {
+                        status,
+                        stdout: Vec::new(),
+                        stderr: SshStderrClassification::default(),
+                    });
+                }
+                let paths = windows_input_paths
+                    .as_ref()
+                    .expect("Windows result probes always have mailbox paths");
+                let (stdout, stderr) =
+                    collect_windows_fenced_mutation_output(destination, paths, output_limit)?;
+                Ok(CommandOutput {
+                    status,
+                    stdout,
+                    stderr,
+                })
+            })();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return output;
+        }
         let status = child.wait().map_err(SshBootstrapError::WaitSsh)?;
         let stdout = stdout_reader
             .join()
@@ -5976,7 +6596,7 @@ fn run_fenced_ssh_command_with_output_limit(
             .join()
             .map_err(|_| SshBootstrapError::ReaderPanicked)?;
         Ok(CommandOutput {
-            status,
+            status: status.into(),
             stdout,
             stderr,
         })
@@ -6014,6 +6634,81 @@ fn publish_windows_fenced_mutation_input(
     let local = sftp_batch_quote(&local_path.to_string_lossy())?;
     let pending = sftp_batch_quote(&pending)?;
     let published = sftp_batch_quote(&published)?;
+    let batch = format!("put {local} {pending}\nrename {pending} {published}\n");
+    let (success, stderr) = run_sftp_batch(destination, &batch)?;
+    if success {
+        Ok(())
+    } else if stderr.host_key_verification_failed() {
+        Err(SshBootstrapError::HostKeyVerificationRequired)
+    } else {
+        Err(SshBootstrapError::RemoteOperationFailed)
+    }
+}
+
+fn windows_bootstrap_mailbox_exchange(
+    destination: &str,
+    mailbox_path: &str,
+    sequence: u64,
+    challenge: &str,
+    response_timeout: Duration,
+) -> Result<Vec<u8>, SshBootstrapError> {
+    let directory = tempfile::tempdir().map_err(SshBootstrapError::LocalFile)?;
+    let local_request_path = directory.path().join("request");
+    let mut local_request =
+        File::create(&local_request_path).map_err(SshBootstrapError::LocalFile)?;
+    writeln!(local_request, "{challenge}").map_err(SshBootstrapError::WriteMutationInput)?;
+    local_request
+        .flush()
+        .map_err(SshBootstrapError::LocalFile)?;
+
+    let mailbox = windows_path_to_sftp(mailbox_path)?;
+    let request = format!("{mailbox}/request.{sequence:020}");
+    let response = format!("{mailbox}/response.{sequence:020}");
+    let pending = format!("{mailbox}/pending.{}", Uuid::now_v7().simple());
+    let local_request = sftp_batch_quote(&local_request_path.to_string_lossy())?;
+    let request = sftp_batch_quote(&request)?;
+    let response = sftp_batch_quote(&response)?;
+    let pending = sftp_batch_quote(&pending)?;
+    let publish = format!("put {local_request} {pending}\nrename {pending} {request}\n");
+    let (published, classification) = run_sftp_batch(destination, &publish)?;
+    if !published {
+        return Err(if classification.host_key_verification_failed() {
+            SshBootstrapError::HostKeyVerificationRequired
+        } else {
+            SshBootstrapError::RemoteOperationFailed
+        });
+    }
+
+    let local_response_path = directory.path().join("response");
+    let local_response = sftp_batch_quote(&local_response_path.to_string_lossy())?;
+    let receive = format!("get {response} {local_response}\nrm {response}\n");
+    let deadline = Instant::now() + response_timeout;
+    loop {
+        let (received, classification) = run_sftp_batch(destination, &receive)?;
+        if received {
+            return read_bounded(
+                File::open(local_response_path).map_err(SshBootstrapError::LocalFile)?,
+                PROBE_OUTPUT_LIMIT,
+            );
+        }
+        if classification.host_key_verification_failed() {
+            return Err(SshBootstrapError::HostKeyVerificationRequired);
+        }
+        if local_response_path.exists() {
+            return Err(SshBootstrapError::RemoteOperationFailed);
+        }
+        if Instant::now() >= deadline {
+            return Err(SshBootstrapError::BootstrapLockLost);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(not(windows))]
+fn run_sftp_batch(
+    destination: &str,
+    batch: &str,
+) -> Result<(bool, SshStderrClassification), SshBootstrapError> {
     let mut child = Command::new("sftp")
         .args(["-q", "-b", "-", destination])
         .stdin(Stdio::piped())
@@ -6025,9 +6720,7 @@ fn publish_windows_fenced_mutation_input(
         .stdin
         .take()
         .expect("SFTP batch stdin was configured as piped");
-    if let Err(error) = writeln!(stdin, "put {local} {pending}")
-        .and_then(|()| writeln!(stdin, "rename {pending} {published}"))
-    {
+    if let Err(error) = stdin.write_all(batch.as_bytes()) {
         return Err(terminate_child(
             &mut child,
             SshBootstrapError::WriteMutationInput(error),
@@ -6038,20 +6731,78 @@ fn publish_windows_fenced_mutation_input(
         .stderr
         .take()
         .expect("SFTP stderr was configured as piped");
-    let stderr_reader = match spawn_stderr_reader(stderr) {
-        Ok(reader) => reader,
-        Err(error) => return Err(terminate_child(&mut child, error)),
-    };
+    let stderr = spawn_stderr_reader(stderr)?;
     let status = child.wait().map_err(SshBootstrapError::WaitSsh)?;
-    let stderr = stderr_reader
+    let classification = stderr
         .join()
         .map_err(|_| SshBootstrapError::ReaderPanicked)?;
-    if status.success() {
-        Ok(())
-    } else if stderr.host_key_verification_failed() {
-        Err(SshBootstrapError::HostKeyVerificationRequired)
-    } else {
-        Err(SshBootstrapError::RemoteOperationFailed)
+    Ok((status.success(), classification))
+}
+
+#[cfg(windows)]
+fn run_sftp_batch(
+    destination: &str,
+    batch: &str,
+) -> Result<(bool, SshStderrClassification), SshBootstrapError> {
+    // Supplying an SFTP batch through an anonymous stdin pipe can leave the
+    // Windows OpenSSH client alive after it completes the batch. A temporary
+    // batch file gives OpenSSH a finite input handle and uses the same
+    // disk-backed output capture as the other Windows child processes.
+    let directory = tempfile::tempdir().map_err(SshBootstrapError::LocalFile)?;
+    let batch_path = directory.path().join("sftp-batch.txt");
+    let mut batch_file = File::create(&batch_path).map_err(SshBootstrapError::LocalFile)?;
+    batch_file
+        .write_all(batch.as_bytes())
+        .and_then(|()| batch_file.flush())
+        .map_err(SshBootstrapError::LocalFile)?;
+    drop(batch_file);
+    let output = run_program_with_output_limit(
+        "sftp",
+        [
+            OsStr::new("-q"),
+            OsStr::new("-b"),
+            batch_path.as_os_str(),
+            OsStr::new(destination),
+        ],
+        PROBE_OUTPUT_LIMIT,
+    )?;
+    Ok((output.status.success(), output.stderr))
+}
+
+fn wait_for_windows_bootstrap_start(
+    destination: &str,
+    paths: &WindowsFencedInputPaths,
+) -> Result<HostStartReady, SshBootstrapError> {
+    let directory = tempfile::tempdir().map_err(SshBootstrapError::LocalFile)?;
+    let local_ready_path = directory.path().join("start-ready.json");
+    let local_ready = sftp_batch_quote(&local_ready_path.to_string_lossy())?;
+    let remote_ready =
+        windows_path_to_sftp(&paths.ready).and_then(|path| sftp_batch_quote(&path))?;
+    let receive = format!("get {remote_ready} {local_ready}\nrm {remote_ready}\n");
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    loop {
+        let (received, classification) = run_sftp_batch(destination, &receive)?;
+        if received {
+            let ready = read_bounded(
+                File::open(&local_ready_path).map_err(SshBootstrapError::LocalFile)?,
+                START_OUTPUT_LIMIT as usize,
+            )?;
+            if !ready.ends_with(b"\n") {
+                return Err(SshBootstrapError::InvalidStartResponse);
+            }
+            return serde_json::from_slice(&ready)
+                .map_err(|_| SshBootstrapError::InvalidStartResponse);
+        }
+        if classification.host_key_verification_failed() {
+            return Err(SshBootstrapError::HostKeyVerificationRequired);
+        }
+        if local_ready_path.exists() {
+            return Err(SshBootstrapError::InvalidStartResponse);
+        }
+        if Instant::now() >= deadline {
+            return Err(SshBootstrapError::StartTimedOut);
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -6059,19 +6810,50 @@ fn cleanup_windows_fenced_mutation_input(destination: &str, paths: &WindowsFence
     let Ok(batch) = windows_fenced_mutation_cleanup_batch(paths) else {
         return;
     };
-    let Ok(mut child) = Command::new("sftp")
-        .args(["-q", "-b", "-", destination])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(batch.as_bytes());
+    let _ = run_sftp_batch(destination, &batch);
+}
+
+fn collect_windows_fenced_mutation_output(
+    destination: &str,
+    paths: &WindowsFencedInputPaths,
+    output_limit: usize,
+) -> Result<(Vec<u8>, SshStderrClassification), SshBootstrapError> {
+    let directory = tempfile::tempdir().map_err(SshBootstrapError::LocalFile)?;
+    let local_stdout_path = directory.path().join("stdout");
+    let local_stderr_path = directory.path().join("stderr");
+    let local_stdout = sftp_batch_quote(&local_stdout_path.to_string_lossy())?;
+    let local_stderr = sftp_batch_quote(&local_stderr_path.to_string_lossy())?;
+    let remote_result =
+        windows_path_to_sftp(&paths.result).and_then(|path| sftp_batch_quote(&path))?;
+    let remote_stdout =
+        windows_path_to_sftp(&paths.stdout).and_then(|path| sftp_batch_quote(&path))?;
+    let remote_stderr =
+        windows_path_to_sftp(&paths.stderr).and_then(|path| sftp_batch_quote(&path))?;
+    let batch = format!(
+        "get {remote_stdout} {local_stdout}\nget {remote_stderr} {local_stderr}\n-rm {remote_result}\n-rm {remote_stdout}\n-rm {remote_stderr}\n"
+    );
+    let (success, transport_stderr) = run_sftp_batch(destination, &batch)?;
+    if !success {
+        return Err(if transport_stderr.host_key_verification_failed() {
+            SshBootstrapError::HostKeyVerificationRequired
+        } else {
+            SshBootstrapError::RemoteOperationFailed
+        });
     }
-    let _ = child.wait();
+    let stdout = read_bounded(
+        File::open(local_stdout_path).map_err(SshBootstrapError::LocalFile)?,
+        output_limit,
+    )?;
+    let stderr_file = File::open(local_stderr_path).map_err(SshBootstrapError::LocalFile)?;
+    if stderr_file
+        .metadata()
+        .map_err(SshBootstrapError::LocalFile)?
+        .len()
+        > output_limit as u64
+    {
+        return Err(SshBootstrapError::ProcessOutputTooLarge);
+    }
+    Ok((stdout, classify_stderr(stderr_file)))
 }
 
 fn windows_fenced_mutation_cleanup_batch(
@@ -6080,7 +6862,13 @@ fn windows_fenced_mutation_cleanup_batch(
     let pending = windows_path_to_sftp(&paths.pending).and_then(|path| sftp_batch_quote(&path))?;
     let published =
         windows_path_to_sftp(&paths.published).and_then(|path| sftp_batch_quote(&path))?;
-    Ok(format!("-rm {pending}\n-rm {published}\n"))
+    let result = windows_path_to_sftp(&paths.result).and_then(|path| sftp_batch_quote(&path))?;
+    let stdout = windows_path_to_sftp(&paths.stdout).and_then(|path| sftp_batch_quote(&path))?;
+    let stderr = windows_path_to_sftp(&paths.stderr).and_then(|path| sftp_batch_quote(&path))?;
+    let ready = windows_path_to_sftp(&paths.ready).and_then(|path| sftp_batch_quote(&path))?;
+    Ok(format!(
+        "-rm {pending}\n-rm {published}\n-rm {result}\n-rm {stdout}\n-rm {stderr}\n-rm {ready}\n"
+    ))
 }
 
 fn windows_path_to_sftp(path: &str) -> Result<String, SshBootstrapError> {
@@ -6139,25 +6927,6 @@ fn decode_utf8_frame(frame: &str) -> Result<String, SshBootstrapError> {
     String::from_utf8(bytes).map_err(|_| SshBootstrapError::InvalidBootstrapLockResponse)
 }
 
-fn parse_windows_fenced_input_paths(
-    stdout: &[u8],
-) -> Result<WindowsFencedInputPaths, SshBootstrapError> {
-    let response =
-        std::str::from_utf8(stdout).map_err(|_| SshBootstrapError::InvalidBootstrapLockResponse)?;
-    let mut frames = response.trim_end().split_ascii_whitespace();
-    if frames.next() != Some(WINDOWS_MUTATION_INPUT) {
-        return Err(SshBootstrapError::InvalidBootstrapLockResponse);
-    }
-    let paths = match (frames.next(), frames.next(), frames.next()) {
-        (Some(pending), Some(published), None) => WindowsFencedInputPaths {
-            pending: decode_utf8_frame(pending)?,
-            published: decode_utf8_frame(published)?,
-        },
-        _ => return Err(SshBootstrapError::InvalidBootstrapLockResponse),
-    };
-    Ok(paths)
-}
-
 #[cfg(not(windows))]
 fn run_program_with_output_limit<const N: usize>(
     program: impl AsRef<OsStr>,
@@ -6187,7 +6956,7 @@ fn run_program_with_output_limit<const N: usize>(
         .map_err(|_| SshBootstrapError::ReaderPanicked)??;
     let stderr = stderr_reader.join().unwrap_or_default();
     Ok(CommandOutput {
-        status,
+        status: status.into(),
         stdout,
         stderr,
     })
@@ -6215,6 +6984,7 @@ fn run_program_with_output_limit<const N: usize>(
         ))
         .spawn()
         .map_err(SshBootstrapError::SpawnSsh)?;
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
     let status = loop {
         let output_limit_exceeded = match output_file_limit_exceeded(&stdout, &stderr, output_limit)
         {
@@ -6232,7 +7002,14 @@ fn run_program_with_output_limit<const N: usize>(
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SshBootstrapError::ProcessTimedOut);
+            }
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -6252,7 +7029,7 @@ fn run_program_with_output_limit<const N: usize>(
         .seek(SeekFrom::Start(0))
         .map_err(SshBootstrapError::ReadProcess)?;
     Ok(CommandOutput {
-        status,
+        status: status.into(),
         stdout: read_bounded(stdout, output_limit)?,
         stderr: classify_stderr(stderr),
     })
@@ -6360,6 +7137,7 @@ fn drain_bootstrap_lock_stdout(
 struct BootstrapLockReady {
     identity: String,
     basename: String,
+    mailbox_path: Option<String>,
 }
 
 fn read_bootstrap_lock_ready(
@@ -6367,7 +7145,7 @@ fn read_bootstrap_lock_ready(
 ) -> Result<BootstrapLockReady, SshBootstrapError> {
     let mut ready = String::new();
     reader
-        .take(256)
+        .take(512)
         .read_line(&mut ready)
         .map_err(SshBootstrapError::ReadProcess)?;
     let ready = ready.trim_end();
@@ -6378,6 +7156,7 @@ fn read_bootstrap_lock_ready(
         let mut fields = fields.split(' ');
         let identity = fields.next().unwrap_or_default();
         let basename = fields.next().unwrap_or_default();
+        let mailbox_path = fields.next().map(decode_utf8_frame).transpose()?;
         if fields.next().is_none()
             && identity.len() == 32
             && identity
@@ -6389,10 +7168,14 @@ fn read_bootstrap_lock_ready(
             && basename.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@')
             })
+            && mailbox_path
+                .as_deref()
+                .is_none_or(|path| windows_path_to_sftp(path).is_ok())
         {
             return Ok(BootstrapLockReady {
                 identity: identity.to_string(),
                 basename: basename.to_string(),
+                mailbox_path,
             });
         }
         Err(SshBootstrapError::InvalidBootstrapLockResponse)
@@ -6465,6 +7248,9 @@ pub(super) enum SshBootstrapError {
     ReadProcess(#[source] io::Error),
     #[error("SSH process output exceeded its protocol limit")]
     ProcessOutputTooLarge,
+    #[cfg(windows)]
+    #[error("a system OpenSSH process exceeded its protocol deadline")]
+    ProcessTimedOut,
     #[error("could not write the bootstrap token to daemon stdin")]
     WriteToken(#[source] io::Error),
     #[error("could not stream a fenced remote mutation to system OpenSSH")]
@@ -8113,7 +8899,7 @@ mod tests {
             );
             assert!(matches!(
                 require_staged_mutation_success(CommandOutput {
-                    status: mismatch_status,
+                    status: mismatch_status.into(),
                     stdout: Vec::new(),
                     stderr: SshStderrClassification::default(),
                 }),
@@ -8683,9 +9469,12 @@ mod tests {
                 "Windows interactive bootstrap did not clear {name}: {script}"
             );
         }
+        assert!(script.contains("$startInfo = [Diagnostics.ProcessStartInfo]::new();"));
+        assert!(script.contains("$startInfo.FileName = $binary;"));
         assert!(script.contains(
-            "& 'satelle.exe' host start --interactive-bootstrap --bootstrap-token-stdin"
+            "$startInfo.Arguments = 'host start --interactive-bootstrap --bootstrap-token-stdin"
         ));
+        assert!(script.contains("[Console]::Out.WriteLine($readyLine);"));
         assert!(script.contains("--bind 127.0.0.1:0"));
         assert!(script.contains("--bootstrap-scope control"));
         assert!(script.contains("--bootstrap-native-readiness-timeout-ms 2500"));
@@ -8751,14 +9540,15 @@ mod tests {
         );
         let script = decode_powershell_command(&windows).expect("decode fresh bootstrap command");
         assert!(
-            script.contains("--initial-host-identity 'host-0195f6d5-18da-7a80-8000-000000000001'")
+            script.contains("--initial-host-identity host-0195f6d5-18da-7a80-8000-000000000001")
         );
         assert!(
-            script
-                .contains("--initial-identity-operation-id '0195f6d5-18da-7a80-8000-000000000002'")
+            script.contains("--initial-identity-operation-id 0195f6d5-18da-7a80-8000-000000000002")
         );
-        assert!(script.contains("--initial-identity-record 'satelle.ssh-host-identity-commit.v2"));
-        assert!(script.contains("host start --interactive-bootstrap --bootstrap-token-stdin"));
+        assert!(script.contains("--initial-identity-record satelle.ssh-host-identity-commit.v2"));
+        assert!(script.contains(
+            "$startInfo.Arguments = 'host start --interactive-bootstrap --bootstrap-token-stdin"
+        ));
     }
 
     #[test]
@@ -8789,6 +9579,45 @@ mod tests {
             format!(
                 "/home/operator/.cache/satelle/bootstrap/{operation_id}/{binary_sha256}/satelle"
             )
+        );
+    }
+
+    #[test]
+    fn identity_operation_paths_follow_daemon_override_precedence() {
+        let target = RemoteTarget::WindowsArm64Msvc;
+        let directories = RemoteUserDirectories::for_tests(target);
+        let mut host = satelle_core::SatelleConfig::defaults()
+            .hosts
+            .remove("local-demo")
+            .expect("the built-in local Host config exists");
+        host.daemon_home = Some(PathBuf::from(r"C:\Satelle Home"));
+
+        assert_eq!(
+            target
+                .resolved_daemon_state_root(&directories, &host)
+                .expect("resolve state under daemon home"),
+            r"C:\Satelle Home\state"
+        );
+        assert_eq!(
+            target
+                .resolved_daemon_cache_root(&directories, &host)
+                .expect("resolve cache under daemon home"),
+            r"C:\Satelle Home\cache"
+        );
+
+        host.daemon_state_dir = Some(PathBuf::from(r"C:\Explicit State"));
+        host.daemon_cache_dir = Some(PathBuf::from(r"C:\Explicit Cache"));
+        assert_eq!(
+            target
+                .resolved_daemon_state_root(&directories, &host)
+                .expect("explicit state wins over daemon home"),
+            r"C:\Explicit State"
+        );
+        assert_eq!(
+            target
+                .resolved_daemon_cache_root(&directories, &host)
+                .expect("explicit cache wins over daemon home"),
+            r"C:\Explicit Cache"
         );
     }
 
@@ -9161,74 +9990,64 @@ mod tests {
         assert!(!posix.contains("host bootstrap-lock"));
 
         let windows = RemoteTarget::WindowsX64Msvc.bootstrap_lock_command(&request);
-        assert!(windows.len() < 32_767);
-        let loader = decode_powershell_command(&windows).expect("decode lock loader");
-        assert!(loader.contains("[IO.Compression.GzipStream]"));
-        assert!(loader.contains("ReadToEnd()"));
-        assert!(loader.contains("[scriptblock]::Create($script)"));
-        assert!(loader.contains("& $program"));
-        assert!(!loader.contains("[IO.File]::WriteAllText"));
-        assert!(!loader.contains("Set-ExecutionPolicy"));
-        assert!(!loader.contains("$scriptPath"));
-        assert!(!loader.contains("Add-Type"));
-        assert!(!loader.contains("RedirectStandardInput"));
-        assert!(loader.contains("[Convert]::FromBase64String('"));
-        assert!(!loader.contains("Invoke-Expression $script"));
-        assert!(!windows.contains("repair-operation"));
-        let mailbox = windows_bootstrap_mailbox_command(
-            "repair-operation",
-            "0123456789abcdef0123456789abcdef",
-            "claim.repair-operation.0123456789abcdef0123456789abcdef",
-            42,
-            bootstrap_lock::HEARTBEAT,
-        );
-        let mailbox = decode_powershell_command(&mailbox).expect("decode mailbox command");
-        assert!(mailbox.contains("request.00000000000000000042"));
-        assert!(mailbox.contains("response.00000000000000000042"));
-        assert!(mailbox.contains("[IO.File]::Move($pendingPath, $requestPath)"));
-        assert!(mailbox.contains("[IO.File]::ReadAllText($responsePath)"));
-        assert!(mailbox.contains("Remove-Item -LiteralPath $responsePath"));
-        assert!(mailbox.contains("if ($response -cne $line) { exit 75 }"));
-        assert!(mailbox.contains("if ($false)"));
-        assert!(mailbox.contains("[IO.FileAttributes]::ReparsePoint"));
-        assert!(mailbox.contains("$claimState -cne 'live'"));
-        assert!(mailbox.contains("$claimState -cne 'mutation_started'"));
-        assert!(!mailbox.contains(bootstrap_lock::HEARTBEAT));
-        let release_mailbox = windows_bootstrap_mailbox_command(
-            "repair-operation",
-            "0123456789abcdef0123456789abcdef",
-            "claim.repair-operation.0123456789abcdef0123456789abcdef",
-            43,
-            bootstrap_lock::RELEASE,
-        );
-        let release_mailbox =
-            decode_powershell_command(&release_mailbox).expect("decode release mailbox command");
-        assert!(release_mailbox.contains("if ($true)"));
-        assert!(release_mailbox.contains("while (Test-Path -LiteralPath $claimPath)"));
-        let input_paths = windows_bootstrap_input_paths_command(
-            "repair-operation",
-            "0123456789abcdef0123456789abcdef",
-            "claim.repair-operation.0123456789abcdef0123456789abcdef",
-            "cache_upload",
-            "fedcba9876543210fedcba9876543210",
-        );
-        let input_paths =
-            decode_powershell_command(&input_paths).expect("decode input path command");
-        assert!(input_paths.contains(WINDOWS_MUTATION_INPUT));
-        assert!(input_paths.contains("pending-input."));
-        assert!(input_paths.contains("mutation_started"));
-        assert!(input_paths.contains("mutation_phase"));
-        assert!(input_paths.contains("mutation_attempt"));
-        assert!(input_paths.contains("[Convert]::ToBase64String"));
+        assert_eq!(windows, request.windows_script());
+        assert!(windows.contains("repair-operation"));
+        let ready = windows_bootstrap_ready_command("repair-operation");
+        let ready = decode_powershell_command(&ready).expect("decode ready command");
+        assert!(ready.contains("Join-Path $claim.FullName 'ready'"));
+        assert!(ready.contains("$ready -cne $identity"));
+        assert!(ready.contains("Join-Path $claim.FullName 'mailbox'"));
+        assert!(ready.contains("$state -cne 'live'"));
+        assert!(ready.contains("[IO.FileAttributes]::ReparsePoint"));
+        assert!(ready.contains("satelle-bootstrap-lock-v2 "));
+        assert!(ready.contains("$mailbox.FullName"));
+        assert!(ready.contains("[Convert]::ToBase64String"));
         let script = request.windows_script();
         assert_eq!(script, request.windows_script());
         assert!(script.contains("New-Item -ItemType Directory -Force -Path $lockRoot"));
         assert!(script.contains("$mailboxPath = Join-Path $claimPath 'mailbox'"));
+        assert!(script.contains("Write-Value $claimPath 'ready' $claimIdentity"));
+        assert_occurs_before(
+            &script,
+            "Write-Value $claimPath 'ready' $claimIdentity",
+            "Write-Protocol ('satelle-bootstrap-lock-v2 ",
+        );
         assert!(script.contains("('request.{0:D20}' -f $requestSequence)"));
         assert!(script.contains("('response.{0:D20}' -f $requestSequence)"));
+        assert!(script.contains(bootstrap_lock::MUTATION_RESULT_REQUEST));
+        assert!(script.contains(bootstrap_lock::MUTATION_RESULT_RESPONSE));
+        assert!(script.contains("('mutation-result.' + $mutationAttempt)"));
         assert!(!script.contains("[Console]::In.ReadLine()"));
         assert!(script.contains("[IO.Directory]::Move($pendingPath, $claimPath)"));
         assert!(!script.contains("host bootstrap-lock"));
+    }
+
+    #[test]
+    fn windows_mutation_result_pending_deadline_abandons_exact_attempt() {
+        let phase = "setup_action_start";
+        let attempt = "0123456789abcdef0123456789abcdef";
+        let exchange_failed = AtomicBool::new(false);
+        let mut poll_count = 0;
+        let mut abandoned = None;
+
+        let error = wait_for_windows_mutation_result(
+            Instant::now(),
+            &exchange_failed,
+            |_| {
+                poll_count += 1;
+                Ok(WindowsMutationResult::Pending)
+            },
+            || {
+                abandoned = Some((phase, attempt));
+                Ok(())
+            },
+        )
+        .expect_err("an expired mutation result deadline must stay recovery-pending");
+
+        assert!(matches!(error, SshBootstrapError::BootstrapLockLost));
+        assert_eq!(poll_count, 0);
+        assert_eq!(abandoned, Some((phase, attempt)));
+        assert!(exchange_failed.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -9236,14 +10055,15 @@ mod tests {
         let identity = "0123456789abcdef0123456789abcdef";
         let attempt = "fedcba9876543210fedcba9876543210";
         let basename = "claim.repair-operation.0123456789abcdef";
-        let posix = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+        let posix = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(FencedMutationContext::new(
             "repair-operation",
             identity,
             basename,
             "cache_upload",
             attempt,
             "sh -c 'cat >/tmp/staged'",
-        );
+            true,
+        ));
         assert!(posix.contains("repair-operation"));
         assert!(posix.contains(identity));
         assert!(posix.contains(basename));
@@ -9266,17 +10086,18 @@ mod tests {
         assert!(posix.contains("claim_path=\"$lock_root/$claim_basename\""));
         assert!(!posix.contains("for candidate in"));
 
-        let windows = RemoteTarget::WindowsX64Msvc.fenced_mutation_command(
-            "repair-operation",
-            identity,
-            basename,
-            "cache_upload",
-            attempt,
-            &powershell_encoded_command("exit 0"),
-        );
-        assert!(windows.len() < 32_767);
-        let script = decode_compressed_powershell_command(&windows)
-            .expect("decode compressed fenced mutation command");
+        let encoded_success = powershell_encoded_command("exit 0");
+        let windows =
+            RemoteTarget::WindowsX64Msvc.fenced_mutation_command(FencedMutationContext::new(
+                "repair-operation",
+                identity,
+                basename,
+                "cache_upload",
+                attempt,
+                &encoded_success,
+                true,
+            ));
+        let script = windows;
         assert!(script.contains("repair-operation"));
         assert!(script.contains(identity));
         assert!(script.contains(basename));
@@ -9285,8 +10106,9 @@ mod tests {
         assert!(script.contains("mutation_phase"));
         assert!(script.contains("mutation_attempt"));
         assert!(script.contains("$commitRequired = $false"));
+        assert!(script.contains("$fileBackedResult = $true"));
         assert!(script.contains(attempt));
-        assert!(!script.contains(WINDOWS_MUTATION_INPUT));
+        assert!(!script.contains("satelle-bootstrap-mutation-input-v1"));
         assert!(script.contains("execution_started."));
         assert!(script.contains("execution_succeeded."));
         assert!(script.contains("execution_failed."));
@@ -9313,12 +10135,17 @@ mod tests {
         assert!(script.contains("Get-Item -LiteralPath $payloadPath"));
         assert!(script.contains("[Diagnostics.ProcessStartInfo]::new()"));
         assert!(script.contains("$startInfo.RedirectStandardInput = $true"));
+        assert!(script.contains("Start-Process -FilePath 'powershell.exe'"));
+        assert!(script.contains("-RedirectStandardInput $payloadPath"));
+        assert!(script.contains("-RedirectStandardOutput $stdoutPath"));
+        assert!(script.contains("-RedirectStandardError $stderrPath"));
+        assert!(script.contains("$process.Dispose()"));
+        assert!(script.contains("mutation-result."));
+        assert!(script.contains("[IO.File]::Move($pendingResultPath, $resultPath)"));
         assert!(script.contains("$payloadStream = [IO.File]::OpenRead($payloadPath)"));
         assert!(script.contains("$payloadStream.CopyTo($process.StandardInput.BaseStream)"));
         assert!(script.contains("$process.StandardInput.Close()"));
         assert!(script.contains("$process.WaitForExit()"));
-        assert!(!script.contains("-RedirectStandardInput $payloadPath"));
-        assert!(!script.contains("Start-Process -FilePath"));
         assert!(!script.contains("Invoke-Expression $innerCommand"));
         assert!(script.contains("$phase -ceq 'state_owner_release'"));
         assert!(script.contains("$stateOwnerProcessProbe -eq $false"));
@@ -9329,28 +10156,39 @@ mod tests {
         assert!(script.contains("if ($status -eq 65) { exit 65 }"));
         assert!(script.contains("exit 1"));
 
-        let commit_required_posix = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
-            "repair-operation",
-            identity,
-            basename,
-            "identity_artifact_upload",
-            attempt,
-            "sh -c 'exit 0'",
-        );
+        let commit_required_posix =
+            RemoteTarget::LinuxX64Gnu.fenced_mutation_command(FencedMutationContext::new(
+                "repair-operation",
+                identity,
+                basename,
+                "identity_artifact_upload",
+                attempt,
+                "sh -c 'exit 0'",
+                true,
+            ));
         assert!(commit_required_posix.contains("commit_required=true"));
-        let commit_required_windows = RemoteTarget::WindowsX64Msvc.fenced_mutation_command(
-            "repair-operation",
-            identity,
-            basename,
-            "identity_artifact_upload",
-            attempt,
-            &powershell_encoded_command("exit 0"),
-        );
-        assert!(
-            decode_compressed_powershell_command(&commit_required_windows)
-                .expect("decode compressed commit-required mutation")
-                .contains("$commitRequired = $true")
-        );
+        let commit_required_windows =
+            RemoteTarget::WindowsX64Msvc.fenced_mutation_command(FencedMutationContext::new(
+                "repair-operation",
+                identity,
+                basename,
+                "identity_artifact_upload",
+                attempt,
+                &encoded_success,
+                true,
+            ));
+        assert!(commit_required_windows.contains("$commitRequired = $true"));
+        let streaming_windows =
+            RemoteTarget::WindowsX64Msvc.fenced_mutation_command(FencedMutationContext::new(
+                "repair-operation",
+                identity,
+                basename,
+                "daemon_start",
+                attempt,
+                &encoded_success,
+                false,
+            ));
+        assert!(streaming_windows.contains("$fileBackedResult = $false"));
         assert_occurs_before(
             &script,
             "Remove-Item -LiteralPath $payloadPath -Force -ErrorAction Stop",
@@ -9382,24 +10220,33 @@ mod tests {
 
         let pending = r"C:\Users\Operator\pending-input.123";
         let published = r"C:\Users\Operator\input.123";
-        let response = format!(
-            "{} {} {}\r\n",
-            WINDOWS_MUTATION_INPUT,
-            base64::engine::general_purpose::STANDARD.encode(pending),
-            base64::engine::general_purpose::STANDARD.encode(published),
-        );
-        let paths = parse_windows_fenced_input_paths(response.as_bytes())
-            .expect("parse exact input path frame");
+        let result = r"C:\Users\Operator\mutation-result.123";
+        let stdout = r"C:\Users\Operator\mutation-stdout.123";
+        let stderr = r"C:\Users\Operator\mutation-stderr.123";
+        let ready = r"C:\Users\Operator\start-ready.123";
+        let mailbox = WindowsBootstrapMailbox {
+            destination: "operator@example".to_string(),
+            mailbox_path: r"C:\Users\Operator".to_string(),
+            next_sequence: 1,
+        };
+        let paths = mailbox.input_paths("123");
         assert_eq!(paths.pending, pending);
         assert_eq!(paths.published, published);
+        assert_eq!(paths.result, result);
+        assert_eq!(paths.stdout, stdout);
+        assert_eq!(paths.stderr, stderr);
+        assert_eq!(paths.ready, ready);
         assert_eq!(
             windows_fenced_mutation_cleanup_batch(&paths).unwrap(),
             concat!(
                 "-rm \"/C:/Users/Operator/pending-input.123\"\n",
                 "-rm \"/C:/Users/Operator/input.123\"\n",
+                "-rm \"/C:/Users/Operator/mutation-result.123\"\n",
+                "-rm \"/C:/Users/Operator/mutation-stdout.123\"\n",
+                "-rm \"/C:/Users/Operator/mutation-stderr.123\"\n",
+                "-rm \"/C:/Users/Operator/start-ready.123\"\n",
             )
         );
-        assert!(parse_windows_fenced_input_paths(b"unframed\n").is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -9470,14 +10317,16 @@ mod tests {
                 assert!(inner_command.contains("exec "));
                 assert!(inner_command.contains("host start --bootstrap-token-stdin"));
             }
-            let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
-                operation_id,
-                identity,
-                basename,
-                "daemon_start",
-                attempt,
-                &inner_command,
-            );
+            let fenced =
+                RemoteTarget::LinuxX64Gnu.fenced_mutation_command(FencedMutationContext::new(
+                    operation_id,
+                    identity,
+                    basename,
+                    "daemon_start",
+                    attempt,
+                    &inner_command,
+                    true,
+                ));
             let mut child = Command::new("sh")
                 .arg("-c")
                 .arg(fenced)
@@ -9541,14 +10390,15 @@ mod tests {
         fs::write(claim.join("mutation_phase"), "offline_storage_maintenance")
             .expect("write mutation phase");
         fs::write(claim.join("mutation_attempt"), attempt).expect("write mutation attempt");
-        let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+        let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(FencedMutationContext::new(
             operation_id,
             identity,
             basename,
             "offline_storage_maintenance",
             attempt,
             "exit 23",
-        );
+            true,
+        ));
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(fenced)
@@ -9595,14 +10445,16 @@ mod tests {
                 "cat > {}",
                 posix_quote(output.to_str().expect("UTF-8 output path"))
             );
-            let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
-                operation_id,
-                identity,
-                basename,
-                phase,
-                attempt,
-                &inner_command,
-            );
+            let fenced =
+                RemoteTarget::LinuxX64Gnu.fenced_mutation_command(FencedMutationContext::new(
+                    operation_id,
+                    identity,
+                    basename,
+                    phase,
+                    attempt,
+                    &inner_command,
+                    true,
+                ));
             let mut child = Command::new("sh")
                 .arg("-c")
                 .arg(fenced)
@@ -9725,14 +10577,16 @@ mod tests {
                 .release_state_command(release_binary.to_str().expect("UTF-8 temporary path"));
             assert!(!release.contains("exec "));
             assert!(!release.starts_with("sh -c "));
-            let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
-                operation_id,
-                identity,
-                basename,
-                "state_owner_release",
-                attempt,
-                &release,
-            );
+            let fenced =
+                RemoteTarget::LinuxX64Gnu.fenced_mutation_command(FencedMutationContext::new(
+                    operation_id,
+                    identity,
+                    basename,
+                    "state_owner_release",
+                    attempt,
+                    &release,
+                    true,
+                ));
             let mut child = Command::new("sh")
                 .arg("-c")
                 .arg(fenced)
@@ -9772,6 +10626,21 @@ mod tests {
         let ready = read_bootstrap_lock_ready(&mut valid).expect("valid exact claim");
         assert_eq!(ready.identity, identity);
         assert_eq!(ready.basename, basename);
+        assert_eq!(ready.mailbox_path, None);
+
+        let mailbox_path = r"C:\Users\Operator\AppData\Local\Satelle\state\bootstrap.lock\claim.repair-operation.0123456789abcdef\mailbox";
+        let mailbox_frame = base64::engine::general_purpose::STANDARD.encode(mailbox_path);
+        let mut windows = std::io::Cursor::new(format!(
+            "{} {identity} {basename} {mailbox_frame}\n",
+            bootstrap_lock::READY
+        ));
+        assert_eq!(
+            read_bootstrap_lock_ready(&mut windows)
+                .expect("valid Windows mailbox path")
+                .mailbox_path
+                .as_deref(),
+            Some(mailbox_path)
+        );
 
         for invalid in [
             format!("{} {identity} {basename}.closing\n", bootstrap_lock::READY),
@@ -10039,14 +10908,15 @@ mod tests {
         assert_occurs_before(&durable, "exec 3<&0", POSIX_DAEMON_ENVIRONMENT_CLEAR);
         assert_occurs_before(&durable, "SATELLE_STATE_DIR=", "nohup ");
 
-        let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(
+        let fenced = RemoteTarget::LinuxX64Gnu.fenced_mutation_command(FencedMutationContext::new(
             operation_id,
             identity,
             basename,
             "daemon_start",
             attempt,
             &durable,
-        );
+            true,
+        ));
         let observation_reader_path = observation.clone();
         let (observation_sender, observation_receiver) = std::sync::mpsc::sync_channel(1);
         let observation_reader = std::thread::spawn(move || {
