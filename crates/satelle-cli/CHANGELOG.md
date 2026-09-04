@@ -1,3 +1,9 @@
+## satelle-cli@0.1.6
+
+### Native Computer Use execution
+
+Run production local operations through one durable loopback Host Daemon, with native Computer Use execution on Windows and macOS.
+
 ## satelle-cli@0.1.5
 
 ### Linux compatibility
