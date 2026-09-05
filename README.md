@@ -86,7 +86,7 @@ The following surfaces are not implemented and must not be treated as available:
 - Local setup mutation after planning.
 - Direct transport setup or automatic direct-token provisioning.
 - Persistent Host service installation and Host stop/restart lifecycle control.
-- Storage migration or support bundle export.
+- Storage migration.
 - Native Linux Computer Use Host execution.
 
 The first-party Homebrew tap and Scoop bucket are not published yet. Use npm,

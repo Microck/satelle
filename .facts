@@ -755,13 +755,14 @@
 - satelle doctor accepts --timeout only with --refresh and a selected computer-use, provider, or all scope and otherwise reports a typed refresh-timeout-without-refresh usage error @spec @mvp @implemented
 - when doctor refresh selects both computer-use and provider, one --timeout value applies independently to each live probe rather than to their combined wall-clock duration @spec @mvp @implemented
 - satelle doctor implementation uses modular probes internally instead of encoding subsystem checks directly in the command handler @implemented @mvp
-- satelle diagnostic bundle export is deferred until after MVP logs, status, and doctor behavior is implemented @spec @later
-- satelle diagnostic bundle export is a post-MVP support workflow instead of a prerequisite for MVP logs, status, or doctor @spec @later
-- satelle diagnostic bundle export uses the dedicated satelle support bundle command instead of satelle logs --export @spec @later
-- satelle support bundle --host <alias> --output <path> is the exact diagnostic bundle command @spec @later
-- satelle support bundle JSON v1 uses schema_version satelle.support.bundle.v1 and includes status, source Host, output path, artifact byte size, included and not_collected categories, redaction policy version, and created_at @spec @contract @later
-- satelle diagnostic bundles redact secrets and exclude screenshots, raw prompts, full transcripts, and desktop recordings by default @spec @later
-- the default diagnostic bundle includes redacted configuration shape, version information, readiness results, structured errors, up to 2000 recent redacted Log Entries, setup-ledger summaries, and transport diagnostics and marks unavailable categories as not_collected in its manifest @spec @later
+- satelle diagnostic bundle export ships after MVP logs, status, and doctor behavior @spec @implemented
+- satelle diagnostic bundle export is a support workflow layered on implemented logs, status, and doctor diagnostics instead of a prerequisite for them @spec @implemented
+- satelle diagnostic bundle export uses the dedicated satelle support bundle command instead of satelle logs --export @spec @implemented
+- satelle support bundle --host <alias> --output <path> is the exact diagnostic bundle command @spec @implemented
+- satelle support bundle JSON v1 uses schema_version satelle.support.bundle.v1 and includes status, source Host, output path, artifact byte size, included and not_collected categories, redaction policy version, and created_at @spec @contract @implemented
+- satelle diagnostic bundles redact secrets and exclude screenshots, raw prompts, full transcripts, and desktop recordings by default @spec @implemented
+- the default diagnostic bundle includes redacted configuration shape, version information, readiness results, structured errors, up to 2000 recent redacted Log Entries, and transport diagnostics and marks unavailable categories as not_collected in its manifest @spec @implemented
+- the default diagnostic bundle adds setup-ledger summaries once the Host diagnostic APIs expose them @spec @later
 - satelle MVP normal diagnostics are limited to redacted metadata, normalized Satelle Log Entries, Doctor Findings, setup action ledger summaries, typed errors, exit statuses, readiness probe results, and recovery commands @spec @mvp @implemented
 - satelle MVP normal diagnostics do not capture, persist, display, or export raw protocol payloads, raw setup or repair subprocess streams, raw prompts, full transcripts, screenshots, desktop snapshots, or desktop recordings by default @spec @mvp @implemented
 - satelle post-MVP Raw Diagnostic Exports are enabled only by explicit command-specific flags and are never enabled by --verbose, --debug, --json, --events, --plain, YOLO mode, Trusted Profiles, user-level configuration, or project-level configuration @spec @later

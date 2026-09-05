@@ -24,14 +24,21 @@ fn satelle() -> Command {
 #[test]
 fn internal_failures_keep_their_typed_cause_and_exit_with_the_internal_class() {
     let sandbox = tempfile::tempdir().expect("temporary Satelle home should be created");
-    let bundle_path = sandbox.path().join("support-bundle.zip");
 
     let output = satelle()
         .env("SATELLE_STATE_DIR", sandbox.path())
         .env("SATELLE_LOG", "satelle=debug")
-        .args(["support", "bundle", "--output"])
-        .arg(bundle_path)
-        .arg("--json")
+        .args([
+            "host",
+            "storage",
+            "migrate",
+            "--host",
+            "local-demo",
+            "--to",
+            "/tmp/satelle-state",
+            "--dry-run",
+            "--json",
+        ])
         .assert()
         .code(70)
         .get_output()

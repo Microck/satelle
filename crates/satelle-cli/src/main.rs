@@ -18,6 +18,7 @@ mod read;
 #[path = "self-update.rs"]
 mod self_update;
 mod skills;
+mod support;
 mod tailscale;
 #[path = "tailscale-serve.rs"]
 mod tailscale_serve;
@@ -1224,7 +1225,7 @@ enum SupportCommand {
 }
 
 #[derive(Args, Debug)]
-#[command(about = "Unavailable in this release: support bundle export is not implemented")]
+#[command(about = "Export a redacted diagnostic bundle")]
 struct SupportBundleCommand {
     #[arg(long)]
     host: Option<String>,
@@ -2064,7 +2065,7 @@ fn execute_command(
         Command::Mcp {
             command: McpCommand::Install(command),
         } => run_mcp_install(command, profile, &config, output).map(|_| None),
-        Command::Support { command } => run_support(command).map(|_| None),
+        Command::Support { command } => support::run_support(command, config, output).map(|_| None),
     }
 }
 
@@ -13076,19 +13077,6 @@ fn prompt_remote_host_update(
                 source,
             ))
         })
-}
-
-fn run_support(command: SupportCommand) -> Result<(), CliFailure> {
-    match command {
-        SupportCommand::Bundle(command) => Err(failure(SatelleError::not_implemented(format!(
-            "support bundle export is not implemented yet{}",
-            command
-                .output
-                .as_ref()
-                .map(|path| format!(" for output {}", path.display()))
-                .unwrap_or_default()
-        )))),
-    }
 }
 
 fn report_not_admitted<T>(

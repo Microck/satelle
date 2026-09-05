@@ -29,7 +29,7 @@ Global options include `--no-color`, `--profile <name>`, and
 | `satelle mcp serve` | Serve the MCP interface over stdio | Implemented |
 | `satelle mcp install` | Configure a supported AI client to call Satelle MCP | Implemented |
 | `satelle skills list` / `get` / `path` | Discover and materialize the release-matched Agent Skill Bundle | Implemented |
-| `satelle support bundle` | Export a support bundle | Not implemented |
+| `satelle support bundle` | Export a redacted support bundle | Implemented |
 | `satelle self update` | Update the executable and optional remotes | Verified local update and optional stable-release single-Host handoff implemented; prerelease and explicit multi-Host handoffs remain unavailable |
 | `satelle completions` | Generate shell completions | Implemented |
 
@@ -73,6 +73,6 @@ result was refreshed. It does not create a Session or admit a prompt Turn.
 ## Unavailable command families
 
 Commands can appear in `--help` before their implementation is complete.
-Host stop/restart, storage migration, and support bundle export currently
-return typed not-implemented errors. The embedded Agent Skill Bundle is
+Host stop/restart and storage migration currently return typed
+not-implemented errors. The embedded Agent Skill Bundle is
 version-matched to this source tree and available through `satelle skills`.
