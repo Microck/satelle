@@ -50,6 +50,16 @@ mode and reports the fallback. Desktop and provider setup run through the
 authenticated Host after the daemon is ready; the SSH bootstrap does not apply
 those broader components directly.
 
+On Windows, persistent mode registers a per-user Task Scheduler logon task
+for the bootstrap OS account with an interactive-token principal, so the
+daemon runs inside the operator's desktop session with least privilege. An
+interactive session must exist: the task does not start when nobody is logged
+on. Do not reconfigure the task to run whether or not a user is logged on,
+and do not install the daemon as a Session 0 Windows Service. Without an
+interactive desktop, screen capture and input injection fail. Setup reads the
+registered task definition back on later runs and rejects anything that is
+not the expected interactive-token logon task.
+
 ## Bind the visible desktop
 
 User configuration can set `desktop_user` and either a preference or a native
