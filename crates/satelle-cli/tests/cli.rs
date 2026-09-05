@@ -12,6 +12,7 @@ use std::fs;
 use std::fs::File;
 #[cfg(unix)]
 use std::io::BufRead;
+#[cfg(unix)]
 use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::io::Write;
