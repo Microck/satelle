@@ -1,3 +1,11 @@
+## satelle-cli@0.1.7
+
+### Diagnostic support bundles
+
+Export a redacted diagnostic bundle with `satelle support bundle` when normal
+diagnostics are not enough, and run Windows persistent Hosts on the documented
+interactive-token logon task.
+
 ## satelle-cli@0.1.6
 
 ### Native Computer Use execution
