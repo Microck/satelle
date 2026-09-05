@@ -10,10 +10,11 @@ use std::collections::BTreeSet;
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::fs::File;
+#[cfg(unix)]
+use std::io::BufRead;
+use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::io::Write;
-#[cfg(unix)]
-use std::io::{BufRead, Read};
 use std::net::TcpListener;
 #[cfg(target_os = "linux")]
 use std::net::TcpStream;
@@ -2289,7 +2290,7 @@ fn run_and_steer_help_explain_events_and_yolo_authority() {
 }
 
 #[test]
-fn support_bundle_help_marks_the_command_unavailable() {
+fn support_bundle_help_describes_the_redacted_export() {
     let output = satelle()
         .args(["support", "bundle", "--help"])
         .assert()
@@ -2298,8 +2299,68 @@ fn support_bundle_help_marks_the_command_unavailable() {
         .clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("Unavailable in this release"));
-    assert!(stdout.contains("support bundle export is not implemented"));
+    assert!(stdout.contains("Export a redacted diagnostic bundle"));
+    assert!(!stdout.contains("not implemented"));
+}
+
+#[test]
+fn support_bundle_writes_a_redacted_archive_and_json_report() {
+    let state = state_dir();
+    let bundle_path = state.path().join("support-bundle.tar.gz");
+    let output = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "support",
+            "bundle",
+            "--output",
+            bundle_path.to_str().expect("UTF-8 bundle path"),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json_output(&output.stdout);
+    assert_eq!(report["schema_version"], "satelle.support.bundle.v1");
+    assert_eq!(report["redaction_policy_version"], "satelle.redaction.v1");
+    assert_eq!(report["status"], "partial");
+    assert!(
+        report["included"]
+            .as_array()
+            .expect("included categories")
+            .iter()
+            .any(|value| value == "version")
+    );
+    assert!(
+        report["not_collected"]
+            .as_array()
+            .expect("not_collected categories")
+            .iter()
+            .any(|value| value["category"] == "setup_ledger")
+    );
+    assert!(bundle_path.exists());
+    assert!(report["artifact_byte_size"].as_u64().expect("byte size") > 0);
+
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["support", "bundle", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid-usage"));
+
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "support",
+            "bundle",
+            "--output",
+            bundle_path.to_str().expect("UTF-8 bundle path"),
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("input-required"));
 }
 
 #[test]
@@ -8148,8 +8209,9 @@ adapter = "fake"
 #[test]
 fn future_cli_surfaces_parse_and_return_typed_not_implemented() {
     let state = state_dir();
-    for args in [
-        vec![
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
             "host",
             "storage",
             "migrate",
@@ -8159,22 +8221,10 @@ fn future_cli_surfaces_parse_and_return_typed_not_implemented() {
             "/tmp/satelle-state",
             "--dry-run",
             "--json",
-        ],
-        vec![
-            "support",
-            "bundle",
-            "--output",
-            "/tmp/satelle-bundle.zip",
-            "--json",
-        ],
-    ] {
-        satelle()
-            .env("SATELLE_STATE_DIR", state.path())
-            .args(args)
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains(r#""code": "not-implemented""#));
-    }
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(r#""code": "not-implemented""#));
 }
 
 #[test]
@@ -10472,10 +10522,8 @@ auth_source = "operator-auth"
         assert_command_canaries_are_absent(&explain, &[CANARY]);
     }
 
-    // `support bundle` is not implemented in PR10. The diagnostics packet
-    // must replace this structural no-artifact proof with archive-content proof.
-    let bundle_path = state.path().join("support-bundle.tar");
-    let unavailable = satelle()
+    let bundle_path = state.path().join("support-bundle.tar.gz");
+    let bundled = satelle()
         .env("SATELLE_CONFIG_FILE", &user_config)
         .env("SATELLE_STATE_DIR", state.path())
         .args([
@@ -10486,15 +10534,33 @@ auth_source = "operator-auth"
             "--json",
         ])
         .assert()
-        .failure()
+        .success()
         .get_output()
         .clone();
-    assert_command_canaries_are_absent(&unavailable, &[CANARY]);
+    assert_command_canaries_are_absent(&bundled, &[CANARY]);
     assert_eq!(
-        parse_json_output(&unavailable.stderr)["code"],
-        "not-implemented"
+        parse_json_output(&bundled.stdout)["schema_version"],
+        "satelle.support.bundle.v1"
     );
-    assert!(!bundle_path.exists());
+    assert!(bundle_path.exists());
+    let compressed = fs::read(&bundle_path).expect("read support bundle");
+    let mut decompressed = Vec::new();
+    flate2::read::GzDecoder::new(compressed.as_slice())
+        .read_to_end(&mut decompressed)
+        .expect("decompress support bundle");
+    let mut archive_bytes = Vec::new();
+    for entry in tar::Archive::new(decompressed.as_slice())
+        .entries()
+        .expect("open support bundle archive")
+    {
+        let mut entry = entry.expect("support bundle entry");
+        let mut bytes = Vec::new();
+        entry
+            .read_to_end(&mut bytes)
+            .expect("read support bundle entry");
+        archive_bytes.extend(bytes);
+    }
+    assert_privacy_canaries_absent("support bundle archive", &archive_bytes, &[CANARY]);
     let mut state_bytes = Vec::new();
     collect_regular_file_bytes(state.path(), &mut state_bytes);
     assert_privacy_canaries_absent("Host state tree", &state_bytes, &[CANARY]);

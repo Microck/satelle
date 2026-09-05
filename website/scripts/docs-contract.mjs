@@ -16,6 +16,7 @@ const publicSchemaSources = [
   'crates/satelle-core/src/events.rs',
   'crates/satelle-cli/src/output.rs',
   'crates/satelle-cli/src/error-output.rs',
+  'crates/satelle-cli/src/support.rs',
   'crates/satelle-host/src/log-page.rs',
 ];
 
