@@ -1,7 +1,7 @@
 use assert_cmd::cargo::CommandCargoExt;
 use satelle_host::{ApiBearerToken, test_support::TestStateDir};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
@@ -153,10 +153,6 @@ fn mutation_mcp_command_for(home: &Path) -> Command {
 
 fn run_mcp(messages: &[Value]) -> Output {
     let (mut command, _home) = mcp_command();
-    run_mcp_command(&mut command, messages)
-}
-
-fn run_mcp_command(command: &mut Command, messages: &[Value]) -> Output {
     let mut child = command.spawn().expect("spawn MCP server");
     {
         let mut stdin = child.stdin.take().expect("piped stdin");
@@ -168,25 +164,37 @@ fn run_mcp_command(command: &mut Command, messages: &[Value]) -> Output {
     child.wait_with_output().expect("wait for MCP server")
 }
 
-fn run_mcp_command_until_response(
+// Drives a scripted session and only closes stdin after every expected
+// response has arrived on stdout. Closing stdin earlier lets EOF race
+// in-flight requests: the server shuts down and silently drops whatever it
+// has not answered yet, which flakes slow runners (notably Windows CI).
+fn run_mcp_command_until_responses(
     command: &mut Command,
     messages: &[Value],
-    response_id: u64,
+    response_ids: &[u64],
 ) -> Output {
+    assert!(
+        !response_ids.is_empty(),
+        "waiting for zero responses cannot distinguish a live server from EOF shutdown"
+    );
     let mut child = command.spawn().expect("spawn MCP server");
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let (response_sender, response_receiver) = mpsc::sync_channel(1);
+    let expected: BTreeSet<u64> = response_ids.iter().copied().collect();
 
     let stdout_reader = thread::spawn(move || {
         let mut output = Vec::new();
+        let mut pending = expected;
         for line in BufReader::new(stdout).lines() {
             let line = line.expect("read MCP stdout");
             output.extend_from_slice(line.as_bytes());
             output.push(b'\n');
             if let Ok(response) = serde_json::from_str::<Value>(&line)
-                && response["id"] == response_id
+                && let Some(id) = response.get("id").and_then(Value::as_u64)
+                && pending.remove(&id)
+                && pending.is_empty()
             {
                 let _ = response_sender.try_send(());
             }
@@ -215,8 +223,22 @@ fn run_mcp_command_until_response(
             child.wait().expect("reap wedged MCP server");
             let stdout = stdout_reader.join().expect("join MCP stdout reader");
             let stderr = stderr_reader.join().expect("join MCP stderr reader");
+            let seen: BTreeSet<u64> = String::from_utf8_lossy(&stdout)
+                .lines()
+                .filter_map(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .ok()?
+                        .get("id")?
+                        .as_u64()
+                })
+                .collect();
+            let missing: Vec<u64> = response_ids
+                .iter()
+                .copied()
+                .filter(|id| !seen.contains(id))
+                .collect();
             panic!(
-                "MCP response {response_id} did not arrive before the test infrastructure deadline ({error}); stdout: {}; stderr: {}",
+                "MCP responses {missing:?} did not arrive before the test infrastructure deadline ({error}); stdout: {}; stderr: {}",
                 String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&stderr)
             );
@@ -399,28 +421,33 @@ fn assert_schema_accepts(tool: &str, schema: &Value, instance: &Value) {
 
 #[test]
 fn initialize_and_tool_contracts_are_sdk_compatible() {
-    let output = run_mcp(&[
-        initialize(1),
-        initialized(),
-        json!({"jsonrpc": "2.0", "method": "notifications/example", "params": {}}),
-        json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/cancelled",
-            "params": {"requestId": 999, "reason": "nothing is running"}
-        }),
-        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
-        tool_call(3, "paths", json!({})),
-        tool_call(4, "status", json!({"session_id": SESSION_ID})),
-        json!({"jsonrpc": "2.0", "id": 5, "method": "satelle/unknown", "params": {}}),
-        tool_call(6, "unknown", json!({})),
-        tool_call(7, "paths", json!({"unexpected": true})),
-        tool_call(8, "config_check", json!({})),
-        tool_call(9, "config_explain", json!({})),
-        tool_call(10, "logs", json!({"tail": 1})),
-        tool_call(11, "doctor", json!({"scope": "config"})),
-        tool_call(12, "host_status", json!({})),
-        tool_call(13, "host_sessions", json!({})),
-    ]);
+    let (mut command, _home) = mcp_command();
+    let output = run_mcp_command_until_responses(
+        &mut command,
+        &[
+            initialize(1),
+            initialized(),
+            json!({"jsonrpc": "2.0", "method": "notifications/example", "params": {}}),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 999, "reason": "nothing is running"}
+            }),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            tool_call(3, "paths", json!({})),
+            tool_call(4, "status", json!({"session_id": SESSION_ID})),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "satelle/unknown", "params": {}}),
+            tool_call(6, "unknown", json!({})),
+            tool_call(7, "paths", json!({"unexpected": true})),
+            tool_call(8, "config_check", json!({})),
+            tool_call(9, "config_explain", json!({})),
+            tool_call(10, "logs", json!({"tail": 1})),
+            tool_call(11, "doctor", json!({"scope": "config"})),
+            tool_call(12, "host_status", json!({})),
+            tool_call(13, "host_sessions", json!({})),
+        ],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+    );
 
     assert!(
         output.status.success(),
@@ -586,7 +613,7 @@ fn initialize_and_tool_contracts_are_sdk_compatible() {
 fn mutating_tools_require_explicit_server_enablement_and_use_cli_policy() {
     let home = TestStateDir::new().expect("production-safe temporary Satelle home");
     let mut command = mutation_mcp_command_for(home.path());
-    let output = run_mcp_command(
+    let output = run_mcp_command_until_responses(
         &mut command,
         &[
             initialize(1),
@@ -603,6 +630,7 @@ fn mutating_tools_require_explicit_server_enablement_and_use_cli_policy() {
                 json!({"action": "stop", "host": "local-demo"}),
             ),
         ],
+        &[1, 2, 3, 4],
     );
     assert!(
         output.status.success(),
@@ -709,7 +737,9 @@ fn mutation_tools_reject_inputs_outside_their_advertised_schemas() {
             .map(|(id, tool, arguments)| tool_call(*id, tool, arguments.clone())),
     );
 
-    let output = run_mcp_command(&mut command, &messages);
+    let mut expected_ids = vec![1];
+    expected_ids.extend(invalid_calls.iter().map(|(id, _, _)| *id));
+    let output = run_mcp_command_until_responses(&mut command, &messages, &expected_ids);
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -730,7 +760,7 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
     let home = TestStateDir::new().expect("production-safe temporary Satelle home");
     let session_id = seed_session(home.path());
     let mut success_command = mcp_command_for(home.path(), true);
-    let success_output = run_mcp_command(
+    let success_output = run_mcp_command_until_responses(
         &mut success_command,
         &[
             initialize(1),
@@ -745,6 +775,7 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
             tool_call(16, "logs", json!({"tail": 100})),
             tool_call(17, "paths", json!({"host": "local-demo"})),
         ],
+        &[1, 2, 10, 11, 12, 13, 14, 15, 16, 17],
     );
     assert!(
         success_output.status.success(),
@@ -839,7 +870,7 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
     );
 
     let mut error_command = mcp_command_for(home.path(), true);
-    let error_output = run_mcp_command(
+    let error_output = run_mcp_command_until_responses(
         &mut error_command,
         &[
             initialize(20),
@@ -850,6 +881,7 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
             tool_call(24, "doctor", json!({"host": "missing-host"})),
             tool_call(25, "host_sessions", json!({"host": "missing-host"})),
         ],
+        &[20, 21, 22, 23, 24, 25],
     );
     assert!(error_output.status.success());
     let error_responses = responses(&error_output);
@@ -874,13 +906,14 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
     let path_home = TestStateDir::new().expect("production-safe temporary invalid-path home");
     let mut path_error_command = mcp_command_for(path_home.path(), true);
     path_error_command.env("SATELLE_LOG_DIR", "relative-log-directory");
-    let path_error_output = run_mcp_command(
+    let path_error_output = run_mcp_command_until_responses(
         &mut path_error_command,
         &[
             initialize(30),
             initialized(),
             tool_call(31, "paths", json!({})),
         ],
+        &[30, 31],
     );
     assert!(path_error_output.status.success());
     let path_error_responses = responses(&path_error_output);
@@ -897,14 +930,14 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
 fn blocked_doctor_is_a_structured_error_with_the_complete_report_as_text() {
     let home = TestStateDir::new().expect("production-safe temporary Satelle home");
     let mut command = mcp_command_for(home.path(), false);
-    let output = run_mcp_command_until_response(
+    let output = run_mcp_command_until_responses(
         &mut command,
         &[
             initialize(1),
             initialized(),
             tool_call(2, "doctor", json!({"scope": "codex"})),
         ],
-        2,
+        &[2],
     );
     assert!(
         output.status.success(),
@@ -961,7 +994,12 @@ fn logs_since_grammar_accepts_zero_and_rejects_noncanonical_tokens() {
         json!({"after": "slc1_0000000000000000", "tail": 1}),
     ));
 
-    let output = run_mcp(&messages);
+    let mut expected_ids = vec![1];
+    expected_ids.extend(10..=12);
+    expected_ids.extend(20..=27);
+    expected_ids.push(30);
+    let (mut command, _home) = mcp_command();
+    let output = run_mcp_command_until_responses(&mut command, &messages, &expected_ids);
     assert!(output.status.success());
     let responses = responses(&output);
     for id in 10..=12 {
@@ -1008,7 +1046,7 @@ api_token = {{ kind = "file", path = {token_path} }}
 
     let mut command = mcp_command_for(home.path(), false);
     command.env("SATELLE_CONFIG_FILE", &config_file);
-    let output = run_mcp_command(
+    let output = run_mcp_command_until_responses(
         &mut command,
         &[
             initialize(1),
@@ -1020,6 +1058,7 @@ api_token = {{ kind = "file", path = {token_path} }}
             tool_call(6, "host_sessions", json!({})),
             tool_call(7, "paths", json!({"host": "remote"})),
         ],
+        &[1, 2, 3, 4, 5, 6, 7],
     );
     let accepted_connections = endpoint.shutdown();
 
