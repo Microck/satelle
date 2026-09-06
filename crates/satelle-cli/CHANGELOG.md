@@ -1,3 +1,10 @@
+## satelle-cli@0.1.8
+
+### Windows CI reliability
+
+Eliminate stdin-EOF races in the MCP integration tests that flaked Windows CI
+runs. No behavior change.
+
 ## satelle-cli@0.1.7
 
 ### Diagnostic support bundles
