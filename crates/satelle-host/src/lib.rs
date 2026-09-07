@@ -5657,20 +5657,6 @@ fn apply_production_doctor_registry_events(
                 scheduler
                     .finish(&probe_id, completion)
                     .expect("registry timeout belongs to a running probe");
-                if options.refresh() && probe_id == DoctorScope::ComputerUse.as_str() {
-                    // A worker still cleaning up cannot return its native
-                    // result. Project the registry's authoritative timeout
-                    // through the same native result path as a worker reply.
-                    let timing = scheduler
-                        .timing(&probe_id)
-                        .expect("a terminal native probe has scheduler timing");
-                    execution.native_refresh = Some((
-                        Err(SatelleError::native_readiness_timeout()),
-                        timing.started_at.clone(),
-                        timing.finished_at.clone(),
-                        timing.duration,
-                    ));
-                }
                 records.push(DoctorProbeExecutionRecord {
                     probe_id,
                     status: DoctorProbeStatus::TimedOut,
@@ -5800,6 +5786,27 @@ impl ProductionDoctorExecution {
                 finished_at,
                 duration,
                 scope_selection.contains(DoctorScope::ComputerUse),
+            );
+        } else if options.refresh()
+            && scope_selection.contains(DoctorScope::ComputerUse)
+            && projection.records.iter().any(|record| {
+                record.probe_id == DoctorScope::ComputerUse.as_str()
+                    && record.status == DoctorProbeStatus::TimedOut
+            })
+        {
+            // The registry proves a timeout, but no worker result proves a
+            // cache write. Render the terminal outcome without applying one.
+            let timing = projection
+                .scheduler
+                .timing(DoctorScope::ComputerUse.as_str())
+                .expect("a terminal native probe has scheduler timing");
+            project_native_refresh(
+                &mut report,
+                &Err(SatelleError::native_readiness_timeout()),
+                timing.started_at.clone(),
+                timing.finished_at.clone(),
+                timing.duration,
+                "not_updated",
             );
         }
         if let Some((refresh, started_at, finished_at, duration)) = self.provider_refresh.take() {
@@ -6290,14 +6297,38 @@ fn apply_native_refresh(
     if !project_public_result {
         return;
     }
+    let cache_status = match refresh {
+        Ok(_) => "refreshed",
+        Err(_) if changed => "refreshed_failed",
+        Err(_) => "not_updated",
+    };
+    project_native_refresh(
+        report,
+        refresh,
+        started_at,
+        finished_at,
+        duration,
+        cache_status,
+    );
+}
 
+/// Shared result rendering for a completed worker and a scheduler timeout.
+/// Cache bookkeeping belongs to observed worker effects, not this projection.
+fn project_native_refresh(
+    report: &mut DoctorReport,
+    refresh: &Result<ReadinessEvidence, SatelleError>,
+    started_at: String,
+    finished_at: String,
+    duration: Duration,
+    cache_status: &str,
+) {
     report
         .findings
         .retain(|finding| finding.scope != "computer-use");
     report
         .probe_results
         .retain(|probe| probe.scope != "computer-use");
-    let (finding, status, cache_status) = match refresh {
+    let (finding, status) = match refresh {
         Ok(readiness) => (
             DoctorFinding {
                 finding_id: "computer-use.native.refresh.passed".to_string(),
@@ -6326,7 +6357,6 @@ fn apply_native_refresh(
                 recovery_command: None,
             },
             "passed",
-            "refreshed",
         ),
         Err(error) => {
             let manual_action_required = error
@@ -6371,11 +6401,6 @@ fn apply_native_refresh(
                     recovery_command: error.recovery_command.clone(),
                 },
                 "blocked",
-                if changed {
-                    "refreshed_failed"
-                } else {
-                    "not_updated"
-                },
             )
         }
     };
