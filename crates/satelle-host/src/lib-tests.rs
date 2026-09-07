@@ -3875,6 +3875,91 @@ fn doctor_native_timeout_without_worker_result_uses_current_execution() {
 }
 
 #[test]
+fn doctor_provider_timeout_preserves_observed_late_cache_outcomes() {
+    for late_cache_status in [None, Some("refreshed"), Some("refreshed_failed")] {
+        let snapshot = capability_snapshot(
+            Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Unavailable,
+                host_platform: HostPlatform::Windows,
+                capabilities: CapabilityMatrix::unproven(),
+            },
+            5_432,
+        );
+        let selection = doctor_selection(&["provider"]);
+        let options = DoctorOptions::new(true, None).unwrap();
+        let mut scheduler = production_doctor_scheduler(
+            production_doctor_probes(
+                selection.scopes(),
+                None,
+                false,
+                (Duration::from_secs(120), Duration::from_secs(60)),
+                true,
+            ),
+            options,
+        )
+        .unwrap();
+        scheduler.start_ready();
+        let mut records = Vec::new();
+        let mut execution = ProductionDoctorExecution::new();
+        execution.snapshot = Some(snapshot.clone());
+        let slot = RwLock::new(snapshot);
+        apply_production_doctor_registry_events(
+            &DoctorTaskRegistry::new(),
+            vec![DoctorRegistryEvent::TimedOut {
+                probe_id: "provider".into(),
+            }],
+            options,
+            &slot,
+            &mut execution,
+            &mut scheduler,
+            &mut records,
+        )
+        .unwrap();
+        if let Some(status) = late_cache_status {
+            apply_production_doctor_effect(
+                &mut execution,
+                ProductionDoctorTaskEffect::PersistedCacheUpdate {
+                    cache: "provider_smoke",
+                    status,
+                },
+            );
+        }
+        let report = execution
+            .project_report(
+                LOCAL_DEMO_HOST,
+                &selection,
+                options,
+                ProductionDoctorProjection {
+                    scheduler: &scheduler,
+                    records: &records,
+                    snapshot_slot: &slot,
+                    fatal_context: false,
+                },
+            )
+            .unwrap();
+        let provider = report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "provider")
+            .unwrap();
+        assert_eq!(provider.status, "timed_out");
+        assert_eq!(
+            provider.cache_status,
+            late_cache_status.unwrap_or("not_persisted")
+        );
+        assert_eq!(report.changed, late_cache_status.is_some());
+        assert_eq!(
+            report.cache_updates,
+            if late_cache_status.is_some() {
+                vec!["provider_smoke".to_string()]
+            } else {
+                Vec::new()
+            }
+        );
+    }
+}
+
+#[test]
 fn doctor_phase0_timeout_keeps_attempt_budget_without_a_new_snapshot() {
     let snapshot = capability_snapshot(
         Phase0CapabilityEvidence {

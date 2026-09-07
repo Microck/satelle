@@ -5823,10 +5823,7 @@ impl ProductionDoctorExecution {
                 timing.started_at.clone(),
                 timing.finished_at.clone(),
                 timing.duration,
-                self.persisted_cache_updates
-                    .get("native_readiness")
-                    .copied()
-                    .unwrap_or("not_updated"),
+                "not_updated",
             );
         }
         if let Some((refresh, started_at, finished_at, duration)) = self.provider_refresh.take() {
@@ -5886,6 +5883,18 @@ impl ProductionDoctorExecution {
                     .any(|entry| entry == *cache_update)
                 {
                     report.cache_updates.push((*cache_update).to_string());
+                }
+            }
+            // Late workers contribute cache outcomes even though their readiness
+            // verdicts no longer count. Keep each row consistent with the report.
+            for probe in &mut report.probe_results {
+                let cache_status = match probe.scope.as_str() {
+                    "computer-use" => self.persisted_cache_updates.get("native_readiness"),
+                    "provider" => self.persisted_cache_updates.get("provider_smoke"),
+                    _ => None,
+                };
+                if let Some(status) = cache_status {
+                    probe.cache_status = (*status).to_string();
                 }
             }
         }
