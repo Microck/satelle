@@ -911,10 +911,10 @@ fn retry_app_server_handshake(command: &Command, deadline: Instant) -> EvidenceS
         let Some(attempt_deadline) = now.checked_add(attempt_cap) else {
             break;
         };
-        let surface =
-            probe_windows_app_policy_until(clone_probe_command(command), attempt_deadline);
-        if surface != EvidenceSurface::Incomplete {
-            return surface;
+        match probe_windows_app_policy_until(clone_probe_command(command), attempt_deadline) {
+            Ok(EvidenceSurface::Incomplete) => {}
+            Ok(surface) => return surface,
+            Err(AppPolicyCleanupFailed) => return EvidenceSurface::Incomplete,
         }
     }
     EvidenceSurface::Incomplete
@@ -947,12 +947,20 @@ fn probe_windows_app_policy_with(command: Command, timeout: Duration) -> Evidenc
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return EvidenceSurface::Incomplete;
     };
-    probe_windows_app_policy_until(command, deadline)
+    probe_windows_app_policy_until(command, deadline).unwrap_or(EvidenceSurface::Incomplete)
 }
 
-fn probe_windows_app_policy_until(mut command: Command, deadline: Instant) -> EvidenceSurface {
+/// The previous attempt still owns an unconfirmed process group or reader.
+/// Starting another app-server after this outcome would compound the leak.
+#[derive(Debug, PartialEq, Eq)]
+struct AppPolicyCleanupFailed;
+
+fn probe_windows_app_policy_until(
+    mut command: Command,
+    deadline: Instant,
+) -> Result<EvidenceSurface, AppPolicyCleanupFailed> {
     if Instant::now() >= deadline {
-        return EvidenceSurface::Incomplete;
+        return Ok(EvidenceSurface::Incomplete);
     }
 
     let mut child = match command
@@ -962,15 +970,21 @@ fn probe_windows_app_policy_until(mut command: Command, deadline: Instant) -> Ev
         .group_spawn()
     {
         Ok(child) => child,
-        Err(_) => return EvidenceSurface::Incomplete,
+        Err(_) => return Ok(EvidenceSurface::Incomplete),
     };
     let Some(mut stdin) = child.inner().stdin.take() else {
-        let _ = terminate_group(&mut child);
-        return EvidenceSurface::Incomplete;
+        return if terminate_group(&mut child) {
+            Ok(EvidenceSurface::Incomplete)
+        } else {
+            Err(AppPolicyCleanupFailed)
+        };
     };
     let Some(stdout) = child.inner().stdout.take() else {
-        let _ = terminate_group(&mut child);
-        return EvidenceSurface::Incomplete;
+        return if terminate_group(&mut child) {
+            Ok(EvidenceSurface::Incomplete)
+        } else {
+            Err(AppPolicyCleanupFailed)
+        };
     };
 
     let (sender, receiver) = mpsc::channel();
@@ -1032,10 +1046,13 @@ fn probe_windows_app_policy_until(mut command: Command, deadline: Instant) -> Ev
         thread::sleep(VERSION_PROBE_POLL_INTERVAL);
     }
     let reader_stopped = reader.is_finished() && reader.join().is_ok();
-    if matches!(status, GroupWaitOutcome::Deadline) && group_stopped && reader_stopped {
-        surface
+    if !group_stopped || !reader_stopped {
+        return Err(AppPolicyCleanupFailed);
+    }
+    if matches!(status, GroupWaitOutcome::Deadline) {
+        Ok(surface)
     } else {
-        EvidenceSurface::Incomplete
+        Ok(EvidenceSurface::Incomplete)
     }
 }
 

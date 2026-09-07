@@ -2252,6 +2252,7 @@
 
 ## native-computer-use
 - satelle Windows readiness diagnostics inspect the current supported Codex Computer Use app policy without hard-coding a version-independent configuration path @spec @mvp @implemented
+- satelle retries incomplete Windows app-policy handshakes only after process-group termination and reader cleanup are confirmed; unconfirmed cleanup stops probing with incomplete evidence @spec @contract @mvp @implemented
 - satelle supports the current Windows Codex app policy in $CODEX_HOME/config.toml under computer_use.windows with always_allowed_app_ids @spec @mvp @implemented
 - satelle treats older $CODEX_HOME/computer-use/config.toml allow-list entries as upstream migration input and does not depend on the removed denied-list schema @spec @mvp @implemented
 - satelle capability probes, not a remembered documentation path, determine whether a Codex release exposes the required native Computer Use app policy and approval behavior @spec @mvp @implemented
