@@ -4389,7 +4389,10 @@ fn execute_test_controller_transport_probe(
 
 enum ProductionDoctorTaskEffect {
     None,
-    PersistedCacheUpdate(&'static str),
+    PersistedCacheUpdate {
+        cache: &'static str,
+        status: &'static str,
+    },
     Snapshot(Result<ProductionCapabilitySnapshot, SatelleError>),
     NativeRefresh {
         refresh: Result<ReadinessEvidence, SatelleError>,
@@ -4431,10 +4434,24 @@ impl ProductionDoctorTaskEffect {
     fn into_late_completion_effect(self) -> Self {
         match self {
             Self::NativeRefresh { refresh, .. } if native_refresh_changed(&refresh) => {
-                Self::PersistedCacheUpdate("native_readiness")
+                Self::PersistedCacheUpdate {
+                    cache: "native_readiness",
+                    status: if refresh.is_ok() {
+                        "refreshed"
+                    } else {
+                        "refreshed_failed"
+                    },
+                }
             }
             Self::ProviderRefresh { refresh, .. } if provider_refresh_changed(&refresh) => {
-                Self::PersistedCacheUpdate("provider_smoke")
+                Self::PersistedCacheUpdate {
+                    cache: "provider_smoke",
+                    status: if refresh.is_ok() {
+                        "refreshed"
+                    } else {
+                        "refreshed_failed"
+                    },
+                }
             }
             _ => Self::None,
         }
@@ -5013,7 +5030,7 @@ struct ProductionDoctorExecution {
     // Start evidence survives a timed-out worker's discarded completion.
     phase0_budget_ms: Arc<Mutex<Option<u64>>>,
     fatal_error: Option<SatelleError>,
-    persisted_cache_updates: BTreeSet<&'static str>,
+    persisted_cache_updates: BTreeMap<&'static str, &'static str>,
     native_refresh: Option<(
         Result<ReadinessEvidence, SatelleError>,
         String,
@@ -5045,7 +5062,7 @@ impl ProductionDoctorExecution {
             snapshot: None,
             phase0_budget_ms: Arc::new(Mutex::new(None)),
             fatal_error: None,
-            persisted_cache_updates: BTreeSet::new(),
+            persisted_cache_updates: BTreeMap::new(),
             native_refresh: None,
             provider_refresh: None,
             provider_auth_evidence: None,
@@ -5061,8 +5078,8 @@ fn apply_production_doctor_effect(
 ) {
     match effect {
         ProductionDoctorTaskEffect::None => {}
-        ProductionDoctorTaskEffect::PersistedCacheUpdate(cache_update) => {
-            execution.persisted_cache_updates.insert(cache_update);
+        ProductionDoctorTaskEffect::PersistedCacheUpdate { cache, status } => {
+            execution.persisted_cache_updates.insert(cache, status);
         }
         ProductionDoctorTaskEffect::Snapshot(Ok(snapshot)) => {
             execution.snapshot = Some(snapshot);
@@ -5794,8 +5811,8 @@ impl ProductionDoctorExecution {
                     && record.status == DoctorProbeStatus::TimedOut
             })
         {
-            // The registry proves a timeout, but no worker result proves a
-            // cache write. Render the terminal outcome without applying one.
+            // A late result loses its readiness verdict, but retains any
+            // observed cache write. A registry-only timeout proves no write.
             let timing = projection
                 .scheduler
                 .timing(DoctorScope::ComputerUse.as_str())
@@ -5806,7 +5823,10 @@ impl ProductionDoctorExecution {
                 timing.started_at.clone(),
                 timing.finished_at.clone(),
                 timing.duration,
-                "not_updated",
+                self.persisted_cache_updates
+                    .get("native_readiness")
+                    .copied()
+                    .unwrap_or("not_updated"),
             );
         }
         if let Some((refresh, started_at, finished_at, duration)) = self.provider_refresh.take() {
@@ -5859,7 +5879,7 @@ impl ProductionDoctorExecution {
         }
         if !self.persisted_cache_updates.is_empty() {
             report.changed = true;
-            for cache_update in &self.persisted_cache_updates {
+            for cache_update in self.persisted_cache_updates.keys() {
                 if !report
                     .cache_updates
                     .iter()
@@ -7935,7 +7955,10 @@ fn doctor_registry_retains_only_cache_mutation_from_late_refresh() {
             ..
         }] if matches!(
             effect.as_ref(),
-            ProductionDoctorTaskEffect::PersistedCacheUpdate("native_readiness")
+            ProductionDoctorTaskEffect::PersistedCacheUpdate {
+                cache: "native_readiness",
+                status: "refreshed_failed",
+            }
         )
     ));
 }

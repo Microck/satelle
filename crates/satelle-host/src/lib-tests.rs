@@ -3766,88 +3766,112 @@ fn capability_snapshot(
 
 #[test]
 fn doctor_native_timeout_without_worker_result_uses_current_execution() {
-    let snapshot = capability_snapshot(
-        Phase0CapabilityEvidence {
-            codex_version: CodexVersionEvidence::Detected {
-                version: MINIMUM_CODEX_VERSION,
+    for late_cache_status in [None, Some("refreshed"), Some("refreshed_failed")] {
+        let snapshot = capability_snapshot(
+            Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Detected {
+                    version: MINIMUM_CODEX_VERSION,
+                },
+                host_platform: HostPlatform::Windows,
+                capabilities: CapabilityMatrix::unproven(),
             },
-            host_platform: HostPlatform::Windows,
-            capabilities: CapabilityMatrix::unproven(),
-        },
-        5_432,
-    );
-    let selection = doctor_selection(&["codex", "computer-use"]);
-    let options = DoctorOptions::new(true, None).unwrap();
-    let mut scheduler = production_doctor_scheduler(
-        production_doctor_probes(
-            selection.scopes(),
-            None,
-            false,
-            (Duration::from_secs(120), Duration::from_secs(60)),
-            true,
-        ),
-        options,
-    )
-    .unwrap();
-    scheduler.start_ready();
-    scheduler
-        .finish(
-            "codex",
-            DoctorProbeCompletion::new(DoctorProbeStatus::Passed, DoctorDependentEvidence::Useful),
-        )
-        .unwrap();
-    scheduler.start_ready();
-    let mut records = vec![DoctorProbeExecutionRecord {
-        probe_id: "codex".into(),
-        status: DoctorProbeStatus::Passed,
-    }];
-    let mut execution = ProductionDoctorExecution::new();
-    execution.snapshot = Some(snapshot.clone());
-    let slot = RwLock::new(snapshot.clone());
-    apply_production_doctor_registry_events(
-        &DoctorTaskRegistry::new(),
-        vec![DoctorRegistryEvent::TimedOut {
-            probe_id: "computer-use".into(),
-        }],
-        options,
-        &slot,
-        &mut execution,
-        &mut scheduler,
-        &mut records,
-    )
-    .unwrap();
-    let report = execution
-        .project_report(
-            LOCAL_DEMO_HOST,
-            &selection,
+            5_432,
+        );
+        let selection = doctor_selection(&["codex", "computer-use"]);
+        let options = DoctorOptions::new(true, None).unwrap();
+        let mut scheduler = production_doctor_scheduler(
+            production_doctor_probes(
+                selection.scopes(),
+                None,
+                false,
+                (Duration::from_secs(120), Duration::from_secs(60)),
+                true,
+            ),
             options,
-            ProductionDoctorProjection {
-                scheduler: &scheduler,
-                records: &records,
-                snapshot_slot: &slot,
-                fatal_context: false,
-            },
         )
         .unwrap();
-    let native = report
-        .probe_results
-        .iter()
-        .find(|probe| probe.scope == "computer-use")
+        scheduler.start_ready();
+        scheduler
+            .finish(
+                "codex",
+                DoctorProbeCompletion::new(
+                    DoctorProbeStatus::Passed,
+                    DoctorDependentEvidence::Useful,
+                ),
+            )
+            .unwrap();
+        scheduler.start_ready();
+        let mut records = vec![DoctorProbeExecutionRecord {
+            probe_id: "codex".into(),
+            status: DoctorProbeStatus::Passed,
+        }];
+        let mut execution = ProductionDoctorExecution::new();
+        execution.snapshot = Some(snapshot.clone());
+        let slot = RwLock::new(snapshot.clone());
+        apply_production_doctor_registry_events(
+            &DoctorTaskRegistry::new(),
+            vec![DoctorRegistryEvent::TimedOut {
+                probe_id: "computer-use".into(),
+            }],
+            options,
+            &slot,
+            &mut execution,
+            &mut scheduler,
+            &mut records,
+        )
         .unwrap();
-    assert_eq!(native.probe_id, "computer-use.native.refresh");
-    assert_eq!(native.status, "timed_out");
-    assert_ne!(native.started_at, snapshot.started_at);
-    assert_ne!(native.finished_at, snapshot.finished_at);
-    assert_ne!(native.duration_ms, snapshot.duration_ms);
-    assert_eq!(native.cache_status, "not_updated");
-    assert!(!report.changed);
-    assert!(report.cache_updates.is_empty());
-    assert!(report.findings.iter().any(|finding| {
-        finding
-            .evidence
+        if let Some(status) = late_cache_status {
+            apply_production_doctor_effect(
+                &mut execution,
+                ProductionDoctorTaskEffect::PersistedCacheUpdate {
+                    cache: "native_readiness",
+                    status,
+                },
+            );
+        }
+        let report = execution
+            .project_report(
+                LOCAL_DEMO_HOST,
+                &selection,
+                options,
+                ProductionDoctorProjection {
+                    scheduler: &scheduler,
+                    records: &records,
+                    snapshot_slot: &slot,
+                    fatal_context: false,
+                },
+            )
+            .unwrap();
+        let native = report
+            .probe_results
             .iter()
-            .any(|entry| entry == "code=native-readiness-timeout")
-    }));
+            .find(|probe| probe.scope == "computer-use")
+            .unwrap();
+        assert_eq!(native.probe_id, "computer-use.native.refresh");
+        assert_eq!(native.status, "timed_out");
+        assert_ne!(native.started_at, snapshot.started_at);
+        assert_ne!(native.finished_at, snapshot.finished_at);
+        assert_ne!(native.duration_ms, snapshot.duration_ms);
+        assert_eq!(
+            native.cache_status,
+            late_cache_status.unwrap_or("not_updated")
+        );
+        assert_eq!(report.changed, late_cache_status.is_some());
+        assert_eq!(
+            report.cache_updates,
+            if late_cache_status.is_some() {
+                vec!["native_readiness".to_string()]
+            } else {
+                Vec::new()
+            }
+        );
+        assert!(report.findings.iter().any(|finding| {
+            finding
+                .evidence
+                .iter()
+                .any(|entry| entry == "code=native-readiness-timeout")
+        }));
+    }
 }
 
 #[test]
