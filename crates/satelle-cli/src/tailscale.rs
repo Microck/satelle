@@ -266,6 +266,7 @@ pub(super) fn execute_transport_only_doctor(
             started_at,
             finished_at,
             duration_ms,
+            phase0_budget_ms: None,
             cache_status: "not_persisted".to_string(),
             dependency_status: "satisfied".to_string(),
             finding_ids,

@@ -46,6 +46,7 @@ pub(super) fn doctor(
             started_at: probe_started_at,
             finished_at: utc_now(),
             duration_ms: 0,
+            phase0_budget_ms: None,
             cache_status: if options.refresh() {
                 "refreshed"
             } else {
@@ -78,6 +79,7 @@ pub(super) fn doctor(
             started_at: started_at.clone(),
             finished_at: utc_now(),
             duration_ms: 0,
+            phase0_budget_ms: None,
             cache_status: "not_persisted".to_string(),
             dependency_status: "satisfied".to_string(),
             finding_ids: vec![finding_id],

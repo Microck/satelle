@@ -4389,7 +4389,10 @@ fn execute_test_controller_transport_probe(
 
 enum ProductionDoctorTaskEffect {
     None,
-    PersistedCacheUpdate(&'static str),
+    PersistedCacheUpdate {
+        cache: &'static str,
+        status: &'static str,
+    },
     Snapshot(Result<ProductionCapabilitySnapshot, SatelleError>),
     NativeRefresh {
         refresh: Result<ReadinessEvidence, SatelleError>,
@@ -4431,10 +4434,24 @@ impl ProductionDoctorTaskEffect {
     fn into_late_completion_effect(self) -> Self {
         match self {
             Self::NativeRefresh { refresh, .. } if native_refresh_changed(&refresh) => {
-                Self::PersistedCacheUpdate("native_readiness")
+                Self::PersistedCacheUpdate {
+                    cache: "native_readiness",
+                    status: if refresh.is_ok() {
+                        "refreshed"
+                    } else {
+                        "refreshed_failed"
+                    },
+                }
             }
             Self::ProviderRefresh { refresh, .. } if provider_refresh_changed(&refresh) => {
-                Self::PersistedCacheUpdate("provider_smoke")
+                Self::PersistedCacheUpdate {
+                    cache: "provider_smoke",
+                    status: if refresh.is_ok() {
+                        "refreshed"
+                    } else {
+                        "refreshed_failed"
+                    },
+                }
             }
             _ => Self::None,
         }
@@ -5010,8 +5027,10 @@ impl Drop for DoctorTaskRegistryInner {
 
 struct ProductionDoctorExecution {
     snapshot: Option<ProductionCapabilitySnapshot>,
+    // Start evidence survives a timed-out worker's discarded completion.
+    phase0_budget_ms: Arc<Mutex<Option<u64>>>,
     fatal_error: Option<SatelleError>,
-    persisted_cache_updates: BTreeSet<&'static str>,
+    persisted_cache_updates: BTreeMap<&'static str, &'static str>,
     native_refresh: Option<(
         Result<ReadinessEvidence, SatelleError>,
         String,
@@ -5041,8 +5060,9 @@ impl ProductionDoctorExecution {
     fn new() -> Self {
         Self {
             snapshot: None,
+            phase0_budget_ms: Arc::new(Mutex::new(None)),
             fatal_error: None,
-            persisted_cache_updates: BTreeSet::new(),
+            persisted_cache_updates: BTreeMap::new(),
             native_refresh: None,
             provider_refresh: None,
             provider_auth_evidence: None,
@@ -5058,8 +5078,8 @@ fn apply_production_doctor_effect(
 ) {
     match effect {
         ProductionDoctorTaskEffect::None => {}
-        ProductionDoctorTaskEffect::PersistedCacheUpdate(cache_update) => {
-            execution.persisted_cache_updates.insert(cache_update);
+        ProductionDoctorTaskEffect::PersistedCacheUpdate { cache, status } => {
+            execution.persisted_cache_updates.insert(cache, status);
         }
         ProductionDoctorTaskEffect::Snapshot(Ok(snapshot)) => {
             execution.snapshot = Some(snapshot);
@@ -5272,9 +5292,14 @@ fn production_doctor_with_provider_intent(
             let spawn_result = match probe.probe_id.as_str() {
                 "codex" => {
                     let snapshot_slot = Arc::clone(snapshot_slot);
+                    let phase0_budget_ms = Arc::clone(&execution.phase0_budget_ms);
                     registry.spawn(request_id, &probe, move |context| {
                         let snapshot = if options.refresh() {
                             let remaining = context.remaining();
+                            *phase0_budget_ms
+                                .lock()
+                                .expect("Phase 0 budget observation lock is not poisoned") =
+                                Some(remaining.as_millis().try_into().unwrap_or(u64::MAX));
                             if remaining.is_zero() {
                                 Err(runtime::integrity_error(
                                     "Phase 0 started without useful-work budget",
@@ -5760,6 +5785,15 @@ impl ProductionDoctorExecution {
             options,
             &snapshot,
         );
+        let phase0_budget_ms = *self
+            .phase0_budget_ms
+            .lock()
+            .expect("Phase 0 budget observation lock is not poisoned");
+        for probe in &mut report.probe_results {
+            if matches!(probe.scope.as_str(), "codex" | "computer-use") {
+                probe.phase0_budget_ms = phase0_budget_ms;
+            }
+        }
 
         if let Some((refresh, started_at, finished_at, duration)) = self.native_refresh.take() {
             apply_native_refresh(
@@ -5769,6 +5803,27 @@ impl ProductionDoctorExecution {
                 finished_at,
                 duration,
                 scope_selection.contains(DoctorScope::ComputerUse),
+            );
+        } else if options.refresh()
+            && scope_selection.contains(DoctorScope::ComputerUse)
+            && projection.records.iter().any(|record| {
+                record.probe_id == DoctorScope::ComputerUse.as_str()
+                    && record.status == DoctorProbeStatus::TimedOut
+            })
+        {
+            // A late result loses its readiness verdict, but retains any
+            // observed cache write. A registry-only timeout proves no write.
+            let timing = projection
+                .scheduler
+                .timing(DoctorScope::ComputerUse.as_str())
+                .expect("a terminal native probe has scheduler timing");
+            project_native_refresh(
+                &mut report,
+                &Err(SatelleError::native_readiness_timeout()),
+                timing.started_at.clone(),
+                timing.finished_at.clone(),
+                timing.duration,
+                "not_updated",
             );
         }
         if let Some((refresh, started_at, finished_at, duration)) = self.provider_refresh.take() {
@@ -5821,13 +5876,25 @@ impl ProductionDoctorExecution {
         }
         if !self.persisted_cache_updates.is_empty() {
             report.changed = true;
-            for cache_update in &self.persisted_cache_updates {
+            for cache_update in self.persisted_cache_updates.keys() {
                 if !report
                     .cache_updates
                     .iter()
                     .any(|entry| entry == *cache_update)
                 {
                     report.cache_updates.push((*cache_update).to_string());
+                }
+            }
+            // Late workers contribute cache outcomes even though their readiness
+            // verdicts no longer count. Keep each row consistent with the report.
+            for probe in &mut report.probe_results {
+                let cache_status = match probe.scope.as_str() {
+                    "computer-use" => self.persisted_cache_updates.get("native_readiness"),
+                    "provider" => self.persisted_cache_updates.get("provider_smoke"),
+                    _ => None,
+                };
+                if let Some(status) = cache_status {
+                    probe.cache_status = (*status).to_string();
                 }
             }
         }
@@ -6049,7 +6116,15 @@ fn apply_production_execution_status(
         match record.status {
             DoctorProbeStatus::Passed | DoctorProbeStatus::Finding => {}
             DoctorProbeStatus::Failed => result.status = "blocked".to_string(),
-            DoctorProbeStatus::TimedOut => result.status = "timed_out".to_string(),
+            DoctorProbeStatus::TimedOut => {
+                let timing = scheduler
+                    .timing(&record.probe_id)
+                    .expect("a terminal probe has scheduler timing");
+                result.status = "timed_out".to_string();
+                result.started_at.clone_from(&timing.started_at);
+                result.finished_at.clone_from(&timing.finished_at);
+                result.duration_ms = timing.duration.as_millis().try_into().unwrap_or(u64::MAX);
+            }
         }
     }
     recompute_doctor_summary(report);
@@ -6203,6 +6278,7 @@ fn apply_provider_refresh(
         started_at,
         finished_at,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        phase0_budget_ms: None,
         cache_status: cache_status.to_string(),
         dependency_status: "satisfied".to_string(),
         finding_ids: vec![finding_id],
@@ -6250,14 +6326,38 @@ fn apply_native_refresh(
     if !project_public_result {
         return;
     }
+    let cache_status = match refresh {
+        Ok(_) => "refreshed",
+        Err(_) if changed => "refreshed_failed",
+        Err(_) => "not_updated",
+    };
+    project_native_refresh(
+        report,
+        refresh,
+        started_at,
+        finished_at,
+        duration,
+        cache_status,
+    );
+}
 
+/// Shared result rendering for a completed worker and a scheduler timeout.
+/// Cache bookkeeping belongs to observed worker effects, not this projection.
+fn project_native_refresh(
+    report: &mut DoctorReport,
+    refresh: &Result<ReadinessEvidence, SatelleError>,
+    started_at: String,
+    finished_at: String,
+    duration: Duration,
+    cache_status: &str,
+) {
     report
         .findings
         .retain(|finding| finding.scope != "computer-use");
     report
         .probe_results
         .retain(|probe| probe.scope != "computer-use");
-    let (finding, status, cache_status) = match refresh {
+    let (finding, status) = match refresh {
         Ok(readiness) => (
             DoctorFinding {
                 finding_id: "computer-use.native.refresh.passed".to_string(),
@@ -6286,7 +6386,6 @@ fn apply_native_refresh(
                 recovery_command: None,
             },
             "passed",
-            "refreshed",
         ),
         Err(error) => {
             let manual_action_required = error
@@ -6331,11 +6430,6 @@ fn apply_native_refresh(
                     recovery_command: error.recovery_command.clone(),
                 },
                 "blocked",
-                if changed {
-                    "refreshed_failed"
-                } else {
-                    "not_updated"
-                },
             )
         }
     };
@@ -6348,6 +6442,7 @@ fn apply_native_refresh(
         started_at,
         finished_at,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        phase0_budget_ms: None,
         cache_status: cache_status.to_string(),
         dependency_status: "satisfied".to_string(),
         finding_ids: vec![finding_id],
@@ -6408,6 +6503,7 @@ fn apply_provider_not_required(
         started_at,
         finished_at,
         duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
+        phase0_budget_ms: None,
         cache_status: "not_required".to_string(),
         dependency_status: "satisfied".to_string(),
         finding_ids: vec![finding_id],
@@ -6848,6 +6944,7 @@ fn production_probe_result(
         started_at,
         finished_at,
         duration_ms,
+        phase0_budget_ms: None,
         cache_status: "not_persisted".to_string(),
         dependency_status: if dependency_blocked {
             "blocked"
@@ -7867,7 +7964,10 @@ fn doctor_registry_retains_only_cache_mutation_from_late_refresh() {
             ..
         }] if matches!(
             effect.as_ref(),
-            ProductionDoctorTaskEffect::PersistedCacheUpdate("native_readiness")
+            ProductionDoctorTaskEffect::PersistedCacheUpdate {
+                cache: "native_readiness",
+                status: "refreshed_failed",
+            }
         )
     ));
 }

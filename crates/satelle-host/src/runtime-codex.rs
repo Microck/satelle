@@ -250,6 +250,10 @@ pub(super) fn probe_control_plane_commands(
     timeout: Option<Duration>,
 ) -> ControlPlaneProbe {
     let timeout = timeout.unwrap_or(PROBE_TIMEOUT);
+    tracing::debug!(
+        budget_ms = timeout.as_millis() as u64,
+        "Control-plane discovery started"
+    );
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return ControlPlaneProbe::unavailable();
     };
@@ -265,6 +269,12 @@ pub(super) fn probe_control_plane_commands(
     let Ok(mcp_server_names) = mcp_server_names_from_json(&mcp_output) else {
         return ControlPlaneProbe::unavailable();
     };
+    tracing::debug!(
+        remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64,
+        "Control-plane MCP inventory finished"
+    );
     let schema_command = move |schema_dir: &Path| {
         schema_command
             .args(["app-server", "generate-json-schema", "--out"])
@@ -2939,8 +2949,15 @@ where
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if !run_schema_generation_to_completion(&mut command, deadline) {
+        tracing::debug!("Control-plane schema generation failed");
         return ControlPlaneProbe::unavailable();
     }
+    tracing::debug!(
+        remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64,
+        "Control-plane schema generation finished"
+    );
 
     let Some(schema) = StableProtocolSchema::read(schema_dir.path()) else {
         return ControlPlaneProbe::unavailable();
@@ -3110,8 +3127,12 @@ pub(super) fn perform_handshake(
         .group_spawn()
     {
         Ok(child) => child,
-        Err(_) => return false,
+        Err(error) => {
+            tracing::debug!(error_kind = ?error.kind(), "Control-plane child failed to start");
+            return false;
+        }
     };
+    tracing::debug!("Control-plane child started with piped stdin and stdout in a process group");
     let Some(mut stdin) = child.inner().stdin.take() else {
         let _ = super::terminate_group(&mut child);
         return false;
@@ -3122,17 +3143,26 @@ pub(super) fn perform_handshake(
     };
 
     if !write_initialize_request(&mut stdin) {
+        tracing::debug!("Control-plane initialize request write or flush failed");
         let _ = super::terminate_group(&mut child);
         return false;
     }
 
     let (sender, receiver) = mpsc::channel();
+    let span = tracing::Span::current();
     let reader = thread::spawn(move || {
-        let result = read_initialize_response(stdout, deadline);
+        let result = span.in_scope(|| read_initialize_response(stdout, deadline));
         let _ = sender.send(result);
     });
     let remaining = deadline.saturating_duration_since(Instant::now());
     let accepted = receiver.recv_timeout(remaining).unwrap_or(false);
+    tracing::debug!(
+        accepted,
+        remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64,
+        "Control-plane initialize response wait finished"
+    );
 
     let initialized_sent = accepted && write_initialized_notification(&mut stdin);
 
@@ -3141,6 +3171,11 @@ pub(super) fn perform_handshake(
             .saturating_duration_since(Instant::now())
             .min(HANDSHAKE_SHUTDOWN_GRACE);
     let status = super::wait_for_group(&mut child, shutdown_deadline);
+    tracing::debug!(
+        ?status,
+        initialized_sent,
+        "Control-plane conversation finished; stdin remains open until cleanup"
+    );
     // The app-server is expected to remain alive after initialization. Always
     // terminate the complete process group or Windows job, including when the
     // leader exited after spawning descendants.
@@ -3183,9 +3218,7 @@ fn write_initialized_notification(writer: &mut impl Write) -> bool {
 }
 
 fn write_json_line(writer: &mut impl Write, value: &Value) -> bool {
-    serde_json::to_writer(&mut *writer, value).is_ok()
-        && writer.write_all(b"\n").is_ok()
-        && writer.flush().is_ok()
+    super::write_json_line(writer, value)
 }
 
 #[cfg(not(windows))]
@@ -3196,10 +3229,11 @@ fn read_initialize_response(stdout: std::process::ChildStdout, deadline: Instant
     }
     let mut reader = BufReader::new(stdout);
 
-    for _ in 0..HANDSHAKE_MESSAGE_LIMIT {
+    for line_number in 1..=HANDSHAKE_MESSAGE_LIMIT {
         let mut line = Vec::new();
         let mut bounded = (&mut reader).take(HANDSHAKE_LINE_LIMIT + 1);
         loop {
+            let previous_length = line.len();
             match bounded.read_until(b'\n', &mut line) {
                 Ok(0) => return false,
                 Ok(_) if line.last() == Some(&b'\n') => break,
@@ -3220,7 +3254,20 @@ fn read_initialize_response(stdout: std::process::ChildStdout, deadline: Instant
                 }
                 Err(_) => return false,
             }
+            if line.len() > previous_length {
+                tracing::debug!(
+                    line_number,
+                    bytes_read = line.len() - previous_length,
+                    buffered_bytes = line.len(),
+                    "Control-plane partial response read"
+                );
+            }
         }
+        tracing::debug!(
+            line_number,
+            bytes_read = line.len(),
+            "Control-plane response line read"
+        );
         if line.len() > HANDSHAKE_LINE_LIMIT as usize {
             return false;
         }
@@ -3269,10 +3316,20 @@ fn read_initialize_response(mut stdout: std::process::ChildStdout, deadline: Ins
         if stdout.read_exact(&mut pending[start..]).is_err() {
             return false;
         }
+        tracing::debug!(
+            bytes_read = read_length,
+            buffered_bytes = pending.len(),
+            "Control-plane response bytes read"
+        );
 
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=newline).collect::<Vec<_>>();
             messages += 1;
+            tracing::debug!(
+                line_number = messages,
+                bytes_read = line.len(),
+                "Control-plane response line read"
+            );
             match classify_initialize_message(&line) {
                 InitializeMessage::Accepted => return true,
                 InitializeMessage::Notification => {}
