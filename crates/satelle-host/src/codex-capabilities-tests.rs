@@ -56,6 +56,23 @@ fn main() {
             "{}",
             r#"{"computer_use":{"windows":{"always_allowed_app_ids":["fixture-paint.exe"]}}}"#,
         ),
+        "flaky-stable" => {
+            let counter_path = std::path::Path::new(&codex_home).join("flaky-counter");
+            let attempt: u32 = std::fs::read_to_string(&counter_path)
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            std::fs::write(&counter_path, (attempt + 1).to_string())
+                .expect("record flaky handshake attempt");
+            if attempt == 0 {
+                std::process::exit(3);
+            }
+            (
+                "{}",
+                "{}",
+                r#"{"computer_use":{"windows":{"always_allowed_app_ids":["fixture-paint.exe"]}}}"#,
+            )
+        },
         "legacy" => ("{}", "{}", "{}"),
         "defaults" => (
             r#"{"model":"gpt-effective","model_provider":"openai-effective"}"#,
@@ -698,6 +715,30 @@ fn a_stable_app_allow_list_does_not_prove_sensitive_action_approval() {
             observed_surface: EvidenceSurface::Stable,
             live_proof: LiveProofStatus::NotObserved,
         }]
+    );
+}
+
+#[test]
+fn app_policy_probe_retries_a_transient_handshake_timeout() {
+    let fixture = compile_windows_app_policy_fixture();
+    let codex_home = tempfile::TempDir::new().expect("create flaky Codex home fixture");
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[computer_use.windows]\nalways_allowed_app_ids = [\"fixture-paint.exe\"]\n",
+    )
+    .expect("write flaky app-policy fixture");
+    let command = windows_app_policy_fixture_command(&fixture, "flaky-stable", codex_home.path());
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    assert_eq!(
+        retry_app_server_handshake(&command, deadline),
+        EvidenceSurface::Stable
+    );
+    let attempts = std::fs::read_to_string(codex_home.path().join("flaky-counter"))
+        .expect("read flaky handshake counter");
+    assert!(
+        attempts.trim().parse::<u32>().unwrap_or(0) >= 2,
+        "the probe did not retry the transient handshake timeout"
     );
 }
 
