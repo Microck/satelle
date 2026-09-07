@@ -1,3 +1,11 @@
+## satelle-cli@0.1.9
+
+### Windows app-policy probe reliability
+
+Allow up to three 30-second app-policy handshake attempts within the caller's
+absolute deadline. Stop retries when process or reader cleanup is unconfirmed.
+This reduces readiness failures caused by transient app-server handshake stalls.
+
 ## satelle-cli@0.1.8
 
 ### Windows CI reliability
