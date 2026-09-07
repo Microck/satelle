@@ -21,6 +21,12 @@ fn main() {
     let mode = std::env::args().nth(1).expect("fixture mode");
     let codex_home = std::env::var("SATELLE_WINDOWS_APP_POLICY_FIXTURE_HOME")
         .expect("fixture Codex home");
+    if mode == "pipe-holder" {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        std::fs::write(std::path::Path::new(&codex_home).join("holder-done"), "done")
+            .expect("record holder completion");
+        return;
+    }
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut line = String::new();
@@ -51,11 +57,44 @@ fn main() {
     }
 
     let (effective_config, origins, layer_config) = match mode.as_str() {
+        #[cfg(unix)]
+        "unclean-reader" => {
+            use std::os::unix::process::CommandExt;
+            let counter_path = std::path::Path::new(&codex_home).join("unclean-counter");
+            let attempts = std::fs::read_to_string(&counter_path).unwrap_or_default();
+            std::fs::write(&counter_path, format!("{attempts}attempt\n"))
+                .expect("record handshake attempt");
+            // A separate process group retains stdout beyond the probe's cleanup grace.
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("pipe-holder")
+                .stdin(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .expect("spawn bounded stdout holder");
+            ("{}", "{}", r#"{"computer_use":{"windows":{"always_allowed_app_ids":[]}}}"#)
+        },
         "stable" => (
             "{}",
             "{}",
             r#"{"computer_use":{"windows":{"always_allowed_app_ids":["fixture-paint.exe"]}}}"#,
         ),
+        "flaky-stable" => {
+            let counter_path = std::path::Path::new(&codex_home).join("flaky-counter");
+            let attempt: u32 = std::fs::read_to_string(&counter_path)
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            std::fs::write(&counter_path, (attempt + 1).to_string())
+                .expect("record flaky handshake attempt");
+            if attempt == 0 {
+                std::process::exit(3);
+            }
+            (
+                "{}",
+                "{}",
+                r#"{"computer_use":{"windows":{"always_allowed_app_ids":["fixture-paint.exe"]}}}"#,
+            )
+        },
         "legacy" => ("{}", "{}", "{}"),
         "defaults" => (
             r#"{"model":"gpt-effective","model_provider":"openai-effective"}"#,
@@ -655,7 +694,7 @@ fn windows_app_policy_probe_does_not_restart_an_existing_deadline() {
 
     assert_eq!(
         probe_windows_app_policy_until(command, deadline),
-        EvidenceSurface::Incomplete
+        Ok(EvidenceSurface::Incomplete)
     );
     assert!(
         started.elapsed() < Duration::from_secs(1),
@@ -699,6 +738,51 @@ fn a_stable_app_allow_list_does_not_prove_sensitive_action_approval() {
             live_proof: LiveProofStatus::NotObserved,
         }]
     );
+}
+
+#[test]
+fn app_policy_probe_retries_a_transient_handshake_timeout() {
+    let fixture = compile_windows_app_policy_fixture();
+    let codex_home = tempfile::TempDir::new().expect("create flaky Codex home fixture");
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[computer_use.windows]\nalways_allowed_app_ids = [\"fixture-paint.exe\"]\n",
+    )
+    .expect("write flaky app-policy fixture");
+    let command = windows_app_policy_fixture_command(&fixture, "flaky-stable", codex_home.path());
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    assert_eq!(
+        retry_app_server_handshake(&command, deadline),
+        EvidenceSurface::Stable
+    );
+    let attempts = std::fs::read_to_string(codex_home.path().join("flaky-counter"))
+        .expect("read flaky handshake counter");
+    assert!(
+        attempts.trim().parse::<u32>().unwrap_or(0) >= 2,
+        "the probe did not retry the transient handshake timeout"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn app_policy_probe_stops_retrying_when_reader_cleanup_fails() {
+    let fixture = compile_windows_app_policy_fixture();
+    let codex_home = tempfile::tempdir().expect("create unclean reader fixture home");
+    let command = windows_app_policy_fixture_command(&fixture, "unclean-reader", codex_home.path());
+    let surface = retry_app_server_handshake(&command, Instant::now() + Duration::from_secs(10));
+    let attempts = std::fs::read_to_string(codex_home.path().join("unclean-counter"))
+        .expect("read handshake counter");
+
+    // Let the bounded holder exit before dropping its temporary home, even if
+    // the assertions below expose an unwanted retry.
+    let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+    while !codex_home.path().join("holder-done").exists() && Instant::now() < cleanup_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(codex_home.path().join("holder-done").exists());
+    assert_eq!(surface, EvidenceSurface::Incomplete);
+    assert_eq!(attempts, "attempt\n");
 }
 
 #[cfg(target_os = "windows")]

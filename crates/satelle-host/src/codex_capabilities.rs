@@ -29,7 +29,8 @@ pub(crate) const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const APP_POLICY_MESSAGE_LIMIT: usize = 128;
 const APP_POLICY_LINE_LIMIT: u64 = 2 * 1024 * 1024;
-const APP_POLICY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const APP_POLICY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const APP_POLICY_PROBE_ATTEMPTS: u32 = 3;
 const EFFECTIVE_DEFAULTS_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 // Windows Hosts commonly run inside a service or Task Scheduler job. Nested
 // job completion notifications can arrive well after the leader exits, so the
@@ -754,17 +755,21 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
             );
             let mut capabilities = CapabilityMatrix::from_control_plane(probe);
             if host_platform == HostPlatform::Windows {
-                let app_policy_deadline =
-                    match budget.deadline(Instant::now(), APP_POLICY_PROBE_TIMEOUT) {
-                        Ok(deadline) => deadline,
-                        Err(failure) => {
-                            return phase0_budget_failure_with_version(
-                                host_platform,
-                                codex_version,
-                                failure,
-                            );
-                        }
-                    };
+                // Give the bounded retry loop below room for every attempt
+                // while still respecting an explicit outer doctor timeout.
+                let app_policy_deadline = match budget.deadline(
+                    Instant::now(),
+                    APP_POLICY_PROBE_TIMEOUT * APP_POLICY_PROBE_ATTEMPTS,
+                ) {
+                    Ok(deadline) => deadline,
+                    Err(failure) => {
+                        return phase0_budget_failure_with_version(
+                            host_platform,
+                            codex_version,
+                            failure,
+                        );
+                    }
+                };
                 capabilities.approval_observation.surface = probe_windows_app_policy(
                     policy_mcp_command,
                     policy_app_server_command,
@@ -886,7 +891,55 @@ fn probe_windows_app_policy(
     else {
         return EvidenceSurface::Incomplete;
     };
-    probe_windows_app_policy_until(command, deadline)
+    retry_app_server_handshake(&command, deadline)
+}
+
+/// Runs the read-only app-policy handshake more than once because a single
+/// attempt flakes on real Windows Hosts: identical handshakes against the
+/// same managed runtime were observed answering anywhere from a few seconds
+/// to more than a minute on ARM64 validation hardware (cold process start,
+/// background services, and updater activity all move the needle). Attempts
+/// are read-only and each one stays inside the caller's absolute deadline.
+fn retry_app_server_handshake(command: &Command, deadline: Instant) -> EvidenceSurface {
+    for _ in 0..APP_POLICY_PROBE_ATTEMPTS {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let attempt_cap = remaining.min(APP_POLICY_PROBE_TIMEOUT);
+        let Some(attempt_deadline) = now.checked_add(attempt_cap) else {
+            break;
+        };
+        match probe_windows_app_policy_until(clone_probe_command(command), attempt_deadline) {
+            Ok(EvidenceSurface::Incomplete) => {}
+            Ok(surface) => return surface,
+            Err(AppPolicyCleanupFailed) => return EvidenceSurface::Incomplete,
+        }
+    }
+    EvidenceSurface::Incomplete
+}
+
+/// Rebuilds a probe child command because `std::process::Command` cannot be
+/// cloned. Probe commands only ever carry a program, arguments, environment
+/// deltas, and an optional working directory.
+fn clone_probe_command(command: &Command) -> Command {
+    let mut rebuilt = Command::new(command.get_program());
+    rebuilt.args(command.get_args());
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                rebuilt.env(key, value);
+            }
+            None => {
+                rebuilt.env_remove(key);
+            }
+        }
+    }
+    if let Some(cwd) = command.get_current_dir() {
+        rebuilt.current_dir(cwd);
+    }
+    rebuilt
 }
 
 #[cfg(test)]
@@ -894,12 +947,20 @@ fn probe_windows_app_policy_with(command: Command, timeout: Duration) -> Evidenc
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return EvidenceSurface::Incomplete;
     };
-    probe_windows_app_policy_until(command, deadline)
+    probe_windows_app_policy_until(command, deadline).unwrap_or(EvidenceSurface::Incomplete)
 }
 
-fn probe_windows_app_policy_until(mut command: Command, deadline: Instant) -> EvidenceSurface {
+/// The previous attempt still owns an unconfirmed process group or reader.
+/// Starting another app-server after this outcome would compound the leak.
+#[derive(Debug, PartialEq, Eq)]
+struct AppPolicyCleanupFailed;
+
+fn probe_windows_app_policy_until(
+    mut command: Command,
+    deadline: Instant,
+) -> Result<EvidenceSurface, AppPolicyCleanupFailed> {
     if Instant::now() >= deadline {
-        return EvidenceSurface::Incomplete;
+        return Ok(EvidenceSurface::Incomplete);
     }
 
     let mut child = match command
@@ -909,15 +970,21 @@ fn probe_windows_app_policy_until(mut command: Command, deadline: Instant) -> Ev
         .group_spawn()
     {
         Ok(child) => child,
-        Err(_) => return EvidenceSurface::Incomplete,
+        Err(_) => return Ok(EvidenceSurface::Incomplete),
     };
     let Some(mut stdin) = child.inner().stdin.take() else {
-        let _ = terminate_group(&mut child);
-        return EvidenceSurface::Incomplete;
+        return if terminate_group(&mut child) {
+            Ok(EvidenceSurface::Incomplete)
+        } else {
+            Err(AppPolicyCleanupFailed)
+        };
     };
     let Some(stdout) = child.inner().stdout.take() else {
-        let _ = terminate_group(&mut child);
-        return EvidenceSurface::Incomplete;
+        return if terminate_group(&mut child) {
+            Ok(EvidenceSurface::Incomplete)
+        } else {
+            Err(AppPolicyCleanupFailed)
+        };
     };
 
     let (sender, receiver) = mpsc::channel();
@@ -979,10 +1046,13 @@ fn probe_windows_app_policy_until(mut command: Command, deadline: Instant) -> Ev
         thread::sleep(VERSION_PROBE_POLL_INTERVAL);
     }
     let reader_stopped = reader.is_finished() && reader.join().is_ok();
-    if matches!(status, GroupWaitOutcome::Deadline) && group_stopped && reader_stopped {
-        surface
+    if !group_stopped || !reader_stopped {
+        return Err(AppPolicyCleanupFailed);
+    }
+    if matches!(status, GroupWaitOutcome::Deadline) {
+        Ok(surface)
     } else {
-        EvidenceSurface::Incomplete
+        Ok(EvidenceSurface::Incomplete)
     }
 }
 
