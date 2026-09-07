@@ -271,6 +271,16 @@ pub enum DoctorProbeState {
 struct ScheduledProbe {
     definition: DoctorProbe,
     state: DoctorProbeState,
+    started_at: Option<(Instant, String)>,
+    timing: Option<DoctorProbeTiming>,
+}
+
+/// Current scheduler execution time, independent of cached evidence timestamps.
+#[derive(Clone, Debug)]
+pub struct DoctorProbeTiming {
+    pub started_at: String,
+    pub finished_at: String,
+    pub duration: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -460,6 +470,8 @@ impl DoctorProbeScheduler {
                     ScheduledProbe {
                         definition: probe,
                         state: DoctorProbeState::Pending,
+                        started_at: None,
+                        timing: None,
                     },
                 )
                 .is_some()
@@ -574,11 +586,13 @@ impl DoctorProbeScheduler {
                 .get_mut(&probe_id)
                 .expect("candidate probe must remain present");
             scheduled_probe.state = DoctorProbeState::Running;
+            let timestamp = crate::utc_now();
+            scheduled_probe.started_at = Some((Instant::now(), timestamp.clone()));
             started.push(scheduled_probe.definition.clone());
             self.schedule_events
                 .push(DoctorProbeScheduleEvent::Started {
                     probe_id,
-                    timestamp: crate::utc_now(),
+                    timestamp,
                 });
             remaining_capacity -= 1;
         }
@@ -601,17 +615,31 @@ impl DoctorProbeScheduler {
             });
         }
         probe.state = DoctorProbeState::Finished(completion);
+        let (started, started_at) = probe
+            .started_at
+            .take()
+            .expect("a running probe has a scheduler start time");
+        let finished_at = crate::utc_now();
+        probe.timing = Some(DoctorProbeTiming {
+            started_at,
+            finished_at: finished_at.clone(),
+            duration: started.elapsed(),
+        });
         self.completion_order.push(probe_id.to_string());
         self.schedule_events
             .push(DoctorProbeScheduleEvent::Finished {
                 probe_id: probe_id.to_string(),
-                timestamp: crate::utc_now(),
+                timestamp: finished_at,
             });
         Ok(())
     }
 
     pub fn state(&self, probe_id: &str) -> Option<&DoctorProbeState> {
         self.probes.get(probe_id).map(|probe| &probe.state)
+    }
+
+    pub fn timing(&self, probe_id: &str) -> Option<&DoctorProbeTiming> {
+        self.probes.get(probe_id)?.timing.as_ref()
     }
 
     pub fn completion_order(&self) -> &[String] {

@@ -1414,7 +1414,6 @@ pub(crate) struct ProductionCapabilitySnapshot {
     verdict: Phase0SupportVerdict,
     control_plane_admission: codex_capabilities::ControlPlaneAdmission,
     budget_failure: Option<codex_capabilities::Phase0BudgetFailure>,
-    phase0_budget_ms: Option<u64>,
     started_at: String,
     finished_at: String,
     duration_ms: u64,
@@ -1437,8 +1436,6 @@ impl ProductionCapabilitySnapshot {
             verdict,
             control_plane_admission: discovery.control_plane_admission,
             budget_failure: discovery.budget_failure,
-            phase0_budget_ms: probe_timeout
-                .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
             started_at,
             finished_at: utc_now(),
             duration_ms,
@@ -5013,6 +5010,8 @@ impl Drop for DoctorTaskRegistryInner {
 
 struct ProductionDoctorExecution {
     snapshot: Option<ProductionCapabilitySnapshot>,
+    // Start evidence survives a timed-out worker's discarded completion.
+    phase0_budget_ms: Arc<Mutex<Option<u64>>>,
     fatal_error: Option<SatelleError>,
     persisted_cache_updates: BTreeSet<&'static str>,
     native_refresh: Option<(
@@ -5044,6 +5043,7 @@ impl ProductionDoctorExecution {
     fn new() -> Self {
         Self {
             snapshot: None,
+            phase0_budget_ms: Arc::new(Mutex::new(None)),
             fatal_error: None,
             persisted_cache_updates: BTreeSet::new(),
             native_refresh: None,
@@ -5275,9 +5275,14 @@ fn production_doctor_with_provider_intent(
             let spawn_result = match probe.probe_id.as_str() {
                 "codex" => {
                     let snapshot_slot = Arc::clone(snapshot_slot);
+                    let phase0_budget_ms = Arc::clone(&execution.phase0_budget_ms);
                     registry.spawn(request_id, &probe, move |context| {
                         let snapshot = if options.refresh() {
                             let remaining = context.remaining();
+                            *phase0_budget_ms
+                                .lock()
+                                .expect("Phase 0 budget observation lock is not poisoned") =
+                                Some(remaining.as_millis().try_into().unwrap_or(u64::MAX));
                             if remaining.is_zero() {
                                 Err(runtime::integrity_error(
                                     "Phase 0 started without useful-work budget",
@@ -5652,6 +5657,20 @@ fn apply_production_doctor_registry_events(
                 scheduler
                     .finish(&probe_id, completion)
                     .expect("registry timeout belongs to a running probe");
+                if options.refresh() && probe_id == DoctorScope::ComputerUse.as_str() {
+                    // A worker still cleaning up cannot return its native
+                    // result. Project the registry's authoritative timeout
+                    // through the same native result path as a worker reply.
+                    let timing = scheduler
+                        .timing(&probe_id)
+                        .expect("a terminal native probe has scheduler timing");
+                    execution.native_refresh = Some((
+                        Err(SatelleError::native_readiness_timeout()),
+                        timing.started_at.clone(),
+                        timing.finished_at.clone(),
+                        timing.duration,
+                    ));
+                }
                 records.push(DoctorProbeExecutionRecord {
                     probe_id,
                     status: DoctorProbeStatus::TimedOut,
@@ -5763,6 +5782,15 @@ impl ProductionDoctorExecution {
             options,
             &snapshot,
         );
+        let phase0_budget_ms = *self
+            .phase0_budget_ms
+            .lock()
+            .expect("Phase 0 budget observation lock is not poisoned");
+        for probe in &mut report.probe_results {
+            if matches!(probe.scope.as_str(), "codex" | "computer-use") {
+                probe.phase0_budget_ms = phase0_budget_ms;
+            }
+        }
 
         if let Some((refresh, started_at, finished_at, duration)) = self.native_refresh.take() {
             apply_native_refresh(
@@ -6052,7 +6080,15 @@ fn apply_production_execution_status(
         match record.status {
             DoctorProbeStatus::Passed | DoctorProbeStatus::Finding => {}
             DoctorProbeStatus::Failed => result.status = "blocked".to_string(),
-            DoctorProbeStatus::TimedOut => result.status = "timed_out".to_string(),
+            DoctorProbeStatus::TimedOut => {
+                let timing = scheduler
+                    .timing(&record.probe_id)
+                    .expect("a terminal probe has scheduler timing");
+                result.status = "timed_out".to_string();
+                result.started_at.clone_from(&timing.started_at);
+                result.finished_at.clone_from(&timing.finished_at);
+                result.duration_ms = timing.duration.as_millis().try_into().unwrap_or(u64::MAX);
+            }
         }
     }
     recompute_doctor_summary(report);
@@ -6854,11 +6890,7 @@ fn production_probe_result(
         started_at,
         finished_at,
         duration_ms,
-        phase0_budget_ms: if capability_probe {
-            snapshot.phase0_budget_ms
-        } else {
-            None
-        },
+        phase0_budget_ms: None,
         cache_status: "not_persisted".to_string(),
         dependency_status: if dependency_blocked {
             "blocked"
@@ -7344,30 +7376,6 @@ mod packet17_doctor_tests {
                 DoctorProbeStatus::TimedOut,
                 DoctorDependentEvidence::NotUseful,
             )
-        );
-        let probe = production_probe_result("computer-use", &[], &snapshot);
-        assert_eq!(serde_json::to_value(probe).unwrap()["phase0_budget_ms"], 0);
-        let unrelated = production_probe_result("config", &[], &snapshot);
-        assert!(
-            serde_json::to_value(unrelated)
-                .unwrap()
-                .get("phase0_budget_ms")
-                .is_none()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn phase0_snapshot_preserves_its_collection_budget() {
-        // Linux returns before launching Codex; the reported budget still
-        // describes the caller's deadline, not elapsed discovery time.
-        let snapshot = ProductionCapabilitySnapshot::collect(Some(Duration::from_millis(119_123)));
-        let probe = production_probe_result("computer-use", &[], &snapshot);
-        assert_eq!(probe.phase0_budget_ms, Some(119_123));
-        let cached_defaults = ProductionCapabilitySnapshot::collect(None);
-        assert_eq!(
-            production_probe_result("computer-use", &[], &cached_defaults).phase0_budget_ms,
-            None
         );
     }
 

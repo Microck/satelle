@@ -3149,8 +3149,9 @@ pub(super) fn perform_handshake(
     }
 
     let (sender, receiver) = mpsc::channel();
+    let span = tracing::Span::current();
     let reader = thread::spawn(move || {
-        let result = read_initialize_response(stdout, deadline);
+        let result = span.in_scope(|| read_initialize_response(stdout, deadline));
         let _ = sender.send(result);
     });
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -3217,9 +3218,7 @@ fn write_initialized_notification(writer: &mut impl Write) -> bool {
 }
 
 fn write_json_line(writer: &mut impl Write, value: &Value) -> bool {
-    serde_json::to_writer(&mut *writer, value).is_ok()
-        && writer.write_all(b"\n").is_ok()
-        && writer.flush().is_ok()
+    super::write_json_line(writer, value)
 }
 
 #[cfg(not(windows))]
@@ -3230,10 +3229,11 @@ fn read_initialize_response(stdout: std::process::ChildStdout, deadline: Instant
     }
     let mut reader = BufReader::new(stdout);
 
-    for _ in 0..HANDSHAKE_MESSAGE_LIMIT {
+    for line_number in 1..=HANDSHAKE_MESSAGE_LIMIT {
         let mut line = Vec::new();
         let mut bounded = (&mut reader).take(HANDSHAKE_LINE_LIMIT + 1);
         loop {
+            let previous_length = line.len();
             match bounded.read_until(b'\n', &mut line) {
                 Ok(0) => return false,
                 Ok(_) if line.last() == Some(&b'\n') => break,
@@ -3254,7 +3254,20 @@ fn read_initialize_response(stdout: std::process::ChildStdout, deadline: Instant
                 }
                 Err(_) => return false,
             }
+            if line.len() > previous_length {
+                tracing::debug!(
+                    line_number,
+                    bytes_read = line.len() - previous_length,
+                    buffered_bytes = line.len(),
+                    "Control-plane partial response read"
+                );
+            }
         }
+        tracing::debug!(
+            line_number,
+            bytes_read = line.len(),
+            "Control-plane response line read"
+        );
         if line.len() > HANDSHAKE_LINE_LIMIT as usize {
             return false;
         }
@@ -3303,10 +3316,20 @@ fn read_initialize_response(mut stdout: std::process::ChildStdout, deadline: Ins
         if stdout.read_exact(&mut pending[start..]).is_err() {
             return false;
         }
+        tracing::debug!(
+            bytes_read = read_length,
+            buffered_bytes = pending.len(),
+            "Control-plane response bytes read"
+        );
 
         while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=newline).collect::<Vec<_>>();
             messages += 1;
+            tracing::debug!(
+                line_number = messages,
+                bytes_read = line.len(),
+                "Control-plane response line read"
+            );
             match classify_initialize_message(&line) {
                 InitializeMessage::Accepted => return true,
                 InitializeMessage::Notification => {}

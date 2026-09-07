@@ -3758,9 +3758,185 @@ fn capability_snapshot(
         verdict: evaluate_phase0_support(evidence),
         control_plane_admission: codex_capabilities::ControlPlaneAdmission::not_applicable(),
         budget_failure: None,
-        phase0_budget_ms: None,
         started_at: "2026-07-09T00:00:00Z".to_string(),
         finished_at: "2026-07-09T00:00:01Z".to_string(),
         duration_ms,
     }
+}
+
+#[test]
+fn doctor_native_timeout_without_worker_result_uses_current_execution() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Windows,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        5_432,
+    );
+    let selection = doctor_selection(&["codex", "computer-use"]);
+    let options = DoctorOptions::new(true, None).unwrap();
+    let mut scheduler = production_doctor_scheduler(
+        production_doctor_probes(
+            selection.scopes(),
+            None,
+            false,
+            (Duration::from_secs(120), Duration::from_secs(60)),
+            true,
+        ),
+        options,
+    )
+    .unwrap();
+    scheduler.start_ready();
+    scheduler
+        .finish(
+            "codex",
+            DoctorProbeCompletion::new(DoctorProbeStatus::Passed, DoctorDependentEvidence::Useful),
+        )
+        .unwrap();
+    scheduler.start_ready();
+    let mut records = vec![DoctorProbeExecutionRecord {
+        probe_id: "codex".into(),
+        status: DoctorProbeStatus::Passed,
+    }];
+    let mut execution = ProductionDoctorExecution::new();
+    execution.snapshot = Some(snapshot.clone());
+    let slot = RwLock::new(snapshot.clone());
+    apply_production_doctor_registry_events(
+        &DoctorTaskRegistry::new(),
+        vec![DoctorRegistryEvent::TimedOut {
+            probe_id: "computer-use".into(),
+        }],
+        options,
+        &slot,
+        &mut execution,
+        &mut scheduler,
+        &mut records,
+    )
+    .unwrap();
+    let report = execution
+        .project_report(
+            LOCAL_DEMO_HOST,
+            &selection,
+            options,
+            ProductionDoctorProjection {
+                scheduler: &scheduler,
+                records: &records,
+                snapshot_slot: &slot,
+                fatal_context: false,
+            },
+        )
+        .unwrap();
+    let native = report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "computer-use")
+        .unwrap();
+    assert_eq!(native.probe_id, "computer-use.native.refresh");
+    assert_eq!(native.status, "timed_out");
+    assert_ne!(native.started_at, snapshot.started_at);
+    assert_ne!(native.finished_at, snapshot.finished_at);
+    assert_ne!(native.duration_ms, snapshot.duration_ms);
+    assert_eq!(native.cache_status, "not_updated");
+    assert!(!report.changed);
+    assert!(report.cache_updates.is_empty());
+    assert!(report.findings.iter().any(|finding| {
+        finding
+            .evidence
+            .iter()
+            .any(|entry| entry == "code=native-readiness-timeout")
+    }));
+}
+
+#[test]
+fn doctor_phase0_timeout_keeps_attempt_budget_without_a_new_snapshot() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Unavailable,
+            host_platform: HostPlatform::Windows,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        5_432,
+    );
+    let selection = doctor_selection(&["codex", "config"]);
+    let options = DoctorOptions::new(true, None).unwrap();
+    let mut scheduler = production_doctor_scheduler(
+        production_doctor_probes(
+            selection.scopes(),
+            None,
+            false,
+            (Duration::from_secs(120), Duration::from_secs(60)),
+            true,
+        ),
+        options,
+    )
+    .unwrap();
+    scheduler.start_ready();
+    scheduler
+        .finish(
+            "codex",
+            DoctorProbeCompletion::new(
+                DoctorProbeStatus::TimedOut,
+                DoctorDependentEvidence::NotUseful,
+            ),
+        )
+        .unwrap();
+    scheduler
+        .finish(
+            "config",
+            DoctorProbeCompletion::new(DoctorProbeStatus::Passed, DoctorDependentEvidence::Useful),
+        )
+        .unwrap();
+    let records = vec![
+        DoctorProbeExecutionRecord {
+            probe_id: "codex".into(),
+            status: DoctorProbeStatus::TimedOut,
+        },
+        DoctorProbeExecutionRecord {
+            probe_id: "config".into(),
+            status: DoctorProbeStatus::Passed,
+        },
+    ];
+    let mut execution = ProductionDoctorExecution::new();
+    // A late completion contributes no snapshot. The start observation remains.
+    *execution.phase0_budget_ms.lock().unwrap() = Some(28_987);
+    let slot = RwLock::new(snapshot.clone());
+    let report = execution
+        .project_report(
+            LOCAL_DEMO_HOST,
+            &selection,
+            options,
+            ProductionDoctorProjection {
+                scheduler: &scheduler,
+                records: &records,
+                snapshot_slot: &slot,
+                fatal_context: false,
+            },
+        )
+        .unwrap();
+    let codex = report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "codex")
+        .unwrap();
+    assert_eq!(codex.status, "timed_out");
+    assert_eq!(
+        serde_json::to_value(codex).unwrap()["phase0_budget_ms"],
+        28_987
+    );
+    assert_ne!(codex.started_at, snapshot.started_at);
+    assert_ne!(codex.duration_ms, snapshot.duration_ms);
+    let config = report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "config")
+        .unwrap();
+    assert!(
+        serde_json::to_value(config)
+            .unwrap()
+            .get("phase0_budget_ms")
+            .is_none()
+    );
 }
