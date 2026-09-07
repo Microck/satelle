@@ -3758,6 +3758,7 @@ fn capability_snapshot(
         verdict: evaluate_phase0_support(evidence),
         control_plane_admission: codex_capabilities::ControlPlaneAdmission::not_applicable(),
         budget_failure: None,
+        phase0_budget_ms: None,
         started_at: "2026-07-09T00:00:00Z".to_string(),
         finished_at: "2026-07-09T00:00:01Z".to_string(),
         duration_ms,

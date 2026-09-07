@@ -8213,6 +8213,9 @@ pub struct DoctorProbeResult {
     pub started_at: String,
     pub finished_at: String,
     pub duration_ms: u64,
+    /// Useful-work budget at collection of this Phase 0 snapshot, if bounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase0_budget_ms: Option<u64>,
     pub cache_status: String,
     pub dependency_status: String,
     pub finding_ids: Vec<String>,

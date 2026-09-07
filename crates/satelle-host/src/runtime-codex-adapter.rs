@@ -3454,6 +3454,7 @@ mod tests {
                 satelle_core::ControlPlaneFailureReason::HandshakeUnavailable,
             ),
             budget_failure: None,
+            phase0_budget_ms: None,
             started_at: "2026-07-17T00:00:00Z".to_string(),
             finished_at: "2026-07-17T00:00:01Z".to_string(),
             duration_ms: 1_000,

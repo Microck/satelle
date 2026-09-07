@@ -672,6 +672,12 @@ impl Phase0SupportVerdict {
 /// version command's bytes are classified and dropped inside this module.
 pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discovery {
     let started_at = Instant::now();
+    let span = tracing::debug_span!(
+        "phase0",
+        budget_ms = probe_timeout.map(|timeout| timeout.as_millis() as u64),
+    );
+    let _entered = span.enter();
+    tracing::debug!("Phase 0 discovery started");
     let host_platform = HostPlatform::current();
     let budget = match Phase0Budget::new(probe_timeout, started_at) {
         Ok(budget) => budget,
@@ -735,6 +741,11 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
         Err(failure) => return phase0_budget_failure(host_platform, failure),
     };
     let codex_version = probe_codex_version(version_command, version_timeout);
+    tracing::debug!(
+        ?codex_version,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "Phase 0 version probe finished"
+    );
     let (capabilities, control_plane_admission) = match codex_version {
         CodexVersionEvidence::Detected { version } if supports_codex_version(version) => {
             let control_plane_timeout = match budget.optional_remaining(Instant::now()) {
@@ -752,6 +763,10 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
                 control_schema_command,
                 control_app_server_command,
                 control_plane_timeout,
+            );
+            tracing::debug!(
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "Phase 0 control-plane probe finished"
             );
             let mut capabilities = CapabilityMatrix::from_control_plane(probe);
             if host_platform == HostPlatform::Windows {
@@ -829,6 +844,7 @@ fn phase0_budget_failure_with_version(
     codex_version: CodexVersionEvidence,
     failure: Phase0BudgetFailure,
 ) -> Phase0Discovery {
+    tracing::debug!(?failure, "Phase 0 budget rejected further work");
     Phase0Discovery {
         evidence: Phase0CapabilityEvidence {
             codex_version,
@@ -901,7 +917,7 @@ fn probe_windows_app_policy(
 /// background services, and updater activity all move the needle). Attempts
 /// are read-only and each one stays inside the caller's absolute deadline.
 fn retry_app_server_handshake(command: &Command, deadline: Instant) -> EvidenceSurface {
-    for _ in 0..APP_POLICY_PROBE_ATTEMPTS {
+    for attempt in 1..=APP_POLICY_PROBE_ATTEMPTS {
         let now = Instant::now();
         if now >= deadline {
             break;
@@ -911,6 +927,13 @@ fn retry_app_server_handshake(command: &Command, deadline: Instant) -> EvidenceS
         let Some(attempt_deadline) = now.checked_add(attempt_cap) else {
             break;
         };
+        let span = tracing::debug_span!(
+            "app_policy_attempt",
+            attempt,
+            remaining_ms = remaining.as_millis() as u64,
+            attempt_budget_ms = attempt_cap.as_millis() as u64,
+        );
+        let _entered = span.enter();
         match probe_windows_app_policy_until(clone_probe_command(command), attempt_deadline) {
             Ok(EvidenceSurface::Incomplete) => {}
             Ok(surface) => return surface,
@@ -970,8 +993,12 @@ fn probe_windows_app_policy_until(
         .group_spawn()
     {
         Ok(child) => child,
-        Err(_) => return Ok(EvidenceSurface::Incomplete),
+        Err(error) => {
+            tracing::debug!(error_kind = ?error.kind(), "App-policy child failed to start");
+            return Ok(EvidenceSurface::Incomplete);
+        }
     };
+    tracing::debug!("App-policy child started with piped stdin and stdout in a process group");
     let Some(mut stdin) = child.inner().stdin.take() else {
         return if terminate_group(&mut child) {
             Ok(EvidenceSurface::Incomplete)
@@ -988,7 +1015,8 @@ fn probe_windows_app_policy_until(
     };
 
     let (sender, receiver) = mpsc::channel();
-    let reader = thread::spawn(move || read_app_policy_messages(stdout, sender));
+    let span = tracing::Span::current();
+    let reader = thread::spawn(move || span.in_scope(|| read_app_policy_messages(stdout, sender)));
     let initialized = write_json_line(
         &mut stdin,
         &serde_json::json!({
@@ -1039,6 +1067,11 @@ fn probe_windows_app_policy_until(
             .saturating_duration_since(Instant::now())
             .min(APP_POLICY_SHUTDOWN_GRACE);
     let status = wait_for_group(&mut child, shutdown_deadline);
+    tracing::debug!(
+        ?status,
+        ?surface,
+        "App-policy conversation finished; stdin remains open until cleanup"
+    );
     let group_stopped = terminate_group(&mut child);
     drop(stdin);
     let reader_cleanup_deadline = Instant::now() + APP_POLICY_SHUTDOWN_GRACE;
@@ -1239,9 +1272,26 @@ fn classify_codex_config_origin(origin: Option<&Value>) -> CodexConfigOriginClas
 }
 
 fn write_json_line(writer: &mut impl Write, value: &Value) -> bool {
-    serde_json::to_writer(&mut *writer, value).is_ok()
-        && writer.write_all(b"\n").is_ok()
-        && writer.flush().is_ok()
+    let Ok(mut bytes) = serde_json::to_vec(value) else {
+        return false;
+    };
+    bytes.push(b'\n');
+    let written = writer.write_all(&bytes).is_ok() && writer.flush().is_ok();
+    // Only log request methods constructed here, never values from config/read.
+    let method = match value.get("method").and_then(Value::as_str) {
+        Some("initialize") => "initialize",
+        Some("initialized") => "initialized",
+        Some("config/read") => "config/read",
+        Some("thread/start") => "thread/start",
+        _ => "other",
+    };
+    tracing::debug!(
+        method,
+        request_bytes = bytes.len(),
+        written,
+        "Codex probe request write and flush"
+    );
+    written
 }
 
 fn read_app_policy_messages(
@@ -1249,7 +1299,7 @@ fn read_app_policy_messages(
     sender: mpsc::Sender<Result<Value, ()>>,
 ) {
     let mut reader = BufReader::new(stdout);
-    for _ in 0..APP_POLICY_MESSAGE_LIMIT {
+    for line_number in 1..=APP_POLICY_MESSAGE_LIMIT {
         let mut line = Vec::new();
         let mut bounded = (&mut reader).take(APP_POLICY_LINE_LIMIT + 1);
         let complete_line = matches!(
@@ -1257,6 +1307,12 @@ fn read_app_policy_messages(
             Ok(read) if read > 0
                 && read <= APP_POLICY_LINE_LIMIT as usize
                 && line.last() == Some(&b'\n')
+        );
+        tracing::debug!(
+            line_number,
+            bytes_read = line.len(),
+            complete_line,
+            "Codex probe response line read"
         );
         if !complete_line {
             let _ = sender.send(Err(()));
@@ -1279,11 +1335,27 @@ fn next_app_policy_result(
 ) -> Option<Value> {
     for _ in 0..APP_POLICY_MESSAGE_LIMIT {
         let remaining = deadline.saturating_duration_since(Instant::now());
+        tracing::debug!(
+            expected_id,
+            remaining_ms = remaining.as_millis() as u64,
+            "Waiting for Codex probe response"
+        );
         if remaining.is_zero() {
             return None;
         }
-        let Ok(Ok(message)) = receiver.recv_timeout(remaining) else {
-            return None;
+        let message = match receiver.recv_timeout(remaining) {
+            Ok(Ok(message)) => message,
+            Ok(Err(())) => {
+                tracing::debug!(
+                    expected_id,
+                    "Codex probe response stream ended or was invalid"
+                );
+                return None;
+            }
+            Err(error) => {
+                tracing::debug!(expected_id, ?error, "Codex probe response unavailable");
+                return None;
+            }
         };
         let object = message.as_object()?;
         match object.get("id").and_then(Value::as_u64) {
@@ -1831,6 +1903,7 @@ pub(crate) fn set_nonblocking(fd: &impl std::os::fd::AsFd) -> std::io::Result<()
     )?)
 }
 
+#[derive(Debug)]
 enum GroupWaitOutcome {
     Exited(std::process::ExitStatus),
     Deadline,

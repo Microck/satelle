@@ -1414,6 +1414,7 @@ pub(crate) struct ProductionCapabilitySnapshot {
     verdict: Phase0SupportVerdict,
     control_plane_admission: codex_capabilities::ControlPlaneAdmission,
     budget_failure: Option<codex_capabilities::Phase0BudgetFailure>,
+    phase0_budget_ms: Option<u64>,
     started_at: String,
     finished_at: String,
     duration_ms: u64,
@@ -1436,6 +1437,8 @@ impl ProductionCapabilitySnapshot {
             verdict,
             control_plane_admission: discovery.control_plane_admission,
             budget_failure: discovery.budget_failure,
+            phase0_budget_ms: probe_timeout
+                .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
             started_at,
             finished_at: utc_now(),
             duration_ms,
@@ -6203,6 +6206,7 @@ fn apply_provider_refresh(
         started_at,
         finished_at,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        phase0_budget_ms: None,
         cache_status: cache_status.to_string(),
         dependency_status: "satisfied".to_string(),
         finding_ids: vec![finding_id],
@@ -6348,6 +6352,7 @@ fn apply_native_refresh(
         started_at,
         finished_at,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        phase0_budget_ms: None,
         cache_status: cache_status.to_string(),
         dependency_status: "satisfied".to_string(),
         finding_ids: vec![finding_id],
@@ -6408,6 +6413,7 @@ fn apply_provider_not_required(
         started_at,
         finished_at,
         duration_ms: duration.as_millis().try_into().unwrap_or(u64::MAX),
+        phase0_budget_ms: None,
         cache_status: "not_required".to_string(),
         dependency_status: "satisfied".to_string(),
         finding_ids: vec![finding_id],
@@ -6848,6 +6854,11 @@ fn production_probe_result(
         started_at,
         finished_at,
         duration_ms,
+        phase0_budget_ms: if capability_probe {
+            snapshot.phase0_budget_ms
+        } else {
+            None
+        },
         cache_status: "not_persisted".to_string(),
         dependency_status: if dependency_blocked {
             "blocked"
@@ -7333,6 +7344,30 @@ mod packet17_doctor_tests {
                 DoctorProbeStatus::TimedOut,
                 DoctorDependentEvidence::NotUseful,
             )
+        );
+        let probe = production_probe_result("computer-use", &[], &snapshot);
+        assert_eq!(serde_json::to_value(probe).unwrap()["phase0_budget_ms"], 0);
+        let unrelated = production_probe_result("config", &[], &snapshot);
+        assert!(
+            serde_json::to_value(unrelated)
+                .unwrap()
+                .get("phase0_budget_ms")
+                .is_none()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn phase0_snapshot_preserves_its_collection_budget() {
+        // Linux returns before launching Codex; the reported budget still
+        // describes the caller's deadline, not elapsed discovery time.
+        let snapshot = ProductionCapabilitySnapshot::collect(Some(Duration::from_millis(119_123)));
+        let probe = production_probe_result("computer-use", &[], &snapshot);
+        assert_eq!(probe.phase0_budget_ms, Some(119_123));
+        let cached_defaults = ProductionCapabilitySnapshot::collect(None);
+        assert_eq!(
+            production_probe_result("computer-use", &[], &cached_defaults).phase0_budget_ms,
+            None
         );
     }
 

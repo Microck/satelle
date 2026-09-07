@@ -721,6 +721,8 @@
 - satelle doctor continues running independent probes after another probe reports a finding, fails, times out, or is skipped @mvp @implemented
 - satelle doctor serializes probes that share native Computer Use, visible desktop control, a provider probe surface, readiness-cache writes, or the same remote service-manager resource @mvp @implemented
 - satelle doctor applies per-probe timeouts and reports timed_out probe results without cancelling unrelated independent probes @mvp @implemented
+- Phase 0 doctor probe results expose phase0_budget_ms as the useful-work budget passed to the snapshot's discovery; snapshots collected with stage defaults and non-Phase-0 probes omit the field @contract @mvp @implemented
+- Phase 0 debug diagnostics record remaining budget, protocol request and response progress, retry attempt, and child exit status without recording raw arguments, configuration, protocol bodies, or private paths @contract @mvp @implemented
 - satelle doctor final human and JSON output orders probe results by scope and stable probe id instead of probe completion order @implemented @mvp
 - satelle doctor may show transient TTY progress in completion order while preserving deterministic final output order @mvp @implemented
 - satelle doctor --json probe_results entries include probe_id, scope, status, started_at, finished_at, duration_ms, cache_status, dependency_status, and finding_ids fields @implemented @mvp

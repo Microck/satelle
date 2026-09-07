@@ -87,6 +87,20 @@ implicitly by a same-name profile.
 Diagnostic verbosity accepts `off`, `info`, `debug`, or `trace`. Precedence is
 `--log-verbosity`, then `SATELLE_LOG`, then profile and user configuration.
 JSON command output never includes diagnostic logs.
+
+For Phase 0 discovery, debug logs report stage budgets, request writes and
+flushes, response line sizes, app-policy attempts, and child process outcomes.
+They exclude raw arguments, configuration values, protocol bodies, and paths.
+Enable debug logging on the process performing discovery; a Controller flag
+does not change the verbosity of an already running Host Daemon. `RUST_LOG`
+does not configure Satelle diagnostics.
+
+Phase 0 rows in doctor JSON and event output include `phase0_budget_ms` when
+the snapshot was collected with a caller deadline. This is the useful-work
+budget at collection, after the scheduler reserves cleanup time. Cached rows
+retain their collection budget. Snapshots collected with per-stage defaults
+and unrelated probes omit the field.
+
 User Host configuration sets the retention baseline. A selected user-owned
 profile can override it. Project configuration cannot set destructive
 retention.

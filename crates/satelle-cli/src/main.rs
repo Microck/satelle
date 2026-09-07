@@ -6886,6 +6886,10 @@ fn doctor_event_records(
                 if probe.dependency_status == "blocked" {
                     continue;
                 }
+                let mut data = json!({"cache_status": probe.cache_status});
+                if let Some(budget_ms) = probe.phase0_budget_ms {
+                    data["phase0_budget_ms"] = json!(budget_ms);
+                }
                 let mut record = doctor_event(
                     &mut seq,
                     DoctorEventType::ProbeStarted,
@@ -6893,7 +6897,7 @@ fn doctor_event_records(
                     &probe.scope,
                     Some(&probe.probe_id),
                     "running",
-                    json!({"cache_status": probe.cache_status}),
+                    data,
                 );
                 record.timestamp.clone_from(timestamp);
                 records.push(record);
@@ -6985,6 +6989,7 @@ mod doctor_event_tests {
             started_at: "2026-07-29T00:00:00Z".to_string(),
             finished_at: "2026-07-29T00:00:01Z".to_string(),
             duration_ms: 1,
+            phase0_budget_ms: None,
             cache_status: "not_persisted".to_string(),
             dependency_status: "satisfied".to_string(),
             finding_ids: Vec::new(),
@@ -7221,6 +7226,7 @@ fn post_start_doctor_failure_event_includes_completed_probe_results() {
         started_at: "2026-07-29T00:00:00Z".to_string(),
         finished_at: "2026-07-29T00:00:00Z".to_string(),
         duration_ms: 0,
+        phase0_budget_ms: None,
         cache_status: "not_persisted".to_string(),
         dependency_status: "satisfied".to_string(),
         finding_ids: Vec::new(),
