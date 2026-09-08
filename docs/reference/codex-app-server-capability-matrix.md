@@ -109,6 +109,15 @@ config for every isolated bridge start, accepts only the exact
 `\\.\pipe\codex-computer-use-<UUID>` shape, and keeps executable and code-path
 authority anchored to the separately authenticated managed inventory.
 
+Each Windows native session owns a private temporary directory for the bundled
+runtime's kernel scripts. Only the Host user can write those files; the Codex
+sandbox group receives read-and-execute access. Satelle supplies that directory
+as `TEMP` and `TMP` to the isolated runtime and removes it after the session's
+processes stop. The Turn still excludes temporary directories from writable
+roots. Startup fails if the staging permissions cannot be established and
+directs the user to check Codex's Windows sandbox setup and Host temporary
+directory access. Satelle does not create or replace Codex's sandbox accounts.
+
 The readiness probe selects the `satelle.exe` identifier returned by that same
 authenticated app inventory. It drives the Satelle-owned readiness window, so
 the Windows proof does not depend on a separate browser target.
