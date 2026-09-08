@@ -1,3 +1,14 @@
+## satelle-cli@0.1.10
+
+### Windows native startup and doctor diagnostics
+
+Fix Windows native Computer Use startup failing to read `kernel.js` by granting
+the Codex sandbox read and execute access to each session's private bridge
+files. Keep those files until process shutdown is confirmed.
+
+Report doctor timeouts from the current probe execution instead of showing
+stale timeout diagnostics.
+
 ## satelle-cli@0.1.9
 
 ### Windows app-policy probe reliability
