@@ -113,8 +113,10 @@ Each Windows native session owns a private temporary directory for the bundled
 runtime's kernel scripts. Only the Host user can write those files; the Codex
 sandbox group receives read-and-execute access. Satelle supplies that directory
 as `TEMP` and `TMP` to the isolated runtime and removes it after the session's
-processes stop. The Turn still excludes temporary directories from writable
-roots. Startup fails if the staging permissions cannot be established and
+processes stop. If Windows process termination cannot be confirmed, the Host
+retains the process group and its staging directory. A later exchange must
+finish that cleanup before it can start. The Turn still excludes temporary
+directories from writable roots. Startup fails if the staging permissions cannot be established and
 directs the user to check Codex's Windows sandbox setup and Host temporary
 directory access. Satelle does not create or replace Codex's sandbox accounts.
 

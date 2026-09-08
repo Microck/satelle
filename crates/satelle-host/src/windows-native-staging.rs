@@ -52,6 +52,11 @@ impl WindowsNativeStaging {
         Ok(staging)
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test() -> Self {
+        tests::staging_for_test().0
+    }
+
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
@@ -147,8 +152,7 @@ mod tests {
         FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
     };
 
-    #[test]
-    fn staging_grants_only_read_execute_and_cleans_up() {
+    pub(super) fn staging_for_test() -> (WindowsNativeStaging, String) {
         // Resolve the built-in Users group by SID so the test also works on
         // localized Windows installations, without installing Codex users.
         let mut sid = [0_u32; SECURITY_MAX_SID_SIZE as usize / size_of::<u32>()];
@@ -188,8 +192,15 @@ mod tests {
             String::from_utf16(&domain[..domain_length as usize]).unwrap(),
             String::from_utf16(&name[..name_length as usize]).unwrap(),
         );
-        let staging =
-            WindowsNativeStaging::create_for_reader(&reader).expect("create native staging");
+        (
+            WindowsNativeStaging::create_for_reader(&reader).expect("create native staging"),
+            reader,
+        )
+    }
+
+    #[test]
+    fn staging_grants_only_read_execute_and_cleans_up() {
+        let (staging, reader) = staging_for_test();
         let path = staging.path().to_path_buf();
         let script = path.join("kernel.js");
         fs::write(&script, "console.log(2)").expect("the Host can stage its script");

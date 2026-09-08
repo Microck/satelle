@@ -1,5 +1,5 @@
 use super::{CodexSessionError, CodexSessionFailure};
-use command_group::CommandGroup;
+use command_group::{CommandGroup, GroupChild};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
@@ -29,6 +29,65 @@ fn join_after_cancelling_io<T>(thread: thread::JoinHandle<T>) -> bool {
     thread.join().is_ok()
 }
 
+/// Native launches carry their runtime files through the same lifetime as the
+/// process group. Read-only control exchanges have no native resources.
+pub(crate) struct CodexCommand {
+    pub(crate) command: Command,
+    pub(crate) native_resources: Option<crate::codex_capabilities::NativeSessionResources>,
+}
+
+impl From<Command> for CodexCommand {
+    fn from(command: Command) -> Self {
+        Self {
+            command,
+            native_resources: None,
+        }
+    }
+}
+
+struct ProcessOwner {
+    child: Option<GroupChild>,
+    native_resources: Option<crate::codex_capabilities::NativeSessionResources>,
+    group_stopped: bool,
+}
+
+#[cfg(windows)]
+static PENDING_CLEANUP: std::sync::Mutex<Vec<ProcessOwner>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn cleanup_pending(processes: &mut Vec<ProcessOwner>) -> bool {
+    processes.retain_mut(|process| {
+        process.group_stopped = matches!(process.child.as_mut().unwrap().try_wait(), Ok(Some(_)));
+        !process.group_stopped
+    });
+    processes.is_empty()
+}
+
+impl Drop for ProcessOwner {
+    fn drop(&mut self) {
+        // On Windows, keep the job handle and runtime files together if the OS
+        // cannot prove shutdown. Admission polls that same job, never a reused PID.
+        #[cfg(windows)]
+        if !self.group_stopped
+            && let Some(child) = self.child.as_mut()
+            && !crate::codex_capabilities::terminate_group(child)
+        {
+            PENDING_CLEANUP
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(Self {
+                    child: self.child.take(),
+                    native_resources: self.native_resources.take(),
+                    group_stopped: false,
+                });
+        }
+        // Close the job before releasing its native files. kill_on_drop also
+        // makes Windows terminate retained jobs if the Host itself exits.
+        drop(self.child.take());
+        drop(self.native_resources.take());
+    }
+}
+
 pub(super) trait CodexExchange {
     type Output;
 
@@ -44,22 +103,44 @@ pub(super) trait CodexExchange {
 }
 
 pub(super) fn run_exchange<E: CodexExchange>(
-    mut command: Command,
+    invocation: CodexCommand,
     working_directory: &Path,
     deadline: Instant,
     exchange: &mut E,
 ) -> Result<E::Output, CodexSessionFailure> {
-    let mut child = command
+    #[cfg(windows)]
+    if !cleanup_pending(
+        &mut PENDING_CLEANUP
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+    ) {
+        return Err(CodexSessionFailure::before_turn_dispatch(
+            CodexSessionError::Containment,
+        ));
+    }
+    let CodexCommand {
+        mut command,
+        native_resources,
+    } = invocation;
+    let child = command
         .current_dir(working_directory)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .group_spawn()
+        .group()
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|_| CodexSessionFailure::before_turn_dispatch(CodexSessionError::Spawn))?;
+    let mut process = ProcessOwner {
+        child: Some(child),
+        native_resources,
+        group_stopped: false,
+    };
+    let child = process.child.as_mut().unwrap();
     let stdin = child.inner().stdin.take();
     let stdout = child.inner().stdout.take();
     let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
-        let _ = crate::codex_capabilities::terminate_group(&mut child);
+        process.group_stopped = crate::codex_capabilities::terminate_group(child);
         return Err(CodexSessionFailure::before_turn_dispatch(
             CodexSessionError::Spawn,
         ));
@@ -67,7 +148,7 @@ pub(super) fn run_exchange<E: CodexExchange>(
 
     #[cfg(unix)]
     if crate::codex_capabilities::set_nonblocking(&stdout).is_err() {
-        let _ = crate::codex_capabilities::terminate_group(&mut child);
+        process.group_stopped = crate::codex_capabilities::terminate_group(child);
         return Err(CodexSessionFailure::before_turn_dispatch(
             CodexSessionError::Spawn,
         ));
@@ -85,7 +166,7 @@ pub(super) fn run_exchange<E: CodexExchange>(
         }) {
         Ok(reader) => reader,
         Err(_) => {
-            let _ = crate::codex_capabilities::terminate_group(&mut child);
+            process.group_stopped = crate::codex_capabilities::terminate_group(child);
             return Err(CodexSessionFailure::before_turn_dispatch(
                 CodexSessionError::Spawn,
             ));
@@ -103,7 +184,7 @@ pub(super) fn run_exchange<E: CodexExchange>(
         Ok(writer_thread) => writer_thread,
         Err(_) => {
             drop(writer);
-            let _ = crate::codex_capabilities::terminate_group(&mut child);
+            process.group_stopped = crate::codex_capabilities::terminate_group(child);
             drop(receiver);
             let _ = join_after_cancelling_io(reader);
             return Err(CodexSessionFailure::before_turn_dispatch(
@@ -127,7 +208,7 @@ pub(super) fn run_exchange<E: CodexExchange>(
         let writer_stopped = writer_thread.take().is_some_and(join_after_cancelling_io);
         if writer_stopped {
             let _ = crate::codex_capabilities::wait_for_group_shutdown(
-                &mut child,
+                child,
                 GRACEFUL_SHUTDOWN_TIMEOUT,
             );
         }
@@ -139,7 +220,8 @@ pub(super) fn run_exchange<E: CodexExchange>(
     // Keep stdout connected until the process group is signaled and reaped.
     // Closing it first can make a backpressured child exit while termination
     // is starting, leaving macOS unable to prove that the group is contained.
-    let group_stopped = crate::codex_capabilities::terminate_group(&mut child);
+    let group_stopped = crate::codex_capabilities::terminate_group(child);
+    process.group_stopped = group_stopped;
     // Release a reader blocked on the bounded queue before joining either pipe
     // owner. A completed reader retains stdout in its JoinHandle until join.
     drop(receiver);
@@ -337,6 +419,58 @@ mod tests {
         assert_eq!(
             writer.read(&mut closed).expect("observe the closed peer"),
             0
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_unconfirmed_group_retains_staging_and_blocks_admission_until_exit() {
+        let (resources, path) =
+            crate::codex_capabilities::NativeSessionResources::windows_for_test();
+        let child = Command::new(
+            std::path::Path::new(&std::env::var_os("SystemRoot").expect("Windows system root"))
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+        )
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .group()
+        .kill_on_drop(true)
+        .spawn()
+        .expect("start a real Windows job");
+        // An unconfirmed teardown retains exactly this ownership record. Use
+        // a local recovery queue so the test cannot gate parallel Host tests.
+        let mut pending = vec![ProcessOwner {
+            child: Some(child),
+            native_resources: Some(resources),
+            group_stopped: false,
+        }];
+        assert!(
+            !cleanup_pending(&mut pending),
+            "a live job must block admission"
+        );
+        assert!(path.is_dir(), "the live job must retain its native staging");
+        assert!(crate::codex_capabilities::terminate_group(
+            pending[0].child.as_mut().unwrap()
+        ));
+        assert!(
+            cleanup_pending(&mut pending),
+            "confirmed exit must reopen admission"
+        );
+        assert!(
+            !path.exists(),
+            "confirmed exit must remove the native staging"
         );
     }
 }

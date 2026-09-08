@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 mod control_plane;
 pub(crate) use control_plane::{
     CodexImageInputMode, ControlPlaneAdmission, NativeComputerUseActionPath,
-    VerifiedComputerUseAppServer, installed_computer_use_app_server,
+    NativeSessionResources, VerifiedComputerUseAppServer, installed_computer_use_app_server,
     installed_read_only_app_server_command, provision_native_computer_use,
 };
 

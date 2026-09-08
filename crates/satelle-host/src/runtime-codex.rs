@@ -455,7 +455,7 @@ fn verified_computer_use_app_server(
         plugin_version: isolation.plugin_version,
         native_runtime_version: prepared_native_bridge.native_runtime_version,
         native_action_evidence: crate::provider_probe::NativeActionEvidence::new(),
-        _native_resources: prepared_native_bridge.native_resources,
+        native_resources: prepared_native_bridge.native_resources,
     })
 }
 
@@ -573,10 +573,17 @@ pub(crate) struct VerifiedComputerUseAppServer {
     plugin_version: String,
     native_runtime_version: String,
     native_action_evidence: crate::provider_probe::NativeActionEvidence,
-    _native_resources: NativeSessionResources,
+    native_resources: NativeSessionResources,
 }
 
 impl VerifiedComputerUseAppServer {
+    pub(crate) fn into_command(self) -> crate::codex_session::CodexCommand {
+        crate::codex_session::CodexCommand {
+            command: self.command,
+            native_resources: Some(self.native_resources),
+        }
+    }
+
     pub(crate) fn plugin_version(&self) -> &str {
         &self.plugin_version
     }
@@ -606,7 +613,7 @@ impl VerifiedComputerUseAppServer {
             plugin_version: "test-plugin-1".to_owned(),
             native_runtime_version: "cdhash-test-bridge-1".to_owned(),
             native_action_evidence: crate::provider_probe::NativeActionEvidence::new(),
-            _native_resources: NativeSessionResources::empty(),
+            native_resources: NativeSessionResources::empty(),
         }
     }
 }
@@ -1681,7 +1688,7 @@ struct PreparedNativeBridge {
     native_resources: NativeSessionResources,
 }
 
-struct NativeSessionResources {
+pub(crate) struct NativeSessionResources {
     #[cfg(windows)]
     _windows: Option<windows_native_staging::WindowsNativeStaging>,
     #[cfg(target_os = "macos")]
@@ -1689,6 +1696,18 @@ struct NativeSessionResources {
 }
 
 impl NativeSessionResources {
+    #[cfg(all(test, windows))]
+    pub(crate) fn windows_for_test() -> (Self, PathBuf) {
+        let staging = windows_native_staging::WindowsNativeStaging::for_test();
+        let path = staging.path().to_path_buf();
+        (
+            Self {
+                _windows: Some(staging),
+            },
+            path,
+        )
+    }
+
     const fn empty() -> Self {
         Self {
             #[cfg(windows)]
