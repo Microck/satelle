@@ -570,9 +570,9 @@ impl ProductionComputerUseAdapter {
             &native_action_evidence,
         )
         .map_err(native_smoke_failure)?;
-        let expected_mcp_server_name = verified_app_server.native_mcp_server_name;
+        let expected_mcp_server_name = verified_app_server.native_mcp_server_name.clone();
         let run = run_codex_session_with_native_action_completion(
-            verified_app_server.command,
+            verified_app_server.into_command(),
             CodexSessionRequest {
                 working_directory: &working_directory,
                 prompt: &prompt,
@@ -824,9 +824,9 @@ impl ProductionComputerUseAdapter {
             &native_action_evidence,
         )
         .map_err(|reason| mark_probe_dispatch_possible(adapter_failure(reason), false))?;
-        let expected_mcp_server_name = verified_app_server.native_mcp_server_name;
+        let expected_mcp_server_name = verified_app_server.native_mcp_server_name.clone();
         let run = run_codex_session_with_timeout_cancellation(
-            verified_app_server.command,
+            verified_app_server.into_command(),
             provider_smoke_session_request(
                 binding,
                 provider_secret,
@@ -2323,13 +2323,13 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 let verified_app_server = preserve_managed_codex_error(
                     crate::codex_capabilities::installed_computer_use_app_server(),
                 )?;
-                let expected_mcp_server_name = verified_app_server.native_mcp_server_name;
+                let expected_mcp_server_name = verified_app_server.native_mcp_server_name.clone();
                 let prompt = native_computer_use_prompt(
                     request.prompt(),
                     &verified_app_server.native_action_path,
                 );
                 let run = run_codex_session_with_timeout_cancellation(
-                    verified_app_server.command,
+                    verified_app_server.into_command(),
                     CodexSessionRequest {
                         working_directory: &working_directory,
                         prompt: &prompt,

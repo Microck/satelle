@@ -20,6 +20,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+#[path = "windows-native-staging.rs"]
+mod windows_native_staging;
+
 const SCHEMA_FILE_LIMIT: u64 = 2 * 1024 * 1024;
 const HANDSHAKE_LINE_LIMIT: u64 = 64 * 1024;
 const HANDSHAKE_MESSAGE_LIMIT: usize = 64;
@@ -451,7 +455,7 @@ fn verified_computer_use_app_server(
         plugin_version: isolation.plugin_version,
         native_runtime_version: prepared_native_bridge.native_runtime_version,
         native_action_evidence: crate::provider_probe::NativeActionEvidence::new(),
-        _native_resources: prepared_native_bridge.native_resources,
+        native_resources: prepared_native_bridge.native_resources,
     })
 }
 
@@ -569,10 +573,17 @@ pub(crate) struct VerifiedComputerUseAppServer {
     plugin_version: String,
     native_runtime_version: String,
     native_action_evidence: crate::provider_probe::NativeActionEvidence,
-    _native_resources: NativeSessionResources,
+    native_resources: NativeSessionResources,
 }
 
 impl VerifiedComputerUseAppServer {
+    pub(crate) fn into_command(self) -> crate::codex_session::CodexCommand {
+        crate::codex_session::CodexCommand {
+            command: self.command,
+            native_resources: Some(self.native_resources),
+        }
+    }
+
     pub(crate) fn plugin_version(&self) -> &str {
         &self.plugin_version
     }
@@ -602,7 +613,7 @@ impl VerifiedComputerUseAppServer {
             plugin_version: "test-plugin-1".to_owned(),
             native_runtime_version: "cdhash-test-bridge-1".to_owned(),
             native_action_evidence: crate::provider_probe::NativeActionEvidence::new(),
-            _native_resources: NativeSessionResources::empty(),
+            native_resources: NativeSessionResources::empty(),
         }
     }
 }
@@ -1602,7 +1613,9 @@ fn prepare_native_bridge(
 ) -> Result<PreparedNativeBridge, SatelleError> {
     match platform {
         "windows" => {
-            let _ = (codex_home, native_env, deadline);
+            let _ = (codex_home, deadline);
+            #[cfg(not(windows))]
+            let _ = native_env;
             validate_native_bridge_filesystem(path, trusted_root, platform)?;
             // The inventory path lives in a user-writable runtime cache. The
             // AppX copy authenticates its bytes, while protected PowerShell
@@ -1610,11 +1623,31 @@ fn prepare_native_bridge(
             // until Windows has opened the child image.
             let inventory_digest = native_bridge_digest(path)?;
             protected_windows_native_bridge(&inventory_digest)?;
+            #[cfg(windows)]
+            let native_resources = {
+                let staging = windows_native_staging::WindowsNativeStaging::create().map_err(|_| {
+                    let mut error = codex_isolation_error("native_staging_permissions_unavailable");
+                    error.message = "native Computer Use cannot create its private staging directory; check that Codex's Windows sandbox setup is complete and the Host can write to its temporary directory".to_string();
+                    error
+                })?;
+                let directory = staging
+                    .path()
+                    .to_str()
+                    .ok_or_else(|| codex_isolation_error("native_staging_path_invalid"))?;
+                for key in ["TEMP", "TMP"] {
+                    native_env.insert(key.to_string(), directory.to_string());
+                }
+                NativeSessionResources {
+                    _windows: Some(staging),
+                }
+            };
+            #[cfg(not(windows))]
+            let native_resources = NativeSessionResources::empty();
             Ok(PreparedNativeBridge {
                 command: windows_powershell_path()?.to_string_lossy().into_owned(),
                 prefix_args: windows_locked_bridge_args(path, &inventory_digest),
                 native_runtime_version: format!("sha256-{}", hex_digest(&inventory_digest)),
-                native_resources: NativeSessionResources::empty(),
+                native_resources,
             })
         }
         "macos" => {
@@ -1655,14 +1688,30 @@ struct PreparedNativeBridge {
     native_resources: NativeSessionResources,
 }
 
-struct NativeSessionResources {
+pub(crate) struct NativeSessionResources {
+    #[cfg(windows)]
+    _windows: Option<windows_native_staging::WindowsNativeStaging>,
     #[cfg(target_os = "macos")]
     _macos: Option<MacosNativeSessionResources>,
 }
 
 impl NativeSessionResources {
+    #[cfg(all(test, windows))]
+    pub(crate) fn windows_for_test() -> (Self, PathBuf) {
+        let staging = windows_native_staging::WindowsNativeStaging::for_test();
+        let path = staging.path().to_path_buf();
+        (
+            Self {
+                _windows: Some(staging),
+            },
+            path,
+        )
+    }
+
     const fn empty() -> Self {
         Self {
+            #[cfg(windows)]
+            _windows: None,
             #[cfg(target_os = "macos")]
             _macos: None,
         }

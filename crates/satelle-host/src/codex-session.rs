@@ -18,6 +18,7 @@ mod codex_process;
 #[path = "codex-turn-read.rs"]
 mod codex_turn_read;
 
+pub(crate) use codex_process::CodexCommand;
 use codex_process::{CodexExchange, ProtocolWriter, ReadEvent, run_exchange};
 
 #[cfg(test)]
@@ -340,11 +341,11 @@ pub(crate) fn run_codex_session(
     command: Command,
     request: CodexSessionRequest<'_>,
 ) -> Result<CodexSessionTerminal, CodexSessionFailure> {
-    run_codex_session_bound(command, request)
+    run_codex_session_bound(command.into(), request)
 }
 
 fn run_codex_session_bound(
-    mut command: Command,
+    mut invocation: CodexCommand,
     request: CodexSessionRequest<'_>,
 ) -> Result<CodexSessionTerminal, CodexSessionFailure> {
     if Instant::now() >= request.deadline {
@@ -352,6 +353,7 @@ fn run_codex_session_bound(
             CodexSessionError::Timeout,
         ));
     }
+    let command = &mut invocation.command;
     if let Some(endpoint) = request.provider_endpoint {
         let Some(model) = request.model else {
             return Err(CodexSessionFailure::before_turn_dispatch(
@@ -412,7 +414,7 @@ fn run_codex_session_bound(
         None => None,
     };
     let mut exchange = SessionExchange::new(request, control);
-    run_exchange(command, working_directory, deadline, &mut exchange)
+    run_exchange(invocation, working_directory, deadline, &mut exchange)
 }
 
 /// Runs an exchange until its user-visible timeout, then uses its registered
@@ -420,13 +422,13 @@ fn run_codex_session_bound(
 /// deadline includes a short grace period so the app server can confirm that
 /// the Turn is no longer active.
 pub(crate) fn run_codex_session_with_timeout_cancellation(
-    command: Command,
+    command: impl Into<CodexCommand>,
     request: CodexSessionRequest<'_>,
     cancellation_grace: Duration,
     admission_cancellation: Option<crate::AdmissionCancellation>,
 ) -> TimedCodexSessionRun {
     run_timed_codex_session(
-        command,
+        command.into(),
         request,
         cancellation_grace,
         admission_cancellation,
@@ -438,7 +440,7 @@ pub(crate) fn run_codex_session_with_timeout_cancellation(
 /// tool item and both OS action callbacks are observed. The latter still uses
 /// the normal correlated interrupt path and requires terminal stop evidence.
 pub(crate) fn run_codex_session_with_native_action_completion(
-    command: Command,
+    command: impl Into<CodexCommand>,
     mut request: CodexSessionRequest<'_>,
     native_action_evidence: NativeActionEvidence,
     cancellation_grace: Duration,
@@ -446,7 +448,7 @@ pub(crate) fn run_codex_session_with_native_action_completion(
 ) -> TimedCodexSessionRun {
     request.native_action_evidence = Some(native_action_evidence.clone());
     run_timed_codex_session(
-        command,
+        command.into(),
         request,
         cancellation_grace,
         admission_cancellation,
@@ -466,7 +468,7 @@ fn interrupt_and_commit(control: &CodexSessionControl) -> StopObservation {
 }
 
 fn run_timed_codex_session(
-    command: Command,
+    command: CodexCommand,
     mut request: CodexSessionRequest<'_>,
     cancellation_grace: Duration,
     admission_cancellation: Option<crate::AdmissionCancellation>,
@@ -542,7 +544,7 @@ pub(crate) fn read_codex_turn(
         request.deadline,
     );
     run_exchange(
-        command,
+        command.into(),
         request.working_directory,
         request.deadline,
         &mut exchange,
