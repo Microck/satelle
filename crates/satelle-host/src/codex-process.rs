@@ -47,7 +47,7 @@ impl From<Command> for CodexCommand {
 
 struct ProcessOwner {
     child: Option<GroupChild>,
-    native_resources: Option<crate::codex_capabilities::NativeSessionResources>,
+    _native_resources: Option<crate::codex_capabilities::NativeSessionResources>,
     group_stopped: bool,
 }
 
@@ -77,14 +77,13 @@ impl Drop for ProcessOwner {
                 .unwrap_or_else(|error| error.into_inner())
                 .push(Self {
                     child: self.child.take(),
-                    native_resources: self.native_resources.take(),
+                    _native_resources: self._native_resources.take(),
                     group_stopped: false,
                 });
         }
         // Close the job before releasing its native files. kill_on_drop also
         // makes Windows terminate retained jobs if the Host itself exits.
         drop(self.child.take());
-        drop(self.native_resources.take());
     }
 }
 
@@ -133,7 +132,7 @@ pub(super) fn run_exchange<E: CodexExchange>(
         .map_err(|_| CodexSessionFailure::before_turn_dispatch(CodexSessionError::Spawn))?;
     let mut process = ProcessOwner {
         child: Some(child),
-        native_resources,
+        _native_resources: native_resources,
         group_stopped: false,
     };
     let child = process.child.as_mut().unwrap();
@@ -453,7 +452,7 @@ mod windows_tests {
         // a local recovery queue so the test cannot gate parallel Host tests.
         let mut pending = vec![ProcessOwner {
             child: Some(child),
-            native_resources: Some(resources),
+            _native_resources: Some(resources),
             group_stopped: false,
         }];
         assert!(
