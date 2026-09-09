@@ -138,17 +138,17 @@ function Platforms() {
   );
 }
 
-/** Four shared demo concepts. The review route lets readers compare all six. */
+/** Four animated workflows, shared with the focused review route. */
 function Channels() {
   return (
     <Section id="channels">
       <SectionHead
-        title="Everything a Session needs, from where you already are."
-        note="Illustrative interactions, not live runs. Terminal fields follow the CLI; MCP panels show selected result fields."
+        title="Different tasks. Your computers."
+        note="Animated illustrations, not live runs. Each scene plays once on view; pause, replay, or explore its steps."
       />
       <DemoGallery />
       <Link className="sx-compare-link" href="/demo-explorations">
-        Compare all six demo concepts <span aria-hidden="true">→</span>
+        Explore the four workflows <span aria-hidden="true">→</span>
       </Link>
     </Section>
   );

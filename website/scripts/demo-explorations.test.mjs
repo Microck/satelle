@@ -3,102 +3,149 @@ import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import test from 'node:test';
 
-// Test the actual fixtures. TypeScript is already a website devDependency.
 const require = createRequire(import.meta.url);
 const ts = require('typescript');
-const location = '../app/(landing)/demos/';
-const source = readFileSync(new URL(`${location}exploration-data.ts`, import.meta.url), 'utf8');
-const component = readFileSync(new URL(`${location}explorations.tsx`, import.meta.url), 'utf8');
-const { outputText, diagnostics } = ts.transpileModule(source, {
-  reportDiagnostics: true,
-  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
-});
-assert.equal(diagnostics?.length ?? 0, 0);
-const data = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
-const { DEFAULT_SELECTION, DEMOS, SESSION, TURN, CLI_OUTPUT, MCP_EXAMPLE, HOST, MONTHS, READ_TOOLS, parseSelection, toggleSelection } = data;
+const directory = new URL('../app/(landing)/demos/', import.meta.url);
+function compile(file) {
+  const source = readFileSync(new URL(file, directory), 'utf8');
+  const { outputText, diagnostics } = ts.transpileModule(source, {
+    reportDiagnostics: true,
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022, jsx: ts.JsxEmit.React },
+  });
+  assert.equal(diagnostics?.length ?? 0, 0, `syntax: ${file}`);
+  return outputText;
+}
+const data = await import(`data:text/javascript;base64,${Buffer.from(compile('exploration-data.ts')).toString('base64')}`);
+const { DEMOS, TIMELINES, COMMIT_DELAY, POINTER_TRAVEL, duration, stepStart, sample, typed, HOST_CHECK, CHAT_RUN, TRANSFER_RUN, PROMPTS, SESSION } = data;
+const scenes = readFileSync(new URL('workflow-scenes.tsx', directory), 'utf8');
+const motion = readFileSync(new URL('workflow-motion.tsx', directory), 'utf8');
+const gallery = readFileSync(new URL('explorations.tsx', directory), 'utf8');
 
-test('six scenarios have six different interface types', () => {
-  assert.equal(DEMOS.length, 6);
-  assert.equal(new Set(DEMOS.map(demo => demo.id)).size, 6);
-  assert.equal(new Set(DEMOS.map(demo => demo.surface)).size, 6);
+test('exactly the four requested workflows, in order', () => {
+  assert.deepEqual(DEMOS.map(d => d.id), ['qa', 'chat', 'transfer', 'wallpaper']);
+  assert.equal(new Set(DEMOS.map(d => d.surface)).size, 4);
+  assert.equal(DEMOS.filter(d => d.surface.includes('terminal')).length, 1);
 });
-test('homepage defaults are four non-terminal scenarios', () => {
-  assert.equal(DEFAULT_SELECTION.length, 4);
-  assert.deepEqual(DEFAULT_SELECTION, ['spreadsheet', 'chat', 'editor', 'browser']);
-  assert.ok(DEFAULT_SELECTION.every(id => DEMOS.some(demo => demo.id === id && demo.surface !== 'terminal')));
-});
-test('the CLI is the only terminal-marked body', () => {
-  assert.equal(DEMOS.filter(demo => demo.surface === 'terminal').length, 1);
-  assert.equal((component.match(/className="sx-terminal"/g) ?? []).length, 1);
-  for (const name of ['SpreadsheetDemo', 'ChatDemo', 'EditorDemo', 'BrowserDemo', 'DocumentDemo', 'TerminalDemo']) {
-    assert.match(component, new RegExp(`class ${name} extends React.Component`));
+test('every workflow has a finite multi-beat animation', () => {
+  for (const demo of DEMOS) {
+    const beats = TIMELINES[demo.id];
+    assert.ok(beats.length >= 6);
+    assert.ok(beats.every(b => Number.isFinite(b.ms) && b.ms > COMMIT_DELAY));
+    assert.ok(duration(beats) < 25000);
   }
 });
-test('missing, invalid, and old selections normalize to fresh defaults', () => {
-  for (const value of [null, 'unknown,<script>', 'durability,readiness,transports,agent']) {
-    assert.deepEqual(parseSelection(value), DEFAULT_SELECTION);
+test('zero starts at the first frame', () => {
+  for (const beats of Object.values(TIMELINES)) {
+    const f = sample(beats, 0);
+    assert.equal(f.step, 0); assert.equal(f.local, 0); assert.equal(f.done, false);
   }
-  assert.notEqual(parseSelection(null), DEFAULT_SELECTION);
 });
-test('explicitly empty selection stays empty', () => assert.deepEqual(parseSelection(''), []));
-test('URL parsing deduplicates, removes unknown IDs and caps at four', () => {
-  assert.deepEqual(parseSelection('chat,chat,unknown,document,editor,browser,terminal'), ['chat', 'document', 'editor', 'browser']);
+test('final and excess time settle at a complete last frame, never loop', () => {
+  for (const beats of Object.values(TIMELINES)) {
+    for (const elapsed of [duration(beats), duration(beats) + 10000]) {
+      const f = sample(beats, elapsed);
+      assert.equal(f.step, beats.length - 1);
+      assert.equal(f.done, true);
+      assert.equal(f.committed, beats.length - 1);
+    }
+  }
 });
-test('selection changes are immutable', () => {
-  const original = Object.freeze([...DEFAULT_SELECTION]);
-  const fewer = toggleSelection(original, 'editor');
-  assert.equal(fewer.length, 3);
-  assert.equal(original.length, 4);
-  assert.deepEqual(toggleSelection(fewer, 'document'), ['spreadsheet', 'chat', 'browser', 'document']);
+test('invalid clock inputs are bounded', () => {
+  for (const elapsed of [-1, NaN, Infinity, -Infinity]) assert.equal(sample(TIMELINES.qa, elapsed).elapsed, 0);
 });
-test('a fifth selection is not admitted', () => assert.deepEqual(toggleSelection(DEFAULT_SELECTION, 'terminal'), DEFAULT_SELECTION));
-test('every scenario can be chosen independently', () => {
-  for (const demo of DEMOS) assert.deepEqual(toggleSelection([], demo.id), [demo.id]);
+test('step boundaries project into the next beat', () => {
+  for (const beats of Object.values(TIMELINES)) for (let i = 1; i < beats.length; i++) {
+    const f = sample(beats, stepStart(beats, i));
+    assert.equal(f.step, i); assert.equal(f.local, 0);
+  }
 });
-test('Session and Turn IDs are well-formed UUIDv7 examples', () => {
-  const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
-  assert.match(SESSION, new RegExp(`^rs_${uuid}$`));
-  assert.match(TURN, new RegExp(`^rt_${uuid}$`));
+test('the pointer arrives before an application action commits', () => {
+  assert.ok(POINTER_TRAVEL < COMMIT_DELAY);
+  for (const beats of Object.values(TIMELINES)) for (let i = 1; i < beats.length; i++) {
+    const at = stepStart(beats, i);
+    assert.equal(sample(beats, at + POINTER_TRAVEL).pointer, 1);
+    assert.equal(sample(beats, at + COMMIT_DELAY - 1).committed, i - 1);
+    assert.equal(sample(beats, at + COMMIT_DELAY).committed, i);
+  }
 });
-test('detached admission and later status retain real CLI field shapes', () => {
-  assert.deepEqual(CLI_OUTPUT.start, [`Session: ${SESSION}`, 'Status: starting']);
-  assert.deepEqual(CLI_OUTPUT.reconnect, [`Session: ${SESSION}`, `Host: ${HOST}`, 'Status: running', 'Turns: 1', `Latest turn: ${TURN}`, 'Latest status: running']);
+test('manual stepping exposes the completed contents of each beat', () => {
+  for (const beats of Object.values(TIMELINES)) beats.forEach((b, i) => {
+    assert.equal(sample(beats, stepStart(beats, i) + b.ms - 1).committed, i);
+  });
 });
-test('MCP follow-up is explicitly detached and begins after a stopped Turn', () => {
-  assert.equal(MCP_EXAMPLE.statusFields.status, 'stopped');
-  assert.equal(MCP_EXAMPLE.steerInput.detach, true);
-  assert.equal(MCP_EXAMPLE.steerInput.session_id, SESSION);
-  assert.equal(MCP_EXAMPLE.steerInput.host, HOST);
-  assert.equal(MCP_EXAMPLE.steerInput.prompt, 'Open settings');
-  assert.equal(MCP_EXAMPLE.steerFields.status, 'starting');
+test('human text reveals progressively and remains complete afterward', () => {
+  const text = 'hello world';
+  assert.equal(typed(text, sample(TIMELINES.chat, 0), 0, 1000), '');
+  assert.equal(typed(text, sample(TIMELINES.chat, 500), 0, 1000), 'hello');
+  assert.equal(typed(text, sample(TIMELINES.chat, 1000), 0, 1000), text);
+  assert.equal(typed(text, sample(TIMELINES.chat, 1000), 3), '');
+  assert.equal(typed(text, sample(TIMELINES.chat, duration(TIMELINES.chat)), 3), text);
 });
-test('MCP schema projections and tool inventory match the release', () => {
-  assert.equal(MCP_EXAMPLE.readOnlyToolCount, 8);
-  assert.equal(MCP_EXAMPLE.mutationToolCount, 15);
-  assert.deepEqual(READ_TOOLS, ['config_check', 'config_explain', 'paths', 'status', 'logs', 'doctor', 'host_status', 'host_sessions']);
-  assert.equal(MCP_EXAMPLE.chatFields.schema_version, 'satelle.status.v2');
-  assert.equal(MCP_EXAMPLE.statusFields.schema_version, 'satelle.status.v2');
-  assert.equal(MCP_EXAMPLE.steerFields.schema_version, 'satelle.steer.v2');
-  assert.ok(!('turns' in MCP_EXAMPLE.statusFields));
+test('every cursor target has a corresponding rendered marker', () => {
+  for (const beats of Object.values(TIMELINES)) for (const beat of beats) {
+    if (beat.target) assert.ok(scenes.includes(`data-cursor="${beat.target}"`), beat.target);
+  }
 });
-test('the spreadsheet uses the existing synthetic monthly totals', () => {
-  assert.equal(data.money(MONTHS.reduce((sum, row) => sum + row.revenue, 0)), '39,444.10');
-  assert.equal(data.money(MONTHS.reduce((sum, row) => sum + row.profit, 0)), '16,209.10');
-  assert.ok(MONTHS.every(row => row.revenue >= row.profit && row.profit > 0));
+test('Host inventory is configuration, not a invented discovery endpoint', () => {
+  assert.deepEqual(HOST_CHECK.input, { all: true });
+  assert.equal(HOST_CHECK.fields.schema_version, 'satelle.config.check.v1');
+  assert.deepEqual(HOST_CHECK.fields.checked_contexts.map(c => c.host), ['studio-mac', 'ops-pc']);
+  assert.ok(HOST_CHECK.fields.not_checked.includes('native_computer_use'));
+  assert.ok(HOST_CHECK.fields.not_checked.includes('remote_host'));
+  assert.ok(!scenes.includes('list_hosts'));
 });
-test('CTAs point to the documentation tree, not invented integrations', () => {
-  for (const demo of DEMOS) assert.match(demo.href, /^\/docs\//);
-  assert.ok(!/Connect (GitHub|Slack)/.test(source + component));
+test('desktop chat asks about Hosts before requesting a specific task', () => {
+  assert.equal(PROMPTS.hosts, 'Which hosts are available?');
+  assert.ok(PROMPTS.chat.includes('studio-mac'));
+  assert.equal(CHAT_RUN.input.prompt, PROMPTS.chat);
 });
-test('native scenarios retain the visible readiness and illustration boundary', () => {
-  for (const text of ['not recordings or live runs', 'passes the live readiness probe', 'macOS and Windows are candidate Hosts', 'native Linux Host execution is not supported', 'not app-specific integrations']) assert.ok(component.includes(text));
+test('mutation examples use real run arguments and detached admission', () => {
+  for (const run of [CHAT_RUN, TRANSFER_RUN]) {
+    assert.equal(run.input.detach, true);
+    assert.deepEqual(Object.keys(run.input).sort(), ['detach', 'host', 'prompt']);
+    assert.equal(run.fields.schema_version, 'satelle.run.v2');
+    assert.equal(run.fields.status, 'starting');
+  }
 });
-test('only local demo state changes, not Host calls or timed animation', () => {
-  assert.ok(!/\b(fetch|WebSocket|EventSource|setInterval|setTimeout)\s*\(/.test(component));
-  assert.match(component, /Local demo switch only/);
-  assert.match(component, /componentWillUnmount/);
+test('Session identifier is a well-formed UUIDv7 example', () => {
+  assert.match(SESSION, /^rs_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 });
-test('the component syntax transpiles with the repository JSX mode', () => {
-  const { diagnostics } = ts.transpileModule(component, { fileName: 'explorations.tsx', reportDiagnostics: true, compilerOptions: { target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.Preserve } });
-  assert.equal(diagnostics?.length ?? 0, 0);
+test('transfer prompt names the computer, source, file, and destination', () => {
+  for (const part of ['ops-pc', 'reports.example', 'September.csv', 'files.example / Finance']) assert.ok(PROMPTS.transfer.includes(part));
+  assert.equal(TRANSFER_RUN.input.prompt, PROMPTS.transfer);
+  assert.equal(TRANSFER_RUN.input.host, 'ops-pc');
+});
+test('file flow has explicit download, native selection, upload, and confirmation beats', () => {
+  const labels = TIMELINES.transfer.map(b => b.label).join('\n');
+  assert.match(labels, /Download September.csv[\s\S]*Open the file picker[\s\S]*Select the downloaded file[\s\S]*Upload to Finance[\s\S]*Confirm/);
+});
+test('QA is synthetic functional testing that stops before a purchase', () => {
+  assert.ok(PROMPTS.qa.includes('Do not place an order'));
+  assert.ok(scenes.includes('Test stops before placing an order.'));
+  assert.ok(scenes.includes('EXAMPLE QA NOTES'));
+});
+test('wallpaper scenario uses native Settings and a visible desktop change', () => {
+  assert.match(scenes, /System Settings/);
+  assert.match(scenes, /sw-new-wallpaper/);
+  assert.ok(PROMPTS.wallpaper.includes('studio-mac'));
+  assert.match(TIMELINES.wallpaper[3].label, /mountain/);
+});
+test('clock suspends when offscreen or the document is hidden, and cleans up', () => {
+  for (const token of ['IntersectionObserver', 'visibilitychange', '!document.hidden', 'cancelAnimationFrame', 'componentWillUnmount', 'removeEventListener']) assert.ok(motion.includes(token));
+});
+test('reduced motion starts at the final frame and has an explicit still-frame notice', () => {
+  assert.ok(motion.includes('prefers-reduced-motion: reduce'));
+  assert.ok(motion.includes('reduced ? duration(TIMELINES[this.props.id]) : 0'));
+  assert.ok(motion.includes('Reduced motion: still frames.'));
+});
+test('both routes use all four and no longer show the obsolete six-option picker', () => {
+  assert.ok(gallery.includes('DEMOS.map'));
+  assert.ok(!gallery.includes('parseSelection'));
+  assert.ok(!gallery.includes('Show all 6'));
+});
+test('all CTAs remain in the existing docs tree', () => {
+  for (const d of DEMOS) assert.match(d.href, /^\/docs\//);
+});
+test('source files transpile without syntax errors', () => {
+  for (const file of ['explorations.tsx', 'workflow-motion.tsx', 'workflow-scenes.tsx']) compile(file);
 });

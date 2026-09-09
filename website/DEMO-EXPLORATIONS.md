@@ -1,117 +1,99 @@
-# Workflow demo explorations
+# Four animated landing workflows
 
-Review at `/demo-explorations`. The homepage imports the same `DemoGallery`
-component with its default selection. This is a website illustration, not a
-Satelle frontend, a live Host connection, or evidence of task completion.
+This revision replaces the six exploratory concepts with the four requested
+workflows, in order, on both `/` and `/demo-explorations`. The comparison route
+remains `noindex`, but no longer offers a selection UI. Old `demos` and `view`
+query parameters are ignored. The homepage hero, documentation routes, theme
+tokens, dependencies, and original demo modules are unchanged.
 
-## Revision: different workflows, not six terminals
+## Scenes
 
-V12's useful reference is its variety of contexts: a PR thread, a Slack
-conversation, an agent session, and a CLI. The first Satelle implementation
-copied the terminal treatment across too many cards. This revision replaces
-that approach with six different application surfaces:
-
-| ID | Surface | Interaction |
+| Order | Surface | Script |
 | --- | --- | --- |
-| `spreadsheet` | Desktop workbook with cells, formula bar and chart | Before/result toggles the illustrative chart, not the source values |
-| `chat` | Claude Desktop-style conversation | Ask about the Session or why a follow-up is unavailable; inspect the example status tool call |
-| `editor` | Cursor-style file pane and agent sidebar | Switch the example MCP mode, then preview detached follow-up admission |
-| `browser` | Native browser tab, address bar and start/settings pages | Compare the first Turn with an illustrative follow-up in the same Session |
-| `document` | Word processor with outline, toolbar and document page | Compare a synthetic draft with formatted headings and spacing |
-| `terminal` | One CLI transcript | Compare detached admission with status from a fresh Controller |
+| 01 | Website QA | Type a checkout test request; add an item; open checkout; type an invalid email; observe the validation failure; show example QA notes. No purchase is made. |
+| 02 | Claude Desktop-style chat | Ask which Hosts are available; read configured contexts with `config_check`; show `studio-mac` and `ops-pc`; ask for a browser task on `studio-mac`; show detached `run` admission. |
+| 03 | Claude Code terminal and Host browser | Type a request targeting `ops-pc`; show a Satelle `run` call; browse a reports dashboard; download `September.csv`; open the Finance destination; select the downloaded file in a native picker; upload and show an illustrative confirmation. |
+| 04 | macOS desktop | Type a wallpaper request; move to System Settings; choose Wallpaper; select Mountains; crossfade the desktop background; close Settings and reveal the changed desktop. |
 
-The homepage defaults are `spreadsheet,chat,editor,browser`: **zero terminal
-cards**. The comparison page includes one optional CLI card. There is no new
-Satelle dashboard, Slack bot, GitHub integration, office add-in, browser
-extension, or hosted service in these designs.
+Application furniture is illustrative, not clickable product chrome. The actual
+controls are outside each application: Play/Pause, Replay, and individually
+labelled step buttons. Source inspectors are native disclosures on the review
+route. No control executes a command, calls MCP, contacts a Host, or transfers a
+file. The examples use synthetic domains, data, findings, aliases, and outcomes.
 
-Flat surfaces use the existing landing tokens. There are no vendor logos,
-external assets, font changes, new dependencies, gradients, autoplay loops or
-new network requests. Client and application chrome is an illustration, not a
-pixel-exact claim about another vendor's current UI. Only labeled example
-controls are interactive; inert chrome is not rendered as fake buttons.
+## Motion contract
 
-## Product fidelity
+`workflow-motion.tsx` owns a finite requestAnimationFrame clock shared by all
+four scenes. Beat definitions and the pure `sample` projection are in
+`exploration-data.ts`.
 
-The source baseline is `ef70a83340845ec012e39d4f080d28425096dd35`, based on
-`feat/landing-page` at `e390e26f5f18eb287f1434e2ea3489057d356f07`, release 0.1.10.
+- Autoplay starts once when at least 15% of a player enters the viewport. It
+  reaches the final frame and stops; there is no automatic loop.
+- Leaving the viewport or hiding the document suspends the clock. Returning
+  resumes from the same position. An explicit Pause is not undone by scrolling.
+- Human prompts are typed. Tool results arrive as blocks rather than being
+  typed character by character.
+- Pointers are measured against actual DOM targets, not desktop-only hardcoded
+  coordinates. They arrive in 620ms; the corresponding app state commits at
+  720ms. Pointer interpolation, the upload bar, and the wallpaper crossfade use
+  the same clock, so Pause also freezes those changes.
+- Replay restarts that scene only. Step buttons pause at the end of the chosen
+  beat, showing its complete contents. Keyboard Enter/Space operate the native
+  controls. Step changes have a polite, atomic status announcement; screen
+  readers receive complete prompt text, not a stream of individual characters.
+- SSR renders complete, readable scenes. In `prefers-reduced-motion: reduce`,
+  autoplay is skipped, all scenes show their finished state, CSS motion is
+  disabled, and manual step exploration remains available. A preference change
+  while running takes effect immediately.
+- Observers, listeners, and animation frames are cleaned up on unmount.
 
-| Claim or fixture | Repository source |
-| --- | --- |
-| Cursor and Claude Desktop are MCP installer targets | `crates/satelle-cli/src/mcp/install.rs`: `ALL_TARGETS`, `InstallTarget` |
-| Eight read-only tools and fifteen with mutations advertised | `crates/satelle-cli/src/mcp/schema.rs`: `tools(enable_mutations)` |
-| `status` input uses `session_id` and `host` | Same file, `status` tool schema |
-| `steer` requires `session_id` and `prompt`; detach defaults to false | Same file, `mutation_tools` |
-| Selected status and steer JSON fields | `crates/satelle-cli/src/output.rs`; MCP schema and existing `demos/agent.tsx` |
-| Detached admission prints two lines, `starting` | `crates/satelle-cli/src/main.rs`: `print_detached_session`; existing `demos/durability.tsx` |
-| A later status prints Session, Host, Status, Turns, Latest turn and Latest status | Same file, `print_session_human` |
-| Browser followed by `Open settings` in the same Session | `README.md`, shortest successful flow; `docs/how-to/operate-session.mdx` |
-| Spreadsheet example numbers | Existing `demos/stages/excel.tsx`: `MONTHS` (Q3 synthetic showcase data) |
-| Desktop word-processing scenario, not an office API | Existing `demos/stages/filing.tsx` and `website/DESIGN.md` section 7; the new brief is synthetic copy |
-| Host ownership and native support boundaries | `README.md`, platform support and security model |
+Styles are scoped to the landing tree and reuse its existing light/dark tokens.
+The desktop wallpaper is a lightweight CSS illustration, not a downloaded asset.
+No font or animation dependency was added.
 
-The editor's starting state is `stopped`, so the example does not claim that
-`steer` admits a concurrent Turn over an already-running one. Enabling mutation
-tools is a separate example step from admitting the follow-up. The request
-explicitly includes `detach: true`; its returned status is `starting`, not a
-claim that settings already opened. Turning the example flag back off resets
-the local follow-up state. The switch neither changes real configuration nor
-grants Host, OS, or app permissions.
+## Fidelity and assumptions
 
-The chat is a separate read-only example. It displays selected status fields,
-not fabricated CLI output. Its follow-up explains that `steer` is absent from
-the tool list. It does not silently enable or invoke mutations.
+Baseline: `c2c4c9d5bddaaad1a151436cd7bf41b59c948748`, Satelle 0.1.10 on the
+PR branch. These are designed scenes, not recorded or verified task executions.
 
-Browser, spreadsheet and document scenes are illustrative candidate tasks,
-not recordings, benchmarks, promises of reliable completion or named app
-integrations. They assume a configured Host that passes live readiness.
-macOS and Windows remain candidate native Hosts. Linux Controller support is
-not native Linux Host support. These caveats stay visible in the gallery and
-app captions. No remote live-doctor call, permission bypass, automatic token
-provisioning, persistent Host service installation, or storage migration is
-added or implied.
-
-## Preview selection
-
-Select at most four. Deselect one before adding another. `Preview selected 4`
-filters the comparison page only; it does not change the published homepage.
-A shared example URL is:
-
-```text
-/demo-explorations?demos=spreadsheet,chat,editor,browser&view=selection
-```
-
-Missing/invalid selections use fresh defaults. An explicitly empty selection
-stays empty. Unknown IDs are removed, duplicates deduplicated, and results
-capped at four. Old all-terminal selection IDs now normalize to the new
-defaults. `popstate` is observed and its listener cleaned up on unmount.
-Clipboard denial has a visible fallback message. History updates preserve
-Next's existing history state. The review route remains `noindex`.
+| Claim / field | Source in this repository | Boundary |
+| --- | --- | --- |
+| `config_check({ all: true })` | `crates/satelle-cli/src/mcp/schema.rs` | This is a read-only configuration check, not Host discovery. |
+| `checked_contexts[].host`, `status`, and `not_checked` | `crates/satelle-cli/src/read.rs`, `config_check_report` | The list is derived from configured contexts. Remote Host availability, provider authentication, and native Computer Use are explicitly not checked. The visible rows say Configured, never Online or Ready. |
+| Config result version | `crates/satelle-cli/src/mcp/output-schema.rs` | `satelle.config.check.v1`. Inspectors contain selected fields, not a fabricated full result. |
+| `run` arguments `host`, `prompt`, `detach` | `crates/satelle-cli/src/mcp/schema.rs` | Mutation tools must already have been enabled on the MCP server. The example does not enable them or grant OS permissions. |
+| Detached `run` reports `starting` | `crates/satelle-cli/src/main.rs`, `print_detached_session` | Admission is not task completion. The CLI transcript labels this as admission; later browser results are separate illustrative application state. |
+| Claude Desktop and Claude Code client targets | `crates/satelle-cli/src/mcp/install.rs` | Client layouts are illustrations, not exact vendor screenshots or new Satelle-specific plugins. |
+| Native desktop operations | `README.md`, `docs/tutorial/first-session.mdx` | macOS and Windows Hosts remain candidates and require a live readiness pass. Native Linux Host execution is unsupported. |
+| Dashboard download/upload | Generic native browser task, carried by `run` | Assumes authorized, signed-in sites on `ops-pc`. The file stays on that Host between the browser download and browser upload; no Satelle file-transfer API or cross-Host copy is implied. |
+| QA notes and wallpaper result | Synthetic illustration | Not a built-in QA dashboard, recorded test, guaranteed application outcome, or app-specific integration. No operating-system, administrator, or security prompt is approved. |
 
 ## Validation
+
+Run the repository's existing hook:
 
 ```sh
 npm run test:demos --workspace website
 npm run docs:build
 ```
 
-The existing website `prebuild` hook runs the fixture tests. Eighteen tests
-cover scenario diversity, non-terminal defaults, the single terminal body,
-selection normalization and limits, IDs, CLI print shapes, MCP admission and
-schemas, synthetic chart totals, CTAs and visible capability boundaries.
-They also syntax-transpile the actual TSX, not a duplicate component.
+The fixture/timeline suite contains 23 tests: exact workflow order, interface
+variety, finite clocks, boundaries, pointer-before-commit ordering, manual
+stepping, typed prompts, marker presence, Host configuration semantics, MCP
+admission, the file handoff, the wallpaper scene, and component syntax.
 
-An isolated Chromium harness renders the actual transpiled components using
-an available React 16 runtime, a Fragment compatibility shim, and system-font
-fallbacks. Local checks passed for all six controls, keyboard Enter/Space,
-MCP read-only gating and reset, tool disclosures, four-card selection,
-clipboard-denial feedback, and 28 viewport/theme/motion combinations
-(56 initial/alternate layouts). Widths: 320, 390, 768, 880, 1024, 1440 and 1920.
-No page/card horizontal overflow, visible text below 12px, page JavaScript
-errors, or reduced-motion animations were found in that harness.
+Local browser validation used the actual transpiled modules in an isolated
+Chromium harness with an available React 16.0.0 runtime, a Fragment compatibility
+shim, and system fonts. It checked 28 viewport/theme/motion combinations from
+320px to 1920px and all 27 beat endpoints (756 state checks), without horizontal
+page/card overflow or scene content overlapping playback controls. It also
+exercised on-view playback, offscreen suspension, Pause/Play, keyboard controls,
+Replay, completion without looping, source disclosures, and reduced-motion
+changes. Document visibility was tested by dispatching a visibility event in the
+harness, not by a full browser multi-tab integration test.
 
-This environment cannot download the pinned npm dependencies. These local
-checks do **not** replace the Next.js/React 19 build, SSR/hydration, actual
-route navigation or integration tests. The previous revision's Documentation
-CI build passed; that is not a result for this revision. Check CI on the new
-commit separately. No deployment or merge is performed by this change.
+These checks are not a substitute for the pinned Next.js/React 19 build,
+SSR/hydration, real site navigation, or actual Satelle execution. Dependency
+network access was unavailable locally. The documentation workflow performs
+the pinned integration build; its current status belongs in the PR, not in this
+versioned document.
