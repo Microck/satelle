@@ -1,15 +1,10 @@
-/* Finish layer: no footer strip, captions or taskbar. A deliberately small
-   keyboard-accessible control overlay replaces the removed playback footer. */
+/* Restrained semantic accents, not vendor color themes. Playback uses the
+   focusable scene itself; there is no footer, toolbar or icon overlay. */
 .sa .sx-card {position:relative;}
-.sa .sx-card-head {padding-right:82px;}
 .sa .sx-card-body {margin-bottom:18px;}
-.sa .sw-player {position:static;}
+.sa .sw-player {position:static;cursor:default;}
+.sa .sw-player:focus-visible {outline:2px solid var(--sa-accent-text);outline-offset:3px;}
 .sa .sw-a11y-status {position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0;}
-.sa .sw-controls {position:absolute;top:13px;right:12px;z-index:40;display:flex;align-items:center;gap:2px;padding:2px;border:1px solid var(--sa-7);border-radius:6px;background:var(--sa-2);opacity:0;pointer-events:none;}
-.sa .sx-card:hover .sw-controls,.sa .sw-player:focus-within>.sw-controls,.sa .sw-player[data-reduced='true'][data-motion-opt-in='false']>.sw-controls {opacity:1;pointer-events:auto;}
-.sa .sw-controls button {display:grid;place-items:center;width:28px;height:28px;border:0;border-radius:3px;background:transparent;color:var(--sa-11);cursor:pointer;padding:0;}
-.sa .sw-controls button:hover {background:var(--sa-5);color:var(--sa-12);}
-.sa .sw-controls button:focus-visible {outline:2px solid var(--sa-accent-text);outline-offset:2px;}
 .sa .rf-host-browser,.sa .rf-terminal-layer {inset:0;}
 .sa .rf-terminal-layer {transform-origin:left bottom;}
 .sa .rf-terminal {border-bottom:0;}
@@ -39,8 +34,15 @@
   .sa .rf-mcp-state {font-size:12px;gap:3px;}
   .sa .rf-mcp-detail {gap:6px;}
 }
-@media (hover:none) {
-  .sa .sw-controls {opacity:1;pointer-events:auto;}
-  .sa .sw-controls button {width:32px;height:32px;}
-}
 @media (max-width:440px) { .sa .sx-card-body {margin-bottom:12px;} }
+
+/* The screenshot's redundant QA instruction strip is removed from layout. */
+.sa .rf-qa > .rf-request {display:none;}
+/* V12-style emphasis communicates state. Most text, surfaces, logos and chart
+   lines remain neutral; only the finding, live spinner and success marks tint. */
+.sa .rf-qa-finding[data-found='true'] {border-left-color:var(--sa-warn);}
+.sa .rf-qa-finding[data-found='true'] > small {color:var(--sa-warn);}
+.sa .rf-buy-viewport[data-broken='true']::after {border-color:var(--sa-warn);}
+.sa .rf-mcp-activity[data-mcp-state='running'] .rf-mcp-state > svg {color:var(--sa-accent-text);}
+.sa .rf-mcp-activity[data-mcp-state='completed'] .rf-mcp-state {color:var(--sa-ok);}
+.sa .rf-chat-file > b,.sa .rf-delivered > span:last-child,.sa .rf-upload-note > b {color:var(--sa-ok);}
