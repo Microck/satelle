@@ -1,0 +1,73 @@
+/* Keep the v12 reference's restraint: one flat surface per task. These rules
+   supplement the existing monochrome native-browser/Slack scene styles. */
+.sa .sx-grid {align-items:stretch;}
+.sa .sx-card {display:flex;flex-direction:column;}
+.sa .sx-card-head {min-height:132px;}
+.sa .sw-notes {margin-top:auto;}
+.sa .lf-checkout,.sa .lf-chat {display:flex;flex-direction:column;background:var(--sa-3);color:var(--sa-12);}
+.sa .lf-checkout .wf-request {min-height:60px;border-bottom:1px solid var(--sa-6);font-size:13px;}
+.sa .lf-store-nav {display:flex;justify-content:space-between;align-items:center;padding:11px 18px;border-bottom:1px solid var(--sa-6);}
+.sa .lf-store-nav strong {font-size:17px;font-weight:600;letter-spacing:-.02em;}
+.sa .lf-store-nav>span {display:flex;align-items:center;gap:7px;font-size:12px;color:var(--sa-10);}
+.sa .lf-checkout-main {flex:1;min-height:0;display:grid;grid-template-columns:40% 60%;}
+.sa .lf-order-summary {padding:17px 14px;background:var(--sa-2);border-right:1px solid var(--sa-6);}
+.sa .lf-product-art {height:110px;display:grid;place-items:center;margin-bottom:11px;}
+.sa .lf-order-summary strong {font-size:13px;font-weight:500;display:block;}
+.sa .lf-order-summary span {display:block;font-size:12px;color:var(--sa-10);margin:4px 0 8px;}
+.sa .lf-order-summary b {font-size:15px;font-weight:500;}
+.sa .lf-checkout-form {padding:12px 18px;min-width:0;}
+.sa .lf-checkout-form>small {font:12px/1.4 var(--font-mono);letter-spacing:.025em;color:var(--sa-10);}
+.sa .lf-checkout-form h4 {font-size:18px;font-weight:500;margin:3px 0 8px;letter-spacing:-.02em;}
+.sa .lf-field {height:28px;padding:4px 9px;margin-bottom:5px;border:1px solid var(--sa-7);border-radius:4px;color:var(--sa-10);font-size:13px;}
+.sa .lf-field[data-filled='true'] {color:var(--sa-12);}
+.sa .lf-field[data-invalid='true'] {border-color:var(--sa-11);}
+.sa .lf-validation {height:20px;display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sa-12);}
+.sa .lf-action {display:flex;justify-content:space-between;align-items:center;padding:5px 11px;border:1px solid var(--sa-7);border-radius:4px;background:var(--sa-5);font-size:13px;}
+.sa .lf-qa-result {padding:10px 16px;border-top:1px solid var(--sa-6);flex-shrink:0;background:var(--sa-2);font-size:12px;line-height:1.5;}
+.sa .lf-qa-result>div {display:flex;justify-content:space-between;gap:10px;}
+.sa .lf-qa-result b,.sa .lf-qa-result strong {font-weight:500;}
+.sa .lf-qa-result small {color:var(--sa-10);font-size:12px;}
+.sa .lf-qa-result p {display:flex;gap:19px;margin:4px 0;color:var(--sa-11);}
+.sa .lf-qa-result>strong {display:block;color:var(--sa-10);font-size:12px;}
+.sa .lf-total {display:flex;align-items:center;justify-content:space-between;padding:5px 0;font-size:13px;}
+.sa .lf-total b {font-weight:500;}
+.sa .lf-grand-total {border-top:1px solid var(--sa-6);margin:3px 0 8px;font-size:15px;}
+.sa .lf-no-purchase {justify-content:center;background:transparent;color:var(--sa-10);}
+.sa .lf-stopped {color:var(--sa-10);font-size:12px;text-align:center;margin-top:6px!important;}
+.sa .lf-chat-title {height:43px;border-bottom:1px solid var(--sa-6);display:flex;align-items:center;gap:10px;padding:10px 14px;flex-shrink:0;}
+.sa .lf-chat-title .wf-brand {width:20px;height:20px;margin-left:4px;}
+.sa .lf-chat-title strong {font-size:14px;font-weight:500;}
+.sa .lf-chat-title small {font-size:12px;color:var(--sa-10);margin-left:auto;}
+.sa .lf-conversation {padding:17px 20px;display:flex;flex-direction:column;gap:14px;flex:1;min-height:0;font-size:14px;line-height:1.5;}
+.sa .lf-user-message {align-self:flex-end;max-width:90%;padding:8px 12px;border-radius:7px;background:var(--sa-5);min-height:37px;}
+.sa .lf-assistant {display:flex;gap:10px;align-items:flex-start;}
+.sa .lf-assistant>.wf-brand {width:23px;height:23px;margin-top:3px;}
+.sa .lf-assistant>div {flex:1;min-width:0;}
+.sa .lf-assistant small {font-size:12px;color:var(--sa-10);}
+.sa .lf-assistant p {margin:4px 0;}
+.sa .lf-hosts {border-top:1px solid var(--sa-6);margin-top:8px;}
+.sa .lf-hosts>span {display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--sa-6);}
+.sa .lf-hosts b {font:12px/1.5 var(--font-mono);}
+.sa .lf-hosts em {margin-left:auto;font-style:normal;font-size:12px;color:var(--sa-10);}
+.sa .lf-muted {color:var(--sa-10);font-size:12px;}
+.sa .lf-composer {display:flex;align-items:center;justify-content:space-between;margin:0 17px 14px;padding:10px 12px;border:1px solid var(--sa-7);border-radius:6px;color:var(--sa-10);font-size:13px;flex-shrink:0;}
+.sa .lf-composer>span:last-child {display:flex;gap:13px;align-items:center;}
+.sa .lf-composer i {font-style:normal;font-size:16px;color:var(--sa-12);}
+/* All movement is clock-driven. Explicit Play still works with a reduced-motion
+   preference; decorative CSS animation remains disabled by the base stylesheet. */
+.sa .sw-player[data-motion-opt-in='true'] .sw-cursor {display:block;}
+@container (max-width:420px) {
+  .sa .lf-conversation {padding:15px 13px;gap:12px;font-size:13px;}
+  .sa .lf-user-message {max-width:94%;}
+  .sa .lf-chat-title {gap:8px;}
+  .sa .lf-checkout-main {grid-template-columns:34% 66%;}
+  .sa .lf-order-summary {padding:16px 9px;}
+  .sa .lf-product-art {height:116px;}
+  .sa .lf-product-art svg {width:65px;height:80px;}
+  .sa .lf-order-summary strong {font-size:12px;}
+  .sa .lf-checkout-form {padding:13px 10px;}
+  .sa .lf-checkout-form h4 {font-size:17px;}
+  .sa .lf-checkout-form>small {font-family:var(--font-sans);font-size:12px;letter-spacing:0;}
+  .sa .lf-qa-result {padding:9px 11px;}
+  .sa .lf-qa-result p {gap:12px;}
+}

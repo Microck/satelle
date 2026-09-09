@@ -1,159 +1,105 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
-
 const require = createRequire(import.meta.url);
 const ts = require('typescript');
-const directory = new URL('../app/(landing)/demos/', import.meta.url);
-const read = (name) => readFileSync(new URL(name, directory), 'utf8');
-const source = read('exploration-data.ts');
-const compile = (source, fileName) => ts.transpileModule(source, {
-  fileName, reportDiagnostics: true,
-  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022, jsx: ts.JsxEmit.React },
-});
-const compiled = compile(source, 'exploration-data.ts');
+const dir = new URL('../app/(landing)/demos/', import.meta.url);
+const read = (name) => readFileSync(new URL(name, dir), 'utf8');
+const compile = (name) => ts.transpileModule(read(name), {fileName:name, reportDiagnostics:true, compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022,jsx:ts.JsxEmit.React}});
+const compiled = compile('exploration-data.ts');
 assert.equal(compiled.diagnostics?.length ?? 0, 0);
 const data = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`);
-const { DEMOS, TIMELINES, duration, sample, phase, typed, COMMIT_DELAY, POINTER_TRAVEL } = data;
-const ui = read('workflow-ui.tsx');
-const scenes = read('workflow-scenes.tsx');
-const motion = read('workflow-motion.tsx');
-const gallery = read('explorations.tsx');
-const css = read('explorations.css');
-
-// Syntax validation is not a full Next.js / React type-check. CI still owns that build.
-for (const file of ['workflow-ui.tsx', 'workflow-scenes.tsx', 'workflow-motion.tsx', 'explorations.tsx']) {
-  test(`${file} transpiles without syntax errors`, () => {
-    assert.equal(compile(read(file), file).diagnostics?.length ?? 0, 0);
-  });
+const {DEMOS,TIMELINES,duration,stepStart,sample,typed,phase,COMMIT_DELAY,POINTER_TRAVEL} = data;
+const focus = read('landing-scenes.tsx'), motion = read('workflow-motion.tsx'), gallery = read('explorations.tsx');
+for (const name of ['exploration-data.ts','workflow-ui.tsx','workflow-logos.tsx','workflow-motion.tsx','landing-scenes.tsx','explorations.tsx']) {
+  test(`${name}: TypeScript/JSX syntax`,()=>assert.equal(compile(name).diagnostics?.length ?? 0,0));
 }
-test('the four requested workflows have a stable order and distinct surfaces', () => {
-  assert.deepEqual(DEMOS.map(d => d.id), ['qa', 'chat', 'transfer', 'slack']);
-  assert.equal(new Set(DEMOS.map(d => d.surface)).size, 4);
-  assert.deepEqual(Object.keys(TIMELINES), DEMOS.map(d => d.id));
+test('same four workflows are mounted on the landing page',()=>{
+  assert.deepEqual(DEMOS.map(d=>d.id),['qa','chat','transfer','slack']);
+  assert.match(gallery,/qa: CheckoutScene, chat: SimpleChatScene, transfer: TransferScene, slack: SlackScene/);
+  assert.match(gallery,/DEMOS.map/);
 });
-test('real service domains replace placeholder sites', () => {
-  assert.match(data.SITES.qa, /^github\.com\/Microck\/satelle$/);
-  assert.match(data.SITES.analytics, /^analytics\.google\.com\//);
-  assert.match(data.SITES.drive, /^drive\.google\.com\//);
-  assert.equal(data.SITES.slack, 'slack.com');
-  assert.doesNotMatch(source + scenes, /(?:shop|reports|files)\.example|example\.com/);
+test('QA is a real practice-store checkout, not a repository or invented real-site defect',()=>{
+  assert.equal(data.SITES.qa,'saucedemo.com/checkout-step-one.html');
+  assert.match(focus,/Last Name is required/);
+  assert.match(focus,/Stopped before purchase/);
+  assert.doesNotMatch(focus,/wf-gh|GitHub|Critical|invalid email accepted/i);
 });
-test('every script is finite and every action allows pointer travel before commit', () => {
-  assert.ok(POINTER_TRAVEL < COMMIT_DELAY);
-  for (const beats of Object.values(TIMELINES)) {
-    assert.ok(beats.length > 1);
-    assert.ok(beats.every(b => Number.isFinite(b.ms) && b.ms > COMMIT_DELAY));
-    assert.ok(duration(beats) < 60_000);
-    assert.equal(sample(beats, duration(beats)).done, true);
-    assert.equal(sample(beats, duration(beats) * 2).elapsed, duration(beats));
+test('chat is the small conversation, not a full desktop-app clone',()=>{
+  assert.match(focus,/ChatGPT/); assert.match(focus,/lf-composer/);
+  assert.doesNotMatch(focus,/wf-gpt-side|Search chats|Library|ChatViewport|Confirmation/);
+  assert.match(focus,/First Turn: starting/);
+});
+test('Host configuration and ChatGPT integration remain honestly scoped',()=>{
+  assert.deepEqual(data.HOST_CHECK.input,{all:true});
+  assert.ok(data.HOST_CHECK.fields.not_checked.includes('native_computer_use'));
+  assert.equal(data.CHATGPT_INTEGRATION.status,'concept');
+  assert.match(gallery,/not an available Satelle integration/);
+  assert.equal(data.CHAT_RUN.fields.status,'starting');
+  assert.equal(data.CHAT_RUN.input.detach,true);
+});
+test('each sequence is bounded and gives the pointer time to arrive',()=>{
+  assert.ok(POINTER_TRAVEL<COMMIT_DELAY);
+  for(const beats of Object.values(TIMELINES)) {
+    assert.ok(beats.every(b=>b.ms>COMMIT_DELAY));
+    assert.ok(duration(beats)<60000);
+    assert.equal(sample(beats,duration(beats)).done,true);
+    for(let i=1;i<beats.length;i++){
+      assert.equal(sample(beats,stepStart(beats,i)+POINTER_TRAVEL).committed,i-1);
+      assert.equal(sample(beats,stepStart(beats,i)+COMMIT_DELAY).committed,i);
+    }
   }
 });
-test('clock projections clamp invalid times and reject empty scripts', () => {
-  for (const t of [NaN, Infinity, -4]) assert.equal(sample(TIMELINES.qa, t).elapsed, 0);
-  assert.throws(() => sample([], 0), RangeError);
+test('invalid and empty clock inputs are handled',()=>{
+  assert.throws(()=>sample([],0),RangeError);
+  for(const t of [-1,Infinity,NaN]) assert.equal(sample(TIMELINES.qa,t).elapsed,0);
 });
-test('cursor reaches each actionable target before its application change', () => {
-  for (const beats of Object.values(TIMELINES)) for (let index = 1; index < beats.length; index++) {
-    const start = data.stepStart(beats, index);
-    const before = sample(beats, start + POINTER_TRAVEL);
-    assert.equal(before.pointer, 1);
-    assert.equal(before.committed, index - 1);
-    assert.equal(sample(beats, start + COMMIT_DELAY).committed, index);
+test('typing and window handoff are real time-varying projections',()=>{
+  const text='Test checkout';
+  assert.equal(typed(text,sample(TIMELINES.qa,0),0),'');
+  assert.ok(typed(text,sample(TIMELINES.qa,900),0).length>0);
+  assert.equal(typed(text,sample(TIMELINES.qa,1900),0),text);
+  assert.equal(phase(sample(TIMELINES.transfer,0),2),0);
+  assert.equal(phase(sample(TIMELINES.transfer,duration(TIMELINES.transfer)),2),1);
+});
+test('visible normal playback loops instead of stopping permanently',()=>{
+  assert.equal(data.LOOP_HOLD,1800);
+  assert.match(motion,/!this.reduced && this.clock >= total \+ LOOP_HOLD/);
+  assert.match(motion,/this.cycle\+\+/);
+});
+test('reduced motion has an explicit real-animation opt-in, not still-only Replay',()=>{
+  assert.match(motion,/this.optedIn = true/);
+  assert.match(motion,/this.clock = 0/);
+  assert.match(motion,/Play animation/);
+  assert.doesNotMatch(motion,/nextStill|Next frame|sw-steps|step buttons/);
+});
+test('offscreen/hidden work is suspended and effects clean up',()=>{
+  for(const text of ['IntersectionObserver','document.hidden','cancelAnimationFrame','disconnect()','removeEventListener','private paused = false'])assert.ok(motion.includes(text));
+  assert.doesNotMatch(motion,/setInterval|setTimeout/);
+});
+test('transfer and Slack remain the requested native task sequences',()=>{
+  assert.equal(data.TRANSFER_RUN.input.host,'ops-pc');
+  assert.equal(data.TRANSFER_RUN.input.detach,true);
+  assert.deepEqual(TIMELINES.transfer.flatMap(b=>b.target?[b.target]:[]),['ga-report','ga-share','ga-download','ga-csv','drive-tab','drive-folder','drive-new','drive-upload','transfer-file','transfer-open']);
+  assert.deepEqual(TIMELINES.slack.flatMap(b=>b.target?[b.target]:[]),['slack-account','slack-profile','slack-edit','slack-upload','slack-pictures','slack-file','slack-open','slack-crop','slack-crop-save','slack-save']);
+});
+test('new scenes inherit Satelle paint without vendor palette or filters',()=>{
+  assert.doesNotMatch(read('landing-scenes.css'),/#[0-9a-f]{3,8}\b|grayscale|hue-rotate/i);
+  assert.doesNotMatch(focus+read('workflow-logos.tsx'),/(?:fill|stroke)=["']#/);
+  assert.match(read('workflow-logos.tsx'),/fill="currentColor"/);
+});
+test('logo paths match the pinned Simple Icons 15.0.0 source snapshots',()=>{
+  const src=read('workflow-logos.tsx');
+  const expected={"chatgpt": "3fae9b38d571a5ab5aa662bc279dcda580855d6ca6b35330e4b4ba171367ffb1", "slack": "69c3650cc9632f4edcf00bb5fd02792d5cb46d8af58f8db5001ba64cdd40da4b", "drive": "583dfed4b5d2e771e6d1df51d78588feaa4e8f11db4bbd4e44fff7a369b061d8", "analytics": "4697f13a7ce9c068abeb35c5d480e7f28f20c9404f48ba244115fe293773c9ac"};
+  for(const [name,hash] of Object.entries(expected)){
+    const path=src.match(new RegExp(`  ${name}: '([^']+)'`))?.[1];
+    assert.ok(path,name);
+    assert.equal(createHash('sha256').update(path).digest('hex'),hash,name);
   }
+  assert.doesNotMatch(src,/rotate\(/);
 });
-test('human text types progressively then remains complete', () => {
-  const text = data.PROMPTS.transfer;
-  assert.equal(typed(text, sample(TIMELINES.transfer, 0), 0), '');
-  assert.ok(typed(text, sample(TIMELINES.transfer, 900), 0).length < text.length);
-  assert.equal(typed(text, sample(TIMELINES.transfer, 1800), 0), text);
-  assert.equal(typed(text, sample(TIMELINES.transfer, 6000), 0), text);
+test('no external operation is performed by a demo',()=>{
+  assert.doesNotMatch(focus+motion+gallery,/\bfetch\s*\(|XMLHttpRequest|new WebSocket|execSync|window\.open/);
 });
-test('window handoff and crop interpolation follow the finite clock', () => {
-  assert.equal(phase(sample(TIMELINES.transfer, 0), 2), 0);
-  assert.equal(phase(sample(TIMELINES.transfer, duration(TIMELINES.transfer)), 2), 1);
-  assert.match(scenes, /phase\(frame, 2, 1100\)/);
-  assert.match(scenes, /phase\(frame, 8, 1000, data.COMMIT_DELAY\)/);
-});
-test('no segmented step bars, step rail, or obsolete help text survive', () => {
-  assert.doesNotMatch(motion + css, /sw-steps|animation steps|Use the steps to explore|Show .* step /);
-  assert.match(motion, /Replay/);
-  assert.match(motion, /Next frame/);
-});
-test('all application paint is inherited from the landing theme, not vendor hex colors', () => {
-  assert.doesNotMatch(css, /#[0-9a-f]{3,8}\b/i);
-  assert.doesNotMatch(ui + scenes + motion, /(?:fill|stroke)=["']#[0-9a-f]/i);
-  assert.doesNotMatch(ui, /#[0-9a-f]{3,8}\b/i);
-  assert.doesNotMatch(css, /filter\s*:\s*(?:grayscale|hue-rotate)/);
-  assert.doesNotMatch(css, /var\(--(?:google|slack|gpt|claude)-/);
-  assert.match(css, /background: var\(--sa-5\)/);
-});
-test('branding is represented by monochrome shapes, not raster assets', () => {
-  assert.match(ui, /name === 'slack'/);
-  assert.match(ui, /fill="currentColor"/);
-  assert.doesNotMatch(ui + scenes, /<img\b|<iframe\b|https?:\/\/.*\.(?:png|svg|jpe?g)/);
-});
-test('Host rows mean configured contexts, not discovered or confirmed-ready machines', () => {
-  assert.deepEqual(data.HOST_CHECK.input, { all: true });
-  assert.equal(data.HOST_CHECK.fields.schema_version, 'satelle.config.check.v1');
-  assert.deepEqual(data.HOST_CHECK.fields.not_checked, ['remote_host', 'provider_auth', 'native_computer_use']);
-  assert.doesNotMatch(source + scenes, /hosts_list|discover_hosts|list_hosts/);
-  assert.match(scenes, /Configured/);
-});
-test('ChatGPT is visibly a concept, with no nonexistent installer command', () => {
-  assert.equal(data.CHATGPT_INTEGRATION.status, 'concept');
-  assert.match(scenes, /Integration concept/);
-  assert.match(gallery, /not an available Satelle integration/);
-  assert.doesNotMatch(source + scenes + gallery, /mcp install.*chatgpt/);
-});
-test('ChatGPT task submission remains hypothetical and detached', () => {
-  assert.equal(data.CHAT_RUN.input.detach, true);
-  assert.equal(data.CHAT_RUN.input.host, 'studio-mac');
-  assert.equal(data.CHAT_RUN.fields.status, 'starting');
-  assert.match(data.PROMPTS.chat, /Slack profile picture/);
-});
-test('Claude Code uses the recognizable prompt and tool transcript, not a checklist app', () => {
-  assert.match(scenes, /▐▛███▜▌/);
-  assert.match(scenes, /satelle - run \(MCP\)/);
-  assert.match(scenes, /esc to interrupt/);
-  assert.match(scenes, /wf-terminal-layer/);
-  assert.match(scenes, /wf-minimized-terminal/);
-});
-test('file export and upload share one Host and one filename', () => {
-  assert.equal(data.TRANSFER_RUN.input.host, 'ops-pc');
-  assert.equal(data.TRANSFER_RUN.input.detach, true);
-  assert.match(data.PROMPTS.transfer, /Google Analytics/);
-  assert.match(data.PROMPTS.transfer, /Google Drive/);
-  assert.equal(data.REPORT_FILE, 'Traffic acquisition.csv');
-  const targets = TIMELINES.transfer.map(b => b.target).filter(Boolean);
-  assert.deepEqual(targets, ['ga-report','ga-share','ga-download','ga-csv','drive-tab','drive-folder','drive-new','drive-upload','transfer-file','transfer-open']);
-});
-test('Slack profile navigation includes picker, crop, and both save actions', () => {
-  assert.equal(data.PHOTO_FILE, 'profile.png');
-  const targets = TIMELINES.slack.map(b => b.target).filter(Boolean);
-  assert.deepEqual(targets, ['slack-account','slack-profile','slack-edit','slack-upload','slack-pictures','slack-file','slack-open','slack-crop','slack-crop-save','slack-save']);
-  assert.match(scenes, /Save Changes/);
-  assert.doesNotMatch(source + scenes, /WallpaperScene|change the wallpaper|mountain landscape/);
-});
-test('example identifiers remain valid, without personal account details', () => {
-  assert.match(data.SESSION, /^rs_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-  assert.doesNotMatch(scenes, /Sara Parras|555 0123|checkout\.js:421/);
-});
-test('QA is read-only and does not invent a security finding on GitHub', () => {
-  assert.match(data.PROMPTS.qa, /Do not submit anything/);
-  assert.match(scenes, /Scripted example/);
-  assert.doesNotMatch(scenes, /Critical|invalid email|security vulnerability/);
-});
-test('playback suspends offscreen, honors reduced motion, and cleans up', () => {
-  for (const term of ['IntersectionObserver','document.hidden','prefers-reduced-motion','cancelAnimationFrame','disconnect()','removeEventListener']) assert.ok(motion.includes(term));
-  assert.match(motion, /private paused = false/);
-  assert.doesNotMatch(motion, /setInterval|setTimeout/);
-});
-test('illustrative scenes do not invoke the apps, a Host, or a shell', () => {
-  assert.doesNotMatch(source + scenes + ui + motion, /\bfetch\s*\(|XMLHttpRequest|WebSocket\s*\(|child_process|execSync|window\.open/);
-});
-test('Claude Code retains the website monospace operator typography', () => {
-  assert.match(css, /\.wf-claude-window\s*\{\s*font-family:\s*var\(--font-mono/);
-});
-

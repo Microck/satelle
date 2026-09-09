@@ -1,0 +1,52 @@
+name: Landing demo browser checks
+on:
+  pull_request:
+    paths:
+      - 'website/**'
+      - 'package*.json'
+      - '.github/workflows/landing-demos.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: landing-demos-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 20
+          cache: npm
+      - name: Build the actual pinned Next.js site
+        run: |
+          npm ci --ignore-scripts
+          npm run postinstall --workspace website
+          npm run docs:build
+      - name: Install an isolated browser test runner
+        run: |
+          npm install --prefix "$RUNNER_TEMP/landing-browser" --no-save --ignore-scripts --no-audit --no-fund playwright@1.55.0
+          "$RUNNER_TEMP/landing-browser/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Verify animation on the exported landing page
+        env:
+          PLAYWRIGHT_MODULE: ${{ runner.temp }}/landing-browser/node_modules/playwright/index.mjs
+          DEMO_ARTIFACTS: ${{ runner.temp }}/landing-artifacts
+        run: |
+          python3 -m http.server 4173 --bind 127.0.0.1 --directory website/out &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID"' EXIT
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:4173/ >/dev/null && break; sleep 1; done
+          node website/scripts/landing-browser-check.mjs
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: landing-demo-browser-evidence
+          path: ${{ runner.temp }}/landing-artifacts
+          if-no-files-found: ignore
+          retention-days: 7

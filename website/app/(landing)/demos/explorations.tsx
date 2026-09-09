@@ -1,78 +1,45 @@
 'use client';
-import * as React from "react";
-import * as data from "./exploration-data";
-import * as motion from "./workflow-motion";
-import * as scenes from "./workflow-scenes";
-import "./explorations.css";
-const SCENES: Record<data.DemoId, React.ComponentType<data.SceneProps>> = { qa: scenes.QaScene, chat: scenes.ChatScene, transfer: scenes.TransferScene, slack: scenes.SlackScene };
+import * as React from 'react';
+import { CHAT_RUN, CHATGPT_INTEGRATION, DEMOS, HOST_CHECK, RELEASE, TRANSFER_RUN } from './exploration-data';
+import { WorkflowPlayer } from './workflow-motion';
+import { SlackScene, TransferScene } from './workflow-scenes';
+import { CheckoutScene, SimpleChatScene } from './landing-scenes';
+import { ToolDetails } from './workflow-ui';
+import './explorations.css';
+import './landing-scenes.css';
+
+const SCENES = { qa: CheckoutScene, chat: SimpleChatScene, transfer: TransferScene, slack: SlackScene };
 const NOTES = {
-    qa: 'GitHub UI reenactment. The QA notes are scripted, not measured results or a built-in Satelle report.',
-    chat: data.CHATGPT_INTEGRATION.note,
-    transfer: 'Signed-in sample accounts. Browser download and upload occur on the same Host, with mutation tools enabled.',
-    slack: 'A Slack desktop task, not a Slack API integration. The image is illustrative; no account is changed.',
+  qa: 'Sauce Demo checkout illustration. Scripted QA results, not a measured run. No purchase is made.',
+  chat: CHATGPT_INTEGRATION.note,
+  transfer: 'Signed-in sample accounts. Browser download and upload stay on the same Host. Mutation tools are enabled.',
+  slack: 'A native Slack task, not a Slack API integration. No real profile is changed by this demo.',
 };
-export default function DemoGallery({ explore = false }: {
-    explore?: boolean;
-}) {
-    return <div className="sx-gallery" data-explorations={explore ? 'review' : 'home'}>
+export default function DemoGallery({ explore = false }: { explore?: boolean }) {
+  return <div className="sx-gallery" data-explorations={explore ? 'review' : 'home'}>
     <div className="sx-grid">
-        {data.DEMOS.map((demo) => {
-            const Scene = SCENES[demo.id];
-            const titleId = `${explore ? 'explore' : 'home'}-${demo.id}-title`;
-            return <article className="sx-card" key={demo.id} aria-labelledby={titleId} data-demo={demo.id} data-surface={demo.surface}>
-            <header className="sx-card-head">
-            {explore && <span className="sx-eyebrow">
-            {demo.number}
-            {" / "}
-            {demo.label}
-            </span>}
-            <h3 id={titleId}>
-            {demo.title}
-            </h3>
-            <p>
-            {demo.lead}
-            </p>
-            <a href={demo.href}>
-            {demo.cta}
-            {" "}
-            <span aria-hidden="true">
-            {"\u2192"}
-            </span>
-            </a>
-            </header>
-            <div className="sx-card-body">
-            <motion.WorkflowPlayer id={demo.id}>
-            {(frame, moving) => <Scene frame={frame} moving={moving}/>}
-            </motion.WorkflowPlayer>
-            </div>
-            <div className="sw-notes">
-            <p>
-            {NOTES[demo.id]}
-            </p>
-            {explore && demo.id === 'chat' && <React.Fragment>
-            <scenes.ToolDetails label="Proposed config_check · configured Hosts" input={data.HOST_CHECK.input} fields={data.HOST_CHECK.fields}/>
-            <scenes.ToolDetails label="Proposed run · ChatGPT concept" input={data.CHAT_RUN.input} fields={data.CHAT_RUN.fields}/>
-            </React.Fragment>}
-            {explore && demo.id === 'transfer' && <scenes.ToolDetails label="run · Claude Code task" input={data.TRANSFER_RUN.input} fields={data.TRANSFER_RUN.fields}/>}
-            </div>
-            </article>;
-        })}
+      {DEMOS.map((demo) => {
+        const Scene = SCENES[demo.id];
+        const titleId = `${explore ? 'explore' : 'home'}-${demo.id}-title`;
+        return <article className="sx-card" key={demo.id} aria-labelledby={titleId} data-demo={demo.id} data-surface={demo.surface}>
+          <header className="sx-card-head">
+            {explore && <span className="sx-eyebrow">{demo.number} / {demo.label}</span>}
+            <h3 id={titleId}>{demo.title}</h3><p>{demo.lead}</p>
+            <a href={demo.href}>{demo.cta} <span aria-hidden="true">→</span></a>
+          </header>
+          <div className="sx-card-body"><WorkflowPlayer id={demo.id}>{(frame, moving) => <Scene frame={frame} moving={moving} />}</WorkflowPlayer></div>
+          <div className="sw-notes"><p>{NOTES[demo.id]}</p>
+            {explore && demo.id === 'chat' && <><ToolDetails label="Proposed config_check · configured Hosts" input={HOST_CHECK.input} fields={HOST_CHECK.fields} /><ToolDetails label="Proposed run · chat task" input={CHAT_RUN.input} fields={CHAT_RUN.fields} /></>}
+            {explore && demo.id === 'transfer' && <ToolDetails label="run · Claude Code task" input={TRANSFER_RUN.input} fields={TRANSFER_RUN.fields} />}
+          </div>
+        </article>;
+      })}
     </div>
     {explore && <section id="chatgpt-requirements" className="wf-integration-note" aria-labelledby="chatgpt-requirements-title">
-    <h2 id="chatgpt-requirements-title">
-    {"ChatGPT connection requirements"}
-    </h2>
-    <p>
-    {"The desktop conversation is a design concept, not an available Satelle integration. This release serves MCP over local stdio and has no ChatGPT installer target. ChatGPT custom MCP requires a compatible remote transport; a bridge and desktop-client compatibility would need implementation and verification. Neither is supplied by this PR. Configured Hosts are not automatically discovered, online, or ready."}
-    </p>
-    <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt">
-    {"OpenAI\u2019s MCP requirements \u2197"}
-    </a>
+      <h2 id="chatgpt-requirements-title">ChatGPT connection requirements</h2>
+      <p>The simplified chat is a concept, not an available Satelle integration. This release serves MCP over local stdio and has no ChatGPT installer. A compatible remote bridge and client compatibility need separate implementation and verification. Configured Hosts are not automatically online or ready.</p>
+      <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt">OpenAI’s MCP requirements ↗</a>
     </section>}
-    <p className="sx-footnote">
-    {"Animated UI reenactments, not live runs or recordings. Sample data and outcomes are illustrative. Native macOS and Windows Hosts are candidates and must pass the live readiness probe; native Linux Host execution is not supported in "}
-    {data.RELEASE}
-    {". Playback controls affect this page only. App brands do not imply a partnership."}
-    </p>
-    </div>;
+    <p className="sx-footnote">Animated illustrations, not live runs or recordings. Normal playback repeats while visible; Pause stops it. Reduced motion disables autoplay, with Play animation available by choice. Native macOS and Windows Hosts are candidates requiring a live readiness pass; native Linux Host execution is unsupported in {RELEASE}.</p>
+  </div>;
 }
