@@ -205,12 +205,18 @@
 /* Contracts onto the point, holds there long enough to be seen, then goes. The
    first version was 300ms with no hold and was easy to miss entirely, which is
    the whole complaint it exists to answer. */
+/* Starts visible. The commit that lands with this press re-renders the whole
+   drawn interior, which occupies the main thread and drops the animation's
+   first frames: fading in from zero meant the ring did not appear until about
+   250ms after the pointer arrived, so the application appeared to change before
+   anything had visibly clicked it. Beginning at full opacity means the first
+   frame that does get painted already shows the press. */
 @keyframes ctl-press {
   from {
-    opacity: 0;
+    opacity: 1;
     scale: 1.9;
   }
-  40% {
+  55% {
     opacity: 1;
     scale: 1;
   }

@@ -139,6 +139,19 @@
   color: var(--sa-12);
 }
 
+/* One caret in the pane, on the line being written.
+
+   A field reports itself as editing from the moment it mounts, its lead time
+   included, so every line of a block still waiting its turn draws a caret of
+   its own: the six line collect_coin body opened with six of them stacked up
+   and blinking at once. The excerpt is written top to bottom, so the first
+   caret in the pane is the live insertion point and every caret after it
+   belongs to a line that has not started. Hidden rather than removed, so
+   nothing shifts sideways when a line's turn does come. */
+.gd-line:has(.sa-caret) ~ .gd-line .sa-caret {
+  visibility: hidden;
+}
+
 /* The starter's TODO stubs, still in place. */
 .gd-line[data-kind='todo'] {
   background: color-mix(in oklab, var(--sa-warn) 8%, transparent);

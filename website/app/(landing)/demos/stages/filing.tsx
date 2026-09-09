@@ -474,10 +474,16 @@ export const filingStage: Stage = {
       label: 'Page and margins',
       message: 'set US Letter with 1 inch margins on every side',
       // Fallback: the left rule of the margin guide, at half its height, which
-      // is the line the drag pulls in. The live target is the sheet itself,
-      // because the guide is not drawn until the step lands.
+      // is the line the text block moves out to. The live target is the sheet
+      // itself, because the guide is not drawn until the step lands.
       at: { x: 0.274, y: 0.304 },
-      act: 'drag',
+      // A click, not a drag: paper size and all four margins are one page setup
+      // change to the whole sheet, not a gesture across a distance. A drag also
+      // draws a trail as long as the travel, and the travel into this step
+      // comes from the guide pane on the far right, so it streaked 2.5rem back
+      // towards the guide and read as dragging something out of it onto the
+      // middle of the page.
+      act: 'click',
     },
     {
       event: 'turn_progress',

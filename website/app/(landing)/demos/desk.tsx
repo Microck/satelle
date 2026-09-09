@@ -27,7 +27,7 @@ const STAGES: Stage[] = [excelStage, kicadStage, godotStage, filingStage];
  * longest retype on the page.
  */
 const DWELL_MS = 360;
-const TYPE_DWELL_MS = 850;
+const TYPE_DWELL_MS = 1100;
 
 /**
  * True once the element has been on screen, and true forever after. A hero that

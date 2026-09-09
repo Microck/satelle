@@ -219,6 +219,11 @@
 .fl-sig {
   display: flex;
   flex-direction: column;
+  /* Hugs its own lines instead of stretching to the text block. The pointer
+     aims at the centre of the box a stage marks, and a full width box put step
+     8's landing 23px past the end of the longest line, on blank paper, and left
+     it in the gutter between the sheets once the page break moved the sheet. */
+  width: fit-content;
   row-gap: 0.05em;
   margin-block-start: 0.4em;
   font-size: 0.8em;

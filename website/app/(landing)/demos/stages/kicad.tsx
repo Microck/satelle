@@ -231,8 +231,18 @@ function targetOf(next: number): Target {
       return 'panel';
     case 7:
       return 'drc';
-    // Both output steps write into the same panel slot, which the Requirements
-    // list occupies until the fabrication list replaces it.
+    // Both output steps aim at the same panel slot, the one the Requirements
+    // list occupies until the fabrication list replaces it in place at step 9.
+    //
+    // Step 9 lands on the thing it changes. Step 8 has nothing to land on: the
+    // saved path is drawn in exactly one place, the file field in the top bar,
+    // and that field's centre sits 17px from the top of the stage, inside the
+    // control aura, the same reason Calc's formula bar cannot be a target
+    // either. Every other candidate is further from the truth, not closer:
+    // nothing else on the board or in the panel changes when the board is
+    // saved, and sending the pointer out to the board and back would put a
+    // jump across the window between two adjacent output steps. So it waits on
+    // the slot the export fills, and the file field carries the change alone.
     case 8:
     case 9:
       return 'slot';
@@ -592,11 +602,17 @@ export const kicadStage: Stage = {
       event: 'turn_progress',
       label: 'Route GND',
       message: 'dropped 5 vias, routed GND on B.Cu inside the Edge.Cuts outline',
-      // The via at 10,29 mm, where J1's GND pad drops to B.Cu: it ends the first
-      // ground stub, so the drag sweeps back across the board from J2. The vias
-      // on the bottom trunk are level with the Controller window, which sits
-      // over that corner of the Host, and would hide the pointer.
-      at: { x: 0.211, y: 0.369 },
+      // The via at 55,29 mm, where J2's GND pad drops to B.Cu: the last of the
+      // five and the far end of the ground run, so the drag carries on down
+      // from the J2 pad LED_A just reached instead of crossing the whole board
+      // back to J1, which read as a jump to somewhere unrelated.
+      //
+      // The bottom trunk is the other end of this net and is not available: it
+      // runs at y 0.495 of the stage and the Controller window's top edge is at
+      // 0.466 from step 2 on, so a pointer there is behind the terminal. Its
+      // two middle vias sit at 0.460, clearing that edge by 4px, which the
+      // pointer's own glyph is four times taller than.
+      at: { x: 0.507, y: 0.369 },
       act: 'drag',
     },
     {
@@ -618,9 +634,9 @@ export const kicadStage: Stage = {
       event: 'turn_progress',
       label: 'Save the board',
       message: 'saved submission/status_light_final.kicad_pcb',
-      // The submission slot in the side panel: the Requirements list sits here
-      // until the fabrication list replaces it at the same place, so the two
-      // output steps land on the same block.
+      // The submission slot in the side panel. Nothing in the slot changes on
+      // this step: see `targetOf` for why the saved path itself cannot be the
+      // target and why the pointer waits here for the export.
       at: { x: 0.869, y: 0.498 },
       act: 'click',
     },

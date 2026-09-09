@@ -576,13 +576,29 @@ shake, theirs being 12.5 degrees on a 660ms period over 1410ms, compressed here
 to finish inside the demo's dwell so a settled demo has nothing running.
 
 A click is also drawn, as two rings contracting onto the point over 480ms with a
-held peak, painted *under* the arrow: a click mark drawn over the pointer that
+held peak. It begins at full opacity rather than fading in, because the commit
+landing with it re-renders the whole interior and drops the animation's first
+frames: fading from zero meant the ring did not appear until about 250ms after
+the pointer arrived, so the application appeared to change before anything had
+visibly clicked it. It is painted *under* the arrow: a click mark drawn over the pointer that
 made it looks like the mark is the thing being pointed at. Neither shipped implementation draws one: 21.5MB of extension
 contains no `ripple`, no `keyframes`, and no per-click marker, and they carry the
 press in their motion springs alone. That works at 60fps in a live session and
 does not work in a stepped demo, where a click step landed with nothing at all
 to see. The first attempt at this was 300ms with no hold and was still easy to
 miss, which is the whole complaint it exists to answer.
+
+**A block of text writes top to bottom, one line at a time.** `Retype` takes a
+`delayMs`, and a stage gives each line of a block a lead equal to the characters
+before it. Without that lead every line of a block mounted on the same frame and
+started typing together, so a function grew rightward all at once instead of
+being written.
+
+Typing advances by the frame, not by the character. A character per timeout meant
+a React commit and a paint each, about 13ms rather than the rate asked for, so
+the schedule was a lie and a six line block overran the step holding it by 780ms.
+Batching several characters into one tick makes the rate real and cuts that
+block's renders from 177 to about 60.
 
 **Text the Turn rewrites is typed, not swapped.** `Retype` in
 `demos/typewriter.tsx` deletes the divergent tail one character at a time and

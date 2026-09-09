@@ -70,8 +70,10 @@ function revenueOf(row: Row, repaired: boolean) {
  *
  * Nothing here may resolve to the sheet tabs at the left of the strip or to the
  * middle of the grid's bottom edge: the Controller window covers the Host's
- * bottom left corner, out to x 0.58 and down from y 0.54 of the stage, and a
- * pointer under it is invisible.
+ * bottom left corner, measured at 1440 as out to x 0.583 and down from y 0.466
+ * of the stage, and a pointer under it is invisible. Nor to the formula bar,
+ * whose centre lands at 0.525, 0.026, under both the top of the control aura
+ * and the aura's own label pill at x 0.41 to 0.59.
  */
 type Target =
   | 'file'
@@ -95,8 +97,11 @@ function targetOf(next: number): Target {
     case 3:
       return 'duplicate';
     // Drawn J5: the Revenue cell of the broken row, which turns from the wrong
-    // figure to the right one. The formula bar carries the same edit but sits
-    // 17px from the top of the stage, inside the control aura.
+    // figure to the right one and which shows the formula being written while
+    // it happens. The formula bar carries the same edit and keeps the caret,
+    // being the only field wide enough to read a formula at this size, but it
+    // cannot be the target: its centre is 17px from the top of the stage, under
+    // the aura's label.
     case 4:
       return 'revenue';
     // The Profit column header, the first of the two columns the fill crosses.
@@ -143,7 +148,17 @@ function Sheet({ step, next, reduced }: StageProps) {
   // The formula bar is typed rather than swapped, and the "repaired" badge
   // waits for the typing to finish: it was appearing on the first keystroke,
   // calling the formula repaired while it was still being written.
-  const typed = useRetype(formula, !reduced);
+  //
+  // It types only for the repair, which is the one step whose message says the
+  // Turn typed. The broken formula was in the workbook when it opened, so it is
+  // simply there beforehand: writing it out the moment the workbook opened put
+  // a blinking caret at the top of the sheet while the pointer was down in the
+  // tab strip clicking the file, which is two claims at once about where the
+  // Turn is working, and neither of them is what that step's message says.
+  const typed = useRetype(formula, !reduced && repaired);
+  // True while the repair is being written. The pointer stands on the cell, so
+  // the cell has to show the edit; see the overlay below.
+  const editing = repaired && typed.editing;
 
   return (
     <div className="xl">
@@ -225,9 +240,27 @@ function Sheet({ step, next, reduced }: StageProps) {
                     <td
                       className="xl-num"
                       data-fixed={row.broken && repaired}
+                      data-editing={(row.broken && editing) || undefined}
                       data-cu-target={(target === 'revenue' && row.broken) || undefined}
                     >
                       {money(revenue)}
+                      {/* The edit, drawn in the cell the pointer is standing
+                          on. The caret stays in the formula bar, which is the
+                          only field wide enough to read the formula at this
+                          size, but a step whose message says it typed has to
+                          show something happening under the pointer: a cell
+                          whose number simply changes reads as the pointer
+                          having missed whatever did it.
+                          Drawn over the cell rather than in it, so thirteen
+                          characters of formula cannot widen an eight character
+                          column and shove the rest of the row sideways
+                          mid-edit. A spreadsheet's own edit box overhangs its
+                          neighbours in exactly this way. */}
+                      {row.broken && editing ? (
+                        <span className="xl-edit sa-mono" aria-hidden="true">
+                          {typed.shown}
+                        </span>
+                      ) : null}
                     </td>
                     <td className="xl-num">{money(cogs)}</td>
                     <td className="xl-num">{derived ? money(profit) : ''}</td>
@@ -433,10 +466,10 @@ export const excelStage: Stage = {
       event: 'turn_progress',
       label: 'Repair formulas',
       message: 'repaired J5 to =F5*G5*(1-I5), filled Revenue and COGS through row 31',
-      // Drawn J5: the Revenue cell of row 5, which turns from the broken
-      // figure to the repaired one under the caret. The formula bar mirrors the
-      // same edit but sits 17px from the top of the stage, inside the control
-      // ring, so the typing is shown in the cell.
+      // Drawn J5: the Revenue cell of row 5, which shows the formula being
+      // written and then the repaired figure. The formula bar mirrors the edit
+      // and holds the caret, but it sits 17px from the top of the stage, inside
+      // the control ring, so it cannot be where the pointer stands.
       at: { x: 0.665, y: 0.236 },
       act: 'type',
     },
