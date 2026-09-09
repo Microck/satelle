@@ -6,6 +6,8 @@ mod codex_capabilities;
 mod codex_install;
 #[path = "codex-session.rs"]
 mod codex_session;
+#[path = "credential-helper.rs"]
+mod credential_helper;
 mod daemon;
 #[path = "desktop-sessions.rs"]
 mod desktop_sessions;
@@ -1318,7 +1320,7 @@ impl ComputerUseAdapter for ResolvedSecretCanaryAdapter {
         let binding = provider_intent
             .resolved_provider_binding()
             .expect("Host must inject the authoritative provider binding");
-        let secret = runtime::resolve_provider_child_secret_for_test(binding)?
+        let secret = runtime::resolve_provider_child_secret_for_test(binding, host)?
             .expect("the canary provider binding must resolve a secret");
         assert!(
             secret
@@ -1840,16 +1842,21 @@ pub fn validate_provider_binding_authorization(
             provider_auth::ProviderHostPlatform::current(),
         )
         .map_err(|error| match error {
-            provider_auth::ProviderAuthResolutionError::InvalidFilePath => SatelleError {
-                code: satelle_core::ErrorCode::SecretFilePathNotAbsolute,
-                message: "the provider Secret Source file path is not absolute for the target Host"
-                    .to_string(),
+            provider_auth::ProviderAuthResolutionError::InvalidHelperArgv => SatelleError {
+                code: satelle_core::ErrorCode::CredentialHelperArgvInvalid,
+                message:
+                    "the credential helper executable path is not absolute for the target Host"
+                        .to_string(),
                 recovery_command: Some(
-                    "use an absolute target-host file path for file Secret Sources".to_string(),
+                    "configure an absolute executable path for the target Host operating system"
+                        .to_string(),
                 ),
                 source_detail: None,
                 details: std::collections::BTreeMap::new(),
             },
+            provider_auth::ProviderAuthResolutionError::FilePath(error) => {
+                error.diagnostic(None, None, None, Some(std::env::consts::OS))
+            }
             _ => SatelleError::config_error(
                 "the provider Secret Source descriptor is invalid for the target Host",
                 None,
@@ -3791,13 +3798,11 @@ impl HostService {
                 None,
             ));
         }
-        validate_provider_binding_authorization(&authorization)?;
-        let binding = ResolvedProviderBinding::from_authorization(
+        provider_auth::prepare_provider_binding(
             authorization,
             ProviderBindingSource::UserConfig,
-        );
-        let _ = host;
-        Ok(binding)
+            host,
+        )
     }
 
     fn provider_candidate_intent(

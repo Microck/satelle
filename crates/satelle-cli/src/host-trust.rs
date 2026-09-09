@@ -385,10 +385,13 @@ fn provider_secret_source_item_matches(existing: &Item, expected: &Table) -> boo
     let Some(existing) = existing.as_table_like() else {
         return false;
     };
-    existing.len() == expected.len()
-        && expected
-            .iter()
-            .all(|(key, value)| existing.get(key).and_then(Item::as_str) == value.as_str())
+    let mut existing_table = Table::new();
+    for (key, item) in existing.iter() {
+        existing_table.insert(key, item.clone());
+    }
+    let existing: Result<toml::Value, _> = toml::from_str(&existing_table.to_string());
+    let expected: Result<toml::Value, _> = toml::from_str(&expected.to_string());
+    matches!((existing, expected), (Ok(existing), Ok(expected)) if existing == expected)
 }
 
 fn provider_secret_source_item(descriptor: &ProviderSecretSource) -> Item {
@@ -410,6 +413,20 @@ fn provider_secret_source_item(descriptor: &ProviderSecretSource) -> Item {
         ProviderSecretSource::HostStore { name } => {
             table.insert("kind", value("host-store"));
             table.insert("name", value(name));
+        }
+        ProviderSecretSource::ExecutableHelper(helper) => {
+            table.insert("kind", value("executable-helper"));
+            let mut argv = toml_edit::Array::new();
+            for argument in helper.argv() {
+                argv.push(argument.as_str());
+            }
+            table.insert("argv", value(argv));
+            table.insert("timeout", value(helper.timeout().as_str()));
+            let mut environment = Table::new();
+            for (name, setting) in helper.environment() {
+                environment.insert(name, value(setting));
+            }
+            table.insert("environment", Item::Table(environment));
         }
     }
     Item::Table(table)
@@ -1131,6 +1148,39 @@ mod tests {
             !persist_provider_auth_descriptor(&config, "remote", "openai", &descriptor).unwrap()
         );
         assert_eq!(fs::read_to_string(&config).unwrap(), updated);
+    }
+
+    #[test]
+    fn credential_helper_persistence_compares_nested_settings_and_literal_argv() {
+        let (_directory, config) =
+            secure_config("[hosts.local]\ntransport = \"local\"\nadapter = \"fake\"\n");
+        for (argument, account) in [("first argument", "one"), ("second argument", "two")] {
+            let descriptor = ProviderSecretSource::ExecutableHelper(
+                satelle_core::CredentialHelper::new(
+                    vec!["/opt/helper".to_string(), argument.to_string()],
+                    satelle_core::ExplicitDuration::parse("2s").unwrap(),
+                    std::collections::BTreeMap::from([(
+                        "HELPER_ACCOUNT".to_string(),
+                        account.to_string(),
+                    )]),
+                )
+                .unwrap(),
+            );
+            assert!(
+                persist_provider_auth_descriptor(&config, "local", "auth", &descriptor).unwrap()
+            );
+            let saved = fs::read_to_string(&config).unwrap();
+            let parsed: toml::Value = toml::from_str(&saved).unwrap();
+            let reloaded: ProviderSecretSource = parsed["hosts"]["local"]["provider_auth"]["auth"]
+                .clone()
+                .try_into()
+                .unwrap();
+            assert_eq!(reloaded, descriptor);
+            assert!(
+                !persist_provider_auth_descriptor(&config, "local", "auth", &descriptor).unwrap()
+            );
+            assert_eq!(fs::read_to_string(&config).unwrap(), saved);
+        }
     }
 
     #[cfg(windows)]

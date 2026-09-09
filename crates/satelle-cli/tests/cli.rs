@@ -7282,9 +7282,9 @@ auth_source = "openai"
 
 [hosts.local.provider_auth.openai]
 kind = "file"
-path = "~/openai-key"
+path = "~another-user/openai-key"
 "#,
-            "secret-file-path-not-absolute",
+            "secret-file-tilde-form-unsupported",
         ),
     ];
 

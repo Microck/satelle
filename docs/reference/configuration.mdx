@@ -166,3 +166,57 @@ satelle config explain --host local-demo --json
 `config explain` redacts Secret Source references unless
 `--show-secret-references` is explicit. It never reads or prints secret
 material.
+
+## Credential helpers
+
+A user-owned provider binding can resolve credentials with an executable on
+the target Host. The executable and its settings must exist on that Host.
+Project configuration cannot define a helper.
+
+```toml
+[hosts.local-demo.provider_auth.work]
+kind = "executable-helper"
+argv = ["/opt/credentials/provider-helper", "--account", "work"]
+timeout = "10s"
+environment = { HELPER_PROFILE = "work" }
+```
+
+Reference `work` from a provider binding's `auth_source`. `argv[0]` must be an
+absolute executable path for the Host's operating system. Satelle passes the
+remaining arguments literally. Shell launchers, inline interpreter commands,
+and standalone shell operators are rejected. Satelle does not expand shell
+syntax or search `PATH`. `timeout` defaults to `10s` and requires explicit
+units when set.
+
+The Host sends one UTF-8 JSON object, then closes stdin:
+
+```json
+{"schema_version":1,"operation":"resolve","provider_alias":"work","resolved_provider":"openai","host_alias":"local-demo"}
+```
+
+Requests contain no existing credentials or prompt text and are limited to
+2 KiB. The helper returns exactly one UTF-8 JSON object on stdout:
+
+```json
+{"schema_version":1,"status":"success","secret":"example-provider-credential"}
+```
+
+Failure responses use `status = "error"` or `"interaction_required"` and a
+nonempty `code` instead of `secret`. Unknown fields, nonzero exits, invalid or
+multiple JSON values, NULs, empty secrets, and output over 64 KiB fail before
+prompt execution. A timeout reports `credential-helper-timeout`. Helpers have
+no terminal; Satelle discards stderr and does not answer interactive prompts.
+The Host terminates the helper process group when the operation ends.
+
+The inherited environment contains only `HOME`, `USERPROFILE`, `SystemRoot`,
+`WINDIR`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, and `LC_ALL` when present. Explicit
+`environment` entries add literal, non-secret helper settings. Keys use ASCII
+letters, digits, and underscores, cannot start with a digit, and cannot use
+the reserved `SATELLE_` prefix. Existing provider or transport credentials are
+never inherited.
+
+`config check` and `config explain` never execute a helper. Explain reports
+the kind, source, and effective timeout. It always redacts executable paths,
+arguments, environment key names, and values, even with
+`--show-secret-references`. Satelle never includes helper stdout, stderr,
+response error codes, or resolved secrets in diagnostics or stored state.

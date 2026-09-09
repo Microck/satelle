@@ -2248,7 +2248,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         if (!validResult) {
           fail(
             "release-executable-mismatch",
-            `${packageName} packed executable does not preserve native launch behavior`,
+            `${packageName} packed executable does not preserve native launch behavior (status=${child.status}, signal=${child.signal}, error=${child.error?.code ?? "none"})`,
           );
         }
       }

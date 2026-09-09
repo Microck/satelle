@@ -1912,11 +1912,11 @@ impl RuntimeEngine {
             .or(self.provider_policy.experimental_provider_computer_use)
             .unwrap_or(false);
         authorization = authorization.with_experimental_provider_computer_use(experimental);
-        crate::validate_provider_binding_authorization(&authorization)?;
-        let binding = ResolvedProviderBinding::from_authorization(
+        let binding = crate::provider_auth::prepare_provider_binding(
             authorization,
             ProviderBindingSource::HostOwned,
-        );
+            host,
+        )?;
         Ok(Some(match missing_auth_source_name {
             Some(auth_source_name) => ProviderBindingResolution::MissingDescriptor {
                 binding,

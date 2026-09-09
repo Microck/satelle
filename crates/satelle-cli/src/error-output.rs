@@ -291,6 +291,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::DesktopSessionNativeSelectorUnmatched
         | ErrorCode::DoctorReadinessBlockersFound
         | ErrorCode::SetupVerificationFailed
+        | ErrorCode::CredentialHelperTimeout
         | ErrorCode::ProviderSecretResolutionFailed
         | ErrorCode::ExperimentalProviderNotValidated => ErrorContract {
             category: ErrorCategory::Readiness,
@@ -505,8 +506,11 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ProjectProviderSelectionNotAllowed
         | ErrorCode::ProjectSecretSourceNotAllowed
         | ErrorCode::ProjectCredentialHelperNotAllowed
+        | ErrorCode::CredentialHelperArgvInvalid
         | ErrorCode::UnsupportedSecretSourceKind
         | ErrorCode::SecretFilePathNotAbsolute
+        | ErrorCode::SecretFileTildeFormUnsupported
+        | ErrorCode::SecretFileHomeUnavailable
         | ErrorCode::DesktopSessionSelectorConflict
         | ErrorCode::PathOverrideNotAbsolute
         | ErrorCode::DaemonPathOverrideNotAbsolute

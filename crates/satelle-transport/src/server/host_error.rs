@@ -275,6 +275,37 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "native Computer Use is not ready on this Host",
             details: None,
         },
+        ErrorCode::CredentialHelperArgvInvalid => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::CredentialHelperArgvInvalid,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the credential helper executable path is not absolute for the target Host",
+            details: None,
+        },
+        ErrorCode::CredentialHelperTimeout => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::CredentialHelperTimeout,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Host credential helper exceeded its timeout",
+            details: None,
+        },
+        ErrorCode::SecretFileTildeFormUnsupported | ErrorCode::SecretFileHomeUnavailable => {
+            let details = serde_json::json!(error.details);
+            ApiFailure {
+                status: StatusCode::BAD_REQUEST,
+                code: if error.code == ErrorCode::SecretFileHomeUnavailable {
+                    ApiErrorCode::SecretFileHomeUnavailable
+                } else {
+                    ApiErrorCode::SecretFileTildeFormUnsupported
+                },
+                category: ApiErrorCategory::InvalidRequest,
+                retryable: false,
+                message: "the Host cannot expand the provider secret file reference",
+                details: satelle_core::secret_file_error_details(&details).is_some().then_some(details),
+            }
+        }
         ErrorCode::ProviderSecretResolutionFailed => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::ProviderSecretResolutionFailed,
@@ -640,6 +671,23 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn secret_file_home_failures_preserve_only_the_closed_detail_envelope() {
+        for cause in [
+            satelle_core::SecretFilePathError::HomeUnavailable,
+            satelle_core::SecretFilePathError::TildeFormUnsupported,
+        ] {
+            let mut error = cause.diagnostic(None, None, Some("host-alias"), Some("windows"));
+            let mapped = failure(&error);
+            assert_eq!(mapped.code.as_str(), error.code.as_str());
+            assert_eq!(mapped.details, Some(json!(error.details)));
+            error
+                .details
+                .insert("private_diagnostic".to_string(), json!("must-not-leak"));
+            assert_eq!(failure(&error).details, None);
+        }
+    }
 
     #[test]
     fn computer_use_not_ready_exposes_only_a_closed_reason_token() {

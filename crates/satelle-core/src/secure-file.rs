@@ -1242,9 +1242,20 @@ pub fn sync_owner_only_directory(
 pub fn read_owner_only_secret_config_file(
     path: &Path,
 ) -> Result<Zeroizing<String>, SecureFileError> {
-    let bytes = read_secure_file(path, SecurityPolicy::OwnerPrivate, MAX_CONFIG_FILE_BYTES)?;
+    read_optional_owner_only_secret_config_file(path)?.ok_or(SecureFileError::UnsafeOrUnavailable)
+}
+
+/// Reads a private file that may disappear during its owner's lifecycle.
+/// Absence is determined by the same open that pins the validated file.
+pub fn read_optional_owner_only_secret_config_file(
+    path: &Path,
+) -> Result<Option<Zeroizing<String>>, SecureFileError> {
+    let Some(file) = open_optional_secure_file(path, SecurityPolicy::OwnerPrivate)? else {
+        return Ok(None);
+    };
+    let bytes = read_secure_file_contents(file, MAX_CONFIG_FILE_BYTES)?;
     let value = std::str::from_utf8(bytes.as_slice()).map_err(|_| SecureFileError::NotUtf8)?;
-    Ok(Zeroizing::new(value.to_string()))
+    Ok(Some(Zeroizing::new(value.to_string())))
 }
 
 pub fn read_owner_controlled_config_file(path: &Path) -> Result<String, SecureFileError> {
@@ -1865,7 +1876,13 @@ fn read_secure_file(
     policy: SecurityPolicy,
     maximum_bytes: usize,
 ) -> Result<Zeroizing<Vec<u8>>, SecureFileError> {
-    let mut file = open_secure_file(path, policy)?;
+    read_secure_file_contents(open_secure_file(path, policy)?, maximum_bytes)
+}
+
+fn read_secure_file_contents(
+    mut file: File,
+    maximum_bytes: usize,
+) -> Result<Zeroizing<Vec<u8>>, SecureFileError> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(maximum_bytes.min(4096)));
     Read::by_ref(&mut file)
         .take((maximum_bytes + 1) as u64)
@@ -1877,16 +1894,26 @@ fn read_secure_file(
     Ok(bytes)
 }
 
-#[cfg(unix)]
 fn open_secure_file(path: &Path, policy: SecurityPolicy) -> Result<File, SecureFileError> {
+    open_optional_secure_file(path, policy)?.ok_or(SecureFileError::UnsafeOrUnavailable)
+}
+
+#[cfg(unix)]
+fn open_optional_secure_file(
+    path: &Path,
+    policy: SecurityPolicy,
+) -> Result<Option<File>, SecureFileError> {
     use rustix::fs::{FileType, Mode, OFlags};
 
-    let descriptor = rustix::fs::open(
+    let descriptor = match rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
-    )
-    .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(_) => return Err(SecureFileError::UnsafeOrUnavailable),
+    };
     let metadata =
         rustix::fs::fstat(&descriptor).map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
     let mode = metadata.st_mode & 0o777;
@@ -1901,9 +1928,16 @@ fn open_secure_file(path: &Path, policy: SecurityPolicy) -> Result<File, SecureF
         || (policy == SecurityPolicy::UserOrAdministratorControlled && metadata.st_uid == 0);
     if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
         || !owner_is_trusted
-        || metadata.st_nlink != 1
         || !permissions_are_safe
     {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+    // An unlinked descriptor is a removed artifact, even if unlink raced fstat.
+    // It contributes no bytes; hard links still fail the security policy.
+    if metadata.st_nlink == 0 {
+        return Ok(None);
+    }
+    if metadata.st_nlink != 1 {
         return Err(SecureFileError::UnsafeOrUnavailable);
     }
     if matches!(
@@ -1912,12 +1946,15 @@ fn open_secure_file(path: &Path, policy: SecurityPolicy) -> Result<File, SecureF
     ) {
         require_no_macos_extended_acl(&descriptor)?;
     }
-    Ok(File::from(descriptor))
+    Ok(Some(File::from(descriptor)))
 }
 
 #[cfg(windows)]
-fn open_secure_file(path: &Path, policy: SecurityPolicy) -> Result<File, SecureFileError> {
-    windows::open_secure_file(path, policy)
+fn open_optional_secure_file(
+    path: &Path,
+    policy: SecurityPolicy,
+) -> Result<Option<File>, SecureFileError> {
+    windows::open_optional_secure_file(path, policy)
 }
 
 #[cfg(windows)]
@@ -1935,10 +1972,13 @@ mod windows {
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
         FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        RtlDosPathNameToNtPathName_U_WithStatus,
     };
     use windows_sys::Win32::Foundation::{
         GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
-        INVALID_HANDLE_VALUE, LocalFree, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING,
+        INVALID_HANDLE_VALUE, LocalFree, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE,
+        STATUS_DELETE_PENDING, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_NOT_FOUND,
+        STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -1957,9 +1997,10 @@ mod windows {
         FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TYPE_DISK, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
-        FileAttributeTagInfo, FileDispositionInfo, GetFileInformationByHandle,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TYPE_DISK,
+        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA, FileAttributeTagInfo,
+        FileDispositionInfo, FileStandardInfo, GetFileInformationByHandle,
         GetFileInformationByHandleEx, GetFileType, GetVolumeInformationByHandleW, OPEN_ALWAYS,
         OPEN_EXISTING, READ_CONTROL, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER,
     };
@@ -1968,6 +2009,7 @@ mod windows {
         ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, FILE_PERSISTENT_ACLS,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::System::WindowsProgramming::RtlFreeUnicodeString;
 
     const DANGEROUS_WRITE_MASK: u32 = FILE_WRITE_DATA
         | FILE_APPEND_DATA
@@ -2294,31 +2336,88 @@ mod windows {
         Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
     }
 
-    pub(super) fn open_secure_file(
+    pub(super) fn open_optional_secure_file(
         path: &Path,
         policy: SecurityPolicy,
-    ) -> Result<File, SecureFileError> {
+    ) -> Result<Option<File>, SecureFileError> {
         let wide = wide_path(path)?;
-        let raw = unsafe {
-            CreateFileW(
+        let mut native_path = UNICODE_STRING::default();
+        if unsafe {
+            RtlDosPathNameToNtPathName_U_WithStatus(
                 wide.as_ptr(),
-                FILE_GENERIC_READ | FILE_READ_ATTRIBUTES | READ_CONTROL,
-                FILE_SHARE_READ,
-                null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                &mut native_path,
                 null_mut(),
+                null(),
+            )
+        } < 0
+        {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: null_mut(),
+            ObjectName: &native_path,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: null_mut(),
+            SecurityQualityOfService: null(),
+        };
+        let mut raw = INVALID_HANDLE_VALUE;
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // Win32 maps delete-pending to ACCESS_DENIED, which cannot safely mean
+        // absence. Retain the native status and permit deletion to overlap an
+        // open reader, as on POSIX. Write sharing remains denied.
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                FILE_GENERIC_READ,
+                &attributes,
+                &mut io_status,
+                null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                null(),
+                0,
             )
         };
-        if raw == INVALID_HANDLE_VALUE {
+        unsafe { RtlFreeUnicodeString(&mut native_path) };
+        if matches!(
+            status,
+            STATUS_DELETE_PENDING
+                | STATUS_NO_SUCH_FILE
+                | STATUS_OBJECT_NAME_NOT_FOUND
+                | STATUS_OBJECT_PATH_NOT_FOUND
+        ) {
+            return Ok(None);
+        }
+        if status < 0 || raw == INVALID_HANDLE_VALUE {
             return Err(SecureFileError::UnsafeOrUnavailable);
         }
         let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
         require_persistent_acls(&handle)?;
-        require_regular_single_link(&handle)?;
+        require_regular_file(&handle)?;
+        let mut information = FILE_STANDARD_INFO::default();
+        if unsafe {
+            GetFileInformationByHandleEx(
+                raw_handle(&handle),
+                FileStandardInfo,
+                (&mut information as *mut FILE_STANDARD_INFO).cast(),
+                size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
+        if information.DeletePending || information.NumberOfLinks == 0 {
+            return Ok(None);
+        }
+        if information.NumberOfLinks != 1 {
+            return Err(SecureFileError::UnsafeOrUnavailable);
+        }
         let process_sid = current_user_sid()?;
         verify_security(&handle, &process_sid, policy)?;
-        Ok(File::from(handle))
+        Ok(Some(File::from(handle)))
     }
 
     fn require_regular_single_link(handle: &OwnedHandle) -> Result<(), SecureFileError> {
@@ -3992,6 +4091,124 @@ mod tests {
         assert!(
             !child.exists(),
             "ACL-bearing parents must be rejected before creation"
+        );
+    }
+
+    #[test]
+    fn optional_private_config_distinguishes_absence_from_invalid_files() {
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        #[cfg(unix)]
+        secure_test_root(temporary_root.path());
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create private directory"));
+        let path = directory.join("ephemeral.json");
+        assert_eq!(read_optional_owner_only_secret_config_file(&path), Ok(None));
+        assert_eq!(
+            read_owner_only_secret_config_file(&path),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        persist_new_owner_only_config_file(&path, b"private-value").unwrap();
+        assert_eq!(
+            read_optional_owner_only_secret_config_file(&path)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "private-value"
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            read_optional_owner_only_secret_config_file(&path),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn optional_private_config_treats_native_delete_pending_as_absence() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileDispositionInfo, FileStandardInfo,
+            GetFileInformationByHandleEx, SetFileInformationByHandle,
+        };
+
+        let temporary_root = tempfile::tempdir().expect("create temporary root");
+        let directory = temporary_root.path().join("owner-only");
+        drop(open_or_create_owner_only_directory(&directory).expect("create private directory"));
+        let path = directory.join("deleting.json");
+        persist_new_owner_only_config_file(&path, b"private-value").unwrap();
+        let pending_handle = fs::OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+        // Hold the handle that requested classic deferred deletion open. Path
+        // removal helpers can close that handle and unlink the name immediately.
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        assert_ne!(
+            unsafe {
+                SetFileInformationByHandle(
+                    pending_handle.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            },
+            0
+        );
+        let mut information = FILE_STANDARD_INFO::default();
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    pending_handle.as_raw_handle(),
+                    FileStandardInfo,
+                    (&mut information as *mut FILE_STANDARD_INFO).cast(),
+                    std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+                )
+            },
+            0
+        );
+        assert!(information.DeletePending);
+        assert_eq!(fs::File::open(&path).unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(read_optional_owner_only_secret_config_file(&path), Ok(None));
+        assert_eq!(
+            read_owner_only_secret_config_file(&path),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        drop(pending_handle);
+        assert_eq!(read_optional_owner_only_secret_config_file(&path), Ok(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_private_config_preserves_link_and_permission_checks() {
+        let directory = tempfile::tempdir().unwrap();
+        secure_test_root(directory.path());
+        let path = directory.path().join("present");
+        let link = directory.path().join("link");
+        persist_new_owner_only_config_file(&path, b"private-value").unwrap();
+        fs::hard_link(&path, &link).unwrap();
+        assert_eq!(
+            read_optional_owner_only_secret_config_file(&path),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        fs::remove_file(&link).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_optional_owner_only_secret_config_file(&path),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(
+            read_optional_owner_only_secret_config_file(&link),
+            Err(SecureFileError::UnsafeOrUnavailable)
+        );
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read_optional_owner_only_secret_config_file(&link),
+            Err(SecureFileError::UnsafeOrUnavailable)
         );
     }
 

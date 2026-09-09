@@ -14,8 +14,9 @@ those pull requests merge, the integration branch gets a final pull request to
 
 | Block | Scope | Status |
 | --- | --- | --- |
-| Configuration composition and consent | Explicit includes, source attribution, Trusted Profile expiration | Verified in PR #218 |
-| Credential sources and config repair | Executable helpers, Host home expansion, deterministic local repair | Pending |
+| Configuration composition and consent | Explicit includes, source attribution, Trusted Profile expiration | Merged in PR #218 |
+| Host credential sources | Executable helpers with bounded JSON protocol, Host home expansion | Verified in PR #219; integration checks pending |
+| Config repair | Deterministic local repair with backups and explicit consent | Pending |
 | Host operations | Storage migration, CLI/Host compatibility, explicit versions, plain update output | Pending |
 | Transport and inputs | Mutual TLS, token lifecycle, remote image attachments | Pending |
 | Output and package repair | Lossless output formats, launcher native repair | Pending |
@@ -47,3 +48,56 @@ macOS, and Windows, plus npm checks and the documentation build. Box verified
   Profile. Omission does not create an expiry. An expired profile supplies no
   mutation consent; explicit command consent or an interactive confirmation is
   still available.
+
+## Credential helper contract decisions
+
+The next 36 requirements passed the complete Rust test suites and Clippy on
+Linux, macOS, and Windows. npm and documentation checks passed. Box also
+verified helper success and failure responses, deadlines, descendant cleanup,
+authorized runtime resolution, configuration inspection, and home-path handling.
+
+- `kind = "executable-helper"` uses `argv`, optional `timeout` (default `10s`),
+  and optional `environment` entries. The executable must be an absolute path
+  on the Host. Arguments are literal; shell launchers and inline commands are
+  invalid. The Host validates its platform grammar before execution.
+- Stdin contains one object with `schema_version = 1`, `operation = "resolve"`,
+  `provider_alias`, `resolved_provider`, and `host_alias`. Stdin closes after
+  this request. Neither prompts nor existing credentials enter the request.
+- Stdout contains exactly one object with `schema_version = 1`. A successful
+  response has `status = "success"` and a nonempty `secret` string. A failure
+  has `status = "error"` or `"interaction_required"` and a nonempty `code`.
+  Unknown fields, NULs, non-UTF-8 output, and output over 64 KiB are rejected.
+- The helper receives no terminal. Satelle discards stderr and does not answer
+  prompts. The timeout covers the process and its pipes; Satelle terminates
+  the helper process group when it finishes or reaches the deadline.
+- The inherited environment consists of `HOME`, `USERPROFILE`, `SystemRoot`,
+  `WINDIR`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, and `LC_ALL` when present. Explicit
+  entries contain literal non-secret settings. No full environment inheritance,
+  PATH lookup, interpolation, or project-provided entries are supported.
+- Config inspection never executes helpers. Explain output always redacts
+  executable identity, every argument, environment key names, and environment
+  values, including with `--show-secret-references`; it reports the effective
+  timeout. Helper output and response error codes are never copied to logs.
+
+## Host home path contract decisions
+
+- Provider File descriptors accept absolute paths, bare `~`, and `~/...`.
+  Windows Hosts also accept `~\...`. Other relative paths, named-user forms,
+  misplaced home-expansion components, environment substitutions, and command
+  substitutions fail. Embedded tildes in filenames, including Windows short
+  names, remain literal characters.
+- Expansion uses the resolving process account's OS home, before the Host
+  validates its native absolute-path grammar or opens the file. The expanded
+  absolute path is the effective file reference in the Host binding, including
+  stored authorizations and provisioning destinations. The configured shorthand
+  remains input and does not change the account that resolves it.
+- POSIX resolution reads the effective user's account record. Windows uses
+  the process account's known Profile folder. `HOME`, `USERPROFILE`, Satelle
+  path overrides, SSH login settings, and `desktop_user` do not select this home.
+- Config check validates syntax only. Config explain reveals an expanded
+  reference only with `--show-secret-references` for a local on-demand Host.
+  Other Hosts report `normalization_status = "remote_home_not_checked"`.
+- Typed failures include `config_file`, `toml_path`, `host`,
+  `secret_source_kind`, `resolver_os`, and `supported_forms` under `details`.
+  A field is null when its source location or resolver is not known at that
+  boundary. Failure messages never contain the secret-file path or contents.
