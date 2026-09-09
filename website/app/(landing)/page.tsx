@@ -1,10 +1,7 @@
 import Link from 'next/link';
 import { CopyCommand } from './copy-command';
-import AgentDemo from './demos/agent';
+import DemoGallery from './demos/explorations';
 import DeskDemo from './demos/desk';
-import DurabilityDemo from './demos/durability';
-import ReadinessDemo from './demos/readiness';
-import TransportsDemo from './demos/transports';
 import { Mark } from './mark';
 import { ThemeToggle } from './theme-toggle';
 import './page.css';
@@ -141,51 +138,18 @@ function Platforms() {
   );
 }
 
-/** v12's "We meet you where you work.": one section, four demos, two by two. */
+/** Four shared demo concepts. The review route lets readers compare all six. */
 function Channels() {
   return (
     <Section id="channels">
       <SectionHead
         title="Everything a Session needs, from where you already are."
-        note="Every demo is interactive. Printed output matches what the binary prints; identifiers and timings are examples."
+        note="Illustrative interactions, not live runs. Terminal fields follow the CLI; MCP panels show selected result fields."
       />
-      <div className="cards cards-2">
-        <DemoCard
-          title="Close the terminal. The work keeps going."
-          lead="A Session is durable state on the Host, not a connection. Stop targets the active Turn: it does not delete the Session, and the terminal state is the proof."
-          href="/docs/how-to/operate-session"
-          cta="Operate a Session"
-        >
-          <DurabilityDemo />
-        </DemoCard>
-
-        <DemoCard
-          title="Satelle will not pretend a Host is ready."
-          lead="A binary, a plugin, or a feature flag is not proof that native desktop control works. Only the live probe is, and --refresh is the boundary that reruns it."
-          href="/docs/how-to/diagnose"
-          cta="Diagnose a Host"
-        >
-          <ReadinessDemo />
-        </DemoCard>
-
-        <DemoCard
-          title="You choose how the Controller reaches the Host."
-          lead="Local, direct TLS, or an authenticated SSH tunnel. Whichever you pick, Satelle never answers an operating-system, administrator or security prompt for you."
-          href="/docs/how-to/connect-remote"
-          cta="Connect remotely"
-        >
-          <TransportsDemo />
-        </DemoCard>
-
-        <DemoCard
-          title="Your coding agent gets typed tools, not a shell."
-          lead="satelle mcp serve speaks MCP over stdio, and satelle mcp install writes the config for one of twelve clients. The tool list is read-only until you add --enable-mutations, which advertises tools rather than adding capability."
-          href="/docs/reference/commands"
-          cta="Configure MCP"
-        >
-          <AgentDemo />
-        </DemoCard>
-      </div>
+      <DemoGallery />
+      <Link className="sx-compare-link" href="/demo-explorations">
+        Compare all six demo concepts <span aria-hidden="true">→</span>
+      </Link>
     </Section>
   );
 }
@@ -341,39 +305,6 @@ function SectionHead({ title, note }: { title: string; note?: string }) {
       <h2>{title}</h2>
       {note ? <p className="sa-head-note">{note}</p> : null}
     </div>
-  );
-}
-
-/**
- * One demo, boxed with its own headline, supporting line, and link, the way v12
- * grids its channel demos. The card is structure rather than decoration: it is
- * what separates one demo's surface from the next in a two-column grid.
- */
-function DemoCard({
-  title,
-  lead,
-  href,
-  cta,
-  children,
-}: {
-  title: string;
-  lead: string;
-  href: string;
-  cta: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <article className="card card-demo">
-      <div className="card-head">
-        <h3>{title}</h3>
-        <p>{lead}</p>
-        <Link className="card-link" href={href}>
-          {cta}
-          <Arrow />
-        </Link>
-      </div>
-      <div className="card-body">{children}</div>
-    </article>
   );
 }
 

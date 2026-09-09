@@ -3,9 +3,11 @@
   "version": "0.1.10",
   "private": true,
   "scripts": {
+    "prebuild": "npm run test:demos",
     "build": "next build",
     "dev": "next dev",
-    "postinstall": "fumadocs-mdx"
+    "postinstall": "fumadocs-mdx",
+    "test:demos": "node --test scripts/demo-explorations.test.mjs"
   },
   "dependencies": {
     "fumadocs-core": "16.11.5",
