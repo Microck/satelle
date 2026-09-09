@@ -1,0 +1,359 @@
+/* Game project stage: a script editor beside the game window, both drawn from
+   the page's own tokens. It reads as a diagram of the work, not as a capture of
+   a vendor's editor. */
+
+.gd {
+  /* Two panes. Stacked below 44rem, side by side above it, and the drawn stage
+     carries no chrome row of its own: the Host window title bar above it
+     already names the project and the application. */
+  display: grid;
+  min-height: 0;
+  background: var(--sa-2);
+  font-size: var(--step--2);
+}
+
+.gd-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.gd-pane-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: var(--space-3xs) var(--space-2xs);
+  border-block-end: 1px solid var(--sa-6);
+  /* Editor chrome, so both heads take the chrome step. What sits below them is
+     either the code surface or the game surface, and both are darker. */
+  background: var(--sa-3);
+  font-family: var(--font-mono);
+}
+
+/* ----------------------------------------------------------- script pane --- */
+
+.gd-script {
+  background: var(--sa-1);
+}
+
+.gd-tabs {
+  display: flex;
+  gap: var(--space-3xs);
+  min-width: 0;
+}
+
+.gd-tab {
+  padding: 0.125rem 0.5rem;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  color: var(--sa-9);
+  white-space: nowrap;
+}
+
+/* The one accent mark in this interior: which file the Turn is editing. The
+   rule is on the bottom edge, tying the tab to the code surface under it. */
+.gd-tab[data-active='true'] {
+  background: var(--sa-1);
+  color: var(--sa-12);
+  box-shadow: inset 0 -1px 0 var(--sa-accent);
+}
+
+.gd-saved {
+  margin-inline-start: auto;
+  color: var(--sa-9);
+}
+
+.gd-saved[data-state='modified'] {
+  color: var(--sa-warn);
+}
+
+.gd-saved[data-state='saved'] {
+  color: var(--sa-ok);
+}
+
+.gd-codewrap {
+  /* Both axes scroll inside the pane: long GDScript lines never widen the page,
+     and a stacked narrow layout does not turn the excerpt into a wall. */
+  overflow-y: auto;
+  max-height: 12rem;
+  min-height: 0;
+}
+
+.gd-code {
+  margin: 0;
+  padding-block: var(--space-3xs);
+  /* max-content so an added line's tint runs the full width of the longest
+     line rather than stopping at the pane edge. */
+  width: max-content;
+  min-width: 100%;
+  /* Denser than the 1.6 the page gives a terminal transcript. A code panel is
+     read as a block of structure rather than line by line, and the whole
+     twenty-one line excerpt has to fit beside the game window without the
+     lines the Turn just added falling below the fold. */
+  line-height: 1.4;
+  color: var(--sa-11);
+  counter-reset: gd-line 10;
+}
+
+/* Both, because the nested <code> otherwise picks up the 0.9375em step that
+   landing.css gives inline code and renders a size smaller than the pane. */
+.gd-code,
+.gd-code code {
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+}
+
+.gd-line {
+  display: block;
+  white-space: pre;
+  padding-inline-end: var(--space-s);
+  /* Transparent on unchanged lines so a line does not shift sideways when the
+     Turn marks it as added. */
+  border-inline-start: 2px solid transparent;
+}
+
+/* Real main.gd line numbers: the excerpt starts at `func _ready` on line 11. */
+.gd-line::before {
+  content: counter(gd-line);
+  counter-increment: gd-line;
+  display: inline-block;
+  width: 2.25rem;
+  padding-inline-end: 0.75rem;
+  text-align: end;
+  color: var(--sa-8);
+}
+
+/* Lines the Turn added. The rule and the tint are --sa-ok, not the accent: the
+   accent is scarce on this page and a dozen crimson bars would read as errors
+   rather than as additions. */
+.gd-line[data-kind='add'] {
+  border-inline-start-color: var(--sa-ok);
+  background: color-mix(in oklab, var(--sa-ok) 12%, transparent);
+  color: var(--sa-12);
+}
+
+/* The starter's TODO stubs, still in place. */
+.gd-line[data-kind='todo'] {
+  background: color-mix(in oklab, var(--sa-warn) 8%, transparent);
+  color: var(--sa-9);
+}
+
+/* -------------------------------------------------------------- the game --- */
+
+.gd-view {
+  background: var(--sa-2);
+  border-block-start: 1px solid var(--sa-6);
+}
+
+/* The play area is a diagram, so it says what its two marks mean. */
+.gd-legend {
+  margin-inline-start: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75em;
+  color: var(--sa-9);
+}
+
+.gd-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+}
+
+.gd-swatch {
+  width: 0.5rem;
+  height: 0.5rem;
+  flex: none;
+}
+
+.gd-swatch[data-kind='coin'] {
+  border-radius: var(--radius-full);
+  background: var(--sa-warn);
+}
+
+.gd-swatch[data-kind='player'] {
+  border-radius: 1px;
+  background: var(--sa-11);
+}
+
+/* HUD/TopBar/ScoreLabel, drawn. The only text the game itself writes, so it
+   sits on the game's own dark surface rather than on the editor chrome. */
+.gd-hud {
+  padding: var(--space-3xs) var(--space-2xs);
+  background: var(--sa-0);
+  border-block-end: 1px solid var(--sa-6);
+  letter-spacing: 0.08em;
+  color: var(--sa-12);
+}
+
+/* Takes the pane's leftover height, so the drawn level scales inside it rather
+   than leaving a band of pane background under the game. Capped while the panes
+   are stacked, where the pane is as wide as the whole window and an uncapped
+   16 by 10 box would make the stage twice as tall as it needs to be. */
+.gd-playwrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  max-height: 15rem;
+  background: var(--sa-0);
+}
+
+.gd-play {
+  width: 100%;
+  height: 100%;
+  min-height: 7rem;
+}
+
+.gd-wall {
+  fill: var(--sa-3);
+  stroke: var(--sa-6);
+  stroke-width: 1;
+}
+
+.gd-coin {
+  fill: var(--sa-warn);
+}
+
+/* The coin the starter's player walked through without collecting it. */
+.gd-coin[data-missed='true'] {
+  fill: color-mix(in oklab, var(--sa-warn) 30%, transparent);
+  stroke: var(--sa-warn);
+  stroke-width: 1.5;
+  stroke-dasharray: 3 3;
+}
+
+/* The player commits a new position per step. Nothing walks a path, and the
+   transition is on transform only so nothing else repaints. */
+.gd-player {
+  fill: var(--sa-11);
+  stroke: var(--sa-12);
+  stroke-width: 1;
+  transition: transform var(--mo-state) var(--mo-ease-flat);
+}
+
+/* set_physics_process(false), after the win gate fires. */
+.gd-player[data-frozen='true'] {
+  fill: color-mix(in oklab, var(--sa-11) 22%, transparent);
+  stroke: var(--sa-8);
+}
+
+.gd[data-reduced='true'] .gd-player {
+  transition: none;
+}
+
+/* ------------------------------------------------------------- win panel --- */
+
+.gd-win {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2xs);
+  padding: var(--space-s);
+  text-align: center;
+  background: color-mix(in oklab, var(--sa-0) 94%, transparent);
+  /* One-shot reveal, the way the panel appears when the fifth coin lands. It
+     runs once and never loops. */
+  animation: gd-reveal var(--mo-overlay) var(--mo-ease-flat);
+}
+
+.gd[data-reduced='true'] .gd-win {
+  animation: none;
+}
+
+@keyframes gd-reveal {
+  from {
+    opacity: 0;
+  }
+}
+
+.gd-win-title {
+  font-family: var(--font-mono);
+  font-size: var(--step-0);
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  color: var(--sa-12);
+}
+
+.gd-win-btn {
+  padding: 0.25rem 0.75rem;
+  border: 1px solid var(--sa-7);
+  border-radius: var(--radius-sm);
+  background: var(--sa-3);
+  color: var(--sa-9);
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  letter-spacing: 0.08em;
+  /* Disabled chrome, so it must not offer a pointer. */
+  cursor: default;
+}
+
+/* -------------------------------------------------------- status, checks --- */
+
+.gd-status,
+.gd-checks {
+  padding: var(--space-3xs) var(--space-2xs);
+  border-block-start: 1px solid var(--sa-6);
+  font-family: var(--font-mono);
+  color: var(--sa-9);
+}
+
+.gd-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+}
+
+.gd-status[data-tone='warn'] {
+  color: var(--sa-warn);
+}
+
+.gd-status[data-tone='ok'] {
+  color: var(--sa-ok);
+}
+
+.gd-checks {
+  list-style: none;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--space-s);
+  color: var(--sa-10);
+}
+
+.gd-checks li::before {
+  content: '\2713';
+  color: var(--sa-ok);
+  margin-inline-end: 0.4em;
+}
+
+/* ----------------------------------------------------------------- wide --- */
+
+/* Side by side once there is room for a readable code column beside the game
+   window. Below this the two panes stack and nothing is hidden. */
+@media (min-width: 44rem) {
+  .gd {
+    grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
+  }
+
+  .gd-view {
+    border-block-start: 0;
+    border-inline-start: 1px solid var(--sa-6);
+  }
+
+  .gd-codewrap {
+    /* Side by side there is room for the whole excerpt, so the lines the Turn
+       just added are never below the fold. */
+    max-height: none;
+  }
+
+  /* The game pane takes the height the code pane sets, so the play area fills
+     it instead of being capped. */
+  .gd-playwrap {
+    max-height: none;
+  }
+}

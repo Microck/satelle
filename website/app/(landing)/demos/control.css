@@ -1,0 +1,145 @@
+/* Computer Use presentation: the control ring and the driven pointer. */
+
+.ctl-cursor {
+  /* The page's own easing vocabulary is ease-out, which is right for a panel
+     appearing but wrong for a pointer: it makes the cursor leap off the mark at
+     full speed. A pointer accelerates out of rest and decelerates into its
+     target, so this one curve is local to the cursor. */
+  --ctl-ease: cubic-bezier(0.4, 0.02, 0.2, 1);
+}
+
+/* --------------------------------------------------------------- ring --- */
+
+/* Frames the controlled screen from inside, the way a native Computer Use
+   session outlines the display it has taken over. Drawn with inset shadows so
+   it costs no layout and cannot be clipped by the stage's own content. */
+.ctl-ring {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  border-radius: inherit;
+  opacity: 0;
+  box-shadow:
+    inset 0 0 0 2px var(--sa-accent),
+    inset 0 0 14px -2px color-mix(in oklab, var(--sa-accent) 55%, transparent);
+  transition: opacity var(--mo-overlay) var(--mo-ease-flat);
+}
+
+.ctl-ring[data-held='true'] {
+  opacity: 1;
+}
+
+/* Names what the ring means, once. It rides ON the ring's top line rather than
+   floating over the application: unfilled annotation text collided with
+   whatever the app drew underneath it (the spreadsheet's formula bar, the
+   editor's toolbar), so the label is a filled tab that reads as part of the
+   ring no matter what is behind it. */
+.ctl-ring-label {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 0.0625rem 0.4375rem 0.125rem;
+  border-end-start-radius: var(--radius-sm);
+  background: var(--sa-accent);
+  color: #fff;
+  font-size: var(--step--2);
+  line-height: 1.2;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------- cursor --- */
+
+.ctl-cursor {
+  position: absolute;
+  z-index: 4;
+  pointer-events: none;
+  /* The hotspot is the tip of the arrow, so the glyph hangs down and right of
+     the stated point, as a real pointer does. */
+  margin: -2px 0 0 -2px;
+  filter: drop-shadow(0 1px 2px rgb(var(--sa-shadow) / 0.45));
+  /* Not a keyframe: a move has to start wherever the last action left the
+     pointer, which a keyframe cannot know. The duration is set per step from
+     the distance travelled, so a long sweep takes longer than a nudge. */
+  transition:
+    left var(--ctl-move, 420ms) var(--ctl-ease),
+    top var(--ctl-move, 420ms) var(--ctl-ease);
+}
+
+/* A click: one ring, expanding once, keyed on the step so every action replays
+   it. Finite by construction, so a settled demo has nothing running. */
+.ctl-hit {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 2.25rem;
+  height: 2.25rem;
+  margin: -1.125rem 0 0 -1.125rem;
+  border-radius: var(--radius-full);
+  border: 2px solid var(--sa-accent);
+  animation: ctl-hit 480ms var(--mo-ease-flat) both;
+}
+
+@keyframes ctl-hit {
+  from {
+    opacity: 0.9;
+    transform: scale(0.25);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+
+/* Typing: a caret at the pointer, so a keystroke step is distinguishable from
+   a click step without reading the log.
+
+   Finite on purpose. This blinked forever at first, which is exactly what the
+   page was criticised for: a hero whose only motion was something blinking. It
+   now shows a few keystrokes landing and then settles solid, so a demo at rest
+   has nothing repainting. No fill-mode, so when the burst ends the element
+   falls back to its own opacity of 1. */
+.ctl-type {
+  position: absolute;
+  left: 0.75rem;
+  top: 0.9rem;
+  width: 0.5rem;
+  height: 1rem;
+  background: var(--sa-accent);
+  opacity: 1;
+  animation: ctl-type 340ms steps(1, end) 3;
+}
+
+@keyframes ctl-type {
+  0%,
+  50% {
+    opacity: 0;
+  }
+  51%,
+  100% {
+    opacity: 1;
+  }
+}
+
+/* A drag leaves a trail behind the pointer, aimed back along the travel and
+   as long as the travel was. A fixed angle was wrong for every move that did
+   not happen to go that way. */
+.ctl-cursor[data-act='drag']::before {
+  content: '';
+  position: absolute;
+  left: 0.25rem;
+  top: 0.25rem;
+  width: var(--ctl-trail, 0rem);
+  height: 2px;
+  transform-origin: left center;
+  transform: rotate(var(--ctl-back, 156deg));
+  background: linear-gradient(to right, var(--sa-accent), transparent);
+  opacity: 0.7;
+}
+
+/* No reduced-motion block here on purpose: landing.css already clamps every
+   animation and transition under `.sa` to 1ms with !important, which covers the
+   move, the click ring, and the caret. A second copy here would only look like
+   care. */

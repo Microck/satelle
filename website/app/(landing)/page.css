@@ -1,0 +1,632 @@
+/* Landing page shell. The skeleton follows v12.sh: a small hero holding its own
+   demo, a proof band, gridded demo cards, a three-up band, a closing evidence
+   section, a centered call to action, and a footer. Demo-specific CSS lives
+   beside each demo component. */
+
+/* ------------------------------------------------------------------- nav --- */
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  /* Opaque. At 88 percent with a blur, terminal text from the demos underneath
+     stayed legible through the bar while scrolling. The hairline is the only
+     separator it needs. */
+  background: var(--sa-1);
+  border-block-end: 1px solid var(--sa-6);
+}
+
+.nav-inner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-s);
+  min-height: var(--nav-height);
+  padding-inline: var(--grid-edge);
+}
+
+.nav-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  letter-spacing: -0.01em;
+}
+
+.nav-version {
+  font-size: var(--step--2);
+  color: var(--sa-9);
+}
+
+/* v12 puts two pill buttons here rather than a row of text links. */
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3xs);
+  margin-inline-start: auto;
+}
+
+.nav-links .sa-btn {
+  border-radius: var(--radius-full);
+  padding-block: 0.4375rem;
+}
+
+.nav-skip:focus {
+  position: fixed;
+  top: var(--space-2xs);
+  left: var(--space-2xs);
+  z-index: 30;
+  width: auto;
+  height: auto;
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  clip-path: none;
+  background: var(--sa-3);
+  border: 1px solid var(--sa-accent);
+  border-radius: var(--radius-md);
+  font-size: var(--step--1);
+}
+
+/* ------------------------------------------------------------------ hero --- */
+
+/* The hero holds the headline and the whole desk demo, as v12's does. It is
+   deliberately short: the reference opens at 31px, not at display scale. */
+.hero {
+  padding-block: var(--space-xl) var(--space-l);
+  row-gap: var(--space-m-l);
+}
+
+.hero-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-xs);
+  max-width: var(--measure-hero);
+}
+
+.hero-flag {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  color: var(--sa-10);
+}
+
+.hero-title {
+  font-size: var(--step-3);
+  line-height: 1.24;
+  letter-spacing: -0.012em;
+  font-weight: 400;
+  text-wrap: pretty;
+}
+
+.hero-title em {
+  font-style: normal;
+  color: var(--sa-accent-text);
+}
+
+/* v12 carries the supporting sentence inside the h1, set in the muted ink. */
+.hero-title-sub {
+  color: var(--sa-9);
+}
+
+/* The command sits beside the button on a wide hero and wraps under it on a
+   narrow one. It needs an explicit basis and min-width:0, or the nowrap command
+   text sets the row's width and pushes the whole hero past the viewport. */
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2xs);
+  margin-block-start: var(--space-2xs);
+  width: 100%;
+}
+
+
+.hero-actions .sa-btn {
+  border-radius: var(--radius-full);
+}
+
+/* A tinted slab the window floats on, not a bordered card. The reference's
+   stage sits 33 to 84 of 255 off its page ground with no border and a ~3px
+   radius; an earlier version here was 8 of 255 off with a 1px border and a 16px
+   radius, so it read as another panel rather than as a backdrop. Two overlapping
+   radials give the panel a direction of light instead of a flat wash. */
+.hero-stage {
+  border-radius: var(--radius-sm);
+  /* The reference insets its window 125px from the stage edge, about 9% of the
+     stage width, which is what lets the terminal hang off the window's left and
+     still land inside the panel. */
+  padding: var(--space-l) clamp(var(--space-m), 7.5vw, 7rem);
+  /* Clean at the top, tinted toward the bottom, warm on the left and cool on
+     the right: the reference's stage reads as ground at its top edge and sits
+     about 30 of 255 below it at the bottom. Directional washes rather than
+     radials, because radials anchored past the box put colour in the wrong
+     corners and left the middle at a delta of 6. */
+  background:
+    linear-gradient(to bottom, transparent 8%, var(--sa-stage-warm) 100%),
+    linear-gradient(to right, transparent 42%, var(--sa-stage-cool) 100%),
+    var(--sa-1);
+}
+
+/* ------------------------------------------------------------------ hero --- */
+
+/* The hero holds the headline and the whole desk demo, as v12's does. It is
+   deliberately short: the reference opens at 31px, not at display scale. */
+.hero {
+  padding-block: var(--space-xl) var(--space-l);
+  row-gap: var(--space-m-l);
+}
+
+.hero-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-xs);
+  max-width: var(--measure-hero);
+}
+
+.hero-flag {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  color: var(--sa-10);
+}
+
+.hero-title {
+  font-size: var(--step-3);
+  line-height: 1.24;
+  letter-spacing: -0.012em;
+  font-weight: 400;
+  text-wrap: pretty;
+}
+
+.hero-title em {
+  font-style: normal;
+  color: var(--sa-accent-text);
+}
+
+/* v12 carries the supporting sentence inside the h1, set in the muted ink. */
+.hero-title-sub {
+  color: var(--sa-9);
+}
+
+/* The command sits beside the button on a wide hero and wraps under it on a
+   narrow one. It needs an explicit basis and min-width:0, or the nowrap command
+   text sets the row's width and pushes the whole hero past the viewport. */
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2xs);
+  margin-block-start: var(--space-2xs);
+  width: 100%;
+}
+
+
+.hero-actions .sa-btn {
+  border-radius: var(--radius-full);
+}
+
+/* -------------------------------------------------------- copy a command --- */
+
+.copycmd {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid var(--sa-6);
+  border-radius: var(--radius-full);
+  background: var(--sa-0);
+  overflow: hidden;
+}
+
+.copycmd-text {
+  flex: 1;
+  min-width: 0;
+  padding: 0.375rem var(--space-xs);
+  font-size: var(--step--1);
+  color: var(--sa-11);
+  overflow-wrap: anywhere;
+}
+
+/* Wide enough for one line, so keep it on one line and let the pill be a pill. */
+@media (min-width: 40rem) {
+  .copycmd-text {
+    white-space: nowrap;
+  }
+}
+
+/* Narrow, the command wraps rather than hiding two thirds of itself behind a
+   scroller with no scrollbar. A wrapped command is not pill-shaped. */
+@media (max-width: 39.999rem) {
+  .copycmd {
+    border-radius: var(--radius-lg);
+  }
+}
+
+.copycmd-btn {
+  flex: none;
+  padding-inline: var(--space-xs);
+  border-inline-start: 1px solid var(--sa-6);
+  background: var(--sa-3);
+  font-size: var(--step--2);
+  font-family: var(--font-mono);
+  color: var(--sa-11);
+  transition: background var(--mo-state) var(--mo-ease-flat);
+}
+
+.copycmd-btn:hover {
+  background: var(--sa-5);
+  color: var(--sa-12);
+}
+
+/* ------------------------------------------------------------------ band --- */
+
+/* Occupies the reference's customer-logo band: same height, same job, honest
+   content. Six cells in a 6x1 / 3x2 / 2x3 wall. */
+.band {
+  padding-block: var(--space-l);
+}
+
+.band-title {
+  font-size: var(--step-0);
+  color: var(--sa-11);
+  text-align: center;
+  margin-block-end: var(--space-s);
+}
+
+.band-grid {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2xs);
+}
+
+.band-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  padding: var(--space-xs);
+  background: var(--sa-2);
+  border-radius: var(--radius-sm);
+}
+
+.band-os {
+  font-size: var(--step--1);
+  color: var(--sa-12);
+}
+
+.band-role {
+  font-size: var(--step--2);
+  color: var(--sa-9);
+}
+
+.band-verdict {
+  font-size: var(--step--2);
+  margin-block-start: var(--space-3xs);
+}
+
+.band-verdict[data-verdict='implemented'] {
+  color: var(--sa-ok);
+}
+.band-verdict[data-verdict='candidate'] {
+  color: var(--sa-warn);
+}
+.band-verdict[data-verdict='not-supported'] {
+  color: var(--sa-9);
+}
+
+.band-note {
+  font-size: var(--step--1);
+  color: var(--sa-9);
+  text-align: center;
+  margin-block-start: var(--space-xs);
+}
+
+/* Three by two, which is both the reference's two-row wall and the shape the
+   content actually has: two roles across three operating systems. */
+@media (min-width: 40rem) {
+  .band-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* ----------------------------------------------------------------- cards --- */
+
+/* The reference's whole middle is card grids: two-up for the big demos, three-up
+   for supporting copy. The card is structure, not ornament: it is the boundary
+   between one demo's surface and the next one beside it. */
+.cards {
+  display: grid;
+  gap: var(--space-s);
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-s);
+  min-width: 0;
+  padding: var(--space-s);
+  border-radius: var(--radius-sm);
+  background: var(--sa-2);
+}
+
+.card-plain {
+  gap: var(--space-2xs);
+}
+
+.card > h3,
+.card-head > h3 {
+  font-size: var(--step-0);
+  color: var(--sa-12);
+  line-height: 1.35;
+}
+
+.card > p,
+.card-head > p {
+  font-size: var(--step--1);
+  color: var(--sa-10);
+  max-width: 48ch;
+}
+
+.card-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+}
+
+.card-link {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  margin-block-start: var(--space-3xs);
+  font-size: var(--step--1);
+  color: var(--sa-12);
+  transition: gap var(--mo-state) var(--mo-ease-flat);
+}
+
+.card-link:hover {
+  gap: 0.6em;
+  color: var(--sa-accent-text);
+}
+
+/* The demos inside these cards size themselves against this box rather than the
+   viewport, because a card in the two-up grid is roughly half the width the
+   viewport reports. See the @container rules in each demo's stylesheet. */
+.card-body {
+  min-width: 0;
+  container-type: inline-size;
+  container-name: demo;
+}
+
+/* No scroll box. An earlier version fixed the demo viewport at 43rem so the four
+   cards would match, but the demos are taller than that, so a quarter to a half
+   of each one sat behind an inner scrollbar, including states the rail could
+   select and controls the reader had to reach. Rows equalise instead: the grid
+   row takes the tallest card and every card stretches to it, which is uniform by
+   construction and hides nothing. Keeping the tallest demo short is then a
+   content job, done in the demos themselves.
+
+   A nested scroller also steals the wheel from the page, which is its own defect. */
+@media (min-width: 62rem) {
+  .cards-2 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    /* Only when there is a row to equalise. Stacked, this padded every card out
+       to the tallest one and added roughly 4000px to a phone. */
+    grid-auto-rows: 1fr;
+  }
+
+  .cards-2 > .card {
+    block-size: 100%;
+  }
+}
+
+@media (min-width: 52rem) {
+  .cards-3 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* --------------------------------------------------------------- surface --- */
+
+.surface-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  font-size: var(--step--1);
+  border-block-start: 1px solid var(--sa-6);
+  padding-block-start: var(--space-2xs);
+  margin-block-start: var(--space-3xs);
+}
+
+.surface-list li {
+  padding-inline-start: 1.125rem;
+  text-indent: -1.125rem;
+  color: var(--sa-11);
+}
+
+.surface-list li::before {
+  display: inline-block;
+  width: 1.125rem;
+  text-indent: 0;
+}
+
+.surface-list[data-tone='ok'] li::before {
+  content: '\2713';
+  color: var(--sa-ok);
+}
+
+.surface-list[data-tone='off'] li::before {
+  content: '\2014';
+  color: var(--sa-8);
+}
+
+.surface-list[data-tone='off'] li {
+  color: var(--sa-9);
+}
+
+.surface-list[data-tone='check'] li::before {
+  content: '\203A';
+  color: var(--sa-8);
+}
+
+.sa-label[data-tone='ok'] {
+  color: var(--sa-ok);
+}
+
+.sa-label[data-tone='off'] {
+  color: var(--sa-9);
+}
+
+
+/* --------------------------------------------------------------- closing --- */
+
+/* A tinted full-bleed band above the footer, not a section inside main. The
+   reference's closing band sits about 8 of 255 off its page ground, enough to
+   read as a separate register without becoming another panel. */
+.closing {
+  padding-block: var(--space-xl);
+  /* A step away from the footer, or the call to action reads as footer furniture. */
+  background: var(--sa-3);
+  border-block-start: 1px solid var(--sa-6);
+}
+
+.closing > * {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-s);
+  text-align: center;
+}
+
+.closing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2xs);
+}
+
+.closing-actions .sa-btn {
+  border-radius: var(--radius-full);
+}
+
+.foot-fine {
+  margin-block-start: var(--space-m);
+  padding-block-start: var(--space-s);
+  border-block-start: 1px solid var(--sa-6);
+  font-size: var(--step--2);
+  color: var(--sa-9);
+  max-width: 78ch;
+}
+
+/* ---------------------------------------------------------------- footer --- */
+
+.foot {
+  position: relative;
+  overflow: hidden;
+  background: var(--sa-2);
+}
+
+.foot > .sa-grid:not(.closing) {
+  padding-block: var(--space-xl) var(--space-4xl);
+  border-block-start: 1px solid var(--sa-6);
+}
+
+.foot-inner {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: var(--space-m);
+}
+
+.foot-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  align-self: start;
+  gap: var(--space-xs);
+  font-size: var(--step--1);
+  color: var(--sa-11);
+}
+
+.foot-brand-name {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
+/* A three-way segmented control, as the reference puts in the same corner. */
+.themer {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--sa-6);
+  border-radius: var(--radius-full);
+  background: var(--sa-1);
+}
+
+.themer-btn {
+  display: grid;
+  place-items: center;
+  width: 1.875rem;
+  height: 1.375rem;
+  border-radius: var(--radius-full);
+  color: var(--sa-9);
+  transition:
+    background var(--mo-state) var(--mo-ease-flat),
+    color var(--mo-state) var(--mo-ease-flat);
+}
+
+.themer-btn:hover {
+  color: var(--sa-12);
+}
+
+.themer-btn[data-active='true'] {
+  background: var(--sa-4);
+  color: var(--sa-12);
+}
+
+.foot ul {
+  list-style: none;
+  padding: 0;
+  margin-block-start: var(--space-2xs);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  font-size: var(--step--1);
+}
+
+.foot-inner a {
+  color: var(--sa-10);
+  transition: color var(--mo-state) var(--mo-ease-flat);
+}
+
+.foot-inner a:hover {
+  color: var(--sa-12);
+}
+
+/* The oversized mark bleeds off the bottom edge, as the reference's wordmark
+   does. Very low contrast: it is a watermark, not a graphic. */
+.foot-watermark {
+  position: absolute;
+  bottom: -38%;
+  left: var(--grid-edge);
+  /* The reference's watermark is a near-neutral ghost. Crimson at 5 percent
+     reads as a pink wash on the light ground, so it is desaturated here and
+     kept fainter than the dark theme needs. */
+  opacity: 0.05;
+  filter: grayscale(0.7);
+  pointer-events: none;
+}
+
+@media (min-width: 52rem) {
+  .foot-inner {
+    grid-template-columns: 1.3fr repeat(4, 1fr);
+    gap: var(--space-m);
+  }
+}

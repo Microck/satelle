@@ -1,0 +1,248 @@
+/* Spreadsheet stage. A diagram of the work, not an imitation of a vendor UI. */
+
+.xl {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 0;
+  background: var(--sa-2);
+  font-size: var(--step--2);
+}
+
+/* ----------------------------------------------------------- formula bar --- */
+
+.xl-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: var(--space-3xs) var(--space-2xs);
+  border-block-end: 1px solid var(--sa-6);
+  background: var(--sa-3);
+}
+
+.xl-cellref {
+  min-width: 3rem;
+  padding: 0.125rem 0.375rem;
+  border: 1px solid var(--sa-6);
+  border-radius: var(--radius-sm);
+  background: var(--sa-2);
+  color: var(--sa-11);
+}
+
+.xl-formula {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.125rem 0.375rem;
+  border: 1px solid var(--sa-6);
+  border-radius: var(--radius-sm);
+  background: var(--sa-1);
+  color: var(--sa-12);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* 0.9em of --step--2 landed at 11.7px, under the page's 12px floor. */
+.xl-fixed {
+  color: var(--sa-ok);
+}
+
+/* ------------------------------------------------------------------ grid --- */
+
+.xl-panes {
+  display: grid;
+  min-height: 0;
+}
+
+.xl-gridwrap {
+  min-width: 0;
+}
+
+.xl-grid {
+  border-collapse: collapse;
+  width: 100%;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.xl-grid th,
+.xl-grid td {
+  padding: 0.1875rem 0.5rem;
+  border-inline-end: 1px solid var(--sa-3);
+  border-block-end: 1px solid var(--sa-3);
+  text-align: start;
+  font-weight: 400;
+  color: var(--sa-11);
+}
+
+.xl-grid thead th {
+  position: sticky;
+  top: 0;
+  background: var(--sa-3);
+  color: var(--sa-10);
+  font-weight: 500;
+  border-block-end-color: var(--sa-6);
+}
+
+.xl-rownum {
+  background: var(--sa-3);
+  color: var(--sa-9);
+  text-align: end;
+  min-width: 1.75rem;
+}
+
+.xl-num {
+  text-align: end;
+}
+
+.xl-wide {
+  min-width: 8rem;
+}
+
+/* A duplicate Order ID, before it is removed. */
+.xl-grid tbody tr[data-dup='true'] td,
+.xl-grid tbody tr[data-dup='true'] th {
+  color: var(--sa-9);
+  background: color-mix(in oklab, var(--sa-warn) 10%, transparent);
+  text-decoration: line-through;
+  text-decoration-color: var(--sa-warn);
+}
+
+/* The row whose Revenue formula drops the discount term. */
+.xl-grid tbody tr[data-broken='true'] td:nth-child(8) {
+  background: color-mix(in oklab, var(--sa-fail) 16%, transparent);
+  color: var(--sa-12);
+}
+
+.xl-grid td[data-fixed='true'] {
+  background: color-mix(in oklab, var(--sa-ok) 14%, transparent);
+  color: var(--sa-12);
+}
+
+.xl-more td,
+.xl-more th {
+  color: var(--sa-9);
+  font-style: normal;
+}
+
+/* --------------------------------------------------------------- summary --- */
+
+.xl-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding: var(--space-xs);
+  border-block-start: 1px solid var(--sa-6);
+  background: var(--sa-1);
+  min-width: 0;
+}
+
+/* Four columns of currency in a 22rem pane: the default cell padding put this
+   table 19px past the window edge. */
+.xl-summary-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--sa-6) transparent;
+}
+
+.xl-grid-summary {
+  width: 100%;
+  min-width: 17rem;
+}
+
+.xl-grid-summary th,
+.xl-grid-summary td {
+  padding-inline: 0.3125rem;
+}
+
+.xl-total th,
+.xl-total td {
+  color: var(--sa-12);
+  font-weight: 500;
+  border-block-start: 1px solid var(--sa-6);
+}
+
+.xl-chart {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  max-width: 20rem;
+}
+
+.xl-chart svg {
+  width: 100%;
+  height: auto;
+}
+
+/* The verification list is the widest thing in this pane; without a wrap it
+   pushed the summary column 19px past the window edge. */
+.xl-checks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 0 var(--space-s);
+  font-family: var(--font-mono);
+  color: var(--sa-10);
+}
+
+.xl-checks li {
+  white-space: nowrap;
+}
+
+.xl-checks li::before {
+  content: '\2713';
+  color: var(--sa-ok);
+  margin-inline-end: 0.4em;
+}
+
+/* ------------------------------------------------------------------ tabs --- */
+
+.xl-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3xs);
+  padding: var(--space-3xs) var(--space-2xs);
+  border-block-start: 1px solid var(--sa-6);
+  background: var(--sa-3);
+  font-family: var(--font-mono);
+  overflow: hidden;
+}
+
+.xl-tab {
+  padding: 0.125rem 0.5rem;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  color: var(--sa-9);
+}
+
+.xl-tab[data-active='true'] {
+  background: var(--sa-1);
+  color: var(--sa-12);
+  box-shadow: inset 0 1px 0 var(--sa-accent);
+}
+
+.xl-file {
+  margin-inline-start: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ wide --- */
+
+@media (min-width: 52rem) {
+  .xl-panes[data-summary='true'] {
+    grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
+  }
+
+  .xl-panes[data-summary='true'] .xl-summary {
+    border-block-start: 0;
+    border-inline-start: 1px solid var(--sa-6);
+  }
+}

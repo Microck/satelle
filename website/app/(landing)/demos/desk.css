@@ -1,0 +1,336 @@
+/* Hero demo: the operator's desk. Two machines, one Turn. */
+
+.desk {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------------------------------------------------------- task picker --- */
+
+/* A tab strip inside the Controller window: choosing the task is the operator's
+   move, so it belongs on the operator's machine rather than floating above both
+   windows as page chrome. */
+.desk-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  border: 0;
+  border-block-end: 1px solid var(--sa-6);
+  padding: 0 var(--space-2xs);
+  margin: 0;
+  background: var(--sa-1);
+}
+
+.desk-chip {
+  padding: var(--space-3xs) var(--space-2xs);
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sa-9);
+  cursor: pointer;
+  border-block-end: 1px solid transparent;
+  margin-block-end: -1px;
+  transition: color var(--mo-state) var(--mo-ease-flat);
+}
+
+.desk-chip:hover {
+  color: var(--sa-11);
+}
+
+.desk-chip[data-active='true'] {
+  color: var(--sa-accent-text);
+  border-block-end-color: var(--sa-accent);
+}
+
+.desk-chip:has(:focus-visible) {
+  outline: 2px solid var(--sa-accent);
+  outline-offset: -2px;
+}
+
+/* ----------------------------------------------------------- the window --- */
+
+.desk-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-s);
+}
+
+.desk-host {
+  min-height: 20rem;
+}
+
+.desk-stage {
+  position: relative;
+  display: grid;
+  min-height: 20rem;
+  /* The control ring is drawn inside this box, so it has to clip to the window's
+     own corners rather than overhang them. */
+  overflow: hidden;
+  /* An explicit z-index makes this a stacking context, which confines the ring
+     and the pointer to the Host window. Without it they were only positioned,
+     not layered, and painted over the operator's own terminal: the pointer
+     appeared to be clicking around inside the Linux window it is driving from.
+     Keep it below the terminal's z-index 1. */
+  z-index: 0;
+}
+
+.desk-stage-in {
+  display: grid;
+  min-height: 0;
+}
+
+/* The application's change should ease, not snap: the pointer has just landed
+   on the thing that changed, and an instant swap reads as the panel being
+   replaced rather than edited. Only the elements whose colour actually changed
+   transition, so this costs nothing on the ones that did not. Cheaper and more
+   honest than re-entering the whole interior, which is what this used to do. */
+.desk-stage-in :is(td, th, li, figure, [data-fixed], [data-dup], [data-broken]) {
+  transition:
+    background-color 150ms var(--mo-ease-flat),
+    color 150ms var(--mo-ease-flat);
+}
+
+.desk-bar-alias {
+  color: var(--sa-12);
+  font-weight: 500;
+}
+
+.desk-bar-file {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ----------------------------------------------------------- controller --- */
+
+.desk-controller {
+  /* Sits inboard of the Host window so the two machines read as a stack rather
+     than a pair of equals. The Controller is the smaller, closer surface. */
+  align-self: stretch;
+}
+
+/* No height cap: a terminal grows as it prints, and capping it here would make
+   the newest event the one the reader cannot see. */
+.desk-term {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+}
+
+.desk-term-cmd {
+  white-space: pre-wrap;
+  color: var(--sa-11);
+}
+
+/* Clamp the echoed prompt: it is up to eight lines and would otherwise fill the
+   whole terminal, pushing the events the demo exists to show below the fold. The
+   full text stays in the accessibility tree through .sa-sr. */
+.desk-term-prompt-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.desk-term-hint {
+  margin: 0;
+}
+
+.desk-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Stacked by default: on a phone the terminal is about 237px, and holding the
+   event type at its desktop 8.5rem left 101px for the message, which broke
+   file names mid-token. The type sits above its message until there is room. */
+.desk-event {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0 0.75em;
+  width: 100%;
+  text-align: start;
+  padding: 0.0625rem var(--space-3xs);
+  border-radius: var(--radius-sm);
+  border-inline-start: 1px solid transparent;
+  transition: background var(--mo-state) var(--mo-ease-flat);
+}
+
+.desk-event:hover {
+  background: var(--sa-3);
+}
+
+.desk-event[data-current='true'] {
+  border-inline-start-color: var(--sa-accent);
+  background: var(--sa-3);
+}
+
+.desk-event-type {
+  color: var(--sa-9);
+}
+
+.desk-event[data-current='true'] .desk-event-type {
+  color: var(--sa-accent-text);
+}
+
+.desk-event-msg {
+  color: var(--sa-11);
+}
+
+.desk-result {
+  display: flex;
+  flex-direction: column;
+  padding-block-start: var(--space-2xs);
+  border-block-start: 1px solid var(--sa-6);
+}
+
+.desk-result b {
+  color: var(--sa-12);
+  font-weight: 500;
+}
+
+/* -------------------------------------------------------------- actions --- */
+
+.desk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-xs);
+  border-block-start: 1px solid var(--sa-6);
+  background: var(--sa-2);
+}
+
+.desk-actions .sa-btn:disabled {
+  background: var(--sa-4);
+  color: var(--sa-9);
+  cursor: default;
+}
+
+/* Its own row on a narrow layout: inline, the rail plus its counter ran past
+   the end of the action bar and the counter rendered as "9/". */
+/* Its own row on a narrow layout: inline, the rail plus its counter ran past
+   the end of the action bar. It wraps rather than overflowing, because ten
+   24px targets plus a counter is wider than a 281px bar. */
+.desk-rail {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3xs);
+  flex: 1 0 100%;
+  min-width: 0;
+  justify-content: flex-start;
+}
+
+@media (min-width: 40rem) {
+  .desk-rail {
+    flex: 0 1 auto;
+    margin-inline-start: auto;
+    justify-content: flex-end;
+  }
+}
+
+/* A 24x24 target with the mark drawn inside it, matching the other three demos.
+   The bar alone was a 22x6 hit area on the page's most-used control. */
+.desk-rail-step {
+  display: grid;
+  place-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+.desk-rail-mark {
+  width: 1.375rem;
+  height: 0.375rem;
+  border-radius: var(--radius-full);
+  background: var(--sa-6);
+  transition: background var(--mo-state) var(--mo-ease-flat);
+}
+
+.desk-rail-step[data-done='true'] .desk-rail-mark {
+  background: var(--sa-9);
+}
+
+.desk-rail-step[data-current='true'] .desk-rail-mark {
+  background: var(--sa-accent);
+}
+
+/* After the state rules, and at their specificity, or a done or current step
+   stops responding to a pointer. Every demo opens finished, so that was every
+   step on the page. */
+.desk-rail-step:hover:not([data-current='true']) .desk-rail-mark {
+  background: var(--sa-8);
+}
+
+.desk-rail-count {
+  font-size: var(--step--2);
+  color: var(--sa-9);
+  margin-inline-start: auto;
+  text-align: end;
+}
+
+@media (min-width: 40rem) {
+  .desk-event {
+    grid-template-columns: minmax(0, 8.5rem) minmax(0, 1fr);
+  }
+}
+
+/* ----------------------------------------------------------------- wide --- */
+
+@media (min-width: 60rem) {
+  /* Two windows on a desk, overlapping, as the reference stacks its CLI onto the
+     bottom-left of its app window. An earlier pass removed the overlap because
+     the terminal covered the columns the Turn was changing; the fix is not to
+     drop the overlap but to give the Host window enough height that the overlap
+     falls past the end of its content. The Host reserves bottom padding equal to
+     the intrusion, so nothing the Turn writes can ever end up underneath. */
+  .desk-stack {
+    display: grid;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    gap: 0;
+    /* Room for the Controller to hang below the Host window. */
+    padding-block-end: var(--space-l);
+  }
+
+  .desk-host {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    /* The reference's app window is 752px tall against a 321px terminal, so the
+       terminal takes under a fifth of it. At 27rem it took over a quarter. */
+    min-height: 44rem;
+  }
+
+  .desk-stage {
+    /* A modest reserved band. The Controller is allowed to sit over the bottom
+       left corner of the drawn application, the way a second window on a real
+       desk does and the way the reference lets its terminal cover part of the
+       findings list. The Host window is tall enough that this costs a corner,
+       not the content. */
+    padding-block-end: var(--space-l);
+  }
+
+  .desk-controller {
+    grid-column: 1 / span 7;
+    grid-row: 1;
+    align-self: end;
+    /* Percentage margins on a grid item resolve against its own grid area, not
+       the grid, so this is -14% of a seven-column track rather than of the whole
+       stack. It lands the terminal about 95px outside the Host window's left
+       edge, matching the reference's 94px break at a comparable window width. */
+    margin: 0 0 -1rem -14%;
+    z-index: 1;
+    box-shadow: 0 18px 40px -18px rgb(var(--sa-shadow) / calc(var(--sa-shadow-strength) + 0.1));
+  }
+
+  /* The terminal is a small floating window here, not a full-width panel, so it
+     scrolls its own history rather than growing the whole stack. */
+  .desk-term {
+    max-height: 15rem;
+    overflow: auto;
+  }
+}
