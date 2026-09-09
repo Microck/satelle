@@ -3,13 +3,16 @@ export const RELEASE = '0.1.10';
 export const SESSION = 'rs_0193f2c1-8a4e-7c33-b0d1-5e9a4c17be02';
 export const COMMIT_DELAY = 760;
 export const POINTER_TRAVEL = 620;
+export const POINTER_PRESS = COMMIT_DELAY - 90;
+export const POINTER_RELEASE = 100;
+export const POINTER_LINGER = 130;
 export const DRAG_DURATION = 1200;
+export const MINIMIZE_DURATION = 320;
 export const LOOP_HOLD = 1800;
 export const REPORT_FILE = 'Traffic acquisition.csv';
 export const PHOTO_FILE = 'profile.png';
 export const BRIEF_FILE = 'Documents/launch-brief.pdf';
-/** Classic compact Clawd, using full-width terminal cells, not letter spacing.
- * The preformatted glyphs are also the source for the pixel-aligned rendering. */
+/** Classic compact Clawd; the block cells are rendered as SVG quadrants. */
 export const CLAWD = ' ▐▛███▜▌\n▝▜█████▛▘\n  ▘▘ ▝▝';
 export const SITES = {
   qa: 'localhost:3000/storefront',
@@ -29,10 +32,10 @@ export const CHATGPT_INTEGRATION = {
   note: 'ChatGPT concept. A compatible remote MCP bridge is required; it is not included in Satelle.',
 };
 export const DEMOS = [
-  { id: 'qa', number: '01', title: 'Catch the layout that breaks.', lead: 'Resize the browser. Make the responsive bug impossible to miss.', cta: 'Run a website check', href: '/docs/tutorial/first-session', label: 'Responsive QA', surface: 'resizable-browser' },
-  { id: 'chat', number: '02', title: 'Start a task. Stay in the conversation.', lead: 'Choose a Host, check progress, and see the finished result.', cta: 'Review connection requirements', href: '/demo-explorations#chatgpt-requirements', label: 'ChatGPT concept', surface: 'conversation' },
-  { id: 'transfer', number: '03', title: 'A prompt, then the computer takes over.', lead: 'Export from Google Analytics. Deliver to Google Drive.', cta: 'Connect your coding agent', href: '/docs/reference/commands', label: 'Claude Code', surface: 'terminal-and-browser' },
-  { id: 'slack', number: '04', title: 'Your profile, updated for you.', lead: 'Choose the photo. Adjust the crop. Save the change.', cta: 'Operate a Session', href: '/docs/how-to/operate-session', label: 'Slack on macOS', surface: 'slack' },
+  { id: 'qa', number: '01', title: 'Test the experience, end to end.', lead: 'Check real interfaces on the computers you control.', cta: 'Run a website check', href: '/docs/tutorial/first-session', label: 'Website QA', surface: 'resizable-browser' },
+  { id: 'chat', number: '02', title: 'Talk to your computers.', lead: 'Start tasks, follow progress, and see the result.', cta: 'Review connection requirements', href: '/demo-explorations#chatgpt-requirements', label: 'ChatGPT concept', surface: 'conversation' },
+  { id: 'transfer', number: '03', title: 'Give your coding agent a computer.', lead: 'Go beyond the editor and get work done in your apps.', cta: 'Connect your coding agent', href: '/docs/reference/commands', label: 'Coding agents', surface: 'terminal-and-browser' },
+  { id: 'slack', number: '04', title: 'Skip the repetitive clicks.', lead: 'Let your Host handle the everyday work in your apps.', cta: 'Operate a Session', href: '/docs/how-to/operate-session', label: 'Desktop tasks', surface: 'slack' },
 ] as const;
 export type DemoId = (typeof DEMOS)[number]['id'];
 export type Beat = Readonly<{ label: string; ms: number; target?: string; dragTo?: string }>;
@@ -60,7 +63,7 @@ export const TIMELINES: Record<DemoId, readonly Beat[]> = {
   transfer: [
     { label: 'Give Claude Code the task', ms: 3500 },
     { label: 'Satelle admits the task on ops-pc', ms: 1800 },
-    { label: 'Click the terminal’s minimize control', ms: 2100, target: 'terminal-minimize' },
+    { label: 'Click the terminal’s minimize control', ms: 1400, target: 'terminal-minimize' },
     { label: 'Open the report export menu', ms: 1600, target: 'ga-export' },
     { label: 'Download the CSV', ms: 1700, target: 'ga-csv' },
     { label: 'Switch to Google Drive', ms: 1600, target: 'drive-tab' },
@@ -116,6 +119,18 @@ export function qaWidth(frame: Frame) {
     + 36 * ease(phase(frame, 4, DRAG_DURATION, COMMIT_DELAY))
     - 36 * ease(phase(frame, 5, DRAG_DURATION, COMMIT_DELAY));
 }
+/** Cursor visibility is an action window, not the lifetime of the beat.
+ * Arrive, press, commit/drag, release, briefly linger, then leave the scene. */
+export function gesturePhase(frame: Frame) {
+  const releaseAt = COMMIT_DELAY + (frame.dragTo ? DRAG_DURATION : POINTER_RELEASE);
+  const visible = Boolean(frame.target && !frame.done && frame.local < releaseAt + POINTER_LINGER);
+  const pressed = visible && frame.local >= POINTER_PRESS && frame.local < releaseAt;
+  return { visible, pressed, dragging: pressed && Boolean(frame.dragTo) && frame.local >= COMMIT_DELAY, releaseAt };
+}
+export function terminalMinimize(frame: Frame) {
+  const progress = phase(frame, 2, MINIMIZE_DURATION, COMMIT_DELAY);
+  return 1 - (1 - progress) ** 3;
+}
 /** Entire messages arrive at commit time. Only their geometry pops; no fading. */
 export function messagePop(frame: Frame, step: number) {
   const t = phase(frame, step, 280, step === 0 ? 0 : COMMIT_DELAY);
@@ -133,6 +148,15 @@ export const CHAT_MESSAGES = [
   { step: 7, role: 'assistant', tool: 'status · running', text: `On studio-mac at ${BRIEF_FILE}. The export is in progress; I’ll check again.` },
   { step: 8, role: 'assistant', tool: 'status · completed', text: 'Completed. The PDF is saved on studio-mac.', file: BRIEF_FILE },
 ] as const;
+export type McpActivity = Readonly<{ tools: readonly string[]; action: string; state: 'checked' | 'started' | 'running' | 'completed' }>;
+/** Presentation of the real tool operations above, not additional MCP tools. */
+export const MCP_ACTIVITIES: Record<number, McpActivity> = {
+  1: { tools: ['config_check'], action: '2 configured Hosts', state: 'checked' },
+  3: { tools: ['run'], action: 'Task admitted · studio-mac', state: 'started' },
+  5: { tools: ['status', 'logs'], action: 'Checking the Session', state: 'running' },
+  7: { tools: ['status'], action: 'Export in progress', state: 'running' },
+  8: { tools: ['status'], action: 'Task completed', state: 'completed' },
+};
 export const HOST_CHECK = {
   input: { all: true },
   fields: { schema_version: 'satelle.config.check.v1', status: 'ok', mode: 'all',
