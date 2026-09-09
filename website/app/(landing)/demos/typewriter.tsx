@@ -144,3 +144,77 @@ export function useTypewriter(beats: Beat[], reduced: boolean) {
     finish,
   };
 }
+
+/* ------------------------------------------------------------- retyping --- */
+
+const DELETE_MS = 24;
+const RETYPE_MS = 34;
+
+/**
+ * Animates a text value being replaced the way a person replaces it: the
+ * divergent tail is deleted one character at a time, then the new tail is
+ * typed. The common prefix is left alone, which is what an editor actually
+ * does, and it is what makes a formula repair read as an edit rather than as a
+ * swap.
+ *
+ * Deleting is faster than typing, because holding backspace is faster than
+ * choosing characters.
+ */
+export function useRetype(value: string, animate: boolean, typeIn = false) {
+  // `typeIn` is for text that appears rather than changes: a line the Turn has
+  // just written should be written, not pasted. Safe against the server render
+  // because content that types in only ever mounts after hydration.
+  const [shown, setShown] = useState(typeIn && animate ? '' : value);
+  const timer = useRef<number | undefined>(undefined);
+
+  // A text edit playing out over time is synchronisation with the clock, which
+  // is what an effect is for. One pending timeout at a time, cleared on every
+  // change, so a value that changes mid-edit redirects rather than racing.
+  useEffect(() => {
+    if (!animate) {
+      window.clearTimeout(timer.current);
+      setShown(value);
+      return;
+    }
+    if (shown === value) return;
+
+    // How much of the head the two versions agree on. Everything after it has
+    // to go before the new tail can be typed.
+    let shared = 0;
+    while (shared < shown.length && shared < value.length && shown[shared] === value[shared]) {
+      shared += 1;
+    }
+
+    const deleting = shown.length > shared;
+    timer.current = window.setTimeout(
+      () => setShown((text) => (deleting ? text.slice(0, -1) : value.slice(0, text.length + 1))),
+      deleting ? DELETE_MS : RETYPE_MS,
+    );
+    return () => window.clearTimeout(timer.current);
+  }, [value, shown, animate]);
+
+  return { shown, /** True while the edit is still playing out. */ editing: shown !== value };
+}
+
+/**
+ * The text of a field that the Host is editing, plus a caret while the edit is
+ * in flight. Drop it in place of the value and the field types itself.
+ */
+export function Retype({
+  value,
+  animate,
+  typeIn,
+}: {
+  value: string;
+  animate: boolean;
+  /** Write the text out on first appearance instead of replacing existing text. */
+  typeIn?: boolean;
+}) {
+  const { shown, editing } = useRetype(value, animate, typeIn);
+  return (
+    <>
+      {shown}
+      {editing ? <i className="sa-caret" data-blink="true" aria-hidden="true" /> : null}
+    </>
+  );
+}

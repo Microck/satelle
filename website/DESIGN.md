@@ -512,12 +512,15 @@ clears on `turn_completed` and the reader sees the desktop handed back. Its
 label is a pill, which is what both vendors ship, at top centre because the
 Controller window covers the bottom left where they put theirs.
 
-**The pointer** is a black arrow with a white outline, and the accent is carried
-by the glow, not the arrow: `drop-shadow(0 0 6px …90%) drop-shadow(0 0 15px
-…48%)`. That pair of stops is the signature both vendors converged on. A crimson
-arrow was the first attempt and was wrong twice over, since Codex's blue is the
-glow colour and a crimson arrow also disappeared into the lighter application
-interiors.
+**The pointer** is a crimson arrow with a white outline, carrying the same glow
+filter the shipped cursors use: `drop-shadow(0 0 6px …90%) drop-shadow(0 0 15px
+…48%)`. That pair of stops is the signature both vendors converged on.
+
+This is a deliberate departure. Codex's arrow is black and puts the accent only
+in the glow, and this page followed that first. But Satelle's pointer is meant
+to be read as Satelle's, so the accent is on the arrow itself. The white outline
+is what makes that work: crimson alone disappeared into the lighter application
+interiors, which is why the faithful version was tried first.
 
 Every `StageStep` may name `at: { x, y }` as fractions of the stage box and an
 `act`:
@@ -529,14 +532,35 @@ Every `StageStep` may name `at: { x, y }` as fractions of the stage box and an
 | `click` | nothing of its own               | the step activates something |
 | `move`  | nothing                          | default: the Host responding, or a check with no input |
 
-There is no click ripple, because there is none in either shipped
-implementation: 21.5MB of extension contains no `ripple`, no `keyframes`, and no
-per-click marker. An earlier version of this file invented one. The click reads
-instead through the two things they do ship. On travel the pointer squashes
-along its axis, dipping to 0.85 at the midpoint, as `rotate(axis) scale(1, s)
-rotate(-axis)`. On arrival it gives a short damped shake, theirs being 12.5
-degrees on a 660ms period over 1410ms, compressed here to finish inside the
-demo's dwell so a settled demo has nothing running.
+On travel the pointer squashes along its axis, dipping to 0.85 at the midpoint,
+as `rotate(axis) scale(1, s) rotate(-axis)`. On arrival it gives a short damped
+shake, theirs being 12.5 degrees on a 660ms period over 1410ms, compressed here
+to finish inside the demo's dwell so a settled demo has nothing running.
+
+A click is also drawn, as two rings contracting onto the point over 480ms with a
+held peak. Neither shipped implementation draws one: 21.5MB of extension
+contains no `ripple`, no `keyframes`, and no per-click marker, and they carry the
+press in their motion springs alone. That works at 60fps in a live session and
+does not work in a stepped demo, where a click step landed with nothing at all
+to see. The first attempt at this was 300ms with no hold and was still easy to
+miss, which is the whole complaint it exists to answer.
+
+**Text the Turn rewrites is typed, not swapped.** `Retype` in
+`demos/typewriter.tsx` deletes the divergent tail one character at a time and
+writes the new one, leaving the common prefix alone, which is what an editor
+actually does: watching `=F5*G5` become `=F5*G5*(1-I5)` is the clearest thing on
+the stage. Deleting runs faster than typing, because holding backspace is faster
+than choosing characters. A `typeIn` mode covers text that appears rather than
+changes, which is how a line the Turn has just written to a script gets written
+rather than pasted.
+
+The caret belongs in the field being edited, at the insertion point, not
+floating beside the mouse pointer, which is not a thing any editor does. An
+earlier version hung one off the cursor, where it was also invisible in
+practice: it ran for 1020ms inside a 420ms window and blinked off for half of
+each cycle. A typing step therefore gets a longer dwell than the others, since
+cutting away mid-edit would show the pointer setting off again while the last
+edit was still being written.
 
 Movement is a `transition` on `left` and `top`, not a keyframe, because a move
 has to start wherever the last action left the pointer, which a keyframe cannot

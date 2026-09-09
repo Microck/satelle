@@ -1,5 +1,6 @@
 'use client';
 
+import { useRetype } from '../typewriter';
 import type { Stage, StageProps } from '../stage';
 import './excel.css';
 
@@ -55,7 +56,7 @@ function revenueOf(row: Row, repaired: boolean) {
   return row.units * row.price * (1 - discount);
 }
 
-function Sheet({ step }: StageProps) {
+function Sheet({ step, reduced }: StageProps) {
   // Step gates. Each one is the state *after* that action commits.
   const inSubmission = step >= 2;
   const deduped = step >= 3;
@@ -72,6 +73,10 @@ function Sheet({ step }: StageProps) {
     : step >= 1
       ? '=F5*G5'
       : '';
+  // The formula bar is typed rather than swapped, and the "repaired" badge
+  // waits for the typing to finish: it was appearing on the first keystroke,
+  // calling the formula repaired while it was still being written.
+  const typed = useRetype(formula, !reduced);
 
   return (
     <div className="xl">
@@ -80,8 +85,15 @@ function Sheet({ step }: StageProps) {
         <span className="xl-formula sa-mono">
           {formula ? (
             <>
-              {formula}
-              {repaired ? <span className="xl-fixed">repaired</span> : null}
+              {/* The repair rewrites this field, so it is typed rather than
+                  swapped: the broken formula's tail is deleted and the corrected
+                  one is written in its place. Watching `=F5*G5` become
+                  `=F5*G5*(1-I5)` is the clearest thing on the stage. */}
+              {typed.shown}
+              {typed.editing ? (
+                <i className="sa-caret" data-blink="true" aria-hidden="true" />
+              ) : null}
+              {repaired && !typed.editing ? <span className="xl-fixed">repaired</span> : null}
             </>
           ) : (
             <span className="sa-faint">fx</span>

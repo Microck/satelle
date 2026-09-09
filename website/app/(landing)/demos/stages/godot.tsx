@@ -1,5 +1,6 @@
 'use client';
 
+import { Retype } from '../typewriter';
 import type { Stage, StageProps } from '../stage';
 import './godot.css';
 
@@ -201,7 +202,15 @@ function Project({ step, reduced }: StageProps) {
                   className="gd-line"
                   data-kind={line.kind}
                 >
-                  {line.text}
+                  {/* A line the Turn has just written is written out, not
+                      pasted in. Only `add` lines do this: they mount when the
+                      step that writes them commits, so each one types itself
+                      once and the lines already in the file stay put. */}
+                  {line.kind === 'add' ? (
+                    <Retype value={line.text} animate={!reduced} typeIn />
+                  ) : (
+                    line.text
+                  )}
                 </span>
               ))}
             </code>

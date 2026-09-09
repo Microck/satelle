@@ -168,29 +168,59 @@
   }
 }
 
-/* Typing: a caret at the pointer, so a keystroke step is distinguishable from a
-   click without reading the log. Finite on purpose. This blinked forever at
-   first, which is exactly what the page was criticised for. No fill-mode, so
-   when the burst ends the element falls back to its own opacity of 1. */
-.ctl-type {
+/* A click. The shipped implementations draw nothing here and carry the press
+   in their motion springs alone, which works at 60fps in a live session but
+   leaves a stepped demo with nothing to see: the pointer arrived and the
+   application changed with no visible cause in between.
+
+   So this is drawn, and drawn as a press rather than as a ripple: two rings
+   contracting onto the point, which reads as something being pushed rather than
+   as something radiating out of it. Keyed on the step, finite, and short enough
+   to finish well inside the dwell. */
+.ctl-press,
+.ctl-press::after {
   position: absolute;
-  left: 0.9rem;
-  top: 1rem;
-  width: 0.4375rem;
-  height: 1rem;
-  background: var(--sa-accent);
-  opacity: 1;
-  animation: ctl-type 340ms steps(1, end) 3;
+  left: 0;
+  top: 0;
+  border-radius: var(--radius-full);
+  border: 2px solid var(--sa-accent);
 }
 
-@keyframes ctl-type {
-  0%,
-  50% {
+.ctl-press {
+  width: 1.5rem;
+  height: 1.5rem;
+  margin: -0.75rem 0 0 -0.75rem;
+  animation: ctl-press 480ms var(--mo-ease-flat) both;
+}
+
+.ctl-press::after {
+  content: '';
+  inset: -0.375rem;
+  width: auto;
+  height: auto;
+  margin: 0;
+  opacity: 0.45;
+}
+
+/* Contracts onto the point, holds there long enough to be seen, then goes. The
+   first version was 300ms with no hold and was easy to miss entirely, which is
+   the whole complaint it exists to answer. */
+@keyframes ctl-press {
+  from {
     opacity: 0;
+    scale: 1.9;
   }
-  51%,
-  100% {
+  40% {
     opacity: 1;
+    scale: 1;
+  }
+  72% {
+    opacity: 1;
+    scale: 1;
+  }
+  to {
+    opacity: 0;
+    scale: 0.92;
   }
 }
 
@@ -214,3 +244,10 @@
    animation and transition under `.sa` to 1ms with !important, which covers the
    enter, the scoot, the landing shake, and the caret. A second copy here would
    only look like care. */
+
+/* The typing caret is not here. A caret belongs at the insertion point in the
+   field being edited, not floating beside the mouse pointer, which is not a
+   thing any editor does. It lives in the drawn application now, via `Retype`,
+   and it appears for exactly as long as the edit takes. The version that hung
+   off the cursor was also invisible in practice: it ran for 1020ms inside a
+   420ms window, blinking off for half of each cycle. */

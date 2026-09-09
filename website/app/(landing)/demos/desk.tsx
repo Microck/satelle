@@ -20,8 +20,14 @@ const STAGES: Stage[] = [excelStage, kicadStage, godotStage, filingStage];
 /**
  * How long a committed action is left on screen before the pointer sets off for
  * the next one. The travel time is on top of this and is set by the distance.
+ *
+ * A typing action gets longer, because the field it lands in deletes the old
+ * text and types the new: cutting away mid-edit would show the pointer starting
+ * its next move while the last one was still being written. Sized to the
+ * longest retype on the page.
  */
 const DWELL_MS = 420;
+const TYPE_DWELL_MS = 1100;
 
 /**
  * True once the element has been on screen, and true forever after. A hero that
@@ -122,7 +128,10 @@ export default function DeskDemo() {
     // a session running rather than a screenshot of one. Reduced motion gets
     // the finished Turn on the first paint instead.
     step: 0,
-    phase: 'travel',
+    // Committed, not travelling. The server renders this, so starting mid-travel
+    // would hand a reader without JavaScript an untouched application and an
+    // empty event log. Every step after the first still travels before it lands.
+    phase: 'acted',
     auto: true,
   });
   const reduced = useReducedMotion();
@@ -179,9 +188,10 @@ export default function DeskDemo() {
   // Leave the committed action on screen, then set off for the next one.
   useEffect(() => {
     if (reduced || !started || !state.auto || state.phase !== 'acted') return;
-    const id = window.setTimeout(() => dispatch({ type: 'tick' }), DWELL_MS);
+    const dwell = stage.steps[state.step]?.act === 'type' ? TYPE_DWELL_MS : DWELL_MS;
+    const id = window.setTimeout(() => dispatch({ type: 'tick' }), dwell);
     return () => window.clearTimeout(id);
-  }, [reduced, started, state.auto, state.phase, state.step, state.stage]);
+  }, [reduced, started, state.auto, state.phase, state.step, state.stage, stage.steps]);
 
   // Reduced motion never animates, so it opens on the finished Turn.
   useEffect(() => {

@@ -126,11 +126,12 @@ export function ControlCursor({
       } as CSSProperties}
       aria-hidden="true"
     >
-      {/* Black body, white outline. The accent is carried by the glow, not the
-          arrow: that is how the shipped cursor is built, and a crimson arrow
-          also disappeared into the lighter application interiors. `paint-order`
-          puts the stroke behind the fill so the outline reads as an outline
-          rather than eating the shape. */}
+      {/* Crimson body, white outline. The shipped cursor is black with the
+          accent only in its glow, but Satelle's pointer is meant to be read as
+          Satelle's, so the accent is on the arrow itself. The white outline is
+          what keeps it legible over the lighter application interiors, and
+          `paint-order` puts the stroke behind the fill so the outline reads as
+          an outline rather than eating the shape. */}
       <svg
         className="ctl-cursor-glyph"
         width="24"
@@ -140,7 +141,7 @@ export function ControlCursor({
       >
         <path
           d="M1.5 1.5 14.6 12.4 8.2 12.8 11.4 20.1 8.6 21.3 5.4 14 1.5 17.4Z"
-          fill="#0a0a0a"
+          fill="var(--sa-accent)"
           stroke="#fff"
           strokeWidth="2.1"
           strokeLinejoin="round"
@@ -150,7 +151,10 @@ export function ControlCursor({
       {/* Keyed on the step so each typing action replays the burst. The
           reader complained the hero was "animated by blinking", so this ends:
           a few keystrokes landing, then a settled caret. */}
-      {acting && act === 'type' ? <i key={`t${step}`} className="ctl-type" /> : null}
+      {/* The shipped cursors mark a click only through their springs, which
+          reads in a live session at 60fps but not in a stepped demo: a click
+          step was landing with nothing to see. So the press is drawn. */}
+      {acting && act === 'click' ? <i key={`k${step}`} className="ctl-press" /> : null}
     </span>
   );
 }
