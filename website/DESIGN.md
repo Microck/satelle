@@ -486,42 +486,105 @@ because the card head already carries their content visibly.
 ### Computer Use presentation
 
 The hero is not a log with pictures beside it. It is a Turn playing back at
-speed, and the two things that make it read that way are the control ring and
-the driven pointer, in `demos/control.tsx`.
+speed. Three things make it read that way, in `demos/control.tsx`: the screen
+aura, the driven pointer, and the rule that the Host does not change until the
+pointer gets there.
 
-**The ring** frames the Host window from inside, the way a native Computer Use
-session outlines the display it has taken over: `inset 0 0 0 2px` in
-`--sa-accent`, plus a soft inner bloom. Inset shadows cost no layout and cannot
-be pushed around by the application drawn underneath. It is held exactly while
-the Turn is non-terminal, so it disappears on `turn_completed`: the reader sees
-control handed back. Its label rides on the ring's top-right corner as a filled
-tab. Unfilled annotation text was tried first and collided with whatever the
-stage drew there.
+The shapes and numbers are taken from the shipping implementations rather than
+invented, so an operator who has seen one recognises this. What was recoverable,
+and from where:
 
-**The pointer** goes to the element each step changes. Every `StageStep` may
-name `at: { x, y }` as fractions of the stage box and an `act`:
+| Source | What it gave |
+| ------ | ------------ |
+| Claude in Chrome extension, `assets/agent-visual-indicator.js` | the screen-edge glow, complete and verbatim |
+| Codex Desktop Computer Use extension, `content-scripts/codex.js` | the cursor's geometry, glow filter, and motion model |
+| `~/.codex/computer-use/config.json` | the local overlay's accent `#339cff` and its label, "Codex is using your computer" |
 
-| `act`   | What it draws                        | When |
-| ------- | ------------------------------------ | ---- |
-| `click` | one expanding ring, keyed on the step | the step activates something |
-| `type`  | a caret at the point                  | the step enters text |
-| `drag`  | a short trail behind the pointer      | the step draws, routes, or selects across |
-| `move`  | nothing                               | default: the Host responding, or a check with no input |
+Codex's own screen overlay is a native Metal effect whose radii and easing are
+compiled in and could not be read. So the aura's structure is the one that
+could be, in crimson instead of a blue accent.
+
+**The aura** is not a border. Three stacked inset shadows, no line and no
+radius, at 15/25/35px and 0.7/0.5/0.2 alpha. A hard 2px ring was the first
+attempt and read as window chrome rather than as a screen under someone else's
+control. It is held for exactly as long as the Turn is non-terminal, so it
+clears on `turn_completed` and the reader sees the desktop handed back. Its
+label is a pill, which is what both vendors ship, at top centre because the
+Controller window covers the bottom left where they put theirs.
+
+**The pointer** is a black arrow with a white outline, and the accent is carried
+by the glow, not the arrow: `drop-shadow(0 0 6px …90%) drop-shadow(0 0 15px
+…48%)`. That pair of stops is the signature both vendors converged on. A crimson
+arrow was the first attempt and was wrong twice over, since Codex's blue is the
+glow colour and a crimson arrow also disappeared into the lighter application
+interiors.
+
+Every `StageStep` may name `at: { x, y }` as fractions of the stage box and an
+`act`:
+
+| `act`   | What it draws                    | When |
+| ------- | -------------------------------- | ---- |
+| `type`  | a caret at the point, three keystrokes then solid | the step enters text |
+| `drag`  | a trail behind the pointer, aimed back along the travel and as long as it was | the step draws, routes, or selects across |
+| `click` | nothing of its own               | the step activates something |
+| `move`  | nothing                          | default: the Host responding, or a check with no input |
+
+There is no click ripple, because there is none in either shipped
+implementation: 21.5MB of extension contains no `ripple`, no `keyframes`, and no
+per-click marker. An earlier version of this file invented one. The click reads
+instead through the two things they do ship. On travel the pointer squashes
+along its axis, dipping to 0.85 at the midpoint, as `rotate(axis) scale(1, s)
+rotate(-axis)`. On arrival it gives a short damped shake, theirs being 12.5
+degrees on a 660ms period over 1410ms, compressed here to finish inside the
+demo's dwell so a settled demo has nothing running.
 
 Movement is a `transition` on `left` and `top`, not a keyframe, because a move
 has to start wherever the last action left the pointer, which a keyframe cannot
-know. A step with no `at` leaves the pointer put, so a run of Host-side steps
-does not make the cursor wander.
+know, and not `translate`, because the target is a percentage of the stage box
+and a percentage in `translate` resolves against the element's own size. The
+duration is paced by distance, 170ms to 700ms: a pointer that takes as long to
+cross the screen as to nudge 20px reads as teleporting. The curve is local to
+the cursor, since the page's own easing is an ease-out that made it leave the
+mark at full speed rather than accelerate out of rest.
 
-Both live inside `.desk-stage`, which carries an explicit `z-index: 0` to make
-itself a stacking context. Without it the ring and pointer were only positioned,
-not layered, and painted over the operator's own terminal: the pointer appeared
-to be clicking around inside the Linux window it is driving *from*.
+**The Host changes on arrival, not on selection.** This is the part that does
+the most work and the part that was wrong longest. `step` is the action the
+pointer is working on; `phase` says whether it is still travelling or has
+landed; and the drawn application, the event line, and the rail's done state all
+follow the *committed* step, which lags by the travel time. Committing on
+selection meant the pointer spent every step narrating a change that had already
+happened, which is exactly why the hero read as an overview rather than a
+session.
+
+For the same reason the stage wrapper is keyed on the stage alone. It was keyed
+on the step too, which unmounted and remounted the whole drawn application on
+every action and faded it back in: the application appeared to blink rather than
+to change. Letting React diff the interior means only the cells that changed
+change, and those ease over 150ms.
+
+A step with no `at` leaves the pointer put, so a run of Host-side steps does not
+make the cursor wander. Targets are measured against the built page rather than
+guessed, and they account for the Controller window covering the Host's bottom
+left corner: a target under it would put the pointer somewhere the reader cannot
+see it.
+
+Both the aura and the pointer live inside `.desk-stage`, which carries an
+explicit `z-index: 0` to make itself a stacking context. Without it they were
+only positioned, not layered, and painted over the operator's own terminal: the
+pointer appeared to be clicking around inside the Linux window it drives *from*.
 
 Under `prefers-reduced-motion` the demo settles straight to the completed Turn,
-so the ring is already released and the pointer is already at its last target.
+so the aura is already released and the pointer is already at its last target.
 Nothing needs a special case: the global 1ms clamp in `landing.css` covers the
-move, the click ring, and the caret.
+enter, the squash, the landing shake, and the caret.
+
+### Dragging the demo windows
+
+A window may be dragged only within the box the page marks `data-demo-area`,
+which is the tinted stage, and it is held fully inside it on every edge. Not the
+window stack: the Controller rests outside the stack by design, breaking past
+the Host window's left edge, so bounding a drag by the stack would snap it
+inward the moment it was touched.
 
 ## 9. Implementation
 

@@ -243,8 +243,14 @@
   background: var(--sa-1);
 }
 
+/* Wraps at narrow widths on purpose. Stacked, the pane is about 257px, and the
+   guide's filename and the applied count cannot share a line at that width: the
+   count is nowrap and start-margined to the end, so it pushed the whole pane
+   past the right edge of the screen. It goes back on one line in the wide
+   layout below, where both fit. */
 .fl-rules-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   gap: var(--space-2xs);
 }
@@ -362,6 +368,10 @@
   .fl-rules {
     border-block-start: 0;
     border-inline-start: 1px solid var(--sa-6);
+  }
+
+  .fl-rules-head {
+    flex-wrap: nowrap;
   }
 
   .fl-page {

@@ -43,10 +43,11 @@ const MISSED_COIN = 'Coin3';
 type CodeLine = { text: string; kind?: 'add' | 'todo' };
 
 /**
- * The visible excerpt of main.gd: the three functions the Turn touches, from
- * `func _ready` on line 11 down, so the panel stays readable instead of
- * scrolling a whole file. The gates are monotone, so `gated` never arrives
- * before the collect_coin body it extends.
+ * The excerpt of main.gd the pane holds: the three functions the Turn touches,
+ * from `func _ready` on line 11 down, rather than a whole file. The code box is
+ * shorter than the excerpt gets and is pinned to its end, so what a reader sees
+ * is always the block the Turn has just written. The gates are monotone, so
+ * `gated` never arrives before the collect_coin body it extends.
  */
 function codeLines(gates: {
   wired: boolean;
@@ -384,55 +385,100 @@ export const godotStage: Stage = {
     'Open the NeonCollector Godot project and run it. Fix the unfinished coin-collection workflow in main.gd: touching each of the five coins must remove it, increment the HUD to COINS: n/5, and reveal the existing SECTOR CLEARED panel after all five are collected. The PLAY AGAIN button must reload the scene. Preserve the existing visual design and player controls. Save the working project in place and run it once to verify the complete flow.',
   budget: { minutes: 20, steps: 160 },
   steps: [
+    // Pointer targets are fractions of the stage box, measured off the built
+    // page at 1440 with Chromium rather than guessed. Every one of them is
+    // somewhere the reader can actually see: the Controller window floats over
+    // the bottom left of the Host, so a target is either in the game pane on
+    // the right or in the top band of the script pane, which is the part of the
+    // excerpt the code box keeps in view.
     {
       event: 'turn_started',
       label: 'Turn admitted',
       message: 'Turn admitted on host win-11-lab, desktop session console',
+      // The player square at its spawn, where the run is about to start.
+      // Nothing has been committed yet, so there is no action here.
+      at: { x: 0.727, y: 0.601 },
     },
     {
       event: 'turn_progress',
       label: 'Run the starter',
       message: 'ran main.tscn, the player crossed a coin and COINS stayed 0/5',
+      // The coin the starter walked through: drawn hollow and dashed at this
+      // step, with the player standing on it. The Host is reporting what the
+      // run did rather than taking input, so the pointer only moves.
+      at: { x: 0.867, y: 0.54 },
     },
     {
       event: 'turn_progress',
       label: 'Wire coins group',
       message: 'connected body_entered for every node in the coins group to collect_coin',
+      // The connect() call, second of the two lines this step writes into
+      // _ready and the one that names collect_coin.
+      at: { x: 0.258, y: 0.144 },
+      act: 'type',
     },
     {
       event: 'turn_progress',
       label: 'Remove and score',
       message: 'filled collect_coin: queue_free the coin, score += 1, rewrite ScoreLabel',
+      // Last line of the block, the ScoreLabel rewrite the message ends on.
+      at: { x: 0.235, y: 0.28 },
+      act: 'type',
     },
     {
       event: 'turn_progress',
       label: 'Gate the win panel',
       message: 'added the score >= TOTAL_COINS gate that stops player physics and shows WinPanel',
+      // The gate line itself, `if score >= TOTAL_COINS:`.
+      at: { x: 0.127, y: 0.225 },
+      act: 'type',
     },
     {
       event: 'turn_progress',
       label: 'Wire play again',
       message: 'filled reset_game with get_tree().reload_current_scene()',
+      // reset_game's one line, at the end of the excerpt.
+      at: { x: 0.157, y: 0.389 },
+      act: 'type',
     },
     {
       event: 'turn_progress',
       label: 'Save and re-run',
       message: 'saved main.gd in place, ran main.tscn, first coin cleared at COINS: 1/5',
+      // Coin1's slot, now holding the player square that cleared it, which is
+      // the outcome the message ends on. The main.gd tab is the other drawn
+      // thing this step changes, but the pane head sits 17px below the top of
+      // the stage, inside the control ring, and the pointer is kept off the
+      // ring. No click either: Ctrl+S and walking the player are keystrokes,
+      // and the only thing this Turn clicks in the game window is PLAY AGAIN.
+      at: { x: 0.758, y: 0.533 },
     },
     {
       event: 'turn_progress',
       label: 'Clear three coins',
       message: 'second and third coins cleared, HUD read COINS: 3/5',
+      // The HUD counter, which is what this step is a reading of.
+      at: { x: 0.731, y: 0.066 },
     },
     {
       event: 'turn_progress',
       label: 'Reveal the panel',
       message: 'fourth and fifth coins cleared at COINS: 5/5, SECTOR CLEARED became visible',
+      // The panel's own title, on the words rather than in the middle of the
+      // overlay that fills the play area. The panel revealing itself is the
+      // game responding to the gate, so the pointer only moves.
+      at: { x: 0.848, y: 0.451 },
     },
     {
       event: 'turn_completed',
       label: 'Verify play again',
       message: 'PLAY AGAIN reloaded main.tscn, WASD and arrow movement unchanged',
+      // Where PLAY AGAIN stood one step ago. The click reloads the scene, which
+      // takes the panel away, so by the time this step draws there is no button
+      // under the pointer. The play area keeps its top edge while the pane
+      // relaxes, so this is still the point the button occupied.
+      at: { x: 0.848, y: 0.508 },
+      act: 'click',
     },
   ],
   Render: Project,

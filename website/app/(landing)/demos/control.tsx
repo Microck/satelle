@@ -15,11 +15,16 @@ import './control.css';
  * this is Satelle's Host, but the idea is the one an operator already knows.
  */
 
-/** Drawn over the whole screen area, so it frames the desktop, not the window. */
+/**
+ * The screen aura, drawn over the whole controlled screen.
+ *
+ * Held for exactly as long as control is held, so it clears the moment the Turn
+ * completes and the reader sees the desktop handed back.
+ */
 export function ControlRing({ held }: { held: boolean }) {
   return (
     <span className="ctl-ring" data-held={held} aria-hidden="true">
-      <span className="ctl-ring-label sa-mono">Computer Use</span>
+      <span className="ctl-ring-label">Satelle is using this computer</span>
     </span>
   );
 }
@@ -115,22 +120,31 @@ export function ControlCursor({
         top: `${to.y * 100}%`,
         '--ctl-move': `${moveDurationMs(steps, step)}ms`,
         '--ctl-back': `${backAngle}deg`,
+        // The axis the squash happens along: the direction of this move.
+        '--ctl-axis': `${Math.round((Math.atan2(dy, dx) * 180) / Math.PI)}deg`,
         '--ctl-trail': `${trailRem}rem`,
       } as CSSProperties}
       aria-hidden="true"
     >
-      {/* A click lands as one expanding ring, keyed on the step so it replays
-          on every action rather than once per mount. It fires on arrival: a
-          ring that expands while the pointer is still travelling would be a
-          click on whatever it happened to be passing over. */}
-      {acting && act === 'click' ? <i key={step} className="ctl-hit" /> : null}
-      <svg width="18" height="20" viewBox="0 0 18 20" focusable="false">
+      {/* Black body, white outline. The accent is carried by the glow, not the
+          arrow: that is how the shipped cursor is built, and a crimson arrow
+          also disappeared into the lighter application interiors. `paint-order`
+          puts the stroke behind the fill so the outline reads as an outline
+          rather than eating the shape. */}
+      <svg
+        className="ctl-cursor-glyph"
+        width="24"
+        height="24"
+        viewBox="0 0 17 23"
+        focusable="false"
+      >
         <path
-          d="M2 1.5 15.5 11 9.5 11.6 12.3 17.8 9.6 19 6.8 12.8 2 16.4Z"
-          fill="var(--sa-accent)"
+          d="M1.5 1.5 14.6 12.4 8.2 12.8 11.4 20.1 8.6 21.3 5.4 14 1.5 17.4Z"
+          fill="#0a0a0a"
           stroke="#fff"
-          strokeWidth="1.2"
+          strokeWidth="2.1"
           strokeLinejoin="round"
+          paintOrder="stroke fill"
         />
       </svg>
       {/* Keyed on the step so each typing action replays the burst. The

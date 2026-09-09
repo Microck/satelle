@@ -318,58 +318,109 @@ export const filingStage: Stage = {
   prompt:
     'Open Motion_to_Compel_DRAFT.docx and follow Court_Style_Guide.txt. Preserve all wording. Format the document on US Letter with one-inch margins, Times New Roman 12 pt body text, double-spaced body paragraphs, centered bold uppercase section headings, a two-column case caption, the case-number header, and centered automatic page numbers. Keep signature blocks single-spaced. Start CERTIFICATE OF SERVICE on a new page. Save the result as submission/Motion_to_Compel_FINAL.docx. Do not overwrite the draft.',
   budget: { minutes: 18, steps: 140 },
+  // Pointer targets are fractions of the stage box, measured off the drawn page
+  // and the guide pane in a 1440 build. Two shifts matter: the page's text block
+  // narrows when the margins land at step 3, so every target inside it moves,
+  // and the one page becomes a two page spread at step 8, which re-centres the
+  // spread and slides page 1 left. Each `at` is measured in the layout that step
+  // commits to, not the layout it starts from.
   steps: [
     {
       event: 'turn_started',
       label: 'Turn admitted',
       message: 'Turn admitted on host win-11-lab, desktop session console',
+      // The draft's own title, left aligned and mixed case: the pointer rests on
+      // the document as opened, before any rule has been applied to it.
+      at: { x: 0.293, y: 0.197 },
     },
     {
       event: 'turn_progress',
       label: 'Read the style guide',
       message: 'opened Motion_to_Compel_DRAFT.docx and read Court_Style_Guide.txt',
+      // The pane header naming Court_Style_Guide.txt. The pane under it turns
+      // from "Not opened yet." into the rule table as this step commits.
+      at: { x: 0.803, y: 0.079 },
+      act: 'click',
     },
     {
       event: 'turn_progress',
       label: 'Copy the draft',
       message: 'saved a working copy as submission/Motion_to_Compel_FINAL.docx',
+      // Save As types the copy's name. The Editing strip at the foot of the page
+      // carries that name, but its start is under the floating Controller
+      // window, so the pointer takes the other drawn place the name appears:
+      // the guide's own Output rule, which ticks with this step.
+      at: { x: 0.818, y: 0.557 },
+      act: 'type',
     },
     {
       event: 'turn_progress',
       label: 'Page and margins',
       message: 'set US Letter with 1 inch margins on every side',
+      // The left rule of the margin guide, at half its height. The guide's own
+      // centre is the middle of the text block, which is not a margin, so the
+      // pointer takes the line it drags in.
+      at: { x: 0.274, y: 0.304 },
+      act: 'drag',
     },
     {
       event: 'turn_progress',
       label: 'Body type and spacing',
       message: 'applied Times New Roman 12 pt and double-spaced the body paragraphs',
+      // The three line paragraph under ARGUMENT, the longest body block and so
+      // the one whose leading visibly opens up when this step commits.
+      at: { x: 0.355, y: 0.287 },
+      act: 'click',
     },
     {
       event: 'turn_progress',
       label: 'Center the headings',
       message: 'centered MOTION TO COMPEL, ARGUMENT and CONCLUSION in bold uppercase',
+      // The centre line of the text block at the first heading, which is where
+      // MOTION TO COMPEL arrives. Before the step it sits to the left of this
+      // point, so the heading moves to meet the pointer.
+      at: { x: 0.355, y: 0.219 },
+      act: 'click',
     },
     {
       event: 'turn_progress',
       label: 'Split the caption',
       message: 'split the caption into two columns, parties left, court right',
+      // The middle of the caption block, which is exactly where the rule between
+      // the two columns lands, so the pointer ends on the split it pulled.
+      at: { x: 0.355, y: 0.144 },
+      act: 'drag',
     },
     {
       event: 'turn_progress',
       label: 'Header and page numbers',
       message: 'added the 25-CV-0421 header and centered automatic page numbers',
+      // The header strip in the top margin: the case number is the one string
+      // this step enters, so the pointer types it where it appears. The centred
+      // page number lands in the same action, at the foot of the same page.
+      at: { x: 0.421, y: 0.089 },
+      act: 'type',
     },
     {
       event: 'turn_progress',
       label: 'Signature and page break',
       message:
         'single-spaced the signature blocks and started CERTIFICATE OF SERVICE on page 2',
+      // The top of page 2, where the certificate heading arrives. While the
+      // pointer is travelling there is still one page, so this point sits in the
+      // empty sheet beside it: the page break opens the page under the click.
+      at: { x: 0.469, y: 0.123 },
+      act: 'click',
     },
     {
       event: 'turn_completed',
       label: 'Verify and save',
       message:
         'wording unchanged, saved submission/Motion_to_Compel_FINAL.docx, draft untouched',
+      // The "Wording: preserved" rule in the compliance list, which is the guide
+      // line this step's first claim answers. Nothing is typed or clicked here,
+      // so the pointer only reads down the list the Turn is being judged against.
+      at: { x: 0.788, y: 0.513 },
     },
   ],
   Render: Filing,

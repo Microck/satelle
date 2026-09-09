@@ -78,6 +78,12 @@
   overflow-y: auto;
   max-height: 12rem;
   min-height: 0;
+  /* Pinned to the end of the excerpt, with no script: a scroll box holding one
+     child in a column-reverse flow starts scrolled to the bottom. The Turn only
+     ever appends, so the block it just wrote is the block the reader sees, and
+     the pointer that typed it has somewhere visible to stand. */
+  display: flex;
+  flex-direction: column-reverse;
 }
 
 .gd-code {
@@ -88,9 +94,9 @@
   width: max-content;
   min-width: 100%;
   /* Denser than the 1.6 the page gives a terminal transcript. A code panel is
-     read as a block of structure rather than line by line, and the whole
-     twenty-one line excerpt has to fit beside the game window without the
-     lines the Turn just added falling below the fold. */
+     read as a block of structure rather than line by line, and the denser the
+     lines the more of the excerpt fits in the band the Controller window leaves
+     clear beside the game window. */
   line-height: 1.4;
   color: var(--sa-11);
   counter-reset: gd-line 10;
@@ -346,9 +352,12 @@
   }
 
   .gd-codewrap {
-    /* Side by side there is room for the whole excerpt, so the lines the Turn
-       just added are never below the fold. */
-    max-height: none;
+    /* Capped to the band the floating Controller window leaves clear. The
+       Controller sits over the bottom left of the Host, so an uncapped excerpt
+       put its last seven lines, and the pointer typing them, behind another
+       window. What the cap hides is settled code above, never the lines the
+       Turn just added: the box is pinned to the end of the excerpt. */
+    max-height: 15rem;
   }
 
   /* The game pane takes the height the code pane sets, so the play area fills
