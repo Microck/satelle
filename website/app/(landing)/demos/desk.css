@@ -305,14 +305,13 @@
     min-height: 44rem;
   }
 
-  .desk-stage {
-    /* A modest reserved band. The Controller is allowed to sit over the bottom
-       left corner of the drawn application, the way a second window on a real
-       desk does and the way the reference lets its terminal cover part of the
-       findings list. The Host window is tall enough that this costs a corner,
-       not the content. */
-    padding-block-end: var(--space-l);
-  }
+  /* No reserved band at the foot of the stage. There used to be one, and it
+     contradicted itself: the Controller is *allowed* to sit over the bottom left
+     corner of the drawn application, the way a second window on a real desk does
+     and the way the reference lets its terminal cover part of its findings list.
+     Reserving space as well left a 36px strip of empty window under the
+     application across its whole width, and the Controller overhangs the stage
+     by more than that regardless. */
 
   .desk-controller {
     grid-column: 1 / span 7;
