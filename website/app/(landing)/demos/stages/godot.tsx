@@ -138,7 +138,7 @@ function codeLines(gates: {
  * the one thing guaranteed to be there; it also moves down as the file grows,
  * which is exactly what a fixed coordinate could not follow.
  */
-type Target = 'play' | 'lastLine' | 'saved' | 'coin' | 'again' | null;
+type Target = 'play' | 'lastLine' | 'coin' | 'again' | null;
 
 function targetOf(next: number): Target {
   switch (next) {
@@ -149,10 +149,14 @@ function targetOf(next: number): Target {
     case 4:
     case 5:
       return 'lastLine'; // the script is being written at its end
+    // Both of these are about coins being cleared, so both point at the coin
+    // the message names. The file state chip was tried for the save step and
+    // sits at the very top of the pane, inside the control aura, where the
+    // pointer is half off the screen; the step's message is about the run and
+    // the first coin anyway.
     case 6:
-      return 'saved'; // the file state chip, which this step flips to saved
     case 7:
-      return 'coin'; // the last coin this step collects
+      return 'coin';
     case 8:
       return 'play'; // the win panel does not exist yet: mark what will hold it
     case 9:
@@ -198,10 +202,11 @@ function Project({ step, next, reduced }: StageProps) {
   const fileState = saved ? 'saved' : wired ? 'modified' : 'unchanged';
   const lines = codeLines({ wired, collects, gated, restarts });
   const target = targetOf(next);
-  // The coin this step takes: collection runs 1, 3, then 5, so the third is the
-  // last one step 7 clears. `COINS.slice(collected)` drops the ones already
-  // gone, so the index has to be taken in the original numbering.
-  const coinTarget = 2;
+  // Which coin the pointer is on. Collection runs 1, then 3, then 5, so the
+  // save step clears the first coin and the next step clears through the third.
+  // `COINS.slice(collected)` drops the ones already gone, so the index has to be
+  // read back in the original numbering.
+  const coinTarget = next === 6 ? 0 : 2;
 
   return (
     <div className="gd" data-reduced={reduced}>
@@ -224,11 +229,7 @@ function Project({ step, next, reduced }: StageProps) {
             </span>
           </span>
           <span className="sa-faint sa-mono">lines 11-{10 + lines.length}</span>
-          <span
-            className="gd-saved"
-            data-state={fileState}
-            data-cu-target={target === 'saved' || undefined}
-          >
+          <span className="gd-saved" data-state={fileState}>
             {fileState}
           </span>
         </div>
