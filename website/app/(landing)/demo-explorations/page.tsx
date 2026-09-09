@@ -8,7 +8,7 @@ import '../page.css';
 
 export const metadata: Metadata = {
   title: 'Demo explorations | Satelle',
-  description: 'Six interactive, release-grounded website demo concepts. Choose four to compare.',
+  description: 'Six different workflows: spreadsheet, chat, editor, browser, document, and CLI. Choose four.',
   robots: { index: false, follow: false },
 };
 
@@ -26,12 +26,12 @@ export default function DemoExplorationsPage() {
       <main id="main" className="sx-review-main">
         <header className="sx-review-intro">
           <p className="sx-eyebrow">Website explorations / {RELEASE}</p>
-          <h1>Six demos. Pick your four.</h1>
-          <p>Try the controls, compare the concepts, and preview your preferred set. These are illustrative website demos, not a connection to a live Host.</p>
+          <h1>Different work. Different windows.</h1>
+          <p>A spreadsheet, a conversation, your editor, a browser, a document, and one terminal. Try the examples and choose four for the homepage.</p>
         </header>
         <DemoGallery explore />
         <footer className="sx-review-footer">
-          <p>The homepage uses 01–04. Your selection changes this preview only.</p>
+          <p>The homepage uses 01–04. This picker changes the preview only, not the published page.</p>
           <ThemeToggle />
         </footer>
       </main>
