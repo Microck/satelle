@@ -208,7 +208,41 @@ const FAB_FILES = [
   'status_light-PTH.drl',
 ];
 
-function Board({ step }: StageProps) {
+/**
+ * The element the pointer aims at while it travels to step `next`.
+ *
+ * Most of this stage keeps its coordinates on purpose. The board is a fixed SVG
+ * viewBox, so a point on it is a genuine point: routing to a pad, dropping a
+ * via, filling a zone. Marking an element there would be less accurate, not
+ * more.
+ *
+ * The side panel is the part that reflows, since the DRC counters, the
+ * Requirements list and the fabrication file list replace one another in the
+ * same slot. Those steps are the ones worth marking.
+ */
+type Target = 'panel' | 'drc' | 'slot' | null;
+
+function targetOf(next: number): Target {
+  switch (next) {
+    // The brief is read from a file, not from the screen. What this step puts on
+    // screen is the Requirements list, which is not there yet, so the pointer
+    // goes to the panel that will hold it.
+    case 1:
+      return 'panel';
+    case 7:
+      return 'drc';
+    // Both output steps write into the same panel slot, which the Requirements
+    // list occupies until the fabrication list replaces it.
+    case 8:
+    case 9:
+      return 'slot';
+    // Everything else is a point on the board: see the note above.
+    default:
+      return null;
+  }
+}
+
+function Board({ step, next }: StageProps) {
   // Step gates. Each one is the state *after* that action commits, so the whole
   // interior is a pure function of one number and a test can jump anywhere.
   const briefRead = step >= 1;
@@ -369,10 +403,10 @@ function Board({ step }: StageProps) {
           </div>
         </div>
 
-        <div className="kc-side">
+        <div className="kc-side" data-cu-target={targetOf(next) === 'panel' || undefined}>
           <section className="kc-block">
             <span className="sa-label">DRC</span>
-            <table className="kc-table">
+            <table className="kc-table" data-cu-target={targetOf(next) === 'drc' || undefined}>
               <caption className="sa-sr">Design rule check counters</caption>
               <tbody>
                 <tr>
@@ -430,7 +464,7 @@ function Board({ step }: StageProps) {
           {briefRead && !exported ? (
             <section className="kc-block">
               <span className="sa-label">Requirements</span>
-              <ul className="kc-reqs">
+              <ul className="kc-reqs" data-cu-target={targetOf(next) === 'slot' || undefined}>
                 <Requirement done={netsChecked}>Keep six footprints and net names</Requirement>
                 <Requirement done={ground}>0.40 mm tracks, copper inside Edge.Cuts</Requirement>
                 <Requirement done={zoned}>Filled GND zone on B.Cu</Requirement>

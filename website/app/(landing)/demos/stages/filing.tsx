@@ -40,6 +40,11 @@ type Fmt = {
  */
 type Rule = { rule: string; at: number };
 
+// The two rules the pointer aims at, named because they are read in two places:
+// once to draw the row and once to mark it as a target.
+const OUTPUT_RULE = 'Output: Motion_to_Compel_FINAL.docx';
+const WORDING_RULE = 'Wording: preserved';
+
 const RULES: readonly Rule[] = [
   { rule: 'Paper: US Letter', at: 3 },
   { rule: 'Margins: 1 in all sides', at: 3 },
@@ -51,8 +56,8 @@ const RULES: readonly Rule[] = [
   { rule: 'Footer: centered page number', at: 7 },
   { rule: 'Signature blocks: single-spaced', at: 8 },
   { rule: 'CERTIFICATE OF SERVICE: new page', at: 8 },
-  { rule: 'Wording: preserved', at: 9 },
-  { rule: 'Output: Motion_to_Compel_FINAL.docx', at: 2 },
+  { rule: WORDING_RULE, at: 9 },
+  { rule: OUTPUT_RULE, at: 2 },
   { rule: 'Draft: not overwritten', at: 9 },
 ];
 
@@ -73,10 +78,75 @@ const CERT_SIGNATURE = ['/s/ A. Reyes', 'Counsel for Plaintiff'];
 const DRAFT = 'Motion_to_Compel_DRAFT.docx';
 const FINAL = 'submission/Motion_to_Compel_FINAL.docx';
 
+/**
+ * The one drawn part of the interior the pointer is aiming at. The pointer
+ * measures the marked element live, against the render it is crossing, which is
+ * the state *before* the step it is travelling to commits. So every entry names
+ * something that exists in that earlier layout: the heading before it is
+ * centred, the caption before it splits, the body block before it is respaced.
+ */
+type Target =
+  | 'heading'
+  | 'guide'
+  | 'outputRule'
+  | 'page'
+  | 'argumentBody'
+  | 'caption'
+  | 'runhead'
+  | 'signature'
+  | 'wordingRule';
+
+/** What each step of the Turn acts on, indexed by step. */
+const TARGETS: readonly Target[] = [
+  // 0 Turn admitted. Nothing has been formatted yet, so the pointer rests on
+  // the document as opened, at its own title.
+  'heading',
+  // 1 Read the style guide. The rule table does not exist yet; the pane head
+  // does, and it carries the filename the event line reads out.
+  'guide',
+  // 2 Copy the draft. The Editing strip at the foot carries the new path, but
+  // it runs under the Controller window, so the pointer takes the other drawn
+  // place the name appears: the guide's own Output rule, which ticks here.
+  'outputRule',
+  // 3 Page and margins. The margin guide is not drawn until the step lands, so
+  // what there is to aim at is the sheet whose setup changes.
+  'page',
+  // 4 Body type and spacing. The three line block under Argument, the longest
+  // body paragraph and so the one whose leading visibly opens.
+  'argumentBody',
+  // 5 Center the headings. A heading is a full width block, so its box centre
+  // is the centre line of the text block: the pointer lands on the line
+  // MOTION TO COMPEL moves to, and the heading arrives under it.
+  'heading',
+  // 6 Split the caption. The caption block, one column while the pointer
+  // crosses it and two once it lands.
+  'caption',
+  // 7 Header and page numbers. The header slot in the top margin, which the
+  // page draws empty until the case number lands in it. The centred page
+  // number lands in the same action, but the foot of the sheet is behind the
+  // Controller window.
+  'runhead',
+  // 8 Signature and page break. The signature block this step tightens, which
+  // is what the event line names first. Page 2 does not exist yet, and the
+  // certificate that moves onto it sits lower down the sheet, close to the
+  // Controller window.
+  'signature',
+  // 9 Verify and save. The Wording rule, the guide line this step's first
+  // claim answers.
+  'wordingRule',
+];
+
 // `reduced` is deliberately unread: every transition in this stage is CSS, and
 // the shared reduced-motion rule in landing.css collapses all of them, so the
 // interior needs no JavaScript branch to honour the preference.
-function Filing({ step }: StageProps) {
+function Filing({ step, next }: StageProps) {
+  // What the pointer is on its way to. Exactly one drawn element carries
+  // `data-cu-target`, so `|| undefined` is used rather than `false`: the
+  // attribute has to be absent, not present and empty.
+  const target = TARGETS[next];
+  const markedRule =
+    target === 'outputRule' ? OUTPUT_RULE : target === 'wordingRule' ? WORDING_RULE : null;
+
   // Step gates. Each one is the state *after* that action commits, so the whole
   // interior is a pure function of one number and stays drivable by a click, a
   // key, or a test.
@@ -139,15 +209,21 @@ function Filing({ step }: StageProps) {
             wording. The style guide table carries the same state as text.
           </figcaption>
           <div className="fl-sheet">
-            <Page number={1} fmt={fmt} label={pageOneLabel}>
-              <Caption fmt={fmt} />
-              <Heading text="Motion to Compel" fmt={fmt} />
+            {/* Only page 1 takes the target: every step that aims at the page
+                runs while page 2 is still unwritten. */}
+            <Page number={1} fmt={fmt} label={pageOneLabel} mark={target}>
+              <Caption fmt={fmt} marked={target === 'caption'} />
+              <Heading text="Motion to Compel" fmt={fmt} marked={target === 'heading'} />
               <Body lines={2} lead={fmt.body} />
               <Heading text="Argument" fmt={fmt} />
-              <Body lines={3} lead={fmt.body} />
+              <Body lines={3} lead={fmt.body} marked={target === 'argumentBody'} />
               <Heading text="Conclusion" fmt={fmt} />
               <Body lines={2} lead={fmt.body} />
-              <Signature lines={SIGNATURE} lead={fmt.signature} />
+              <Signature
+                lines={SIGNATURE}
+                lead={fmt.signature}
+                marked={target === 'signature'}
+              />
               {/* Before the break the certificate runs straight on from the
                   signature block, which is the fault the last rule fixes. */}
               {certificateSplit ? null : <Certificate fmt={fmt} />}
@@ -167,7 +243,9 @@ function Filing({ step }: StageProps) {
 
         <div className="fl-rules">
           <div className="fl-rules-head">
-            <span className="sa-label">Court_Style_Guide.txt</span>
+            <span className="sa-label" data-cu-target={target === 'guide' || undefined}>
+              Court_Style_Guide.txt
+            </span>
             {guideRead ? (
               <span className="fl-count sa-mono">
                 {applied} of {RULES.length} applied
@@ -190,7 +268,11 @@ function Filing({ step }: StageProps) {
                 {RULES.map((rule) => {
                   const done = step >= rule.at;
                   return (
-                    <tr key={rule.rule} data-done={done}>
+                    <tr
+                      key={rule.rule}
+                      data-done={done}
+                      data-cu-target={rule.rule === markedRule || undefined}
+                    >
                       <th scope="row">{rule.rule}</th>
                       <td className="fl-state">
                         <span className="sa-sr">{done ? 'applied' : 'pending'}</span>
@@ -230,17 +312,33 @@ function Page({
   number,
   fmt,
   label,
+  mark,
   children,
 }: {
   number: number;
   fmt: Fmt;
   label: string;
+  /** Which part of this page, if any, the pointer is aiming at. */
+  mark?: Target;
   children: ReactNode;
 }) {
   return (
-    <div className="fl-page" data-margins={fmt.margins} role="img" aria-label={label}>
+    <div
+      className="fl-page"
+      data-margins={fmt.margins}
+      data-cu-target={mark === 'page' || undefined}
+      role="img"
+      aria-label={label}
+    >
       {fmt.margins ? <span className="fl-guide" /> : null}
-      {fmt.runningHead ? <span className="fl-runhead">25-CV-0421</span> : null}
+      {/* The header strip is page furniture rather than wording, so the slot is
+          always drawn and step 7 fills it. Empty it paints nothing, and it is
+          what that step has to aim at: the case number is not on the page yet,
+          and marking the sheet instead would put the pointer in the middle of
+          it, half a page below the header the event line names. */}
+      <span className="fl-runhead" data-cu-target={mark === 'runhead' || undefined}>
+        {fmt.runningHead ? '25-CV-0421' : null}
+      </span>
       <div className="fl-content">{children}</div>
       {fmt.runningHead ? <span className="fl-folio">{number}</span> : null}
     </div>
@@ -248,9 +346,13 @@ function Page({
 }
 
 /** The case caption. One column in the draft, two once step 6 commits. */
-function Caption({ fmt }: { fmt: Fmt }) {
+function Caption({ fmt, marked }: { fmt: Fmt; marked?: boolean }) {
   return (
-    <div className="fl-caption" data-columns={fmt.twoColumn ? 2 : 1}>
+    <div
+      className="fl-caption"
+      data-columns={fmt.twoColumn ? 2 : 1}
+      data-cu-target={marked || undefined}
+    >
       <div className="fl-caption-col">
         {CAPTION_PARTIES.map((line) => (
           <span key={line}>{line}</span>
@@ -270,18 +372,22 @@ function Caption({ fmt }: { fmt: Fmt }) {
  * uppercase is a formatting rule, so it is applied with text-transform rather
  * than by rewriting the string, because no wording may change.
  */
-function Heading({ text, fmt }: { text: string; fmt: Fmt }) {
+function Heading({ text, fmt, marked }: { text: string; fmt: Fmt; marked?: boolean }) {
   return (
-    <p className="fl-heading" data-formatted={fmt.headings}>
+    <p
+      className="fl-heading"
+      data-formatted={fmt.headings}
+      data-cu-target={marked || undefined}
+    >
       {text}
     </p>
   );
 }
 
 /** A body paragraph, drawn as ruled lines so the leading is what shows. */
-function Body({ lines, lead }: { lines: number; lead: Lead }) {
+function Body({ lines, lead, marked }: { lines: number; lead: Lead; marked?: boolean }) {
   return (
-    <div className="fl-para" data-lead={lead}>
+    <div className="fl-para" data-lead={lead} data-cu-target={marked || undefined}>
       {Array.from({ length: lines }, (_, index) => (
         <span key={index} className="fl-line" data-last={index === lines - 1} />
       ))}
@@ -289,9 +395,17 @@ function Body({ lines, lead }: { lines: number; lead: Lead }) {
   );
 }
 
-function Signature({ lines, lead }: { lines: readonly string[]; lead: Lead }) {
+function Signature({
+  lines,
+  lead,
+  marked,
+}: {
+  lines: readonly string[];
+  lead: Lead;
+  marked?: boolean;
+}) {
   return (
-    <div className="fl-sig" data-lead={lead}>
+    <div className="fl-sig" data-lead={lead} data-cu-target={marked || undefined}>
       {lines.map((line) => (
         <span key={line}>{line}</span>
       ))}
@@ -318,12 +432,14 @@ export const filingStage: Stage = {
   prompt:
     'Open Motion_to_Compel_DRAFT.docx and follow Court_Style_Guide.txt. Preserve all wording. Format the document on US Letter with one-inch margins, Times New Roman 12 pt body text, double-spaced body paragraphs, centered bold uppercase section headings, a two-column case caption, the case-number header, and centered automatic page numbers. Keep signature blocks single-spaced. Start CERTIFICATE OF SERVICE on a new page. Save the result as submission/Motion_to_Compel_FINAL.docx. Do not overwrite the draft.',
   budget: { minutes: 18, steps: 140 },
-  // Pointer targets are fractions of the stage box, measured off the drawn page
-  // and the guide pane in a 1440 build. Two shifts matter: the page's text block
-  // narrows when the margins land at step 3, so every target inside it moves,
-  // and the one page becomes a two page spread at step 8, which re-centres the
-  // spread and slides page 1 left. Each `at` is measured in the layout that step
-  // commits to, not the layout it starts from.
+  // Every `at` below is the fallback, for the server render and for a reader
+  // without JavaScript, where nothing can be measured. They are fractions of
+  // the stage box, measured off the drawn page and the guide pane in a 1440
+  // build, so they hold only at that width and only in the layout each was
+  // measured in. What the pointer actually uses is the element `TARGETS` marks,
+  // measured live: that is the only thing that can follow a target through the
+  // two shifts this stage makes, the text block narrowing at step 3 and the one
+  // page becoming a spread at step 8.
   steps: [
     {
       event: 'turn_started',
@@ -357,9 +473,9 @@ export const filingStage: Stage = {
       event: 'turn_progress',
       label: 'Page and margins',
       message: 'set US Letter with 1 inch margins on every side',
-      // The left rule of the margin guide, at half its height. The guide's own
-      // centre is the middle of the text block, which is not a margin, so the
-      // pointer takes the line it drags in.
+      // Fallback: the left rule of the margin guide, at half its height, which
+      // is the line the drag pulls in. The live target is the sheet itself,
+      // because the guide is not drawn until the step lands.
       at: { x: 0.274, y: 0.304 },
       act: 'drag',
     },
@@ -406,9 +522,10 @@ export const filingStage: Stage = {
       label: 'Signature and page break',
       message:
         'single-spaced the signature blocks and started CERTIFICATE OF SERVICE on page 2',
-      // The top of page 2, where the certificate heading arrives. While the
-      // pointer is travelling there is still one page, so this point sits in the
-      // empty sheet beside it: the page break opens the page under the click.
+      // Fallback: the top of page 2, where the certificate heading arrives.
+      // While the pointer is travelling there is still one page, so the point
+      // sits in empty sheet beside it, which is why the live target is the
+      // signature block this step tightens instead.
       at: { x: 0.469, y: 0.123 },
       act: 'click',
     },

@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { useReducedMotion } from './motion';
-import { ControlCursor, ControlRing, moveDurationMs } from './control';
+import { ControlCursor, ControlRing } from './control';
 import { useMovable, useViewportAtLeast } from './movable';
 import type { Stage, StageId } from './stage';
 import { excelStage } from './stages/excel';
@@ -26,8 +26,8 @@ const STAGES: Stage[] = [excelStage, kicadStage, godotStage, filingStage];
  * its next move while the last one was still being written. Sized to the
  * longest retype on the page.
  */
-const DWELL_MS = 420;
-const TYPE_DWELL_MS = 1100;
+const DWELL_MS = 360;
+const TYPE_DWELL_MS = 850;
 
 /**
  * True once the element has been on screen, and true forever after. A hero that
@@ -174,16 +174,11 @@ export default function DeskDemo() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [committed, state.stage]);
 
-  // Let the pointer get there, then land the action. One pending timeout at a
-  // time, cleared on every change, so the run cannot double up.
-  useEffect(() => {
-    if (reduced || !started || state.phase !== 'travel') return;
-    const id = window.setTimeout(
-      () => dispatch({ type: 'arrive' }),
-      moveDurationMs(stage.steps, state.step),
-    );
-    return () => window.clearTimeout(id);
-  }, [reduced, started, state.phase, state.step, stage.steps]);
+  // The action lands when the pointer gets there, and the pointer is the only
+  // thing that knows how far it had to go: it measures its own target, so
+  // asking the demo to compute the same duration independently only gave the
+  // two a chance to disagree. `ControlCursor` calls this when it arrives.
+  const handleArrive = useCallback(() => dispatch({ type: 'arrive' }), []);
 
   // Leave the committed action on screen, then set off for the next one.
   useEffect(() => {
@@ -236,7 +231,7 @@ export default function DeskDemo() {
                 blink rather than to change. Letting React diff the interior
                 means only the cells that changed change. */}
             <div key={state.stage} className="desk-stage-in">
-              <stage.Render step={committed} reduced={reduced} />
+              <stage.Render step={committed} next={state.step} reduced={reduced} />
             </div>
             {/* Control is held for as long as the Turn is not terminal, which is
                 exactly when the Host is driving the desktop. */}
@@ -245,6 +240,7 @@ export default function DeskDemo() {
               step={state.step}
               steps={stage.steps}
               acting={state.phase === 'acted'}
+              onArrive={started && !reduced ? handleArrive : undefined}
             />
           </div>
         </section>

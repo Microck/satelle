@@ -129,7 +129,40 @@ function codeLines(gates: {
   return lines;
 }
 
-function Project({ step, reduced }: StageProps) {
+/**
+ * The element the pointer aims at while it travels to step `next`.
+ *
+ * The render being crossed is the project *after* step `next - 1`, so a key may
+ * only name something that exists then. The four edit steps all resolve to the
+ * script's last line, which is the insertion point the new code appears at and
+ * the one thing guaranteed to be there; it also moves down as the file grows,
+ * which is exactly what a fixed coordinate could not follow.
+ */
+type Target = 'play' | 'lastLine' | 'saved' | 'coin' | 'again' | null;
+
+function targetOf(next: number): Target {
+  switch (next) {
+    case 1:
+      return 'play'; // the starter run happens in the viewport
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+      return 'lastLine'; // the script is being written at its end
+    case 6:
+      return 'saved'; // the file state chip, which this step flips to saved
+    case 7:
+      return 'coin'; // the last coin this step collects
+    case 8:
+      return 'play'; // the win panel does not exist yet: mark what will hold it
+    case 9:
+      return 'again'; // PLAY AGAIN, which by now is on screen
+    default:
+      return null;
+  }
+}
+
+function Project({ step, next, reduced }: StageProps) {
   // Step gates. Each one is the state *after* that action commits, so the whole
   // interior stays a pure function of one number.
   const ranStarter = step >= 1;
@@ -164,6 +197,11 @@ function Project({ step, reduced }: StageProps) {
   const playing = (ranStarter && !wired) || saved;
   const fileState = saved ? 'saved' : wired ? 'modified' : 'unchanged';
   const lines = codeLines({ wired, collects, gated, restarts });
+  const target = targetOf(next);
+  // The coin this step takes: collection runs 1, 3, then 5, so the third is the
+  // last one step 7 clears. `COINS.slice(collected)` drops the ones already
+  // gone, so the index has to be taken in the original numbering.
+  const coinTarget = 2;
 
   return (
     <div className="gd" data-reduced={reduced}>
@@ -186,7 +224,11 @@ function Project({ step, reduced }: StageProps) {
             </span>
           </span>
           <span className="sa-faint sa-mono">lines 11-{10 + lines.length}</span>
-          <span className="gd-saved" data-state={fileState}>
+          <span
+            className="gd-saved"
+            data-state={fileState}
+            data-cu-target={target === 'saved' || undefined}
+          >
             {fileState}
           </span>
         </div>
@@ -201,6 +243,9 @@ function Project({ step, reduced }: StageProps) {
                   key={`${index}-${line.text}`}
                   className="gd-line"
                   data-kind={line.kind}
+                  data-cu-target={
+                    (target === 'lastLine' && index === lines.length - 1) || undefined
+                  }
                 >
                   {/* A line the Turn has just written is written out, not
                       pasted in. Only `add` lines do this: they mount when the
@@ -241,6 +286,7 @@ function Project({ step, reduced }: StageProps) {
         <div className="gd-playwrap">
           <svg
             className="gd-play"
+            data-cu-target={target === 'play' || undefined}
             viewBox="0 0 160 100"
             role="img"
             aria-label={`Play area diagram: ${5 - collected} of five coins left, HUD reads COINS: ${collected} of 5${
@@ -259,7 +305,7 @@ function Project({ step, reduced }: StageProps) {
               />
             ))}
 
-            {COINS.slice(collected).map((coin) => (
+            {COINS.slice(collected).map((coin, index) => (
               <circle
                 key={coin.name}
                 className="gd-coin"
@@ -267,6 +313,9 @@ function Project({ step, reduced }: StageProps) {
                 cy={coin.y}
                 r="4"
                 data-missed={ranStarter && !saved && coin.name === MISSED_COIN}
+                data-cu-target={
+                  (target === 'coin' && index + collected === coinTarget) || undefined
+                }
               />
             ))}
 
@@ -291,7 +340,12 @@ function Project({ step, reduced }: StageProps) {
               <span className="gd-win-title">SECTOR CLEARED</span>
               {/* Disabled on purpose: a live button here would imply this page
                   runs the project. The Host runs it, not the page. */}
-              <button type="button" className="gd-win-btn" disabled>
+              <button
+                type="button"
+                className="gd-win-btn"
+                disabled
+                data-cu-target={target === 'again' || undefined}
+              >
                 PLAY AGAIN
               </button>
               <span className="sa-sr">

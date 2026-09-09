@@ -522,6 +522,44 @@ to be read as Satelle's, so the accent is on the arrow itself. The white outline
 is what makes that work: crimson alone disappeared into the lighter application
 interiors, which is why the faithful version was tried first.
 
+**The pointer aims at an element, not at a coordinate.** A stage marks the one
+element that the upcoming step is about to act on with `data-cu-target`, and the
+pointer measures it live, in a layout effect, against the stage box.
+
+Fixed coordinates were the first design and they were wrong in a way that took a
+report to see. They were measured against the layout *after* each step commits,
+but the pointer travels while the interior still shows the previous step. So the
+pointer spent every travel flying toward a spot that was meaningless in the
+layout it was crossing, and the click fired exactly as the layout changed
+underneath it. In Writer, where every step reflows the page, the pointer would
+travel over the rules table and land on a paragraph. It read as clicking at
+random, which is what it was.
+
+The stage is the only thing that knows which element an action belongs to, and it
+already has the step logic to decide, so the mapping lives there. The rule for
+choosing is that the marked element must exist in the *current* render, since
+that is the layout being travelled through; for an action that creates something,
+the stage marks whatever will hold it.
+
+The measurement runs on the step alone, deliberately. The action commits when the
+pointer lands, which re-renders the interior and can move the very element that
+was targeted. Re-measuring then would drag the pointer along after its own click,
+when what really happens is that the content moves and the pointer stays where it
+was.
+
+`at` survives as the fallback: for the server render, where nothing can be
+measured, and for a target that is a true point rather than an element. Thirty of
+the page's thirty-five travelling steps mark an element. The five that do not are
+the PCB's routing, via and zone-fill steps, where the board is a fixed SVG
+viewBox and a point on it is a genuine point: marking an element there would be
+less accurate, not more. The QA battery caps how many steps may sit on
+coordinates, so the check cannot pass by having nothing left to assert.
+
+The pointer also announces its own arrival. It is the only thing that knows how
+far it had to go, so having the demo compute the same duration independently only
+gave the two numbers a chance to disagree, and a disagreement there means the
+application changes before the pointer that supposedly caused it gets there.
+
 Every `StageStep` may name `at: { x, y }` as fractions of the stage box and an
 `act`:
 
@@ -538,7 +576,8 @@ shake, theirs being 12.5 degrees on a 660ms period over 1410ms, compressed here
 to finish inside the demo's dwell so a settled demo has nothing running.
 
 A click is also drawn, as two rings contracting onto the point over 480ms with a
-held peak. Neither shipped implementation draws one: 21.5MB of extension
+held peak, painted *under* the arrow: a click mark drawn over the pointer that
+made it looks like the mark is the thing being pointed at. Neither shipped implementation draws one: 21.5MB of extension
 contains no `ripple`, no `keyframes`, and no per-click marker, and they carry the
 press in their motion springs alone. That works at 60fps in a live session and
 does not work in a stepped demo, where a click step landed with nothing at all
@@ -566,8 +605,11 @@ Movement is a `transition` on `left` and `top`, not a keyframe, because a move
 has to start wherever the last action left the pointer, which a keyframe cannot
 know, and not `translate`, because the target is a percentage of the stage box
 and a percentage in `translate` resolves against the element's own size. The
-duration is paced by distance, 170ms to 700ms: a pointer that takes as long to
-cross the screen as to nudge 20px reads as teleporting. The curve is local to
+duration is paced by distance, 170ms to 520ms: a pointer that takes as long to
+cross the screen as to nudge 20px reads as teleporting. The ceiling is set by the
+whole Turn's length rather than by how one move feels. Measuring targets live
+made the real distances longer than the coordinates had implied and pushed a
+nine-action Turn to 12.6s, which is past the point where anyone waits for it. The curve is local to
 the cursor, since the page's own easing is an ease-out that made it leave the
 mark at full speed rather than accelerate out of rest.
 
