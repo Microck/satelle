@@ -8,7 +8,7 @@ import '../page.css';
 
 export const metadata: Metadata = {
   title: 'Animated workflows | Satelle',
-  description: 'Checkout QA, a simple ChatGPT concept, Claude Code file delivery, and a Slack profile update.',
+  description: 'Responsive browser QA, a ChatGPT task through completion, Claude Code file delivery, and a Slack profile update.',
   robots: { index: false, follow: false },
 };
 export default function DemoExplorationsPage() {
