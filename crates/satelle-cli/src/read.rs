@@ -22,6 +22,10 @@ pub(super) fn config_check_report(
     config_context: ConfigContext<'_>,
 ) -> Result<Value, CliFailure> {
     let config = config_context.load()?;
+    let evaluated_at = time::OffsetDateTime::now_utc();
+    config
+        .check_trusted_profile_expiration(all, evaluated_at)
+        .map_err(failure)?;
     let contexts = config
         .config_check_contexts(host.as_deref(), all)
         .map_err(failure)?;
@@ -41,6 +45,7 @@ pub(super) fn config_check_report(
                 },
             );
             let resolved = context_config.load()?;
+            resolved.check_trusted_profile_expiration(false, evaluated_at).map_err(failure)?;
             let provider_host = resolved
                 .resolve_host(Some(&context.host))
                 .map(super::SelectedHost::from)
@@ -79,7 +84,7 @@ pub(super) fn config_check_report(
         "mode": if all { "all" } else { "selected" },
         "selected_host": selected.host,
         "selected_profile": selected.profile,
-        "checked_files": [config.user_config_path, config.project_config_path],
+        "checked_files": config.checked_files(),
         "checks": LOCAL_CONFIG_CHECKS,
         "checked_contexts": checked_contexts,
         "errors": [],
@@ -93,6 +98,8 @@ const LOCAL_CONFIG_CHECKS: &[&str] = &[
     "typed_schema",
     "unknown_keys",
     "unsupported_composition",
+    "config_includes",
+    "trusted_profile_expiration",
     "interpolation_syntax",
     "duration_units",
     "path_overrides",
@@ -105,13 +112,16 @@ const LOCAL_CONFIG_CHECKS: &[&str] = &[
 const REMOTE_CONFIG_CHECKS: &[&str] = &["remote_host", "provider_auth", "native_computer_use"];
 
 fn noninteractive_mutation_consent_json(config: &ResolvedConfig, host: &str) -> Value {
+    let evaluated_at = time::OffsetDateTime::now_utc();
     let trusted_profile = config
         .trusted_profile_reference()
         .and_then(|reference| config.config.trusted_profiles.get(reference))
         .filter(|trusted| trusted.hosts.contains(host));
     let family = |command_family| {
-        let active = trusted_profile
-            .is_some_and(|trusted| trusted.command_families.contains(&command_family));
+        let active = trusted_profile.is_some_and(|trusted| {
+            !trusted.is_expired_at(evaluated_at)
+                && trusted.command_families.contains(&command_family)
+        });
         json!({
             "active": active,
             "source": if active {
@@ -123,6 +133,15 @@ fn noninteractive_mutation_consent_json(config: &ResolvedConfig, host: &str) -> 
     };
 
     json!({
+        "trusted_profile": config.selected_trusted_profile_reference().map(|reference| {
+            let trusted = &config.config.trusted_profiles[reference];
+            json!({
+                "name": reference,
+                "expiration_state": trusted.expiration_state_at(evaluated_at),
+                "expires_at": trusted.expires_at.and_then(|expiry| expiry.format(&time::format_description::well_known::Rfc3339).ok()),
+                "source": config.sources.value_at(&["trusted_profiles", reference, "expires_at"]),
+            })
+        }),
         // Config explain has no mutating command flag. Report that source
         // explicitly so consumers do not mistake Trusted Profile consent for
         // a command-scoped --yes decision.
@@ -179,11 +198,13 @@ pub(super) fn config_explain_report(
         "status": "ok",
         "selected_host": selected_host,
         "selected_profile": selected_profile,
-        "checked_files": [config.user_config_path, config.project_config_path],
+        "checked_files": config.checked_files(),
         "sources": {
             "defaults": true,
             "user_config": config.user_config_path,
             "project_config": config.project_config_path,
+            "files": config.sources.files,
+            "values": config.effective_value_sources(&selected_host),
             "profile": selected_profile_source,
             "project_intent": {
                 "host": host_from_project,

@@ -50,6 +50,10 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::TrustedProfileCommandAllowlistRequired
         | ErrorCode::UnsupportedTrustedProfileCommandScope
         | ErrorCode::UnsupportedConfigComposition
+        | ErrorCode::ConfigIncludeInvalid
+        | ErrorCode::ConfigIncludeOutsideSource
+        | ErrorCode::ConfigIncludeCycle
+        | ErrorCode::TrustedProfileExpired
         | ErrorCode::ProjectDaemonPathOverrideNotAllowed
         | ErrorCode::ProjectDesktopBindingNotAllowed
         | ErrorCode::ProjectYoloEnableNotAllowed

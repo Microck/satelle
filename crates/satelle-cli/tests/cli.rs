@@ -6654,14 +6654,14 @@ fn project_config_discovery_walks_up_to_nearest_satelle_config() {
 }
 
 #[test]
-fn config_composition_and_unknown_keys_are_rejected() {
+fn unsupported_config_composition_and_unknown_keys_are_rejected() {
     let state = state_dir();
     let project = state.path().join("project");
     fs::create_dir_all(project.join(".satelle")).expect("project config dir should be created");
     fs::write(
         project.join(".satelle").join("config.toml"),
         r#"
-include = ["other.toml"]
+imports = ["other.toml"]
 "#,
     )
     .expect("project config should be written");

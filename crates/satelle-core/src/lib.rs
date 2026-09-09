@@ -11,6 +11,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 mod authority;
+#[path = "config-includes.rs"]
+mod config_includes;
 #[path = "control-plane.rs"]
 pub mod control_plane;
 #[path = "daemon-service.rs"]
@@ -40,6 +42,9 @@ pub use authority::{
     PhaseOneContractFreeze, PhaseOneSubject, PlatformSupport, PrincipalRef,
     ProductAuthorityBoundary, ProductDifferentiator, PublicPayloadGuard, SatelleHost,
     SessionMappingAuthority, SessionWorkflow, TurnCardinalityAuthority, UpstreamRuntimeBoundary,
+};
+pub use config_includes::{
+    ConfigFileSource, ConfigSourceKind, ConfigSources, ConfigValueSource, config_toml_key,
 };
 pub use control_plane::{
     ControlPlaneCapability, ControlPlaneCapabilitySet, ControlPlaneFailureReason,
@@ -273,6 +278,27 @@ fn default_websocket_inbound_messages_per_minute() -> NonZeroUsize {
 pub struct TrustedProfile {
     pub hosts: BTreeSet<String>,
     pub command_families: BTreeSet<MutationCommandFamily>,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_at: Option<OffsetDateTime>,
+}
+
+impl TrustedProfile {
+    pub fn is_expired_at(&self, evaluated_at: OffsetDateTime) -> bool {
+        self.expires_at
+            .is_some_and(|expires_at| expires_at <= evaluated_at)
+    }
+
+    pub fn expiration_state_at(&self, evaluated_at: OffsetDateTime) -> &'static str {
+        match self.expires_at {
+            None => "absent",
+            Some(expires_at) if expires_at <= evaluated_at => "expired",
+            Some(_) => "active",
+        }
+    }
 }
 
 /// The complete MVP vocabulary that a Trusted Profile can authorize.
@@ -1888,6 +1914,8 @@ pub struct ResolvedConfig {
     pub user_config_path: PathBuf,
     pub project_config_path: PathBuf,
     pub selected_profile: Option<SelectedProfile>,
+    #[serde(default)]
+    pub sources: ConfigSources,
     // The overlay follows the eventual host selection. Keeping it intact avoids mutating every
     // configured host before SATELLE_HOST or --host chooses one.
     #[serde(skip)]
@@ -1936,8 +1964,14 @@ impl ResolvedConfig {
             profiles::ProfileSelectionSource::UserConfig
                 | profiles::ProfileSelectionSource::CliFlag
         )
-        .then(|| self.profile_overlay.as_ref()?.trusted_profile_reference())
+        .then(|| self.selected_trusted_profile_reference())
         .flatten()
+    }
+
+    /// Inspection may report a selected grant even when the profile's selection
+    /// source cannot activate its consent.
+    pub fn selected_trusted_profile_reference(&self) -> Option<&str> {
+        self.profile_overlay.as_ref()?.trusted_profile_reference()
     }
 
     pub fn timeout_intent_from_project(&self, alias: &str) -> bool {
@@ -1946,6 +1980,109 @@ impl ResolvedConfig {
 
     pub fn transport_intent_from_project(&self, alias: &str) -> bool {
         self.project_transport_intents.contains(alias)
+    }
+
+    pub fn checked_files(&self) -> Vec<&Path> {
+        let mut files = vec![
+            self.user_config_path.as_path(),
+            self.project_config_path.as_path(),
+        ];
+        for source in &self.sources.files {
+            if source.parent.is_some() && !files.contains(&source.path.as_path()) {
+                files.push(source.path.as_path());
+            }
+        }
+        files
+    }
+
+    /// Host Bindings replace complete user-owned objects, and their required
+    /// adapter field cannot come from project configuration or a profile.
+    pub fn host_binding_config_file(&self, alias: &str) -> &Path {
+        self.sources
+            .value_at(&["hosts", alias, "adapter"])
+            .map_or(self.user_config_path.as_path(), |source| {
+                source.config_file.as_path()
+            })
+    }
+
+    pub fn check_trusted_profile_expiration(
+        &self,
+        all: bool,
+        evaluated_at: OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        let selected = self.selected_trusted_profile_reference();
+        for (name, trusted) in &self.config.trusted_profiles {
+            if (all || selected == Some(name.as_str())) && trusted.is_expired_at(evaluated_at) {
+                return Err(self.trusted_profile_expired_error(name));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn trusted_profile_expired_error(&self, name: &str) -> SatelleError {
+        let toml_path = format!("trusted_profiles.{}.expires_at", config_toml_key(name));
+        let file = self
+            .sources
+            .values
+            .get(&toml_path)
+            .map_or(&self.user_config_path, |source| &source.config_file);
+        SatelleError {
+            code: ErrorCode::TrustedProfileExpired,
+            message: format!("Trusted Profile '{name}' has expired and cannot grant mutation consent"),
+            recovery_command: Some("review the Trusted Profile expiry in user configuration, or confirm this command interactively or with --yes".to_string()),
+            source_detail: None,
+            details: BTreeMap::from([
+                ("config_file".into(), serde_json::json!(file)),
+                ("toml_path".into(), serde_json::json!(toml_path)),
+                ("trusted_profile".into(), serde_json::json!(name)),
+            ]),
+        }
+    }
+
+    /// Map profile fields onto the eventual selected Host without reading files
+    /// again. The original TOML path continues to identify the winning definition.
+    pub fn effective_value_sources(&self, host: &str) -> BTreeMap<String, ConfigValueSource> {
+        let mut sources = self.sources.values.clone();
+        if let Some(selected) = &self.selected_profile {
+            let prefix = format!("profiles.{}.", config_toml_key(&selected.name));
+            let host_prefix = format!("hosts.{}", config_toml_key(host));
+            let allows_user_policy = matches!(
+                selected.source,
+                ProfileSelectionSource::UserConfig | ProfileSelectionSource::CliFlag
+            );
+            for (path, source) in &self.sources.values {
+                let Some(field) = path.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if (!allows_user_policy
+                    && (field.starts_with("experimental_provider_computer_use")
+                        || matches!(
+                            field,
+                            "session_metadata_retention"
+                                | "sqlite_log_retention"
+                                | "operator_log_retained_files"
+                        )))
+                    || (field == "yolo"
+                        && !self.profile_overrides_for_host(ProfileField::Yolo, host))
+                    || field == "trusted_profile"
+                {
+                    continue;
+                }
+                let effective_path = match field {
+                    "host" => "default_host".to_string(),
+                    "model_alias" | "provider_alias" | "output_format" | "log_verbosity" => {
+                        field.to_string()
+                    }
+                    field if field.starts_with("experimental_provider_computer_use") => {
+                        sources.insert(field.to_string(), source.clone());
+                        format!("{host_prefix}.{field}")
+                    }
+                    _ => format!("{host_prefix}.{field}"),
+                };
+                sources.insert(effective_path, source.clone());
+            }
+        }
+        sources
     }
 }
 
@@ -2180,6 +2317,13 @@ fn load_config_with_profile_selection(
     let mut config = SatelleConfig::defaults();
     let user_config = read_user_config_file(&user_config_path)?;
     let project_config = project_config::read(&project_config_path)?;
+    let mut sources = user_config
+        .as_ref()
+        .map(|user| user.sources.clone())
+        .unwrap_or_default();
+    if let Some(project) = &project_config {
+        sources.extend(&project.sources);
+    }
     let user_bound_hosts = user_config
         .as_ref()
         .map(|config| config.config.hosts.keys().cloned().collect())
@@ -2317,6 +2461,7 @@ fn load_config_with_profile_selection(
         user_config_path,
         project_config_path,
         selected_profile,
+        sources,
         profile_overlay,
         default_host_requires_project_permission,
         project_selectable_hosts,
@@ -2561,6 +2706,7 @@ struct ParsedUserConfig {
     config: SatelleConfig,
     default_profile: Option<String>,
     profiles: BTreeMap<String, profiles::ProfileConfig>,
+    sources: ConfigSources,
 }
 
 #[cfg(test)]
@@ -2759,6 +2905,50 @@ port = 22
 #[cfg(test)]
 mod trusted_profile_config_tests {
     use super::*;
+
+    #[test]
+    fn trusted_profile_expiry_uses_an_inclusive_utc_boundary_without_defaults() {
+        let raw = "[trusted_profiles.work]\nhosts = [\"office\"]\ncommand_families = [\"setup\"]\n";
+        let durable = parse_user_config(Path::new("/test/config.toml"), raw).unwrap();
+        assert_eq!(durable.config.trusted_profiles["work"].expires_at, None);
+        let dated = parse_user_config(
+            Path::new("/test/config.toml"),
+            &format!("{raw}expires_at = \"2030-01-01T00:00:00Z\"\n"),
+        )
+        .unwrap();
+        let profile = &dated.config.trusted_profiles["work"];
+        let expiry = profile.expires_at.unwrap();
+        assert!(!profile.is_expired_at(expiry - time::Duration::nanoseconds(1)));
+        assert!(profile.is_expired_at(expiry));
+        assert!(profile.is_expired_at(expiry + time::Duration::nanoseconds(1)));
+        let encoded = toml::to_string(&dated.config).unwrap();
+        let decoded: SatelleConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(dated.config, decoded);
+    }
+
+    #[test]
+    fn trusted_profile_expiry_rejects_non_utc_or_untyped_timestamps() {
+        let raw = "[trusted_profiles.work]\nhosts = [\"office\"]\ncommand_families = [\"setup\"]\n";
+        for expiry in [
+            "\"tomorrow\"",
+            "\"2030-01-01\"",
+            "\"2030-01-01T00:00:00-00:00\"",
+            "\"2030-01-01T00:00:00+01:00\"",
+            "2030-01-01T00:00:00Z",
+            "42",
+        ] {
+            let error = parse_user_config(
+                Path::new("/test/config.toml"),
+                &format!("{raw}expires_at = {expiry}\n"),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ConfigError, "{expiry}");
+            assert_eq!(
+                error.details["toml_path"],
+                "trusted_profiles.work.expires_at"
+            );
+        }
+    }
 
     const VALID_PROFILE: &str = r#"
 [trusted_profiles.maintenance]
@@ -3009,30 +3199,44 @@ mod invocation_profile_tests {
 }
 
 fn read_user_config_file(path: &Path) -> Result<Option<ParsedUserConfig>, SatelleError> {
-    if !path.exists() {
-        return Ok(None);
+    let mut merged: Option<ParsedUserConfig> = None;
+    let mut sources = ConfigSources::default();
+    for document in config_includes::read(path, ConfigSourceKind::UserConfig)? {
+        sources.record(document.source.clone(), &document.value);
+        let higher = parse_user_config_value(&document.source.path, document.value)?;
+        merged = Some(match merged {
+            None => higher,
+            Some(mut base) => {
+                base.config = base.config.merge(higher.config);
+                if higher.default_profile.is_some() {
+                    base.default_profile = higher.default_profile;
+                }
+                base.profiles.extend(higher.profiles);
+                base
+            }
+        });
     }
-
-    let raw = read_owner_controlled_config_file(path).map_err(|error| {
-        SatelleError::config_error(
-            format!(
-                "user config file {} does not satisfy the owner security policy",
-                path.display()
-            ),
-            Some(error.to_string()),
-        )
-    })?;
-
-    parse_user_config(path, &raw).map(Some)
+    if let Some(config) = &mut merged {
+        config.sources = sources;
+    }
+    Ok(merged)
 }
 
+#[cfg(test)]
 fn parse_user_config(path: &Path, raw: &str) -> Result<ParsedUserConfig, SatelleError> {
-    let mut value = toml::from_str::<toml::Value>(raw).map_err(|source| {
+    let value = toml::from_str::<toml::Value>(raw).map_err(|source| {
         SatelleError::config_error(
             format!("could not parse config file {}", path.display()),
             Some(source.to_string()),
         )
     })?;
+    parse_user_config_value(path, value)
+}
+
+fn parse_user_config_value(
+    path: &Path,
+    mut value: toml::Value,
+) -> Result<ParsedUserConfig, SatelleError> {
     let profile_data = profiles::extract_profile_data(path, &mut value, true)?;
     reject_config_composition(path, &value)?;
     reject_trusted_profile_interpolation(path, &value)?;
@@ -3055,6 +3259,7 @@ fn parse_user_config(path: &Path, raw: &str) -> Result<ParsedUserConfig, Satelle
         config,
         default_profile: profile_data.default_profile,
         profiles: profile_data.profiles,
+        sources: ConfigSources::default(),
     })
 }
 
@@ -3102,6 +3307,28 @@ fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(),
         let Some(profile) = profile_value.as_table() else {
             continue;
         };
+
+        if let Some(expiry) = profile.get("expires_at") {
+            let valid = expiry.as_str().is_some_and(|raw| {
+                (raw.ends_with(['Z', 'z']) || raw.ends_with("+00:00"))
+                    && OffsetDateTime::parse(raw, &Rfc3339)
+                        .is_ok_and(|parsed| parsed.offset().is_utc())
+            });
+            if !valid {
+                let mut error = SatelleError::config_error(
+                    "Trusted Profile expires_at must be a quoted RFC 3339 UTC timestamp",
+                    None,
+                );
+                error
+                    .details
+                    .insert("config_file".into(), serde_json::json!(path));
+                error.details.insert(
+                    "toml_path".into(),
+                    serde_json::json!(format!("{profile_path}.expires_at")),
+                );
+                return Err(error);
+            }
+        }
 
         let hosts = profile.get("hosts").and_then(toml::Value::as_array);
         if hosts.is_none_or(Vec::is_empty) {
@@ -3176,7 +3403,7 @@ fn reject_config_composition(path: &Path, value: &toml::Value) -> Result<(), Sat
         return Ok(());
     };
 
-    for key in ["include", "imports", "extends", "fragments"] {
+    for key in ["imports", "extends", "fragments"] {
         if table.contains_key(key) {
             return Err(SatelleError::unsupported_config_composition(path, key));
         }
@@ -3808,7 +4035,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             collect_unknown_keys_for_table(
                 &format!("trusted_profiles.{name}"),
                 profile_table,
-                &["hosts", "command_families"],
+                &["hosts", "command_families", "expires_at"],
                 &mut unknown_keys,
             );
         }
@@ -4218,7 +4445,11 @@ pub enum ErrorCode {
     UnsupportedTrustedProfileHostScope,
     TrustedProfileCommandAllowlistRequired,
     UnsupportedTrustedProfileCommandScope,
+    TrustedProfileExpired,
     UnsupportedConfigComposition,
+    ConfigIncludeInvalid,
+    ConfigIncludeOutsideSource,
+    ConfigIncludeCycle,
     ProjectDaemonPathOverrideNotAllowed,
     ProjectDesktopBindingNotAllowed,
     ProjectYoloEnableNotAllowed,
@@ -4356,6 +4587,10 @@ impl ErrorCode {
                 "unsupported-trusted-profile-command-scope"
             }
             Self::UnsupportedConfigComposition => "unsupported-config-composition",
+            Self::TrustedProfileExpired => "trusted-profile-expired",
+            Self::ConfigIncludeInvalid => "config-include-invalid",
+            Self::ConfigIncludeOutsideSource => "config-include-outside-source",
+            Self::ConfigIncludeCycle => "config-include-cycle",
             Self::ProjectDaemonPathOverrideNotAllowed => "project-daemon-path-override-not-allowed",
             Self::ProjectDesktopBindingNotAllowed => "project-desktop-binding-not-allowed",
             Self::ProjectYoloEnableNotAllowed => "project-yolo-enable-not-allowed",
@@ -4518,7 +4753,11 @@ impl ErrorCode {
             | Self::UnsupportedTrustedProfileHostScope
             | Self::TrustedProfileCommandAllowlistRequired
             | Self::UnsupportedTrustedProfileCommandScope
+            | Self::TrustedProfileExpired
             | Self::UnsupportedConfigComposition
+            | Self::ConfigIncludeInvalid
+            | Self::ConfigIncludeOutsideSource
+            | Self::ConfigIncludeCycle
             | Self::ProjectDaemonPathOverrideNotAllowed
             | Self::ProjectDesktopBindingNotAllowed
             | Self::ProjectYoloEnableNotAllowed
