@@ -42,6 +42,7 @@ jobs:
           trap 'kill "$SERVER_PID"' EXIT
           for i in $(seq 1 30); do curl -fsS http://127.0.0.1:4173/ >/dev/null && break; sleep 1; done
           node website/scripts/landing-browser-check.mjs
+          node website/scripts/device-network-browser-check.mjs
       - name: Upload browser evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -2,6 +2,7 @@ import Link from 'next/link';
 import { CopyCommand } from './copy-command';
 import DemoGallery from './demos/explorations';
 import DeskDemo from './demos/desk';
+import DeviceNetwork from './devices/device-network';
 import { Mark } from './mark';
 import { ThemeToggle } from './theme-toggle';
 import './page.css';
@@ -13,7 +14,7 @@ const INSTALL = 'npm install --global @microck/satelle --include=optional';
 /**
  * The page follows v12.sh's skeleton beat for beat: a small hero that contains
  * its own demo, a short proof band, one section of gridded demo cards, one
- * section of three supporting cards, a closing evidence section, then a centered
+ * machine-to-machine illustration, a closing evidence section, then a centered
  * call to action and a footer. Satelle has no customers to put in v12's logo
  * wall or testimonial grid, so those two beats carry the honest equivalents:
  * exactly where the product runs, and exactly what it does not do yet.
@@ -154,34 +155,15 @@ function Channels() {
   );
 }
 
-/** v12's three-up supporting band. */
+/** One Controller-to-Host illustration replaces the supporting-card row. */
 function Claims() {
-  const claims = [
-    {
-      title: 'Your machine, your desktop',
-      body: 'Work happens in real applications on a Host you provisioned, under a Desktop Binding you selected. Satelle is the control plane, not the runtime.',
-    },
-    {
-      title: 'Durable by construction',
-      body: 'The Session, its Turn history, and its logs live on the Host. The Controller is a client. Losing it loses nothing.',
-    },
-    {
-      title: 'Boundaries you hold',
-      body: 'You control the Host, the Desktop Binding, every provider credential, the unsafe execution policy, and every state-changing action. Project configuration cannot grant any of them.',
-    },
-  ];
-
   return (
     <Section id="claims">
-      <SectionHead title="Work runs where you put it, and stays there." />
-      <div className="cards cards-3">
-        {claims.map((claim) => (
-          <article key={claim.title} className="card card-plain">
-            <h3>{claim.title}</h3>
-            <p>{claim.body}</p>
-          </article>
-        ))}
-      </div>
+      <SectionHead
+        title="Start on one machine. Work on another."
+        note="Send work from a macOS, Windows, or Linux Controller to a configured, ready Host."
+      />
+      <DeviceNetwork />
     </Section>
   );
 }

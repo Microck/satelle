@@ -1,0 +1,51 @@
+/* Scoped to the landing page. Application state, not decoration, earns red. */
+.sa .dn-block {position:relative;isolation:isolate;overflow:hidden;border:1px solid var(--sa-6);border-radius:var(--radius-md,6px);background:var(--sa-2);cursor:default;color:var(--sa-12);font-family:var(--font-sans);}
+.sa .dn-block:focus-visible {outline:2px solid var(--sa-accent-text);outline-offset:4px;}
+.sa .dn-canvas {display:block;width:100%;height:auto;max-height:590px;}
+.sa .dn-corner {position:absolute;top:20px;left:23px;display:flex;align-items:center;gap:8px;z-index:1;font:12px/1.5 var(--font-mono);letter-spacing:.08em;color:var(--sa-10);pointer-events:none;}
+.sa .dn-corner-dot {height:5px;width:5px;background:var(--sa-9);border-radius:50%;}
+.sa .dn-orbit {fill:none;stroke:var(--sa-6);stroke-width:1;opacity:.48;}
+.sa .dn-orbit-inner {stroke-dasharray:2 10;opacity:.48;}
+.sa .dn-route {fill:none;stroke:var(--sa-6);stroke-width:1;stroke-dasharray:3 7;opacity:.45;}
+.sa .dn-active-route {fill:none;stroke:var(--sa-accent-text);stroke-width:1.4;stroke-linecap:round;}
+.sa .dn-signal {color:var(--sa-accent);}
+.sa .dn-signal path {fill:none;stroke:currentColor;stroke-width:3;stroke-linecap:round;}
+.sa .dn-signal circle {fill:var(--sa-accent-text);}
+.sa .dn-device {fill:var(--sa-3);stroke:var(--sa-9);stroke-width:1.6;stroke-linejoin:round;stroke-linecap:round;}
+.sa .dn-device[data-selected='true'] {stroke:var(--sa-12);}
+.sa .dn-device-screen {fill:var(--sa-1);stroke:var(--sa-7);stroke-width:1;}
+.sa .dn-detail {fill:none;stroke:var(--sa-7);stroke-width:1.2;}
+.sa .dn-led {fill:var(--sa-10);stroke:none;}
+.sa .dn-device[data-selected='true'] .dn-led {fill:var(--sa-accent-text);}
+.sa .dn-host {stroke-linejoin:round;stroke-linecap:round;}
+.sa .dn-host-ground {fill:var(--sa-1);opacity:.8;}
+.sa .dn-receive-ring {fill:none;stroke:var(--sa-accent-text);stroke-width:1.5;}
+.sa .dn-host-case {fill:var(--sa-3);stroke:var(--sa-10);stroke-width:1.7;}
+.sa .dn-host-screen {fill:var(--sa-1);stroke:var(--sa-6);stroke-width:1;}
+.sa .dn-host-tint {fill:color-mix(in srgb,var(--sa-accent) 9%,transparent);stroke:var(--sa-accent);stroke-width:2;}
+.sa .dn-camera {fill:var(--sa-7);}
+.sa .dn-host-base {fill:var(--sa-3);stroke:var(--sa-10);stroke-width:1.5;}
+.sa .dn-host-base-active {fill:color-mix(in srgb,var(--sa-accent) 11%,var(--sa-3));stroke:var(--sa-accent);stroke-width:1.7;}
+.sa .dn-host-keyboard {fill:var(--sa-2);stroke:var(--sa-7);stroke-width:1;}
+.sa .dn-host-detail {fill:none;stroke:var(--sa-7);stroke-width:1;}
+.sa .dn-screen-idle rect {fill:var(--sa-2);stroke:var(--sa-7);stroke-width:1.4;}
+.sa .dn-screen-idle path {fill:none;stroke:var(--sa-9);stroke-width:1.5;}
+.sa .dn-screen-idle circle {fill:var(--sa-9);}
+.sa .dn-app-window {fill:var(--sa-1);stroke:var(--sa-accent-text);stroke-width:1;}
+.sa .dn-app-rule {fill:none;stroke:var(--sa-6);stroke-width:1;}
+.sa .dn-app-dot {fill:var(--sa-8);}
+.sa .dn-work-row {fill:var(--sa-accent-text);}
+.sa .dn-work-tick {fill:none;stroke:var(--sa-accent-text);stroke-width:1.6;}
+.sa .dn-progress-track {fill:var(--sa-5);}
+.sa .dn-progress-fill {fill:var(--sa-accent);}
+.sa .dn-work-cursor {fill:var(--sa-12);stroke:var(--sa-1);stroke-width:1;}
+.sa .dn-complete-check circle {fill:var(--sa-2);stroke:var(--sa-accent-text);stroke-width:1.5;}
+.sa .dn-complete-check path {fill:none;stroke:var(--sa-accent-text);stroke-width:2.5;}
+.sa .dn-host-caption {position:absolute;top:71%;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:9px;pointer-events:none;white-space:nowrap;}
+.sa .dn-host-caption strong {font:500 14px/1.3 var(--font-sans);color:var(--sa-12);}
+.sa .dn-host-caption span {font:12px/1.4 var(--font-sans);color:var(--sa-10);}
+.sa .dn-host-caption span[data-active='true'] {color:var(--sa-accent-text);}
+.sa .dn-block[data-compact='true'] .dn-host-caption {top:68%;}
+.sa .dn-block[data-compact='true'] .dn-corner {top:14px;left:15px;font-size:12px;letter-spacing:.035em;}
+.sa .dn-sr {position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0;}
+@media (prefers-reduced-motion:reduce) {.sa .dn-block * {animation:none!important;transition:none!important;}}

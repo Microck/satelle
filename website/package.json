@@ -7,7 +7,7 @@
     "build": "next build",
     "dev": "next dev",
     "postinstall": "fumadocs-mdx",
-    "test:demos": "node --test scripts/demo-explorations.test.mjs"
+    "test:demos": "node --test scripts/demo-explorations.test.mjs scripts/device-network.test.mjs"
   },
   "dependencies": {
     "fumadocs-core": "16.11.5",
