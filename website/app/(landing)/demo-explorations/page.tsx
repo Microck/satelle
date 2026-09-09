@@ -7,31 +7,32 @@ import { ThemeToggle } from '../theme-toggle';
 import '../page.css';
 
 export const metadata: Metadata = {
-  title: 'Four animated workflows | Satelle',
-  description: 'Website QA, desktop chat, a Claude Code dashboard handoff, and macOS wallpaper. Animated illustrations on operator-controlled Hosts.',
+  title: 'Animated workflows | Satelle',
+  description: 'GitHub QA, a ChatGPT desktop concept, Claude Code file delivery, and a Slack profile update.',
   robots: { index: false, follow: false },
 };
 
 export default function DemoExplorationsPage() {
   return (
-    <div className="sx-review-page sx-review-shell">
-      <a href="#main" className="sx-skip">Skip to workflow demos</a>
+    <div className="sx-review-shell">
+      <a href="#main" className="sx-skip">Skip to the workflows</a>
       <header className="sx-review-nav">
         <Link href="/" className="sx-review-brand"><Mark size={18} /> Satelle</Link>
-        <nav className="sx-review-links" aria-label="Workflow demo navigation">
+        <nav className="sx-review-links" aria-label="Workflow navigation">
           <Link href="/">Back to the website</Link>
           <Link href="/docs">Documentation</Link>
         </nav>
       </header>
       <main id="main" className="sx-review-main">
         <header className="sx-review-intro">
-          <p className="sx-eyebrow">Four workflows / {RELEASE}</p>
-          <h1>Different tasks. Your computers.</h1>
-          <p>Website QA, desktop chat, a dashboard handoff, and a new macOS wallpaper. Each scene plays once as it enters view. Pause, replay, or explore the steps.</p>
+          <p className="sx-eyebrow">Website workflows / {RELEASE}</p>
+          <h1>Real apps. One visual language.</h1>
+          <p>Four scripted workflows in Satelle’s visual style. Each plays once on view.
+            Pause or replay a scene. With reduced motion, use Next frame to view stills.</p>
         </header>
         <DemoGallery explore />
         <footer className="sx-review-footer">
-          <p>The same four workflows appear on the homepage. All scenes are illustrative.</p>
+          <p>These controls replay the illustrations. They do not operate a live Host.</p>
           <ThemeToggle />
         </footer>
       </main>

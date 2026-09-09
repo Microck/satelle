@@ -1,99 +1,129 @@
-# Four animated landing workflows
+# Monochrome application workflows
 
-This revision replaces the six exploratory concepts with the four requested
-workflows, in order, on both `/` and `/demo-explorations`. The comparison route
-remains `noindex`, but no longer offers a selection UI. Old `demos` and `view`
-query parameters are ignored. The homepage hero, documentation routes, theme
-tokens, dependencies, and original demo modules are unchanged.
+Replaces the pending terminal-heavy/placeholder revision with the four requested
+scenarios. The homepage and `/demo-explorations` use the same React components.
+The review route remains `noindex` and exposes illustrative MCP argument/result
+excerpts. The old six-option selector and all segmented step bars are gone.
 
-## Scenes
+## Visual contract
 
-| Order | Surface | Script |
-| --- | --- | --- |
-| 01 | Website QA | Type a checkout test request; add an item; open checkout; type an invalid email; observe the validation failure; show example QA notes. No purchase is made. |
-| 02 | Claude Desktop-style chat | Ask which Hosts are available; read configured contexts with `config_check`; show `studio-mac` and `ops-pc`; ask for a browser task on `studio-mac`; show detached `run` admission. |
-| 03 | Claude Code terminal and Host browser | Type a request targeting `ops-pc`; show a Satelle `run` call; browse a reports dashboard; download `September.csv`; open the Finance destination; select the downloaded file in a native picker; upload and show an illustrative confirmation. |
-| 04 | macOS desktop | Type a wallpaper request; move to System Settings; choose Wallpaper; select Mountains; crossfade the desktop background; close Settings and reveal the changed desktop. |
+The V12 reference is a vocabulary of recognizable applications drawn within one
+website design system, not four unrelated embedded product themes. Satelle's
+existing `--sa-*` ramp owns every application background, foreground, border,
+chart, icon, avatar, selection, and simulated button. Both existing themes work.
 
-Application furniture is illustrative, not clickable product chrome. The actual
-controls are outside each application: Play/Pause, Replay, and individually
-labelled step buttons. Source inspectors are native disclosures on the review
-route. No control executes a command, calls MCP, contacts a Host, or transfers a
-file. The examples use synthetic domains, data, findings, aliases, and outcomes.
+There are no Slack-purple panels, Google brand colors, orange Claude mascot,
+red/yellow/green window lights, white application islands, remote images, or
+CSS grayscale filters. Identity comes from layout and familiar controls. The
+website accent is reserved for keyboard focus. No font or dependency is added.
 
-## Motion contract
+The UI geometry is a responsive recreation, not a claimed pixel-for-pixel capture
+of a specific vendor version. App-specific typography is replaced by the site's
+existing sans and mono stacks. All app chrome is illustrative and hidden from
+assistive technology; the actual playback controls are real labelled buttons and
+the current action is a live status. The reduced-motion Next frame button keeps
+all stills available without restoring the removed step rail.
 
-`workflow-motion.tsx` owns a finite requestAnimationFrame clock shared by all
-four scenes. Beat definitions and the pure `sample` projection are in
-`exploration-data.ts`.
+## The four scenes
 
-- Autoplay starts once when at least 15% of a player enters the viewport. It
-  reaches the final frame and stops; there is no automatic loop.
-- Leaving the viewport or hiding the document suspends the clock. Returning
-  resumes from the same position. An explicit Pause is not undone by scrolling.
-- Human prompts are typed. Tool results arrive as blocks rather than being
-  typed character by character.
-- Pointers are measured against actual DOM targets, not desktop-only hardcoded
-  coordinates. They arrive in 620ms; the corresponding app state commits at
-  720ms. Pointer interpolation, the upload bar, and the wallpaper crossfade use
-  the same clock, so Pause also freezes those changes.
-- Replay restarts that scene only. Step buttons pause at the end of the chosen
-  beat, showing its complete contents. Keyboard Enter/Space operate the native
-  controls. Step changes have a polite, atomic status announcement; screen
-  readers receive complete prompt text, not a stream of individual characters.
-- SSR renders complete, readable scenes. In `prefers-reduced-motion: reduce`,
-  autoplay is skipped, all scenes show their finished state, CSS motion is
-  disabled, and manual step exploration remains available. A preference change
-  while running takes effect immediately.
-- Observers, listeners, and animation frames are cleaned up on unmount.
+1. **GitHub QA.** Read-only navigation through `github.com/Microck/satelle`, the
+   README and Issues search, ending at an empty search state. Notes are scripted
+   examples, not measured QA results or a built-in Satelle QA dashboard. No defect
+   or vulnerability is attributed to GitHub. Nothing is submitted.
+2. **ChatGPT desktop concept.** Ask which Hosts are configured, display the
+   configured aliases, request the Slack task, and preview a proposed approval
+   and detached admission. A persistent `Integration concept` badge, a visible
+   caption, and the review-page requirements section prevent this from implying
+   a shipped integration.
+3. **Claude Code to Google Drive.** A recognizable Clawd/terminal prompt and MCP
+   transcript precede a finite window handoff. The terminal minimizes; the Host
+   browser expands. Google Analytics Share -> Download File -> CSV is followed
+   by Google Drive Reports -> New -> File upload -> native picker -> Open.
+   `Traffic acquisition.csv` stays on `ops-pc` throughout. This is not a Satelle
+   file-transfer API or a cross-Host copy. Sample accounts are assumed signed in
+   and authorized. The chart and file data are synthetic.
+4. **Slack profile photo.** Account menu -> Profile -> Edit -> Upload Photo ->
+   Pictures -> `profile.png` -> Open -> crop -> Save -> Save Changes. The new
+   avatar is an original abstract illustration, not a supposed photo of the user.
+   No account is changed and no Slack API integration is claimed.
 
-Styles are scoped to the landing tree and reuse its existing light/dark tokens.
-The desktop wallpaper is a lightweight CSS illustration, not a downloaded asset.
-No font or animation dependency was added.
+## Product fidelity
 
-## Fidelity and assumptions
+Product baseline: `3601b323d5d487597666066f97eb0197205ae41a` on
+`feat/landing-demo-explorations`, derived from the requested `feat/landing-page`.
 
-Baseline: `c2c4c9d5bddaaad1a151436cd7bf41b59c948748`, Satelle 0.1.10 on the
-PR branch. These are designed scenes, not recorded or verified task executions.
+- `crates/satelle-cli/src/read.rs`: `config_check(all=true)` reports checked
+  configuration contexts. `remote_host`, `provider_auth`, and
+  `native_computer_use` remain in `not_checked`. Configured is not online/ready.
+- `crates/satelle-cli/src/mcp/schema.rs`: `run` takes `prompt`, `host`, and
+  `detach`. Mutation tools require explicit enablement. The demo's complete
+  illustrative input is available on the review route; terminal fields are
+  excerpts. Detached `starting` means admission, not completed work.
+- `crates/satelle-cli/src/mcp/install.rs`: Claude Code is an installer target;
+  ChatGPT is not. This revision does not add a transport bridge, installer,
+  plugin, desktop compatibility, or backend for the ChatGPT concept.
+- `README.md`: native macOS/Windows Hosts are candidates, gated by a live
+  readiness probe. Native Linux Host execution is unsupported. No demo grants
+  operating-system, administrator, or application permission.
 
-| Claim / field | Source in this repository | Boundary |
-| --- | --- | --- |
-| `config_check({ all: true })` | `crates/satelle-cli/src/mcp/schema.rs` | This is a read-only configuration check, not Host discovery. |
-| `checked_contexts[].host`, `status`, and `not_checked` | `crates/satelle-cli/src/read.rs`, `config_check_report` | The list is derived from configured contexts. Remote Host availability, provider authentication, and native Computer Use are explicitly not checked. The visible rows say Configured, never Online or Ready. |
-| Config result version | `crates/satelle-cli/src/mcp/output-schema.rs` | `satelle.config.check.v1`. Inspectors contain selected fields, not a fabricated full result. |
-| `run` arguments `host`, `prompt`, `detach` | `crates/satelle-cli/src/mcp/schema.rs` | Mutation tools must already have been enabled on the MCP server. The example does not enable them or grant OS permissions. |
-| Detached `run` reports `starting` | `crates/satelle-cli/src/main.rs`, `print_detached_session` | Admission is not task completion. The CLI transcript labels this as admission; later browser results are separate illustrative application state. |
-| Claude Desktop and Claude Code client targets | `crates/satelle-cli/src/mcp/install.rs` | Client layouts are illustrations, not exact vendor screenshots or new Satelle-specific plugins. |
-| Native desktop operations | `README.md`, `docs/tutorial/first-session.mdx` | macOS and Windows Hosts remain candidates and require a live readiness pass. Native Linux Host execution is unsupported. |
-| Dashboard download/upload | Generic native browser task, carried by `run` | Assumes authorized, signed-in sites on `ops-pc`. The file stays on that Host between the browser download and browser upload; no Satelle file-transfer API or cross-Host copy is implied. |
-| QA notes and wallpaper result | Synthetic illustration | Not a built-in QA dashboard, recorded test, guaranteed application outcome, or app-specific integration. No operating-system, administrator, or security prompt is approved. |
+OpenAI documents remote MCP connectivity and currently describes custom-app
+availability on ChatGPT web. A desktop-compatible connection would need separate
+implementation and verification. This website scene cannot establish that.
+
+## Reference sources
+
+Visual structure: https://v12.sh/ and the screenshots provided for this change.
+Vendor workflow references, checked 2026-09-09:
+
+- https://code.claude.com/docs/en/interactive-mode
+- https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt
+- https://support.google.com/analytics/answer/9317657
+- https://support.google.com/drive/answer/2424368
+- https://slack.com/help/articles/115005506003-Upload-a-profile-photo
+
+These references support UI conventions/workflow order, not an endorsement,
+partnership, measured outcome, or claim of an available Satelle integration.
+
+## Motion and implementation
+
+`workflow-motion.tsx` owns a single finite clock per scene. Autoplay starts when
+15% of the card enters view. Offscreen cards and hidden documents suspend work;
+manual Pause persists. Replay resets only that scene. Prompts type in; tool
+results appear as blocks. Cursor travel finishes before the application commits
+its next state. Window handoff, conversation scrolling, crop adjustment, and upload
+progress follow that same clock. All observers/listeners/frames are cleaned up.
+
+Server rendering and reduced motion show complete content. Reduced motion has no
+autoplay and no CSS motion. Replay starts its still sequence; Next frame advances
+it. There are no segmented bars and no stale “Use the steps” instructions.
+
+`workflow-ui.tsx` holds the reusable monochrome chrome, icons, abstract avatar,
+and source disclosures. `workflow-scenes.tsx` holds app layouts.
+`exploration-data.ts` contains the immutable fixtures and pure clock functions.
+`explorations.css` is scoped under `.sa` and uses the existing landing tokens.
+No product state, Host, service, shell, or account is contacted by these modules.
 
 ## Validation
 
-Run the repository's existing hook:
+Run the existing prebuild fixture tests:
 
 ```sh
 npm run test:demos --workspace website
-npm run docs:build
 ```
 
-The fixture/timeline suite contains 23 tests: exact workflow order, interface
-variety, finite clocks, boundaries, pointer-before-commit ordering, manual
-stepping, typed prompts, marker presence, Host configuration semantics, MCP
-admission, the file handoff, the wallpaper scene, and component syntax.
+The prepared revision passed 25 fixture/source tests, including the four-scene
+order, real domains, monochrome paint, removal of step bars, Host semantics,
+ChatGPT concept labelling, pointer-before-commit timing, and the file/profile
+workflows. TS/TSX files transpile without syntax diagnostics.
 
-Local browser validation used the actual transpiled modules in an isolated
-Chromium harness with an available React 16.0.0 runtime, a Fragment compatibility
-shim, and system fonts. It checked 28 viewport/theme/motion combinations from
-320px to 1920px and all 27 beat endpoints (756 state checks), without horizontal
-page/card overflow or scene content overlapping playback controls. It also
-exercised on-view playback, offscreen suspension, Pause/Play, keyboard controls,
-Replay, completion without looping, source disclosures, and reduced-motion
-changes. Document visibility was tested by dispatching a visibility event in the
-harness, not by a full browser multi-tab integration test.
+An isolated Chromium harness rendered 546 scene endpoints across seven widths
+(320, 390, 768, 880, 1024, 1440, 1920) and both themes, and checked 350 pre-action
+cursor targets. No page/card overflow, clipped dialog, terminal-footer overlap,
+missing/out-of-bounds target, or JavaScript error remained. Actual playback checks
+covered autoplay, pause, replay, offscreen suspension, dynamic reduced motion,
+and still navigation.
 
-These checks are not a substitute for the pinned Next.js/React 19 build,
-SSR/hydration, real site navigation, or actual Satelle execution. Dependency
-network access was unavailable locally. The documentation workflow performs
-the pinned integration build; its current status belongs in the PR, not in this
-versioned document.
+The harness uses an available React 16 runtime and system fonts. This is **not**
+a pinned React 19 / Next.js build, a full type-check, SSR/hydration validation, or
+vendor-application testing. Run the full existing website build in CI. No new CI
+result is claimed for an unpushed revision.

@@ -144,7 +144,7 @@ function Channels() {
     <Section id="channels">
       <SectionHead
         title="Different tasks. Your computers."
-        note="Animated illustrations, not live runs. Each scene plays once on view; pause, replay, or explore its steps."
+        note="Animated illustrations, not live runs. Each scene plays once on view. Pause or replay it; reduced motion uses still frames."
       />
       <DemoGallery />
       <Link className="sx-compare-link" href="/demo-explorations">
