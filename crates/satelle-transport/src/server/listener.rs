@@ -1,4 +1,6 @@
-use super::{ApiFailure, DaemonState, api_error_response, auth, request_id_or_new};
+use super::{
+    ApiFailure, DaemonState, DaemonTlsConfig, api_error_response, auth, request_id_or_new,
+};
 use crate::contract::{ApiErrorCategory, ApiErrorCode};
 use axum::extract::connect_info::{ConnectInfo, Connected};
 use axum::extract::{Request, State};
@@ -8,11 +10,12 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::serve::IncomingStream;
 use axum::serve::Listener;
+use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -31,7 +34,7 @@ pub(super) struct LimitedTcpListener {
     permits: Arc<Semaphore>,
     rejection_permits: Arc<Semaphore>,
     activity: ConnectionActivity,
-    tls_config: Option<watch::Receiver<Arc<rustls::ServerConfig>>>,
+    tls_config: Option<watch::Receiver<DaemonTlsConfig>>,
 }
 
 impl LimitedTcpListener {
@@ -51,7 +54,7 @@ impl LimitedTcpListener {
     pub(super) fn with_tls(
         inner: TcpListener,
         max_connections: usize,
-        server_config: watch::Receiver<Arc<rustls::ServerConfig>>,
+        server_config: watch::Receiver<DaemonTlsConfig>,
     ) -> Self {
         let mut listener = Self::new(inner, max_connections);
         listener.tls_config = Some(server_config);
@@ -98,27 +101,47 @@ impl Listener for LimitedTcpListener {
                     // Snapshot at TCP acceptance, before capacity admission can
                     // wait. A connection already accepted under one TLS
                     // configuration must not switch certificates while queued.
-                    let tls_acceptor = self
-                        .tls_config
-                        .as_ref()
-                        .map(|server_config| TlsAcceptor::from(server_config.borrow().clone()));
+                    let tls_snapshot = self.tls_config.as_ref().map(|receiver| {
+                        let mut changes = receiver.clone();
+                        let config = changes.borrow_and_update().clone();
+                        (config, changes)
+                    });
                     // Tests and idle-shutdown tracking may observe this signal.
                     // Publish it only after the accepted socket's TLS identity
                     // is fixed so observers cannot race the snapshot.
                     let activity = self.activity.connect();
                     let admission = self.acquire_admission().await;
                     let _ = stream.set_nodelay(true);
-                    let stream = match tls_acceptor {
+                    let mut trust_reload: Option<TrustReload> = None;
+                    let stream = match tls_snapshot {
                         // Hyper polls each handshake in its own bounded
                         // connection task. The deadline prevents silent peers
                         // from retaining every admission permit indefinitely.
-                        Some(acceptor) => TransportIo::TlsHandshake {
-                            handshake: Box::pin(acceptor.accept(stream)),
-                            deadline: Box::pin(tokio::time::sleep(TLS_HANDSHAKE_TIMEOUT)),
-                        },
+                        Some((config, mut changes)) => {
+                            let required = config.requires_client_certificate;
+                            trust_reload = Some(Box::pin(async move {
+                                while changes.changed().await.is_ok() {
+                                    if required
+                                        || changes.borrow_and_update().requires_client_certificate
+                                    {
+                                        return;
+                                    }
+                                }
+                                std::future::pending::<()>().await;
+                            }));
+                            TransportIo::TlsHandshake {
+                                handshake: Box::pin(
+                                    TlsAcceptor::from(config.server).accept(stream),
+                                ),
+                                deadline: Box::pin(tokio::time::sleep(TLS_HANDSHAKE_TIMEOUT)),
+                                client_fingerprint: required.then(|| Arc::new(OnceLock::new())),
+                            }
+                        }
                         None => TransportIo::Plain(stream),
                     };
-                    return (PermitIo::new(stream, admission, activity), address);
+                    let mut io = PermitIo::new(stream, admission, activity);
+                    io.trust_reload = trust_reload;
+                    return (io, address);
                 }
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -138,13 +161,18 @@ pub(super) struct PermitIo {
     _activity: ConnectedClient,
     rejection_deadline: Option<Pin<Box<Sleep>>>,
     start_rejection_deadline_after_handshake: bool,
+    client_fingerprint: Option<Arc<OnceLock<[u8; 32]>>>,
+    trust_reload: Option<TrustReload>,
 }
+
+type TrustReload = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 enum TransportIo {
     Plain(TcpStream),
     TlsHandshake {
         handshake: Pin<Box<Accept<TcpStream>>>,
         deadline: Pin<Box<Sleep>>,
+        client_fingerprint: Option<Arc<OnceLock<[u8; 32]>>>,
     },
     Tls(Box<TlsStream<TcpStream>>),
     TlsFailed {
@@ -165,12 +193,23 @@ impl TransportIo {
         let Self::TlsHandshake {
             handshake,
             deadline,
+            client_fingerprint,
         } = self
         else {
             return Poll::Ready(Ok(()));
         };
         match handshake.as_mut().poll(context) {
             Poll::Ready(Ok(stream)) => {
+                if let Some(fingerprint) = client_fingerprint {
+                    // Rustls has verified this leaf and its proof of key
+                    // possession. Request headers never populate this value.
+                    let leaf = &stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .expect("required client authentication supplies a certificate")[0];
+                    let _ = fingerprint.set(Sha256::digest(leaf.as_ref()).into());
+                }
                 *self = Self::Tls(Box::new(stream));
                 Poll::Ready(Ok(()))
             }
@@ -208,12 +247,20 @@ impl PermitIo {
         let start_rejection_deadline_after_handshake = rejected && stream.handshake_pending();
         let rejection_deadline = (rejected && !start_rejection_deadline_after_handshake)
             .then(|| Box::pin(tokio::time::sleep(REJECTION_IDLE_TIMEOUT)));
+        let client_fingerprint = match &stream {
+            TransportIo::TlsHandshake {
+                client_fingerprint, ..
+            } => client_fingerprint.clone(),
+            _ => None,
+        };
         Self {
             stream,
             admission,
             _activity: activity,
             rejection_deadline,
             start_rejection_deadline_after_handshake,
+            client_fingerprint,
+            trust_reload: None,
         }
     }
 
@@ -222,6 +269,19 @@ impl PermitIo {
     }
 
     fn poll_handshake(&mut self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self
+            .trust_reload
+            .as_mut()
+            .is_some_and(|reload| reload.as_mut().poll(context).is_ready())
+        {
+            self.trust_reload = None;
+            self.stream = TransportIo::TlsFailed {
+                kind: io::ErrorKind::ConnectionAborted,
+                message:
+                    "TLS client trust changed; reconnect to authenticate with the current policy"
+                        .to_string(),
+            };
+        }
         match self.stream.poll_handshake(context) {
             Poll::Ready(Ok(())) => {
                 if self.start_rejection_deadline_after_handshake {
@@ -317,15 +377,22 @@ impl AsyncRead for PermitIo {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct ConnectionContext {
     peer_address: SocketAddr,
     admitted: bool,
+    client_fingerprint: Option<Arc<OnceLock<[u8; 32]>>>,
 }
 
 impl ConnectionContext {
-    pub(super) const fn peer_ip(self) -> IpAddr {
+    pub(super) const fn peer_ip(&self) -> IpAddr {
         self.peer_address.ip()
+    }
+
+    pub(super) fn client_fingerprint(&self) -> Option<[u8; 32]> {
+        self.client_fingerprint
+            .as_ref()
+            .and_then(|fingerprint| fingerprint.get().copied())
     }
 }
 
@@ -334,6 +401,7 @@ impl Connected<IncomingStream<'_, LimitedTcpListener>> for ConnectionContext {
         Self {
             peer_address: *stream.remote_addr(),
             admitted: stream.io().admitted(),
+            client_fingerprint: stream.io().client_fingerprint.clone(),
         }
     }
 }
@@ -443,8 +511,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::TlsConnector;
 
-    fn tls_receiver(tls: DaemonTlsConfig) -> watch::Receiver<Arc<rustls::ServerConfig>> {
-        let (_, receiver) = watch::channel(tls.0);
+    fn tls_receiver(tls: DaemonTlsConfig) -> watch::Receiver<DaemonTlsConfig> {
+        let (_, receiver) = watch::channel(tls);
         receiver
     }
 
@@ -488,10 +556,11 @@ mod tests {
         let tls = DaemonTlsConfig::from_pem(
             certified.cert.pem().as_bytes(),
             certified.signing_key.serialize_pem().as_bytes(),
+            None,
         )
         .expect("build validated TLS configuration");
         let client_config =
-            crate::transport_tls::websocket_tls_config(Some(certified.cert.pem().as_bytes()))
+            crate::transport_tls::websocket_tls_config(Some(certified.cert.pem().as_bytes()), None)
                 .unwrap_or_else(|_| panic!("build trusted TLS client configuration"));
         let connector = TlsConnector::from(client_config);
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -540,18 +609,20 @@ mod tests {
         let initial_tls = DaemonTlsConfig::from_pem(
             initial.cert.pem().as_bytes(),
             initial.signing_key.serialize_pem().as_bytes(),
+            None,
         )
         .expect("build initial TLS configuration");
         let replacement_tls = DaemonTlsConfig::from_pem(
             replacement.cert.pem().as_bytes(),
             replacement.signing_key.serialize_pem().as_bytes(),
+            None,
         )
         .expect("build replacement TLS configuration");
         let client_config =
-            crate::transport_tls::websocket_tls_config(Some(initial.cert.pem().as_bytes()))
+            crate::transport_tls::websocket_tls_config(Some(initial.cert.pem().as_bytes()), None)
                 .unwrap_or_else(|_| panic!("build client trusting the initial certificate"));
         let connector = TlsConnector::from(client_config);
-        let (tls_sender, tls_receiver) = watch::channel(initial_tls.0);
+        let (tls_sender, tls_receiver) = watch::channel(initial_tls);
         let tcp_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
             .await
             .expect("bind test listener");
@@ -581,7 +652,7 @@ mod tests {
         .await
         .expect("listener must accept the TCP connection before TLS reload");
         tls_sender
-            .send(replacement_tls.0)
+            .send(replacement_tls)
             .expect("publish replacement TLS configuration");
         drop(admission_permit);
 
@@ -618,6 +689,7 @@ mod tests {
         let tls = DaemonTlsConfig::from_pem(
             certified.cert.pem().as_bytes(),
             certified.signing_key.serialize_pem().as_bytes(),
+            None,
         )
         .expect("build validated TLS configuration");
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -660,6 +732,7 @@ mod tests {
         let tls = DaemonTlsConfig::from_pem(
             certified.cert.pem().as_bytes(),
             certified.signing_key.serialize_pem().as_bytes(),
+            None,
         )
         .expect("build validated TLS configuration");
         let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))

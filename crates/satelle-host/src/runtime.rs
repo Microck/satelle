@@ -3803,6 +3803,23 @@ impl RuntimeHandle {
             .map_err(model::storage_failure)
     }
 
+    pub(crate) fn record_client_certificate_auth(
+        &self,
+        principal: &ApiPrincipal,
+        request_id: uuid::Uuid,
+        certificate_sha256: &[u8; 32],
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .record_client_certificate_auth(
+                principal,
+                request_id,
+                certificate_sha256,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
     pub(crate) fn authenticate_pending_setup_api_token(
         &self,
         token: &ApiBearerToken,

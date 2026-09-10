@@ -22,6 +22,7 @@ const ACCEPTED_HOST_KEYS: &[&str] = &["transport", "timeouts"];
 const SECRET_SOURCE_KEYS: &[&str] = &[
     "api_token",
     "ca_bundle",
+    "client_certificate",
     "expected_host_id",
     "provider_auth",
     "provider_credentials",

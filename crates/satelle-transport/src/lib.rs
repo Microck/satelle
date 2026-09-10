@@ -6,6 +6,8 @@ mod server;
 #[path = "transport-tls.rs"]
 mod transport_tls;
 
+pub use transport_tls::{ClientCertificate, ClientCertificateError};
+
 pub use client::{
     DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError, DaemonEventStream,
     PreparedProviderSecretProvisioning,
@@ -34,7 +36,7 @@ pub use contract::{
     TurnRequest, WsCloseReason, WsControlError, WsServerControl,
 };
 pub use server::{
-    DaemonServer, DaemonServerConfig, DaemonServerError, DaemonShutdownHandle, DaemonTlsConfig,
-    DaemonTlsConfigError, DaemonTlsReloadError, DaemonTlsReloader, TrustedProxy,
+    DaemonClientTrust, DaemonServer, DaemonServerConfig, DaemonServerError, DaemonShutdownHandle,
+    DaemonTlsConfig, DaemonTlsConfigError, DaemonTlsReloadError, DaemonTlsReloader, TrustedProxy,
     TrustedProxyParseError,
 };

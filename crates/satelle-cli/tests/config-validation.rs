@@ -8,6 +8,61 @@ mod config_fixture;
 use config_fixture::{ConfigFixture, assert_same_file, parse_json};
 
 #[test]
+fn client_certificate_configuration_is_user_owned_direct_only_and_closed() {
+    let path = serde_json::to_string(&std::env::temp_dir().join("client.pem")).unwrap();
+    let key = serde_json::to_string(&std::env::temp_dir().join("client.key")).unwrap();
+    let prefix = format!(
+        r#"
+command_history = false
+default_host = "workstation"
+[hosts.workstation]
+transport = "direct"
+adapter = "fake"
+address = "https://host.example.test"
+expected_host_id = "host-certificate-config-test"
+[hosts.workstation.client_certificate]
+certificate_file = {path}
+private_key_file = {key}
+"#
+    );
+    let fixture = ConfigFixture::new(&prefix, "");
+    fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .success();
+    for invalid in [
+        prefix.replace("transport = \"direct\"", "transport = \"local\""),
+        prefix.replace("transport = \"direct\"", "transport = \"ssh\""),
+        prefix.replace(
+            &format!("certificate_file = {path}"),
+            "certificate_file = \"relative.pem\"",
+        ),
+        prefix.replace(
+            &format!("private_key_file = {key}"),
+            "private_key_file = \"$CLIENT_KEY\"",
+        ),
+        format!("{prefix}secret = \"inline-identity-is-forbidden\"\n"),
+    ] {
+        fixture.write_user_config(&invalid);
+        fixture
+            .command()
+            .args(["config", "check", "--json"])
+            .assert()
+            .code(66);
+    }
+    fixture.write_user_config(&prefix);
+    fixture.write_project_config(&format!(
+        "[client_certificate]\ncertificate_file = {path}\nprivate_key_file = {key}\n"
+    ));
+    fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66);
+}
+
+#[test]
 fn config_repair_preview_and_apply_preserve_comments_redact_references_and_back_up_exact_bytes() {
     let original = r#"
 command_history = false

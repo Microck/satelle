@@ -9,6 +9,65 @@ const PAYLOAD_CANARY: &[u8] = b"PRIVATE_CANONICAL_PROMPT_PAYLOAD_CANARY";
 const PROVIDER_SECRET_CANARY: &str = "PRIVATE_PROVIDER_SECRET_RESTART_CANARY";
 
 #[test]
+fn client_certificate_audit_survives_restart_and_obeys_log_retention() {
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let token = crate::ApiBearerToken::generate().unwrap();
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new(&token, "audit-principal", 1, ApiScopes::READ, None, at(0))
+                .unwrap(),
+        )
+        .unwrap();
+    let principal = storage
+        .authenticate_api_token(&token, at(0))
+        .unwrap()
+        .unwrap();
+    let request_id = uuid::Uuid::now_v7();
+    storage
+        .record_client_certificate_auth(&principal, request_id, &[1; 32], at(0))
+        .unwrap();
+    drop(storage);
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let observed: (String, Vec<u8>) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT request_id, certificate_sha256 FROM client_certificate_audit",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(observed, (request_id.hyphenated().to_string(), vec![1; 32]));
+    // A cutoff within the same second exercises integer timestamp ordering.
+    storage.set_log_retention(time::Duration::seconds(1));
+    storage
+        .prune_expired_session_metadata(at(0) + time::Duration::milliseconds(1001))
+        .unwrap();
+    let count: i64 = storage
+        .connection_for_test()
+        .query_row("SELECT count(*) FROM client_certificate_audit", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    storage
+        .record_client_certificate_auth(&principal, request_id, &[2; 32], at(1))
+        .unwrap();
+    storage
+        .record_client_certificate_auth(&principal, request_id, &[3; 32], at(3))
+        .unwrap();
+    let fingerprints = storage
+        .connection_for_test()
+        .prepare("SELECT certificate_sha256 FROM client_certificate_audit")
+        .unwrap()
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(fingerprints, vec![vec![3; 32]]);
+}
+
+#[test]
 fn token_lifecycle_replays_metadata_after_restart_and_preserves_authority() {
     use crate::{ApiTokenMutation, ApiTokenMutationOutcome};
     let state = TempDir::new().unwrap();

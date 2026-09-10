@@ -9814,6 +9814,7 @@ mod tests {
             expected_host_id: Some("host-test".to_string()),
             api_token: None,
             ca_bundle: None,
+            client_certificate: None,
             provider_auth: std::collections::BTreeMap::new(),
         };
         let unix_environment = RemoteTarget::LinuxX64Gnu

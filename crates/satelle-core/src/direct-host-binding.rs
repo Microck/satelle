@@ -10,6 +10,14 @@ pub enum ApiTokenSource {
     File { path: PathBuf },
 }
 
+/// User-owned PEM file references for one Direct TLS client identity.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientCertificateSource {
+    pub certificate_file: PathBuf,
+    pub private_key_file: PathBuf,
+}
+
 /// A direct Host Binding after all endpoint, identity, and file-reference
 /// invariants have been validated at one boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +26,7 @@ pub struct DirectHostBinding {
     expected_host_identity: HostIdentityRef,
     api_token: ApiTokenSource,
     ca_bundle: Option<PathBuf>,
+    client_certificate: Option<ClientCertificateSource>,
 }
 
 /// An SSH Host Binding after destination, identity, and file-reference
@@ -70,6 +79,9 @@ impl SshHostBinding {
         if host.ca_bundle.is_some() {
             return Err(SshHostBindingError::UnexpectedCaBundle);
         }
+        if host.client_certificate.is_some() {
+            return Err(SshHostBindingError::UnexpectedClientCertificate);
+        }
         Ok(Self {
             destination: destination.to_string(),
             expected_host_identity,
@@ -120,11 +132,18 @@ impl DirectHostBinding {
         {
             return Err(DirectHostBindingError::InvalidCaBundlePath);
         }
+        if host.client_certificate.as_ref().is_some_and(|source| {
+            !is_absolute_file_reference(&source.certificate_file)
+                || !is_absolute_file_reference(&source.private_key_file)
+        }) {
+            return Err(DirectHostBindingError::InvalidClientCertificatePath);
+        }
         Ok(Self {
             origin: HttpsOrigin::parse(address)?,
             expected_host_identity,
             api_token,
             ca_bundle: host.ca_bundle.clone(),
+            client_certificate: host.client_certificate.clone(),
         })
     }
 
@@ -142,6 +161,10 @@ impl DirectHostBinding {
 
     pub fn ca_bundle(&self) -> Option<&Path> {
         self.ca_bundle.as_deref()
+    }
+
+    pub fn client_certificate(&self) -> Option<&ClientCertificateSource> {
+        self.client_certificate.as_ref()
     }
 }
 
@@ -191,6 +214,8 @@ pub enum DirectHostBindingError {
     InvalidApiTokenPath,
     #[error("the direct Host Binding ca_bundle path must be absolute")]
     InvalidCaBundlePath,
+    #[error("the direct Host Binding client certificate and private key paths must be absolute")]
+    InvalidClientCertificatePath,
     #[error("direct Host Daemon transport requires HTTPS")]
     InsecureOrigin,
     #[error("the direct Host Daemon HTTPS origin is invalid")]
@@ -215,6 +240,8 @@ pub enum SshHostBindingError {
     InvalidApiTokenPath,
     #[error("an SSH Host Binding cannot configure ca_bundle")]
     UnexpectedCaBundle,
+    #[error("an SSH Host Binding cannot configure a client certificate")]
+    UnexpectedClientCertificate,
 }
 
 #[cfg(test)]
@@ -279,5 +306,43 @@ mod tests {
             SshHostBinding::from_host_config(&config),
             Err(SshHostBindingError::UnexpectedCaBundle)
         );
+    }
+
+    #[test]
+    fn client_certificate_references_require_direct_transport_and_absolute_paths() {
+        let mut config = ssh_config("prod-alias");
+        let identity = ClientCertificateSource {
+            certificate_file: std::env::temp_dir().join("client.pem"),
+            private_key_file: std::env::temp_dir().join("client.key"),
+        };
+        config.client_certificate = Some(identity.clone());
+        assert_eq!(
+            SshHostBinding::from_host_config(&config),
+            Err(SshHostBindingError::UnexpectedClientCertificate)
+        );
+        config.transport = TransportKind::Direct;
+        config.address = Some("https://host.example.test".to_string());
+        assert_eq!(
+            DirectHostBinding::from_host_config(&config)
+                .unwrap()
+                .client_certificate(),
+            Some(&identity)
+        );
+        for (certificate_file, private_key_file) in [
+            (
+                PathBuf::from("relative.pem"),
+                identity.private_key_file.clone(),
+            ),
+            (identity.certificate_file, PathBuf::from("relative.key")),
+        ] {
+            config.client_certificate = Some(ClientCertificateSource {
+                certificate_file,
+                private_key_file,
+            });
+            assert_eq!(
+                DirectHostBinding::from_host_config(&config),
+                Err(DirectHostBindingError::InvalidClientCertificatePath)
+            );
+        }
     }
 }

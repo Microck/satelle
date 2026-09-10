@@ -833,6 +833,7 @@ mod tests {
                 path: PathBuf::from("/tmp/token"),
             }),
             ca_bundle: None,
+            client_certificate: None,
             provider_auth: BTreeMap::new(),
         }
     }

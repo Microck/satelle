@@ -77,6 +77,7 @@ impl DaemonEventClient {
         binding: &DirectHostBinding,
         token: satelle_host::ApiBearerToken,
         ca_bundle: Option<&[u8]>,
+        client_certificate: Option<&crate::ClientCertificate>,
     ) -> Result<Self, DaemonEventError> {
         let expected_host_identity = binding.expected_host_identity().to_string();
         HeaderValue::from_str(&expected_host_identity)
@@ -85,13 +86,14 @@ impl DaemonEventClient {
             "{}/v1/events",
             binding.origin().replacen("https://", "wss://", 1)
         );
-        let tls_config = websocket_tls_config(ca_bundle).map_err(|error| match error {
-            WebSocketTrustError::InvalidCaBundle => DaemonEventError::InvalidCaBundle,
-            WebSocketTrustError::EmptyCaBundle => DaemonEventError::EmptyCaBundle,
-            WebSocketTrustError::TlsConfiguration(error) => {
-                DaemonEventError::TlsConfiguration(error)
-            }
-        })?;
+        let tls_config =
+            websocket_tls_config(ca_bundle, client_certificate).map_err(|error| match error {
+                WebSocketTrustError::InvalidCaBundle => DaemonEventError::InvalidCaBundle,
+                WebSocketTrustError::EmptyCaBundle => DaemonEventError::EmptyCaBundle,
+                WebSocketTrustError::TlsConfiguration(error) => {
+                    DaemonEventError::TlsConfiguration(error)
+                }
+            })?;
         Ok(Self {
             endpoint: EventEndpoint::Direct { url, tls_config },
             token,

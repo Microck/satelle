@@ -199,6 +199,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "admission_cancellations",
             "api_tokens",
             "authorized_provider_bindings",
+            "client_certificate_audit",
             "control_leases",
             "daemon_identity",
             "idempotency_hmac_keys",
@@ -221,6 +222,23 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "turn_private_refs",
             "turns",
         ]
+    );
+
+    // Certificate audits retain a fingerprint and authorization references.
+    // Certificate bodies, private keys, and bearer values are never persisted.
+    assert_table_columns(
+        &storage,
+        "client_certificate_audit",
+        &[
+            "sequence",
+            "request_id",
+            "principal_ref",
+            "token_id",
+            "credential_revision",
+            "scopes",
+            "certificate_sha256",
+            "recorded_at_unix_nanos",
+        ],
     );
 
     assert_table_columns(

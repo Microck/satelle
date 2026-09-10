@@ -14,8 +14,9 @@ use satelle_core::{
     SetupReport, SetupRequiredInput, SetupSchemaVersion, SshHostBinding, StopResult, TransportKind,
     TurnId, load_user_api_rate_limits, open_or_create_owner_only_directory,
     open_or_create_owner_only_file, persist_new_owner_only_config_file,
-    persist_new_owner_only_secret_file, read_owner_only_secret_config_file,
-    read_owner_only_secret_file, read_trusted_ca_bundle_file, resolve_path_set,
+    persist_new_owner_only_secret_file, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    resolve_path_set,
 };
 use satelle_host::{
     AdmissionCancellation, ApiBearerToken, ApiScopes, ControllerTransportProbe, DaemonLogPage,
@@ -23,8 +24,8 @@ use satelle_host::{
     LogPageQuery, TurnIntent, TurnOutcome, admission_request_timeout,
 };
 use satelle_transport::{
-    ApiError, ApiErrorCode, DaemonClient, DaemonClientError, DaemonEventClient, DaemonEventError,
-    DaemonServer, DaemonServerConfig, DaemonShutdownHandle, TurnRequest,
+    ApiError, ApiErrorCode, ClientCertificate, DaemonClient, DaemonClientError, DaemonEventClient,
+    DaemonEventError, DaemonServer, DaemonServerConfig, DaemonShutdownHandle, TurnRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -1490,6 +1491,7 @@ impl LocalDaemonConfigIdentity {
         host_config.expected_host_id = None;
         host_config.api_token = None;
         host_config.ca_bundle = None;
+        host_config.client_certificate = None;
         #[cfg(feature = "test-support")]
         let test_support_adapter = std::env::var(TEST_SUPPORT_ADAPTER_ENV).ok();
         #[cfg(not(feature = "test-support"))]
@@ -7982,13 +7984,19 @@ fn direct_transport(host: &SelectedHost) -> Result<DirectTransport, SatelleError
         .transpose()
         .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
     let ca_bundle = ca_bundle.as_deref().map(str::as_bytes);
+    let client_certificate = direct_client_certificate(&binding)?;
     let client = Arc::new(
-        DaemonClient::https(&binding, http_token, ca_bundle)
+        DaemonClient::https(&binding, http_token, ca_bundle, client_certificate.as_ref())
             .map_err(|error| direct_transport_error(&host.alias, error))?
             .with_admission_timeout(admission_request_timeout(&host.config)),
     );
-    let event_client = DaemonEventClient::wss(&binding, event_token, ca_bundle)
-        .map_err(|error| direct_event_error(&host.alias, error))?;
+    let event_client = DaemonEventClient::wss(
+        &binding,
+        event_token,
+        ca_bundle,
+        client_certificate.as_ref(),
+    )
+    .map_err(|error| direct_event_error(&host.alias, error))?;
     let event_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -10079,6 +10087,7 @@ fn ssh_bootstrap_host(host: &SelectedHost) -> Result<SelectedHost, SatelleError>
     config.address = Some(settings.address.clone());
     config.network = None;
     config.ca_bundle = None;
+    config.client_certificate = None;
     // The direct daemon already proved this durable credential unreachable. The SSH leg must
     // select the tokenless read-bootstrap branch instead of retrying the same credential.
     config.api_token = None;
@@ -10211,11 +10220,42 @@ pub(crate) fn discover_direct_host_identity(host: &SelectedHost) -> Result<Strin
         .map(read_trusted_ca_bundle_file)
         .transpose()
         .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
-    let client = DaemonClient::https(&binding, token, ca_bundle.as_deref().map(str::as_bytes))
-        .map_err(|error| direct_transport_error(&host.alias, error))?;
+    let client_certificate = direct_client_certificate(&binding)?;
+    let client = DaemonClient::https(
+        &binding,
+        token,
+        ca_bundle.as_deref().map(str::as_bytes),
+        client_certificate.as_ref(),
+    )
+    .map_err(|error| direct_transport_error(&host.alias, error))?;
     client
         .discover_host_identity()
         .map_err(|error| direct_transport_error(&host.alias, error))
+}
+
+fn direct_client_certificate(
+    binding: &DirectHostBinding,
+) -> Result<Option<ClientCertificate>, SatelleError> {
+    let Some(source) = binding.client_certificate() else {
+        return Ok(None);
+    };
+    let certificate =
+        read_owner_controlled_config_file(&source.certificate_file).map_err(|error| {
+            SatelleError::config_error(
+                "the TLS client certificate file is unavailable or unsafe",
+                Some(error.to_string()),
+            )
+        })?;
+    let private_key =
+        read_owner_only_secret_config_file(&source.private_key_file).map_err(|error| {
+            SatelleError::config_error(
+                "the TLS client private key file is unavailable or unsafe",
+                Some(error.to_string()),
+            )
+        })?;
+    ClientCertificate::from_pem(certificate.as_bytes(), private_key.as_bytes())
+        .map(Some)
+        .map_err(|error| SatelleError::config_error(error.to_string(), None))
 }
 
 pub(crate) fn cleanup_ssh_host_cache(
