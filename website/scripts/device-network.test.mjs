@@ -62,9 +62,9 @@ test('pulse endpoints track the moving source and stop at the Host, never telepo
   }
 });
 test('completion returns a smooth acknowledgment to the original Controller before idle',()=>{
-  const complete=m.networkFrame(m.TIMING.complete), start=m.networkFrame(m.TIMING.acknowledge), sent=m.networkFrame(m.TIMING.cooldown), idle=m.networkFrame(m.TIMING.rest);
-  assert.equal(complete.phase,'complete');assert.equal(start.phase,'acknowledging');assert.equal(sent.phase,'acknowledging');
-  assert.equal(start.ackSignal,0);assert.equal(sent.ackSignal,1);assert.equal(sent.ackEffect,1);
+  const complete=m.networkFrame(m.TIMING.complete), start=m.networkFrame(m.TIMING.acknowledge), sent=m.networkFrame(m.TIMING.cooldown-1), cooling=m.networkFrame(m.TIMING.cooldown), idle=m.networkFrame(m.TIMING.rest);
+  assert.equal(complete.phase,'complete');assert.equal(start.phase,'acknowledging');assert.equal(sent.phase,'acknowledging');assert.equal(cooling.phase,'cooling');
+  assert.equal(start.ackSignal,0);assert.ok(sent.ackSignal>0.99);assert.ok(sent.ackEffect>0.99);assert.equal(cooling.ackSignal,1);
   assert.equal(idle.phase,'idle');assert.equal(idle.heat,0);assert.equal(idle.ackEffect,0);
 });
 test('device rotation is a gentle tilt, not upside-down tumbling',()=>{
