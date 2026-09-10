@@ -1302,7 +1302,7 @@ test("native release archives use canonical names and match native npm executabl
     schema_version: 1,
     version: workspaceVersion(),
     protocol_version: "15",
-    storage_schema_version: 16,
+    storage_schema_version: 17,
     minimum_cli_version: "0.1.10",
   });
   assert.ok(readFileSync(path.join(githubRoot, "SHA256SUMS"), "utf8").includes(

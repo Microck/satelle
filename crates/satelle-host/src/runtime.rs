@@ -3837,6 +3837,53 @@ impl RuntimeHandle {
             .map_err(model::storage_failure)
     }
 
+    pub(crate) fn api_token_mutation_replay(
+        &self,
+        input: &crate::storage::IdempotencyInput,
+        principal: &ApiPrincipal,
+    ) -> Result<Option<crate::ApiTokenMutationOutcome>, SatelleError> {
+        let engine = self.engine()?;
+        let storage = engine.lock_storage()?;
+        if !storage
+            .api_principal_is_active(principal, time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)?
+        {
+            return Ok(Some(crate::ApiTokenMutationOutcome::Rejected(
+                crate::ApiTokenRejection::AuthenticationFailed,
+            )));
+        }
+        storage
+            .api_token_mutation_replay(input)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn mutate_api_token(
+        &self,
+        input: &crate::storage::IdempotencyInput,
+        mutation: &crate::ApiTokenMutation,
+        principal: &ApiPrincipal,
+    ) -> Result<crate::ApiTokenMutationResult, SatelleError> {
+        let engine = self.engine()?;
+        let mut storage = engine.lock_storage()?;
+        let at = time::OffsetDateTime::now_utc();
+        // Authentication may have changed while this operation acquired
+        // capacity. The storage lock holds that authority stable through commit.
+        if !storage
+            .api_principal_is_active(principal, at)
+            .map_err(model::storage_failure)?
+        {
+            return Ok(crate::ApiTokenMutationResult {
+                outcome: crate::ApiTokenMutationOutcome::Rejected(
+                    crate::ApiTokenRejection::AuthenticationFailed,
+                ),
+                bearer_token: None,
+            });
+        }
+        storage
+            .mutate_api_token(input, mutation, at)
+            .map_err(model::storage_failure)
+    }
+
     pub(crate) fn activate_api_token(
         &self,
         token_id: &str,

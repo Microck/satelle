@@ -16,6 +16,8 @@ const TURN_1: &str = "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21";
 const TURN_2: &str = "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e22";
 const TURN_3: &str = "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e23";
 
+#[path = "tests/api-token-migrations.rs"]
+mod api_token_migrations;
 mod atomicity;
 mod auth;
 mod cancellation;

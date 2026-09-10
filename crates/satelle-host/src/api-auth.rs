@@ -1,5 +1,6 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::ops::BitOr;
@@ -28,12 +29,14 @@ pub struct ApiBearerToken {
 
 impl ApiBearerToken {
     pub fn generate() -> Result<Self, ApiBearerTokenError> {
+        Self::generate_for_id(format!("token-{}", Uuid::now_v7().hyphenated()))
+    }
+
+    /// Storage supplies an already validated stable token ID during rotation.
+    pub(crate) fn generate_for_id(token_id: String) -> Result<Self, ApiBearerTokenError> {
         let mut secret = Zeroizing::new([0_u8; TOKEN_SECRET_BYTES]);
         getrandom::fill(secret.as_mut()).map_err(|_| ApiBearerTokenError::RandomUnavailable)?;
-        Ok(Self {
-            token_id: format!("token-{}", Uuid::now_v7().hyphenated()),
-            secret,
-        })
+        Ok(Self { token_id, secret })
     }
 
     pub fn parse(value: &str) -> Result<Self, ApiBearerTokenError> {
@@ -171,7 +174,7 @@ impl fmt::Debug for ApiTokenVerifier {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ApiScopes(u8);
 
 impl ApiScopes {
@@ -192,6 +195,23 @@ impl ApiScopes {
             effective |= Self::READ.0;
         }
         effective & required.0 == required.0
+    }
+
+    pub fn from_scopes(scopes: &[ApiScope]) -> Option<Self> {
+        let bits = scopes.iter().fold(0, |bits, scope| bits | scope.bits());
+        Self::from_bits(bits).ok()
+    }
+
+    pub fn scopes(self) -> Vec<ApiScope> {
+        [
+            ApiScope::Read,
+            ApiScope::Control,
+            ApiScope::Admin,
+            ApiScope::DiagnosticsSensitive,
+        ]
+        .into_iter()
+        .filter(|scope| self.0 & scope.bits() != 0)
+        .collect()
     }
 
     pub(crate) const fn bits(self) -> u8 {
@@ -216,6 +236,88 @@ impl BitOr for ApiScopes {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ApiScopeDecodeError;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiScope {
+    Read,
+    Control,
+    Admin,
+    DiagnosticsSensitive,
+}
+
+impl ApiScope {
+    const fn bits(self) -> u8 {
+        match self {
+            Self::Read => ApiScopes::READ.0,
+            Self::Control => ApiScopes::CONTROL.0,
+            Self::Admin => ApiScopes::ADMIN.0,
+            Self::DiagnosticsSensitive => ApiScopes::DIAGNOSTICS_SENSITIVE.0,
+        }
+    }
+}
+
+/// This input contains no raw token. Generated secrets never participate in
+/// canonical request digests or durable replay records.
+#[derive(Debug, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum ApiTokenMutation {
+    Issue {
+        scopes: ApiScopes,
+        #[serde(with = "time::serde::rfc3339::option")]
+        expires_at: Option<OffsetDateTime>,
+    },
+    Rotate {
+        token_id: String,
+        expected_credential_revision: u64,
+    },
+    Revoke {
+        token_id: String,
+        expected_credential_revision: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiTokenMetadata {
+    pub token_id: String,
+    pub principal_ref: String,
+    pub credential_revision: u64,
+    pub scopes: Vec<ApiScope>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub revoked_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiTokenRejection {
+    AuthenticationFailed,
+    InsufficientScope,
+    NotFound,
+    StateConflict,
+    InvalidExpiry,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "status",
+    content = "outcome",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ApiTokenMutationOutcome {
+    Completed(ApiTokenMetadata),
+    Rejected(ApiTokenRejection),
+}
+
+/// Only the leader of a first successful operation owns a secret. Followers
+/// share the non-secret outcome and the transport reports non-replayability.
+pub struct ApiTokenMutationResult {
+    pub outcome: ApiTokenMutationOutcome,
+    pub bearer_token: Option<ApiBearerToken>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApiPrincipal {

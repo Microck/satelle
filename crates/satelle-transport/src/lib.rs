@@ -12,6 +12,7 @@ pub use client::{
 };
 pub use contract::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ApiError, ApiErrorCode,
+    ApiTokenIssueRequest, ApiTokenResponse, ApiTokenRevokeRequest, ApiTokenRotateRequest,
     CapabilitiesResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, EventSubscription,
     HostDesktopSessionsResponse, HostStatusResponse, HostUpdateMaintenanceRequest, ImageAttachment,

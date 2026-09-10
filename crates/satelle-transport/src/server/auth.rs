@@ -1049,7 +1049,7 @@ fn single_header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&
     values.next().is_none().then_some(value)
 }
 
-fn authentication_failed(request_id: RequestId) -> Response {
+pub(super) fn authentication_failed(request_id: RequestId) -> Response {
     api_error_response(
         request_id,
         None,
