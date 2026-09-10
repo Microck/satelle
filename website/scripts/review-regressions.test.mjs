@@ -173,10 +173,14 @@ for (const mascot of [' ▐▛███▜▌\n▝▜█████▛▘\n  �
 }
 
 const installer = read('../public/install');
+const helperStart = installer.indexOf('run_with_timeout() {');
+const helperEnd = installer.indexOf('\n}\n', helperStart);
+assert.ok(helperStart >= 0 && helperEnd > helperStart);
+const helper = installer.slice(helperStart, helperEnd + 3);
 const preflightStart = installer.indexOf('command -v gh');
 const preflightEnd = installer.indexOf('validate_paths_output()', preflightStart);
 assert.ok(preflightStart >= 0 && preflightEnd > preflightStart);
-const preflight = installer.slice(preflightStart, preflightEnd);
+const preflight = `${helper}\n${installer.slice(preflightStart, preflightEnd)}`;
 
 for (const state of ['missing', 'unauthenticated', 'authenticated']) {
   test(`installer preflight handles ${state} gh without live API calls`, () => {
@@ -202,6 +206,25 @@ for (const state of ['missing', 'unauthenticated', 'authenticated']) {
     }
   });
 }
+
+test('installer preflight fails a stalled gh instead of hanging', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'satelle-preflight-stall-'));
+  try {
+    writeFileSync(join(directory, 'jq'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(directory, 'gh'), '#!/bin/sh\ntrap "" TERM\nexec sleep 30\n', { mode: 0o755 });
+    // Shrink only the preflight timeout so the lifecycle path stays fast.
+    const stalled = preflight.replace(/run_with_timeout \d+/, 'run_with_timeout 1');
+    assert.notEqual(stalled, preflight);
+    const result = spawnSync('/bin/sh', ['-c', stalled], {
+      encoding: 'utf8', env: { PATH: directory }, timeout: 30000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /gh auth login.*GH_TOKEN/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 for (const equal of [true, false]) {
   test(`installer parity check ${equal ? 'accepts identical bytes' : 'rejects drift'}`, () => {

@@ -189,7 +189,7 @@ command -v gh >/dev/null 2>&1 || {
   printf '%s\n' "gh is required to verify the signed release tag and Sigstore attestation" >&2
   exit 1
 }
-gh auth status >/dev/null 2>&1 || {
+run_with_timeout 30 gh auth status >/dev/null 2>&1 || {
   printf '%s\n' "gh is not authenticated; run 'gh auth login' or set GH_TOKEN before installing" >&2
   exit 1
 }
