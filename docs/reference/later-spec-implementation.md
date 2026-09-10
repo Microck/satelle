@@ -16,8 +16,9 @@ those pull requests merge, the integration branch gets a final pull request to
 | --- | --- | --- |
 | Configuration composition and consent | Explicit includes, source attribution, Trusted Profile expiration | Merged in PR #218 |
 | Host credential sources | Executable helpers with bounded JSON protocol, Host home expansion | Merged in PR #219 |
-| Config repair | Deterministic local repair with backups and explicit consent | Box verified; pull request pending |
-| Host operations | Storage migration, CLI/Host compatibility, explicit versions, plain update output | Pending |
+| Config repair | Deterministic local repair with backups and explicit consent | Merged in PR #220 |
+| Host update scripting | Stable target records through `host update --plain` | Box verified; pull request pending |
+| Host operations | Storage migration, CLI/Host compatibility, explicit versions | Pending |
 | Transport and inputs | Mutual TLS, token lifecycle, remote image attachments | Pending |
 | Output and package repair | Lossless output formats, launcher native repair | Pending |
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit, diagnostic bundles | Pending |
@@ -104,8 +105,10 @@ authorized runtime resolution, configuration inspection, and home-path handling.
 
 ## Config repair contract decisions
 
-Box verified 229 core tests, 45 configuration integration tests, the interactive
-repair test, workspace Clippy, and the generated documentation contract.
+The next 21 requirements passed the complete Rust suites and Clippy on Linux,
+macOS, and Windows, plus npm, documentation, and release validation. Box verified
+229 core tests, 45 configuration integration tests, the interactive repair test,
+workspace Clippy, and the generated documentation contract.
 
 - `satelle config repair` selects the local user configuration file by default.
   `--file <path>` explicitly selects a loaded user or project configuration file,
@@ -131,3 +134,18 @@ repair test, workspace Clippy, and the generated documentation contract.
   state directory before replacing the selected file. It checks that the source
   still matches the preview, then uses the existing atomic config writer while
   preserving permissions. Any failure retains the backup and restore command.
+
+## Host update scripting decisions
+
+Box verified the Host update unit tests, CLI integration tests, output contract
+tests, workspace Clippy, and generated documentation. Native pull request checks
+remain pending.
+
+- `host update --plain` emits UTF-8, LF-terminated, tab-separated records with
+  the fixed `satelle.host.update.plain.v1` schema and eleven fields.
+- Backslashes, tabs, line feeds, and carriage returns are escaped. Optional
+  values use `-`; booleans use `true` and `false`.
+- Records retain each target's outcome and confirmed changes when another
+  target fails. Prompts and diagnostics stay on stderr.
+- Plain output shares the existing consent and exit-status policy. It cannot
+  combine with `--json` or an explicit `--format`; `--quiet` retains records.

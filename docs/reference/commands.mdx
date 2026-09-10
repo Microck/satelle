@@ -71,6 +71,36 @@ eligible refresh scope and requires explicit units.
 diagnostic, updates the normal Host readiness cache, and reports whether the
 result was refreshed. It does not create a Session or admit a prompt Turn.
 
+## Host update plain records
+
+`satelle host update --plain` writes UTF-8, LF-terminated records to stdout.
+Fields are separated by TAB, with no header row:
+
+| Position | Field | Values |
+| --- | --- | --- |
+| 1 | `schema` | `satelle.host.update.plain.v1` |
+| 2 | `host` | Selected Host alias |
+| 3 | `component` | `host_daemon`, `host_daemon_service`, `codex_runtime`, `codex_native_computer_use`, or `unknown` when planning fails before targets are known |
+| 4 | `phase` | `plan`, `apply`, or `postcheck` |
+| 5 | `status` | `planned`, `unchanged`, `skipped`, `succeeded`, `failed`, `postcheck_failed`, or `cancelled` |
+| 6 | `current_version` | Observed version, or `-` |
+| 7 | `target_version` | Selected version, or `-` |
+| 8 | `changed` | `true` when this target has a confirmed applied action, otherwise `false` |
+| 9 | `restart_required` | `true` or `false` from this target's plan |
+| 10 | `error_code` | Typed error token with hyphens replaced by underscores, or `-` |
+| 11 | `recovery_command` | Shell-safe command, or `-` |
+
+Inside fields, backslash, TAB, LF, and CR become `\\`, `\t`, `\n`, and `\r`.
+The v1 field order, escaping, and token meanings are fixed. A command emits one
+plan record per target and, when it reaches application, one terminal record
+per target. Completed targets retain their outcomes when another target fails.
+Dry-runs and already-current targets do not require confirmation.
+
+`--plain` conflicts with `--json` and every explicit `--format` value. It keeps
+diagnostics and prompts on stderr, suppresses colors and human summaries, and
+uses the same consent rules and exit codes as the equivalent update command.
+`--quiet` does not suppress plain records. JSON remains the complete report.
+
 ## Unavailable command families
 
 Commands can appear in `--help` before their implementation is complete.

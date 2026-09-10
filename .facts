@@ -629,8 +629,8 @@
 - satelle host update --no-input --yes follows the same human plan-output rule as --yes when human output mode is active @spec @mvp @implemented
 - satelle host update --quiet --yes suppresses non-error human plan and progress output but does not suppress final failure summaries or required recovery guidance @spec @mvp @implemented
 - satelle host update JSON output includes planned_actions before mutation and applied_actions after mutation instead of printing human plan text @mvp @spec @implemented
-- satelle host update does not expose a --plain output mode in MVP because --json is the stable automation contract for update plans, results, and typed errors @implemented @mvp
-- satelle host update help text directs scripts and other agents to --json instead of human output or --quiet output for stable automation data @spec @mvp @implemented
+- satelle host update exposes --plain for stable target records and retains --json as its complete automation contract for plans, results, and typed errors @spec @phase4
+- satelle host update help text directs scripts to --json for complete reports or --plain for fixed target records @spec @phase4
 - satelle later adds satelle host update --plain as a stable line-oriented scripting output mode narrower than --json and not a replacement for the complete JSON automation contract @spec @later
 - satelle host update --plain is mutually exclusive with --json and every explicit --format value and reports a typed output-mode-conflict usage error for either combination @spec @contract @later
 - satelle host update --plain writes only machine-readable plain records to stdout and writes diagnostics, prompts, progress, and errors to stderr @spec @later
@@ -1172,8 +1172,8 @@
 - satelle reports a typed unsupported-trusted-profile-host-scope configuration error when a Satelle Trusted Profile uses an all-hosts, wildcard, glob, regex, project-host, or default-host scope @spec @mvp @implemented
 - satelle MVP Satelle Trusted Profiles require a non-empty explicit Satelle Mutation Command Family allowlist for noninteractive mutation consent @spec @mvp @implemented
 - satelle MVP Satelle Trusted Profiles do not support all-mutating-command consent scopes, wildcard command scopes, glob command scopes, regex command scopes, or future-command scopes @spec @mvp @implemented
-- satelle Satelle Mutation Command Family values are setup, repair, host_update, self_update_remotes, doctor_fix, and config_repair @spec @phase4
-- satelle later adds config_repair and host_storage_migrate Satelle Mutation Command Family values when those commands become available @spec @later
+- satelle Mutation Command Family values are setup, repair, host_update, self_update_remotes, doctor_fix, and config_repair @spec @phase4 @implemented
+- satelle later adds the host_storage_migrate Satelle Mutation Command Family value when those commands become available @spec @later
 - satelle Satelle Trusted Profile command-family allowlists match the command family for the selected mutating command before remote mutation planning starts @spec @mvp @implemented
 - satelle reports a typed trusted-profile-command-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit Satelle Mutation Command Family @spec @mvp @implemented
 - satelle reports a typed unsupported-trusted-profile-command-scope configuration error when a Satelle Trusted Profile uses an all-mutating-command, wildcard, glob, regex, or future-command scope @spec @mvp @implemented
@@ -1308,28 +1308,28 @@
 - satelle config explain output reports included configuration files in checked_files and sources, shows each included file's parent file and normalized include path, and attributes every effective value to the exact included or including file that won precedence @spec @phase4 @implemented
 - satelle config composition never reads, resolves, dereferences, prints, or includes raw secret material from Satelle Secret Sources while loading includes, running config check, or running config explain @spec @phase4 @implemented
 - satelle config composition treats included files as ordinary Satelle configuration files, so included project-level files cannot define Satelle Secret Sources, Satelle Trusted Profiles, YOLO enablement, concrete daemon paths, provider credentials, credential helpers, or noninteractive mutation consent @spec @phase4 @implemented
-- satelle config repair is an explicit local configuration mutation with fresh validation, redacted previews, private backups, and command-scoped consent @spec @phase4
-- satelle later config repair is an explicit user-invoked command and never runs as an implicit side effect of config check, config explain, setup, repair, doctor, preflight, run, or steer @spec @later
-- satelle later config repair changes only local CLI-visible Satelle configuration files and does not mutate remote-Host-owned configuration unless a separate remote-Host config repair command is specified @spec @later
-- satelle later config repair edits project-level configuration only when the project config file is explicitly selected on the command line @spec @later
-- satelle later config repair plans edits only from local config loading, parsing, schema, precedence, and config check diagnostics that have deterministic repairs @spec @later
-- satelle later config repair reports a typed config-repair-manual-action-required diagnostic instead of editing configuration when a diagnostic requires a user choice, raw secret material, remote Host probe, provider smoke test, OS permission change, or app approval @spec @later
-- satelle later config repair does not install, update, start, stop, restart, or reconfigure remote Host Daemon services, Codex runtime installations, operating-system permissions, app approvals, Desktop Sessions, or provider secret material @spec @later
-- satelle later config repair does not write Satelle Setup Action Ledger entries because it does not perform remote setup or repair actions @spec @later
-- satelle doctor, after satelle config repair exists, may recommend satelle config repair as a recovery command for local configuration diagnostics but never applies config repair edits itself @spec @later
-- satelle later config repair supports --dry-run to show target config files, addressed diagnostics, planned writes, backup paths, and a redacted unified diff without mutating files @spec @later
-- satelle later config repair uses the same redaction policy as config explain for human and JSON diff output and never prints raw provider secret material @spec @later
-- satelle later config repair treats dry-run previews as diagnostics and does not persist or emit a reusable apply plan @spec @later
-- satelle later config repair rebuilds and revalidates the repair plan in every non-dry-run invocation instead of applying a plan persisted by an earlier dry-run @spec @later
-- satelle later config repair creates all required byte-for-byte backups before replacing any target configuration file and aborts without writes when any backup cannot be created @spec @later
-- satelle later config repair writes backups under the invoking user's Satelle local state directory instead of beside project configuration files by default @spec @later
-- satelle later config repair reports each backup path, original file path, original digest, repaired digest, and restore command in human and JSON output @spec @later
-- satelle later config repair asks for one final interactive confirmation after showing the redacted diff and backup plan and before writing any configuration file when the plan contains mutations and --yes is absent @spec @later
-- satelle later config repair treats a user choosing No at final confirmation as a clean cancelled no-op with changed false @spec @later
-- satelle later config repair supports --yes as the explicit flag for accepting planned configuration-file mutations without final interactive confirmation @spec @later
-- satelle later config repair does not write configuration files when --no-input is set unless --yes is also set or an applicable user-level Satelle Trusted Profile supplies config_repair consent @spec @later
-- satelle later config repair accepts Satelle Trusted Profile consent only for Host-scoped edits when the selected user-level Trusted Profile includes the config_repair Satelle Mutation Command Family and target Host Alias @spec @later
-- satelle later config repair never treats project-level configuration as noninteractive mutation consent even when project-level configuration selected the Host, profile, or file needing repair @spec @later
+- satelle config repair is an explicit local configuration mutation with fresh validation, redacted previews, private backups, and command-scoped consent @spec @phase4 @implemented
+- satelle config repair is an explicit user-invoked command and never runs as an implicit side effect of config check, config explain, setup, repair, doctor, preflight, run, or steer @spec @phase4 @implemented
+- satelle config repair changes only local CLI-visible Satelle configuration files and does not mutate remote-Host-owned configuration unless a separate remote-Host config repair command is specified @spec @phase4 @implemented
+- satelle config repair edits project-level configuration only when the project config file is explicitly selected on the command line @spec @phase4 @implemented
+- satelle config repair plans edits only from local config loading, parsing, schema, precedence, and config check diagnostics that have deterministic repairs @spec @phase4 @implemented
+- satelle config repair reports a typed config-repair-manual-action-required diagnostic instead of editing configuration when a diagnostic requires a user choice, raw secret material, remote Host probe, provider smoke test, OS permission change, or app approval @spec @phase4 @implemented
+- satelle config repair does not install, update, start, stop, restart, or reconfigure remote Host Daemon services, Codex runtime installations, operating-system permissions, app approvals, Desktop Sessions, or provider secret material @spec @phase4 @implemented
+- satelle config repair does not write Satelle Setup Action Ledger entries because it does not perform remote setup or repair actions @spec @phase4 @implemented
+- satelle doctor may recommend satelle config repair as a recovery command for local configuration diagnostics but never applies config repair edits itself @spec @phase4 @implemented
+- satelle config repair supports --dry-run to show target config files, addressed diagnostics, planned writes, backup paths, and a redacted unified diff without mutating files @spec @phase4 @implemented
+- satelle config repair uses the same redaction policy as config explain for human and JSON diff output and never prints raw provider secret material @spec @phase4 @implemented
+- satelle config repair treats dry-run previews as diagnostics and does not persist or emit a reusable apply plan @spec @phase4 @implemented
+- satelle config repair rebuilds and revalidates the repair plan in every non-dry-run invocation instead of applying a plan persisted by an earlier dry-run @spec @phase4 @implemented
+- satelle config repair creates all required byte-for-byte backups before replacing any target configuration file and aborts without writes when any backup cannot be created @spec @phase4 @implemented
+- satelle config repair writes backups under the invoking user's Satelle local state directory instead of beside project configuration files by default @spec @phase4 @implemented
+- satelle config repair reports each backup path, original file path, original digest, repaired digest, and restore command in human and JSON output @spec @phase4 @implemented
+- satelle config repair asks for one final interactive confirmation after showing the redacted diff and backup plan and before writing any configuration file when the plan contains mutations and --yes is absent @spec @phase4 @implemented
+- satelle config repair treats a user choosing No at final confirmation as a clean cancelled no-op with changed false @spec @phase4 @implemented
+- satelle config repair supports --yes as the explicit flag for accepting planned configuration-file mutations without final interactive confirmation @spec @phase4 @implemented
+- satelle config repair does not write configuration files when --no-input is set unless --yes is also set or an applicable user-level Satelle Trusted Profile supplies config_repair consent @spec @phase4 @implemented
+- satelle config repair accepts Satelle Trusted Profile consent only for Host-scoped edits when the selected user-level Trusted Profile includes the config_repair Satelle Mutation Command Family and target Host Alias @spec @phase4 @implemented
+- satelle config repair never treats project-level configuration as noninteractive mutation consent even when project-level configuration selected the Host, profile, or file needing repair @spec @phase4 @implemented
 - satelle executable credential helpers are provider authentication Secret Sources resolved by the target Host Daemon instead of by the local CLI @spec @phase4 @implemented
 - satelle executable credential helper descriptors may be defined only in user-level configuration or remote-host owned user-level configuration for the OS user that resolves the provider authentication binding @spec @phase4 @implemented
 - satelle project-level configuration cannot define executable credential helper descriptors, helper executable paths, helper arguments, helper environment variables, helper timeouts, or helper protocol options @implemented @phase4

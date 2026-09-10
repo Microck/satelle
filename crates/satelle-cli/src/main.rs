@@ -797,6 +797,11 @@ struct HostUpdateCommand {
         help = "Suppress non-error human plan and progress output; use --json for stable automation data"
     )]
     quiet: bool,
+    #[arg(
+        long,
+        help = "Emit fixed tab-separated target records; use --json for the complete report"
+    )]
+    plain: bool,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -2037,7 +2042,8 @@ fn execute_command(
         log_verbosity,
         configured_log_verbosity,
     );
-    let human_style = HumanStyle::detect(no_color);
+    let plain_host_update = matches!(&command, Command::Host { command: HostCommand::Update(command) } if command.plain);
+    let human_style = HumanStyle::detect(no_color || plain_host_update);
     human_style.install();
 
     match command {
@@ -10808,14 +10814,21 @@ fn run_host_update(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    run_host_update_invocation(command.into(), config, format)
+    if command.plain && command.output_args.is_explicit() {
+        return Err(failure(SatelleError::output_mode_conflict(
+            "host update --plain cannot be combined with --json or --format",
+        )));
+    }
+    let output = host_update::HostUpdateOutput::from_cli(format, command.plain);
+    run_host_update_invocation(command.into(), config, output)
 }
 
 fn run_host_update_invocation(
     command: HostUpdateInvocation,
     config: ConfigContext<'_>,
-    format: OutputFormat,
+    format: host_update::HostUpdateOutput,
 ) -> Result<(), CliFailure> {
+    use host_update::PlainUpdateStage;
     validate_host_update_components(&command.component).map_err(failure)?;
     if command.all_remotes || command.host.len() > 1 {
         return Err(failure(SatelleError::invalid_usage(
@@ -10834,12 +10847,26 @@ fn run_host_update_invocation(
     let (components, includes_all) = selected_host_update_components(&command.component);
     let mut report =
         transport::plan_host_update(&host, &command.host_version, &components, includes_all)
-            .map_err(failure)?;
+            .map_err(|error| {
+                if format.is_plain() {
+                    print!(
+                        "{}",
+                        host_update::render_host_update_plain_planning_error(&host.alias, &error)
+                    );
+                }
+                failure(error)
+            })?;
+    if format.is_plain() {
+        print!(
+            "{}",
+            host_update::render_host_update_plain(&report, PlainUpdateStage::Plan)
+        );
+    }
     if command.dry_run {
         report = report.into_dry_run();
         if format.is_json() {
             print_json(&report).map_err(failure)?;
-        } else if !command.quiet {
+        } else if !format.is_plain() && !command.quiet {
             print!("{}", host_update::render_host_update_plan(&report));
         }
         return Ok(());
@@ -10847,7 +10874,7 @@ fn run_host_update_invocation(
     if !report.confirmation_required {
         if format.is_json() {
             print_json(&report).map_err(failure)?;
-        } else if !command.quiet {
+        } else if !format.is_plain() && !command.quiet {
             let has_skipped_targets = report.targets.iter().any(|target| {
                 target.disposition == satelle_core::host_update::HostUpdateDisposition::Skipped
             });
@@ -10861,35 +10888,58 @@ fn run_host_update_invocation(
         }
         return Ok(());
     }
-    if !format.is_json() && !command.quiet {
+    if !format.is_plain() && !format.is_json() && !command.quiet {
         print!("{}", host_update::render_host_update_plan(&report));
     }
     let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
     let consent_granted = host_update_consent_granted(command.yes, trusted_consent);
     if noninteractive && !consent_granted {
-        return Err(failure(SatelleError::setup_consent_required(
+        let error = SatelleError::setup_consent_required(
             &report.planned_actions,
             host_update_consent_command(&host.alias, &command.component),
-        )));
+        );
+        if format.is_plain() {
+            print!(
+                "{}",
+                host_update::render_host_update_plain(&report, PlainUpdateStage::Failed(&error))
+            );
+        }
+        return Err(failure(error));
     }
     if !consent_granted {
         let confirmed = cliclack::confirm(format!("Apply the Host update to '{}'?", host.alias))
             .initial_value(false)
             .interact()
             .map_err(|source| {
-                failure(setup_interaction_error(
-                    "could not read Host update confirmation",
-                    source,
-                ))
+                let error =
+                    setup_interaction_error("could not read Host update confirmation", source);
+                if format.is_plain() {
+                    print!(
+                        "{}",
+                        host_update::render_host_update_plain(
+                            &report,
+                            PlainUpdateStage::Failed(&error)
+                        )
+                    );
+                }
+                failure(error)
             })?;
         if !confirmed {
-            if !command.quiet {
+            if format.is_plain() {
+                print!(
+                    "{}",
+                    host_update::render_host_update_plain(&report, PlainUpdateStage::Cancelled)
+                );
+            } else if !command.quiet {
                 println!("No changes applied.");
             }
             return Ok(());
         }
     }
 
+    // Keep the displayed target mapping only when plain failure output needs
+    // to join confirmed action IDs back to their original update targets.
+    let plain_plan = format.is_plain().then(|| report.clone());
     report = transport::apply_host_update(
         &host,
         &command.host_version,
@@ -10897,8 +10947,22 @@ fn run_host_update_invocation(
         &components,
         includes_all,
     )
-    .map_err(failure)?;
-    if format.is_json() {
+    .map_err(|error| {
+        if let Some(plan) = &plain_plan {
+            print!(
+                "{}",
+                host_update::render_host_update_plain(plan, PlainUpdateStage::Failed(&error))
+            );
+        }
+        failure(error)
+    })?;
+    if format.is_plain() {
+        print!(
+            "{}",
+            host_update::render_host_update_plain(&report, PlainUpdateStage::Completed)
+        );
+        Ok(())
+    } else if format.is_json() {
         print_json(&report).map_err(failure)
     } else if command.quiet {
         println!(
