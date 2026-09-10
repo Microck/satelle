@@ -147,6 +147,11 @@ const MIGRATIONS: [Migration; 16] = [
     },
 ];
 
+const _: () = assert!(
+    MIGRATIONS[MIGRATIONS.len() - 1].version
+        == satelle_core::host_update::HOST_STORAGE_SCHEMA_VERSION
+);
+
 #[derive(Clone, Copy)]
 struct Migration {
     version: i64,

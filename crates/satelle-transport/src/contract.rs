@@ -53,7 +53,7 @@ pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
 // Protocol v15 distinguishes Controller uploads from explicit Host image paths.
 // Older peers cannot interpret the tagged attachment request, so every protected
 // operation requires the current protocol before decoding its payload.
-pub(crate) const PROTOCOL_VERSION: &str = "15";
+pub(crate) const PROTOCOL_VERSION: &str = satelle_core::host_update::HOST_PROTOCOL_VERSION;
 
 macro_rules! define_schema_token {
     ($name:ident, $token:literal) => {

@@ -43,23 +43,23 @@ pub(crate) enum PlainUpdateStage<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostVersionRelation {
     Missing,
-    OlderThanCli,
-    MatchesCli,
-    NewerThanCli,
+    Older,
+    Matches,
+    Newer,
     RequiresNewerCli,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostUpdateInspection {
     pub current_version: Option<String>,
-    pub relation_to_cli: HostVersionRelation,
+    pub relation_to_target: HostVersionRelation,
     pub remote_platform: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostUpdateServiceInspection {
     pub current_version: Option<String>,
-    pub relation_to_cli: HostVersionRelation,
+    pub relation_to_target: HostVersionRelation,
     pub destination: String,
 }
 
@@ -71,12 +71,12 @@ pub struct VerifiedHostArtifact {
     pub daemon_destination: Option<String>,
 }
 
-/// T4 owns artifact discovery and target-matrix policy. T1 consumes only a
-/// verified artifact for the exact invoking CLI version and remote platform.
+/// Artifact discovery owns release verification and platform policy. Planning
+/// consumes only the verified identity of the selected release and platform.
 pub trait VerifiedHostArtifactResolver {
-    fn resolve_exact_cli_artifact(
+    fn resolve_release_artifact(
         &self,
-        cli_version: &str,
+        target_version: &str,
         remote_platform: &str,
     ) -> Result<Option<VerifiedHostArtifact>, HostUpdatePlanError>;
 }
@@ -137,6 +137,8 @@ pub enum HostUpdatePlanError {
 pub struct HostUpdatePlanRequest<'a> {
     pub host: &'a str,
     pub cli_version: &'a str,
+    pub target_version: &'a str,
+    pub version_source: HostUpdateVersionSource,
     pub components: &'a [HostUpdateComponent],
     pub includes_all: bool,
     pub host_inspection: &'a HostUpdateInspection,
@@ -191,51 +193,21 @@ fn plan_host_targets(
     request: &HostUpdatePlanRequest<'_>,
     artifacts: &dyn VerifiedHostArtifactResolver,
 ) -> Result<Vec<HostUpdateTargetPlan>, HostUpdatePlanError> {
-    match request.host_inspection.relation_to_cli {
-        HostVersionRelation::NewerThanCli => {
-            return Err(HostUpdatePlanError::HostBinaryNewerThanCli {
-                host_version: request
-                    .host_inspection
-                    .current_version
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                cli_version: request.cli_version.to_string(),
-            });
-        }
-        HostVersionRelation::RequiresNewerCli => {
-            return Err(HostUpdatePlanError::HostUpdateRequiresCliUpgrade {
-                cli_version: request.cli_version.to_string(),
-            });
-        }
-        HostVersionRelation::Missing
-        | HostVersionRelation::OlderThanCli
-        | HostVersionRelation::MatchesCli => {}
-    }
-
-    let disposition = match request.host_inspection.relation_to_cli {
-        HostVersionRelation::Missing => HostUpdateDisposition::Install,
-        HostVersionRelation::OlderThanCli => HostUpdateDisposition::Update,
-        HostVersionRelation::MatchesCli => HostUpdateDisposition::Current,
-        HostVersionRelation::NewerThanCli | HostVersionRelation::RequiresNewerCli => unreachable!(),
-    };
+    let disposition = host_update_disposition(
+        request.host_inspection.relation_to_target,
+        request.host_inspection.current_version.as_deref(),
+        request.cli_version,
+        request.version_source,
+    )?;
     let mut service_disposition = request
         .service_inspection
-        .map(|service| match service.relation_to_cli {
-            HostVersionRelation::Missing => Ok(HostUpdateDisposition::Install),
-            HostVersionRelation::OlderThanCli => Ok(HostUpdateDisposition::Update),
-            HostVersionRelation::MatchesCli => Ok(HostUpdateDisposition::Current),
-            HostVersionRelation::NewerThanCli => Err(HostUpdatePlanError::HostBinaryNewerThanCli {
-                host_version: service
-                    .current_version
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-                cli_version: request.cli_version.to_string(),
-            }),
-            HostVersionRelation::RequiresNewerCli => {
-                Err(HostUpdatePlanError::HostUpdateRequiresCliUpgrade {
-                    cli_version: request.cli_version.to_string(),
-                })
-            }
+        .map(|service| {
+            host_update_disposition(
+                service.relation_to_target,
+                service.current_version.as_deref(),
+                request.cli_version,
+                request.version_source,
+            )
         })
         .transpose()?;
     if disposition != HostUpdateDisposition::Current
@@ -252,15 +224,15 @@ fn plan_host_targets(
         None
     } else {
         let artifact = artifacts
-            .resolve_exact_cli_artifact(
-                request.cli_version,
+            .resolve_release_artifact(
+                request.target_version,
                 &request.host_inspection.remote_platform,
             )?
             .ok_or_else(|| HostUpdatePlanError::HostArtifactUnavailable {
-                cli_version: request.cli_version.to_string(),
+                cli_version: request.target_version.to_string(),
                 remote_platform: request.host_inspection.remote_platform.clone(),
             })?;
-        if artifact.version != request.cli_version
+        if artifact.version != request.target_version
             || artifact.remote_platform != request.host_inspection.remote_platform
             || artifact.digest.len() != 64
             || !artifact
@@ -269,7 +241,7 @@ fn plan_host_targets(
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err(HostUpdatePlanError::InvalidArtifact {
-                expected_version: request.cli_version.to_string(),
+                expected_version: request.target_version.to_string(),
                 expected_platform: request.host_inspection.remote_platform.clone(),
             });
         }
@@ -291,8 +263,8 @@ fn plan_host_targets(
     let mut targets = vec![HostUpdateTargetPlan {
         target: HostUpdateTarget::HostDaemon,
         current_version: request.host_inspection.current_version.clone(),
-        target_version: request.cli_version.to_string(),
-        version_source: HostUpdateVersionSource::InvokingCliRelease,
+        target_version: request.target_version.to_string(),
+        version_source: request.version_source,
         artifact_digest: if daemon_mutations.is_empty() {
             None
         } else {
@@ -305,7 +277,7 @@ fn plan_host_targets(
     if let Some((service, disposition)) = request.service_inspection.zip(service_disposition) {
         let mut remote_mutations = Vec::new();
         if disposition != HostUpdateDisposition::Current
-            && request.host_inspection.relation_to_cli == HostVersionRelation::MatchesCli
+            && request.host_inspection.relation_to_target == HostVersionRelation::Matches
         {
             // A service-only repair still needs the authenticated daemon
             // artifact that the repaired definition will execute.
@@ -331,8 +303,8 @@ fn plan_host_targets(
         targets.push(HostUpdateTargetPlan {
             target: HostUpdateTarget::HostDaemonService,
             current_version: service.current_version.clone(),
-            target_version: request.cli_version.to_string(),
-            version_source: HostUpdateVersionSource::InvokingCliRelease,
+            target_version: request.target_version.to_string(),
+            version_source: request.version_source,
             artifact_digest,
             disposition,
             restart_impact: if remote_mutations.is_empty() {
@@ -345,6 +317,31 @@ fn plan_host_targets(
     }
 
     Ok(targets)
+}
+
+fn host_update_disposition(
+    relation: HostVersionRelation,
+    current_version: Option<&str>,
+    cli_version: &str,
+    source: HostUpdateVersionSource,
+) -> Result<HostUpdateDisposition, HostUpdatePlanError> {
+    match relation {
+        HostVersionRelation::Missing => Ok(HostUpdateDisposition::Install),
+        HostVersionRelation::Older => Ok(HostUpdateDisposition::Update),
+        HostVersionRelation::Matches => Ok(HostUpdateDisposition::Current),
+        HostVersionRelation::Newer if source == HostUpdateVersionSource::ExplicitRelease => {
+            Ok(HostUpdateDisposition::Update)
+        }
+        HostVersionRelation::Newer => Err(HostUpdatePlanError::HostBinaryNewerThanCli {
+            host_version: current_version.unwrap_or("unknown").to_string(),
+            cli_version: cli_version.to_string(),
+        }),
+        HostVersionRelation::RequiresNewerCli => {
+            Err(HostUpdatePlanError::HostUpdateRequiresCliUpgrade {
+                cli_version: cli_version.to_string(),
+            })
+        }
+    }
 }
 
 fn mutation_for(
@@ -827,9 +824,9 @@ mod tests {
     struct Artifact(Option<VerifiedHostArtifact>);
 
     impl VerifiedHostArtifactResolver for Artifact {
-        fn resolve_exact_cli_artifact(
+        fn resolve_release_artifact(
             &self,
-            _cli_version: &str,
+            _target_version: &str,
             _remote_platform: &str,
         ) -> Result<Option<VerifiedHostArtifact>, HostUpdatePlanError> {
             Ok(self.0.clone())
@@ -845,10 +842,10 @@ mod tests {
         }))
     }
 
-    fn host_inspection(relation_to_cli: HostVersionRelation) -> HostUpdateInspection {
+    fn host_inspection(relation_to_target: HostVersionRelation) -> HostUpdateInspection {
         HostUpdateInspection {
             current_version: Some("1.2.2".to_string()),
-            relation_to_cli,
+            relation_to_target,
             remote_platform: "linux-x64".to_string(),
         }
     }
@@ -857,7 +854,7 @@ mod tests {
         HostUpdateServiceInspection {
             // The service asset is managed but does not embed its own version.
             current_version: None,
-            relation_to_cli: HostVersionRelation::OlderThanCli,
+            relation_to_target: HostVersionRelation::Older,
             destination: "/home/operator/.config/systemd/user/satelle.service".to_string(),
         }
     }
@@ -867,15 +864,62 @@ mod tests {
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
-                host_inspection: &host_inspection(HostVersionRelation::OlderThanCli),
+                host_inspection: &host_inspection(HostVersionRelation::Older),
                 service_inspection: Some(&service_inspection()),
                 codex_inspections: &[],
             },
             &artifact(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn explicit_release_selection_plans_upgrades_and_downgrades_for_both_host_targets() {
+        for (current, relation) in [
+            ("1.2.2", HostVersionRelation::Older),
+            ("1.2.4", HostVersionRelation::Newer),
+        ] {
+            let host = HostUpdateInspection {
+                current_version: Some(current.to_string()),
+                relation_to_target: relation,
+                remote_platform: "linux-x64".to_string(),
+            };
+            let service = HostUpdateServiceInspection {
+                current_version: Some(current.to_string()),
+                relation_to_target: relation,
+                ..service_inspection()
+            };
+            let report = build_host_update_plan(
+                HostUpdatePlanRequest {
+                    host: "office",
+                    cli_version: "1.2.4",
+                    target_version: "1.2.3",
+                    version_source: HostUpdateVersionSource::ExplicitRelease,
+                    components: &[HostUpdateComponent::Host],
+                    includes_all: false,
+                    host_inspection: &host,
+                    service_inspection: Some(&service),
+                    codex_inspections: &[],
+                },
+                &artifact(),
+            )
+            .unwrap();
+            assert!(report.confirmation_required);
+            assert_eq!(report.targets.len(), 2);
+            for target in &report.targets {
+                assert_eq!(target.current_version.as_deref(), Some(current));
+                assert_eq!(target.target_version, "1.2.3");
+                assert_eq!(
+                    target.version_source,
+                    HostUpdateVersionSource::ExplicitRelease
+                );
+                assert_eq!(target.disposition, HostUpdateDisposition::Update);
+            }
+        }
     }
 
     #[test]
@@ -1006,7 +1050,7 @@ mod tests {
 
     #[test]
     fn no_filter_checks_host_and_codex_and_keeps_codex_actions_separate() {
-        let host = host_inspection(HostVersionRelation::OlderThanCli);
+        let host = host_inspection(HostVersionRelation::Older);
         let codex = [
             CodexUpdateInspection {
                 target: HostUpdateTarget::CodexRuntime,
@@ -1042,6 +1086,8 @@ mod tests {
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[],
                 includes_all: false,
                 host_inspection: &host,
@@ -1067,12 +1113,14 @@ mod tests {
 
     #[test]
     fn host_selection_targets_only_exact_cli_host_artifacts() {
-        let host = host_inspection(HostVersionRelation::OlderThanCli);
+        let host = host_inspection(HostVersionRelation::Older);
         let service = service_inspection();
         let report = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
@@ -1102,11 +1150,13 @@ mod tests {
 
     #[test]
     fn host_selection_omits_an_unobserved_service_asset() {
-        let host = host_inspection(HostVersionRelation::OlderThanCli);
+        let host = host_inspection(HostVersionRelation::Older);
         let report = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
@@ -1123,16 +1173,18 @@ mod tests {
 
     #[test]
     fn daemon_update_republishes_the_current_service_for_the_new_artifact_path() {
-        let host = host_inspection(HostVersionRelation::OlderThanCli);
+        let host = host_inspection(HostVersionRelation::Older);
         let service = HostUpdateServiceInspection {
             current_version: Some("1.2.3".to_string()),
-            relation_to_cli: HostVersionRelation::MatchesCli,
+            relation_to_target: HostVersionRelation::Matches,
             destination: "/home/operator/.config/systemd/user/satelle.service".to_string(),
         };
         let report = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
@@ -1179,17 +1231,19 @@ mod tests {
 
     #[test]
     fn missing_service_asset_renders_as_not_installed() {
-        let mut host = host_inspection(HostVersionRelation::MatchesCli);
+        let mut host = host_inspection(HostVersionRelation::Matches);
         host.current_version = Some("1.2.3".to_string());
         let service = HostUpdateServiceInspection {
             current_version: None,
-            relation_to_cli: HostVersionRelation::Missing,
+            relation_to_target: HostVersionRelation::Missing,
             destination: "/home/operator/.config/systemd/user/satelle.service".to_string(),
         };
         let report = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
@@ -1216,17 +1270,19 @@ mod tests {
 
     #[test]
     fn current_host_does_not_resolve_an_update_artifact() {
-        let mut host = host_inspection(HostVersionRelation::MatchesCli);
+        let mut host = host_inspection(HostVersionRelation::Matches);
         host.current_version = Some("1.2.3".to_string());
         let service = HostUpdateServiceInspection {
             current_version: Some("1.2.3".to_string()),
-            relation_to_cli: HostVersionRelation::MatchesCli,
+            relation_to_target: HostVersionRelation::Matches,
             destination: "/home/operator/.config/systemd/user/satelle.service".to_string(),
         };
         let report = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
@@ -1248,7 +1304,7 @@ mod tests {
 
     #[test]
     fn invalid_artifact_digest_blocks_the_update_plan() {
-        let host = host_inspection(HostVersionRelation::OlderThanCli);
+        let host = host_inspection(HostVersionRelation::Older);
         let invalid_artifact = Artifact(Some(VerifiedHostArtifact {
             version: "1.2.3".to_string(),
             remote_platform: "linux-x64".to_string(),
@@ -1260,6 +1316,8 @@ mod tests {
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
@@ -1300,7 +1358,7 @@ mod tests {
 
     #[test]
     fn current_daemon_with_outdated_service_still_requires_the_exact_release_artifact() {
-        let mut host = host_inspection(HostVersionRelation::MatchesCli);
+        let mut host = host_inspection(HostVersionRelation::Matches);
         host.current_version = Some("1.2.3".to_string());
         let service = service_inspection();
 
@@ -1308,6 +1366,8 @@ mod tests {
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
@@ -1330,6 +1390,8 @@ mod tests {
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
@@ -1372,13 +1434,15 @@ mod tests {
 
     #[test]
     fn unavailable_codex_evidence_is_skipped_by_default_but_blocks_explicit_selection() {
-        let host = host_inspection(HostVersionRelation::OlderThanCli);
+        let host = host_inspection(HostVersionRelation::Older);
         let unavailable = unavailable_codex_inspections("1.0.0");
 
         build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &host,
@@ -1393,6 +1457,8 @@ mod tests {
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[],
                 includes_all: false,
                 host_inspection: &host,
@@ -1417,6 +1483,8 @@ mod tests {
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[],
                 includes_all: true,
                 host_inspection: &host,
@@ -1466,11 +1534,13 @@ mod tests {
 
     #[test]
     fn newer_host_and_missing_artifact_fail_before_a_plan_exists() {
-        let newer = host_inspection(HostVersionRelation::NewerThanCli);
+        let newer = host_inspection(HostVersionRelation::Newer);
         let newer_error = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &newer,
@@ -1485,12 +1555,14 @@ mod tests {
             HostUpdatePlanError::HostBinaryNewerThanCli { .. }
         ));
 
-        let mut older = host_inspection(HostVersionRelation::OlderThanCli);
+        let mut older = host_inspection(HostVersionRelation::Older);
         older.remote_platform = "linux-x64-musl".to_string();
         let unavailable_error = build_host_update_plan(
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Host],
                 includes_all: false,
                 host_inspection: &older,
@@ -1511,7 +1583,7 @@ mod tests {
 
     #[test]
     fn ambiguous_codex_ownership_fails_closed() {
-        let host = host_inspection(HostVersionRelation::MatchesCli);
+        let host = host_inspection(HostVersionRelation::Matches);
         let ambiguous = [CodexUpdateInspection {
             target: HostUpdateTarget::CodexNativeComputerUse,
             evidence_available: true,
@@ -1527,6 +1599,8 @@ mod tests {
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Codex],
                 includes_all: false,
                 host_inspection: &host,
@@ -1545,7 +1619,7 @@ mod tests {
 
     #[test]
     fn unsafe_owned_codex_update_is_a_skipped_manual_action() {
-        let host = host_inspection(HostVersionRelation::MatchesCli);
+        let host = host_inspection(HostVersionRelation::Matches);
         let codex = [CodexUpdateInspection {
             target: HostUpdateTarget::CodexRuntime,
             evidence_available: true,
@@ -1564,6 +1638,8 @@ mod tests {
             HostUpdatePlanRequest {
                 host: "office",
                 cli_version: "1.2.3",
+                target_version: "1.2.3",
+                version_source: HostUpdateVersionSource::InvokingCliRelease,
                 components: &[HostUpdateComponent::Codex],
                 includes_all: false,
                 host_inspection: &host,

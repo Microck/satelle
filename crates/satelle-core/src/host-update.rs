@@ -1,5 +1,22 @@
 use serde::{Deserialize, Serialize};
 
+// Release packaging reads these constants for the signed compatibility asset.
+// Protocol handling and storage migrations enforce the same values below their
+// own boundaries, so a release cannot advertise a separate compatibility state.
+pub const HOST_PROTOCOL_VERSION: &str = "15";
+pub const HOST_STORAGE_SCHEMA_VERSION: i64 = 16;
+pub const HOST_MINIMUM_CLI_VERSION: &str = "0.1.10";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostReleaseCompatibility {
+    pub schema_version: u32,
+    pub version: String,
+    pub protocol_version: String,
+    pub storage_schema_version: i64,
+    pub minimum_cli_version: String,
+}
+
 /// Exact release artifact identity retained by the Host for interrupted
 /// Host-update recovery. Repair must resume this identity instead of deriving
 /// a new target from whichever CLI release happens to run later.
@@ -71,6 +88,7 @@ pub enum HostUpdateRestartImpact {
 #[serde(rename_all = "snake_case")]
 pub enum HostUpdateVersionSource {
     InvokingCliRelease,
+    ExplicitRelease,
     HostCompatibilityRequirement,
     CodexCompatibilityRequirement,
 }

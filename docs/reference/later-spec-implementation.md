@@ -18,8 +18,9 @@ those pull requests merge, the integration branch gets a final pull request to
 | Host credential sources | Executable helpers with bounded JSON protocol, Host home expansion | Merged in PR #219 |
 | Config repair | Deterministic local repair with backups and explicit consent | Merged in PR #220 |
 | Host update scripting | Stable target records through `host update --plain` | Merged in PR #221 |
-| Remote image attachments | Host file resolution with bounded validation and no retention | Box verified; pull request pending |
-| Host operations | Storage migration, CLI/Host compatibility, explicit versions | Pending |
+| Remote image attachments | Host file resolution with bounded validation and no retention | Merged in PR #222 |
+| Host versions | CLI/Host compatibility and explicit versions | Box verified; pull request pending |
+| Host storage | Safe path-set migration | Pending |
 | Transport authentication | Mutual TLS and token lifecycle | Pending |
 | Output and package repair | Lossless output formats, launcher native repair | Pending |
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit, diagnostic bundles | Pending |
@@ -155,7 +156,8 @@ verified the Host update, CLI integration, and output contract tests.
 
 Box passed 9 attachment tests, 267 transport tests, 585 CLI unit tests, and
 19 focused CLI integration tests. Workspace Clippy and documentation checks
-also passed. Cross-platform pull request checks remain pending.
+also passed. PR #222 passed Rust and npm checks on Linux, macOS, and Windows,
+plus documentation and release installation checks on all six targets.
 
 - `run` and `steer` accept repeatable `--remote-image <HOST_PATH>` after resolving
   the selected Host. The option requires SSH or Direct transport.
@@ -167,3 +169,23 @@ also passed. Cross-platform pull request checks remain pending.
   cancellation resolves from durable admission state without reopening files.
 - Remote files share the upload limits and private staging lifecycle. Cleanup
   removes generated files and never removes the operator's source image.
+
+## Host version compatibility decisions
+
+Box passed 231 core tests, 589 CLI unit tests, 19 focused CLI integration
+tests, and 65 release-packaging tests. Workspace Clippy and documentation
+checks passed. Cross-platform pull request checks remain pending.
+
+- `host update --component host --version <version>` selects a stable release.
+  The option cannot combine with Codex updates or `--component all`.
+- The default target remains the invoking CLI release. Explicit selection can
+  move forward or backward within the same major/minor series, with an exact
+  protocol and storage schema match and a satisfied minimum CLI version.
+- A release asset named `satelle-compatibility.json` carries these compatibility
+  fields. The existing checksum and signed release attestation checks cover it.
+  Missing or invalid metadata blocks explicit selection.
+- Protocol negotiation accepts the one supported version. Capability discovery
+  gates optional features. Upgrade the CLI first when a release requires it.
+- The existing artifact verifier, replacement handshake, and pinned recovery
+  identity also apply to selected releases. There is no automatic downgrade or
+  storage downgrade, and no update channel.

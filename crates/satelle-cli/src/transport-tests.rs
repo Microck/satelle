@@ -501,9 +501,9 @@ fn replacement_daemon_adopts_bootstrap_repair_actions_before_postchecks() {
 fn host_update_recovery_requires_and_rechecks_the_persisted_artifact() {
     assert!(maintenance_release_artifact_required(
         HostMaintenancePlanKind::HostUpdateRecovery,
-        crate::host_update::HostVersionRelation::MatchesCli,
+        crate::host_update::HostVersionRelation::Matches,
         true,
-        Some(crate::host_update::HostVersionRelation::MatchesCli),
+        Some(crate::host_update::HostVersionRelation::Matches),
     ));
 
     let identity = test_host_update_recovery_identity();
@@ -511,7 +511,7 @@ fn host_update_recovery_requires_and_rechecks_the_persisted_artifact() {
         current_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         minimum_host_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         protocol_compatible: true,
-        relation_to_cli: crate::host_update::HostVersionRelation::MatchesCli,
+        relation_to_target: crate::host_update::HostVersionRelation::Matches,
         remote_platform: "linux-x64-gnu".to_string(),
         artifact: Some(crate::host_update::VerifiedHostArtifact {
             version: identity.target_version().to_string(),
@@ -661,7 +661,7 @@ fn newer_reachable_host_is_not_hidden_by_its_minimum_version() {
     assert_eq!(
         host_version_relation(Some("2.0.0"), true, Some("2.0.0"), "1.5.0")
             .expect("classify newer authenticated Host version"),
-        crate::host_update::HostVersionRelation::NewerThanCli
+        crate::host_update::HostVersionRelation::Newer
     );
 }
 
@@ -1278,8 +1278,14 @@ fn default_missing_ssh_host_plan_skips_unavailable_codex_targets() {
         path: std::env::temp_dir().join("unread-token"),
     }));
 
-    let report = plan_host_update(&host, env!("CARGO_PKG_VERSION"), &[], false)
-        .expect("default planning must preserve the missing Host recovery target");
+    let report = plan_host_update(
+        &host,
+        env!("CARGO_PKG_VERSION"),
+        &[],
+        false,
+        satelle_core::host_update::HostUpdateVersionSource::InvokingCliRelease,
+    )
+    .expect("default planning must preserve the missing Host recovery target");
 
     assert_eq!(
         report.targets[0].target,
@@ -5705,6 +5711,34 @@ fn pre_action_repair_failure_preserves_selected_run_recovery_command() {
     assert_eq!(
         error.details["recovery_command"],
         serde_json::json!("satelle repair --host remote --run exact-run --no-input --yes")
+    );
+}
+
+#[test]
+fn durable_readiness_allows_remote_patch_skew_and_keeps_local_version_ownership() {
+    let (major, minor, patch) = parse_release_version(env!("CARGO_PKG_VERSION")).unwrap();
+    let mut readiness = DurableReadinessSnapshot {
+        daemon_version: format!("{major}.{minor}.{}", patch + 1),
+        host_identity: "expected-host".to_string(),
+    };
+    assert!(
+        require_durable_readiness("remote", "expected-host", &readiness, TransportKind::Ssh)
+            .is_ok()
+    );
+    assert!(
+        require_durable_readiness("local", "expected-host", &readiness, TransportKind::Local)
+            .is_err()
+    );
+    assert_eq!(
+        require_durable_readiness("remote", "other-host", &readiness, TransportKind::Ssh)
+            .unwrap_err()
+            .code,
+        ErrorCode::HostIdentityMismatch
+    );
+    readiness.daemon_version = format!("{major}.{}.0", minor + 1);
+    assert!(
+        require_durable_readiness("remote", "expected-host", &readiness, TransportKind::Ssh)
+            .is_err()
     );
 }
 
