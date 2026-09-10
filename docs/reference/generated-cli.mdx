@@ -17,6 +17,7 @@ public Satelle result and event schema sources. CI rejects hand-edited or stale 
 | `ERROR_SCHEMA_VERSION` | `crates/satelle-cli/src/error-output.rs` | `satelle.error.v1` |
 | `EVENT_SCHEMA_VERSION` | `crates/satelle-core/src/events.rs` | `satelle.events.v2` |
 | `HostSessionsSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.host.sessions.v1` |
+| `HOST_UPDATE_PLAIN_SCHEMA_VERSION` | `crates/satelle-cli/src/output.rs` | `satelle.host.update.plain.v1` |
 | `LogEntrySchema` | `crates/satelle-host/src/log-page.rs` | `satelle.logs.entry.v1` |
 | `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.run.v2` |
 | `SetupSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.setup.v2` |
@@ -707,6 +708,7 @@ Options:
       --yes
       --no-input
       --quiet                  Suppress non-error human plan and progress output; use --json for stable automation data
+      --plain                  Emit fixed tab-separated target records; use --json for the complete report
       --format <FORMAT>        [possible values: human, json]
       --json                   Alias for --format json
   -h, --help                   Print help

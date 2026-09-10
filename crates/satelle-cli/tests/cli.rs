@@ -4945,7 +4945,7 @@ fn host_update_keeps_the_single_host_json_contract() {
 }
 
 #[test]
-fn host_update_help_documents_json_and_component_filter_without_short_alias() {
+fn host_update_help_documents_json_plain_and_component_filter_without_short_alias() {
     let output = satelle()
         .args(["host", "update", "--help"])
         .assert()
@@ -4957,7 +4957,8 @@ fn host_update_help_documents_json_and_component_filter_without_short_alias() {
     assert!(help.contains("--component <COMPONENT>"));
     assert!(help.contains("--json"));
     assert!(!help.contains("-c, --component"));
-    assert!(!help.contains("--plain"));
+    assert!(help.contains("--plain"));
+    assert!(help.contains("tab-separated target records"));
 }
 
 #[test]

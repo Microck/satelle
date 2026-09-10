@@ -16,6 +16,7 @@ pub(crate) enum OutputFormat {
 }
 
 pub(crate) const CONFIG_REPAIR_SCHEMA_VERSION: &str = "satelle.config.repair.v1";
+pub(crate) const HOST_UPDATE_PLAIN_SCHEMA_VERSION: &str = "satelle.host.update.plain.v1";
 
 /// Command-specific schema tokens for JSON results backed by a Satelle session.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -332,7 +333,7 @@ impl OutputArgs {
         self.json || matches!(self.format, Some(OutputFormat::Json))
     }
 
-    const fn is_explicit(self) -> bool {
+    pub(crate) const fn is_explicit(self) -> bool {
         self.json || self.format.is_some()
     }
 }

@@ -7,6 +7,39 @@ use satelle_core::host_update::{
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+#[derive(Clone, Copy)]
+pub(crate) enum HostUpdateOutput {
+    Human,
+    Json,
+    Plain,
+}
+
+impl HostUpdateOutput {
+    pub(crate) fn from_cli(format: crate::output::OutputFormat, plain: bool) -> Self {
+        match (plain, format) {
+            (true, _) => Self::Plain,
+            (false, crate::output::OutputFormat::Json) => Self::Json,
+            (false, crate::output::OutputFormat::Human) => Self::Human,
+        }
+    }
+
+    pub(crate) fn is_json(self) -> bool {
+        matches!(self, Self::Json)
+    }
+
+    pub(crate) fn is_plain(self) -> bool {
+        matches!(self, Self::Plain)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PlainUpdateStage<'a> {
+    Plan,
+    Completed,
+    Cancelled,
+    Failed(&'a satelle_core::SatelleError),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostVersionRelation {
     Missing,
@@ -519,6 +552,167 @@ pub fn build_repair_upgrade_plan(
     )
 }
 
+/// Project the canonical plan and confirmed action outcomes into the fixed v1
+/// target records. A failed action never erases a different target's success.
+pub(crate) fn render_host_update_plain(
+    report: &HostUpdateReport,
+    stage: PlainUpdateStage<'_>,
+) -> String {
+    let error = match stage {
+        PlainUpdateStage::Failed(error) => Some(error),
+        _ => None,
+    };
+    let completed: BTreeSet<&str> = match error {
+        Some(error) => error
+            .details
+            .get("completed_actions")
+            .or_else(|| error.details.get("applied_actions"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect(),
+        None => report.applied_actions.iter().map(String::as_str).collect(),
+    };
+    let failed_action = error
+        .and_then(|error| error.details.get("failed_action"))
+        .and_then(serde_json::Value::as_str);
+    let failure_has_target = failed_action.is_some_and(|action| {
+        report.targets.iter().any(|target| {
+            target
+                .remote_mutations
+                .iter()
+                .any(|mutation| mutation.operation == action)
+        })
+    });
+    let postcheck_failed =
+        error.is_some_and(|error| error.code == satelle_core::ErrorCode::HostUpdatePostcheckFailed);
+    let phase = match stage {
+        PlainUpdateStage::Plan => "plan",
+        _ if postcheck_failed => "postcheck",
+        _ => "apply",
+    };
+    let error_code = error.map(|error| error.code.as_str().replace('-', "_"));
+    let mut output = String::new();
+    for target in &report.targets {
+        let confirmed = target
+            .remote_mutations
+            .iter()
+            .filter(|mutation| completed.contains(mutation.operation.as_str()))
+            .count();
+        let changed = confirmed > 0;
+        let complete = changed && confirmed == target.remote_mutations.len();
+        let is_failed_target = failed_action.is_some_and(|action| {
+            target
+                .remote_mutations
+                .iter()
+                .any(|mutation| mutation.operation == action)
+        });
+        let status = match (target.disposition, stage) {
+            (HostUpdateDisposition::Current, _) => "unchanged",
+            (HostUpdateDisposition::Skipped, _) => "skipped",
+            (_, PlainUpdateStage::Plan) => "planned",
+            (_, PlainUpdateStage::Cancelled) => "cancelled",
+            (_, PlainUpdateStage::Failed(_)) if postcheck_failed && changed => "postcheck_failed",
+            (_, PlainUpdateStage::Failed(_)) if is_failed_target => "failed",
+            (_, PlainUpdateStage::Failed(_)) if failure_has_target && complete => "succeeded",
+            (_, PlainUpdateStage::Failed(_)) if failure_has_target && !changed => "skipped",
+            (_, PlainUpdateStage::Failed(_)) => "failed",
+            (_, PlainUpdateStage::Completed) if complete => "succeeded",
+            (_, PlainUpdateStage::Completed)
+                if target
+                    .remote_mutations
+                    .iter()
+                    .any(|mutation| report.skipped_actions.contains(&mutation.operation)) =>
+            {
+                "skipped"
+            }
+            (_, PlainUpdateStage::Completed) => "unchanged",
+        };
+        let failed = matches!(status, "failed" | "postcheck_failed");
+        let component = match target.target {
+            HostUpdateTarget::HostDaemon => "host_daemon",
+            HostUpdateTarget::HostDaemonService => "host_daemon_service",
+            HostUpdateTarget::CodexRuntime => "codex_runtime",
+            HostUpdateTarget::CodexNativeComputerUse => "codex_native_computer_use",
+        };
+        let recovery = failed
+            .then(|| {
+                error
+                    .and_then(|error| error.recovery_command.as_deref())
+                    .or(report.recovery_command.as_deref())
+            })
+            .flatten();
+        write_plain_record(
+            &mut output,
+            [
+                crate::output::HOST_UPDATE_PLAIN_SCHEMA_VERSION,
+                &report.host,
+                component,
+                phase,
+                status,
+                target.current_version.as_deref().unwrap_or("-"),
+                &target.target_version,
+                if changed { "true" } else { "false" },
+                if target.restart_impact == HostUpdateRestartImpact::None {
+                    "false"
+                } else {
+                    "true"
+                },
+                if failed {
+                    error_code.as_deref().unwrap_or("-")
+                } else {
+                    "-"
+                },
+                recovery.unwrap_or("-"),
+            ],
+        );
+    }
+    output
+}
+
+pub(crate) fn render_host_update_plain_planning_error(
+    host: &str,
+    error: &satelle_core::SatelleError,
+) -> String {
+    let mut output = String::new();
+    write_plain_record(
+        &mut output,
+        [
+            crate::output::HOST_UPDATE_PLAIN_SCHEMA_VERSION,
+            host,
+            "unknown",
+            "plan",
+            "failed",
+            "-",
+            "-",
+            "false",
+            "false",
+            &error.code.as_str().replace('-', "_"),
+            error.recovery_command.as_deref().unwrap_or("-"),
+        ],
+    );
+    output
+}
+
+fn write_plain_record(output: &mut String, fields: [&str; 11]) {
+    for (index, field) in fields.into_iter().enumerate() {
+        if index > 0 {
+            output.push('\t');
+        }
+        for character in field.chars() {
+            match character {
+                '\\' => output.push_str("\\\\"),
+                '\t' => output.push_str("\\t"),
+                '\n' => output.push_str("\\n"),
+                '\r' => output.push_str("\\r"),
+                character => output.push(character),
+            }
+        }
+    }
+    output.push('\n');
+}
+
 pub fn render_host_update_plan(report: &HostUpdateReport) -> String {
     let mut output = format!("Host update plan for {}\n", report.host);
     for target in &report.targets {
@@ -666,6 +860,148 @@ mod tests {
             relation_to_cli: HostVersionRelation::OlderThanCli,
             destination: "/home/operator/.config/systemd/user/satelle.service".to_string(),
         }
+    }
+
+    fn plain_report() -> HostUpdateReport {
+        build_host_update_plan(
+            HostUpdatePlanRequest {
+                host: "office",
+                cli_version: "1.2.3",
+                components: &[HostUpdateComponent::Host],
+                includes_all: false,
+                host_inspection: &host_inspection(HostVersionRelation::OlderThanCli),
+                service_inspection: Some(&service_inspection()),
+                codex_inspections: &[],
+            },
+            &artifact(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn plain_update_v1_fixes_field_order_and_escapes_record_delimiters() {
+        let report = plain_report();
+        assert_eq!(
+            render_host_update_plain(&report, PlainUpdateStage::Plan),
+            concat!(
+                "satelle.host.update.plain.v1\toffice\thost_daemon\tplan\tplanned\t1.2.2\t1.2.3\tfalse\ttrue\t-\t-\n",
+                "satelle.host.update.plain.v1\toffice\thost_daemon_service\tplan\tplanned\t-\t1.2.3\tfalse\ttrue\t-\t-\n",
+            )
+        );
+        let mut encoded = String::new();
+        write_plain_record(
+            &mut encoded,
+            [
+                "schema",
+                "host",
+                "component",
+                "phase",
+                "status",
+                "-",
+                "-",
+                "false",
+                "true",
+                "error",
+                "C:\\path\tline\nreturn\r",
+            ],
+        );
+        assert_eq!(
+            encoded,
+            "schema\thost\tcomponent\tphase\tstatus\t-\t-\tfalse\ttrue\terror\tC:\\\\path\\tline\\nreturn\\r\n"
+        );
+    }
+
+    #[test]
+    fn plain_update_failure_preserves_successful_unchanged_and_skipped_targets() {
+        let mut report = plain_report();
+        for (target, disposition) in [
+            (
+                HostUpdateTarget::CodexRuntime,
+                HostUpdateDisposition::Current,
+            ),
+            (
+                HostUpdateTarget::CodexNativeComputerUse,
+                HostUpdateDisposition::Skipped,
+            ),
+        ] {
+            let mut other = report.targets[0].clone();
+            other.target = target;
+            other.disposition = disposition;
+            other.remote_mutations.clear();
+            other.restart_impact = HostUpdateRestartImpact::None;
+            report.targets.push(other);
+        }
+        report.applied_actions.push("install-host-artifact".into());
+        report.recovery_command = Some("satelle repair --host 'office' --no-input --yes".into());
+        let error = satelle_core::SatelleError::host_update_partially_applied(
+            &report,
+            "publish-host-service",
+            "fixture failure",
+        );
+        let text = render_host_update_plain(&report, PlainUpdateStage::Failed(&error));
+        let rows: Vec<Vec<_>> = text
+            .lines()
+            .map(|line| line.split('\t').collect())
+            .collect();
+        assert!(rows.iter().all(|row| row.len() == 11));
+        assert_eq!(
+            [rows[0][4], rows[1][4], rows[2][4], rows[3][4]],
+            ["succeeded", "failed", "unchanged", "skipped"]
+        );
+        assert_eq!(
+            [rows[0][7], rows[1][7], rows[2][7], rows[3][7]],
+            ["true", "false", "false", "false"]
+        );
+        assert_eq!(rows[0][9], "-");
+        assert_eq!(rows[1][9], "host_update_partially_applied");
+        assert_eq!(
+            rows[1][10],
+            "satelle repair --host 'office' --no-input --yes"
+        );
+
+        report.applied_actions.push("publish-host-service".into());
+        let error = satelle_core::SatelleError::host_update_postcheck_failed(
+            &report,
+            "fixture postcheck failure",
+        );
+        let text = render_host_update_plain(&report, PlainUpdateStage::Failed(&error));
+        let rows: Vec<Vec<_>> = text
+            .lines()
+            .map(|line| line.split('\t').collect())
+            .collect();
+        assert_eq!(
+            [rows[0][3], rows[0][4], rows[0][7], rows[0][9]],
+            [
+                "postcheck",
+                "postcheck_failed",
+                "true",
+                "host_update_postcheck_failed"
+            ]
+        );
+        assert_eq!(rows[1][4], "postcheck_failed");
+        assert_eq!(rows[2][4], "unchanged");
+        assert_eq!(rows[3][4], "skipped");
+    }
+
+    #[test]
+    fn plain_update_terminal_records_distinguish_application_and_cancellation() {
+        let mut report = plain_report();
+        let cancelled = render_host_update_plain(&report, PlainUpdateStage::Cancelled);
+        assert_eq!(cancelled.lines().count(), 2);
+        assert!(cancelled.lines().all(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            fields[3] == "apply" && fields[4] == "cancelled" && fields[7] == "false"
+        }));
+        report.applied_actions.extend([
+            "install-host-artifact".into(),
+            "publish-host-service".into(),
+        ]);
+        let completed = render_host_update_plain(&report, PlainUpdateStage::Completed);
+        assert_eq!(completed.lines().count(), 2);
+        assert!(completed.lines().all(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            fields[3] == "apply" && fields[4] == "succeeded" && fields[7] == "true"
+        }));
     }
 
     #[test]

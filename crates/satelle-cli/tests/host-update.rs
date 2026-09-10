@@ -8,6 +8,82 @@ fn satelle() -> Command {
 }
 
 #[test]
+fn host_update_plain_dry_run_matches_json_targets_and_ignores_quiet() {
+    let state = TestStateDir::new().unwrap();
+    let args = [
+        "host",
+        "update",
+        "--host",
+        "local-demo",
+        "--component",
+        "host",
+        "--dry-run",
+    ];
+    let json = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(args)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report: Value = serde_json::from_slice(&json.stdout).unwrap();
+    for quiet in [false, true] {
+        let mut command = satelle();
+        command
+            .env("SATELLE_STATE_DIR", state.path())
+            .env("FORCE_COLOR", "1")
+            .env("TERM", "xterm-256color")
+            .args(args)
+            .arg("--plain");
+        if quiet {
+            command.arg("--quiet");
+        }
+        let output = command.assert().success().get_output().clone();
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.ends_with('\n'));
+        assert!(!text.contains(['\r', '\u{1b}']));
+        let rows: Vec<Vec<_>> = text
+            .lines()
+            .map(|line| line.split('\t').collect())
+            .collect();
+        let targets = report["targets"].as_array().unwrap();
+        assert_eq!(rows.len(), targets.len());
+        for (row, target) in rows.iter().zip(targets) {
+            assert_eq!(row.len(), 11);
+            assert_eq!(row[0], "satelle.host.update.plain.v1");
+            assert_eq!(row[1], report["host"].as_str().unwrap());
+            assert_eq!(row[2], target["target"].as_str().unwrap());
+            assert_eq!([row[3], row[4]], ["plan", "unchanged"]);
+            assert_eq!(row[5], target["current_version"].as_str().unwrap_or("-"));
+            assert_eq!(row[6], target["target_version"].as_str().unwrap());
+            assert_eq!(&row[7..], ["false", "false", "-", "-"]);
+        }
+    }
+}
+
+#[test]
+fn host_update_plain_conflicts_with_every_explicit_result_selector() {
+    for selector in [
+        vec!["--json"],
+        vec!["--format", "human"],
+        vec!["--format", "json"],
+    ] {
+        let output = satelle()
+            .args(["--error-format", "json", "host", "update", "--plain"])
+            .args(selector)
+            .assert()
+            .code(64)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["code"], "output-mode-conflict");
+    }
+}
+
+#[test]
 fn host_update_dry_run_emits_the_v1_plan_before_any_apply_boundary() {
     let output = satelle()
         .args([
