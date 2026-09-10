@@ -24,8 +24,8 @@ test('signals arrive before the Host becomes active',()=>{
   assert.equal(m.networkFrame(m.TIMING.send).phase,'sending');
   assert.equal(m.networkFrame(m.TIMING.arrive).phase,'receiving');
   assert.equal(m.networkFrame(m.TIMING.work).heat,1);
-  assert.equal(m.networkFrame(m.TIMING.acknowledge).phase,'complete');
-  assert.equal(m.networkFrame(m.TIMING.cooldown).phase,'acknowledging');
+  assert.equal(m.networkFrame(m.TIMING.acknowledge-1).phase,'complete');
+  assert.equal(m.networkFrame(m.TIMING.acknowledge).phase,'acknowledging');
 });
 test('Host visibly works then returns to idle without losing the Session',()=>{
   assert.equal(m.networkFrame(m.TIMING.work).working,true);
@@ -63,7 +63,7 @@ test('pulse endpoints track the moving source and stop at the Host, never telepo
 });
 test('completion returns a smooth acknowledgment to the original Controller before idle',()=>{
   const complete=m.networkFrame(m.TIMING.complete), start=m.networkFrame(m.TIMING.acknowledge), sent=m.networkFrame(m.TIMING.cooldown), idle=m.networkFrame(m.TIMING.rest);
-  assert.equal(complete.phase,'complete');assert.equal(start.phase,'complete');assert.equal(sent.phase,'acknowledging');
+  assert.equal(complete.phase,'complete');assert.equal(start.phase,'acknowledging');assert.equal(sent.phase,'acknowledging');
   assert.equal(start.ackSignal,0);assert.equal(sent.ackSignal,1);assert.equal(sent.ackEffect,1);
   assert.equal(idle.phase,'idle');assert.equal(idle.heat,0);assert.equal(idle.ackEffect,0);
 });
