@@ -258,7 +258,7 @@ fn persist_new_config(
     })
 }
 
-fn create_owner_only_directory_tree(
+pub(crate) fn create_owner_only_directory_tree(
     directory: &Path,
     config_path: &Path,
     recovery_command: &str,
@@ -432,7 +432,7 @@ fn provider_secret_source_item(descriptor: &ProviderSecretSource) -> Item {
     Item::Table(table)
 }
 
-fn persist_config(
+pub(crate) fn persist_config(
     config_path: &Path,
     contents: &[u8],
     recovery_command: Option<&str>,

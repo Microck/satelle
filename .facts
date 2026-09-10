@@ -1172,7 +1172,7 @@
 - satelle reports a typed unsupported-trusted-profile-host-scope configuration error when a Satelle Trusted Profile uses an all-hosts, wildcard, glob, regex, project-host, or default-host scope @spec @mvp @implemented
 - satelle MVP Satelle Trusted Profiles require a non-empty explicit Satelle Mutation Command Family allowlist for noninteractive mutation consent @spec @mvp @implemented
 - satelle MVP Satelle Trusted Profiles do not support all-mutating-command consent scopes, wildcard command scopes, glob command scopes, regex command scopes, or future-command scopes @spec @mvp @implemented
-- satelle MVP Satelle Mutation Command Family values are setup, repair, host_update, self_update_remotes, and doctor_fix @spec @mvp @implemented
+- satelle Satelle Mutation Command Family values are setup, repair, host_update, self_update_remotes, doctor_fix, and config_repair @spec @phase4
 - satelle later adds config_repair and host_storage_migrate Satelle Mutation Command Family values when those commands become available @spec @later
 - satelle Satelle Trusted Profile command-family allowlists match the command family for the selected mutating command before remote mutation planning starts @spec @mvp @implemented
 - satelle reports a typed trusted-profile-command-allowlist-required configuration error when a Satelle Trusted Profile grants noninteractive mutation consent without at least one explicit Satelle Mutation Command Family @spec @mvp @implemented
@@ -1308,7 +1308,7 @@
 - satelle config explain output reports included configuration files in checked_files and sources, shows each included file's parent file and normalized include path, and attributes every effective value to the exact included or including file that won precedence @spec @phase4 @implemented
 - satelle config composition never reads, resolves, dereferences, prints, or includes raw secret material from Satelle Secret Sources while loading includes, running config check, or running config explain @spec @phase4 @implemented
 - satelle config composition treats included files as ordinary Satelle configuration files, so included project-level files cannot define Satelle Secret Sources, Satelle Trusted Profiles, YOLO enablement, concrete daemon paths, provider credentials, credential helpers, or noninteractive mutation consent @spec @phase4 @implemented
-- satelle MVP does not include a mutating satelle config repair command @spec @mvp @implemented
+- satelle config repair is an explicit local configuration mutation with fresh validation, redacted previews, private backups, and command-scoped consent @spec @phase4
 - satelle later config repair is an explicit user-invoked command and never runs as an implicit side effect of config check, config explain, setup, repair, doctor, preflight, run, or steer @spec @later
 - satelle later config repair changes only local CLI-visible Satelle configuration files and does not mutate remote-Host-owned configuration unless a separate remote-Host config repair command is specified @spec @later
 - satelle later config repair edits project-level configuration only when the project config file is explicitly selected on the command line @spec @later

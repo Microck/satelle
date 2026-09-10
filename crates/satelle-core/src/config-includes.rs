@@ -124,6 +124,12 @@ impl ConfigSources {
 pub(super) struct ConfigDocument {
     pub source: ConfigFileSource,
     pub value: toml::Value,
+    pub raw: String,
+}
+
+pub(super) struct ConfigDocuments {
+    pub user: Vec<ConfigDocument>,
+    pub project: Vec<ConfigDocument>,
 }
 
 /// Load explicit includes in precedence order without following links or leaving
@@ -307,6 +313,7 @@ fn visit(
             source,
         },
         value,
+        raw,
     });
     Ok(())
 }

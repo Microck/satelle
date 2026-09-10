@@ -1883,7 +1883,7 @@ fn hex_digest(value: &str) -> Option<[u8; 32]> {
     Some(digest)
 }
 
-fn digest_hex(digest: &[u8; 32]) -> String {
+pub(crate) fn digest_hex(digest: &[u8; 32]) -> String {
     let mut value = String::with_capacity(64);
     for byte in digest {
         use std::fmt::Write as _;

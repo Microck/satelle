@@ -15,6 +15,8 @@ pub(crate) enum OutputFormat {
     Json,
 }
 
+pub(crate) const CONFIG_REPAIR_SCHEMA_VERSION: &str = "satelle.config.repair.v1";
+
 /// Command-specific schema tokens for JSON results backed by a Satelle session.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum SessionResultSchemaVersion {
@@ -197,6 +199,7 @@ impl ConfigCommand {
         match self {
             Self::Check(command) => (command.output_args, EventOutput::None),
             Self::Explain(command) => (command.output_args, EventOutput::None),
+            Self::Repair(command) => (command.output_args, EventOutput::None),
         }
     }
 }

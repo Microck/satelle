@@ -155,6 +155,7 @@ fn noninteractive_mutation_consent_json(config: &ResolvedConfig, host: &str) -> 
             "host_update": family(MutationCommandFamily::HostUpdate),
             "self_update_remotes": family(MutationCommandFamily::SelfUpdateRemotes),
             "doctor_fix": family(MutationCommandFamily::DoctorFix),
+            "config_repair": family(MutationCommandFamily::ConfigRepair),
         },
     })
 }

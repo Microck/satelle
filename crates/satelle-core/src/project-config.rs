@@ -224,9 +224,18 @@ impl ParsedProjectConfig {
 }
 
 pub(super) fn read(path: &Path) -> Result<Option<ParsedProjectConfig>, SatelleError> {
+    parse_documents(config_includes::read(
+        path,
+        ConfigSourceKind::ProjectConfig,
+    )?)
+}
+
+pub(super) fn parse_documents(
+    documents: Vec<config_includes::ConfigDocument>,
+) -> Result<Option<ParsedProjectConfig>, SatelleError> {
     let mut merged: Option<ParsedProjectConfig> = None;
     let mut sources = ConfigSources::default();
-    for document in config_includes::read(path, ConfigSourceKind::ProjectConfig)? {
+    for document in documents {
         sources.record(document.source.clone(), &document.value);
         let higher = parse(&document.source.path, document.value)?;
         merged = Some(match merged {
@@ -275,7 +284,10 @@ pub(super) fn read(path: &Path) -> Result<Option<ParsedProjectConfig>, SatelleEr
     Ok(merged)
 }
 
-fn parse(path: &Path, mut value: toml::Value) -> Result<ParsedProjectConfig, SatelleError> {
+pub(super) fn parse(
+    path: &Path,
+    mut value: toml::Value,
+) -> Result<ParsedProjectConfig, SatelleError> {
     let profile_data = profiles::extract_profile_data(path, &mut value, false)?;
     reject_config_composition(path, &value)?;
     reject_interpolation(path, &value)?;

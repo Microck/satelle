@@ -15,8 +15,8 @@ those pull requests merge, the integration branch gets a final pull request to
 | Block | Scope | Status |
 | --- | --- | --- |
 | Configuration composition and consent | Explicit includes, source attribution, Trusted Profile expiration | Merged in PR #218 |
-| Host credential sources | Executable helpers with bounded JSON protocol, Host home expansion | Verified in PR #219; integration checks pending |
-| Config repair | Deterministic local repair with backups and explicit consent | Pending |
+| Host credential sources | Executable helpers with bounded JSON protocol, Host home expansion | Merged in PR #219 |
+| Config repair | Deterministic local repair with backups and explicit consent | Box verified; pull request pending |
 | Host operations | Storage migration, CLI/Host compatibility, explicit versions, plain update output | Pending |
 | Transport and inputs | Mutual TLS, token lifecycle, remote image attachments | Pending |
 | Output and package repair | Lossless output formats, launcher native repair | Pending |
@@ -101,3 +101,33 @@ authorized runtime resolution, configuration inspection, and home-path handling.
   `secret_source_kind`, `resolver_os`, and `supported_forms` under `details`.
   A field is null when its source location or resolver is not known at that
   boundary. Failure messages never contain the secret-file path or contents.
+
+## Config repair contract decisions
+
+Box verified 229 core tests, 45 configuration integration tests, the interactive
+repair test, workspace Clippy, and the generated documentation contract.
+
+- `satelle config repair` selects the local user configuration file by default.
+  `--file <path>` explicitly selects a loaded user or project configuration file,
+  including an explicit include. No other file is edited.
+- Repairs convert schema key spelling to its exact accepted lowercase,
+  underscore form, for example `default-host` to `default_host`. A repair must
+  have exactly one accepted spelling and no existing destination key. Repairs
+  preserve values and comments. They never guess values, remove fields, or fix
+  arbitrary misspellings through a fuzzy match.
+- Each invocation validates the entire prospective configuration through the
+  normal loader before offering a mutation. Other diagnostics require manual
+  action. A dry-run is a redacted report, never a reusable apply plan.
+- `--dry-run` reports the selected file, diagnostics, planned write, private
+  backup path, original and repaired digests, restore command, and redacted
+  unified diff of canonical JSON with the config-explain redaction policy. It
+  creates no files or command-history entries. Comments remain in the edited
+  TOML file but do not enter the preview.
+- A mutation needs `--yes`, one final interactive confirmation, or a matching
+  user-owned Trusted Profile with `config_repair` consent. Trusted Profiles
+  apply only when every edit lies inside the explicitly selected Host Binding;
+  they cannot authorize root, profile, or trust-policy edits.
+- The command creates and verifies a byte-for-byte backup under the Controller
+  state directory before replacing the selected file. It checks that the source
+  still matches the preview, then uses the existing atomic config writer while
+  preserving permissions. Any failure retains the backup and restore command.

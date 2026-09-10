@@ -167,6 +167,38 @@ satelle config explain --host local-demo --json
 `--show-secret-references` is explicit. It never reads or prints secret
 material.
 
+## Repair local configuration
+
+```sh
+satelle config repair --dry-run --json
+satelle config repair --yes
+satelle config repair --file .satelle/config.toml --dry-run
+```
+
+Repair fixes unambiguous key spelling such as `default-host` to `default_host`.
+It preserves values and comments. Colliding keys, other misspellings, invalid
+values, and diagnostics that require a choice need manual correction.
+
+The default target is the local user config file. Use `--file` to select a
+loaded include or a project config file. The command validates the resulting
+configuration through the normal loader before offering any write.
+
+A dry-run shows a unified diff of redacted JSON, backup paths, digests, and a
+restore command. It writes nothing. An apply invocation builds a fresh plan,
+checks the input files again, and verifies a private byte-for-byte backup under
+the local state directory before replacing the selected config file. Keep the
+reported backup until the configuration is verified.
+
+Use `--yes` to accept the planned changes. Otherwise an interactive invocation
+shows the preview and asks once; choosing No leaves the file unchanged.
+`--no-input` needs `--yes` or a user-owned Trusted Profile with `config_repair`
+consent. Trusted Profile consent also requires an explicit `--host` and edits
+confined to that Host Binding. It cannot authorize project, root, profile, or
+trust-policy edits.
+
+Config repair never contacts a Host, resolves a Secret Source, changes a
+service, or writes a setup ledger.
+
 ## Credential helpers
 
 A user-owned provider binding can resolve credentials with an executable on

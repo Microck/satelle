@@ -8,6 +8,286 @@ mod config_fixture;
 use config_fixture::{ConfigFixture, assert_same_file, parse_json};
 
 #[test]
+fn config_repair_preview_and_apply_preserve_comments_redact_references_and_back_up_exact_bytes() {
+    let original = r#"
+command_history = false
+# comment-secret-canary
+default-host = "local"
+[hosts.local]
+transport = "local"
+adapter = "fake"
+[hosts.local.provider_auth.unused]
+kind = "environment"
+variable = "REFERENCE_SECRET_CANARY"
+"#;
+    let fixture = ConfigFixture::new(original, "");
+    let private_root = satelle_host::test_support::TestStateDir::new().unwrap();
+    let state = private_root.path().join("repair-state");
+    let preview = fixture
+        .command()
+        .env("SATELLE_STATE_DIR", &state)
+        .args(["config", "repair", "--dry-run", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&preview.stdout);
+    assert_eq!(report["schema_version"], "satelle.config.repair.v1");
+    assert_eq!(report["changed"], false);
+    assert_eq!(report["status"], "planned");
+    assert!(
+        !state.exists(),
+        "dry-run must not initialize state or backup directories"
+    );
+    let preview_text = String::from_utf8(preview.stdout).unwrap();
+    assert!(!preview_text.contains("comment-secret-canary"));
+    assert!(!preview_text.contains("REFERENCE_SECRET_CANARY"));
+    assert!(preview_text.contains("default-host"));
+    assert!(preview_text.contains("default_host"));
+    assert_eq!(
+        fs::read_to_string(fixture.user_config_path()).unwrap(),
+        original
+    );
+
+    let no_consent = fixture
+        .command()
+        .env("SATELLE_STATE_DIR", &state)
+        .args(["config", "repair", "--no-input", "--json"])
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&no_consent.stderr)["code"],
+        "config-repair-consent-required"
+    );
+    assert!(!state.exists());
+    let applied = fixture
+        .command()
+        .env("SATELLE_STATE_DIR", &state)
+        .args(["config", "repair", "--no-input", "--yes", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let applied = parse_json(&applied.stdout);
+    assert_eq!(applied["changed"], true);
+    assert_eq!(applied["files"][0]["backup_created"], true);
+    let backup = std::path::Path::new(applied["files"][0]["backup_path"].as_str().unwrap());
+    assert_eq!(fs::read_to_string(backup).unwrap(), original);
+    assert!(backup.starts_with(&state));
+    let repaired = fs::read_to_string(fixture.user_config_path()).unwrap();
+    assert!(repaired.contains("# comment-secret-canary"));
+    assert!(repaired.contains("REFERENCE_SECRET_CANARY"));
+    assert!(repaired.contains("default_host = \"local\""));
+    assert!(!repaired.contains("default-host"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(fixture.user_config_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let unchanged = fixture
+        .command()
+        .env("SATELLE_STATE_DIR", &state)
+        .args(["config", "repair", "--yes", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(parse_json(&unchanged.stdout)["changed"], false);
+    assert_eq!(
+        fs::read_dir(state.join("config-repair")).unwrap().count(),
+        1
+    );
+}
+
+#[test]
+fn config_repair_requires_explicit_selection_for_project_and_included_files() {
+    let user = "command_history=false\ndefault_host='local'\n[hosts.local]\ntransport='local'\nadapter='fake'\nallow_project_selection=true\n";
+    let fixture = ConfigFixture::new(user, "default-host='local'\n");
+    let project = fixture.resolved_project_config();
+    config_fixture::test_file::write_user_controlled(&project, "default-host='local'\n").unwrap();
+    fixture
+        .command()
+        .args(["config", "repair", "--yes", "--json"])
+        .assert()
+        .code(66)
+        .stderr(predicate::str::contains(
+            "config-repair-manual-action-required",
+        ));
+    assert_eq!(
+        fs::read_to_string(&project).unwrap(),
+        "default-host='local'\n"
+    );
+    let applied = fixture
+        .command()
+        .args(["config", "repair", "--file"])
+        .arg(&project)
+        .args(["--yes", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&applied.stdout)["files"][0]["source"],
+        "project_config"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.user_config_path()).unwrap(),
+        user
+    );
+
+    fixture.write_project_config("");
+    fixture.write_user_config("command_history=false\ninclude=['host.toml']\n");
+    let included = fixture
+        .user_config_path()
+        .parent()
+        .unwrap()
+        .join("host.toml");
+    config_fixture::test_file::write_user_controlled(
+        &included,
+        user.replace("default_host", "default-host"),
+    )
+    .unwrap();
+    fixture
+        .command()
+        .args(["config", "repair", "--yes", "--json"])
+        .assert()
+        .code(66);
+    fixture
+        .command()
+        .args(["config", "repair", "--file"])
+        .arg(&included)
+        .args(["--yes", "--json"])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(&included).unwrap(), user);
+    assert_eq!(
+        fs::read_to_string(fixture.user_config_path()).unwrap(),
+        "command_history=false\ninclude=['host.toml']\n"
+    );
+}
+
+#[test]
+fn config_repair_refuses_manual_choices_and_failed_backups_without_config_writes() {
+    for original in [
+        "default-host='one'\ndefault_host='two'",
+        "defalt_host='one'",
+        "[hosts.local]\ntransport='local'\nadapter='fake'\ndaemon_idle_timeout=30",
+        "broken=[",
+    ] {
+        let fixture = ConfigFixture::new(original, "");
+        fixture
+            .command()
+            .args(["config", "repair", "--yes", "--json"])
+            .assert()
+            .code(66)
+            .stderr(predicate::str::contains(
+                "config-repair-manual-action-required",
+            ));
+        assert_eq!(
+            fs::read_to_string(fixture.user_config_path()).unwrap(),
+            original
+        );
+    }
+    let original = "command_history=false\ndefault-host='local-demo'\n";
+    let fixture = ConfigFixture::new(original, "");
+    let blocked_state = fixture
+        .user_config_path()
+        .parent()
+        .unwrap()
+        .join("blocked-state");
+    fs::write(&blocked_state, "an existing file").unwrap();
+    fixture
+        .command()
+        .env("SATELLE_STATE_DIR", &blocked_state)
+        .args(["config", "repair", "--yes", "--json"])
+        .assert()
+        .code(66);
+    assert_eq!(
+        fs::read_to_string(fixture.user_config_path()).unwrap(),
+        original
+    );
+    assert_eq!(
+        fs::read_to_string(blocked_state).unwrap(),
+        "an existing file"
+    );
+}
+
+#[test]
+fn config_repair_trusted_consent_is_user_owned_and_limited_to_the_selected_host() {
+    let original = r#"
+command_history = false
+default_host = "local"
+profile = "maintenance"
+[profiles.maintenance]
+trusted_profile = "local-maintenance"
+[trusted_profiles.local-maintenance]
+hosts = ["local"]
+command_families = ["config_repair"]
+[hosts.local]
+transport = "local"
+adapter = "fake"
+daemon-idle-timeout = "5m"
+"#;
+    let fixture = ConfigFixture::new(original, "");
+    fixture
+        .command()
+        .args(["config", "repair", "--no-input", "--json"])
+        .assert()
+        .code(64);
+    let applied = fixture
+        .command()
+        .args([
+            "config",
+            "repair",
+            "--host",
+            "local",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(parse_json(&applied.stdout)["changed"], true);
+    for denied in [
+        original.replace("default_host", "default-host"),
+        original.replace("profile = \"maintenance\"", ""),
+    ] {
+        fixture.write_user_config(&denied);
+        fixture.write_project_config("profile='maintenance'\n");
+        fixture
+            .command()
+            .args([
+                "config",
+                "repair",
+                "--host",
+                "local",
+                "--no-input",
+                "--json",
+            ])
+            .assert()
+            .code(64);
+        assert_eq!(
+            fs::read_to_string(fixture.user_config_path()).unwrap(),
+            denied
+        );
+    }
+}
+
+#[test]
 fn config_check_rejects_invalid_provider_binding_table_aliases() {
     let fixture = ConfigFixture::new(
         r#"
