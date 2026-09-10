@@ -1,10 +1,8 @@
 import Link from 'next/link';
 import { CopyCommand } from './copy-command';
-import AgentDemo from './demos/agent';
 import DeskDemo from './demos/desk';
-import DurabilityDemo from './demos/durability';
-import ReadinessDemo from './demos/readiness';
-import TransportsDemo from './demos/transports';
+import DemoGallery from './demos/explorations';
+import DeviceNetwork from './devices/device-network';
 import { Mark } from './mark';
 import { ThemeToggle } from './theme-toggle';
 import './page.css';
@@ -141,83 +139,28 @@ function Platforms() {
   );
 }
 
-/** v12's "We meet you where you work.": one section, four demos, two by two. */
+/** Four animated workflows in the landing page's demo section. */
 function Channels() {
   return (
     <Section id="channels">
       <SectionHead
-        title="Everything a Session needs, from where you already are."
-        note="Every demo is interactive. Printed output matches what the binary prints; identifiers and timings are examples."
+        title="Different tasks. Your computers."
+        note="Animated illustrations, not live runs. Watch the tasks unfold, pause, or replay. With reduced motion, choose Play animation."
       />
-      <div className="cards cards-2">
-        <DemoCard
-          title="Close the terminal. The work keeps going."
-          lead="A Session is durable state on the Host, not a connection. Stop targets the active Turn: it does not delete the Session, and the terminal state is the proof."
-          href="/docs/how-to/operate-session"
-          cta="Operate a Session"
-        >
-          <DurabilityDemo />
-        </DemoCard>
-
-        <DemoCard
-          title="Satelle will not pretend a Host is ready."
-          lead="A binary, a plugin, or a feature flag is not proof that native desktop control works. Only the live probe is, and --refresh is the boundary that reruns it."
-          href="/docs/how-to/diagnose"
-          cta="Diagnose a Host"
-        >
-          <ReadinessDemo />
-        </DemoCard>
-
-        <DemoCard
-          title="You choose how the Controller reaches the Host."
-          lead="Local, direct TLS, or an authenticated SSH tunnel. Whichever you pick, Satelle never answers an operating-system, administrator or security prompt for you."
-          href="/docs/how-to/connect-remote"
-          cta="Connect remotely"
-        >
-          <TransportsDemo />
-        </DemoCard>
-
-        <DemoCard
-          title="Your coding agent gets typed tools, not a shell."
-          lead="satelle mcp serve speaks MCP over stdio, and satelle mcp install writes the config for one of twelve clients. The tool list is read-only until you add --enable-mutations, which advertises tools rather than adding capability."
-          href="/docs/reference/commands"
-          cta="Configure MCP"
-        >
-          <AgentDemo />
-        </DemoCard>
-      </div>
+      <DemoGallery />
     </Section>
   );
 }
 
-/** v12's three-up supporting band. */
+/** One Controller-to-Host illustration below the workflow demos. */
 function Claims() {
-  const claims = [
-    {
-      title: 'Your machine, your desktop',
-      body: 'Work happens in real applications on a Host you provisioned, under a Desktop Binding you selected. Satelle is the control plane, not the runtime.',
-    },
-    {
-      title: 'Durable by construction',
-      body: 'The Session, its Turn history, and its logs live on the Host. The Controller is a client. Losing it loses nothing.',
-    },
-    {
-      title: 'Boundaries you hold',
-      body: 'You control the Host, the Desktop Binding, every provider credential, the unsafe execution policy, and every state-changing action. Project configuration cannot grant any of them.',
-    },
-  ];
-
   return (
     <Section id="claims">
-      <SectionHead title="Work runs where you put it, and stays there." />
-      <div className="cards cards-3">
-        {claims.map((claim) => (
-          <article key={claim.title} className="card card-plain">
-            <h3>{claim.title}</h3>
-            <p>{claim.body}</p>
-          </article>
-        ))}
-      </div>
+      <SectionHead
+        title="Start on one machine. Work on another."
+        note="Send work from a macOS, Windows, or Linux Controller to a configured, ready Host."
+      />
+      <DeviceNetwork />
     </Section>
   );
 }
