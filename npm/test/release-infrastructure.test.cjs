@@ -350,7 +350,7 @@ function writeNativeNpmFixture(
   archivePath,
   target,
   binary,
-  { manifest = undefined, binaryMode = undefined } = {},
+  { manifest = undefined, binaryMode = undefined, checksums = undefined } = {},
 ) {
   const metadata = platformMatrix[target];
   const packageManifest = manifest ?? readFileSync(
@@ -362,6 +362,11 @@ function writeNativeNpmFixture(
       name: `package/${metadata.binaryPath}`,
       contents: binary,
       mode: binaryMode ?? (metadata.os === "win32" ? 0o644 : 0o755),
+    },
+    {
+      name: "package/SHA256SUMS",
+      contents: checksums ?? `${createHash("sha256").update(binary).digest("hex")}  ${metadata.binaryPath}\n`,
+      mode: 0o644,
     },
   ]);
 }
@@ -2325,6 +2330,28 @@ test("native release archive validation rejects one-byte npm drift", (context) =
     ),
     expectReleaseError("release-native-digest-mismatch"),
   );
+});
+
+test("native release validation binds packaged checksums to the executable", (context) => {
+  const destination = mkdtempSync(path.join(tmpdir(), "satelle-native-release-checksums-"));
+  context.after(() => rmSync(destination, { recursive: true, force: true }));
+  const release = createReleaseContext(repositoryRoot);
+  const { binaries, plan } = stageNativeReleaseSet(release, destination);
+  const artifact = plan.artifacts.find(({ target }) => target === "linux-x64-gnu");
+  const binary = binaries.get(artifact.target);
+  for (const [index, checksums] of [
+    `${"0".repeat(64)}  bin/satelle\n`,
+    `${sha256(binary)}  bin/another-executable\n`,
+    "x".repeat(1025),
+  ].entries()) {
+    writeNativeNpmFixture(path.join(destination, artifact.npmArtifact), artifact.target, binary, {
+      checksums,
+    });
+    assert.throws(
+      () => release.validateNativeReleaseArchives(destination, validationStaging(context, `checksums-${index}`)),
+      expectReleaseError("release-integrity-mismatch"),
+    );
+  }
 });
 
 test(

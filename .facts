@@ -322,12 +322,12 @@
 - satelle local CLI can fetch a version-matched target host binary artifact for a different remote OS or architecture from the same release artifact set when SSH bootstrap or host update needs it @spec @mvp @implemented
 - satelle verifies integrity metadata for fetched native binary artifacts before uploading or executing them on a remote host @spec @mvp @implemented
 - satelle remote hosts do not need Node.js, npm, pnpm, or bun installed to run the Satelle Host Daemon because the uploaded host component is a self-contained native binary @spec @mvp @implemented
-- satelle MVP does not include an explicit package-manager native binary repair command because normal npm-registry installation must succeed through package-manager optionalDependencies rather than a secondary downloader @spec @mvp @implemented
-- satelle later adds the launcher-only satelle native repair command so a missing native optionalDependency can be repaired without reinstalling the entire Satelle package graph manually @spec @later
-- satelle native repair is implemented in the JavaScript launcher because the Rust native binary may be missing when repair is needed @spec @later
-- satelle native repair invokes the detected package manager to reinstall the matching platform-specific native package instead of using direct HTTP downloads @spec @later
-- satelle native repair verifies the repaired native package version, executable path, platform metadata, and release integrity metadata before reporting success @spec @later
-- satelle native repair refuses installs owned by package managers it cannot identify safely and reports the direct native binary install path instead @spec @later
+- satelle native repair is an explicit launcher command; ordinary execution still relies on package-manager optionalDependencies and never repairs or downloads a native package implicitly @spec @contract @phase4
+- satelle later adds the launcher-only satelle native repair command so a missing native optionalDependency can be repaired without reinstalling the entire Satelle package graph manually @spec @phase4 @implemented
+- satelle native repair is implemented in the JavaScript launcher because the Rust native binary may be missing when repair is needed @spec @phase4 @implemented
+- satelle native repair invokes the detected package manager to reinstall the matching platform-specific native package instead of using direct HTTP downloads @spec @phase4 @implemented
+- satelle native repair verifies the repaired native package version, executable path, platform metadata, and release integrity metadata before reporting success @spec @phase4 @implemented
+- satelle native repair refuses installs owned by package managers it cannot identify safely and reports the direct native binary install path instead @spec @phase4 @implemented
 
 ## execution
 - satelle optimizes equally for one-shot prompt execution and ongoing session/thread control @spec @mvp @implemented
@@ -613,12 +613,12 @@
 - satelle host update uses the existing SSH replacement handshake with the selected verified release artifact and its pinned recovery identity @spec @phase4
 - satelle host update reports a typed host-binary-newer-than-cli error instead of downgrading when no explicit version was selected and the reachable Host is newer than the invoking CLI @spec @phase4
 - satelle host update reports a typed host-update-requires-cli-upgrade error when the selected release compatibility metadata requires a newer CLI @spec @phase4
-- satelle later host update --component host --version <version> is the sole explicit Host binary version selector @spec @later
-- satelle post-MVP CLI-host compatibility matrix defines supported version skew, protocol version negotiation, feature gating, upgrade order, downgrade policy, artifact verification policy, and recovery path @spec @later
-- satelle exact Satelle CLI and Host Daemon version matching remains the default host update target when --version is absent @spec @later
-- satelle later Host binary version selection never downgrades a reachable Host Daemon unless the user explicitly selects a lower version and the compatibility matrix permits that downgrade @spec @later
-- satelle later Host binary version selection verifies the selected version's release artifact integrity metadata for the detected remote platform before upload or execution @spec @later
-- Satelle does not add Host update channels in current committed scope @spec @later
+- satelle later host update --component host --version <version> is the sole explicit Host binary version selector @spec @phase4 @implemented
+- satelle post-MVP CLI-host compatibility matrix defines supported version skew, protocol version negotiation, feature gating, upgrade order, downgrade policy, artifact verification policy, and recovery path @spec @phase4 @implemented
+- satelle exact Satelle CLI and Host Daemon version matching remains the default host update target when --version is absent @spec @phase4 @implemented
+- satelle later Host binary version selection never downgrades a reachable Host Daemon unless the user explicitly selects a lower version and the compatibility matrix permits that downgrade @spec @phase4 @implemented
+- satelle later Host binary version selection verifies the selected version's release artifact integrity metadata for the detected remote platform before upload or execution @spec @phase4 @implemented
+- Satelle does not add Host update channels in current committed scope @spec @phase4 @implemented
 - satelle host update --component codex selects the standalone Codex runtime and Codex-owned native Computer Use components required by that runtime for native Computer Use readiness @mvp @spec @implemented
 - satelle host update --component codex does not select the Satelle host binary or Host Daemon service assets @mvp @spec @implemented
 - satelle host update --component codex does not update unrelated browser extensions, operating-system packages, third-party tools, user browser profiles, provider credentials, or non-Codex automation software @mvp @spec @implemented
@@ -2468,3 +2468,12 @@
 - a completed token issuance or rotation retry returns HTTP 409 token-secret-not-replayable with the original token metadata and revoke-and-reissue guidance; revocation retries return their original successful outcome @spec @contract @phase4
 - general token-management responses and pending setup token issuance responses carry Cache-Control no-store @spec @contract @phase4
 - schema migrations that rebuild referenced tables preserve journal rows, check database and foreign-key integrity before commit, and enable foreign-key enforcement before returning the Host runtime connection @spec @contract @phase4
+
+## native-package-repair-contract
+- satelle native repair accepts only --dry-run, --no-color, and -h or --help; help and invalid arguments are handled before native binary resolution or package-manager mutation @spec @contract @phase4
+- satelle native repair selects the exact launcher version and current supported platform, and derives package-manager ownership from the installed launcher, package metadata, lockfile, and matching global-root discovery rather than a user-agent hint @spec @phase4
+- satelle native repair uses npm install, pnpm add, or bun add with the exact native package version, forced reinstallation, and lifecycle scripts disabled; global installs retain the global scope, and local installs record an exact optional dependency in the owning project through its package manager @spec @contract @phase4
+- satelle native repair --dry-run reports the detected owner, installation root, target package version, and package-manager command without changing the installation @spec @contract @phase4
+- each native npm package includes SHA256SUMS with exactly one SHA-256 digest and its package-relative executable path; release assembly and release validation check this metadata against the same executable bytes used by the package @spec @contract @phase4
+- satelle native repair reports success only after resolving the exact-version package through the ordinary launcher resolver and verifying its name, OS, CPU, libc, regular executable path inside the package, executable permissions, and SHA256SUMS digest; missing or invalid metadata is a native-repair-verification-failed error @spec @contract @phase4
+- satelle native repair refuses unknown or ambiguous installation owners with native-repair-owner-unknown and directs the operator to the verified direct native release installation; a failed package-manager operation returns native-repair-failed and never claims success @spec @contract @phase4

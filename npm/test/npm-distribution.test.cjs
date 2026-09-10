@@ -2,7 +2,9 @@
 
 const assert = require("node:assert/strict");
 const { execFileSync, spawnSync } = require("node:child_process");
+const { createHash } = require("node:crypto");
 const {
+  chmodSync,
   copyFileSync,
   mkdtempSync,
   mkdirSync,
@@ -898,7 +900,7 @@ test("package manifests align versions, constraints, dependencies, and executabl
     assert.deepEqual(nativeManifest.cpu, [target.cpu]);
     assert.deepEqual(nativeManifest.libc, target.libc ? [target.libc] : undefined);
     assert.equal(nativeManifest.bin, undefined);
-    assert.deepEqual(nativeManifest.files, [target.binaryPath]);
+    assert.deepEqual(nativeManifest.files, [target.binaryPath, "SHA256SUMS"]);
     assert.equal(nativeManifest.scripts.prepack, "node ../scripts/verify-native-package.cjs");
   }
 
@@ -1006,13 +1008,15 @@ test("native package prepack accepts an assembled binary and includes it", (cont
     path.join(stagedScriptsRoot, "verify-native-package.cjs"),
   );
   writeFileSync(binaryPath, "assembled-native-binary");
+  const digest = createHash("sha256").update(readFileSync(binaryPath)).digest("hex");
+  writeFileSync(path.join(stagedPackageRoot, "SHA256SUMS"), `${digest}  bin/satelle.exe\n`);
 
   const packDestination = path.join(fixtureRoot, "packs");
   mkdirSync(packDestination);
   const nativePack = packPackage(stagedPackageRoot, packDestination);
   assert.deepEqual(
     nativePack.files.map(({ path: filePath }) => filePath).sort(),
-    ["bin/satelle.exe", "package.json"],
+    ["SHA256SUMS", "bin/satelle.exe", "package.json"],
   );
 });
 
@@ -1024,4 +1028,121 @@ test("the executable boundary prints typed errors without a stack trace", () => 
   assert.equal(child.status, 1);
   assert.match(child.stderr, /^satelle: native-binary-package-missing:/);
   assert.doesNotMatch(child.stderr, /LauncherError|\n\s+at /);
+});
+
+
+test("native repair help and usage work without an installed native binary", () => {
+  const executable = path.join(canonicalPackageRoot, "bin", "satelle.cjs");
+  for (const args of [["native", "repair", "--help"], ["--no-color", "native", "-h"]]) {
+    const help = spawnSync(process.execPath, [executable, ...args], { encoding: "utf8" });
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(help.stdout, /Usage: satelle native repair/);
+    assert.match(help.stdout, /exact optional dependency/);
+    assert.equal(help.stderr, "");
+  }
+  for (const args of [
+    ["native"], ["native", "repair", "--yes"], ["native", "repair", "another-package"],
+    ["native", "unknown", "--help"], ["native", "repair", "--yes", "--help"],
+  ]) {
+    const invalid = spawnSync(process.execPath, [executable, ...args], { encoding: "utf8" });
+    assert.equal(invalid.status, 64);
+    assert.equal(invalid.stdout, "");
+    assert.match(invalid.stderr, /^satelle: invalid-usage:/);
+    assert.doesNotMatch(invalid.stderr, /native-binary-package-missing|\n\s+at /);
+  }
+  const unowned = spawnSync(process.execPath, [executable, "native", "repair"], { encoding: "utf8" });
+  assert.equal(unowned.status, 1);
+  assert.equal(unowned.stdout, "");
+  assert.match(unowned.stderr, /native-repair-owner-unknown/);
+  assert.match(unowned.stderr, /verified direct native binary installation path/);
+  assert.equal(launcher.nativeRepairOptions(["run", "--command", "native repair"]), undefined);
+});
+
+test("native repair pins the native package and keeps its installation owner", () => {
+  const target = platformMatrix["linux-x64-gnu"];
+  for (const manager of ["npm", "pnpm", "bun"]) {
+    for (const scope of ["local", "global"]) {
+      const installRoot = path.resolve("repair-fixture", "project", "node_modules");
+      const plan = launcher.nativeRepairPlan(target, { manager, scope, install_root: installRoot });
+      assert.equal(plan.manager, manager);
+      assert.equal(plan.scope, scope);
+      assert.equal(plan.cwd, scope === "global" ? path.dirname(installRoot) : installRoot);
+      assert.equal(plan.arguments.at(-1), `${target.packageName}@${canonicalPackageVersion}`);
+      assert.ok(plan.arguments.includes("--force"));
+      assert.ok(plan.arguments.includes("--ignore-scripts"));
+      assert.equal(plan.arguments.includes("--global"), scope === "global");
+      if (scope === "local") {
+        assert.ok(plan.arguments.includes(manager === "bun" ? "--optional" : "--save-optional"));
+        assert.ok(plan.arguments.includes(manager === "bun" ? "--exact" : "--save-exact"));
+      }
+    }
+  }
+  for (const owner of [undefined, { manager: "unknown" }]) {
+    assert.throws(() => launcher.nativeRepairPlan(target, owner), { code: "native-repair-owner-unknown" });
+  }
+});
+
+test("native repair rejects package metadata, executable, and checksum drift", (context) => {
+  const fixtureRoot = realpathSync(mkdtempSync(path.join(tmpdir(), "satelle-native-integrity-")));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  const target = launcher.selectTarget({
+    platform: process.platform,
+    arch: process.arch,
+    libc: process.platform === "linux" ? launcher.detectLinuxLibc() : undefined,
+  });
+  const nativeBytes = Buffer.from("native package integrity fixture");
+  const digest = createHash("sha256").update(nativeBytes).digest("hex");
+  const validManifest = {
+    name: target.packageName,
+    version: canonicalPackageVersion,
+    os: [target.os],
+    cpu: [target.cpu],
+    ...(target.libc ? { libc: [target.libc] } : {}),
+  };
+  let fixtureNumber = 0;
+  function fixture() {
+    const root = path.join(fixtureRoot, String(fixtureNumber++));
+    const nativeRoot = path.join(root, "node_modules", ...target.packageName.split("/"));
+    const binaryPath = path.join(nativeRoot, target.binaryPath);
+    const manifestPath = path.join(nativeRoot, "package.json");
+    const checksumPath = path.join(nativeRoot, "SHA256SUMS");
+    mkdirSync(path.dirname(binaryPath), { recursive: true });
+    writeFileSync(binaryPath, nativeBytes, { mode: 0o755 });
+    writeFileSync(manifestPath, JSON.stringify(validManifest));
+    writeFileSync(checksumPath, `${digest}  ${target.binaryPath}\n`);
+    return { root, nativeRoot, binaryPath, manifestPath, checksumPath };
+  }
+  const valid = fixture();
+  assert.equal(launcher.verifyRepairedNativePackage(target, valid.root), valid.binaryPath);
+  for (const [key, value] of [
+    ["name", "another-package"], ["version", "0.0.0"], ["os", ["wrong-os"]],
+    ["cpu", ["wrong-cpu"]], ["libc", ["wrong-libc"]],
+  ]) {
+    const current = fixture();
+    writeFileSync(current.manifestPath, JSON.stringify({ ...validManifest, [key]: value }));
+    assert.throws(() => launcher.verifyRepairedNativePackage(target, current.root), { code: "native-repair-verification-failed" });
+  }
+  for (const change of [
+    (current) => writeFileSync(current.binaryPath, "different native bytes"),
+    (current) => writeFileSync(current.binaryPath, ""),
+    (current) => writeFileSync(current.checksumPath, `${digest}  another-path\n`),
+    (current) => rmSync(current.checksumPath),
+    (current) => { rmSync(current.checksumPath); mkdirSync(current.checksumPath); },
+  ]) {
+    const current = fixture();
+    change(current);
+    assert.throws(() => launcher.verifyRepairedNativePackage(target, current.root), { code: "native-repair-verification-failed" });
+  }
+  const outside = fixture();
+  const externalDirectory = path.join(outside.root, "external");
+  mkdirSync(externalDirectory);
+  copyFileSync(outside.binaryPath, path.join(externalDirectory, path.basename(outside.binaryPath)));
+  rmSync(path.dirname(outside.binaryPath), { recursive: true });
+  symlinkSync(externalDirectory, path.dirname(outside.binaryPath), process.platform === "win32" ? "junction" : "dir");
+  assert.throws(() => launcher.verifyRepairedNativePackage(target, outside.root), { code: "native-repair-verification-failed" });
+  if (process.platform !== "win32") {
+    const noExecute = fixture();
+    chmodSync(noExecute.binaryPath, 0o600);
+    assert.throws(() => launcher.verifyRepairedNativePackage(target, noExecute.root), { code: "native-repair-verification-failed" });
+  }
 });
