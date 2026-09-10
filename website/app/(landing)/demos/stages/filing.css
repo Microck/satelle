@@ -1,0 +1,386 @@
+/* Court filing stage: a drawn US Letter page preview beside the compliance list
+   from Court_Style_Guide.txt.
+
+   The job of this interior is to make *formatting* visible, so body text is
+   drawn as ruled lines rather than as prose: at page-preview scale nobody reads
+   the words, they read the layout. Every style rule lands as a change in the
+   drawing, and the table beside it carries the same state as text. */
+
+.fl {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 0;
+  background: var(--sa-2);
+  font-size: var(--step--2);
+}
+
+/* ------------------------------------------------------------------ head --- */
+
+.fl-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: var(--space-3xs) var(--space-2xs);
+  border-block-end: 1px solid var(--sa-6);
+  background: var(--sa-3);
+  font-family: var(--font-mono);
+}
+
+.fl-type {
+  color: var(--sa-11);
+}
+
+/* Before the body type lands this reads as a statement about the Turn's own
+   work, never as a claim about what the draft already held. */
+.fl-type[data-set='false'] {
+  color: var(--sa-9);
+}
+
+.fl-pagecount {
+  margin-inline-start: auto;
+  color: var(--sa-10);
+}
+
+/* ------------------------------------------------------------------ body --- */
+
+.fl-body {
+  display: grid;
+  min-height: 0;
+}
+
+.fl-sheetwrap {
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-xs);
+  background: var(--sa-1);
+}
+
+/* max-content keeps the pages at their true size and lets the wrapper scroll
+   when the column is narrower than the spread, so the page never does. */
+.fl-sheet {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-s);
+  width: max-content;
+  margin-inline: auto;
+}
+
+/* ------------------------------------------------------------------ page --- */
+
+.fl-page {
+  --fl-h: 17rem;
+
+  position: relative;
+  flex: none;
+  height: var(--fl-h);
+  /* US Letter, 8.5 by 11 inches. */
+  width: calc(var(--fl-h) * 8.5 / 11);
+  /* One em is 1/34 of the page height, so one inch is exactly 34/11 em. Every
+     measure below is therefore written in real inches: 3.0909em is 1 in,
+     1.5455em is half an inch, and a 24 pt line (12 pt double-spaced) is
+     1.0303em. Type is drawn larger than true 12 pt so the few real strings
+     stay legible; the leading stays honest, because the leading is the thing
+     the reader is being asked to see. */
+  font-size: calc(var(--fl-h) / 34);
+  background: var(--sa-3);
+  border: 1px solid var(--sa-6);
+  border-radius: var(--radius-sm);
+  color: var(--sa-12);
+  /* The draft carries half-inch margins. Step 3 narrows the text block to one
+     inch on every side, which is the change the reader is meant to see. */
+  padding: 1.5455em;
+  transition: padding var(--mo-overlay) var(--mo-ease-flat);
+}
+
+.fl-page[data-margins='true'] {
+  padding: 3.0909em;
+}
+
+/* The margin guide sits exactly on the text block edge, so the guide and the
+   narrowed text arrive together. */
+.fl-guide {
+  position: absolute;
+  inset: 3.0909em;
+  border: 1px dashed var(--sa-7);
+  pointer-events: none;
+}
+
+.fl-runhead {
+  position: absolute;
+  inset-block-start: 1.3em;
+  inset-inline-end: 3.0909em;
+  font-family: var(--font-mono);
+  font-size: 0.8em;
+  color: var(--sa-11);
+}
+
+/* Centered automatic page number, sitting in the bottom margin. */
+.fl-folio {
+  position: absolute;
+  inset-block-end: 1.2em;
+  inset-inline: 0;
+  text-align: center;
+  font-size: 0.8em;
+  color: var(--sa-11);
+}
+
+.fl-content {
+  display: flex;
+  flex-direction: column;
+  /* Tight, because the block gaps have to leave room for the worst frame: one
+     column caption, double-spaced body, double-spaced signature, and the
+     certificate still running on before the page break lands. That state fills
+     roughly 27.2 of the 27.8 em the text block holds. */
+  gap: 0.15em;
+  height: 100%;
+  /* Clips at the text block, so anything overset is cut at the margin line the
+     way a page cuts it. */
+  overflow: hidden;
+}
+
+/* --------------------------------------------------------------- caption --- */
+
+/* One column in the draft. Step 6 splits it, parties left and court right,
+   with a hairline standing in for the bracket a filing carries at full size. */
+.fl-caption {
+  display: grid;
+  gap: 0.05em;
+  font-size: 0.8em;
+  line-height: 1.15;
+  color: var(--sa-11);
+}
+
+.fl-caption[data-columns='2'] {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  column-gap: 1em;
+}
+
+.fl-caption-col {
+  display: grid;
+  gap: 0.05em;
+  align-content: start;
+}
+
+.fl-caption[data-columns='2'] .fl-caption-col + .fl-caption-col {
+  padding-inline-start: 1em;
+  border-inline-start: 1px solid var(--sa-7);
+}
+
+/* -------------------------------------------------------------- headings --- */
+
+.fl-heading {
+  margin-block-start: 0.4em;
+  font-size: 0.95em;
+  line-height: 1.2;
+  font-weight: 400;
+  color: var(--sa-11);
+}
+
+/* Centered, bold, uppercase. The uppercase is applied as formatting rather than
+   by rewriting the string, because the guide's rule is that no wording changes. */
+.fl-heading[data-formatted='true'] {
+  text-align: center;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--sa-12);
+}
+
+/* ------------------------------------------------------------- body text --- */
+
+/* Body text as ruled lines, with the gap carrying the leading: 12 pt single
+   spaced sets a 13.8 pt line, which is 0.45em of gap above a 0.14em rule, and
+   double spacing it sets a 24 pt line, which is 0.89em. That is why the lines
+   visibly spread when step 4 commits. */
+.fl-para {
+  display: flex;
+  flex-direction: column;
+  row-gap: 0.45em;
+  transition: row-gap var(--mo-overlay) var(--mo-ease-flat);
+}
+
+.fl-para[data-lead='double'] {
+  row-gap: 0.89em;
+}
+
+.fl-line {
+  height: 0.14em;
+  min-height: 1px;
+  background: var(--sa-9);
+}
+
+/* The last line of a paragraph runs short, the way a real one does. */
+.fl-line[data-last='true'] {
+  width: 62%;
+}
+
+/* Signature block. The blanket double-space at step 4 catches it, and step 8
+   tightens it back, which is the rule the guide states on its own. */
+.fl-sig {
+  display: flex;
+  flex-direction: column;
+  /* Hugs its own lines instead of stretching to the text block. The pointer
+     aims at the centre of the box a stage marks, and a full width box put step
+     8's landing 23px past the end of the longest line, on blank paper, and left
+     it in the gutter between the sheets once the page break moved the sheet. */
+  width: fit-content;
+  row-gap: 0.05em;
+  margin-block-start: 0.4em;
+  font-size: 0.8em;
+  line-height: 1.15;
+  color: var(--sa-11);
+  transition: row-gap var(--mo-overlay) var(--mo-ease-flat);
+}
+
+.fl-sig[data-lead='double'] {
+  row-gap: 0.55em;
+}
+
+/* ----------------------------------------------------------- style guide --- */
+
+.fl-rules {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  min-width: 0;
+  padding: var(--space-xs);
+  border-block-start: 1px solid var(--sa-6);
+  background: var(--sa-1);
+}
+
+/* Wraps at narrow widths on purpose. Stacked, the pane is about 257px, and the
+   guide's filename and the applied count cannot share a line at that width: the
+   count is nowrap and start-margined to the end, so it pushed the whole pane
+   past the right edge of the screen. It goes back on one line in the wide
+   layout below, where both fit. */
+.fl-rules-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2xs);
+}
+
+.fl-count {
+  margin-inline-start: auto;
+  color: var(--sa-10);
+  white-space: nowrap;
+}
+
+.fl-unread {
+  color: var(--sa-9);
+}
+
+.fl-grid {
+  border-collapse: collapse;
+  width: 100%;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.fl-grid th,
+.fl-grid td {
+  padding: 0.0625rem 0.375rem;
+  border-block-end: 1px solid var(--sa-2);
+  text-align: start;
+  font-weight: 400;
+  line-height: 1.35;
+  color: var(--sa-10);
+}
+
+.fl-grid thead th {
+  background: var(--sa-3);
+  color: var(--sa-10);
+  font-weight: 500;
+  border-block-end-color: var(--sa-6);
+}
+
+/* The rule labels are lines of a text file, so they stay mono and are allowed
+   to wrap. The long output path breaks anywhere rather than pushing the pane
+   sideways. */
+.fl-grid tbody th {
+  color: var(--sa-11);
+  overflow-wrap: anywhere;
+}
+
+.fl-grid tbody tr[data-done='true'] th {
+  color: var(--sa-12);
+}
+
+/* Same tick treatment as the spreadsheet stage: a middot while a rule is
+   pending, the tick in --sa-ok once the Turn has landed it. The word beside it
+   is screen-reader only, so the glyph never carries the state alone. */
+.fl-state {
+  width: 1px;
+  white-space: nowrap;
+}
+
+.fl-state::before {
+  content: '\00b7';
+  color: var(--sa-8);
+}
+
+.fl-grid tbody tr[data-done='true'] .fl-state::before {
+  content: '\2713';
+  color: var(--sa-ok);
+}
+
+/* ------------------------------------------------------------------ foot --- */
+
+.fl-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3xs) var(--space-2xs);
+  padding: var(--space-3xs) var(--space-2xs);
+  border-block-start: 1px solid var(--sa-6);
+  background: var(--sa-3);
+  font-family: var(--font-mono);
+  color: var(--sa-11);
+}
+
+.fl-path {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--sa-12);
+}
+
+.fl-source {
+  display: flex;
+  align-items: center;
+  gap: 0.4em;
+  min-width: 0;
+  margin-inline-start: auto;
+  overflow-wrap: anywhere;
+  color: var(--sa-10);
+}
+
+.fl-untouched {
+  color: var(--sa-ok);
+}
+
+.fl-untouched::before {
+  content: '\2713';
+  margin-inline-end: 0.3em;
+}
+
+/* ------------------------------------------------------------------ wide --- */
+
+@media (min-width: 52rem) {
+  .fl-body {
+    grid-template-columns: minmax(0, 1fr) minmax(16rem, 21rem);
+  }
+
+  .fl-rules {
+    border-block-start: 0;
+    border-inline-start: 1px solid var(--sa-6);
+  }
+
+  .fl-rules-head {
+    flex-wrap: nowrap;
+  }
+
+  .fl-page {
+    --fl-h: 20rem;
+  }
+}

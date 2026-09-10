@@ -1,0 +1,269 @@
+/*
+ * Transports demo. One window: a tab strip, the Controller-to-Host link as a
+ * single row, the tokens that link carries, and the command typed underneath.
+ * No wiring diagram, no claim line, no fact columns. The card head already
+ * names the three paths, so the window only has to show what each one holds.
+ *
+ * A dashed boundary means the same thing in both places it appears: a wrapper
+ * that does not remove what is inside it. Around the two ends it is one
+ * machine; around the tokens it is the SSH tunnel.
+ */
+
+.tr {
+  display: flex;
+  flex-direction: column;
+}
+
+.tr-bar-user {
+  color: var(--sa-12);
+  font-weight: 500;
+}
+
+/* The bar's three columns do not fit a narrow card: the binding value alone
+   takes about half of a 240px body, which pushed the title past the edge. It is
+   the part the tab strip below already states. */
+@container demo (max-width: 26rem) {
+  .tr-bar-key {
+    display: none;
+  }
+}
+
+/* ------------------------------------------------------------------ tabs --- */
+
+.tr-pick {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-2xs) var(--space-xs);
+  border-block-end: 1px solid var(--sa-6);
+}
+
+.tr-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3xs);
+  min-width: 0;
+}
+
+.tr-tab {
+  padding: 0.1875rem 0.625rem;
+  border: 1px solid var(--sa-6);
+  border-radius: var(--radius-sm);
+  background: var(--sa-2);
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  color: var(--sa-11);
+  white-space: nowrap;
+  /* Selection is instant. Only the hover surface moves. */
+  transition:
+    background var(--mo-state) var(--mo-ease-flat),
+    border-color var(--mo-state) var(--mo-ease-flat);
+}
+
+.tr-tab:hover {
+  background: var(--sa-4);
+}
+
+.tr-tab[aria-selected='true'] {
+  border-color: var(--sa-accent);
+  background: var(--sa-accent-quiet);
+  color: var(--sa-accent-text);
+}
+
+/* ----------------------------------------------------------------- panel --- */
+
+/* Floored, not sized to content: the SSH tab carries a tunnel box the other two
+   do not, and a panel that grew on selection would step the whole grid row down
+   the page. The floor also buys the resting whitespace the reference leaves. */
+.tr-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-s);
+  padding: var(--space-s);
+  min-height: 19rem;
+}
+
+.tr-panel:focus-visible,
+.tr-panel:focus {
+  outline: 2px solid var(--sa-accent);
+  outline-offset: -2px;
+}
+
+/* ------------------------------------------------------------------ link --- */
+
+.tr-path {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  min-width: 0;
+}
+
+/* Local: both ends inside one machine boundary. They keep separate surfaces,
+   because local removes the network and not the boundary. */
+.tr-path[data-one-machine='true'] {
+  border: 1px dashed var(--sa-7);
+  border-radius: var(--radius-md);
+  padding: var(--space-2xs) var(--space-xs) var(--space-xs);
+}
+
+.tr-path-tag {
+  align-self: flex-start;
+}
+
+/* Stacked below the container query, so the ends read top to bottom on a phone
+   rather than shrinking their labels under reading size. */
+.tr-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3xs);
+  min-width: 0;
+}
+
+.tr-end {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  font-size: var(--step--1);
+  line-height: 1.4;
+}
+
+.tr-end b {
+  color: var(--sa-12);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.tr-end-note {
+  font-size: var(--step--2);
+  color: var(--sa-9);
+  overflow-wrap: anywhere;
+}
+
+/* Stacked, the wire is a stub between the two ends and lines up with them.
+   Once the row goes horizontal it centres between them instead. */
+.tr-wire {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3xs);
+  min-width: 0;
+}
+
+.tr-wire-name {
+  font-size: var(--step--2);
+  color: var(--sa-11);
+  white-space: nowrap;
+}
+
+.tr-rule {
+  inline-size: 0;
+  block-size: 0.75rem;
+  border-inline-start: 1px solid var(--sa-7);
+  flex: none;
+}
+
+/* ---------------------------------------------------------------- tokens --- */
+
+.tr-carry {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3xs);
+  min-width: 0;
+}
+
+/* SSH: the wrapper is drawn around the tokens it does not replace. */
+.tr-carry[data-tunnel='true'] {
+  border: 1px dashed var(--sa-8);
+  border-radius: var(--radius-md);
+  padding: var(--space-2xs) var(--space-xs) var(--space-xs);
+}
+
+.tr-tokens {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3xs) var(--space-2xs);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.tr-tokens code {
+  color: var(--sa-12);
+  background: var(--sa-3);
+  border-radius: var(--radius-sm);
+  padding: 0.05em 0.4em;
+  overflow-wrap: anywhere;
+}
+
+/* Absences read as absences: same shape, no fill, quieter ink. Local carries
+   nothing off the machine, and that is information, not a blank. */
+.tr-tokens[data-absent='true'] code {
+  color: var(--sa-9);
+  background: none;
+  border: 1px solid var(--sa-6);
+  padding: 0.05em 0.35em;
+}
+
+/* --------------------------------------------------------------- command --- */
+
+/* Takes the panel's slack, so the whitespace the floor buys lands in the
+   terminal rather than between the rows above it. */
+.tr-cmd {
+  flex: 1;
+  background: var(--sa-1);
+  border: 1px solid var(--sa-6);
+  border-radius: var(--radius-md);
+}
+
+/* --------------------------------------------------------------- actions --- */
+
+.tr-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: var(--space-xs);
+  border-block-start: 1px solid var(--sa-6);
+  background: var(--sa-2);
+}
+
+/* ------------------------------------------------------------------ wide --- */
+
+/* Layout responds to the demo's card, not the viewport: these demos are gridded
+   two-up, so a viewport query reports a width the card does not have. The
+   container is declared on .card-body in page.css.
+
+   The link becomes the path it describes once there is room for the rule to
+   read as a link rather than as a stub. */
+@container demo (min-width: 26rem) {
+  .tr-row {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--space-2xs);
+  }
+
+  .tr-end {
+    flex: 0 1 auto;
+  }
+
+  /* The Host end is the far end of the link, so it hangs off the right. */
+  .tr-end[data-role='host'] {
+    align-items: flex-end;
+    text-align: end;
+  }
+
+  .tr-wire {
+    align-items: center;
+    flex: 1 1 4rem;
+  }
+
+  .tr-rule {
+    block-size: 0;
+    inline-size: auto;
+    align-self: stretch;
+    border-inline-start: 0;
+    border-block-start: 1px solid var(--sa-7);
+  }
+}

@@ -1,0 +1,106 @@
+/* MCP demo: one agent session, two typed lines, and nothing else in the window.
+   The read-only against mutations boundary is carried by what the session
+   prints, so there is no tool inventory, no field table and no log block. */
+
+.ag {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ----------------------------------------------------------------- bar --- */
+
+.ag-bar-cmd {
+  color: var(--sa-12);
+  font-weight: 500;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.ag-bar-count {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* Below a 320px card the bar has to fit the process name and the tool count,
+   which both mean something, alongside 40px of traffic lights that mean
+   nothing. Furniture yields, and the first grid track goes with it so the two
+   remaining cells keep their places. */
+@container demo (max-width: 20rem) {
+  .ag .sa-win-lights {
+    display: none;
+  }
+
+  .ag .sa-win-bar {
+    grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+  }
+}
+
+/* ------------------------------------------------------------ transcript --- */
+
+/* Every line is its own element, so the terminal's pre-wrap is not needed and
+   would only preserve JSX indentation.
+
+   The height is the taller of the two endings, measured at the two-up card
+   width: the window does not grow while the script types, and restarting the
+   server with the other flag does not move the buttons under the pointer. Below
+   that width the lines wrap more and the window grows past the reservation,
+   which is the right way round: reserving the widest case would leave a phone
+   staring at 200px of nothing. `em` resolves against the terminal's own size. */
+.ag-term {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  white-space: normal;
+  min-height: 26.4em;
+}
+
+/* The operator's line. The marker sits in its own column so a wrapped line
+   hangs under the text rather than under the marker. */
+.ag-ask {
+  display: flex;
+  gap: 0.55em;
+  color: var(--sa-12);
+}
+
+.ag-mark {
+  flex: none;
+  color: var(--sa-9);
+}
+
+.ag-ask-text {
+  min-width: 0;
+}
+
+/* One 64 character token against a 240px card at 320px. It has to be allowed to
+   break wherever it runs out of room, since it holds no spaces at all. */
+.ag-call {
+  color: var(--sa-11);
+  overflow-wrap: anywhere;
+}
+
+.ag-out {
+  color: var(--sa-11);
+  overflow-wrap: anywhere;
+}
+
+/* A Turn state, marked the way every other demo on the page marks one. */
+.ag-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+}
+
+.ag-refusal {
+  color: var(--sa-10);
+}
+
+/* --------------------------------------------------------------- actions --- */
+
+/* Outside the window: the controls belong to the reader, not to the server the
+   window draws. Wrapping keeps both reachable on a 320px card. */
+.ag-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2xs);
+  margin-block-start: var(--space-xs);
+}

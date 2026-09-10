@@ -1,0 +1,116 @@
+/* Durability demo: the Session outlives the Controller process that started it.
+   Two terminals, one line typed in each, and no other content. */
+
+.du {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Stacked at every width. One terminal above the other reads as a sequence in
+   time, which is what this demo is: the first process runs, then dies, then the
+   second one asks. Side by side would read as a comparison. */
+.du-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+}
+
+/* --------------------------------------------------------------- window --- */
+
+.du-alias {
+  color: var(--sa-12);
+  font-weight: 500;
+  min-width: 0;
+  overflow: hidden;
+  /* Insurance only. The container rule below keeps the bar within its width at
+     every size from 320px up, so this never actually truncates. */
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.du-end {
+  flex: none;
+}
+
+/* Below a 272px card the bar has 254px for three things that mean something
+   (the machine, the tty, the exited dot) plus 40px of traffic lights that mean
+   nothing. Furniture yields. The first grid track goes with the lights so the
+   two remaining cells keep their places. */
+@container demo (max-width: 17rem) {
+  .du-win .sa-win-lights {
+    display: none;
+  }
+
+  .du-win .sa-win-bar {
+    grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+  }
+}
+
+/* A quiet window is a process that is gone. Everything it printed stays, one
+   step further back in the ramp, so the reader can still read it and can still
+   see that Satelle did not clean it up. */
+.du-win[data-quiet='true'] .du-alias,
+.du-win[data-quiet='true'] .du-end,
+.du-win[data-quiet='true'] .du-term {
+  color: var(--sa-9);
+}
+
+.du-win[data-quiet='true'] .du-alias {
+  font-weight: 400;
+}
+
+.du-win[data-quiet='true'] .du-term b {
+  color: var(--sa-10);
+}
+
+/* -------------------------------------------------------------- terminal --- */
+
+.du-term {
+  display: flex;
+  flex-direction: column;
+  /* No max-height and no inner scroller: the script is short enough to print
+     whole, and a nested scroller would hide the proof and steal the wheel. */
+}
+
+/* Height is reserved for the line count the script ends at, so the card does
+   not reflow while it types and the second window is visibly empty until its
+   beat runs. 1.6 is the terminal line-height, and `em` here resolves against
+   the terminal's own font size.
+
+   First window: one command, the two lines `run --detach` prints, the exit
+   note. Second window: one command, the six lines `status` prints, the prompt
+   the shell returns to. */
+.du-term[data-lines='4'] {
+  min-height: 6.4em;
+}
+
+.du-term[data-lines='8'] {
+  min-height: 12.8em;
+}
+
+.du-cmd {
+  color: var(--sa-11);
+}
+
+/* The Session identifier, wherever Satelle prints it as a value. Tinted rather
+   than set in accent-coloured text: it is printed in both windows, and the mark
+   has to survive the second window going dim without becoming the loudest thing
+   in the section. */
+.du-id {
+  color: var(--sa-12);
+  background: var(--sa-accent-quiet);
+  border-radius: var(--radius-sm);
+  padding-inline: 0.2em;
+  /* One 42-character token against a 240px card body at 320px. It has to be
+     allowed to break wherever it runs out of room. */
+  overflow-wrap: anywhere;
+}
+
+/* --------------------------------------------------------------- actions --- */
+
+/* No frame around the control: it belongs to the reader, not to either machine,
+   and a border here would claim a boundary that is not there. */
+.du-actions {
+  display: flex;
+  margin-block-start: var(--space-xs);
+}

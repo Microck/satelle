@@ -1,0 +1,92 @@
+/*
+ * Readiness demo. One Controller window that runs the probe and prints the
+ * report: no table, no fact columns, no second machine. The Host is the thing
+ * being measured here, not the thing being shown.
+ *
+ * --sa-fail is deliberately absent. The design system keeps it out of any
+ * component that also carries the accent, and the doctor status this demo
+ * prints is literally `blocked`, which is a warn state on that same ramp.
+ */
+
+.rd {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ------------------------------------------------------------ the window --- */
+
+.rd-bar-user {
+  color: var(--sa-12);
+  font-weight: 500;
+}
+
+/* The bar's three columns do not fit a narrow card: at a 320px viewport the
+   card body is 240px and the version chip alone takes 100 of it, which pushed
+   the title past the right edge. The chip is the part that carries no state. */
+@container demo (max-width: 24rem) {
+  .rd-bar-ver {
+    display: none;
+  }
+}
+
+/* -------------------------------------------------------------- terminal --- */
+
+/* The window rests nearly empty and fills itself in, so the body is floored
+   rather than sized to its content: without the floor the card would grow by
+   a third as the report lands, dragging the whole grid row with it. */
+.rd-term {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  min-height: 20rem;
+}
+
+.rd-line {
+  margin: 0;
+  /* `reason=native_readiness_manual_action_required` is one 45-character token
+     and a narrow card gives it 33. It breaks rather than scrolling sideways. */
+  overflow-wrap: anywhere;
+}
+
+.rd-cmd {
+  color: var(--sa-11);
+}
+
+/* One printed line inside a block. The terminal is pre-wrapped, so the
+   evidence lines keep their two-space indent from the string itself. */
+.rd-row {
+  display: block;
+}
+
+.rd-row b {
+  color: var(--sa-12);
+  font-weight: 500;
+}
+
+/* ------------------------------------------------------------------ note --- */
+
+/* This page speaking, not stdout: outside the terminal body, in the sans face,
+   separated by the same rule that divides the window's other strips. */
+.rd-note {
+  margin: 0;
+  padding: var(--space-xs);
+  /* Holds one line before the note arrives, for the same reason the terminal
+     is floored: the card must not step down the page mid-run. */
+  min-height: calc(1.5em + var(--space-xs) * 2);
+  border-block-start: 1px solid var(--sa-6);
+  font-size: var(--step--2);
+  line-height: 1.5;
+  color: var(--sa-9);
+}
+
+/* --------------------------------------------------------------- actions --- */
+
+.rd-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: var(--space-xs);
+  border-block-start: 1px solid var(--sa-6);
+  background: var(--sa-2);
+}
