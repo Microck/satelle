@@ -1,7 +1,7 @@
 'use client';
 
 import * as React from 'react';
-import { DEVICES, PLAYBACK_RATE, TIMING, devicePoint, layout, networkFrame, pointOnSignal, signalPath, type DeviceShape, type NetworkFrame } from './network-model';
+import { DEVICES, PLAYBACK_RATE, TIMING, devicePoint, layout, networkFrame, pointOnSignal, signalPath, smooth, type DeviceShape, type NetworkFrame } from './network-model';
 import './device-network.css';
 
 type State = { elapsed: number; compact: boolean; running: boolean; reduced: boolean };
