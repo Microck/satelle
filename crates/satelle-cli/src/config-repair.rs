@@ -344,7 +344,7 @@ fn repair_error(code: ErrorCode, message: &str, recovery: &str) -> SatelleError 
     }
 }
 
-fn restore_command(backup: &Path, original: &Path) -> String {
+pub(super) fn restore_command(backup: &Path, original: &Path) -> String {
     #[cfg(windows)]
     {
         let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "''"));

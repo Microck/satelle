@@ -74,15 +74,16 @@ pub use secret_file_path::{
 pub use secure_file::{
     OwnerOnlyDirectory, OwnerOnlySecretFilePaths, SecureFileError, SshIdentityCommitRecord,
     cleanup_owner_only_secret_file, keyed_owner_only_secret_file_comparison_digest,
-    keyed_secret_comparison_digest, open_new_owner_only_file, open_or_create_owner_only_directory,
-    open_or_create_owner_only_file, open_or_create_user_or_administrator_controlled_directory,
-    open_owner_only_directory, open_user_or_administrator_controlled_directory,
-    owner_only_secret_destination_exists, persist_new_owner_only_config_file,
-    persist_new_owner_only_secret_file, publish_new_owner_only_directory,
-    publish_owner_only_secret_file, read_bounded_regular_file_no_follow,
-    read_optional_owner_only_secret_config_file, read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
-    rollback_owner_only_secret_file, stage_owner_only_secret_file, sync_owner_only_directory,
+    keyed_secret_comparison_digest, open_existing_private_file, open_new_owner_only_file,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    open_or_create_user_or_administrator_controlled_directory, open_owner_only_directory,
+    open_user_or_administrator_controlled_directory, owner_only_secret_destination_exists,
+    persist_new_owner_only_config_file, persist_new_owner_only_secret_file,
+    publish_new_owner_only_directory, publish_owner_only_secret_file,
+    read_bounded_regular_file_no_follow, read_optional_owner_only_secret_config_file,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file,
+    read_owner_only_secret_file, read_trusted_ca_bundle_file, rollback_owner_only_secret_file,
+    stage_owner_only_secret_file, sync_owner_only_directory,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";
@@ -324,6 +325,7 @@ pub enum MutationCommandFamily {
     SelfUpdateRemotes,
     DoctorFix,
     ConfigRepair,
+    HostStorageMigrate,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3402,15 +3404,10 @@ fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(),
             .flatten()
             .filter_map(toml::Value::as_str)
         {
-            if !matches!(
-                command,
-                "setup"
-                    | "repair"
-                    | "host_update"
-                    | "self_update_remotes"
-                    | "doctor_fix"
-                    | "config_repair"
-            ) {
+            if toml::Value::String(command.to_owned())
+                .try_into::<MutationCommandFamily>()
+                .is_err()
+            {
                 return Err(SatelleError::unsupported_trusted_profile_command_scope(
                     path,
                     &format!("{profile_path}.command_families"),
@@ -4680,6 +4677,11 @@ pub enum ErrorCode {
     RemoteExecution,
     StorageBusy,
     StorageIntegrityFailed,
+    StorageMigrationSourceInvalid,
+    StorageMigrationDestinationInvalid,
+    StorageMigrationPathsOverlap,
+    StorageMigrationDestinationNotEmpty,
+    StorageMigrationRollbackFailed,
     IncompatibleControlPlane,
     ComputerUseNotReady,
     NativeReadinessTimeout,
@@ -4834,6 +4836,11 @@ impl ErrorCode {
             Self::RemoteExecution => "remote-execution",
             Self::StorageBusy => "storage-busy",
             Self::StorageIntegrityFailed => "storage-integrity-failed",
+            Self::StorageMigrationSourceInvalid => "storage-migration-source-invalid",
+            Self::StorageMigrationDestinationInvalid => "storage-migration-destination-invalid",
+            Self::StorageMigrationPathsOverlap => "storage-migration-paths-overlap",
+            Self::StorageMigrationDestinationNotEmpty => "storage-migration-destination-not-empty",
+            Self::StorageMigrationRollbackFailed => "storage-migration-rollback-failed",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
             Self::NativeReadinessTimeout => "native-readiness-timeout",
@@ -4977,6 +4984,10 @@ impl ErrorCode {
             | Self::LogsCursorExpired
             | Self::SelfUpdateInstallOwnerUnknown
             | Self::SelfUpdateReceiptInvalid
+            | Self::StorageMigrationSourceInvalid
+            | Self::StorageMigrationDestinationInvalid
+            | Self::StorageMigrationPathsOverlap
+            | Self::StorageMigrationDestinationNotEmpty
             | Self::UnsupportedLocalPlatform
             | Self::UnsupportedReleaseTarget => 66,
             Self::HostUnreachable
@@ -5005,6 +5016,7 @@ impl ErrorCode {
             | Self::SetupPartiallyApplied
             | Self::StorageBusy
             | Self::StorageIntegrityFailed
+            | Self::StorageMigrationRollbackFailed
             | Self::CredentialHelperTimeout
             | Self::ProviderSecretResolutionFailed
             | Self::SelfUpdateRollbackFailed

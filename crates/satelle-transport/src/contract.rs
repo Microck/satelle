@@ -49,6 +49,7 @@ pub use setup::{
     SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
     SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairPreviousStatus, SetupRepairProbe,
     SetupRepairRunStatus, SetupVerificationRequest, SetupVerificationResponse,
+    StorageMigrationCleanupResponse, StorageMigrationPathsRequest,
 };
 pub(crate) use setup::{
     PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO, provider_secret_upload_aad,

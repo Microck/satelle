@@ -29,9 +29,21 @@ pub(crate) enum OperationOutcome {
     ApiToken(crate::ApiTokenMutationOutcome),
     ProviderBindingAuthorization(PublicResolvedProviderBinding),
     ProviderSecretProvisioning(ProviderSecretProvisioningResult),
+    StorageMigration(crate::storage::StorageMigrationReply),
 }
 
 impl OperationOutcome {
+    pub(crate) fn into_storage_migration(
+        self,
+    ) -> Result<crate::storage::StorageMigrationReply, SatelleError> {
+        match self {
+            Self::StorageMigration(reply) => Ok(reply),
+            _ => Err(crate::runtime::integrity_error(
+                "the operation-capacity result had the wrong response type",
+            )),
+        }
+    }
+
     pub(crate) fn into_api_token(self) -> Result<crate::ApiTokenMutationOutcome, SatelleError> {
         match self {
             Self::ApiToken(outcome) => Ok(outcome),
@@ -69,6 +81,7 @@ impl OperationOutcome {
             Self::Admission { session, .. } => Ok(session),
             Self::Stop(_)
             | Self::ApiToken(_)
+            | Self::StorageMigration(_)
             | Self::ProviderBindingAuthorization(_)
             | Self::ProviderSecretProvisioning(_) => Err(crate::runtime::integrity_error(
                 "the operation-capacity result had the wrong response type",
@@ -81,6 +94,7 @@ impl OperationOutcome {
             Self::Stop(outcome) => Ok(outcome),
             Self::Admission { .. }
             | Self::ApiToken(_)
+            | Self::StorageMigration(_)
             | Self::ProviderBindingAuthorization(_)
             | Self::ProviderSecretProvisioning(_) => Err(crate::runtime::integrity_error(
                 "the operation-capacity result had the wrong response type",
@@ -96,6 +110,7 @@ impl OperationOutcome {
             Self::Admission { .. }
             | Self::Stop(_)
             | Self::ApiToken(_)
+            | Self::StorageMigration(_)
             | Self::ProviderSecretProvisioning(_) => Err(crate::runtime::integrity_error(
                 "the operation-capacity result had the wrong response type",
             )),
@@ -118,6 +133,9 @@ impl OperationOutcome {
             )),
             Self::ApiToken(_) => Err(crate::runtime::integrity_error(
                 "an admission cancellation received an API token result",
+            )),
+            Self::StorageMigration(_) => Err(crate::runtime::integrity_error(
+                "an admission cancellation received a storage migration result",
             )),
         }
     }

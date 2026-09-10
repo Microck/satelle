@@ -22,6 +22,8 @@ mod raw_wire;
 mod sessions;
 #[path = "http/setup-readiness.rs"]
 mod setup_readiness;
+#[path = "http/storage-migration.rs"]
+mod storage_migration;
 
 use reqwest::StatusCode;
 use rustls::RootCertStore;
@@ -59,7 +61,7 @@ use tracing::metadata::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-const EXPECTED_OPERATIONS: [&str; 20] = [
+const EXPECTED_OPERATIONS: [&str; 24] = [
     "live",
     "capabilities",
     "maintenance_update_evidence",
@@ -80,6 +82,10 @@ const EXPECTED_OPERATIONS: [&str; 20] = [
     "api_token_issue",
     "api_token_rotate",
     "api_token_revoke",
+    "storage_migration_begin",
+    "storage_migration_complete",
+    "storage_migration_source_plan",
+    "storage_migration_source_cleanup",
 ];
 
 const BLOCKING_SPAN_ATTRIBUTE_MARKER: &str = "trace-blocking-span-attribute-connected";

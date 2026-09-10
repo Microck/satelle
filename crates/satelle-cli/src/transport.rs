@@ -46,6 +46,9 @@ use std::{
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+#[path = "transport/storage-migration.rs"]
+pub(crate) mod storage_migration;
+
 const SSH_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_DAEMON_LAUNCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -2732,7 +2735,7 @@ impl SshSetupTransport {
     fn prepare_persistent_service(
         &self,
         target: ssh_bootstrap::RemoteTarget,
-        artifact: &ssh_bootstrap::UploadedHostArtifact,
+        artifact: &ssh_bootstrap::ManagedHostArtifact,
         daemon_path_overrides: &DaemonPathOverrides,
         remote: &ssh_bootstrap::PersistentServiceRemote<'_>,
     ) -> Result<PreparedPersistentService, SatelleError> {
@@ -2902,7 +2905,7 @@ struct RemoteSetupExecution<'a> {
     existing_token_file: bool,
     application: Option<SetupApplication>,
     active_token: Option<ApiBearerToken>,
-    artifact: Option<ssh_bootstrap::UploadedHostArtifact>,
+    artifact: Option<ssh_bootstrap::ManagedHostArtifact>,
     service: Option<PreparedPersistentService>,
     previous_observation: Option<ssh_bootstrap::PersistentServiceObservation>,
     durable_tunnel: Option<SshTunnel>,
@@ -8941,10 +8944,65 @@ fn response_connection_lost(error: &reqwest::Error) -> bool {
     false
 }
 
-// Cursor expiry is the one API failure whose details are required to resume
-// safely. Validate that recovery boundary at the transport boundary instead
-// of collapsing it into the generic remote API error used for other codes.
+// Typed API failures can carry path, cleanup, cursor, or contention evidence.
+// Validate each closed detail shape here before exposing it to the Controller.
 fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
+    let storage_code = match error.code() {
+        ApiErrorCode::StorageMigrationSourceInvalid => Some((
+            ErrorCode::StorageMigrationSourceInvalid,
+            "the selected migration source is invalid",
+        )),
+        ApiErrorCode::StorageMigrationDestinationInvalid => Some((
+            ErrorCode::StorageMigrationDestinationInvalid,
+            "the selected migration destination is invalid",
+        )),
+        ApiErrorCode::StorageMigrationPathsOverlap => Some((
+            ErrorCode::StorageMigrationPathsOverlap,
+            "the migration source and destination overlap",
+        )),
+        ApiErrorCode::StorageMigrationDestinationNotEmpty => Some((
+            ErrorCode::StorageMigrationDestinationNotEmpty,
+            "the migration destination contains existing files",
+        )),
+        ApiErrorCode::SetupPartiallyApplied => Some((
+            ErrorCode::SetupPartiallyApplied,
+            "source cleanup stopped after removing some files; inspect the remaining files before retrying",
+        )),
+        _ => None,
+    };
+    if let Some((code, message)) = storage_code {
+        let Some(details) = error
+            .details()
+            .and_then(serde_json::Value::as_object)
+            .filter(|details| details.len() == 1)
+        else {
+            return SatelleError::remote_api_error(host, "invalid-daemon-response");
+        };
+        let details = if code == ErrorCode::SetupPartiallyApplied {
+            let Some(cleanup) = details.get("cleanup").cloned().and_then(|report| {
+                serde_json::from_value::<satelle_host::StorageMigrationCleanup>(report).ok()
+            }) else {
+                return SatelleError::remote_api_error(host, "invalid-daemon-response");
+            };
+            std::collections::BTreeMap::from([("cleanup".into(), serde_json::json!(cleanup))])
+        } else {
+            let Some(path) = details
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|path| !path.is_empty())
+            else {
+                return SatelleError::remote_api_error(host, "invalid-daemon-response");
+            };
+            std::collections::BTreeMap::from([("path".into(), serde_json::json!(path))])
+        };
+        return SatelleError {
+            code,
+            message: message.into(),
+            recovery_command: None,
+            source_detail: None,
+            details,
+        };
+    }
     if matches!(
         error.code(),
         ApiErrorCode::SecretFileTildeFormUnsupported | ApiErrorCode::SecretFileHomeUnavailable

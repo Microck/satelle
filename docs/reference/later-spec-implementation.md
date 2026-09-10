@@ -20,9 +20,9 @@ those pull requests merge, the integration branch gets a final pull request to
 | Host update scripting | Stable target records through `host update --plain` | Merged in PR #221 |
 | Remote image attachments | Host file resolution with bounded validation and no retention | Merged in PR #222 |
 | Host versions | CLI/Host compatibility and explicit versions | Merged in PR #223 |
-| Host storage | Safe path-set migration | Pending |
+| Host storage | Safe path-set migration | Open in PR #236; native checks in progress |
 | API token lifecycle | Durable issuance, rotation, revocation, and one-time secret replies | Merged in PR #224 |
-| Transport authentication | Mutual TLS | Box verified; pull request pending |
+| Transport authentication | Mutual TLS | Merged in PR #228 |
 | Native package repair | Launcher repair through the detected installation owner | Merged in PR #225 |
 | Output formats | Lossless final results and fixed-column CSV | Merged in PR #226 |
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit, diagnostic bundles | Pending |
@@ -36,13 +36,39 @@ Package repository submissions, staged npm publishing, and native action relay
 retain the prerequisites declared in `.facts`. A missing external capability
 or approval is a blocker, never proof of implementation.
 
+## Host storage migration contract decisions
+
+Box passed workspace Clippy, the complete Rust suites, all 115 npm checks, and
+the production documentation build. The Rust suites included 596 CLI tests, 763
+Host tests, 229 core tests, 174 transport library tests, and 151 HTTP transport
+tests. Three independent simplification reviews removed repeated transport and
+planning work without changing the migration contract.
+
+- `host storage migrate --to` selects one absolute storage root. Its `state`
+  and `logs` children replace the selected Host Binding's daemon paths after
+  validation. Configuration, cache, and provider installation paths stay put.
+- Local Hosts use local filesystem authority. Remote Hosts require a trusted
+  SSH management binding. Direct-only Hosts report the missing management path.
+- The Host takes an exclusive maintenance lease before the Controller stops the
+  service. The lease rejects new run and steer admission without displacing an
+  active Turn.
+- The migration uses a SQLite-consistent backup, copies into an inactive
+  destination, verifies file hashes and Host Identity, then switches the service
+  only after every staged check passes.
+- The Controller backs up the owning user configuration and records each
+  authenticated phase with a durable operation identity. Activation failures
+  enter the recorded rollback path and retain explicit recovery commands.
+- A successful migration preserves and fences the source as a rollback copy.
+  `host storage cleanup` deletes only the recorded unchanged source files and
+  can resume after a partial cleanup.
+
 ## Mutual TLS contract decisions
 
 Box passed the full Rust workspace test suites. The final rerun passed workspace
 Clippy, 594 CLI unit tests, 23 configuration integration tests, and all 59
 documentation examples. Inline simplification review completed with one
-comment clarification and no unused code. Native pull request checks remain
-pending.
+comment clarification and no unused code. PR #228 passed Rust and npm checks
+on Linux, macOS, and Windows, plus documentation and release validation.
 
 - Direct HTTPS and WSS share one validated client certificate and key loaded
   from user-owned absolute file references. Bearer scopes and Host Identity

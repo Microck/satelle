@@ -841,6 +841,122 @@ pub(super) async fn delete_provider_binding(
     )
 }
 
+pub(super) async fn begin_storage_migration(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    Path(operation_id): Path<String>,
+    ApiJson(request): ApiJson<crate::StorageMigrationPathsRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let operation = operation_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        service.begin_storage_migration_idempotent(&operation, request.expected_paths(), &authority)
+    })
+    .await
+    {
+        Ok(Ok(())) => authenticated_json_response(
+            StatusCode::OK,
+            &BootstrapMaintenanceResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                operation_id,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
+}
+
+pub(super) async fn complete_storage_migration(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    Path(operation_id): Path<String>,
+    ApiJson(request): ApiJson<crate::StorageMigrationPathsRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let operation = operation_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        service.complete_storage_migration_idempotent(
+            &operation,
+            request.expected_paths(),
+            &authority,
+        )
+    })
+    .await
+    {
+        Ok(Ok(())) => authenticated_json_response(
+            StatusCode::OK,
+            &BootstrapMaintenanceResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                operation_id,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
+}
+
+pub(super) async fn plan_storage_migration_cleanup(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(operation_id): Path<String>,
+) -> Response {
+    storage_migration_cleanup(state, authorized, operation_id, None).await
+}
+
+pub(super) async fn apply_storage_migration_cleanup(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Extension(authority): Extension<MutationAuthority>,
+    Path(operation_id): Path<String>,
+) -> Response {
+    storage_migration_cleanup(state, authorized, operation_id, Some(authority)).await
+}
+
+async fn storage_migration_cleanup(
+    state: Arc<DaemonState>,
+    authorized: AuthorizedRequest,
+    operation_id: String,
+    authority: Option<MutationAuthority>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    match tokio::task::spawn_blocking(move || match authority {
+        Some(authority) => {
+            service.cleanup_storage_migration_source_idempotent(&operation_id, &authority)
+        }
+        None => service.preview_storage_migration_source(&operation_id),
+    })
+    .await
+    {
+        Ok(Ok(cleanup)) => {
+            let mut response = authenticated_json_response(
+                StatusCode::OK,
+                &crate::StorageMigrationCleanupResponse::new(
+                    authorized.request_id().clone(),
+                    state.host_identity.clone(),
+                    cleanup,
+                ),
+                authorized.request_id(),
+                &state.host_identity,
+            );
+            response.headers_mut().insert(
+                axum::http::HeaderName::from_static(super::PROTOCOL_VERSION_HEADER),
+                axum::http::HeaderValue::from_static(super::PROTOCOL_VERSION),
+            );
+            response
+        }
+        Ok(Err(error)) => host_error::response(&state, &authorized, &error),
+        Err(_) => host_error::task_failure(&state, &authorized),
+    }
+}
+
 pub(super) async fn complete_bootstrap_maintenance(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,

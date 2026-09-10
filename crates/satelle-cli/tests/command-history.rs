@@ -428,7 +428,17 @@ adapter = "fake"
         (vec!["repair", "--yes", "--json"], true),
         (vec!["host", "stop", "--json"], false),
         (vec!["host", "restart", "--json"], false),
-        (vec!["host", "storage", "migrate", "--json"], false),
+        (
+            vec![
+                "host",
+                "storage",
+                "migrate",
+                "--to",
+                "/unused-migration-destination",
+                "--json",
+            ],
+            false,
+        ),
     ] {
         let assertion = fixture
             .command()

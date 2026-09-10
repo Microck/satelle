@@ -32,8 +32,9 @@ pub use contract::{
     SetupRepairPlanAction, SetupRepairPlanRequest, SetupRepairPlanResponse,
     SetupRepairPostcondition, SetupRepairPreviousStatus, SetupRepairProbe, SetupRepairRunStatus,
     SetupVerificationRequest, SetupVerificationResponse, StopRequest, StopResponse,
-    SubscribeRequest, SubscribeRequestError, SubscribedResponse, TaskArtifactsResponse,
-    TurnRequest, WsCloseReason, WsControlError, WsServerControl,
+    StorageMigrationCleanupResponse, StorageMigrationPathsRequest, SubscribeRequest,
+    SubscribeRequestError, SubscribedResponse, TaskArtifactsResponse, TurnRequest, WsCloseReason,
+    WsControlError, WsServerControl,
 };
 pub use server::{
     DaemonClientTrust, DaemonServer, DaemonServerConfig, DaemonServerError, DaemonShutdownHandle,

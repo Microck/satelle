@@ -152,6 +152,94 @@ impl tracing::Subscriber for DetachedExecutionMarkerSubscriber {
 }
 
 #[test]
+fn storage_migration_begin_refuses_active_turn_and_then_fences_new_admission() {
+    let state = crate::TestStateDir::new().unwrap();
+    let root = std::fs::canonicalize(state.path()).unwrap();
+    let mut config = satelle_core::SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .unwrap();
+    config.daemon_state_dir = Some(root.clone());
+    config.daemon_log_dir = Some(root.join("logs"));
+    let mut service = crate::HostService::production_for_host(&config);
+    let adapter = BlockingExecutionAndStopAdapter::default();
+    // Keep the production path contract and real storage authority while the
+    // existing controllable adapter holds a Turn at its execution boundary.
+    service.runtime = RuntimeHandle::new(Ok(root.clone()), adapter.clone());
+    let paths = service.daemon_resolved_paths().unwrap();
+    let token = crate::ApiBearerToken::generate().unwrap();
+    service
+        .register_api_token(&token, "migration-admin", crate::ApiScopes::ADMIN, None)
+        .unwrap();
+    let authority = crate::MutationAuthority::new(
+        service.authenticate_api_token(&token).unwrap().unwrap(),
+        "migration-active-turn:begin",
+    )
+    .unwrap();
+    service
+        .runtime
+        .run(RunCommand::detached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_ACTIVE_MIGRATION_TURN",
+        ))
+        .unwrap();
+    adapter.execute_started.wait();
+    let attempt =
+        service.begin_storage_migration_idempotent("migration-active-turn", &paths, &authority);
+    let ledger = service.load_setup_run("migration-active-turn").unwrap();
+    let journal_exists = root
+        .join(".satelle-offline-storage-maintenance-v1")
+        .exists();
+    adapter.execute_release.signal();
+    service.runtime.wait_for_background().unwrap();
+    assert!(
+        attempt.is_err(),
+        "migration must not displace active execution"
+    );
+    assert!(ledger.is_none());
+    assert!(!journal_exists);
+
+    service
+        .begin_storage_migration_idempotent("migration-active-turn", &paths, &authority)
+        .unwrap();
+    service
+        .operation_capacity
+        .execute_exclusive(|| {
+            service.begin_storage_migration_idempotent("migration-active-turn", &paths, &authority)
+        })
+        .expect("a completed replay does not require free mutation capacity");
+    let rejected = service
+        .runtime
+        .run(RunCommand::attached(
+            LOCAL_DEMO_HOST,
+            "PRIVATE_AFTER_MIGRATION_BEGIN",
+        ))
+        .expect_err("confirmed maintenance must fence new Turn admission");
+    assert_eq!(
+        satelle_core::session::TurnAdmissionPhase::NotAdmitted,
+        rejected.phase()
+    );
+    drop(service);
+    crate::HostService::rollback_storage_migration(&root, "migration-active-turn").unwrap();
+    let restored = crate::HostService::production_for_host(&config);
+    restored.initialize_daemon().unwrap();
+    assert!(
+        restored
+            .begin_storage_migration_idempotent("migration-active-turn", &paths, &authority)
+            .is_err(),
+        "a historical begin reply cannot revive a rolled-back lease"
+    );
+    assert_eq!(
+        restored
+            .load_setup_run("migration-active-turn")
+            .unwrap()
+            .unwrap()
+            .status(),
+        crate::SetupRunStatus::Failed
+    );
+}
+
+#[test]
 fn host_service_maintenance_authority_blocks_turns_and_finalizes_atomically() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let service = crate::HostService::local_demo_for_tests_at(state.path()).unwrap();

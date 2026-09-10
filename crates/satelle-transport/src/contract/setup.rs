@@ -32,6 +32,14 @@ define_schema_token!(
 );
 define_schema_token!(RepairMaintenanceSchema, "satelle.repair-maintenance.v1");
 define_schema_token!(
+    StorageMigrationPathsSchema,
+    "satelle.storage-migration-paths.v1"
+);
+define_schema_token!(
+    StorageMigrationCleanupSchema,
+    "satelle.storage-migration-cleanup.v1"
+);
+define_schema_token!(
     ProviderBindingAuthorizationSchema,
     "satelle.provider-binding-authorization.v2"
 );
@@ -108,6 +116,66 @@ pub struct SetupRepairProbe {
 pub struct HostUpdateMaintenanceRequest {
     schema_version: HostUpdateMaintenanceSchema,
     recovery_identity: HostUpdateRecoveryIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageMigrationPathsRequest {
+    schema_version: StorageMigrationPathsSchema,
+    expected_paths: satelle_core::daemon_service::DaemonResolvedPathSet,
+}
+
+impl StorageMigrationPathsRequest {
+    pub fn new(expected_paths: satelle_core::daemon_service::DaemonResolvedPathSet) -> Self {
+        Self {
+            schema_version: StorageMigrationPathsSchema,
+            expected_paths,
+        }
+    }
+
+    pub fn expected_paths(&self) -> &satelle_core::daemon_service::DaemonResolvedPathSet {
+        &self.expected_paths
+    }
+}
+
+impl ApiRequestContract for StorageMigrationPathsRequest {
+    const SCHEMA_VERSION: &'static str = StorageMigrationPathsSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageMigrationCleanupResponse {
+    schema_version: StorageMigrationCleanupSchema,
+    request_id: RequestId,
+    host_identity: String,
+    cleanup: satelle_host::StorageMigrationCleanup,
+}
+
+impl StorageMigrationCleanupResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        cleanup: satelle_host::StorageMigrationCleanup,
+    ) -> Self {
+        Self {
+            schema_version: StorageMigrationCleanupSchema,
+            request_id,
+            host_identity,
+            cleanup,
+        }
+    }
+    pub fn into_cleanup(self) -> satelle_host::StorageMigrationCleanup {
+        self.cleanup
+    }
+}
+
+impl AuthenticatedResponseContract for StorageMigrationCleanupResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
 }
 
 impl HostUpdateMaintenanceRequest {

@@ -3052,12 +3052,21 @@ pub(super) struct RemoteUserDirectories {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct UploadedHostArtifact {
+pub(super) struct ManagedHostArtifact {
     remote_path: String,
     binary_sha256: String,
 }
 
-impl UploadedHostArtifact {
+impl ManagedHostArtifact {
+    /// Both an uploaded artifact and an observed installed executable carry a
+    /// verified path and digest. Migration reuses the latter without an update.
+    pub(super) fn from_installed(executable: &ManagedServiceExecutableObservation) -> Self {
+        Self {
+            remote_path: executable.path.clone(),
+            binary_sha256: crate::self_update::digest_hex(&executable.sha256),
+        }
+    }
+
     pub(super) fn remote_path(&self) -> &str {
         &self.remote_path
     }
@@ -3153,7 +3162,7 @@ impl<'a> PersistentServiceRemote<'a> {
 
     pub(super) fn install_current_host_artifact(
         &mut self,
-    ) -> Result<UploadedHostArtifact, SshBootstrapError> {
+    ) -> Result<ManagedHostArtifact, SshBootstrapError> {
         let artifact = DownloadedArtifact::fetch(self.target)?;
         self.install_host_artifact(artifact)
     }
@@ -3165,7 +3174,7 @@ impl<'a> PersistentServiceRemote<'a> {
     /// state-owner handoff protocol.
     pub(super) fn release_bootstrap_state_owner(
         &mut self,
-        artifact: &UploadedHostArtifact,
+        artifact: &ManagedHostArtifact,
         host_config: &HostConfig,
     ) -> Result<(), SshBootstrapError> {
         let environment = self.target.validated_daemon_environment(host_config)?;
@@ -3180,7 +3189,7 @@ impl<'a> PersistentServiceRemote<'a> {
         &mut self,
         version: &str,
         expected_digest: &str,
-    ) -> Result<UploadedHostArtifact, SshBootstrapError> {
+    ) -> Result<ManagedHostArtifact, SshBootstrapError> {
         let metadata =
             ReleaseArtifactMetadata::from_digest_hex(self.target, version, expected_digest)?;
         let artifact = DownloadedArtifact::fetch_with_metadata(self.target, version, metadata)?;
@@ -3190,7 +3199,7 @@ impl<'a> PersistentServiceRemote<'a> {
     fn install_host_artifact(
         &mut self,
         artifact: DownloadedArtifact,
-    ) -> Result<UploadedHostArtifact, SshBootstrapError> {
+    ) -> Result<ManagedHostArtifact, SshBootstrapError> {
         let directory = self.target.artifact_upload_directory(self.directories)?;
         let mut uploaded = upload_artifact(
             self.destination,
@@ -3228,7 +3237,7 @@ impl<'a> PersistentServiceRemote<'a> {
     pub(super) fn prepare_windows_task(
         &self,
         host_id: &str,
-        artifact: &UploadedHostArtifact,
+        artifact: &ManagedHostArtifact,
     ) -> Result<satelle_core::daemon_service::WindowsTaskDefinition, SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
         let account = self.observe_windows_account()?;
@@ -3337,7 +3346,7 @@ impl<'a> PersistentServiceRemote<'a> {
 
     pub(super) fn launchd_definition(
         &self,
-        artifact: &UploadedHostArtifact,
+        artifact: &ManagedHostArtifact,
         overrides: &DaemonPathOverrides,
         storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
     ) -> Result<LaunchdServiceDefinition, SshBootstrapError> {
@@ -3425,7 +3434,7 @@ impl<'a> PersistentServiceRemote<'a> {
 
     pub(super) fn run_offline_storage_maintenance(
         &mut self,
-        artifact: &UploadedHostArtifact,
+        artifact: &ManagedHostArtifact,
         request: &OfflineStorageMaintenanceRequest<'_>,
     ) -> Result<serde_json::Value, SshBootstrapError> {
         let binary = self.absolute_artifact_path(artifact);
@@ -3447,18 +3456,69 @@ impl<'a> PersistentServiceRemote<'a> {
         }
     }
 
+    pub(super) fn stage_storage_migration(
+        &mut self,
+        artifact: &ManagedHostArtifact,
+        source: &satelle_core::daemon_service::DaemonResolvedPathSet,
+        destination_root: &str,
+        operation_id: &str,
+    ) -> Result<satelle_host::StorageMigrationStage, SshBootstrapError> {
+        let encoded = serde_json::to_string(source)
+            .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+        let command = storage_migration_command(
+            self.target,
+            &self.absolute_artifact_path(artifact),
+            "stage",
+            &[
+                ("source-paths", &encoded),
+                ("to", destination_root),
+                ("operation-id", operation_id),
+            ],
+            true,
+        );
+        let output = self.mutate_with_output("offline_storage_maintenance", &command, None)?;
+        let stage = parse_storage_migration_output::<satelle_host::StorageMigrationStage>(
+            output,
+            "satelle.storage-migration.stage.v1",
+            "stage",
+        )?;
+        if stage.operation_id != operation_id || stage.plan.source != *source {
+            return Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse);
+        }
+        Ok(stage)
+    }
+
+    pub(super) fn rollback_storage_migration(
+        &mut self,
+        artifact: &ManagedHostArtifact,
+        source_root: &str,
+        operation_id: &str,
+    ) -> Result<(), SshBootstrapError> {
+        let command = storage_migration_command(
+            self.target,
+            &self.absolute_artifact_path(artifact),
+            "rollback",
+            &[("source-root", source_root), ("operation-id", operation_id)],
+            true,
+        );
+        let output = self.mutate_with_output("offline_storage_maintenance", &command, None)?;
+        let observed = parse_storage_migration_output::<String>(
+            output,
+            "satelle.storage-migration.rollback.v1",
+            "operation_id",
+        )?;
+        if observed != operation_id {
+            return Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse);
+        }
+        Ok(())
+    }
+
     pub(super) fn observe_canonical_daemon_path_overrides(
         &self,
         host_id: &str,
     ) -> Result<DaemonPathOverrides, SshBootstrapError> {
-        let command =
-            service_path_overrides_observation_command(self.target, self.directories, host_id)?;
-        let output = require_success_output(run_ssh_command_with_output_limit(
-            self.destination,
-            &command,
-            SERVICE_DEFINITION_LIMIT,
-        )?)?;
-        parse_service_path_overrides(self.target, &output.stdout)
+        self.directories
+            .canonical_daemon_path_overrides(self.destination, host_id)
     }
 
     fn observe_windows_account(
@@ -3495,7 +3555,7 @@ impl<'a> PersistentServiceRemote<'a> {
 
     fn observe_windows_executable(
         &self,
-        artifact: &UploadedHostArtifact,
+        artifact: &ManagedHostArtifact,
     ) -> Result<satelle_core::daemon_service::VerifiedWindowsExecutable, SshBootstrapError> {
         let requested_path = self.absolute_artifact_path(artifact);
         let output = require_success_output(run_ssh_command_with_output_limit(
@@ -3614,7 +3674,7 @@ impl<'a> PersistentServiceRemote<'a> {
             .ok_or(SshBootstrapError::PersistentServiceUnsupported)
     }
 
-    fn absolute_artifact_path(&self, artifact: &UploadedHostArtifact) -> String {
+    fn absolute_artifact_path(&self, artifact: &ManagedHostArtifact) -> String {
         if target_path_is_absolute(self.target, artifact.remote_path()) {
             artifact.remote_path().to_string()
         } else {
@@ -3771,6 +3831,95 @@ pub(super) fn plan_offline_storage_backup_cleanup(
     serde_json::from_slice::<OfflineStorageBackupCleanupPlan>(&output.stdout)
         .map(|plan| plan.eligible_backup_file_names)
         .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)
+}
+
+pub(super) fn preview_storage_migration(
+    destination: &str,
+    target: RemoteTarget,
+    binary: &str,
+    source: &satelle_core::daemon_service::DaemonResolvedPathSet,
+    destination_root: &str,
+) -> Result<satelle_host::StorageMigrationPlan, SshBootstrapError> {
+    let encoded = serde_json::to_string(source)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    let command = storage_migration_command(
+        target,
+        binary,
+        "plan",
+        &[("source-paths", &encoded), ("to", destination_root)],
+        false,
+    );
+    let output =
+        run_ssh_command_with_output_limit(destination, &command, OFFLINE_STORAGE_RESULT_LIMIT)?;
+    let plan = parse_storage_migration_output::<satelle_host::StorageMigrationPlan>(
+        output,
+        "satelle.storage-migration.plan.v1",
+        "plan",
+    )?;
+    if plan.source != *source {
+        return Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse);
+    }
+    Ok(plan)
+}
+
+pub(super) fn storage_migration_command(
+    target: RemoteTarget,
+    binary: &str,
+    operation: &str,
+    arguments: &[(&str, &str)],
+    yes: bool,
+) -> String {
+    let quote = if target.is_windows() {
+        powershell_quote
+    } else {
+        posix_quote
+    };
+    let mut command = format!(
+        "{} host offline-storage-migration {}",
+        quote(binary),
+        operation
+    );
+    for (name, value) in arguments {
+        command.push_str(&format!(" --{name} {}", quote(value)));
+    }
+    if yes {
+        command.push_str(" --yes");
+    }
+    if target.is_windows() {
+        powershell_encoded_command(&format!("& {command}"))
+    } else {
+        command
+    }
+}
+
+fn parse_storage_migration_output<T: serde::de::DeserializeOwned>(
+    output: CommandOutput,
+    schema: &str,
+    field: &str,
+) -> Result<T, SshBootstrapError> {
+    if !output.status.success() {
+        if output.stderr.host_key_verification_failed() {
+            return Err(SshBootstrapError::HostKeyVerificationRequired);
+        }
+        return parse_offline_storage_maintenance_failure(&output.stdout)
+            .and_then(|_| Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse));
+    }
+    let mut envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?;
+    if envelope
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        != Some(schema)
+    {
+        return Err(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse);
+    }
+    serde_json::from_value(
+        envelope
+            .get_mut(field)
+            .ok_or(SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)?
+            .take(),
+    )
+    .map_err(|_| SshBootstrapError::InvalidOfflineStorageMaintenanceResponse)
 }
 
 pub(super) fn preview_offline_storage_restore(
@@ -4049,7 +4198,7 @@ fn windows_task_xml(
     ))
 }
 
-fn windows_task_register_command(
+pub(super) fn windows_task_register_command(
     task: &satelle_core::daemon_service::WindowsTaskDefinition,
 ) -> String {
     let (task_path, task_name) = windows_task_parts(task).expect("core task path is validated");
@@ -4143,7 +4292,7 @@ if ($matching) {{ Write-Output 'matching' }} else {{ Write-Output 'drifted' }}"#
     powershell_encoded_command(&script)
 }
 
-fn windows_task_instance_command(
+pub(super) fn windows_task_instance_command(
     task: &satelle_core::daemon_service::WindowsTaskDefinition,
     action: &str,
 ) -> String {
@@ -4727,7 +4876,7 @@ fn decode_plist_text(value: &str) -> Result<String, SshBootstrapError> {
 
 const LAUNCHD_LABEL: &str = "dev.microck.satelle.host";
 
-fn launchd_register_command(plist_path: &str) -> String {
+pub(super) fn launchd_register_command(plist_path: &str) -> String {
     format!(
         "set -eu\ndomain=gui/$(id -u)\nlaunchctl bootout \"$domain/{LAUNCHD_LABEL}\" 2>/dev/null || true\nlaunchctl bootstrap \"$domain\" {}",
         posix_quote(plist_path),
@@ -4746,7 +4895,7 @@ fn launchd_observe_command(definition: &LaunchdServiceDefinition) -> String {
     )
 }
 
-fn launchd_lifecycle_command(action: &str) -> String {
+pub(super) fn launchd_lifecycle_command(action: &str) -> String {
     match action {
         "kickstart" => format!("set -eu\nlaunchctl kickstart -k \"gui/$(id -u)/{LAUNCHD_LABEL}\""),
         "bootout" => format!("set -eu\nlaunchctl bootout \"gui/$(id -u)/{LAUNCHD_LABEL}\""),
@@ -4941,6 +5090,20 @@ pub(super) fn managed_service_executable_version(
 }
 
 impl RemoteUserDirectories {
+    pub(super) fn canonical_daemon_path_overrides(
+        &self,
+        destination: &str,
+        host_id: &str,
+    ) -> Result<DaemonPathOverrides, SshBootstrapError> {
+        let command = service_path_overrides_observation_command(self.target, self, host_id)?;
+        let output = require_success_output(run_ssh_command_with_output_limit(
+            destination,
+            &command,
+            SERVICE_DEFINITION_LIMIT,
+        )?)?;
+        parse_service_path_overrides(self.target, &output.stdout)
+    }
+
     pub(super) fn probe(
         destination: &str,
         target: RemoteTarget,
@@ -5999,7 +6162,7 @@ fn upload_artifact(
     directory: &str,
     address_digest: [u8; 32],
     bootstrap_lock: &mut SshBootstrapLock,
-) -> Result<UploadedHostArtifact, SshBootstrapError> {
+) -> Result<ManagedHostArtifact, SshBootstrapError> {
     let local_digest = sha256_file(local_binary)?;
     let local_digest_hex = local_digest
         .iter()
@@ -6009,7 +6172,7 @@ fn upload_artifact(
     let final_path = if target.is_windows() {
         let content_addressed_path = target.promoted_executable_path(directory, &address_digest);
         if remote_artifact_matches(destination, target, &content_addressed_path, &local_digest)? {
-            return Ok(UploadedHostArtifact {
+            return Ok(ManagedHostArtifact {
                 remote_path: content_addressed_path,
                 binary_sha256: local_digest_hex,
             });
@@ -6045,7 +6208,7 @@ fn upload_artifact(
         return Err(SshBootstrapError::RemoteCacheEntryRejected);
     }
     bootstrap_lock.commit_current_mutation()?;
-    Ok(UploadedHostArtifact {
+    Ok(ManagedHostArtifact {
         remote_path: final_path,
         binary_sha256: local_digest_hex,
     })
@@ -6057,7 +6220,7 @@ fn upload_operation_artifact(
     local_binary: &Path,
     record: &SshIdentityCommitRecord,
     bootstrap_lock: &mut SshBootstrapLock,
-) -> Result<UploadedHostArtifact, SshBootstrapError> {
+) -> Result<ManagedHostArtifact, SshBootstrapError> {
     let local_digest = sha256_file(local_binary)?;
     if digest_hex(&local_digest) != record.binary_sha256() {
         return Err(SshBootstrapError::IdentityArtifactMismatch);
@@ -6074,7 +6237,7 @@ fn upload_operation_artifact(
     if !operation_artifact_matches(destination, target, record)? {
         return Err(SshBootstrapError::RemoteCacheEntryRejected);
     }
-    Ok(UploadedHostArtifact {
+    Ok(ManagedHostArtifact {
         remote_path: record.exact_remote_path().to_string(),
         binary_sha256: digest_hex(&local_digest),
     })

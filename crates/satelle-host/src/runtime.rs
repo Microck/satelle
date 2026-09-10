@@ -2988,6 +2988,73 @@ impl RuntimeHandle {
         self.engine()?.reconcile_maintenance(observer)
     }
 
+    pub(crate) fn verify_storage_migration(
+        &self,
+        operation_id: &str,
+        expected_paths: &satelle_core::daemon_service::DaemonResolvedPathSet,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .verify_storage_migration(operation_id, expected_paths)
+    }
+
+    pub(crate) fn storage_migration_request_state(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<Option<crate::storage::StorageMigrationRequestState>, SatelleError> {
+        let input = model::idempotency(
+            IdempotentOperation::StorageMigration,
+            identity,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        self.engine()?
+            .lock_storage()?
+            .storage_migration_request_state(&input)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn start_storage_migration_request(
+        &self,
+        identity: &RequestIdentity,
+        cleanup: Option<&crate::StorageMigrationCleanup>,
+    ) -> Result<(), SatelleError> {
+        let input = model::idempotency(
+            IdempotentOperation::StorageMigration,
+            identity,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        self.engine()?
+            .lock_storage()?
+            .start_storage_migration_request(&input, cleanup)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn finish_storage_migration_request(
+        &self,
+        identity: &RequestIdentity,
+        reply: &crate::storage::StorageMigrationReply,
+    ) -> Result<(), SatelleError> {
+        let now = time::OffsetDateTime::now_utc();
+        let input = model::idempotency(IdempotentOperation::StorageMigration, identity, now)?;
+        self.engine()?
+            .lock_storage()?
+            .finish_storage_migration_request(&input, reply, now)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn cleanup_storage_migration_source(
+        &self,
+        operation_id: &str,
+        paths: &satelle_core::daemon_service::DaemonResolvedPathSet,
+        approved: Option<&crate::StorageMigrationCleanup>,
+    ) -> Result<crate::StorageMigrationCleanup, SatelleError> {
+        let receipt = self
+            .engine()?
+            .lock_storage()?
+            .migration_source_for_cleanup(operation_id, paths)?;
+        receipt.cleanup(approved)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new<A: ComputerUseAdapter>(
         state_root: Result<PathBuf, SatelleError>,

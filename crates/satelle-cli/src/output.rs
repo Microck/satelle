@@ -312,6 +312,7 @@ impl HostCommand {
             Self::Store { command } => command.output_request(),
             Self::StorageCompletionRecovery(command) => (command.output_args, EventOutput::None),
             Self::OfflineStorageMaintenance(_)
+            | Self::OfflineStorageMigration { .. }
             | Self::OfflineStorageRestorePreview(_)
             | Self::OfflineStorageBackupCleanupPlan(_) => (
                 OutputArgs {
@@ -328,6 +329,10 @@ impl HostStorageCommand {
     const fn output_request(&self) -> (OutputArgs, EventOutput) {
         match self {
             Self::Migrate(command) => (command.output_args, EventOutput::None),
+            Self::Complete(command) => (command.output_args, EventOutput::None),
+            Self::Source {
+                command: super::HostStorageSourceCommand::Cleanup(command),
+            } => (command.output_args, EventOutput::None),
             Self::Restore(command) => (command.output_args, EventOutput::None),
             Self::Backup {
                 command: HostStorageBackupCommand::Cleanup(command),

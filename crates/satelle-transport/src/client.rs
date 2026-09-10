@@ -583,6 +583,54 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
+    pub fn begin_storage_migration(
+        &self,
+        operation_id: &str,
+        expected_paths: satelle_core::daemon_service::DaemonResolvedPathSet,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!("/v1/maintenance/storage-migration/{operation_id}/begin");
+        let (request, request_id) =
+            self.mutation_request(&path, &format!("{operation_id}:begin"))?;
+        self.send_authenticated(
+            request.json(&crate::StorageMigrationPathsRequest::new(expected_paths)),
+            request_id,
+            StatusCode::OK,
+        )
+    }
+
+    pub fn complete_storage_migration(
+        &self,
+        operation_id: &str,
+        expected_paths: satelle_core::daemon_service::DaemonResolvedPathSet,
+    ) -> Result<BootstrapMaintenanceResponse, DaemonClientError> {
+        let path = format!("/v1/maintenance/storage-migration/{operation_id}/complete");
+        let (request, request_id) =
+            self.mutation_request(&path, &format!("{operation_id}:complete"))?;
+        self.send_authenticated(
+            request.json(&crate::StorageMigrationPathsRequest::new(expected_paths)),
+            request_id,
+            StatusCode::OK,
+        )
+    }
+
+    pub fn preview_storage_migration_source(
+        &self,
+        operation_id: &str,
+    ) -> Result<crate::StorageMigrationCleanupResponse, DaemonClientError> {
+        let path = format!("/v1/maintenance/storage-migration/{operation_id}/source/cleanup");
+        self.protocol_read(&path)
+    }
+
+    pub fn cleanup_storage_migration_source(
+        &self,
+        operation_id: &str,
+    ) -> Result<crate::StorageMigrationCleanupResponse, DaemonClientError> {
+        let path = format!("/v1/maintenance/storage-migration/{operation_id}/source/cleanup");
+        let (request, request_id) =
+            self.mutation_request(&path, &format!("{operation_id}:cleanup"))?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
     pub fn apply_bootstrap_managed_setup_action(
         &self,
         operation_id: &str,

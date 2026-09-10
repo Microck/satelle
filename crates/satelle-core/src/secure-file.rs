@@ -254,6 +254,15 @@ pub fn read_owner_only_secret_file(path: &Path) -> Result<Zeroizing<String>, Sec
     Ok(Zeroizing::new(value.to_string()))
 }
 
+/// Opens an existing private file for streaming without creating files or
+/// changing permissions. The caller controls the byte budget and keeps the
+/// returned handle for the complete read.
+pub fn open_existing_private_file(path: &Path) -> Result<File, SecureFileError> {
+    let parent = path.parent().ok_or(SecureFileError::UnsafeOrUnavailable)?;
+    let _directory = open_owner_only_directory(parent)?;
+    open_secure_file(path, SecurityPolicy::OwnerPrivate)
+}
+
 /// Computes a comparison digest over the exact bytes stored in an owner-only
 /// secret file. Provider consumers normalize one trailing line ending, but
 /// replacement recovery compares the persisted representation byte-for-byte.

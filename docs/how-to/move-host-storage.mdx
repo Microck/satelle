@@ -1,0 +1,93 @@
+---
+title: Move Host storage
+description: Preview, verify, and recover an explicit Host storage move.
+---
+
+Storage migration moves one Host's SQLite store, managed runtime receipts,
+operator logs, and recording artifacts. The Host keeps its identity. The
+destination's native readiness cache is cleared so the next readiness check
+uses the new location.
+
+Use a user-owned local Host Binding or a trusted SSH binding to a persistent
+macOS or Windows Host. A Direct binding needs an SSH management binding for
+this operation. Setup, repair, and Host updates do not move storage.
+
+## Preview the move
+
+Choose an absolute path on the selected Host. Its `state` and `logs`
+subdirectories become the new storage paths. Configuration, cache, and
+provider installation references retain their current locations.
+
+```sh
+satelle host storage migrate --host local-demo --to /private/satelle-storage --dry-run --json
+```
+
+On Windows, use a native absolute path such as `C:\SatelleStorage`. The
+existing parent directory must be private and writable by the Host account.
+The destination storage directories must be absent or empty and must not
+overlap the source directories.
+
+The preview lists the source and destination path sets, selected files,
+estimated size, service restart, backup location, verification checks, and
+rollback steps. It does not start or stop the Host or create files.
+
+## Apply the move
+
+Wait for active Turns to finish. Migration refuses to displace active work.
+After it acquires maintenance ownership, new `run` and `steer` requests remain
+blocked until the destination is verified or the source is restored.
+
+```sh
+satelle host storage migrate --host local-demo --to /private/satelle-storage --no-input --yes --json
+```
+
+Interactive use can ask for confirmation. A matching Trusted Profile can
+authorize this operation through its `host_storage_migrate` command family.
+The command preserves an exact backup of the owning user configuration file,
+copies the database through SQLite's backup API, verifies copied files, then
+restarts the same Host executable at the new location. It updates only the
+selected binding's state and log paths after checking the destination API.
+
+Keep the result. It includes the operation ID, source paths, configuration
+backup, restore command, and separate source cleanup command.
+
+## Remove the preserved source
+
+Successful migration leaves the source fenced as an inactive copy. Preview
+and apply cleanup using the operation ID from the successful result:
+
+```sh
+satelle host storage source cleanup --host local-demo --operation-id storage-migration-example --dry-run --json
+satelle host storage source cleanup --host local-demo --operation-id storage-migration-example --no-input --yes --json
+```
+
+The active destination verifies its completed migration before cleanup.
+Cleanup deletes the copied source files and old SQLite files. It preserves
+unrelated Controller files and files created after staging. A changed copied
+file blocks cleanup so an operator edit is not discarded. Empty directories,
+the storage lock, and the source fence remain.
+
+If cleanup stops, retry the same command and operation ID. The Host retains
+the original cleanup plan before deleting files and returns the same completed
+report on replay, including after a daemon restart.
+
+## Recover an interruption
+
+A failure after mutation attempts to restore the previous service paths and
+binding. Concurrent configuration edits are preserved. If rollback fails,
+`storage-migration-rollback-failed` includes both path sets, service state,
+and concrete manual recovery commands. Stop both possible Host processes
+and cancel pending destination launches before restoring the source.
+
+If the destination is active but the completion reply was lost, keep using
+the destination and replay completion with the reported operation ID:
+
+```sh
+satelle host storage complete --host local-demo --operation-id storage-migration-example --yes --json
+```
+
+Completion is idempotent. Do not restore the source after destination
+completion because the destination may already contain new Turns. If the
+initial maintenance request could not be confirmed, first check that the
+reported operation owns maintenance. An unconfirmed request does not
+authorize stopping active work.

@@ -427,6 +427,48 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the Host state store is temporarily busy",
             details: None,
         },
+        ErrorCode::StorageMigrationSourceInvalid => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::StorageMigrationSourceInvalid,
+            category: ApiErrorCategory::Storage,
+            retryable: false,
+            message: "the selected migration source is invalid",
+            details: validated_string_details(error, &["path"]),
+        },
+        ErrorCode::StorageMigrationDestinationInvalid => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::StorageMigrationDestinationInvalid,
+            category: ApiErrorCategory::Storage,
+            retryable: false,
+            message: "the selected migration destination is invalid",
+            details: validated_string_details(error, &["path"]),
+        },
+        ErrorCode::StorageMigrationPathsOverlap => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::StorageMigrationPathsOverlap,
+            category: ApiErrorCategory::Storage,
+            retryable: false,
+            message: "the migration source and destination overlap",
+            details: validated_string_details(error, &["path"]),
+        },
+        ErrorCode::StorageMigrationDestinationNotEmpty => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::StorageMigrationDestinationNotEmpty,
+            category: ApiErrorCategory::Storage,
+            retryable: false,
+            message: "the migration destination contains existing files",
+            details: validated_string_details(error, &["path"]),
+        },
+        ErrorCode::SetupPartiallyApplied if error.details.contains_key("cleanup") => ApiFailure {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ApiErrorCode::SetupPartiallyApplied,
+            category: ApiErrorCategory::Storage,
+            retryable: true,
+            message: "source cleanup stopped after removing some files; inspect the remaining files before retrying",
+            details: error.details.get("cleanup").cloned()
+                .and_then(|report| serde_json::from_value::<satelle_host::StorageMigrationCleanup>(report).ok())
+                .map(|report| serde_json::json!({"cleanup": report})),
+        },
         // Completion installation and profile activation are Controller-local workflows. If
         // either code crosses the Host boundary, expose only the stable internal-error contract.
         ErrorCode::CompletionInstallFailed
@@ -472,6 +514,8 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::AmbiguousCodexComponentOwnership
         | ErrorCode::HostUpdatePartiallyApplied
         | ErrorCode::HostUpdatePostcheckFailed
+        // Restoring the previous service and binding is coordinated by the Controller.
+        | ErrorCode::StorageMigrationRollbackFailed
         | ErrorCode::NoRemoteHostSelected
         | ErrorCode::RemoteUpdatePartialFailure
         // Setup action and partial-application failures are Controller-local

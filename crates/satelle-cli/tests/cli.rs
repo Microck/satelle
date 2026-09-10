@@ -59,6 +59,176 @@ fn production_satelle() -> Command {
     command
 }
 
+#[test]
+fn storage_migration_moves_a_real_local_daemon_and_preserves_its_source_until_cleanup() {
+    let fixture = TestStateDir::new().unwrap();
+    let root = fs::canonicalize(fixture.path()).unwrap();
+    let config_file = root.join("config.toml");
+    let source = root.join("source");
+    let destination = root.join("destination");
+    let mut config = satelle_core::SatelleConfig::defaults();
+    let host = config.hosts.get_mut(satelle_core::LOCAL_DEMO_HOST).unwrap();
+    host.daemon_state_dir = Some(source.clone());
+    host.daemon_log_dir = Some(root.join("source-logs"));
+    host.daemon_cache_dir = Some(root.join("cache"));
+    host.daemon_config_file = Some(config_file.clone());
+    host.daemon_idle_timeout = satelle_core::ExplicitDuration::parse("2s");
+    let service = satelle_host::HostService::production_for_host(host);
+    let identity = service
+        .initialize_daemon()
+        .unwrap()
+        .host_identity()
+        .to_string();
+    drop(service);
+    config.trusted_profiles.insert(
+        "storage".into(),
+        satelle_core::TrustedProfile {
+            hosts: BTreeSet::from(["local-demo".into()]),
+            command_families: BTreeSet::from([
+                satelle_core::MutationCommandFamily::HostStorageMigrate,
+            ]),
+            expires_at: None,
+        },
+    );
+    let original = format!(
+        "{}\n[profiles.migration]\ntrusted_profile = 'storage'\n",
+        toml::to_string(&config).unwrap()
+    );
+    write_user_config(&config_file, &original).unwrap();
+    let command = || {
+        let mut command = production_satelle();
+        command
+            .current_dir(&root)
+            .env("SATELLE_HOME", root.join("controller"))
+            .env("SATELLE_CONFIG_FILE", &config_file)
+            .env("SATELLE_COMMAND_HISTORY", "0");
+        command
+    };
+    let preview = assert_directory_tree_unchanged("storage migration dry-run", &root, || {
+        command()
+            .args([
+                "host",
+                "storage",
+                "migrate",
+                "--host",
+                "local-demo",
+                "--dry-run",
+                "--json",
+                "--to",
+            ])
+            .arg(&destination)
+            .assert()
+            .success()
+            .get_output()
+            .clone()
+    });
+    let preview = parse_json_output(&preview.stdout);
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(
+        preview["plan"]["source"]["state_root"],
+        source.to_str().unwrap()
+    );
+    assert!(!destination.exists());
+
+    assert_directory_tree_unchanged("storage migration without consent", &root, || {
+        command()
+            .args([
+                "host",
+                "storage",
+                "migrate",
+                "--host",
+                "local-demo",
+                "--no-input",
+                "--json",
+                "--to",
+            ])
+            .arg(&destination)
+            .assert()
+            .failure();
+    });
+
+    let applied = command()
+        .args([
+            "host",
+            "storage",
+            "migrate",
+            "--host",
+            "local-demo",
+            "--no-input",
+            "--profile",
+            "migration",
+            "--json",
+            "--to",
+        ])
+        .arg(&destination)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let applied = parse_json_output(&applied.stdout);
+    assert_eq!(applied["status"], "completed");
+    assert_eq!(applied["stage"]["host_identity"], identity);
+    assert_eq!(applied["source_preserved"], true);
+    assert_eq!(
+        fs::read_to_string(applied["binding_backup"].as_str().unwrap()).unwrap(),
+        original
+    );
+    let updated: toml::Value = toml::from_str(&fs::read_to_string(&config_file).unwrap()).unwrap();
+    assert_eq!(
+        updated["hosts"]["local-demo"]["daemon_state_dir"].as_str(),
+        destination.join("state").to_str()
+    );
+    assert_eq!(
+        updated["hosts"]["local-demo"]["daemon_log_dir"].as_str(),
+        destination.join("logs").to_str()
+    );
+    assert!(source.join("satelle.sqlite3").exists());
+    assert!(destination.join("state/satelle.sqlite3").exists());
+    let operation = applied["operation_id"].as_str().unwrap();
+    command()
+        .args([
+            "host",
+            "storage",
+            "source",
+            "cleanup",
+            "--host",
+            "local-demo",
+            "--operation-id",
+            operation,
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .success();
+    assert!(source.join("satelle.sqlite3").exists());
+    command()
+        .args([
+            "host",
+            "storage",
+            "source",
+            "cleanup",
+            "--host",
+            "local-demo",
+            "--operation-id",
+            operation,
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+    assert!(!source.join("satelle.sqlite3").exists());
+    assert!(
+        source
+            .join(".satelle-offline-storage-maintenance-v1")
+            .exists()
+    );
+    command()
+        .env("SATELLE_STATE_DIR", destination.join("state"))
+        .args(["host", "release-state"])
+        .assert()
+        .success();
+}
+
 #[cfg(unix)]
 fn make_test_directory_owner_only(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -8290,27 +8460,6 @@ adapter = "fake"
         .args(["stop", &session_id, "--json"])
         .assert()
         .success();
-}
-
-#[test]
-fn future_cli_surfaces_parse_and_return_typed_not_implemented() {
-    let state = state_dir();
-    satelle()
-        .env("SATELLE_STATE_DIR", state.path())
-        .args([
-            "host",
-            "storage",
-            "migrate",
-            "--host",
-            "local-demo",
-            "--to",
-            "/tmp/satelle-state",
-            "--dry-run",
-            "--json",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(r#""code": "not-implemented""#));
 }
 
 #[test]
