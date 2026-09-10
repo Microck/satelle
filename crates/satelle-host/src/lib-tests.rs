@@ -1312,7 +1312,7 @@ fn turn_intent_with_extras(prompt: &str, timeout_seconds: u64) -> TurnIntent {
     turn_intent(prompt)
         .with_turn_execution_timeout_ms(Some(timeout_seconds * 1_000))
         .expect("valid Turn timeout")
-        .with_attachments(vec![AttachmentUpload::new(
+        .with_attachments(vec![AttachmentInput::upload(
             "image/png",
             u64::try_from(bytes.len()).expect("image size fits u64"),
             sha256,

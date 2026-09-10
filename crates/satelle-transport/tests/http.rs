@@ -148,13 +148,13 @@ impl RunningServer {
 
     fn request(&self, path: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::GET, path)
-            .header("Satelle-Protocol-Version", "14")
+            .header("Satelle-Protocol-Version", "15")
     }
 
     fn mutation(&self, path: &str, idempotency_key: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::POST, path)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "14")
+            .header("Satelle-Protocol-Version", "15")
     }
 
     fn mutation_with_request_id(
@@ -165,7 +165,7 @@ impl RunningServer {
     ) -> reqwest::RequestBuilder {
         self.protected_request_with_request_id(reqwest::Method::POST, path, request_id)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "14")
+            .header("Satelle-Protocol-Version", "15")
     }
 
     fn protected_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -371,7 +371,7 @@ fn setup_mutation_request(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string())
         .header("Idempotency-Key", idempotency_key)
-        .header("Satelle-Protocol-Version", "14")
+        .header("Satelle-Protocol-Version", "15")
 }
 
 fn replacement_token(token_id: &str) -> ApiBearerToken {
@@ -987,7 +987,7 @@ async fn bearer_tokens_outside_authorization_are_rejected() {
             .mutation("/v1/sessions", "01890a5d-ac96-7b7c-8f89-37c3d0a66ec2")
             .header("Content-Type", "application/json")
             .body(format!(
-                r#"{{"schema_version":"satelle.api.v7","model_from_project":false,"provider_from_project":false,"prompt":"{token}","prompt":"safe","execution_mode":"standard"}}"#
+                r#"{{"schema_version":"satelle.api.v8","model_from_project":false,"provider_from_project":false,"prompt":"{token}","prompt":"safe","execution_mode":"standard"}}"#
             )),
     ];
 
@@ -1787,7 +1787,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("14"),
+            Some("15"),
             None,
             false,
             false,
@@ -1796,7 +1796,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("14"),
+            Some("15"),
             Some("query-key"),
             true,
             false,
@@ -1805,7 +1805,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("14"),
+            Some("15"),
             Some("cookie-key"),
             false,
             true,
@@ -1918,7 +1918,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("14"),
+            Some("15"),
             None,
             false,
             false,
@@ -1927,7 +1927,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("14"),
+            Some("15"),
             Some("complete-query-key"),
             true,
             false,
@@ -1936,7 +1936,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("14"),
+            Some("15"),
             Some("complete-cookie-key"),
             false,
             true,

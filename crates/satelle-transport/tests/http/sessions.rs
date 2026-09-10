@@ -19,6 +19,172 @@ const CROSS_SESSION_TURN_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f05";
 const STALE_STOP_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f06";
 
 #[tokio::test]
+async fn remote_images_replay_and_cancel_without_reopening_the_source() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let directory = TestStateDir::new().expect("create remote image directory");
+    let source = directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("PRIVATE_REMOTE_IMAGE.png");
+    let reference = ImageAttachment::host_file(source.to_str().unwrap());
+    let request = TurnRequest::new("Use the Host image").with_attachments(vec![reference]);
+    let mut session_id = None;
+    for operation in ["run", "steer"] {
+        std::fs::write(&source, b"\x89PNG\r\n\x1a\nPRIVATE_REMOTE_BYTES").unwrap();
+        let route = session_id.as_ref().map_or_else(
+            || "/v1/sessions".to_string(),
+            |id| format!("/v1/sessions/{id}/turns"),
+        );
+        let key = format!("remote-image-{operation}");
+        let admitted = running
+            .mutation(&route, &key)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(admitted.status(), StatusCode::ACCEPTED);
+        let bytes = admitted.bytes().await.unwrap();
+        assert_privacy_canaries_absent(
+            "remote image admission",
+            &bytes,
+            &["PRIVATE_REMOTE_IMAGE", "PRIVATE_REMOTE_BYTES"],
+        );
+        let admitted: SessionResponse = serde_json::from_slice(&bytes).unwrap();
+        let id = admitted.session().session_id().clone();
+        let turn = admitted.session().turns().last().unwrap().turn_id().clone();
+        std::fs::remove_file(&source).unwrap();
+        wait_until_idle(&running, id.as_str()).await;
+
+        let replay = running
+            .mutation(&route, &key)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let replay: SessionResponse = replay.json().await.unwrap();
+        assert_eq!(replay.session().session_id(), &id);
+        assert_eq!(replay.session().turns().last().unwrap().turn_id(), &turn);
+        let cancelled: AdmissionCancellationResponse = running
+            .mutation(&route, &key)
+            .header("Satelle-Admission-Action", "cancel")
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cancelled.outcome(), AdmissionCancellationOutcome::Admitted);
+        assert_eq!(cancelled.turn_id(), Some(&turn));
+
+        // A different missing path changes intent before file resolution.
+        let changed = TurnRequest::new("Use the Host image").with_attachments(vec![
+            ImageAttachment::host_file(source.with_file_name("different.png").to_str().unwrap()),
+        ]);
+        let conflict = running
+            .mutation(&route, &key)
+            .json(&changed)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let error: ApiError = conflict.json().await.unwrap();
+        assert_eq!(error.code(), ApiErrorCode::IdempotencyKeyConflict);
+
+        let cancelled: AdmissionCancellationResponse = running
+            .mutation(&route, &format!("cancel-missing-{operation}"))
+            .header("Satelle-Admission-Action", "cancel")
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cancelled.outcome(), AdmissionCancellationOutcome::Cancelled);
+        session_id = Some(id);
+    }
+    assert_returned_host_logs_exclude(&running, &["PRIVATE_REMOTE_IMAGE", "PRIVATE_REMOTE_BYTES"])
+        .await;
+}
+
+#[tokio::test]
+async fn invalid_remote_images_never_commit_a_session_or_turn() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let created: SessionResponse = running
+        .mutation("/v1/sessions", "remote-invalid-baseline")
+        .json(&TurnRequest::new("Create the validation baseline"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created.session().session_id();
+    let baseline = wait_until_idle(&running, id.as_str()).await;
+    let directory = TestStateDir::new().expect("create remote image directory");
+    let root = directory.path().canonicalize().unwrap();
+    let unsupported = root.join("PRIVATE_REMOTE_UNSUPPORTED.gif");
+    std::fs::write(&unsupported, b"GIF89a").unwrap();
+    let oversized = root.join("PRIVATE_REMOTE_OVERSIZED.png");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len((MAX_IMAGE_ATTACHMENT_BYTES + 1) as u64)
+        .unwrap();
+    let cases = [
+        root.join("PRIVATE_REMOTE_MISSING.png"),
+        root.clone(),
+        unsupported,
+        oversized,
+    ];
+    #[cfg(unix)]
+    let cases = {
+        let mut cases = Vec::from(cases);
+        let link = root.join("PRIVATE_REMOTE_LINK.png");
+        std::os::unix::fs::symlink(&cases[2], &link).unwrap();
+        cases.push(link);
+        cases
+    };
+    for (index, source) in cases.iter().enumerate() {
+        let request = TurnRequest::new("Reject invalid Host image")
+            .with_attachments(vec![ImageAttachment::host_file(source.to_str().unwrap())]);
+        for (operation, route) in [
+            ("run", "/v1/sessions".to_string()),
+            ("steer", format!("/v1/sessions/{id}/turns")),
+        ] {
+            let rejected = running
+                .mutation(&route, &format!("remote-invalid-{operation}-{index}"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+            assert_privacy_canaries_absent(
+                "remote image validation",
+                &rejected.bytes().await.unwrap(),
+                &["PRIVATE_REMOTE"],
+            );
+        }
+    }
+    assert_eq!(
+        running.service.initialize_daemon().unwrap().session_count(),
+        1
+    );
+    let after: SessionResponse = running
+        .request(&format!("/v1/sessions/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after.session(), baseline.session());
+    assert_returned_host_logs_exclude(&running, &["PRIVATE_REMOTE"]).await;
+}
+
+#[tokio::test]
 async fn run_and_steer_reject_the_same_invalid_image_constraints_without_mutation() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let created: SessionResponse = running
@@ -42,7 +208,7 @@ async fn run_and_steer_reject_the_same_invalid_image_constraints_without_mutatio
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let valid = ImageAttachment::new(
+    let valid = ImageAttachment::upload(
         "image/png",
         bytes.len() as u64,
         digest.clone(),
@@ -56,7 +222,7 @@ async fn run_and_steer_reject_the_same_invalid_image_constraints_without_mutatio
         ),
         (
             "sniffed-media-type",
-            vec![ImageAttachment::new(
+            vec![ImageAttachment::upload(
                 "image/jpeg",
                 bytes.len() as u64,
                 digest.clone(),
@@ -66,7 +232,7 @@ async fn run_and_steer_reject_the_same_invalid_image_constraints_without_mutatio
         ),
         (
             "declared-size",
-            vec![ImageAttachment::new(
+            vec![ImageAttachment::upload(
                 "image/png",
                 (MAX_IMAGE_ATTACHMENT_BYTES + 1) as u64,
                 digest.clone(),
@@ -76,7 +242,7 @@ async fn run_and_steer_reject_the_same_invalid_image_constraints_without_mutatio
         ),
         (
             "content-digest",
-            vec![ImageAttachment::new(
+            vec![ImageAttachment::upload(
                 "image/png",
                 bytes.len() as u64,
                 "00".repeat(32),
@@ -703,7 +869,7 @@ async fn unsupported_image_runtime_enforces_advertised_zero_before_decode() {
         .collect::<String>();
     let request =
         TurnRequest::new("PRIVATE_UNSUPPORTED_IMAGE_PROMPT_CANARY").with_attachments(vec![
-            ImageAttachment::new(
+            ImageAttachment::upload(
                 "image/png",
                 bytes.len() as u64,
                 digest,
@@ -747,7 +913,7 @@ async fn steer_images_share_run_validation_and_idempotency_identity() {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let prompt = "Use the attached image in this steer";
-    let request = TurnRequest::new(prompt).with_attachments(vec![ImageAttachment::new(
+    let request = TurnRequest::new(prompt).with_attachments(vec![ImageAttachment::upload(
         "image/png",
         first_bytes.len() as u64,
         first_digest,
@@ -781,7 +947,7 @@ async fn steer_images_share_run_validation_and_idempotency_identity() {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let changed = TurnRequest::new(prompt).with_attachments(vec![ImageAttachment::new(
+    let changed = TurnRequest::new(prompt).with_attachments(vec![ImageAttachment::upload(
         "image/png",
         changed_bytes.len() as u64,
         changed_digest,
@@ -1225,7 +1391,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "14")
+        .header("Satelle-Protocol-Version", "15")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -1248,7 +1414,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
         .mutation("/v1/sessions", CREATE_KEY)
         .header("Content-Type", "text/plain")
         .body(
-            r#"{"schema_version":"satelle.api.v7","model_from_project":false,"provider_from_project":false,"prompt":"private","execution_mode":"standard"}"#,
+            r#"{"schema_version":"satelle.api.v8","model_from_project":false,"provider_from_project":false,"prompt":"private","execution_mode":"standard"}"#,
         )
         .send()
         .await
@@ -1263,7 +1429,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
     let duplicate_prompt = running
         .mutation("/v1/sessions", "duplicate-json-field-key")
         .header("Content-Type", "application/json")
-        .body(r#"{"schema_version":"satelle.api.v7","model_from_project":false,"provider_from_project":false,"prompt":"first","prompt":"second","execution_mode":"standard"}"#)
+        .body(r#"{"schema_version":"satelle.api.v8","model_from_project":false,"provider_from_project":false,"prompt":"first","prompt":"second","execution_mode":"standard"}"#)
         .send()
         .await
         .expect("send duplicate JSON field");
@@ -1328,7 +1494,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
     let oversized = running
         .mutation("/v1/sessions", CREATE_KEY)
         .json(
-            &TurnRequest::new("private").with_attachments(vec![ImageAttachment::new(
+            &TurnRequest::new("private").with_attachments(vec![ImageAttachment::upload(
                 "image/png",
                 5_242_881,
                 "0".repeat(64),
@@ -1361,7 +1527,7 @@ async fn fixed_size_attachments_precede_turn_request_deserialization() {
     let response = running
         .mutation("/v1/sessions", "attachment-limit-fixed-size")
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v7",
+            "schema_version": "satelle.api.v8",
             "model_from_project": false,
             "provider_from_project": false,
             "prompt": "PRIVATE_ATTACHMENT_LIMIT_CANARY",
@@ -1386,7 +1552,7 @@ async fn fixed_size_attachments_precede_turn_request_deserialization() {
 async fn attachment_limit_preserves_decoder_error_precedence() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let oversized = format!(
-        r#"{{"schema_version":"satelle.api.v7","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
+        r#"{{"schema_version":"satelle.api.v8","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
         "x".repeat(1_048_576)
     );
     let cases = [
@@ -1397,7 +1563,7 @@ async fn attachment_limit_preserves_decoder_error_precedence() {
         ),
         (
             "duplicate-json-key",
-            r#"{"schema_version":"satelle.api.v7","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
+            r#"{"schema_version":"satelle.api.v8","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
             INVALID_JSON_ERROR,
         ),
         ("oversized-body", oversized, ATTACHMENT_LIMIT_ERROR),
@@ -1449,7 +1615,7 @@ async fn attachment_base64_is_the_only_allowance_above_the_json_budget() {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let attachment = ImageAttachment::new(
+    let attachment = ImageAttachment::upload(
         "image/png",
         bytes.len() as u64,
         digest,
@@ -1483,7 +1649,7 @@ async fn empty_attachments_are_allowed_but_other_shapes_remain_contract_errors()
     let empty_response = running
         .mutation("/v1/sessions", "attachment-operation-contract-empty-array")
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v7",
+            "schema_version": "satelle.api.v8",
             "model_from_project": false,
             "provider_from_project": false,
             "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
@@ -1506,7 +1672,7 @@ async fn empty_attachments_are_allowed_but_other_shapes_remain_contract_errors()
                 &format!("attachment-operation-contract-{name}"),
             )
             .json(&serde_json::json!({
-                "schema_version": "satelle.api.v7",
+                "schema_version": "satelle.api.v8",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
@@ -1551,7 +1717,7 @@ async fn create_turn_attachments_precede_deserialization_without_admission() {
             "attachment-limit-create-turn",
         )
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v7",
+            "schema_version": "satelle.api.v8",
             "model_from_project": false,
             "provider_from_project": false,
             "prompt": "PRIVATE_REJECTED_ATTACHMENT_TURN_CANARY",
@@ -1731,7 +1897,7 @@ async fn request_material_log_privacy(trace_capture: TraceCapture) {
             &rejected_request_id,
         )
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v7",
+            "schema_version": "satelle.api.v8",
             "model_from_project": false,
             "provider_from_project": false,
             "prompt": rejected_prompt,
@@ -1884,7 +2050,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "14")
+        request.header("Satelle-Protocol-Version", "15")
     } else {
         request
     }
@@ -1919,7 +2085,7 @@ async fn assert_attachment_limit_error(response: reqwest::Response, host_identit
 
 fn turn_request_with_controller_field(field: &str, prompt: &str) -> Value {
     let mut request = serde_json::json!({
-        "schema_version": "satelle.api.v7",
+        "schema_version": "satelle.api.v8",
         "model_from_project": false,
         "provider_from_project": false,
         "prompt": prompt,

@@ -36,7 +36,7 @@ use api_auth::EphemeralApiAuthenticator;
 pub use api_auth::{
     ApiBearerToken, ApiBearerTokenError, ApiPrincipal, ApiScopes, contains_api_bearer_token,
 };
-pub use attachment::AttachmentUpload;
+pub use attachment::AttachmentInput;
 use codex_capabilities::{
     BlockerReason, CodexVersionEvidence, Phase0CapabilityBlocker, Phase0SupportVerdict,
     RequiredCapability, discover_phase0, evaluate_phase0_support,
@@ -4120,24 +4120,28 @@ impl HostService {
         }
     }
 
-    fn run_command<'a>(&self, command: RunCommand<'a>, intent: &TurnIntent) -> RunCommand<'a> {
-        command
+    fn run_command<'a>(
+        &self,
+        command: RunCommand<'a>,
+        intent: &TurnIntent,
+    ) -> Result<RunCommand<'a>, SatelleError> {
+        Ok(command
             .with_execution_mode(intent.execution_mode())
             .with_provider_intent(intent.provider_intent().clone())
             .with_turn_execution_timeout(Some(self.effective_turn_execution_timeout(intent)))
-            .with_attachments(intent.attachments().to_vec())
+            .with_attachments(attachment::resolve_images(intent.attachments())?))
     }
 
     fn steer_command<'a>(
         &self,
         command: SteerCommand<'a>,
         intent: &TurnIntent,
-    ) -> SteerCommand<'a> {
-        command
+    ) -> Result<SteerCommand<'a>, SatelleError> {
+        Ok(command
             .with_execution_mode(intent.execution_mode())
             .with_provider_intent(intent.provider_intent().clone())
             .with_turn_execution_timeout(Some(self.effective_turn_execution_timeout(intent)))
-            .with_attachments(intent.attachments().to_vec())
+            .with_attachments(attachment::resolve_images(intent.attachments())?))
     }
 
     pub fn run(
@@ -4148,7 +4152,10 @@ impl HostService {
         self.ensure_image_attachments_supported(intent)
             .map_err(TurnAdmissionFailure::not_admitted)?;
         self.runtime
-            .run(self.run_command(RunCommand::attached(host, intent.prompt()), intent))
+            .run(
+                self.run_command(RunCommand::attached(host, intent.prompt()), intent)
+                    .map_err(TurnAdmissionFailure::not_admitted)?,
+            )
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
 
@@ -4163,6 +4170,7 @@ impl HostService {
         self.runtime
             .run(
                 self.run_command(RunCommand::attached(host, intent.prompt()), intent)
+                    .map_err(TurnAdmissionFailure::not_admitted)?
                     .with_cancellation(cancellation),
             )
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
@@ -4176,7 +4184,7 @@ impl HostService {
         self.ensure_image_attachments_supported(intent)?;
         crate::runtime::admitted_session(
             self.runtime
-                .run(self.run_command(RunCommand::detached(host, intent.prompt()), intent)),
+                .run(self.run_command(RunCommand::detached(host, intent.prompt()), intent)?),
         )
     }
 
@@ -4189,7 +4197,7 @@ impl HostService {
         self.ensure_image_attachments_supported(intent)?;
         crate::runtime::admitted_session(
             self.runtime.run(
-                self.run_command(RunCommand::detached(host, intent.prompt()), intent)
+                self.run_command(RunCommand::detached(host, intent.prompt()), intent)?
                     .with_cancellation(cancellation),
             ),
         )
@@ -4203,10 +4211,13 @@ impl HostService {
         self.ensure_image_attachments_supported(intent)
             .map_err(TurnAdmissionFailure::not_admitted)?;
         self.runtime
-            .steer(self.steer_command(
-                SteerCommand::attached(session_id.clone(), intent.prompt()),
-                intent,
-            ))
+            .steer(
+                self.steer_command(
+                    SteerCommand::attached(session_id.clone(), intent.prompt()),
+                    intent,
+                )
+                .map_err(TurnAdmissionFailure::not_admitted)?,
+            )
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
     }
 
@@ -4224,6 +4235,7 @@ impl HostService {
                     SteerCommand::attached(session_id.clone(), intent.prompt()),
                     intent,
                 )
+                .map_err(TurnAdmissionFailure::not_admitted)?
                 .with_cancellation(cancellation),
             )
             .map(crate::runtime::RuntimeTurnOutcome::into_command_outcome)
@@ -4238,7 +4250,7 @@ impl HostService {
         crate::runtime::admitted_session(self.runtime.steer(self.steer_command(
             SteerCommand::detached(session_id.clone(), intent.prompt()),
             intent,
-        )))
+        )?))
     }
 
     pub fn steer_detached_with_cancellation(
@@ -4253,7 +4265,7 @@ impl HostService {
                 self.steer_command(
                     SteerCommand::detached(session_id.clone(), intent.prompt()),
                     intent,
-                )
+                )?
                 .with_cancellation(cancellation),
             ),
         )

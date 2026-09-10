@@ -1109,6 +1109,12 @@ struct RunCommand {
     )]
     images: Vec<PathBuf>,
     #[arg(
+        long = "remote-image",
+        value_name = "HOST_PATH",
+        help = "Attach an absolute PNG or JPEG path on the selected remote Host; shares the limits of --image"
+    )]
+    remote_images: Vec<String>,
+    #[arg(
         long,
         value_name = "DURATION",
         help = "Shorten this Turn's execution timeout (for example 30s, 5m, or 1h; maximum 24h)"
@@ -1180,6 +1186,12 @@ struct SteerCommand {
         help = "Attach a local PNG or JPEG image (maximum 2, 5 MiB each, 10 MiB total); accepted media types depend on Host capabilities"
     )]
     images: Vec<PathBuf>,
+    #[arg(
+        long = "remote-image",
+        value_name = "HOST_PATH",
+        help = "Attach an absolute PNG or JPEG path on the selected remote Host; shares the limits of --image"
+    )]
+    remote_images: Vec<String>,
     #[arg(
         long,
         value_name = "DURATION",
@@ -13308,24 +13320,25 @@ fn report_not_admitted<T>(
 
 fn load_image_attachments(
     paths: &[PathBuf],
+    remote_paths: &[String],
     supported_media_types: Vec<String>,
 ) -> Result<Vec<satelle_transport::ImageAttachment>, CliFailure> {
     use base64::Engine as _;
     use sha2::Digest as _;
 
-    if paths.len() > satelle_transport::MAX_IMAGE_ATTACHMENT_COUNT {
+    if paths.len() + remote_paths.len() > satelle_transport::MAX_IMAGE_ATTACHMENT_COUNT {
         return Err(failure(SatelleError::invalid_usage(
             "at most two image attachments may be supplied",
         )));
     }
-    if !paths.is_empty() && supported_media_types.is_empty() {
+    if (!paths.is_empty() || !remote_paths.is_empty()) && supported_media_types.is_empty() {
         return Err(failure(SatelleError::invalid_usage(
             "the selected Host does not advertise image attachment support",
         )));
     }
 
     let mut total = 0_usize;
-    paths
+    let mut attachments = paths
         .iter()
         .enumerate()
         .map(|(index, path)| {
@@ -13363,14 +13376,31 @@ fn load_image_attachments(
             let digest = sha2::Sha256::digest(&bytes);
             let sha256: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
             let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            Ok(satelle_transport::ImageAttachment::new(
+            Ok(satelle_transport::ImageAttachment::upload(
                 media_type,
                 bytes.len() as u64,
                 sha256,
                 data_base64,
             ))
         })
-        .collect()
+        .collect::<Result<Vec<_>, CliFailure>>()?;
+    // Host paths use Host-native syntax. The Controller must not parse or open them.
+    attachments.extend(
+        remote_paths
+            .iter()
+            .cloned()
+            .map(satelle_transport::ImageAttachment::host_file),
+    );
+    Ok(attachments)
+}
+
+fn validate_remote_image_host(paths: &[String], host: &SelectedHost) -> Result<(), CliFailure> {
+    if !paths.is_empty() && host.config.transport == satelle_core::TransportKind::Local {
+        return Err(failure(SatelleError::invalid_usage(
+            "--remote-image requires a remote Host; use --image for a local file",
+        )));
+    }
+    Ok(())
 }
 
 fn image_input_error(number: usize, reason: &str) -> CliFailure {
@@ -13390,6 +13420,34 @@ fn sniff_local_image_media_type(bytes: &[u8]) -> Option<&'static str> {
 }
 
 #[test]
+fn image_loader_preserves_host_native_paths_without_local_file_access() {
+    let paths = [
+        r"C:\Users\operator\private.png".to_string(),
+        "/srv/private.png".to_string(),
+    ];
+    let attachments = match load_image_attachments(&[], &paths, vec!["image/png".to_string()]) {
+        Ok(attachments) => attachments,
+        Err(_) => panic!("Controller must not interpret Host paths"),
+    };
+    assert_eq!(
+        attachments,
+        paths
+            .iter()
+            .cloned()
+            .map(satelle_transport::ImageAttachment::host_file)
+            .collect::<Vec<_>>()
+    );
+    let rejected = load_image_attachments(
+        &[PathBuf::from("not-read")],
+        &paths,
+        vec!["image/png".to_string()],
+    );
+    assert!(
+        matches!(rejected, Err(CliFailure { error, .. }) if error.message.contains("at most two"))
+    );
+}
+
+#[test]
 fn image_loader_accepts_a_relative_png_with_truthful_metadata() {
     use base64::Engine as _;
     use sha2::Digest as _;
@@ -13404,20 +13462,29 @@ fn image_loader_accepts_a_relative_png_with_truthful_metadata() {
         .to_path_buf();
     assert!(!path.is_absolute());
 
-    let attachments = match load_image_attachments(&[path], vec!["image/png".to_string()]) {
+    let attachments = match load_image_attachments(&[path], &[], vec!["image/png".to_string()]) {
         Ok(attachments) => attachments,
         Err(_) => panic!("load supported image fixture"),
     };
 
     assert_eq!(attachments.len(), 1);
-    assert_eq!(attachments[0].media_type(), "image/png");
-    assert_eq!(attachments[0].size_bytes(), bytes.len() as u64);
+    let satelle_transport::ImageAttachment::Upload {
+        media_type,
+        size_bytes,
+        sha256,
+        data_base64,
+    } = &attachments[0]
+    else {
+        panic!("local image must be an upload");
+    };
+    assert_eq!(media_type, "image/png");
+    assert_eq!(*size_bytes, bytes.len() as u64);
     assert_eq!(
-        attachments[0].data_base64(),
+        *data_base64,
         base64::engine::general_purpose::STANDARD.encode(bytes)
     );
     assert_eq!(
-        attachments[0].sha256(),
+        *sha256,
         sha2::Sha256::digest(bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -13430,6 +13497,7 @@ fn image_loader_rejects_parent_traversal_before_file_access() {
     assert!(
         load_image_attachments(
             &[PathBuf::from("../PRIVATE_PATH_MUST_NOT_BE_READ.png")],
+            &[],
             vec!["image/png".to_string()]
         )
         .is_err()
@@ -13440,7 +13508,7 @@ fn image_loader_rejects_parent_traversal_before_file_access() {
 fn image_loader_checks_the_count_before_reading_files() {
     let paths = vec![PathBuf::from("not-read"); satelle_transport::MAX_IMAGE_ATTACHMENT_COUNT + 1];
 
-    assert!(load_image_attachments(&paths, vec!["image/png".to_string()]).is_err());
+    assert!(load_image_attachments(&paths, &[], vec!["image/png".to_string()]).is_err());
 }
 
 #[cfg(unix)]
@@ -13457,7 +13525,7 @@ fn image_loader_rejects_symlinks() {
         .expect("canonicalize fixture directory")
         .join("private-link.png");
 
-    assert!(load_image_attachments(&[link], vec!["image/png".to_string()]).is_err());
+    assert!(load_image_attachments(&[link], &[], vec!["image/png".to_string()]).is_err());
 }
 
 #[test]
@@ -13474,6 +13542,7 @@ fn image_loader_rejects_unsupported_media_and_oversized_files() {
     assert!(
         load_image_attachments(
             &[unsupported],
+            &[],
             vec!["image/png".to_string(), "image/jpeg".to_string()],
         )
         .is_err()
@@ -13487,7 +13556,7 @@ fn image_loader_rejects_unsupported_media_and_oversized_files() {
         .strip_prefix(&cwd)
         .expect("fixture is inside Controller cwd")
         .to_path_buf();
-    assert!(load_image_attachments(&[oversized], vec!["image/png".to_string()]).is_err());
+    assert!(load_image_attachments(&[oversized], &[], vec!["image/png".to_string()]).is_err());
 }
 
 #[test]
@@ -13522,7 +13591,7 @@ fn turn_request_construction_carries_provider_aliases_refresh_and_one_shot_opt_i
     assert_eq!(
         serde_json::to_value(request).expect("TurnRequest should serialize"),
         json!({
-            "schema_version": "satelle.api.v7",
+            "schema_version": "satelle.api.v8",
             "prompt": "inspect the desktop",
             "execution_mode": "standard",
             "model": "vision",
@@ -13582,6 +13651,11 @@ fn run_prompt(
             .resolve_host_with_project_source(explicit_host_alias)
             .map(SelectedHost::from)
             .map_err(failure),
+    )?;
+    report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        validate_remote_image_host(&command.remote_images, &host),
     )?;
     let yolo_policy = resolve_yolo_policy(
         config,
@@ -13696,19 +13770,24 @@ fn run_prompt(
         explicit_host_alias,
         resolve_turn_execution_timeout_ms(&host.config, command.timeout.as_deref()),
     )?;
-    let supported_image_media_types = if command.images.is_empty() {
-        Vec::new()
-    } else {
-        report_not_admitted(
-            &mut event_output,
-            explicit_host_alias,
-            transport.supported_image_media_types().map_err(failure),
-        )?
-    };
+    let supported_image_media_types =
+        if command.images.is_empty() && command.remote_images.is_empty() {
+            Vec::new()
+        } else {
+            report_not_admitted(
+                &mut event_output,
+                explicit_host_alias,
+                transport.supported_image_media_types().map_err(failure),
+            )?
+        };
     let attachments = report_not_admitted(
         &mut event_output,
         explicit_host_alias,
-        load_image_attachments(&command.images, supported_image_media_types),
+        load_image_attachments(
+            &command.images,
+            &command.remote_images,
+            supported_image_media_types,
+        ),
     )?;
     let effective_timeouts = effective_timeouts_json(&host.config, turn_execution_timeout_ms);
     let request = build_turn_request(
@@ -13825,6 +13904,11 @@ fn steer_prompt(
         config_context.resolve_session_host(explicit_host_alias, &session_id),
     )?;
     let config = report_not_admitted(&mut event_output, Some(&host.alias), config_context.load())?;
+    report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        validate_remote_image_host(&command.remote_images, &host),
+    )?;
     let yolo_policy = resolve_yolo_policy(
         config,
         &host.alias,
@@ -13938,19 +14022,24 @@ fn steer_prompt(
         explicit_host_alias,
         resolve_turn_execution_timeout_ms(&host.config, command.timeout.as_deref()),
     )?;
-    let supported_image_media_types = if command.images.is_empty() {
-        Vec::new()
-    } else {
-        report_not_admitted(
-            &mut event_output,
-            explicit_host_alias,
-            transport.supported_image_media_types().map_err(failure),
-        )?
-    };
+    let supported_image_media_types =
+        if command.images.is_empty() && command.remote_images.is_empty() {
+            Vec::new()
+        } else {
+            report_not_admitted(
+                &mut event_output,
+                explicit_host_alias,
+                transport.supported_image_media_types().map_err(failure),
+            )?
+        };
     let attachments = report_not_admitted(
         &mut event_output,
         explicit_host_alias,
-        load_image_attachments(&command.images, supported_image_media_types),
+        load_image_attachments(
+            &command.images,
+            &command.remote_images,
+            supported_image_media_types,
+        ),
     )?;
     let effective_timeouts = effective_timeouts_json(&host.config, turn_execution_timeout_ms);
     let request = build_turn_request(

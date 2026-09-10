@@ -2298,6 +2298,40 @@ fn events_json_reports_output_conflict_when_explicit_host_is_already_known() {
 }
 
 #[test]
+fn remote_images_require_a_resolved_remote_host_before_file_or_transport_access() {
+    let state = state_dir();
+    let session_id = SessionId::new().to_string();
+    for arguments in [vec!["run"], vec!["steer", session_id.as_str()]] {
+        let output = satelle()
+            .env("SATELLE_STATE_DIR", state.path())
+            .env("SATELLE_COMMAND_HISTORY", "false")
+            .args(arguments)
+            .args([
+                "--host",
+                "local-demo",
+                "--remote-image",
+                "PRIVATE_REMOTE_PATH",
+                "--json",
+                "Inspect image",
+            ])
+            .assert()
+            .code(64)
+            .get_output()
+            .clone();
+        let error = parse_json_output(&output.stderr);
+        assert_eq!(error["code"], "invalid-usage");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("--remote-image requires a remote Host")
+        );
+        assert_command_canaries_are_absent(&output, &["PRIVATE_REMOTE_PATH"]);
+        assert!(!state.path().join("local-daemon-endpoint.json").exists());
+    }
+}
+
+#[test]
 fn run_and_steer_help_explain_events_and_yolo_authority() {
     for command in ["run", "steer"] {
         let output = satelle()
@@ -2312,6 +2346,7 @@ fn run_and_steer_help_explain_events_and_yolo_authority() {
         assert!(stdout.contains("--quiet"));
         assert!(stdout.contains("--verbose"));
         assert!(stdout.contains("--image <LOCAL_PATH>"));
+        assert!(stdout.contains("--remote-image <HOST_PATH>"));
         assert!(stdout.contains("local PNG or JPEG image"));
         assert!(stdout.contains("maximum 2, 5 MiB each, 10 MiB total"));
         assert!(stdout.contains("Host capabilities"));

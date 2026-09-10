@@ -15,8 +15,8 @@ use crate::storage::{
 use crate::storage::{LeaseOwner, PrivateUpstreamRef, ProbeRecoverySubject};
 use crate::test_runtime::FakeComputerUseAdapter;
 use crate::{
-    AttachmentUpload, ProductionComputerUseAdapter, ProviderSmokeEvidence,
-    ReadinessObservationState, attachment::verify_uploads,
+    AttachmentInput, ProductionComputerUseAdapter, ProviderSmokeEvidence,
+    ReadinessObservationState, attachment::accept_inputs,
 };
 use base64::Engine as _;
 use satelle_core::session::{
@@ -59,13 +59,14 @@ fn verified_png() -> Vec<crate::attachment::VerifiedImageAttachment> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    verify_uploads(vec![AttachmentUpload::new(
+    let accepted = accept_inputs(vec![AttachmentInput::upload(
         "image/png",
         bytes.len() as u64,
         digest,
         base64::engine::general_purpose::STANDARD.encode(bytes),
     )])
-    .expect("verify the runtime image fixture")
+    .expect("accept the runtime image fixture");
+    crate::attachment::resolve_images(&accepted).expect("resolve the runtime image fixture")
 }
 
 fn staged_file_count(state_root: &std::path::Path) -> usize {

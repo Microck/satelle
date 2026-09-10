@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt;
 
-define_schema_token!(TurnRequestSchema, "satelle.api.v7");
+define_schema_token!(TurnRequestSchema, "satelle.api.v8");
 define_schema_token!(StopRequestSchema, "satelle.api.v1");
 define_schema_token!(SessionSchema, "satelle.session.v1");
 define_schema_token!(TaskArtifactsSchema, "satelle.task_artifacts.v1");
@@ -71,23 +71,29 @@ pub(crate) struct TurnRequestParts {
     pub(crate) turn_execution_timeout_ms: Option<u64>,
 }
 
+/// A Controller upload or an explicit path interpreted by the selected Host.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImageAttachment {
-    media_type: String,
-    size_bytes: u64,
-    sha256: String,
-    data_base64: String,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ImageAttachment {
+    Upload {
+        media_type: String,
+        size_bytes: u64,
+        sha256: String,
+        data_base64: String,
+    },
+    HostFile {
+        path: String,
+    },
 }
 
 impl ImageAttachment {
-    pub fn new(
+    pub fn upload(
         media_type: impl Into<String>,
         size_bytes: u64,
         sha256: impl Into<String>,
         data_base64: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::Upload {
             media_type: media_type.into(),
             size_bytes,
             sha256: sha256.into(),
@@ -95,31 +101,27 @@ impl ImageAttachment {
         }
     }
 
-    pub fn media_type(&self) -> &str {
-        &self.media_type
-    }
-
-    pub const fn size_bytes(&self) -> u64 {
-        self.size_bytes
-    }
-
-    pub fn sha256(&self) -> &str {
-        &self.sha256
-    }
-
-    pub fn data_base64(&self) -> &str {
-        &self.data_base64
+    pub fn host_file(path: impl Into<String>) -> Self {
+        Self::HostFile { path: path.into() }
     }
 }
 
 impl fmt::Debug for ImageAttachment {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ImageAttachment")
-            .field("media_type", &self.media_type)
-            .field("size_bytes", &self.size_bytes)
-            .field("data", &"[redacted]")
-            .finish()
+        match self {
+            Self::Upload {
+                media_type,
+                size_bytes,
+                ..
+            } => formatter
+                .debug_struct("ImageAttachment::Upload")
+                .field("media_type", media_type)
+                .field("size_bytes", size_bytes)
+                .finish_non_exhaustive(),
+            Self::HostFile { .. } => formatter
+                .debug_struct("ImageAttachment::HostFile")
+                .finish_non_exhaustive(),
+        }
     }
 }
 
@@ -241,40 +243,45 @@ impl ApiRequestContract for TurnRequest {
     const MAX_BASE64_BODY_ALLOWANCE: usize = MAX_IMAGE_ATTACHMENT_BASE64_BYTES_TOTAL;
 
     fn exceeds_attachment_limit(value: &Value, image_attachments_supported: bool) -> bool {
-        value
-            .as_object()
-            .and_then(|object| object.get("attachments"))
-            .is_some_and(|attachments| match attachments {
-                Value::Array(values) => {
-                    (!image_attachments_supported && !values.is_empty())
-                        || values.len() > MAX_IMAGE_ATTACHMENT_COUNT
-                        || values.iter().any(|value| {
-                            let size = value.get("size_bytes").and_then(Value::as_u64);
-                            let media_type = value.get("media_type").and_then(Value::as_str);
-                            let data_base64 = value.get("data_base64").and_then(Value::as_str);
-                            size.is_none_or(|size| size > MAX_IMAGE_ATTACHMENT_BYTES as u64)
-                                || media_type.is_none_or(|media_type| {
-                                    !SUPPORTED_IMAGE_MEDIA_TYPES.contains(&media_type)
-                                })
-                                || data_base64.is_none_or(|value| {
-                                    value.len() > MAX_IMAGE_ATTACHMENT_BASE64_BYTES
-                                })
-                        })
-                        || values
-                            .iter()
-                            .try_fold(0_u64, |total, value| {
-                                total.checked_add(value.get("size_bytes")?.as_u64()?)
-                            })
-                            .is_none_or(|total| total > MAX_IMAGE_ATTACHMENT_BYTES_TOTAL as u64)
-                        || values
-                            .iter()
-                            .try_fold(0_usize, |total, value| {
-                                total.checked_add(value.get("data_base64")?.as_str()?.len())
-                            })
-                            .is_none_or(|total| total > MAX_IMAGE_ATTACHMENT_BASE64_BYTES_TOTAL)
+        let Some(attachments) = value.get("attachments").and_then(Value::as_array) else {
+            return false;
+        };
+        if (!image_attachments_supported && !attachments.is_empty())
+            || attachments.len() > MAX_IMAGE_ATTACHMENT_COUNT
+        {
+            return true;
+        }
+        // Check upload bounds before decoding JSON into the request. Host-file
+        // bytes are bounded when the Host resolves a new admission.
+        for attachment in attachments {
+            match attachment.get("kind").and_then(Value::as_str) {
+                Some("host_file") => {
+                    if attachment
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .is_none_or(|path| path.len() > 4096)
+                    {
+                        return true;
+                    }
                 }
-                _ => false,
-            })
+                Some("upload") => {
+                    let size = attachment.get("size_bytes").and_then(Value::as_u64);
+                    let media_type = attachment.get("media_type").and_then(Value::as_str);
+                    let encoded = attachment.get("data_base64").and_then(Value::as_str);
+                    if size.is_none_or(|size| size > MAX_IMAGE_ATTACHMENT_BYTES as u64)
+                        || media_type
+                            .is_none_or(|media| !SUPPORTED_IMAGE_MEDIA_TYPES.contains(&media))
+                        || encoded
+                            .is_none_or(|encoded| encoded.len() > MAX_IMAGE_ATTACHMENT_BASE64_BYTES)
+                    {
+                        return true;
+                    }
+                }
+                _ => return true,
+            }
+        }
+        // Two files of at most 5 MiB also satisfy the 10 MiB aggregate bound.
+        false
     }
 
     fn attachment_data_base64_bytes(value: &Value) -> usize {
@@ -284,6 +291,7 @@ impl ApiRequestContract for TurnRequest {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .filter(|attachment| attachment.get("kind").and_then(Value::as_str) == Some("upload"))
             .filter_map(|attachment| attachment.get("data_base64")?.as_str())
             .map(str::len)
             .sum()
@@ -318,7 +326,38 @@ mod provider_binding_boundary_tests {
     use serde_json::json;
 
     #[test]
-    fn turn_request_v7_carries_independent_project_provenance_and_opt_ins() {
+    fn image_sources_have_one_tagged_contract_and_redacted_debug() {
+        let upload =
+            ImageAttachment::upload("image/png", 8, "private-digest", "private-image-bytes");
+        let remote = ImageAttachment::host_file("/private/operator-image.png");
+        for (attachment, expected) in [
+            (
+                upload,
+                json!({"kind":"upload","media_type":"image/png","size_bytes":8,"sha256":"private-digest","data_base64":"private-image-bytes"}),
+            ),
+            (
+                remote,
+                json!({"kind":"host_file","path":"/private/operator-image.png"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&attachment).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<ImageAttachment>(expected.clone()).unwrap(),
+                attachment
+            );
+            let debug = format!("{attachment:?}");
+            assert!(!debug.contains("private"));
+            let mut unknown = expected.clone();
+            unknown["extra"] = json!(true);
+            assert!(serde_json::from_value::<ImageAttachment>(unknown).is_err());
+            let mut untagged = expected;
+            untagged.as_object_mut().unwrap().remove("kind");
+            assert!(serde_json::from_value::<ImageAttachment>(untagged).is_err());
+        }
+    }
+
+    #[test]
+    fn turn_request_v8_carries_independent_project_provenance_and_opt_ins() {
         let request = TurnRequest::new("inspect the repository")
             .with_provider_intent(
                 Some("vision".to_string()),
@@ -331,7 +370,7 @@ mod provider_binding_boundary_tests {
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             json!({
-                "schema_version": "satelle.api.v7",
+                "schema_version": "satelle.api.v8",
                 "model_from_project": true,
                 "provider_from_project": false,
                 "prompt": "inspect the repository",
@@ -348,7 +387,7 @@ mod provider_binding_boundary_tests {
     fn turn_request_rejects_missing_provenance_and_the_v6_shape() {
         for request in [
             serde_json::json!({
-                "schema_version": "satelle.api.v7",
+                "schema_version": "satelle.api.v8",
                 "prompt": "private",
                 "execution_mode": "standard"
             }),
@@ -848,7 +887,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).expect("serialize request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v7",
+                "schema_version": "satelle.api.v8",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -861,7 +900,7 @@ mod tests {
             )
             .expect("serialize YOLO request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v7",
+                "schema_version": "satelle.api.v8",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -878,7 +917,7 @@ mod tests {
             ))
             .expect("serialize provider intent"),
             serde_json::json!({
-                "schema_version": "satelle.api.v7",
+                "schema_version": "satelle.api.v8",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -890,7 +929,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v7",
+                "schema_version": "satelle.api.v8",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt"
@@ -899,7 +938,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v7",
+                "schema_version": "satelle.api.v8",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -918,7 +957,7 @@ mod tests {
     fn controller_presentation_fields_are_absent_from_the_turn_request_contract() {
         for field in ["attach", "detach"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v7",
+                "schema_version": "satelle.api.v8",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -940,7 +979,7 @@ mod tests {
     fn mvp_turn_requests_cannot_route_across_desktop_bindings() {
         for field in ["desktop_user", "desktop_binding", "desktop_session"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v7",
+                "schema_version": "satelle.api.v8",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
