@@ -92,8 +92,7 @@ export function useTypewriter(beats: Beat[], reduced: boolean) {
     const length = current.text.length;
 
     if (current.instant || chars >= length) {
-      const ready = current.instant || chars >= length;
-      const delay = ready ? (current.hold ?? (current.instant ? OUTPUT_MS : 240)) : 0;
+      const delay = current.hold ?? (current.instant ? OUTPUT_MS : 240);
       timer.current = window.setTimeout(() => {
         setBeat((n) => n + 1);
         setChars(0);

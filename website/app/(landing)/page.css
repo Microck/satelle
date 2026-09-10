@@ -139,58 +139,6 @@
     var(--sa-1);
 }
 
-/* ------------------------------------------------------------------ hero --- */
-
-/* The hero holds the headline and the whole desk demo, as v12's does. It is
-   deliberately short: the reference opens at 31px, not at display scale. */
-.hero {
-  padding-block: var(--space-xl) var(--space-l);
-  row-gap: var(--space-m-l);
-}
-
-.hero-inner {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: var(--space-xs);
-  max-width: var(--measure-hero);
-}
-
-.hero-title {
-  font-size: var(--step-3);
-  line-height: 1.24;
-  letter-spacing: -0.012em;
-  font-weight: 400;
-  text-wrap: pretty;
-}
-
-.hero-title em {
-  font-style: normal;
-  color: var(--sa-accent-text);
-}
-
-/* v12 carries the supporting sentence inside the h1, set in the muted ink. */
-.hero-title-sub {
-  color: var(--sa-9);
-}
-
-/* The command sits beside the button on a wide hero and wraps under it on a
-   narrow one. It needs an explicit basis and min-width:0, or the nowrap command
-   text sets the row's width and pushes the whole hero past the viewport. */
-.hero-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2xs);
-  margin-block-start: var(--space-2xs);
-  width: 100%;
-}
-
-
-.hero-actions .sa-btn {
-  border-radius: var(--radius-full);
-}
-
 /* -------------------------------------------------------- copy a command --- */
 
 .copycmd {

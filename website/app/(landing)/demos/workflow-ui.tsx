@@ -1,10 +1,10 @@
 'use client';
 import * as React from 'react';
-import { COMMIT_DELAY, type SceneProps } from './exploration-data';
+import { COMMIT_DELAY, POINTER_TRAVEL, type SceneProps } from './exploration-data';
 import { DemoCursor } from './workflow-motion';
 import { AppLogo } from './workflow-logos';
 export function Pointer({ frame, moving }: SceneProps) {
-  return <DemoCursor target={frame.target} progress={frame.pointer} click={frame.local >= 620 && frame.local < COMMIT_DELAY + 160} visible={!frame.done && moving} layout={frame.committed} />;
+  return <DemoCursor target={frame.target} progress={frame.pointer} click={frame.local >= POINTER_TRAVEL && frame.local < COMMIT_DELAY + 160} visible={!frame.done && moving} layout={frame.committed} />;
 }
 export function Lights() { return <span className="wf-lights"><i /><i /><i /></span>; }
 export function Icon({ name, size = 16 }: { name: string; size?: number }) {
