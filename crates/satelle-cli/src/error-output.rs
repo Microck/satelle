@@ -438,6 +438,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ProviderSecretProvisioningRequired
         | ErrorCode::ProviderSecretOverwriteRequired
         | ErrorCode::DoctorFixConsentRequired
+        | ErrorCode::ConfigRepairConsentRequired
         | ErrorCode::DesktopBindingRequired
         | ErrorCode::DoctorRefreshScopeRequired
         | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
@@ -495,6 +496,8 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ConfigIncludeInvalid
         | ErrorCode::ConfigIncludeOutsideSource
         | ErrorCode::ConfigIncludeCycle
+        | ErrorCode::ConfigRepairManualActionRequired
+        | ErrorCode::ConfigRepairSourceChanged
         | ErrorCode::TrustedProfileExpired
         | ErrorCode::ProjectDaemonPathOverrideNotAllowed
         | ErrorCode::ProjectDesktopBindingNotAllowed

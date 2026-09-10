@@ -3,6 +3,8 @@ mod bootstrap_lock;
 #[path = "command-history.rs"]
 mod command_history;
 mod completions;
+#[path = "config-repair.rs"]
+mod config_repair;
 #[path = "error-output.rs"]
 mod error_output;
 #[path = "host-trust.rs"]
@@ -540,6 +542,7 @@ struct DoctorCommand {
 enum ConfigCommand {
     Check(ConfigCheckCommand),
     Explain(ConfigExplainCommand),
+    Repair(config_repair::ConfigRepairCommand),
 }
 
 #[derive(Args, Debug)]
@@ -2272,15 +2275,20 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             explicit_host: command.host.as_deref(),
             session_id: None,
         },
+        Command::Config {
+            command: ConfigCommand::Repair(command),
+        } if command.dry_run => return None,
         Command::Config { command } => HistoryTarget {
             family: "config",
             selects_host: match command {
                 ConfigCommand::Check(command) => !command.all,
                 ConfigCommand::Explain(_) => true,
+                ConfigCommand::Repair(command) => command.host.is_some(),
             },
             explicit_host: match command {
                 ConfigCommand::Check(command) => command.host.as_deref(),
                 ConfigCommand::Explain(command) => command.host.as_deref(),
+                ConfigCommand::Repair(command) => command.host.as_deref(),
             },
             session_id: None,
         },
@@ -7341,6 +7349,7 @@ fn run_config(
     match command {
         ConfigCommand::Check(command) => config_check(command, config, format),
         ConfigCommand::Explain(command) => config_explain(command, config, format),
+        ConfigCommand::Repair(command) => config_repair::run(command, config.flag_profile, format),
     }
 }
 

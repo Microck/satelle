@@ -886,6 +886,55 @@ fn production_doctor_fix_without_noninteractive_consent_emits_plan_and_typed_err
 
 #[cfg(target_os = "linux")]
 #[test]
+fn interactive_config_repair_decline_and_concurrent_edits_leave_configuration_untouched() {
+    for changed_during_confirmation in [false, true] {
+        let state = state_dir();
+        let user_config = state.path().join("config.toml");
+        let original = "command_history=false\ndefault-host='local-demo'\n";
+        write_user_config(&user_config, original).unwrap();
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("satelle"));
+        command
+            .current_dir(state.path())
+            .env("SATELLE_HOME", state.path())
+            .env("SATELLE_CONFIG_FILE", &user_config)
+            .env("SATELLE_STATE_DIR", state.path())
+            .env("SATELLE_COMMAND_HISTORY", "false")
+            .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
+            .env_remove("SATELLE_PROFILE")
+            .env_remove("SATELLE_HOST")
+            .env_remove("SATELLE_ERROR_FORMAT")
+            .args(["config", "repair"]);
+        let mut process = spawn_pty_command(command);
+        let preview_end = process.wait_for_after("Backup:", 0);
+        process.wait_for_after("Apply these local configuration edits?", preview_end);
+        let expected = if changed_during_confirmation {
+            let updated = "command_history=false\ndefault-host='local-demo'\n# new user edit\n";
+            write_user_config(&user_config, updated).unwrap();
+            process.write_input("y\n");
+            updated
+        } else {
+            process.write_input("n\n");
+            original
+        };
+        let output = process.finish();
+        let rendered = combined_process_output(&output);
+        if changed_during_confirmation {
+            assert_eq!(output.status.code(), Some(66), "{rendered}");
+            assert!(
+                rendered.contains("config-repair-source-changed"),
+                "{rendered}"
+            );
+        } else {
+            assert!(output.status.success(), "{rendered}");
+            assert!(rendered.contains("Config repair: cancelled"), "{rendered}");
+        }
+        assert_eq!(fs::read_to_string(&user_config).unwrap(), expected);
+        assert!(!state.path().join("config-repair").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn interactive_doctor_shows_findings_before_offering_a_fix_plan() {
     let state = state_dir();
     let executable = assert_cmd::cargo::cargo_bin!("satelle");

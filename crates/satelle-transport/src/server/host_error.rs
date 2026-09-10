@@ -431,6 +431,10 @@ fn failure(error: &SatelleError) -> ApiFailure {
         // either code crosses the Host boundary, expose only the stable internal-error contract.
         ErrorCode::CompletionInstallFailed
         | ErrorCode::CompletionProfileUpdateFailed
+        // Config repair is also a Controller-local operation.
+        | ErrorCode::ConfigRepairManualActionRequired
+        | ErrorCode::ConfigRepairConsentRequired
+        | ErrorCode::ConfigRepairSourceChanged
         | ErrorCode::CertificateUntrusted
         | ErrorCode::CertificateHostnameMismatch
         | ErrorCode::CertificateExpired

@@ -11,6 +11,7 @@ public Satelle result and event schema sources. CI rejects hand-edited or stale 
 
 | Public schema source | Production source | Serialized schema version |
 | --- | --- | --- |
+| `CONFIG_REPAIR_SCHEMA_VERSION` | `crates/satelle-cli/src/output.rs` | `satelle.config.repair.v1` |
 | `DoctorEventSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.doctor.events.v1` |
 | `DoctorSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.doctor.v1` |
 | `ERROR_SCHEMA_VERSION` | `crates/satelle-cli/src/error-output.rs` | `satelle.error.v1` |
@@ -228,6 +229,7 @@ Usage: satelle config [OPTIONS] <COMMAND>
 Commands:
   check
   explain
+  repair
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -573,6 +575,26 @@ Options:
       --error-format <FORMAT>   Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --json                    Alias for --format json
   -h, --help                    Print help
+```
+
+## `satelle config repair`
+
+```text
+Usage: satelle config repair [OPTIONS]
+
+Options:
+      --file <FILE>            Select one loaded local configuration file; project files require this flag
+      --no-color               Disable colored human output
+      --host <HOST>            Scope Trusted Profile consent to edits inside this Host Binding
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --dry-run
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --yes                    Accept the displayed local configuration edits and private backup
+      --no-input
+      --format <FORMAT>        [possible values: human, json]
+      --json                   Alias for --format json
+  -h, --help                   Print help
 ```
 
 ## `satelle host start`

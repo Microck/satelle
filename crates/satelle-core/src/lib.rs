@@ -13,6 +13,8 @@ use time::format_description::well_known::Rfc3339;
 mod authority;
 #[path = "config-includes.rs"]
 mod config_includes;
+#[path = "config-repair.rs"]
+pub mod config_repair;
 #[path = "control-plane.rs"]
 pub mod control_plane;
 #[path = "credential-helper.rs"]
@@ -310,7 +312,7 @@ impl TrustedProfile {
     }
 }
 
-/// The complete MVP vocabulary that a Trusted Profile can authorize.
+/// The command families that a Trusted Profile can authorize.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum MutationCommandFamily {
@@ -319,6 +321,7 @@ pub enum MutationCommandFamily {
     HostUpdate,
     SelfUpdateRemotes,
     DoctorFix,
+    ConfigRepair,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2292,11 +2295,11 @@ pub fn load_user_api_rate_limits(user_config_path: &Path) -> Result<ApiRateLimit
 }
 
 pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedConfig, SatelleError> {
-    load_config_with_profile_selection(cwd, flag_profile, true, None)
+    load_config_with_profile_selection(cwd, flag_profile, true, None, None)
 }
 
 pub fn load_config_without_profile(cwd: &Path) -> Result<ResolvedConfig, SatelleError> {
-    load_config_with_profile_selection(cwd, None, false, None)
+    load_config_with_profile_selection(cwd, None, false, None, None)
 }
 
 pub fn load_config_for_profile(
@@ -2312,6 +2315,7 @@ pub fn load_config_for_profile(
             name: profile.to_string(),
             source,
         }),
+        None,
     )
 }
 
@@ -2320,14 +2324,23 @@ fn load_config_with_profile_selection(
     flag_profile: Option<&str>,
     select_profile: bool,
     selected_profile_override: Option<profiles::SelectedProfile>,
+    documents: Option<config_includes::ConfigDocuments>,
 ) -> Result<ResolvedConfig, SatelleError> {
     let paths = resolve_path_set(cwd)?;
     let user_config_path = paths.config_file;
     let project_config_path = paths.project_config_file;
 
     let mut config = SatelleConfig::defaults();
-    let user_config = read_user_config_file(&user_config_path)?;
-    let project_config = project_config::read(&project_config_path)?;
+    let (user_config, project_config) = match documents {
+        Some(documents) => (
+            parse_user_config_documents(documents.user)?,
+            project_config::parse_documents(documents.project)?,
+        ),
+        None => (
+            read_user_config_file(&user_config_path)?,
+            project_config::read(&project_config_path)?,
+        ),
+    };
     let mut sources = user_config
         .as_ref()
         .map(|user| user.sources.clone())
@@ -3059,7 +3072,14 @@ command_families = ["setup", "repair", "host_update", "self_update_remotes", "do
 
     #[test]
     fn trusted_profiles_reject_open_or_future_command_scopes() {
-        for scope in ["all", "*", "host_*", "host_.*", "future", "config_repair"] {
+        for scope in [
+            "all",
+            "*",
+            "host_*",
+            "host_.*",
+            "future",
+            "unrestricted_mutation",
+        ] {
             let raw = format!(
                 "[trusted_profiles.maintenance]\nhosts = [\"office-mac\"]\ncommand_families = [\"{scope}\"]\n"
             );
@@ -3210,9 +3230,15 @@ mod invocation_profile_tests {
 }
 
 fn read_user_config_file(path: &Path) -> Result<Option<ParsedUserConfig>, SatelleError> {
+    parse_user_config_documents(config_includes::read(path, ConfigSourceKind::UserConfig)?)
+}
+
+fn parse_user_config_documents(
+    documents: Vec<config_includes::ConfigDocument>,
+) -> Result<Option<ParsedUserConfig>, SatelleError> {
     let mut merged: Option<ParsedUserConfig> = None;
     let mut sources = ConfigSources::default();
-    for document in config_includes::read(path, ConfigSourceKind::UserConfig)? {
+    for document in documents {
         sources.record(document.source.clone(), &document.value);
         let higher = parse_user_config_value(&document.source.path, document.value)?;
         merged = Some(match merged {
@@ -3374,7 +3400,12 @@ fn reject_trusted_profile_errors(path: &Path, value: &toml::Value) -> Result<(),
         {
             if !matches!(
                 command,
-                "setup" | "repair" | "host_update" | "self_update_remotes" | "doctor_fix"
+                "setup"
+                    | "repair"
+                    | "host_update"
+                    | "self_update_remotes"
+                    | "doctor_fix"
+                    | "config_repair"
             ) {
                 return Err(SatelleError::unsupported_trusted_profile_command_scope(
                     path,
@@ -4547,6 +4578,9 @@ pub enum ErrorCode {
     ConfigIncludeInvalid,
     ConfigIncludeOutsideSource,
     ConfigIncludeCycle,
+    ConfigRepairManualActionRequired,
+    ConfigRepairConsentRequired,
+    ConfigRepairSourceChanged,
     ProjectDaemonPathOverrideNotAllowed,
     ProjectDesktopBindingNotAllowed,
     ProjectYoloEnableNotAllowed,
@@ -4692,6 +4726,9 @@ impl ErrorCode {
             Self::ConfigIncludeInvalid => "config-include-invalid",
             Self::ConfigIncludeOutsideSource => "config-include-outside-source",
             Self::ConfigIncludeCycle => "config-include-cycle",
+            Self::ConfigRepairManualActionRequired => "config-repair-manual-action-required",
+            Self::ConfigRepairConsentRequired => "config-repair-consent-required",
+            Self::ConfigRepairSourceChanged => "config-repair-source-changed",
             Self::ProjectDaemonPathOverrideNotAllowed => "project-daemon-path-override-not-allowed",
             Self::ProjectDesktopBindingNotAllowed => "project-desktop-binding-not-allowed",
             Self::ProjectYoloEnableNotAllowed => "project-yolo-enable-not-allowed",
@@ -4840,6 +4877,7 @@ impl ErrorCode {
             | Self::SetupConsentRequired
             | Self::SetupLedgerUnavailable
             | Self::DoctorFixConsentRequired
+            | Self::ConfigRepairConsentRequired
             | Self::InputRequired
             | Self::DesktopBindingRequired
             | Self::DoctorRefreshScopeRequired
@@ -4863,6 +4901,8 @@ impl ErrorCode {
             | Self::ConfigIncludeInvalid
             | Self::ConfigIncludeOutsideSource
             | Self::ConfigIncludeCycle
+            | Self::ConfigRepairManualActionRequired
+            | Self::ConfigRepairSourceChanged
             | Self::ProjectDaemonPathOverrideNotAllowed
             | Self::ProjectDesktopBindingNotAllowed
             | Self::ProjectYoloEnableNotAllowed
