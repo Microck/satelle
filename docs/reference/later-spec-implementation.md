@@ -25,8 +25,8 @@ those pull requests merge, the integration branch gets a final pull request to
 | Transport authentication | Mutual TLS | Merged in PR #228 |
 | Native package repair | Launcher repair through the detected installation owner | Merged in PR #225 |
 | Output formats | Lossless final results and fixed-column CSV | Merged in PR #226 |
-| Support bundle history | Bounded, redacted Host setup-ledger summaries | Ready for review |
-| Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit | Pending |
+| Support bundle history | Bounded, redacted Host setup-ledger summaries | Merged in PR #238 |
+| Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit | Ready for review |
 | Capture and observability | Raw protocol/subprocess exports, desktop snapshot, recording, native log sinks, telemetry | Pending |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Pending |
@@ -36,6 +36,26 @@ those pull requests merge, the integration branch gets a final pull request to
 Package repository submissions, staged npm publishing, and native action relay
 retain the prerequisites declared in `.facts`. A missing external capability
 or approval is a blocker, never proof of implementation.
+
+## Raw protocol diagnostic decisions
+
+- `run` and `steer` accept `--raw-protocol --output <path>` for one prospective
+  Turn. Capture starts only after explicit interactive consent or the exact
+  `--no-input --yes` noninteractive form.
+- The Host captures only Codex app-server JSON for that Turn. It redacts known
+  provider secrets, authorization data, secret references, and schema-marked
+  fields before records enter the in-memory export.
+- Capture is limited to 8 MiB per Turn and eight pending exports per Host.
+  Capture failure never changes Turn execution or its durable outcome.
+- Download and acknowledgement require control plus `diagnostics:sensitive`
+  authority and the Principal that created the capture. Raw records never enter
+  SQLite, logs, status, events, support bundles, or idempotency receipts.
+- The Host retains a completed artifact for ten minutes, discards it on restart,
+  and records only bounded audit metadata. The audit distinguishes Host
+  preparation from Controller-confirmed local publication.
+- The Controller writes one new owner-only local file without replacement,
+  verifies its exact bytes, then acknowledges success. Failure reports the
+  staging path, cleanup command, and whether raw material may remain.
 
 ## Host storage migration contract decisions
 
@@ -213,8 +233,8 @@ plus documentation and release installation checks on all six targets.
   the selected Host. The option requires SSH or Direct transport.
 - Paths use absolute native Host syntax. The Controller neither interprets nor
   opens them. The Host applies bounded regular-file reads before admission.
-- Uploads and Host paths share a tagged attachment list in `satelle.api.v8` and
-  protocol version 15. No older request shape is accepted.
+- Uploads and Host paths share a tagged attachment list in `satelle.api.v9` and
+  protocol version 16. No older request shape is accepted.
 - The keyed operation identity includes the path reference. A replay or
   cancellation resolves from durable admission state without reopening files.
 - Remote files share the upload limits and private staging lifecycle. Cleanup

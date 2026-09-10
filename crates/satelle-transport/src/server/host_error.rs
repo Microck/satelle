@@ -34,6 +34,19 @@ pub(super) fn task_failure(state: &DaemonState, authorized: &AuthorizedRequest) 
 
 fn failure(error: &SatelleError) -> ApiFailure {
     let mut failure = match error.code {
+        ErrorCode::RawDiagnosticsRedactionFailed | ErrorCode::RawDiagnosticsStagingFailed
+        | ErrorCode::RawDiagnosticsExportFailed => ApiFailure {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: match error.code {
+                ErrorCode::RawDiagnosticsRedactionFailed => ApiErrorCode::RawDiagnosticsRedactionFailed,
+                ErrorCode::RawDiagnosticsStagingFailed => ApiErrorCode::RawDiagnosticsStagingFailed,
+                _ => ApiErrorCode::RawDiagnosticsExportFailed,
+            },
+            category: ApiErrorCategory::Storage,
+            retryable: false,
+            message: "the requested raw diagnostic export is unavailable; no raw staging files remain",
+            details: None,
+        },
         ErrorCode::InvalidUsage
         | ErrorCode::ScopeSelectionConflict
         | ErrorCode::PromptSourceConflict
@@ -81,6 +94,8 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::DoctorFixConsentRequired
         | ErrorCode::DoctorRefreshScopeRequired
         | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
+        | ErrorCode::RawDiagnosticsOutputRequired
+        | ErrorCode::RawDiagnosticsConsentRequired
         | ErrorCode::InputRequired => ApiFailure {
             status: StatusCode::BAD_REQUEST,
             code: ApiErrorCode::InvalidRequest,

@@ -23,7 +23,7 @@ use crate::EphemeralApiAuthenticator;
 use std::sync::Arc;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
-const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 7;
+const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 8;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
 const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 3;
 const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 2;
@@ -186,6 +186,7 @@ pub struct TurnIntent {
     provider_intent: crate::ProviderComputerUseIntent,
     turn_execution_timeout: Option<satelle_core::session::TimeoutPolicy>,
     attachments: Vec<crate::attachment::AcceptedImageAttachment>,
+    raw_protocol_source_host: Option<String>,
 }
 
 impl TurnIntent {
@@ -203,6 +204,7 @@ impl TurnIntent {
             provider_intent: crate::ProviderComputerUseIntent::host_default(),
             turn_execution_timeout: None,
             attachments: Vec::new(),
+            raw_protocol_source_host: None,
         })
     }
 
@@ -275,6 +277,19 @@ impl TurnIntent {
         Ok(self)
     }
 
+    pub fn with_raw_protocol_capture(
+        mut self,
+        source_host: Option<String>,
+    ) -> Result<Self, TurnIntentError> {
+        if source_host.as_ref().is_some_and(|host| {
+            host.is_empty() || host.len() > 256 || host.chars().any(char::is_control)
+        }) {
+            return Err(TurnIntentError::InvalidRawProtocolSourceHost);
+        }
+        self.raw_protocol_source_host = source_host;
+        Ok(self)
+    }
+
     pub(crate) fn prompt(&self) -> &str {
         &self.prompt
     }
@@ -290,6 +305,10 @@ impl TurnIntent {
     pub(crate) fn attachments(&self) -> &[crate::attachment::AcceptedImageAttachment] {
         &self.attachments
     }
+
+    pub(crate) fn raw_protocol_source_host(&self) -> Option<&str> {
+        self.raw_protocol_source_host.as_deref()
+    }
 }
 
 impl fmt::Debug for TurnIntent {
@@ -300,6 +319,10 @@ impl fmt::Debug for TurnIntent {
             .field("execution_mode", &self.execution_mode)
             .field("provider_intent", &self.provider_intent)
             .field("attachment_count", &self.attachments.len())
+            .field(
+                "raw_protocol_capture",
+                &self.raw_protocol_source_host.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -316,6 +339,8 @@ pub enum TurnIntentError {
     InvalidTurnExecutionTimeout,
     #[error("the image attachments failed bounded media or integrity validation")]
     InvalidAttachments,
+    #[error("the raw protocol source Host alias is invalid")]
+    InvalidRawProtocolSourceHost,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -369,6 +394,7 @@ struct CanonicalSessionCreate<'a> {
     experimental_provider_computer_use: bool,
     turn_execution_timeout_seconds: Option<u32>,
     attachments: &'a [CanonicalAttachment<'a>],
+    raw_protocol_source_host: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -385,6 +411,7 @@ struct CanonicalTurnCreate<'a> {
     experimental_provider_computer_use: bool,
     turn_execution_timeout_seconds: Option<u32>,
     attachments: &'a [CanonicalAttachment<'a>],
+    raw_protocol_source_host: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1377,6 +1404,7 @@ impl HostService {
                     .iter()
                     .map(CanonicalAttachment::from)
                     .collect::<Vec<_>>(),
+                raw_protocol_source_host: intent.raw_protocol_source_host(),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -1426,6 +1454,7 @@ impl HostService {
                             .with_attachments(crate::attachment::resolve_images(
                                 &intent.attachments,
                             )?)
+                            .with_raw_protocol_capture(intent.raw_protocol_source_host())
                             .with_cancellation(registered_cancellation),
                         ),
                     )?;
@@ -1492,6 +1521,7 @@ impl HostService {
                     .iter()
                     .map(CanonicalAttachment::from)
                     .collect::<Vec<_>>(),
+                raw_protocol_source_host: intent.raw_protocol_source_host(),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -1545,6 +1575,7 @@ impl HostService {
                             .with_attachments(crate::attachment::resolve_images(
                                 &intent.attachments,
                             )?)
+                            .with_raw_protocol_capture(intent.raw_protocol_source_host())
                             .with_cancellation(registered_cancellation),
                         ),
                     )?;
@@ -1593,6 +1624,7 @@ impl HostService {
                     .iter()
                     .map(CanonicalAttachment::from)
                     .collect::<Vec<_>>(),
+                raw_protocol_source_host: intent.raw_protocol_source_host(),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -1663,6 +1695,7 @@ impl HostService {
                     .iter()
                     .map(CanonicalAttachment::from)
                     .collect::<Vec<_>>(),
+                raw_protocol_source_host: intent.raw_protocol_source_host(),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -2431,14 +2464,15 @@ mod tests {
                 experimental_provider_computer_use: true,
                 turn_execution_timeout_seconds: Some(30 * 60),
                 attachments: &[],
+                raw_protocol_source_host: Some("remote"),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )
         .expect("serialize Turn idempotency payload");
-        assert_eq!(turn.digest_schema_version, 7);
+        assert_eq!(turn.digest_schema_version, 8);
         assert_eq!(
             turn.as_slice(),
-            br#"{"digest_schema_version":7,"payload":{"operation":"session_create","prompt":"PRIVATE_DIGEST_VERSION_PROMPT","execution_mode":"yolo","model":"model-test","provider":"provider-test","model_from_project":true,"provider_from_project":false,"refresh_provider_smoke_test":true,"experimental_provider_computer_use":true,"turn_execution_timeout_seconds":1800,"attachments":[]}}"#
+            br#"{"digest_schema_version":8,"payload":{"operation":"session_create","prompt":"PRIVATE_DIGEST_VERSION_PROMPT","execution_mode":"yolo","model":"model-test","provider":"provider-test","model_from_project":true,"provider_from_project":false,"refresh_provider_smoke_test":true,"experimental_provider_computer_use":true,"turn_execution_timeout_seconds":1800,"attachments":[],"raw_protocol_source_host":"remote"}}"#
         );
 
         let stop = canonical_payload(

@@ -955,6 +955,7 @@ fn stop_winning_before_running_skips_adapter_execution_and_returns_stopped() {
         resolved_provider_secret: None,
         attachments: crate::attachment::StagedAttachments::default(),
         live_events: super::super::request::LocalLiveEventBuffer::default(),
+        raw_protocol_capture: None,
     };
     let outcome = engine
         .execute(plan)

@@ -1535,6 +1535,7 @@ pub struct ExecuteRequest<'a> {
     subject: AdapterSubject<'a>,
     hooks: ExecuteHooks<'a>,
     attachments: &'a [crate::attachment::StagedImage],
+    raw_protocol_capture: Option<crate::raw_diagnostics::RawProtocolCapture>,
 }
 
 pub(super) struct ExecuteHooks<'a> {
@@ -1581,6 +1582,7 @@ impl<'a> ExecuteRequest<'a> {
             subject,
             hooks,
             attachments,
+            raw_protocol_capture: None,
         }
     }
 
@@ -1616,6 +1618,20 @@ impl<'a> ExecuteRequest<'a> {
 
     pub(crate) const fn attachments(&self) -> &'a [crate::attachment::StagedImage] {
         self.attachments
+    }
+
+    pub(super) fn with_raw_protocol_capture(
+        mut self,
+        capture: Option<crate::raw_diagnostics::RawProtocolCapture>,
+    ) -> Self {
+        self.raw_protocol_capture = capture;
+        self
+    }
+
+    pub(crate) fn raw_protocol_capture(
+        &self,
+    ) -> Option<&crate::raw_diagnostics::RawProtocolCapture> {
+        self.raw_protocol_capture.as_ref()
     }
 
     pub const fn execution_mode(&self) -> satelle_core::session::TurnExecutionMode {

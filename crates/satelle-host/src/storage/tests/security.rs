@@ -211,6 +211,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "provider_secret_provisioning_journal",
             "provider_smoke_hmac_key",
             "provider_smoke_results",
+            "raw_diagnostic_audit",
             "schema_migrations",
             "session_private_refs",
             "sessions",
@@ -238,6 +239,26 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "scopes",
             "certificate_sha256",
             "recorded_at_unix_nanos",
+        ],
+    );
+
+    // Raw protocol bytes stay in memory. The durable audit records only who
+    // requested an export, its declared scope, size, timing, and outcome.
+    assert_table_columns(
+        &storage,
+        "raw_diagnostic_audit",
+        &[
+            "turn_id",
+            "session_id",
+            "principal_ref",
+            "host_alias",
+            "command",
+            "data_categories",
+            "redaction_policy_version",
+            "created_at_unix_nanos",
+            "completed_at_unix_nanos",
+            "artifact_byte_size",
+            "status",
         ],
     );
 

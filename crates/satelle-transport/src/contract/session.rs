@@ -1,4 +1,5 @@
 use super::{AuthenticatedResponseContract, RequestId, define_schema_token};
+use satelle_core::sensitive_diagnostics::{RawDiagnosticExportOutcome, RawProtocolArtifact};
 use satelle_core::session::{
     PublicSession, SessionStateRevision, TurnExecutionMode, TurnState, TurnStateRevision,
 };
@@ -7,12 +8,20 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt;
 
-define_schema_token!(TurnRequestSchema, "satelle.api.v8");
+define_schema_token!(TurnRequestSchema, "satelle.api.v9");
 define_schema_token!(StopRequestSchema, "satelle.api.v1");
 define_schema_token!(SessionSchema, "satelle.session.v1");
 define_schema_token!(TaskArtifactsSchema, "satelle.task_artifacts.v1");
 define_schema_token!(SessionStopSchema, "satelle.session.stop.v1");
 define_schema_token!(AdmissionCancellationSchema, "satelle.admission.cancel.v1");
+define_schema_token!(
+    RawProtocolDownloadSchema,
+    "satelle.raw-diagnostics.download.v1"
+);
+define_schema_token!(
+    RawProtocolAcknowledgeSchema,
+    "satelle.raw-diagnostics.acknowledge.v1"
+);
 
 pub const MAX_IMAGE_ATTACHMENT_COUNT: usize = 2;
 pub const MAX_IMAGE_ATTACHMENT_BYTES: usize = 5 * 1_024 * 1_024;
@@ -56,6 +65,8 @@ pub struct TurnRequest {
     attachments: Vec<ImageAttachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     turn_execution_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_protocol: Option<RawProtocolCaptureRequest>,
 }
 
 pub(crate) struct TurnRequestParts {
@@ -69,6 +80,23 @@ pub(crate) struct TurnRequestParts {
     pub(crate) experimental_provider_computer_use: bool,
     pub(crate) attachments: Vec<ImageAttachment>,
     pub(crate) turn_execution_timeout_ms: Option<u64>,
+    pub(crate) raw_protocol: Option<RawProtocolCaptureRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawProtocolCaptureRequest {
+    source_host: String,
+}
+
+impl RawProtocolCaptureRequest {
+    pub fn source_host(&self) -> &str {
+        &self.source_host
+    }
+
+    pub(crate) fn into_source_host(self) -> String {
+        self.source_host
+    }
 }
 
 /// A Controller upload or an explicit path interpreted by the selected Host.
@@ -143,6 +171,7 @@ impl TurnRequest {
             experimental_provider_computer_use: false,
             attachments: Vec::new(),
             turn_execution_timeout_ms: None,
+            raw_protocol: None,
         }
     }
 
@@ -179,6 +208,13 @@ impl TurnRequest {
 
     pub fn with_turn_execution_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.turn_execution_timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    pub fn with_raw_protocol_capture(mut self, source_host: impl Into<String>) -> Self {
+        self.raw_protocol = Some(RawProtocolCaptureRequest {
+            source_host: source_host.into(),
+        });
         self
     }
 
@@ -222,6 +258,10 @@ impl TurnRequest {
         self.turn_execution_timeout_ms
     }
 
+    pub const fn raw_protocol_capture(&self) -> Option<&RawProtocolCaptureRequest> {
+        self.raw_protocol.as_ref()
+    }
+
     pub(crate) fn into_parts(self) -> TurnRequestParts {
         TurnRequestParts {
             prompt: self.prompt,
@@ -234,6 +274,7 @@ impl TurnRequest {
             experimental_provider_computer_use: self.experimental_provider_computer_use,
             attachments: self.attachments,
             turn_execution_timeout_ms: self.turn_execution_timeout_ms,
+            raw_protocol: self.raw_protocol,
         }
     }
 }
@@ -316,6 +357,7 @@ impl fmt::Debug for TurnRequest {
             )
             .field("attachment_count", &self.attachments.len())
             .field("turn_execution_timeout_ms", &self.turn_execution_timeout_ms)
+            .field("raw_protocol_capture", &self.raw_protocol.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -357,7 +399,7 @@ mod provider_binding_boundary_tests {
     }
 
     #[test]
-    fn turn_request_v8_carries_independent_project_provenance_and_opt_ins() {
+    fn turn_request_v9_carries_independent_project_provenance_and_opt_ins() {
         let request = TurnRequest::new("inspect the repository")
             .with_provider_intent(
                 Some("vision".to_string()),
@@ -366,11 +408,13 @@ mod provider_binding_boundary_tests {
                 false,
                 true,
             )
-            .with_experimental_provider_computer_use(true);
+            .with_experimental_provider_computer_use(true)
+            .with_raw_protocol_capture("remote-demo");
+        assert!(!format!("{request:?}").contains("remote-demo"));
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             json!({
-                "schema_version": "satelle.api.v8",
+                "schema_version": "satelle.api.v9",
                 "model_from_project": true,
                 "provider_from_project": false,
                 "prompt": "inspect the repository",
@@ -378,21 +422,22 @@ mod provider_binding_boundary_tests {
                 "model": "vision",
                 "provider": "open_ai",
                 "refresh_provider_smoke_test": true,
-                "experimental_provider_computer_use": true
+                "experimental_provider_computer_use": true,
+                "raw_protocol": {"source_host": "remote-demo"}
             })
         );
     }
 
     #[test]
-    fn turn_request_rejects_missing_provenance_and_the_v6_shape() {
+    fn turn_request_rejects_missing_provenance_and_the_v8_shape() {
         for request in [
             serde_json::json!({
-                "schema_version": "satelle.api.v8",
+                "schema_version": "satelle.api.v9",
                 "prompt": "private",
                 "execution_mode": "standard"
             }),
             serde_json::json!({
-                "schema_version": "satelle.api.v6",
+                "schema_version": "satelle.api.v8",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private",
@@ -557,6 +602,126 @@ impl TaskArtifactsResponse {
 }
 
 impl AuthenticatedResponseContract for TaskArtifactsResponse {
+    fn request_id(&self) -> &RequestId {
+        self.request_id()
+    }
+
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawProtocolDownloadResponse {
+    schema_version: RawProtocolDownloadSchema,
+    request_id: RequestId,
+    host_identity: String,
+    artifact: RawProtocolArtifact,
+}
+
+impl RawProtocolDownloadResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        artifact: RawProtocolArtifact,
+    ) -> Self {
+        Self {
+            schema_version: RawProtocolDownloadSchema,
+            request_id,
+            host_identity,
+            artifact,
+        }
+    }
+
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+
+    pub const fn artifact(&self) -> &RawProtocolArtifact {
+        &self.artifact
+    }
+
+    pub fn into_artifact(self) -> RawProtocolArtifact {
+        self.artifact
+    }
+}
+
+impl AuthenticatedResponseContract for RawProtocolDownloadResponse {
+    fn request_id(&self) -> &RequestId {
+        self.request_id()
+    }
+
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawProtocolAcknowledgeRequest {
+    schema_version: RawProtocolAcknowledgeSchema,
+    outcome: RawDiagnosticExportOutcome,
+}
+
+impl RawProtocolAcknowledgeRequest {
+    pub fn new(outcome: RawDiagnosticExportOutcome) -> Self {
+        Self {
+            schema_version: RawProtocolAcknowledgeSchema,
+            outcome,
+        }
+    }
+
+    pub const fn outcome(&self) -> RawDiagnosticExportOutcome {
+        self.outcome
+    }
+}
+
+impl ApiRequestContract for RawProtocolAcknowledgeRequest {
+    const SCHEMA_VERSION: &'static str = RawProtocolAcknowledgeSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawProtocolAcknowledgeResponse {
+    schema_version: RawProtocolAcknowledgeSchema,
+    request_id: RequestId,
+    host_identity: String,
+    outcome: RawDiagnosticExportOutcome,
+}
+
+impl RawProtocolAcknowledgeResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        outcome: RawDiagnosticExportOutcome,
+    ) -> Self {
+        Self {
+            schema_version: RawProtocolAcknowledgeSchema,
+            request_id,
+            host_identity,
+            outcome,
+        }
+    }
+
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+
+    pub const fn outcome(&self) -> RawDiagnosticExportOutcome {
+        self.outcome
+    }
+}
+
+impl AuthenticatedResponseContract for RawProtocolAcknowledgeResponse {
     fn request_id(&self) -> &RequestId {
         self.request_id()
     }
@@ -887,7 +1052,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).expect("serialize request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v8",
+                "schema_version": "satelle.api.v9",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -900,7 +1065,7 @@ mod tests {
             )
             .expect("serialize YOLO request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v8",
+                "schema_version": "satelle.api.v9",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -917,7 +1082,7 @@ mod tests {
             ))
             .expect("serialize provider intent"),
             serde_json::json!({
-                "schema_version": "satelle.api.v8",
+                "schema_version": "satelle.api.v9",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -929,7 +1094,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v8",
+                "schema_version": "satelle.api.v9",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt"
@@ -938,7 +1103,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v8",
+                "schema_version": "satelle.api.v9",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -957,7 +1122,7 @@ mod tests {
     fn controller_presentation_fields_are_absent_from_the_turn_request_contract() {
         for field in ["attach", "detach"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v8",
+                "schema_version": "satelle.api.v9",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -979,7 +1144,7 @@ mod tests {
     fn mvp_turn_requests_cannot_route_across_desktop_bindings() {
         for field in ["desktop_user", "desktop_binding", "desktop_session"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v8",
+                "schema_version": "satelle.api.v9",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",

@@ -284,6 +284,7 @@ pub(crate) struct RunCommand<'a> {
     pub(super) cancellation: AdmissionCancellation,
     pub(super) turn_execution_timeout: Option<satelle_core::session::TimeoutPolicy>,
     pub(super) attachments: Vec<crate::attachment::VerifiedImageAttachment>,
+    pub(super) raw_protocol_source_host: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -312,6 +313,7 @@ impl<'a> RunCommand<'a> {
             cancellation: AdmissionCancellation::new(),
             turn_execution_timeout: None,
             attachments: Vec::new(),
+            raw_protocol_source_host: None,
         }
     }
 
@@ -334,6 +336,7 @@ impl<'a> RunCommand<'a> {
             cancellation: AdmissionCancellation::new(),
             turn_execution_timeout: None,
             attachments: Vec::new(),
+            raw_protocol_source_host: None,
         }
     }
 
@@ -370,6 +373,11 @@ impl<'a> RunCommand<'a> {
         self.attachments = attachments;
         self
     }
+
+    pub(crate) fn with_raw_protocol_capture(mut self, source_host: Option<&str>) -> Self {
+        self.raw_protocol_source_host = source_host.map(str::to_string);
+        self
+    }
 }
 
 pub(crate) struct SteerCommand<'a> {
@@ -382,6 +390,7 @@ pub(crate) struct SteerCommand<'a> {
     pub(super) cancellation: AdmissionCancellation,
     pub(super) turn_execution_timeout: Option<satelle_core::session::TimeoutPolicy>,
     pub(super) attachments: Vec<crate::attachment::VerifiedImageAttachment>,
+    pub(super) raw_protocol_source_host: Option<String>,
 }
 
 impl<'a> SteerCommand<'a> {
@@ -404,6 +413,7 @@ impl<'a> SteerCommand<'a> {
             cancellation: AdmissionCancellation::new(),
             turn_execution_timeout: None,
             attachments: Vec::new(),
+            raw_protocol_source_host: None,
         }
     }
 
@@ -426,6 +436,7 @@ impl<'a> SteerCommand<'a> {
             cancellation: AdmissionCancellation::new(),
             turn_execution_timeout: None,
             attachments: Vec::new(),
+            raw_protocol_source_host: None,
         }
     }
 
@@ -460,6 +471,11 @@ impl<'a> SteerCommand<'a> {
         attachments: Vec<crate::attachment::VerifiedImageAttachment>,
     ) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    pub(crate) fn with_raw_protocol_capture(mut self, source_host: Option<&str>) -> Self {
+        self.raw_protocol_source_host = source_host.map(str::to_string);
         self
     }
 }

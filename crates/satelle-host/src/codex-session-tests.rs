@@ -836,6 +836,7 @@ fn run_scenario_with_options(
                 crate::codex_capabilities::CodexImageInputMode::Unsupported
             },
             attachments: staged.images(),
+            raw_protocol_capture: None,
         },
     );
     drop(staged);
@@ -1014,6 +1015,7 @@ fn provider_child_overrides_are_process_scoped_and_secret_safe() {
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
             attachments: &[],
+            raw_protocol_capture: None,
         },
     );
 
@@ -1125,6 +1127,7 @@ fn builtin_openai_provider_secret_is_process_scoped_and_shell_excluded() {
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
             attachments: &[],
+            raw_protocol_capture: None,
         },
     );
 
@@ -1336,6 +1339,7 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
                 goal_set_supported: false,
                 image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
                 attachments: &[],
+                raw_protocol_capture: None,
             },
         )
     });
@@ -1400,6 +1404,7 @@ fn interrupt_before_any_session_claims_control_confirms_inactive_upstream_and_sk
                 goal_set_supported: false,
                 image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
                 attachments: &[],
+                raw_protocol_capture: None,
             },
         )
     });
@@ -1477,6 +1482,7 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
             attachments: &[],
+            raw_protocol_capture: None,
         },
         cancellation_grace,
         None,
@@ -1561,6 +1567,7 @@ fn native_action_completion_requests_correlated_upstream_cancellation() {
             goal_set_supported: false,
             image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
             attachments: &[],
+            raw_protocol_capture: None,
         },
         native_action_evidence,
         cancellation_grace,
