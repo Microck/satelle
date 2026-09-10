@@ -8,6 +8,62 @@ fn satelle() -> Command {
 }
 
 #[test]
+fn explicit_host_version_rejects_ambiguous_targets_before_release_or_host_access() {
+    for components in [
+        vec![],
+        vec!["--component", "codex"],
+        vec!["--component", "all"],
+    ] {
+        let output = satelle()
+            .args([
+                "--error-format",
+                "json",
+                "host",
+                "update",
+                "--version",
+                env!("CARGO_PKG_VERSION"),
+                "--dry-run",
+            ])
+            .args(components)
+            .assert()
+            .code(64)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["code"], "invalid-usage");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("--component host")
+        );
+    }
+    let output = satelle()
+        .args([
+            "--error-format",
+            "json",
+            "host",
+            "update",
+            "--component",
+            "host",
+            "--host",
+            "local-demo",
+            "--version",
+            env!("CARGO_PKG_VERSION"),
+            "--dry-run",
+        ])
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["code"], "invalid-usage");
+    assert!(error["message"].as_str().unwrap().contains("remote Host"));
+}
+
+#[test]
 fn host_update_plain_dry_run_matches_json_targets_and_ignores_quiet() {
     let state = TestStateDir::new().unwrap();
     let args = [
@@ -244,8 +300,8 @@ fn quiet_current_host_update_has_no_output() {
 }
 
 #[test]
-fn host_update_has_no_arbitrary_version_or_channel_flags() {
-    for unsupported in ["--version", "--channel", "--latest"] {
+fn host_update_has_no_release_channel_flags() {
+    for unsupported in ["--channel", "--latest"] {
         satelle()
             .args([
                 "host",

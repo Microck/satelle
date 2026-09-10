@@ -521,6 +521,9 @@ function fixtureRepository(context) {
   for (const fileName of ["Cargo.toml", "README.md"]) {
     cpSync(path.join(repositoryRoot, fileName), path.join(fixtureRoot, fileName));
   }
+  const compatibilitySource = "crates/satelle-core/src/host-update.rs";
+  mkdirSync(path.dirname(path.join(fixtureRoot, compatibilitySource)), { recursive: true });
+  cpSync(path.join(repositoryRoot, compatibilitySource), path.join(fixtureRoot, compatibilitySource));
   mkdirSync(path.join(fixtureRoot, "npm"), { recursive: true });
   for (const directory of [
     "satelle",
@@ -1256,6 +1259,25 @@ test(
   },
 );
 
+test("native release validation rejects compatibility metadata changed before finalization", (context) => {
+  const destination = mkdtempSync(path.join(tmpdir(), "satelle-compatibility-release-"));
+  context.after(() => rmSync(destination, { recursive: true, force: true }));
+  const stagingRoot = validationStaging(context, "compatibility-mutation");
+  const release = createReleaseContext(repositoryRoot, {
+    beforeNativeArchiveFinalSourceValidation() {
+      const metadataPath = path.join(stagingRoot, "github", "satelle-compatibility.json");
+      chmodSync(metadataPath, 0o600);
+      writeFileSync(metadataPath, "{}\n");
+    },
+  });
+  stageNativeReleaseSet(release, destination);
+  assert.throws(
+    () => release.validateNativeReleaseArchives(destination, stagingRoot),
+    expectReleaseError("release-checksum-mismatch", "satelle-compatibility.json"),
+  );
+  assert.equal(existsSync(stagingRoot), false);
+});
+
 test("native release archives use canonical names and match native npm executables", (context) => {
   const destination = mkdtempSync(path.join(tmpdir(), "satelle-native-release-archives-"));
   context.after(() => rmSync(destination, { recursive: true, force: true }));
@@ -1274,6 +1296,18 @@ test("native release archives use canonical names and match native npm executabl
   );
   assert.deepEqual(readFileSync(windowsArtifactPath), windowsArtifactBytes);
   assert.equal(validation.version, workspaceVersion());
+  const githubRoot = path.join(validation.stagingDirectory, "github");
+  const compatibilityBytes = readFileSync(path.join(githubRoot, "satelle-compatibility.json"));
+  assert.deepEqual(JSON.parse(compatibilityBytes), {
+    schema_version: 1,
+    version: workspaceVersion(),
+    protocol_version: "15",
+    storage_schema_version: 16,
+    minimum_cli_version: "0.1.10",
+  });
+  assert.ok(readFileSync(path.join(githubRoot, "SHA256SUMS"), "utf8").includes(
+    `${sha256(compatibilityBytes)}  satelle-compatibility.json\n`,
+  ));
   assert.deepEqual(
     validation.archives.map(({ target, archive, npmArtifact }) => ({
       target,

@@ -357,6 +357,65 @@ fn fetch_host_artifact_digest_with(
     source.fetch_release_digest(exact_version, target)
 }
 
+/// Explicit selection is bounded before any release URL or remote Host is used.
+pub(crate) fn validate_host_version_selection(
+    version: &str,
+    cli_version: &str,
+) -> Result<(), SatelleError> {
+    let selected = Version::parse(version).map_err(|_| {
+        SatelleError::invalid_usage("--version must be a canonical stable release such as 0.1.10")
+    })?;
+    let cli = Version::parse(cli_version).map_err(SelfUpdateError::into_satelle_error)?;
+    if selected.prerelease.is_some()
+        || cli.prerelease.is_some()
+        || (selected.major, selected.minor) != (cli.major, cli.minor)
+    {
+        return Err(SatelleError::invalid_usage(
+            "select a stable Host release in the CLI's major/minor series",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_host_release_compatibility(
+    version: &str,
+    cli_version: &str,
+) -> Result<(), SatelleError> {
+    validate_host_version_selection(version, cli_version)?;
+    let compatibility = GithubReleaseSource::new()
+        .and_then(|source| source.fetch_host_compatibility(version))
+        .map_err(SelfUpdateError::into_satelle_error)?;
+    validate_host_release_compatibility(&compatibility, version, cli_version)
+}
+
+fn validate_host_release_compatibility(
+    compatibility: &satelle_core::host_update::HostReleaseCompatibility,
+    version: &str,
+    cli_version: &str,
+) -> Result<(), SatelleError> {
+    use satelle_core::host_update::{HOST_PROTOCOL_VERSION, HOST_STORAGE_SCHEMA_VERSION};
+
+    if compatibility.schema_version != 1
+        || compatibility.version != version
+        || compatibility.protocol_version != HOST_PROTOCOL_VERSION
+        || compatibility.storage_schema_version != HOST_STORAGE_SCHEMA_VERSION
+    {
+        return Err(SatelleError::invalid_usage(
+            "the selected Host release has incompatible protocol or storage metadata; upgrade the CLI first",
+        ));
+    }
+    let minimum = Version::parse(&compatibility.minimum_cli_version)
+        .map_err(SelfUpdateError::into_satelle_error)?;
+    let cli = Version::parse(cli_version).map_err(SelfUpdateError::into_satelle_error)?;
+    if minimum.prerelease.is_some() {
+        return Err(SelfUpdateError::ReleaseMetadataInvalid.into_satelle_error());
+    }
+    if cli.core() < minimum.core() {
+        return Err(SatelleError::host_update_requires_cli_upgrade(cli_version));
+    }
+    Ok(())
+}
+
 pub(crate) fn run(request: SelfUpdateRequest) -> Result<SelfUpdateReport, SelfUpdateError> {
     let source = GithubReleaseSource::new()?;
     run_with(
@@ -543,6 +602,26 @@ impl GithubReleaseSource {
             .and_then(Response::error_for_status)
             .map_err(SelfUpdateError::Http)?;
         read_response_bounded(response, limit)
+    }
+
+    fn fetch_host_compatibility(
+        &self,
+        version: &str,
+    ) -> Result<satelle_core::host_update::HostReleaseCompatibility, SelfUpdateError> {
+        require_release_verifier()?;
+        let name = "satelle-compatibility.json";
+        let release_url = format!("{RELEASE_BASE_URL}/v{version}");
+        let bytes = self.download(&format!("{release_url}/{name}"), MANIFEST_LIMIT)?;
+        let manifest = self.download(&format!("{release_url}/SHA256SUMS"), MANIFEST_LIMIT)?;
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if manifest_digest(&manifest, name)? != digest {
+            return Err(SelfUpdateError::ArchiveDigestMismatch);
+        }
+        let directory = tempdir().map_err(SelfUpdateError::TemporaryDirectory)?;
+        let metadata_path = directory.path().join(name);
+        write_private_file(&metadata_path, &bytes)?;
+        verify_release_attestation(&metadata_path, version)?;
+        serde_json::from_slice(&bytes).map_err(|_| SelfUpdateError::ReleaseMetadataInvalid)
     }
 
     fn latest_stable_version_with(
@@ -2098,6 +2177,83 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
     use tempfile::tempdir;
+
+    #[test]
+    fn explicit_host_versions_allow_stable_patch_skew_only() {
+        for version in ["0.1.9", "0.1.10", "0.1.11"] {
+            assert!(validate_host_version_selection(version, "0.1.10").is_ok());
+        }
+        for version in [
+            "v0.1.10",
+            "0.01.10",
+            "0.1.10-beta.1",
+            "0.1.10+build",
+            "0.2.0",
+            "1.1.10",
+            "latest",
+        ] {
+            assert!(
+                validate_host_version_selection(version, "0.1.10").is_err(),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_compatibility_requires_matching_identity_protocol_storage_and_minimum_cli() {
+        use satelle_core::host_update::{
+            HOST_PROTOCOL_VERSION, HOST_STORAGE_SCHEMA_VERSION, HostReleaseCompatibility,
+        };
+        let compatible = HostReleaseCompatibility {
+            schema_version: 1,
+            version: "0.1.9".to_string(),
+            protocol_version: HOST_PROTOCOL_VERSION.to_string(),
+            storage_schema_version: HOST_STORAGE_SCHEMA_VERSION,
+            minimum_cli_version: "0.1.9".to_string(),
+        };
+        assert!(validate_host_release_compatibility(&compatible, "0.1.9", "0.1.10").is_ok());
+        for incompatible in [
+            HostReleaseCompatibility {
+                schema_version: 2,
+                ..compatible.clone()
+            },
+            HostReleaseCompatibility {
+                version: "0.1.8".to_string(),
+                ..compatible.clone()
+            },
+            HostReleaseCompatibility {
+                protocol_version: "0".to_string(),
+                ..compatible.clone()
+            },
+            HostReleaseCompatibility {
+                storage_schema_version: HOST_STORAGE_SCHEMA_VERSION + 1,
+                ..compatible.clone()
+            },
+            HostReleaseCompatibility {
+                storage_schema_version: HOST_STORAGE_SCHEMA_VERSION - 1,
+                ..compatible.clone()
+            },
+            HostReleaseCompatibility {
+                minimum_cli_version: "0.1.9-beta.1".to_string(),
+                ..compatible.clone()
+            },
+        ] {
+            assert!(validate_host_release_compatibility(&incompatible, "0.1.9", "0.1.10").is_err());
+        }
+        let newer_cli = HostReleaseCompatibility {
+            minimum_cli_version: "0.1.11".to_string(),
+            ..compatible.clone()
+        };
+        assert_eq!(
+            validate_host_release_compatibility(&newer_cli, "0.1.9", "0.1.10")
+                .unwrap_err()
+                .code,
+            ErrorCode::HostUpdateRequiresCliUpgrade,
+        );
+        let mut unknown = serde_json::to_value(compatible).unwrap();
+        unknown["allow_storage_downgrade"] = json!(true);
+        assert!(serde_json::from_value::<HostReleaseCompatibility>(unknown).is_err());
+    }
 
     struct FixtureReleaseSource {
         latest: String,

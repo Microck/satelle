@@ -352,12 +352,12 @@
 - satelle deletes uploaded image attachments from the remote host after the turn by default @spec @mvp @implemented
 - satelle MVP does not retain uploaded image attachments after the turn for logs, status, diagnostics, setup ledgers, diagnostic bundles, or recording artifacts @spec @mvp @implemented
 - satelle --image paths resolve on the local CLI machine and --remote-image paths resolve only on the selected remote Host @spec @phase4
-- satelle post-MVP remote-host path image attachments use an explicit --remote-image <path> option rather than overloading ordinary image attachment paths or SSH-style host:path syntax @spec @later
-- satelle later --remote-image resolves paths on the selected remote Host and never on the local CLI machine @spec @later
-- satelle later --remote-image rejects use when no remote Host resolves unambiguously before path validation @spec @later
-- satelle later --remote-image validates remote file existence, readability by the Host Daemon OS user, supported image media type, and size limits before starting the Codex Turn @spec @later
-- satelle later --remote-image does not copy the remote image back to the local CLI machine during normal execution @spec @later
-- satelle later --remote-image follows the same no-retention default as uploaded local image attachments for logs, status, diagnostics, setup ledgers, diagnostic bundles, and recording artifacts @spec @later
+- satelle post-MVP remote-host path image attachments use an explicit --remote-image <path> option rather than overloading ordinary image attachment paths or SSH-style host:path syntax @spec @phase4 @implemented
+- satelle later --remote-image resolves paths on the selected remote Host and never on the local CLI machine @spec @phase4 @implemented
+- satelle later --remote-image rejects use when no remote Host resolves unambiguously before path validation @spec @phase4 @implemented
+- satelle later --remote-image validates remote file existence, readability by the Host Daemon OS user, supported image media type, and size limits before starting the Codex Turn @spec @phase4 @implemented
+- satelle later --remote-image does not copy the remote image back to the local CLI machine during normal execution @spec @phase4 @implemented
+- satelle later --remote-image follows the same no-retention default as uploaded local image attachments for logs, status, diagnostics, setup ledgers, diagnostic bundles, and recording artifacts @spec @phase4 @implemented
 - satelle --remote-image requires an absolute native Host path, rejects parent traversal and symbolic links, and uses the same bounded regular-file reader as local image attachments @spec @phase4
 - satelle local and remote images share one attachment list and the same total count, per-image byte, aggregate byte, and PNG/JPEG limits @spec @phase4
 - satelle Turn request schema satelle.api.v8 represents each image as kind upload with media_type, size_bytes, sha256, and data_base64 or kind host_file with path; raw paths and image bytes are excluded from response, log, and Debug output @spec @contract @phase4
@@ -607,12 +607,12 @@
 - satelle host update checks all supported update targets by default when no component filter is provided @mvp @spec @implemented
 - satelle host update supports a repeatable --component <host|codex|all> filter for selecting update targets @mvp @spec @implemented
 - satelle host update --component host selects only Satelle-owned host binaries and Host Daemon service assets, not Codex runtime components @mvp @spec @implemented
-- satelle host update --component host targets the Satelle host binary version that exactly matches the invoking local CLI release for the remote host platform @spec @mvp @implemented
-- satelle MVP does not support selecting an arbitrary Satelle host binary version, update channel, or latest remote release independently from the invoking local CLI version @spec @mvp @implemented
-- satelle host update does not intentionally leave the Satelle Host Daemon on a Satelle version different from the invoking local CLI version after a successful host component update @spec @mvp @implemented
-- satelle host update may use SSH bootstrap or a narrow versioned update handshake only to replace an older or missing Satelle host binary with the invoking CLI's matching host artifact @spec @mvp @implemented
-- satelle host update reports a typed host-binary-newer-than-cli error instead of downgrading automatically when the reachable Satelle Host Daemon version is newer than the invoking local CLI version @spec @mvp @implemented
-- satelle host update reports a typed host-update-requires-cli-upgrade error when the selected host update requires a Satelle host binary version newer than the invoking local CLI can provide @spec @mvp @implemented
+- satelle host update --component host defaults to the invoking CLI release and accepts an explicit compatible --version target for the detected remote platform @spec @phase4
+- satelle host update permits only explicit release versions; channels and implicit latest selection are unsupported @spec @phase4
+- satelle host update verifies the exact selected Host version after replacement and preserves the authenticated Host identity @spec @phase4
+- satelle host update uses the existing SSH replacement handshake with the selected verified release artifact and its pinned recovery identity @spec @phase4
+- satelle host update reports a typed host-binary-newer-than-cli error instead of downgrading when no explicit version was selected and the reachable Host is newer than the invoking CLI @spec @phase4
+- satelle host update reports a typed host-update-requires-cli-upgrade error when the selected release compatibility metadata requires a newer CLI @spec @phase4
 - satelle later host update --component host --version <version> is the sole explicit Host binary version selector @spec @later
 - satelle post-MVP CLI-host compatibility matrix defines supported version skew, protocol version negotiation, feature gating, upgrade order, downgrade policy, artifact verification policy, and recovery path @spec @later
 - satelle exact Satelle CLI and Host Daemon version matching remains the default host update target when --version is absent @spec @later
@@ -2449,3 +2449,11 @@
 - managed local daemon endpoint reads treat concurrent removal during an intentional daemon relaunch as absence, while retaining file ownership, regular-file, link, mode, and ACL checks for present endpoints @spec @contract @phase4
 
 - Windows optional private-file readers distinguish native delete-pending status from access denial and permit overlapping deletion without permitting concurrent writes; present files retain regular-file, single-link, ownership, and ACL enforcement @spec @contract @phase4
+
+- Explicit Host version selection requires --component host without codex or all and a stable canonical release version @spec @phase4
+- Host release compatibility permits stable patch skew within one major/minor series only when protocol and storage schema versions exactly match and the CLI meets the release minimum @spec @phase4
+- satelle-compatibility.json declares schema version 1, release version, protocol version, storage schema version, and minimum CLI version and is covered by release checksums and the existing signed release attestation policy @spec @phase4
+- Explicit Host version selection authenticates compatibility metadata before preparing a mutation plan and authenticates the selected platform archive before upload or execution @spec @phase4
+- CLI and Host negotiate only their exact supported protocol version and gate optional features with Host capabilities; incompatible protocols require a CLI upgrade before Host replacement @spec @phase4
+- Explicit Host downgrades require matching storage schema versions and preserve the existing digest-pinned recovery operation; automatic storage downgrades are unsupported @spec @phase4
+

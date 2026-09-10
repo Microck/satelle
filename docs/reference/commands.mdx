@@ -71,6 +71,33 @@ eligible refresh scope and requires explicit units.
 diagnostic, updates the normal Host readiness cache, and reports whether the
 result was refreshed. It does not create a Session or admit a prompt Turn.
 
+## Host version compatibility
+
+Use `satelle host update --host <alias> --component host --version <version>`
+to select a compatible stable release. Add `--dry-run --json` to inspect its
+plan. Without `--version`, the target is the invoking CLI's exact release.
+Explicit selection requires a remote Host and cannot include Codex components.
+The following compatibility checks apply to explicit selection.
+
+| Decision | Policy |
+| --- | --- |
+| Version skew | Stable patch releases within the same major/minor series |
+| Protocol | One exact supported protocol; no fallback negotiation |
+| Storage | Current and selected releases must use the CLI's storage schema |
+| Features | Use the selected Host's advertised capabilities and normal readiness checks |
+| Upgrade order | Upgrade the CLI first when the selected release requires a newer minimum CLI |
+| Downgrade | Requires an explicit lower version and the same compatibility checks |
+| Integrity | Verify `satelle-compatibility.json` against checksums and signed release attestations before planning; verify the platform archive before upload |
+| Recovery | Resume the recorded update operation with its pinned version and artifact digest using the reported `satelle repair --run` command |
+
+Missing or invalid compatibility metadata blocks explicit selection. The
+metadata declares `schema_version`, `version`, `protocol_version`,
+`storage_schema_version`, and `minimum_cli_version`. There are no update
+channels or implicit latest-release selections.
+
+The version option selects this update's target. It does not create a permanent
+version pin for future setup, repair, or missing-daemon bootstrap operations.
+
 ## Host update plain records
 
 `satelle host update --plain` writes UTF-8, LF-terminated records to stdout.

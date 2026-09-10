@@ -784,6 +784,12 @@ struct HostUpdateCommand {
     host: Vec<String>,
     #[arg(long)]
     component: Vec<String>,
+    #[arg(
+        long,
+        value_name = "VERSION",
+        help = "Select a compatible stable Host release; requires --component host"
+    )]
+    version: Option<String>,
     #[arg(long)]
     all_remotes: bool,
     #[arg(long)]
@@ -809,6 +815,7 @@ struct HostUpdateCommand {
 struct HostUpdateInvocation {
     host: Vec<String>,
     host_version: String,
+    version_source: satelle_core::host_update::HostUpdateVersionSource,
     component: Vec<String>,
     all_remotes: bool,
     dry_run: bool,
@@ -821,7 +828,14 @@ impl From<HostUpdateCommand> for HostUpdateInvocation {
     fn from(command: HostUpdateCommand) -> Self {
         Self {
             host: command.host,
-            host_version: env!("CARGO_PKG_VERSION").to_string(),
+            version_source: if command.version.is_some() {
+                satelle_core::host_update::HostUpdateVersionSource::ExplicitRelease
+            } else {
+                satelle_core::host_update::HostUpdateVersionSource::InvokingCliRelease
+            },
+            host_version: command
+                .version
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
             component: command.component,
             all_remotes: command.all_remotes,
             dry_run: command.dry_run,
@@ -10842,12 +10856,36 @@ fn run_host_update_invocation(
 ) -> Result<(), CliFailure> {
     use host_update::PlainUpdateStage;
     validate_host_update_components(&command.component).map_err(failure)?;
+    let explicit_version = command.version_source
+        == satelle_core::host_update::HostUpdateVersionSource::ExplicitRelease;
+    if explicit_version {
+        if command.component.is_empty()
+            || command
+                .component
+                .iter()
+                .any(|component| component != "host")
+        {
+            return Err(failure(SatelleError::invalid_usage(
+                "--version requires --component host without codex or all",
+            )));
+        }
+        self_update::validate_host_version_selection(
+            &command.host_version,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .map_err(failure)?;
+    }
     if command.all_remotes || command.host.len() > 1 {
         return Err(failure(SatelleError::invalid_usage(
             "satelle host update accepts one Host; use satelle self update --update-remotes for multi-Host updates",
         )));
     }
     let host = config.resolve_host(command.host.first().map(String::as_str))?;
+    if explicit_version && host.config.transport == TransportKind::Local {
+        return Err(failure(SatelleError::invalid_usage(
+            "--version selects a remote Host release; use self update for the local CLI",
+        )));
+    }
     let trusted_consent = trusted_profile_allows_mutation(
         config.load()?,
         &host.alias,
@@ -10857,17 +10895,22 @@ fn run_host_update_invocation(
             || (!command.no_input && !format.is_json() && io::stdin().is_terminal()),
     )?;
     let (components, includes_all) = selected_host_update_components(&command.component);
-    let mut report =
-        transport::plan_host_update(&host, &command.host_version, &components, includes_all)
-            .map_err(|error| {
-                if format.is_plain() {
-                    print!(
-                        "{}",
-                        host_update::render_host_update_plain_planning_error(&host.alias, &error)
-                    );
-                }
-                failure(error)
-            })?;
+    let mut report = transport::plan_host_update(
+        &host,
+        &command.host_version,
+        &components,
+        includes_all,
+        command.version_source,
+    )
+    .map_err(|error| {
+        if format.is_plain() {
+            print!(
+                "{}",
+                host_update::render_host_update_plain_planning_error(&host.alias, &error)
+            );
+        }
+        failure(error)
+    })?;
     if format.is_plain() {
         print!(
             "{}",
@@ -10908,7 +10951,11 @@ fn run_host_update_invocation(
     if noninteractive && !consent_granted {
         let error = SatelleError::setup_consent_required(
             &report.planned_actions,
-            host_update_consent_command(&host.alias, &command.component),
+            host_update_consent_command(
+                &host.alias,
+                &command.component,
+                explicit_version.then_some(command.host_version.as_str()),
+            ),
         );
         if format.is_plain() {
             print!(
@@ -11057,7 +11104,13 @@ fn plan_remote_host_updates(
     concurrency: usize,
 ) -> Vec<PlannedRemoteHostUpdate> {
     host_update_batch::bounded_map(hosts, concurrency, |host| {
-        transport::plan_host_update(&host, host_version, components, includes_all)
+        transport::plan_host_update(
+            &host,
+            host_version,
+            components,
+            includes_all,
+            satelle_core::host_update::HostUpdateVersionSource::InvokingCliRelease,
+        )
     })
     .into_iter()
     .map(|(host, worker_result)| {
@@ -11404,13 +11457,16 @@ const fn host_update_consent_granted(command_yes: bool, trusted_profile: bool) -
     command_yes || trusted_profile
 }
 
-fn host_update_consent_command(host: &str, components: &[String]) -> String {
+fn host_update_consent_command(host: &str, components: &[String], version: Option<&str>) -> String {
     let component_selection = components
         .iter()
         .map(|component| format!(" --component {component}"))
         .collect::<String>();
+    let version_selection = version.map_or_else(String::new, |version| {
+        format!(" --version {}", shell_argument(version))
+    });
     format!(
-        "satelle host update --host {}{component_selection} --no-input --yes --json",
+        "satelle host update --host {}{component_selection}{version_selection} --no-input --yes --json",
         shell_argument(host)
     )
 }
@@ -11506,15 +11562,23 @@ mod host_update_consent_tests {
     #[test]
     fn recovery_command_preserves_the_exact_component_selection() {
         assert_eq!(
-            host_update_consent_command("office", &["host".to_string(), "codex".to_string()]),
+            host_update_consent_command("office", &["host".to_string()], Some("0.1.9")),
+            "satelle host update --host office --component host --version 0.1.9 --no-input --yes --json"
+        );
+        assert_eq!(
+            host_update_consent_command("office", &["host".to_string(), "codex".to_string()], None),
             "satelle host update --host office --component host --component codex --no-input --yes --json"
         );
         assert_eq!(
-            host_update_consent_command("office", &[]),
+            host_update_consent_command("office", &[], None),
             "satelle host update --host office --no-input --yes --json"
         );
         assert_eq!(
-            host_update_consent_command("remote host'; touch /tmp/pwn", &["host".to_string()]),
+            host_update_consent_command(
+                "remote host'; touch /tmp/pwn",
+                &["host".to_string()],
+                None
+            ),
             "satelle host update --host 'remote host'\"'\"'; touch /tmp/pwn' --component host --no-input --yes --json"
         );
     }
@@ -12952,6 +13016,8 @@ fn run_self(
                 HostUpdateInvocation {
                     host: command.host,
                     host_version: command.host_version,
+                    version_source:
+                        satelle_core::host_update::HostUpdateVersionSource::InvokingCliRelease,
                     component: components,
                     all_remotes: false,
                     dry_run: command.dry_run,

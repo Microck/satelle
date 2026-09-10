@@ -4261,9 +4261,9 @@ pub(crate) fn apply_ssh_storage_maintenance(
 struct HostUpdateArtifactResolver(Option<crate::host_update::VerifiedHostArtifact>);
 
 impl crate::host_update::VerifiedHostArtifactResolver for HostUpdateArtifactResolver {
-    fn resolve_exact_cli_artifact(
+    fn resolve_release_artifact(
         &self,
-        _cli_version: &str,
+        _target_version: &str,
         _remote_platform: &str,
     ) -> Result<
         Option<crate::host_update::VerifiedHostArtifact>,
@@ -4277,7 +4277,7 @@ struct HostMaintenanceInspection {
     current_version: Option<String>,
     minimum_host_version: Option<String>,
     protocol_compatible: bool,
-    relation_to_cli: crate::host_update::HostVersionRelation,
+    relation_to_target: crate::host_update::HostVersionRelation,
     remote_platform: String,
     artifact: Option<crate::host_update::VerifiedHostArtifact>,
     service_inspection: Option<crate::host_update::HostUpdateServiceInspection>,
@@ -4288,7 +4288,7 @@ struct HostMaintenanceInspection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostMaintenancePlanKind {
     CodexOnly,
-    HostUpdate,
+    HostUpdate(satelle_core::host_update::HostUpdateVersionSource),
     HostUpdateRecovery,
     Repair,
 }
@@ -4299,7 +4299,7 @@ fn inspects_persistent_service(
 ) -> bool {
     matches!(
         kind,
-        HostMaintenancePlanKind::HostUpdate
+        HostMaintenancePlanKind::HostUpdate(_)
             | HostMaintenancePlanKind::HostUpdateRecovery
             | HostMaintenancePlanKind::Repair
     ) && setup_mode == Some(satelle_core::SetupMode::Persistent)
@@ -4309,7 +4309,7 @@ fn host_release_artifact_required(relation: crate::host_update::HostVersionRelat
     matches!(
         relation,
         crate::host_update::HostVersionRelation::Missing
-            | crate::host_update::HostVersionRelation::OlderThanCli
+            | crate::host_update::HostVersionRelation::Older
     )
 }
 
@@ -4321,9 +4321,14 @@ fn maintenance_release_artifact_required(
 ) -> bool {
     match kind {
         HostMaintenancePlanKind::CodexOnly => false,
-        HostMaintenancePlanKind::HostUpdate => {
-            host_release_artifact_required(relation)
-                || service_relation.is_some_and(host_release_artifact_required)
+        HostMaintenancePlanKind::HostUpdate(source) => {
+            let requires_artifact = |relation| {
+                host_release_artifact_required(relation)
+                    || (source
+                        == satelle_core::host_update::HostUpdateVersionSource::ExplicitRelease
+                        && relation == crate::host_update::HostVersionRelation::Newer)
+            };
+            requires_artifact(relation) || service_relation.is_some_and(requires_artifact)
         }
         HostMaintenancePlanKind::HostUpdateRecovery => true,
         HostMaintenancePlanKind::Repair => {
@@ -4331,8 +4336,8 @@ fn maintenance_release_artifact_required(
                 || (!protocol_compatible
                     && matches!(
                         relation,
-                        crate::host_update::HostVersionRelation::OlderThanCli
-                            | crate::host_update::HostVersionRelation::MatchesCli
+                        crate::host_update::HostVersionRelation::Older
+                            | crate::host_update::HostVersionRelation::Matches
                     ))
         }
     }
@@ -4343,13 +4348,13 @@ fn host_service_inspection_from_executable(
     directories: &ssh_bootstrap::RemoteUserDirectories,
     destination: &str,
     executable: Option<ssh_bootstrap::ManagedServiceExecutableObservation>,
-    cli_version: &str,
+    target_version: &str,
     expected_current_release_digest: Option<[u8; 32]>,
 ) -> Result<crate::host_update::HostUpdateServiceInspection, SatelleError> {
     let Some(executable) = executable else {
         return Ok(crate::host_update::HostUpdateServiceInspection {
             current_version: None,
-            relation_to_cli: crate::host_update::HostVersionRelation::Missing,
+            relation_to_target: crate::host_update::HostVersionRelation::Missing,
             destination: destination.to_string(),
         });
     };
@@ -4359,18 +4364,18 @@ fn host_service_inspection_from_executable(
         &executable,
         expected_current_release_digest,
     );
-    let relation_to_cli = match current_version.as_deref() {
+    let relation_to_target = match current_version.as_deref() {
         Some(current_version) => {
-            host_version_relation(Some(current_version), true, None, cli_version)?
+            host_version_relation(Some(current_version), true, None, target_version)?
         }
         // A canonical managed executable exists, but its path does not expose
         // a version. Keep it distinct from an absent service and plan a safe
-        // replacement with the exact invoking CLI artifact.
-        None => crate::host_update::HostVersionRelation::OlderThanCli,
+        // replacement with the exact selected release artifact.
+        None => crate::host_update::HostVersionRelation::Older,
     };
     Ok(crate::host_update::HostUpdateServiceInspection {
         current_version,
-        relation_to_cli,
+        relation_to_target,
         destination: destination.to_string(),
     })
 }
@@ -4378,7 +4383,7 @@ fn host_service_inspection_from_executable(
 fn inspect_host_maintenance(
     host: &SelectedHost,
     kind: HostMaintenancePlanKind,
-    cli_version: &str,
+    target_version: &str,
 ) -> Result<HostMaintenanceInspection, SatelleError> {
     match host.config.transport {
         TransportKind::Local => {
@@ -4388,10 +4393,10 @@ fn inspect_host_maintenance(
                 &satelle_core::host_update::current_host_artifact_platform(),
             );
             Ok(HostMaintenanceInspection {
-                current_version: Some(cli_version.to_string()),
-                minimum_host_version: Some(cli_version.to_string()),
+                current_version: Some(target_version.to_string()),
+                minimum_host_version: Some(target_version.to_string()),
                 protocol_compatible: true,
-                relation_to_cli: crate::host_update::HostVersionRelation::MatchesCli,
+                relation_to_target: crate::host_update::HostVersionRelation::Matches,
                 remote_platform: platform,
                 artifact: None,
                 service_inspection: None,
@@ -4406,20 +4411,20 @@ fn inspect_host_maintenance(
             match observation {
                 DirectMaintenanceEvidence::Compatible(evidence) => {
                     let (target, platform) = canonical_remote_platform(evidence.platform_target());
-                    let relation_to_cli = host_version_relation(
+                    let relation_to_target = host_version_relation(
                         Some(evidence.daemon_version()),
                         true,
                         Some(evidence.minimum_host_version()),
-                        cli_version,
+                        target_version,
                     )?;
-                    let artifact = if kind == HostMaintenancePlanKind::HostUpdate {
+                    let artifact = if matches!(kind, HostMaintenancePlanKind::HostUpdate(_)) {
                         match target {
                             Some(target) => verified_host_update_artifact(
                                 &host.alias,
-                                cli_version,
+                                target_version,
                                 maintenance_release_artifact_required(
                                     kind,
-                                    relation_to_cli,
+                                    relation_to_target,
                                     true,
                                     None,
                                 ),
@@ -4436,7 +4441,7 @@ fn inspect_host_maintenance(
                         current_version: Some(evidence.daemon_version().to_string()),
                         minimum_host_version: Some(evidence.minimum_host_version().to_string()),
                         protocol_compatible: true,
-                        relation_to_cli,
+                        relation_to_target,
                         remote_platform: platform,
                         artifact,
                         service_inspection: None,
@@ -4446,17 +4451,17 @@ fn inspect_host_maintenance(
                     })
                 }
                 DirectMaintenanceEvidence::ProtocolIncompatible { current_version } => {
-                    let relation_to_cli = host_version_relation(
+                    let relation_to_target = host_version_relation(
                         current_version.as_deref(),
                         false,
                         None,
-                        cli_version,
+                        target_version,
                     )?;
                     Ok(HostMaintenanceInspection {
                         current_version,
                         minimum_host_version: None,
                         protocol_compatible: false,
-                        relation_to_cli,
+                        relation_to_target,
                         // The authenticated protocol error cannot expose a
                         // current-schema platform value. Keep automation
                         // disabled instead of guessing the remote target.
@@ -4474,16 +4479,16 @@ fn inspect_host_maintenance(
             let target = transport.remote_target()?;
             let current =
                 transport.observe_maintenance_daemon_artifact(transport.token_file_exists()?)?;
-            let relation_to_cli = host_version_relation(
+            let relation_to_target = host_version_relation(
                 current.current_version.as_deref(),
                 current.protocol_compatible,
                 current.minimum_host_version.as_deref(),
-                cli_version,
+                target_version,
             )?;
             let inspect_service = inspects_persistent_service(kind, host.config.setup_mode);
             let initial_artifact_required = maintenance_release_artifact_required(
                 kind,
-                relation_to_cli,
+                relation_to_target,
                 current.protocol_compatible,
                 None,
             );
@@ -4521,16 +4526,16 @@ fn inspect_host_maintenance(
                         if executable.is_some() {
                             // Current service state is trustworthy only when
                             // the observed executable content matches the
-                            // invoking release manifest.
+                            // selected release manifest.
                             service_release_artifact =
-                                Some(transport.release_artifact(target, cli_version)?);
+                                Some(transport.release_artifact(target, target_version)?);
                         }
                         Some(host_service_inspection_from_executable(
                             target,
                             directories,
                             &destination,
                             executable,
-                            cli_version,
+                            target_version,
                             service_release_artifact.map(|metadata| metadata.digest()),
                         )?)
                     }
@@ -4541,16 +4546,16 @@ fn inspect_host_maintenance(
             };
             let needs_host_release_artifact = maintenance_release_artifact_required(
                 kind,
-                relation_to_cli,
+                relation_to_target,
                 current.protocol_compatible,
                 service_inspection
                     .as_ref()
-                    .map(|service| service.relation_to_cli),
+                    .map(|service| service.relation_to_target),
             );
             let release_artifact = if needs_host_release_artifact {
                 Some(match service_release_artifact {
                     Some(metadata) => metadata,
-                    None => transport.release_artifact(target, cli_version)?,
+                    None => transport.release_artifact(target, target_version)?,
                 })
             } else {
                 None
@@ -4566,7 +4571,7 @@ fn inspect_host_maintenance(
             let artifact = if kind != HostMaintenancePlanKind::CodexOnly {
                 verified_host_update_artifact(
                     &host.alias,
-                    cli_version,
+                    target_version,
                     needs_host_release_artifact,
                     target,
                     install_path,
@@ -4583,7 +4588,7 @@ fn inspect_host_maintenance(
                 current_version: current.current_version,
                 minimum_host_version: current.minimum_host_version,
                 protocol_compatible: current.protocol_compatible,
-                relation_to_cli,
+                relation_to_target,
                 remote_platform: target.id().to_string(),
                 artifact,
                 service_inspection,
@@ -4668,11 +4673,19 @@ fn read_direct_maintenance_evidence(
 
 pub(crate) fn plan_host_update(
     host: &SelectedHost,
-    cli_version: &str,
+    target_version: &str,
     components: &[satelle_core::host_update::HostUpdateComponent],
     includes_all: bool,
+    version_source: satelle_core::host_update::HostUpdateVersionSource,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
-    plan_host_update_internal(host, cli_version, components, includes_all, None)
+    plan_host_update_internal(
+        host,
+        target_version,
+        components,
+        includes_all,
+        version_source,
+        None,
+    )
 }
 
 fn plan_host_update_recovery(
@@ -4684,28 +4697,60 @@ fn plan_host_update_recovery(
         recovery_identity.target_version(),
         &[satelle_core::host_update::HostUpdateComponent::Host],
         false,
+        satelle_core::host_update::HostUpdateVersionSource::HostCompatibilityRequirement,
         Some(recovery_identity),
     )
 }
 
 fn plan_host_update_internal(
     host: &SelectedHost,
-    cli_version: &str,
+    target_version: &str,
     components: &[satelle_core::host_update::HostUpdateComponent],
     includes_all: bool,
+    version_source: satelle_core::host_update::HostUpdateVersionSource,
     recovery_identity: Option<&satelle_core::host_update::HostUpdateRecoveryIdentity>,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
+    use satelle_core::host_update::HostUpdateVersionSource;
+
+    let selected_release = version_source == HostUpdateVersionSource::ExplicitRelease;
+    if selected_release
+        || (recovery_identity.is_some() && target_version != env!("CARGO_PKG_VERSION"))
+    {
+        crate::self_update::verify_host_release_compatibility(
+            target_version,
+            env!("CARGO_PKG_VERSION"),
+        )?;
+    }
     let needs_host_artifact = includes_all
         || components.is_empty()
         || components.contains(&satelle_core::host_update::HostUpdateComponent::Host);
     let kind = if recovery_identity.is_some() {
         HostMaintenancePlanKind::HostUpdateRecovery
     } else if needs_host_artifact {
-        HostMaintenancePlanKind::HostUpdate
+        HostMaintenancePlanKind::HostUpdate(version_source)
     } else {
         HostMaintenancePlanKind::CodexOnly
     };
-    let inspection = inspect_host_maintenance(host, kind, cli_version)?;
+    let inspection = inspect_host_maintenance(host, kind, target_version)?;
+    if selected_release {
+        if !inspection.protocol_compatible {
+            return Err(SatelleError::host_update_requires_cli_upgrade(env!(
+                "CARGO_PKG_VERSION"
+            )));
+        }
+        // A downgrade must also prove the current storage schema. Checking only
+        // the destination release could otherwise open newer storage with an
+        // older binary. The invoking release's constants already prove itself.
+        if let Some(current) = inspection.current_version.as_deref()
+            && current != env!("CARGO_PKG_VERSION")
+            && current != target_version
+        {
+            crate::self_update::verify_host_release_compatibility(
+                current,
+                env!("CARGO_PKG_VERSION"),
+            )?;
+        }
+    }
     if let Some(recovery_identity) = recovery_identity {
         validate_host_update_recovery_artifact(&inspection, recovery_identity)?;
     }
@@ -4713,10 +4758,10 @@ fn plan_host_update_internal(
     let service_inspection = inspection.service_inspection;
 
     let host_inspection = crate::host_update::HostUpdateInspection {
-        relation_to_cli: if recovery_identity.is_some() {
-            crate::host_update::HostVersionRelation::OlderThanCli
+        relation_to_target: if recovery_identity.is_some() {
+            crate::host_update::HostVersionRelation::Older
         } else {
-            inspection.relation_to_cli
+            inspection.relation_to_target
         },
         current_version: inspection.current_version,
         remote_platform: inspection.remote_platform,
@@ -4732,7 +4777,9 @@ fn plan_host_update_internal(
     let mut report = crate::host_update::build_host_update_plan(
         crate::host_update::HostUpdatePlanRequest {
             host: &host.alias,
-            cli_version,
+            cli_version: env!("CARGO_PKG_VERSION"),
+            target_version,
+            version_source,
             components,
             includes_all,
             host_inspection: &host_inspection,
@@ -4764,19 +4811,35 @@ fn plan_host_update_internal(
 
 pub(crate) fn apply_host_update(
     host: &SelectedHost,
-    cli_version: &str,
+    target_version: &str,
     report: satelle_core::host_update::HostUpdateReport,
     components: &[satelle_core::host_update::HostUpdateComponent],
     includes_all: bool,
 ) -> Result<satelle_core::host_update::HostUpdateReport, SatelleError> {
+    let version_source = report
+        .targets
+        .iter()
+        .find(|target| target.target == satelle_core::host_update::HostUpdateTarget::HostDaemon)
+        .map_or(
+            satelle_core::host_update::HostUpdateVersionSource::InvokingCliRelease,
+            |target| target.version_source,
+        );
     apply_host_update_with_operation(
         host,
-        cli_version,
+        target_version,
         report,
         HostUpdateOperation::Update,
         HostReplacementEntry::ReachableDaemon,
         None,
-        || plan_host_update(host, cli_version, components, includes_all),
+        || {
+            plan_host_update(
+                host,
+                target_version,
+                components,
+                includes_all,
+                version_source,
+            )
+        },
     )
 }
 
@@ -4794,7 +4857,7 @@ enum HostReplacementEntry {
 
 fn apply_host_update_with_operation(
     host: &SelectedHost,
-    cli_version: &str,
+    target_version: &str,
     mut report: satelle_core::host_update::HostUpdateReport,
     operation: HostUpdateOperation,
     entry: HostReplacementEntry,
@@ -5020,7 +5083,7 @@ fn apply_host_update_with_operation(
                 ));
             }
         };
-        match remote.install_verified_host_artifact(cli_version, &expected_artifact_digest) {
+        match remote.install_verified_host_artifact(target_version, &expected_artifact_digest) {
             Ok(artifact) => artifact,
             Err(error) => {
                 let source = map_ssh_daemon_bootstrap_error(&transport.alias, error);
@@ -5356,7 +5419,7 @@ fn apply_host_update_with_operation(
             source,
         ));
     }
-    if new_capabilities.daemon_version() != cli_version {
+    if new_capabilities.daemon_version() != target_version {
         return Err(host_update_recovery_pending(
             &mut report,
             "restart-host-daemon",
@@ -6548,7 +6611,13 @@ pub(crate) fn apply_repair_upgrades(
     let host_update = if let Some(recovery_identity) = recovery_identity.as_ref() {
         plan_host_update_recovery(host, recovery_identity)?
     } else {
-        plan_host_update(host, target_version, &components, false)?
+        plan_host_update(
+            host,
+            target_version,
+            &components,
+            false,
+            satelle_core::host_update::HostUpdateVersionSource::InvokingCliRelease,
+        )?
     };
     let operation = resumed_operation.unwrap_or(HostUpdateOperation::Repair);
     let entry = repair_host_replacement_entry(&repair, resumed_operation.is_some());
@@ -6563,7 +6632,13 @@ pub(crate) fn apply_repair_upgrades(
             if let Some(recovery_identity) = recovery_identity.as_ref() {
                 plan_host_update_recovery(host, recovery_identity)
             } else {
-                plan_host_update(host, target_version, &components, false)
+                plan_host_update(
+                    host,
+                    target_version,
+                    &components,
+                    false,
+                    satelle_core::host_update::HostUpdateVersionSource::InvokingCliRelease,
+                )
             }
         },
     ) {
@@ -6690,27 +6765,27 @@ fn host_version_relation(
     current: Option<&str>,
     protocol_compatible: bool,
     minimum_host_version: Option<&str>,
-    cli: &str,
+    target: &str,
 ) -> Result<crate::host_update::HostVersionRelation, SatelleError> {
     let Some(current) = current else {
         return Ok(crate::host_update::HostVersionRelation::Missing);
     };
-    let cli = parse_release_version(cli)?;
+    let target = parse_release_version(target)?;
     let current = parse_release_version(current)?;
-    if current > cli {
-        return Ok(crate::host_update::HostVersionRelation::NewerThanCli);
+    if current > target {
+        return Ok(crate::host_update::HostVersionRelation::Newer);
     }
     if minimum_host_version
         .map(parse_release_version)
         .transpose()?
-        .is_some_and(|minimum| minimum > cli)
+        .is_some_and(|minimum| minimum > target)
     {
         return Ok(crate::host_update::HostVersionRelation::RequiresNewerCli);
     }
-    Ok(if current < cli || !protocol_compatible {
-        crate::host_update::HostVersionRelation::OlderThanCli
+    Ok(if current < target || !protocol_compatible {
+        crate::host_update::HostVersionRelation::Older
     } else {
-        crate::host_update::HostVersionRelation::MatchesCli
+        crate::host_update::HostVersionRelation::Matches
     })
 }
 
@@ -8078,7 +8153,12 @@ fn durable_ssh_clients(
         || observe_remote_durable_readiness(client.capabilities()),
     )? {
         DurableDaemonProbe::Ready(readiness) => {
-            require_exact_durable_readiness(alias, expected_host_identity, &readiness)?;
+            require_durable_readiness(
+                alias,
+                expected_host_identity,
+                &readiness,
+                TransportKind::Ssh,
+            )?;
             bootstrap_lock
                 .release_unmodified()
                 .map_err(|_| SatelleError::host_unreachable(alias))?;
@@ -8219,12 +8299,26 @@ fn probe_durable_daemon_under_lock(
     }
 }
 
-fn require_exact_durable_readiness(
+fn require_durable_readiness(
     host: &str,
     expected_host_identity: &str,
     readiness: &DurableReadinessSnapshot,
+    transport: TransportKind,
 ) -> Result<(), SatelleError> {
-    if readiness.daemon_version != env!("CARGO_PKG_VERSION") {
+    // A managed local daemon belongs to this exact CLI installation. Remote
+    // daemons may use the supported release skew; their response decoder has
+    // already enforced the one current transport protocol.
+    let compatible = match transport {
+        TransportKind::Local => readiness.daemon_version == env!("CARGO_PKG_VERSION"),
+        TransportKind::Ssh | TransportKind::Direct => {
+            crate::self_update::validate_host_version_selection(
+                &readiness.daemon_version,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .is_ok()
+        }
+    };
+    if !compatible {
         return Err(SatelleError::remote_api_error(
             host,
             "unexpected-durable-daemon-version",
@@ -8249,7 +8343,12 @@ fn authenticate_durable_with_confirmation(
         confirm_lock_ownership()?;
         match observation {
             DurableReadinessObservation::Ready(readiness) => {
-                return require_exact_durable_readiness(host, expected_host_identity, &readiness);
+                return require_durable_readiness(
+                    host,
+                    expected_host_identity,
+                    &readiness,
+                    TransportKind::Ssh,
+                );
             }
             DurableReadinessObservation::Failure(error) => {
                 return Err(direct_transport_error(host, error));
@@ -8286,10 +8385,11 @@ fn relaunch_durable_daemon_under_lock<C>(
         initial_readiness,
     )? {
         DurableDaemonProbe::Ready(readiness) => {
-            require_exact_durable_readiness(
+            require_durable_readiness(
                 target.host,
                 target.expected_host_identity,
                 &readiness,
+                TransportKind::Ssh,
             )?;
             Ok(false)
         }
@@ -9685,7 +9785,12 @@ fn probe_local_daemon(
                 daemon_version: readiness.daemon_version().to_string(),
                 host_identity: readiness.host_identity().to_string(),
             };
-            require_exact_durable_readiness(&host.alias, &endpoint.host_identity, &readiness)?;
+            require_durable_readiness(
+                &host.alias,
+                &endpoint.host_identity,
+                &readiness,
+                TransportKind::Local,
+            )?;
             Ok(Some(transport))
         }
         Err(DaemonClientError::Transport(error)) if error.is_connect() => Ok(None),
@@ -11214,15 +11319,11 @@ mod bootstrap_ordering_tests {
         use crate::host_update::HostVersionRelation;
 
         assert!(host_release_artifact_required(HostVersionRelation::Missing));
-        assert!(host_release_artifact_required(
-            HostVersionRelation::OlderThanCli
-        ));
+        assert!(host_release_artifact_required(HostVersionRelation::Older));
         assert!(!host_release_artifact_required(
-            HostVersionRelation::MatchesCli
+            HostVersionRelation::Matches
         ));
-        assert!(!host_release_artifact_required(
-            HostVersionRelation::NewerThanCli
-        ));
+        assert!(!host_release_artifact_required(HostVersionRelation::Newer));
         assert!(!host_release_artifact_required(
             HostVersionRelation::RequiresNewerCli
         ));
@@ -11234,13 +11335,13 @@ mod bootstrap_ordering_tests {
 
         assert!(!maintenance_release_artifact_required(
             HostMaintenancePlanKind::Repair,
-            HostVersionRelation::OlderThanCli,
+            HostVersionRelation::Older,
             true,
             None,
         ));
         assert!(maintenance_release_artifact_required(
             HostMaintenancePlanKind::Repair,
-            HostVersionRelation::OlderThanCli,
+            HostVersionRelation::Older,
             false,
             None,
         ));
@@ -11281,7 +11382,7 @@ mod bootstrap_ordering_tests {
 
         assert_eq!(inspection.current_version, None);
         assert_eq!(
-            inspection.relation_to_cli,
+            inspection.relation_to_target,
             crate::host_update::HostVersionRelation::Missing
         );
         assert_eq!(
@@ -11312,8 +11413,8 @@ mod bootstrap_ordering_tests {
 
         assert_eq!(inspection.current_version, None);
         assert_eq!(
-            inspection.relation_to_cli,
-            crate::host_update::HostVersionRelation::OlderThanCli
+            inspection.relation_to_target,
+            crate::host_update::HostVersionRelation::Older
         );
     }
 

@@ -1850,6 +1850,26 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
     });
   }
 
+  function hostReleaseCompatibility(version) {
+    const source = readFileSync(
+      path.join(repositoryRoot, "crates/satelle-core/src/host-update.rs"),
+      "utf8",
+    );
+    const protocol = source.match(/^pub const HOST_PROTOCOL_VERSION: &str = "([0-9]+)";$/m)?.[1];
+    const storage = source.match(/^pub const HOST_STORAGE_SCHEMA_VERSION: i64 = ([0-9]+);$/m)?.[1];
+    const minimumCli = source.match(/^pub const HOST_MINIMUM_CLI_VERSION: &str = "([0-9]+\.[0-9]+\.[0-9]+)";$/m)?.[1];
+    if (!protocol || !storage || !minimumCli || !Number.isSafeInteger(Number(storage))) {
+      fail("release-metadata-invalid", "Host compatibility constants are missing or invalid");
+    }
+    return {
+      schema_version: 1,
+      version,
+      protocol_version: protocol,
+      storage_schema_version: Number(storage),
+      minimum_cli_version: minimumCli,
+    };
+  }
+
   function validateNativeReleaseArchives(directory, stagingDirectory) {
     if (!directory) fail("release-destination-missing", "release destination is required");
     if (!stagingDirectory) {
@@ -2034,11 +2054,19 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           executableSha256: archiveDigest,
         };
       });
+      // This asset shares the archives' checksum and signed attestation policy.
+      // Its values come from the constants enforced by the Host and transport.
+      const compatibilityName = "satelle-compatibility.json";
+      const compatibilityPath = path.join(githubRoot, compatibilityName);
+      writeFileSync(
+        compatibilityPath,
+        `${JSON.stringify(hostReleaseCompatibility(releaseState.version), null, 2)}\n`,
+        { flag: "wx", mode: 0o400 },
+      );
       const checksums = writeSha256Sums(
         githubRoot,
-        archives.map(({ archive }) => archive),
+        [...archives.map(({ archive }) => archive), compatibilityName],
       );
-      verifySha256Sums(githubRoot, checksums.path);
       chmodSync(checksums.path, 0o400);
       remainingDeadline(deadline, "native release archive validation");
       beforeNativeArchiveFinalSourceValidation?.();
@@ -2066,6 +2094,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         snapshot.handle = undefined;
         chmodSync(snapshot.snapshotPath, 0o400);
       }
+      verifySha256Sums(githubRoot, checksums.path);
       chmodSync(githubRoot, 0o500);
       complete = true;
       return { version, stagingDirectory: stagingRoot, checksums, archives };
