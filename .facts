@@ -118,13 +118,19 @@
 ## profiles-and-output
 - satelle supports a global --profile option that applies selected user-level configuration profile overlays rather than only reporting the selected profile name @spec @mvp @implemented
 - satelle recognizes only the SATELLE_* namespace for Satelle-owned process environment variables and does not preserve pre-Satelle environment compatibility aliases @mvp @implemented
-- satelle MVP command data output modes are human and json; a command-specific streaming contract may define json as versioned NDJSON instead of one final JSON value @contract @mvp @implemented
-- satelle MVP uses --format <human|json> as the canonical command data output selector for commands that support machine-readable output @mvp @implemented
-- satelle later adds compact-json, toon, and markdown command data formats only after each format has a stable lossless mapping from the command's canonical JSON contract @spec @later
-- satelle later tabular inspection commands add csv only when every emitted field has a stable column contract and no nested data would be lost @spec @later
-- satelle compact-json output emits one minified JSON value for commands that otherwise emit one pretty JSON value @spec @later
-- satelle TOON output is a token-efficient structured command result format and never replaces JSON as the canonical machine-readable contract @spec @later
-- satelle later expands the canonical selector to --format <human|json|compact-json|toon|markdown|csv>, while each command advertises only formats with a lossless mapping for that command @spec @later
+- satelle public single-result command data output modes are human, json, compact-json, toon, and markdown; logs retains human and versioned NDJSON json output @contract @phase4
+- satelle uses --format as the canonical command data output selector and advertises only the formats supported by the selected command @contract @phase4
+- satelle adds compact-json, toon, and markdown command data formats only after each format has a stable lossless mapping from the command's canonical JSON contract @spec @phase4 @implemented
+- satelle tabular inspection commands add csv only when every emitted field has a stable column contract and no nested data would be lost @spec @phase4 @implemented
+- satelle compact-json output emits one minified JSON value for commands that otherwise emit one pretty JSON value @spec @phase4 @implemented
+- satelle TOON output is a token-efficient structured command result format and never replaces JSON as the canonical machine-readable contract @spec @phase4 @implemented
+- satelle offers the canonical selector to --format <human|json|compact-json|toon|markdown|csv>, while each command advertises only formats with a lossless mapping for that command @spec @phase4 @implemented
+- satelle compact-json, toon, markdown, and csv retain the command's schema identifier, data values, consent requirements, and exit status; structured final-result formats suppress interactive prompts and implicit human events using the same policy as json @spec @contract @phase4 @implemented
+- satelle markdown output contains the complete pretty JSON result in one json fenced code block, followed by LF; decoding the block recovers the canonical JSON value without a lossy table projection @spec @contract @phase4 @implemented
+- satelle toon output follows TOON 4.1 with two-space indentation, comma delimiters, no key folding, escaped C0 controls, exact signed and unsigned 64-bit integers, and finite JSON numbers; it preserves values and array order and normalizes negative zero to zero @spec @contract @phase4 @implemented
+- satelle skills list csv uses an RFC 4180 header row schema_version,bundle_version,name,description and one record per bundled skill in bundle order; each row repeats the report's schema and bundle versions and quotes fields without changing their text @spec @contract @phase4 @implemented
+- satelle final-result formats do not change --events json or logs JSON record boundaries; unsupported formats fail during parsing before configuration or Host access @spec @contract @phase4 @implemented
+- satelle non-human final-result selectors request the existing typed JSON error contract on stderr unless an explicit --error-format overrides it @spec @contract @phase4 @implemented
 - satelle keeps --json as an exact convenience alias for --format json @mvp @implemented
 - satelle reports a typed output-mode-conflict usage error when --json and --format are both provided @mvp @implemented
 - satelle command help lists only the output formats supported by that command @mvp @implemented

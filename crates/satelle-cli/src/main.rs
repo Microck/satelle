@@ -432,6 +432,7 @@ enum SkillsCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(mut_arg("format", |arg| arg.value_parser(clap::builder::EnumValueParser::<OutputFormat>::new())))]
 struct SkillsOutputCommand {
     #[command(flatten)]
     output_args: OutputArgs,
@@ -1045,6 +1046,7 @@ struct SelfUpdateCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(mut_arg("format", |arg| arg.value_parser(OutputFormat::parser(&OutputFormat::STREAM))))]
 struct SelfUpdateRemoteStageCommand {
     #[arg(long, required = true)]
     host: Vec<String>,
@@ -2051,7 +2053,7 @@ fn execute_command(
         }
     };
     if !error_format_configured && presentation_default.is_some() {
-        *error_format = if output.is_json() {
+        *error_format = if output.is_structured() {
             ErrorFormat::Json
         } else {
             ErrorFormat::Human
@@ -2097,7 +2099,7 @@ fn execute_command(
             command: SessionCommand::Export(command),
         } => export_task_artifacts(command, config).map(|_| None),
         Command::Logs(command) => show_logs(command, config, output).map(|_| None),
-        Command::Skills { command } => skills::run(command).map(|_| None),
+        Command::Skills { command } => skills::run(command, output).map(|_| None),
         Command::Mcp {
             command: McpCommand::Serve(command),
         } => mcp::serve(profile, command.enable_mutations).map(|_| None),
@@ -2145,8 +2147,10 @@ fn run_mcp_install(
     let effective_profile = mcp_install_profile(selected_profile.as_ref());
     let report = mcp::install::install(mcp_install_request(command, effective_profile))?;
 
-    if output.is_json() {
-        print_json(&mcp_install_report_json(&report)).map_err(failure)?;
+    if output.is_structured() {
+        output
+            .print(&mcp_install_report_json(&report))
+            .map_err(failure)?;
         return Ok(());
     }
 
@@ -2662,7 +2666,7 @@ mod mcp_install_cli_tests {
             "--dry-run",
             "--json",
         ]);
-        assert!(command.output_args.requests_json());
+        assert!(command.output_args.requests_machine());
 
         let report = mcp::install::InstallReport {
             dry_run: true,
@@ -2709,7 +2713,7 @@ mod mcp_install_cli_tests {
         let formatted = parse_install(&[
             "satelle", "mcp", "install", "--target", "cursor", "--format", "json",
         ]);
-        assert!(formatted.output_args.requests_json());
+        assert!(formatted.output_args.requests_machine());
     }
 
     #[test]
@@ -3514,18 +3518,22 @@ fn setup_interaction_error(message: &str, source: io::Error) -> SatelleError {
     }
 }
 
-fn finish_cancelled_setup(report: &mut SetupReport, json: bool) -> Result<(), CliFailure> {
+fn finish_cancelled_setup(
+    report: &mut SetupReport,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
     report.status = "cancelled".to_string();
     report.cancellation_reason = Some("user_declined_confirmation".to_string());
     report.changed = false;
     report.mutated = false;
     report.applied_actions.clear();
-    if json {
-        print_json(
-            &serde_json::to_value(report)
-                .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?,
-        )
-        .map_err(failure)
+    if format.is_structured() {
+        format
+            .print(
+                &serde_json::to_value(report)
+                    .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?,
+            )
+            .map_err(failure)
     } else {
         println!("No changes applied.");
         Ok(())
@@ -3850,7 +3858,7 @@ fn run_setup(
     format: OutputFormat,
     exact_state_requires_identity_discovery: bool,
 ) -> Result<(), CliFailure> {
-    let json = format.is_json();
+    let machine_output = format.is_structured();
     if let Some(expected) = command.expected_host_id.as_deref() {
         HostIdentityRef::new(expected).map_err(|error| {
             failure(SatelleError::invalid_usage(format!(
@@ -4287,7 +4295,7 @@ fn run_setup(
             )));
         }
 
-        if !json {
+        if !machine_output {
             print_setup_human(&report);
         }
         if !command.yes && !trusted_consent {
@@ -4311,7 +4319,7 @@ fn run_setup(
                     ))
                 })?;
             if !confirmed {
-                return finish_cancelled_setup(&mut report, json);
+                return finish_cancelled_setup(&mut report, format);
             }
         }
 
@@ -4897,7 +4905,7 @@ fn run_setup(
         }
     }
 
-    if prompted_for_consent && !json {
+    if prompted_for_consent && !machine_output {
         cliclack::outro("Satelle setup produced a readiness plan").map_err(|source| {
             failure(SatelleError {
                 code: ErrorCode::InvalidUsage,
@@ -4909,7 +4917,7 @@ fn run_setup(
         })?;
     }
 
-    if json {
+    if machine_output {
         let mut output = serde_json::to_value(&report)
             .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?;
         if provider_auth_setup
@@ -4924,7 +4932,7 @@ fn run_setup(
                 .expect("a Setup report serializes as an object")
                 .insert("provider_auth_validation".to_string(), validation);
         }
-        print_json(&output).map_err(failure)
+        format.print(&output).map_err(failure)
     } else {
         print_setup_human(&report);
         Ok(())
@@ -5372,7 +5380,7 @@ fn provision_provider_secret(
     };
 
     let interaction_available = !command.no_input
-        && !format.is_json()
+        && !format.is_structured()
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
         && io::stderr().is_terminal();
@@ -5735,7 +5743,7 @@ fn run_repair(
         MutationCommandFamily::Repair,
         command.yes
             || command.dry_run
-            || (!command.no_input && !format.is_json() && io::stdin().is_terminal()),
+            || (!command.no_input && !format.is_structured() && io::stdin().is_terminal()),
     )?;
     let mut mutation_consent = repair_consent_granted(command.yes, trusted_consent);
     let mut report = transport::plan_repair_upgrades(
@@ -5746,8 +5754,8 @@ fn run_repair(
     .map_err(failure)?;
     if command.dry_run {
         report = report.into_dry_run();
-        if format.is_json() {
-            print_json(&report).map_err(failure)?;
+        if format.is_structured() {
+            format.print(&report).map_err(failure)?;
         } else {
             print!("{}", host_update::render_repair_upgrade_plan(&report));
         }
@@ -5755,18 +5763,18 @@ fn run_repair(
     }
 
     if !report.requires_mutation() {
-        if format.is_json() {
-            print_json(&report).map_err(failure)?;
+        if format.is_structured() {
+            format.print(&report).map_err(failure)?;
         } else {
             print!("{}", host_update::render_repair_upgrade_plan(&report));
         }
         return Ok(());
     }
 
-    if !format.is_json() {
+    if !format.is_structured() {
         print!("{}", host_update::render_repair_upgrade_plan(&report));
     }
-    let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
+    let noninteractive = command.no_input || format.is_structured() || !io::stdin().is_terminal();
     if noninteractive && !mutation_consent {
         let recovery_command = match command.run.as_deref() {
             Some(run_id) => format!(
@@ -5796,8 +5804,8 @@ fn run_repair(
             })?;
         if !confirmed {
             report = report.cancelled();
-            if format.is_json() {
-                print_json(&report).map_err(failure)?;
+            if format.is_structured() {
+                format.print(&report).map_err(failure)?;
             } else {
                 println!("No changes applied.");
             }
@@ -5816,8 +5824,8 @@ fn run_repair(
     }
     report = transport::apply_repair_upgrades(&host, revalidated, command.run.as_deref())
         .map_err(failure)?;
-    if format.is_json() {
-        print_json(&report).map_err(failure)
+    if format.is_structured() {
+        format.print(&report).map_err(failure)
     } else {
         print!("{}", host_update::render_repair_upgrade_result(&report));
         Ok(())
@@ -6147,7 +6155,7 @@ fn failed_doctor_fix_delegation(
 #[derive(Clone, Copy)]
 struct DoctorReportEmission {
     events: bool,
-    json: bool,
+    format: OutputFormat,
     quiet: bool,
     findings_already_emitted: bool,
 }
@@ -6283,7 +6291,6 @@ fn run_doctor(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let json = format.is_json();
     if command.events && command.fix {
         return Err(failure(SatelleError::output_mode_conflict(
             "doctor --events cannot be combined with --fix",
@@ -6339,7 +6346,7 @@ fn run_doctor(
             host: &host,
             options,
             scope_selection: &scope_selection,
-            json,
+            format,
         },
     )
 }
@@ -6409,7 +6416,7 @@ struct DoctorFinishContext<'a> {
     host: &'a SelectedHost,
     options: DoctorOptions,
     scope_selection: &'a DoctorScopeSelection,
-    json: bool,
+    format: OutputFormat,
 }
 
 fn finish_doctor_outcome(
@@ -6438,7 +6445,8 @@ fn finish_doctor_report(
     context: &DoctorFinishContext<'_>,
 ) -> Result<(), CliFailure> {
     let events = context.command.events;
-    let json = context.json;
+    let format = context.format;
+    let machine_output = format.is_structured();
     let quiet = context.command.quiet;
     let command = context.command;
     let profile = context.profile;
@@ -6447,12 +6455,13 @@ fn finish_doctor_report(
     let options = context.options;
     let scope_selection = context.scope_selection;
     let targets = doctor_fix_targets(&report.findings);
-    let interactive = !command.no_input && !json && !events && !quiet && io::stdin().is_terminal();
+    let interactive =
+        !command.no_input && !machine_output && !events && !quiet && io::stdin().is_terminal();
     let prompt_for_fix = !command.fix && !targets.is_empty() && interactive;
     let findings_already_emitted = interactive && !targets.is_empty();
     let emission = DoctorReportEmission {
         events,
-        json,
+        format,
         quiet,
         findings_already_emitted,
     };
@@ -6804,8 +6813,8 @@ fn emit_doctor_report(
             return Err(reported_failure(error));
         }
         Ok(())
-    } else if emission.json {
-        print_json(&report).map_err(failure)?;
+    } else if emission.format.is_structured() {
+        emission.format.print(&report).map_err(failure)?;
         if let Some(error) = terminal_error {
             return Err(failure(error));
         }
@@ -7390,11 +7399,11 @@ fn config_check(
     config_context: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let json = format.is_json();
+    let machine_output = format.is_structured();
     let output = read::config_check_report(command.host, command.all, config_context)?;
 
-    if json {
-        print_json(&output).map_err(failure)
+    if machine_output {
+        format.print(&output).map_err(failure)
     } else {
         println!("Config: ok");
         println!(
@@ -7427,12 +7436,12 @@ fn config_explain(
     config_context: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let json = format.is_json();
+    let machine_output = format.is_structured();
     let output =
         read::config_explain_report(command.host, command.show_secret_references, config_context)?;
 
-    if json {
-        print_json(&output).map_err(failure)
+    if machine_output {
+        format.print(&output).map_err(failure)
     } else {
         println!(
             "Selected host: {}",
@@ -8302,7 +8311,7 @@ fn show_paths(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let json = format.is_json();
+    let machine_output = format.is_structured();
     let selected_host = command
         .host
         .as_deref()
@@ -8310,8 +8319,8 @@ fn show_paths(
         .transpose()?;
     let output = read::paths_report(selected_host.as_ref())?;
 
-    if json {
-        print_json(&output).map_err(failure)
+    if machine_output {
+        format.print(&output).map_err(failure)
     } else {
         println!("Host: {}", output["host"].as_str().unwrap_or_default());
         if let Some(observation_source) = output["observation_source"].as_str() {
@@ -8342,15 +8351,15 @@ fn run_host(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let json = format.is_json();
+    let machine_output = format.is_structured();
     match command {
         HostCommand::Start(command) => start_host_daemon(command, config, format),
         HostCommand::ReleaseState => release_ssh_state_owner(),
         HostCommand::Trust(command) => trust_host(command, config, format),
         HostCommand::Status(command) => {
             let status = read::host_status(command.host.as_deref(), config)?;
-            if json {
-                print_json(&status).map_err(failure)
+            if machine_output {
+                format.print(&status).map_err(failure)
             } else {
                 println!("Running: {}", status.running);
                 println!("Mode: {}", status.mode);
@@ -8401,7 +8410,7 @@ fn run_host_lifecycle(
         host.alias
     )];
     let recovery_command = format!("satelle host {action} --host {} --yes", host.alias);
-    if !command.yes && (command.no_input || format.is_json() || !io::stdin().is_terminal()) {
+    if !command.yes && (command.no_input || format.is_structured() || !io::stdin().is_terminal()) {
         return Err(failure(SatelleError::setup_consent_required(
             &planned_actions,
             recovery_command,
@@ -8430,8 +8439,8 @@ fn run_host_lifecycle(
         }
     }
     let report = transport::manage_ssh_persistent_service(&host, lifecycle).map_err(failure)?;
-    if format.is_json() {
-        print_json(&report).map_err(failure)
+    if format.is_structured() {
+        format.print(&report).map_err(failure)
     } else {
         println!("Host: {}", report.host);
         println!("Action: {}", report.action);
@@ -8448,8 +8457,8 @@ fn run_host_cleanup(
 ) -> Result<(), CliFailure> {
     let host = config.resolve_host(command.host.as_deref())?;
     let report = transport::cleanup_ssh_host_cache(&host).map_err(failure)?;
-    if format.is_json() {
-        print_json(&report).map_err(failure)
+    if format.is_structured() {
+        format.print(&report).map_err(failure)
     } else {
         println!("Removed cache entries: {}", report.removed_entries);
         println!("Retained cache entries: {}", report.retained_entries);
@@ -8678,7 +8687,7 @@ fn trust_host(
             "host trust --yes requires --expected-host-id <exact-id>",
         )));
     }
-    let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
+    let noninteractive = command.no_input || format.is_structured() || !io::stdin().is_terminal();
     if noninteractive && (!command.no_input || !command.yes || command.expected_host_id.is_none()) {
         return Err(failure(SatelleError::invalid_usage(
             "noninteractive host trust requires --no-input --yes --expected-host-id <exact-id>",
@@ -8763,8 +8772,8 @@ fn trust_host(
         previous_identity,
         changed,
     );
-    if format.is_json() {
-        print_json(&report).map_err(failure)
+    if format.is_structured() {
+        format.print(&report).map_err(failure)
     } else {
         println!("Trusted Host: {}", report.host());
         println!("Endpoint: {}", report.endpoint());
@@ -9282,8 +9291,8 @@ fn start_host_daemon_with(
                     "flush failed".to_string(),
                 )
             })?;
-        } else if format.is_json() {
-            print_json(&ready).map_err(failure)?;
+        } else if format.is_structured() {
+            format.print(&ready).map_err(failure)?;
         } else {
             println!("Host Daemon listening on {}", server.local_addr());
         }
@@ -10768,11 +10777,11 @@ fn show_host_sessions(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let json = format.is_json();
+    let machine_output = format.is_structured();
     let report = read::host_sessions(command.host.as_deref(), command.no_bootstrap, config)?;
 
-    if json {
-        print_json(&report).map_err(failure)
+    if machine_output {
+        format.print(&report).map_err(failure)
     } else {
         println!("Host: {}", report.host);
         println!("Connection: {}", report.connection_mode);
@@ -10892,7 +10901,7 @@ fn run_host_update_invocation(
         MutationCommandFamily::HostUpdate,
         command.yes
             || command.dry_run
-            || (!command.no_input && !format.is_json() && io::stdin().is_terminal()),
+            || (!command.no_input && !format.is_structured() && io::stdin().is_terminal()),
     )?;
     let (components, includes_all) = selected_host_update_components(&command.component);
     let mut report = transport::plan_host_update(
@@ -10919,16 +10928,16 @@ fn run_host_update_invocation(
     }
     if command.dry_run {
         report = report.into_dry_run();
-        if format.is_json() {
-            print_json(&report).map_err(failure)?;
+        if format.is_structured() {
+            format.print(&report).map_err(failure)?;
         } else if !format.is_plain() && !command.quiet {
             print!("{}", host_update::render_host_update_plan(&report));
         }
         return Ok(());
     }
     if !report.confirmation_required {
-        if format.is_json() {
-            print_json(&report).map_err(failure)?;
+        if format.is_structured() {
+            format.print(&report).map_err(failure)?;
         } else if !format.is_plain() && !command.quiet {
             let has_skipped_targets = report.targets.iter().any(|target| {
                 target.disposition == satelle_core::host_update::HostUpdateDisposition::Skipped
@@ -10943,10 +10952,10 @@ fn run_host_update_invocation(
         }
         return Ok(());
     }
-    if !format.is_plain() && !format.is_json() && !command.quiet {
+    if !format.is_plain() && !format.is_structured() && !command.quiet {
         print!("{}", host_update::render_host_update_plan(&report));
     }
-    let noninteractive = command.no_input || format.is_json() || !io::stdin().is_terminal();
+    let noninteractive = command.no_input || format.is_structured() || !io::stdin().is_terminal();
     let consent_granted = host_update_consent_granted(command.yes, trusted_consent);
     if noninteractive && !consent_granted {
         let error = SatelleError::setup_consent_required(
@@ -11021,8 +11030,8 @@ fn run_host_update_invocation(
             host_update::render_host_update_plain(&report, PlainUpdateStage::Completed)
         );
         Ok(())
-    } else if format.is_json() {
-        print_json(&report).map_err(failure)
+    } else if format.is_structured() {
+        format.print(&report).map_err(failure)
     } else if command.quiet {
         println!(
             "Updated Host '{}': {} actions applied.",
@@ -11368,7 +11377,7 @@ fn execute_remote_host_update_batch(
         includes_all,
         concurrency,
     );
-    if (!format.is_json() || reserve_stdout_for_json) && !command.quiet {
+    if (!format.is_structured() || reserve_stdout_for_json) && !command.quiet {
         for planned in &plans {
             if let Ok(report) = &planned.plan {
                 if reserve_stdout_for_json {
@@ -11405,7 +11414,7 @@ fn execute_remote_host_update_batch(
             MutationCommandFamily::SelfUpdateRemotes,
             command.yes
                 || (!command.no_input
-                    && (!format.is_json() || reserve_stdout_for_json)
+                    && (!format.is_structured() || reserve_stdout_for_json)
                     && io::stdin().is_terminal()),
         )
         .map(|grant| allowed && grant)
@@ -11413,7 +11422,7 @@ fn execute_remote_host_update_batch(
     let consent_granted = host_update_consent_granted(command.yes, trusted_consent);
     if confirmation_required && !consent_granted {
         let noninteractive = command.no_input
-            || (format.is_json() && !reserve_stdout_for_json)
+            || (format.is_structured() && !reserve_stdout_for_json)
             || !io::stdin().is_terminal();
         if noninteractive {
             return Err(failure(SatelleError::setup_consent_required(
@@ -11807,7 +11816,7 @@ fn confirm_storage_maintenance(
     if yes {
         return Ok(true);
     }
-    if no_input || format.is_json() || !io::stdin().is_terminal() {
+    if no_input || format.is_structured() || !io::stdin().is_terminal() {
         return Err(failure(SatelleError::setup_consent_required(
             planned_actions,
             recovery_command,
@@ -12427,8 +12436,8 @@ fn run_host_storage_completion_recovery(
         )
         .map_err(failure)?
     };
-    if format.is_json() {
-        print_json(&result).map_err(failure)
+    if format.is_structured() {
+        format.print(&result).map_err(failure)
     } else {
         println!(
             "Reconciled storage maintenance operation {} on Host '{}'.",
@@ -12658,19 +12667,20 @@ fn print_storage_plan(
     planned_actions: &[String],
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    if format.is_json() {
-        print_json(&json!({
-            "schema_version": "satelle.host.storage.v1",
-            "host": host,
-            "operation": operation,
-            "status": "planned",
-            "changed": false,
-            "planned_actions": planned_actions,
-            "applied_actions": [],
-            "cancellation_reason": null,
-            "result": null
-        }))
-        .map_err(failure)
+    if format.is_structured() {
+        format
+            .print(&json!({
+                "schema_version": "satelle.host.storage.v1",
+                "host": host,
+                "operation": operation,
+                "status": "planned",
+                "changed": false,
+                "planned_actions": planned_actions,
+                "applied_actions": [],
+                "cancellation_reason": null,
+                "result": null
+            }))
+            .map_err(failure)
     } else {
         println!("Host: {host}");
         println!("Operation: {operation}");
@@ -12686,19 +12696,20 @@ fn print_storage_cancelled(
     operation: &str,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    if format.is_json() {
-        print_json(&json!({
-            "schema_version": "satelle.host.storage.v1",
-            "host": host,
-            "operation": operation,
-            "status": "cancelled",
-            "changed": false,
-            "planned_actions": [],
-            "applied_actions": [],
-            "cancellation_reason": "user_declined_confirmation",
-            "result": null
-        }))
-        .map_err(failure)
+    if format.is_structured() {
+        format
+            .print(&json!({
+                "schema_version": "satelle.host.storage.v1",
+                "host": host,
+                "operation": operation,
+                "status": "cancelled",
+                "changed": false,
+                "planned_actions": [],
+                "applied_actions": [],
+                "cancellation_reason": "user_declined_confirmation",
+                "result": null
+            }))
+            .map_err(failure)
     } else {
         println!("No changes applied.");
         Ok(())
@@ -12713,19 +12724,20 @@ fn print_storage_result(
     applied_actions: &[&str],
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    if format.is_json() {
-        print_json(&json!({
-            "schema_version": "satelle.host.storage.v1",
-            "host": host,
-            "operation": operation,
-            "status": "applied",
-            "changed": changed,
-            "planned_actions": [],
-            "applied_actions": applied_actions,
-            "cancellation_reason": null,
-            "result": result
-        }))
-        .map_err(failure)
+    if format.is_structured() {
+        format
+            .print(&json!({
+                "schema_version": "satelle.host.storage.v1",
+                "host": host,
+                "operation": operation,
+                "status": "applied",
+                "changed": changed,
+                "planned_actions": [],
+                "applied_actions": applied_actions,
+                "cancellation_reason": null,
+                "result": result
+            }))
+            .map_err(failure)
     } else {
         println!("Host: {host}");
         println!("Operation: {operation}");
@@ -12819,7 +12831,7 @@ fn run_self(
                 if !remote_choices.is_empty()
                     && !command.no_input
                     && stdin_is_terminal
-                    && !output.is_json()
+                    && !output.is_structured()
                 {
                     // Explicit interactive remote updates choose their targets
                     // before the local binary changes. An empty answer means
@@ -12849,7 +12861,7 @@ fn run_self(
                         host,
                         MutationCommandFamily::SelfUpdateRemotes,
                         command.dry_run
-                            || (!command.no_input && !output.is_json() && stdin_is_terminal),
+                            || (!command.no_input && !output.is_structured() && stdin_is_terminal),
                     )
                 })?;
 
@@ -12858,7 +12870,7 @@ fn run_self(
                     command.dry_run,
                     command.no_input,
                     stdin_is_terminal,
-                    output.is_json(),
+                    output.is_structured(),
                     remote_consent_granted,
                 )
             {
@@ -12870,7 +12882,7 @@ fn run_self(
             let interactive_offer_candidate = !command.update_remotes
                 && !command.no_input
                 && stdin_is_terminal
-                && !output.is_json()
+                && !output.is_structured()
                 && !command.dry_run
                 && remote_host_handoff_supported;
             let request = self_update::SelfUpdateRequest::current(
@@ -12895,7 +12907,7 @@ fn run_self(
                 && report.should_offer_remote_update(
                     command.no_input,
                     stdin_is_terminal,
-                    output.is_json(),
+                    output.is_structured(),
                     command.dry_run,
                 )
             {
@@ -12910,8 +12922,8 @@ fn run_self(
 
             if selected_hosts.is_empty() {
                 if !local_report_printed {
-                    if output.is_json() {
-                        print_json(&report).map_err(failure)?;
+                    if output.is_structured() {
+                        output.print(&report).map_err(failure)?;
                     } else {
                         for line in report.human_lines() {
                             println!("{line}");
@@ -12932,7 +12944,7 @@ fn run_self(
                         host,
                         MutationCommandFamily::SelfUpdateRemotes,
                         command.dry_run
-                            || (!command.no_input && !output.is_json() && stdin_is_terminal),
+                            || (!command.no_input && !output.is_structured() && stdin_is_terminal),
                     )
                 })?;
             let components = if command.component.is_empty() {
@@ -12963,8 +12975,8 @@ fn run_self(
             let remote_report =
                 run_self_update_remote_handoff(report.installed_executable(), &handoff)?;
             let combined = self_update::SelfUpdateRemoteReport::new(&report, &remote_report);
-            if output.is_json() {
-                print_json(&combined).map_err(failure)?;
+            if output.is_structured() {
+                output.print(&combined).map_err(failure)?;
             } else if command.quiet && !remote_report.has_failures() {
                 if combined.changed()
                     && let Some(summary) = quiet_self_update_remote_summary(
@@ -13694,10 +13706,15 @@ fn run_prompt(
     config_context: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<SessionId, CliFailure> {
-    let json = format.is_json();
+    let machine_output = format.is_structured();
     validate_interrupt_mode(command.detach, command.detach_on_interrupt)?;
     validate_event_mode(command.detach, command.events)?;
-    let effective_mode = effective_event_mode(command.events, command.detach, command.quiet, json);
+    let effective_mode = effective_event_mode(
+        command.events,
+        command.detach,
+        command.quiet,
+        machine_output,
+    );
     let mut event_output = TurnEventOutput::new(effective_mode, command.verbose);
     let explicit_host_alias = command.host.as_deref();
     let prompt = report_not_admitted(
@@ -13824,7 +13841,7 @@ fn run_prompt(
     print_experimental_provider_warning(
         &provider_validation,
         command.quiet,
-        json || effective_mode == EffectiveEventMode::Json,
+        machine_output || effective_mode == EffectiveEventMode::Json,
     );
     report_not_admitted(
         &mut event_output,
@@ -13875,7 +13892,7 @@ fn run_prompt(
                 provider_selection: &provider_selection,
                 provider_validation: &provider_validation,
                 schema_version: SessionResultSchemaVersion::RunV2,
-                json,
+                format,
             },
         );
     }
@@ -13938,7 +13955,7 @@ fn run_prompt(
             provider_selection: &provider_selection,
             provider_validation: &provider_validation,
             schema_version: SessionResultSchemaVersion::RunV2,
-            json,
+            format,
         },
     )
 }
@@ -13948,10 +13965,15 @@ fn steer_prompt(
     config_context: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<SessionId, CliFailure> {
-    let json = format.is_json();
+    let machine_output = format.is_structured();
     validate_interrupt_mode(command.detach, command.detach_on_interrupt)?;
     validate_event_mode(command.detach, command.events)?;
-    let effective_mode = effective_event_mode(command.events, command.detach, command.quiet, json);
+    let effective_mode = effective_event_mode(
+        command.events,
+        command.detach,
+        command.quiet,
+        machine_output,
+    );
     let mut event_output = TurnEventOutput::new(effective_mode, command.verbose);
     let explicit_host_alias = command.host.as_deref();
     let prompt = report_not_admitted(
@@ -14076,7 +14098,7 @@ fn steer_prompt(
     print_experimental_provider_warning(
         &provider_validation,
         command.quiet,
-        json || effective_mode == EffectiveEventMode::Json,
+        machine_output || effective_mode == EffectiveEventMode::Json,
     );
     report_not_admitted(
         &mut event_output,
@@ -14129,7 +14151,7 @@ fn steer_prompt(
                 provider_selection: &provider_selection,
                 provider_validation: &provider_validation,
                 schema_version: SessionResultSchemaVersion::SteerV2,
-                json,
+                format,
             },
         );
     }
@@ -14195,7 +14217,7 @@ fn steer_prompt(
             provider_selection: &provider_selection,
             provider_validation: &provider_validation,
             schema_version: SessionResultSchemaVersion::SteerV2,
-            json,
+            format,
         },
     )
 }
@@ -14227,11 +14249,13 @@ fn show_status(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let json = format.is_json();
+    let machine_output = format.is_structured();
     let (session, host_alias) = read::status(&command.session_id, command.host.as_deref(), config)?;
 
-    if json {
-        print_json(&StatusReport::new(&session, &host_alias)).map_err(failure)
+    if machine_output {
+        format
+            .print(&StatusReport::new(&session, &host_alias))
+            .map_err(failure)
     } else {
         print_session_human(&session, latest_turn(&session), &host_alias);
         Ok(())
@@ -14243,15 +14267,15 @@ fn stop_session(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
-    let json = format.is_json();
+    let machine_output = format.is_structured();
     let session_id =
         SessionId::from_str(&command.session_id).map_err(|error| failure(error.into()))?;
     let host = config.resolve_session_host(command.host.as_deref(), &session_id)?;
     let transport = transport::transport_for_session_control(&host)?;
     let result = transport.stop(&session_id).map_err(failure)?;
 
-    if json {
-        print_json(&result).map_err(failure)
+    if machine_output {
+        format.print(&result).map_err(failure)
     } else {
         println!("Outcome: {}", result.outcome().as_str());
         println!("Session: {}", result.session_id());
@@ -14552,7 +14576,7 @@ struct TurnOutputOptions<'a> {
     provider_selection: &'a ProviderSelection,
     provider_validation: &'a transport::ProviderDescriptorValidationReport,
     schema_version: SessionResultSchemaVersion,
-    json: bool,
+    format: OutputFormat,
 }
 
 fn print_turn_session(
@@ -14574,13 +14598,13 @@ fn print_turn_session(
         return Ok(session_id);
     }
 
-    if options.json {
+    if options.format.is_structured() {
         let provider_smoke_test_status = provider_smoke
             .as_ref()
             .and_then(|provider_smoke| provider_smoke.get("status"))
             .cloned()
             .unwrap_or_else(|| json!(options.provider_validation.validation.outcome().as_str()));
-        print_json(&json!({
+        options.format.print(&json!({
             "schema_version": options.schema_version,
             "session_id": session.session_id(),
             "status": target_turn.state(),
@@ -14616,7 +14640,7 @@ struct DetachedOutputOptions<'a> {
     provider_selection: &'a ProviderSelection,
     provider_validation: &'a transport::ProviderDescriptorValidationReport,
     schema_version: SessionResultSchemaVersion,
-    json: bool,
+    format: OutputFormat,
 }
 
 fn print_detached_session(
@@ -14625,8 +14649,8 @@ fn print_detached_session(
 ) -> Result<SessionId, CliFailure> {
     let session_id = session.session_id().clone();
     let latest_turn = latest_turn(&session);
-    if options.json {
-        print_json(&json!({
+    if options.format.is_structured() {
+        options.format.print(&json!({
             "schema_version": options.schema_version,
             "session_id": session.session_id(),
             "host": options.host,
@@ -15009,21 +15033,7 @@ fn status_label(status: TurnState) -> &'static str {
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<(), SatelleError> {
-    let mut stdout = io::stdout().lock();
-    serde_json::to_writer_pretty(&mut stdout, value).map_err(|source| SatelleError {
-        code: ErrorCode::InvalidUsage,
-        message: "could not serialize JSON output".to_string(),
-        recovery_command: None,
-        source_detail: Some(source.to_string()),
-        details: std::collections::BTreeMap::new(),
-    })?;
-    writeln!(stdout).map_err(|source| SatelleError {
-        code: ErrorCode::InvalidUsage,
-        message: "could not write JSON output".to_string(),
-        recovery_command: None,
-        source_detail: Some(source.to_string()),
-        details: std::collections::BTreeMap::new(),
-    })
+    OutputFormat::Json.print(value)
 }
 
 fn failure(error: SatelleError) -> CliFailure {

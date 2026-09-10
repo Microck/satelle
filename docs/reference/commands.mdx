@@ -48,6 +48,42 @@ are running. Pre-release commands may change before the first stable release.
 The [generated CLI and schema reference](/docs/reference/generated-cli) records
 the complete help tree and public schema identifiers for Satelle 0.1.10.
 
+## Output formats
+
+Commands with a final result accept `--format human|json|compact-json|toon|markdown`.
+`--json` is an exact alias for `--format json`. Each command's help lists its
+supported formats.
+
+| Format | Result |
+| --- | --- |
+| `human` | Command-specific text |
+| `json` | The complete versioned JSON report, pretty-printed |
+| `compact-json` | The same report as one minified JSON value followed by LF |
+| `toon` | The complete JSON data model encoded as TOON 4.1 with two-space indentation and comma delimiters |
+| `markdown` | The complete pretty JSON report inside one `json` fenced code block |
+| `csv` | Available only for `skills list`, using the fixed columns below |
+
+Structured formats retain schema identifiers, data values, array order, consent
+requirements, and exit codes. JSON remains the canonical machine contract. TOON
+preserves signed and unsigned 64-bit integers, escapes C0 control characters,
+and writes finite numbers as decimals; negative zero becomes zero. Decode a
+Markdown result by reading the JSON inside its fenced block.
+
+`satelle skills list --format csv` emits the RFC 4180 header
+`schema_version,bundle_version,name,description`, followed by one record per
+bundled skill in bundle order. Each row repeats the schema and bundle versions.
+All data fields are quoted, embedded quotes are doubled, and records end in CRLF.
+No nested fields are discarded to produce a table.
+
+Structured final results suppress interactive prompts and implicit human events
+under the same rules as JSON. Errors use the typed JSON contract on stderr unless
+`--error-format` explicitly selects another error format. Unsupported formats fail
+before configuration loading or Host access.
+
+`logs` supports only human output and its existing JSON records. `--events json`
+continues to select an NDJSON event stream. It cannot combine with `--json` or
+any explicit `--format`; `doctor --events` has the same restriction.
+
 ## Session commands
 
 `run` and `steer` accept `--host`, `--detach`, `--quiet`, `--verbose`,

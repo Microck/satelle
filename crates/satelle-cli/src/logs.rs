@@ -24,6 +24,7 @@ const RECONNECT_MAX_DELAY: StdDuration = StdDuration::from_secs(5);
 const MAX_STREAM_INTERRUPTS: usize = 10;
 
 #[derive(Args, Debug)]
+#[command(mut_arg("format", |arg| arg.value_parser(OutputFormat::parser(&OutputFormat::STREAM))))]
 pub(crate) struct LogsCommand {
     #[arg(
         long,
@@ -139,7 +140,7 @@ impl LogReadRequest {
         command.push_str(" --after ");
         command.push_str(&cursor.to_string());
         command.push_str(" --follow");
-        if self.format.is_json() {
+        if self.format.is_structured() {
             command.push_str(" --json");
         }
         if self.no_reconnect {
@@ -1070,7 +1071,7 @@ fn write_entries_to(
         .iter()
         .take_while(|entry| through.is_none_or(|cursor| entry.cursor() <= cursor))
     {
-        if format.is_json() {
+        if format.is_structured() {
             serde_json::to_writer(&mut *stdout, entry)
                 .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
             writeln!(stdout).map_err(log_output_error)?;

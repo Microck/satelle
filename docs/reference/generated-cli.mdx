@@ -175,7 +175,7 @@ Options:
           Require this exact Host identity during first-time SSH trust
 
       --format <FORMAT>
-          [possible values: human, json]
+          [possible values: human, json, compact-json, toon, markdown]
 
       --json
           Alias for --format json
@@ -204,7 +204,7 @@ Options:
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes                    Accept ordinary repair mutations without an interactive confirmation
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -230,7 +230,7 @@ Options:
       --yes
       --no-input
       --quiet
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -262,7 +262,7 @@ Usage: satelle paths [OPTIONS]
 Options:
       --host <HOST>
       --no-color               Disable colored human output
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --json                   Alias for --format json
       --profile <NAME>         Apply a named user-level configuration profile
@@ -363,7 +363,7 @@ Options:
       --timeout <DURATION>
           Shorten this Turn's execution timeout (for example 30s, 5m, or 1h; maximum 24h)
       --format <FORMAT>
-          [possible values: human, json]
+          [possible values: human, json, compact-json, toon, markdown]
       --json
           Alias for --format json
   -h, --help
@@ -421,7 +421,7 @@ Options:
       --timeout <DURATION>
           Shorten this Turn's execution timeout (for example 30s, 5m, or 1h; maximum 24h)
       --format <FORMAT>
-          [possible values: human, json]
+          [possible values: human, json, compact-json, toon, markdown]
       --json
           Alias for --format json
   -h, --help
@@ -439,7 +439,7 @@ Arguments:
 Options:
       --host <HOST>
       --no-color               Disable colored human output
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --json                   Alias for --format json
       --profile <NAME>         Apply a named user-level configuration profile
@@ -458,7 +458,7 @@ Arguments:
 Options:
       --host <HOST>
       --no-color               Disable colored human output
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --json                   Alias for --format json
       --profile <NAME>         Apply a named user-level configuration profile
@@ -571,7 +571,7 @@ Options:
       --no-color               Disable colored human output
       --all
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --json                   Alias for --format json
@@ -588,7 +588,7 @@ Options:
       --no-color                Disable colored human output
       --log-verbosity <LEVEL>   Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --show-secret-references
-      --format <FORMAT>         [possible values: human, json]
+      --format <FORMAT>         [possible values: human, json, compact-json, toon, markdown]
       --profile <NAME>          Apply a named user-level configuration profile
       --error-format <FORMAT>   Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --json                    Alias for --format json
@@ -610,7 +610,7 @@ Options:
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes                    Accept the displayed local configuration edits and private backup
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -629,7 +629,7 @@ Options:
       --tls-key <PATH>         Owner-only PEM private key matching --tls-cert
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --foreground
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -651,7 +651,7 @@ Options:
       --error-format <FORMAT>       Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes                         Apply trust without an interactive confirmation
       --no-input                    Reject any path that would prompt for input
-      --format <FORMAT>             [possible values: human, json]
+      --format <FORMAT>             [possible values: human, json, compact-json, toon, markdown]
       --json                        Alias for --format json
   -h, --help                        Print help
 ```
@@ -664,7 +664,7 @@ Usage: satelle host status [OPTIONS]
 Options:
       --host <HOST>
       --no-color               Disable colored human output
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --json                   Alias for --format json
       --profile <NAME>         Apply a named user-level configuration profile
@@ -685,7 +685,7 @@ Options:
       --no-input
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -703,7 +703,7 @@ Options:
       --no-input
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -727,7 +727,7 @@ Options:
       --no-input
       --quiet                  Suppress non-error human plan and progress output; use --json for stable automation data
       --plain                  Emit fixed tab-separated target records; use --json for the complete report
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -740,7 +740,7 @@ Usage: satelle host cleanup [OPTIONS]
 Options:
       --host <HOST>
       --no-color               Disable colored human output
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --json                   Alias for --format json
       --profile <NAME>         Apply a named user-level configuration profile
@@ -758,7 +758,7 @@ Options:
       --no-color               Disable colored human output
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --no-bootstrap
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --json                   Alias for --format json
@@ -821,7 +821,7 @@ Options:
       --no-input
       --yes
       --quiet                      Suppress non-error human remote-update output; use --json for stable automation data
-      --format <FORMAT>            [possible values: human, json]
+      --format <FORMAT>            [possible values: human, json, compact-json, toon, markdown]
       --json                       Alias for --format json
   -h, --help                       Print help
 ```
@@ -850,7 +850,7 @@ Options:
 Usage: satelle skills list [OPTIONS]
 
 Options:
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown, csv]
       --no-color               Disable colored human output
       --json                   Alias for --format json
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
@@ -868,7 +868,7 @@ Arguments:
   <NAME>
 
 Options:
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --no-color               Disable colored human output
       --json                   Alias for --format json
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
@@ -886,7 +886,7 @@ Arguments:
   <NAME>
 
 Options:
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --no-color               Disable colored human output
       --json                   Alias for --format json
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
@@ -925,7 +925,7 @@ Options:
       --satelle-path <SATELLE_PATH>
       --dry-run
       --enable-mutations             Configure the MCP server with explicitly enabled mutating tools
-      --format <FORMAT>              [possible values: human, json]
+      --format <FORMAT>              [possible values: human, json, compact-json, toon, markdown]
       --json                         Alias for --format json
   -h, --help                         Print help
 ```
@@ -946,7 +946,7 @@ Options:
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -966,7 +966,7 @@ Options:
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -986,7 +986,7 @@ Options:
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -1023,7 +1023,7 @@ Options:
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -1042,7 +1042,7 @@ Options:
       --yes
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```

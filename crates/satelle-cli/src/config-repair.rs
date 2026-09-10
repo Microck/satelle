@@ -365,8 +365,8 @@ fn restore_command(backup: &Path, original: &Path) -> String {
 }
 
 fn finish(report: &RepairReport, format: OutputFormat) -> Result<(), CliFailure> {
-    if format.is_json() {
-        super::print_json(report).map_err(failure)
+    if format.is_structured() {
+        format.print(report).map_err(failure)
     } else {
         print_human(report, &mut io::stdout()).map_err(|error| {
             failure(SatelleError::config_error(
