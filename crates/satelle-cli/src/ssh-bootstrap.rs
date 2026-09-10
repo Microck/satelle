@@ -381,7 +381,12 @@ impl SshBootstrapLock {
         // The lock process must stay alive, so use its owner-only ready marker
         // through the same bounded filesystem protocol as later exchanges.
         let ready = if target.is_windows() {
-            wait_for_windows_bootstrap_ready(ssh_program, destination, request.operation_id())
+            wait_for_windows_bootstrap_ready(
+                ssh_program,
+                destination,
+                request.operation_id(),
+                &mut child,
+            )
         } else {
             match ready_receiver.recv_timeout(PROCESS_TIMEOUT) {
                 Ok(ready) => ready,
@@ -5666,6 +5671,7 @@ fn wait_for_windows_bootstrap_ready(
     ssh_program: &OsStr,
     destination: &str,
     operation_id: &str,
+    bootstrap_child: &mut Child,
 ) -> Result<BootstrapLockReady, SshBootstrapError> {
     let output = run_ssh_command_with_program(
         ssh_program,
@@ -5675,6 +5681,14 @@ fn wait_for_windows_bootstrap_ready(
     if !output.status.success() {
         return Err(if output.stderr.host_key_verification_failed() {
             SshBootstrapError::HostKeyVerificationRequired
+        // Windows OpenSSH buffers the lock process's BUSY line. Its exit status
+        // is authoritative when the filesystem readiness probe times out.
+        } else if bootstrap_child
+            .try_wait()
+            .map_err(SshBootstrapError::InspectSsh)?
+            .is_some_and(|status| status.code() == Some(bootstrap_lock::BUSY_EXIT_CODE))
+        {
+            SshBootstrapError::BootstrapBusy
         } else {
             SshBootstrapError::BootstrapLockTimedOut
         });
@@ -9282,6 +9296,43 @@ mod tests {
             ordinary_error,
             SshBootstrapError::InvalidBootstrapLockResponse
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_ready_probe_preserves_an_exited_busy_lock_process() {
+        let directory = tempfile::tempdir().expect("temporary SSH program directory");
+        let fake_ssh = directory.path().join("ssh");
+        fs::write(
+            &fake_ssh,
+            format!("#!/bin/sh\nexit {}\n", bootstrap_lock::BUSY_EXIT_CODE),
+        )
+        .expect("write fake SSH");
+        let mut permissions = fs::metadata(&fake_ssh)
+            .expect("read fake SSH metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&fake_ssh, permissions).expect("make fake SSH executable");
+
+        let mut bootstrap_child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {}", bootstrap_lock::BUSY_EXIT_CODE))
+            .spawn()
+            .expect("spawn exited busy bootstrap process");
+        bootstrap_child
+            .wait()
+            .expect("wait for exited busy bootstrap process");
+
+        let error = match wait_for_windows_bootstrap_ready(
+            fake_ssh.as_os_str(),
+            "fake-ssh-host",
+            "busy-operation",
+            &mut bootstrap_child,
+        ) {
+            Ok(_) => panic!("busy bootstrap process must not report readiness"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SshBootstrapError::BootstrapBusy));
     }
 
     #[test]
