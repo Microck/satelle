@@ -1842,8 +1842,12 @@ fn preflight_setup_before_history(
         .map_or(setup_mode_selection.mode, |decision| decision.setup_mode)
         .as_str()
         .to_string();
-    let trusted_consent =
-        trusted_profile_allows_mutation(resolved, &host.alias, MutationCommandFamily::Setup);
+    let trusted_consent = trusted_profile_allows_mutation(
+        resolved,
+        &host.alias,
+        MutationCommandFamily::Setup,
+        command.yes || command.dry_run || (!command.no_input && io::stdin().is_terminal()),
+    )?;
     let verification_checks = if command.verify {
         setup_verification_checks(
             doctor_provider_intent(resolved, &host.config, true, None)
@@ -3381,17 +3385,28 @@ fn trusted_profile_allows_mutation(
     resolved: &ResolvedConfig,
     host_alias: &str,
     command_family: MutationCommandFamily,
-) -> bool {
+    alternative_consent_available: bool,
+) -> Result<bool, CliFailure> {
     let Some(reference) = resolved.trusted_profile_reference() else {
-        return false;
+        return Ok(false);
     };
-    resolved
+    let Some(trusted) = resolved
         .config
         .trusted_profiles
         .get(reference)
-        .is_some_and(|trusted| {
+        .filter(|trusted| {
             trusted.hosts.contains(host_alias) && trusted.command_families.contains(&command_family)
         })
+    else {
+        return Ok(false);
+    };
+    if trusted.is_expired_at(time::OffsetDateTime::now_utc()) {
+        if alternative_consent_available {
+            return Ok(false);
+        }
+        return Err(failure(resolved.trusted_profile_expired_error(reference)));
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3808,7 +3823,7 @@ fn run_setup(
         .resolve_host(command.host.as_deref())
         .map(SelectedHost::from)
         .map_err(failure)?;
-    let user_config_path = resolved.user_config_path.clone();
+    let user_config_path = resolved.host_binding_config_file(&host.alias).to_path_buf();
     if command.expected_host_id.is_some()
         && host.config.transport != satelle_core::TransportKind::Ssh
     {
@@ -3884,8 +3899,12 @@ fn run_setup(
     let tailscale_serve_setup = command.component.as_slice() == [SetupComponent::Transport]
         && tailscale_serve::applies_to(&host.config);
     let interactive_selection = !command.no_input && io::stdin().is_terminal();
-    let trusted_consent =
-        trusted_profile_allows_mutation(resolved, &host.alias, MutationCommandFamily::Setup);
+    let trusted_consent = trusted_profile_allows_mutation(
+        resolved,
+        &host.alias,
+        MutationCommandFamily::Setup,
+        command.yes || command.dry_run || (!command.no_input && io::stdin().is_terminal()),
+    )?;
     let mut provider_selection =
         resolve_provider_selection(resolved, &host, None, None, false, false)?;
     if provider_auth_setup
@@ -5670,8 +5689,14 @@ fn run_repair(
         .resolve_host_with_project_source(command.host.as_deref())
         .map(SelectedHost::from)
         .map_err(failure)?;
-    let trusted_consent =
-        trusted_profile_allows_mutation(resolved, &host.alias, MutationCommandFamily::Repair);
+    let trusted_consent = trusted_profile_allows_mutation(
+        resolved,
+        &host.alias,
+        MutationCommandFamily::Repair,
+        command.yes
+            || command.dry_run
+            || (!command.no_input && !format.is_json() && io::stdin().is_terminal()),
+    )?;
     let mut mutation_consent = repair_consent_granted(command.yes, trusted_consent);
     let mut report = transport::plan_repair_upgrades(
         &host,
@@ -6500,7 +6525,8 @@ fn finish_doctor_report(
         resolved_config,
         &host.alias,
         MutationCommandFamily::DoctorFix,
-    );
+        command.yes || interactive,
+    )?;
     if noninteractive && !command.yes && !trusted_consent {
         let planned_actions = planned_delegations
             .iter()
@@ -7389,12 +7415,28 @@ fn config_explain(
             "Host aliases: {}",
             output["values"]["host_count"].as_u64().unwrap_or_default()
         );
-        print_config_explain_values("", &output["effective"]);
+        if let Some(files) = output["sources"]["files"].as_array() {
+            for file in files.iter().filter(|file| file["parent"].is_string()) {
+                println!(
+                    "Include: {} (from {})",
+                    file["path"].as_str().unwrap_or_default(),
+                    file["parent"].as_str().unwrap_or_default()
+                );
+            }
+        }
+        let grant = &output["values"]["noninteractive_mutation_consent"]["trusted_profile"];
+        if let Some(name) = grant["name"].as_str() {
+            println!(
+                "Trusted Profile: {name} (expiration: {})",
+                grant["expiration_state"].as_str().unwrap_or_default()
+            );
+        }
+        print_config_explain_values("", &output["effective"], &output["sources"]["values"]);
         Ok(())
     }
 }
 
-fn print_config_explain_values(path: &str, value: &serde_json::Value) {
+fn print_config_explain_values(path: &str, value: &serde_json::Value, sources: &serde_json::Value) {
     if value.get("redacted").and_then(serde_json::Value::as_bool) == Some(true) {
         println!(
             "{}: <redacted> (reason: {}, source: {})",
@@ -7407,16 +7449,26 @@ fn print_config_explain_values(path: &str, value: &serde_json::Value) {
     match value {
         serde_json::Value::Object(fields) => {
             for (name, field) in fields {
+                let name = satelle_core::config_toml_key(name);
                 let child_path = if path.is_empty() {
-                    name.clone()
+                    name
                 } else {
                     format!("{path}.{name}")
                 };
-                print_config_explain_values(&child_path, field);
+                print_config_explain_values(&child_path, field, sources);
             }
         }
-        serde_json::Value::String(value) => println!("{path}: {value}"),
-        _ => println!("{path}: {value}"),
+        _ => {
+            let displayed = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string());
+            if let Some(source) = sources[path]["config_file"].as_str() {
+                println!("{path}: {displayed} (from {source})");
+            } else {
+                println!("{path}: {displayed}");
+            }
+        }
     }
 }
 
@@ -7658,11 +7710,7 @@ fn model_provider_config_json(
                 json!("user_config_profile")
             }
         } else {
-            root_config_key_source(
-                "model_alias",
-                &config.user_config_path,
-                &config.project_config_path,
-            )
+            root_config_key_source("model_alias", config)
         };
     let provider_alias_source =
         if config.profile_overrides_for_host(ProfileField::ProviderAlias, selected_host) {
@@ -7672,11 +7720,7 @@ fn model_provider_config_json(
                 json!("user_config_profile")
             }
         } else {
-            root_config_key_source(
-                "provider_alias",
-                &config.user_config_path,
-                &config.project_config_path,
-            )
+            root_config_key_source("provider_alias", config)
         };
 
     let binding = config
@@ -7706,10 +7750,7 @@ fn model_provider_config_json(
         "provider_alias_source": provider_alias_source,
         "model_alias_from_project": config.model_alias_from_project(),
         "provider_alias_from_project": config.provider_alias_from_project(),
-        "contributing_config_files": [
-            config.user_config_path,
-            config.project_config_path,
-        ],
+        "contributing_config_files": config.checked_files(),
         "winning_source": if binding.is_some() {
             "user_config"
         } else {
@@ -8140,10 +8181,7 @@ fn yolo_config_json(
             .selected_profile
             .as_ref()
             .map(|profile| profile.name.as_str()),
-        "contributing_config_files": [
-            config.user_config_path,
-            config.project_config_path,
-        ],
+        "contributing_config_files": config.checked_files(),
         "winning_source": policy.source,
     })
 }
@@ -8155,31 +8193,12 @@ fn yolo_state_json(policy: &YoloPolicy) -> serde_json::Value {
     })
 }
 
-fn root_config_key_source(
-    key: &str,
-    user_config_path: &std::path::Path,
-    project_config_path: &std::path::Path,
-) -> serde_json::Value {
-    if config_file_has_root_key(project_config_path, key) {
-        return json!("project_config");
-    }
-    if config_file_has_root_key(user_config_path, key) {
-        return json!("user_config");
-    }
-    serde_json::Value::Null
-}
-
-fn config_file_has_root_key(path: &std::path::Path, key: &str) -> bool {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = toml::from_str::<toml::Value>(&raw) else {
-        return false;
-    };
-    value
-        .as_table()
-        .map(|table| table.contains_key(key))
-        .unwrap_or(false)
+fn root_config_key_source(key: &str, config: &ResolvedConfig) -> serde_json::Value {
+    config
+        .sources
+        .values
+        .get(key)
+        .map_or(serde_json::Value::Null, |source| json!(source.source))
 }
 
 fn show_paths(
@@ -8635,9 +8654,12 @@ fn trust_host(
         }
     }
 
-    let changed =
-        persist_host_identity(&resolved.user_config_path, &host.alias, &observed_identity)
-            .map_err(failure)?;
+    let changed = persist_host_identity(
+        resolved.host_binding_config_file(&host.alias),
+        &host.alias,
+        &observed_identity,
+    )
+    .map_err(failure)?;
     let report = HostTrustReport::new(
         host.alias,
         endpoint,
@@ -10741,7 +10763,10 @@ fn run_host_update_invocation(
         config.load()?,
         &host.alias,
         MutationCommandFamily::HostUpdate,
-    );
+        command.yes
+            || command.dry_run
+            || (!command.no_input && !format.is_json() && io::stdin().is_terminal()),
+    )?;
     let (components, includes_all) = selected_host_update_components(&command.component);
     let mut report =
         transport::plan_host_update(&host, &command.host_version, &components, includes_all)
@@ -11180,13 +11205,18 @@ fn execute_remote_host_update_batch(
             .is_ok_and(|report| report.confirmation_required)
     });
     let resolved = config.load()?;
-    let trusted_consent = hosts.iter().all(|host| {
+    let trusted_consent = hosts.iter().try_fold(true, |allowed, host| {
         trusted_profile_allows_mutation(
             resolved,
             &host.alias,
             MutationCommandFamily::SelfUpdateRemotes,
+            command.yes
+                || (!command.no_input
+                    && (!format.is_json() || reserve_stdout_for_json)
+                    && io::stdin().is_terminal()),
         )
-    });
+        .map(|grant| allowed && grant)
+    })?;
     let consent_granted = host_update_consent_granted(command.yes, trusted_consent);
     if confirmation_required && !consent_granted {
         let noninteractive = command.no_input
@@ -11538,20 +11568,27 @@ mod host_update_consent_tests {
 
     #[test]
     fn trusted_profile_consent_authorizes_the_self_update_remote_family() {
-        assert!(self_update_remote_consent_granted(
-            false,
-            &["office".to_string()],
-            |host| host == "office"
+        assert!(matches!(
+            self_update_remote_consent_granted(false, &["office".to_string()], |host| Ok(
+                host == "office"
+            )),
+            Ok(true)
         ));
-        assert!(self_update_remote_consent_granted(
-            true,
-            &["office".to_string(), "lab".to_string()],
-            |_| false
+        assert!(matches!(
+            self_update_remote_consent_granted(
+                true,
+                &["office".to_string(), "lab".to_string()],
+                |_| Ok(false)
+            ),
+            Ok(true)
         ));
-        assert!(!self_update_remote_consent_granted(
-            false,
-            &["office".to_string(), "lab".to_string()],
-            |host| host == "office"
+        assert!(matches!(
+            self_update_remote_consent_granted(
+                false,
+                &["office".to_string(), "lab".to_string()],
+                |host| Ok(host == "office")
+            ),
+            Ok(false)
         ));
     }
 }
@@ -12600,14 +12637,17 @@ fn run_self(
             }
             let remote_consent_granted =
                 self_update_remote_consent_granted(command.yes, &selected_remote_hosts, |host| {
-                    resolved_config.is_some_and(|resolved| {
-                        trusted_profile_allows_mutation(
-                            resolved,
-                            host,
-                            MutationCommandFamily::SelfUpdateRemotes,
-                        )
-                    })
-                });
+                    let Some(resolved) = resolved_config else {
+                        return Ok(false);
+                    };
+                    trusted_profile_allows_mutation(
+                        resolved,
+                        host,
+                        MutationCommandFamily::SelfUpdateRemotes,
+                        command.dry_run
+                            || (!command.no_input && !output.is_json() && stdin_is_terminal),
+                    )
+                })?;
 
             if command.update_remotes
                 && self_update_remote_consent_error_required(
@@ -12680,14 +12720,17 @@ fn run_self(
             resolve_remote_update_hosts(&config, &selected_hosts)?;
             let remote_consent_granted =
                 self_update_remote_consent_granted(command.yes, &selected_hosts, |host| {
-                    resolved_config.is_some_and(|resolved| {
-                        trusted_profile_allows_mutation(
-                            resolved,
-                            host,
-                            MutationCommandFamily::SelfUpdateRemotes,
-                        )
-                    })
-                });
+                    let Some(resolved) = resolved_config else {
+                        return Ok(false);
+                    };
+                    trusted_profile_allows_mutation(
+                        resolved,
+                        host,
+                        MutationCommandFamily::SelfUpdateRemotes,
+                        command.dry_run
+                            || (!command.no_input && !output.is_json() && stdin_is_terminal),
+                    )
+                })?;
             let components = if command.component.is_empty() {
                 vec!["host".to_string()]
             } else {
@@ -12791,13 +12834,16 @@ fn run_self(
 fn self_update_remote_consent_granted(
     command_yes: bool,
     selected_hosts: &[String],
-    mut trusted_profile_allows: impl FnMut(&str) -> bool,
-) -> bool {
-    command_yes
-        || (!selected_hosts.is_empty()
-            && selected_hosts
-                .iter()
-                .all(|host| trusted_profile_allows(host)))
+    mut trusted_profile_allows: impl FnMut(&str) -> Result<bool, CliFailure>,
+) -> Result<bool, CliFailure> {
+    if command_yes {
+        return Ok(true);
+    }
+    selected_hosts
+        .iter()
+        .try_fold(!selected_hosts.is_empty(), |allowed, host| {
+            trusted_profile_allows(host).map(|grant| allowed && grant)
+        })
 }
 
 const fn self_update_remote_consent_error_required(

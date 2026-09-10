@@ -1,11 +1,12 @@
 use super::{
-    ErrorCode, SatelleConfig, SatelleError, TimeoutConfig, TransportKind,
-    collect_unknown_keys_for_table, profiles, reject_config_composition, reject_interpolation,
-    reject_timeout_config_errors,
+    ConfigSourceKind, ConfigSources, ErrorCode, SatelleConfig, SatelleError, TimeoutConfig,
+    TransportKind, collect_unknown_keys_for_table, config_includes, profiles,
+    reject_config_composition, reject_interpolation, reject_timeout_config_errors,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
 
@@ -72,6 +73,7 @@ struct ProjectHostIntent {
 pub(super) struct ParsedProjectConfig {
     config: ProjectConfig,
     pub(super) default_profile: Option<String>,
+    pub(super) sources: ConfigSources,
 }
 
 pub(super) fn validate_selected_profile_host(
@@ -222,24 +224,58 @@ impl ParsedProjectConfig {
 }
 
 pub(super) fn read(path: &Path) -> Result<Option<ParsedProjectConfig>, SatelleError> {
-    if !path.exists() {
-        return Ok(None);
+    let mut merged: Option<ParsedProjectConfig> = None;
+    let mut sources = ConfigSources::default();
+    for document in config_includes::read(path, ConfigSourceKind::ProjectConfig)? {
+        sources.record(document.source.clone(), &document.value);
+        let higher = parse(&document.source.path, document.value)?;
+        merged = Some(match merged {
+            None => higher,
+            Some(mut base) => {
+                if higher.config.default_host.is_some() {
+                    base.config.default_host = higher.config.default_host;
+                }
+                if higher.config.model_alias.is_some() {
+                    base.config.model_alias = higher.config.model_alias;
+                }
+                if higher.config.provider_alias.is_some() {
+                    base.config.provider_alias = higher.config.provider_alias;
+                }
+                if higher.config.output_format.is_some() {
+                    base.config.output_format = higher.config.output_format;
+                }
+                if higher.default_profile.is_some() {
+                    base.default_profile = higher.default_profile;
+                }
+                for (alias, intent) in higher.config.hosts {
+                    match base.config.hosts.get_mut(&alias) {
+                        None => {
+                            base.config.hosts.insert(alias, intent);
+                        }
+                        Some(existing) => {
+                            if intent.transport.is_some() {
+                                existing.transport = intent.transport;
+                            }
+                            if let Some(timeouts) = intent.timeouts {
+                                existing.timeouts = Some(match existing.timeouts.take() {
+                                    Some(lower) => lower.merge(timeouts),
+                                    None => timeouts,
+                                });
+                            }
+                        }
+                    }
+                }
+                base
+            }
+        });
     }
+    if let Some(config) = &mut merged {
+        config.sources = sources;
+    }
+    Ok(merged)
+}
 
-    let raw = fs::read_to_string(path).map_err(|source| SatelleError {
-        code: ErrorCode::ConfigNotFound,
-        message: format!("could not read config file {}", path.display()),
-        recovery_command: Some("satelle setup --host local-demo --dry-run".to_string()),
-        source_detail: Some(source.to_string()),
-        details: BTreeMap::new(),
-    })?;
-    let mut value = toml::from_str::<toml::Value>(&raw).map_err(|source| {
-        SatelleError::config_error(
-            format!("could not parse config file {}", path.display()),
-            Some(source.to_string()),
-        )
-    })?;
-
+fn parse(path: &Path, mut value: toml::Value) -> Result<ParsedProjectConfig, SatelleError> {
     let profile_data = profiles::extract_profile_data(path, &mut value, false)?;
     reject_config_composition(path, &value)?;
     reject_interpolation(path, &value)?;
@@ -254,10 +290,11 @@ pub(super) fn read(path: &Path) -> Result<Option<ParsedProjectConfig>, SatelleEr
         )
     })?;
 
-    Ok(Some(ParsedProjectConfig {
+    Ok(ParsedProjectConfig {
         config,
         default_profile: profile_data.default_profile,
-    }))
+        sources: ConfigSources::default(),
+    })
 }
 
 fn reject_forbidden_keys(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {

@@ -4,7 +4,500 @@ use std::fs;
 #[path = "support/config-fixture.rs"]
 mod config_fixture;
 
-use config_fixture::{ConfigFixture, assert_same_file, parse_json};
+use config_fixture::{ConfigFixture, assert_same_file, parse_json, test_file};
+
+#[test]
+fn includes_preserve_order_source_boundaries_and_exact_field_origins() {
+    let fixture = ConfigFixture::new(
+        "include = [\"first.toml\", \"last.toml\"]\ncommand_history = false\n",
+        "include = [\"shared.toml\"]\n",
+    );
+    let user_root = fixture.user_config_path().parent().unwrap();
+    test_file::write_user_controlled(
+        &user_root.join("first.toml"),
+        r#"
+log_verbosity = "info"
+command_history = true
+[profiles.work]
+log_verbosity = "trace"
+[hosts.included]
+transport = "local"
+adapter = "fake"
+"#,
+    )
+    .unwrap();
+    test_file::write_user_controlled(&user_root.join("last.toml"), "log_verbosity = \"debug\"\n")
+        .unwrap();
+    let shared = fixture
+        .resolved_project_config()
+        .parent()
+        .unwrap()
+        .join("shared.toml");
+    fs::write(&shared, "output_format = \"json\"\n").unwrap();
+
+    let output = fixture
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&output.stdout);
+    assert_eq!(report["effective"]["log_verbosity"], "debug");
+    assert_eq!(report["effective"]["command_history"], false);
+    assert_eq!(report["effective"]["output_format"], "json");
+    assert_eq!(report["checked_files"].as_array().unwrap().len(), 5);
+    assert_same_file(
+        &report["sources"]["values"]["log_verbosity"]["config_file"],
+        &user_root.join("last.toml"),
+    );
+    assert_same_file(
+        &report["sources"]["values"]["command_history"]["config_file"],
+        fixture.user_config_path(),
+    );
+    assert_same_file(
+        &report["sources"]["values"]["output_format"]["config_file"],
+        &shared,
+    );
+    assert_eq!(
+        report["sources"]["values"]["output_format"]["source"],
+        "project_config"
+    );
+    assert_same_file(
+        &report["sources"]["files"][0]["parent"],
+        fixture.user_config_path(),
+    );
+
+    let profile = fixture
+        .command()
+        .args(["config", "explain", "--profile", "work", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let profile = parse_json(&profile.stdout);
+    assert_eq!(profile["effective"]["log_verbosity"], "trace");
+    assert_eq!(
+        profile["sources"]["values"]["log_verbosity"]["toml_path"],
+        "profiles.work.log_verbosity"
+    );
+    assert_same_file(
+        &profile["sources"]["values"]["log_verbosity"]["config_file"],
+        &user_root.join("first.toml"),
+    );
+    fixture
+        .command()
+        .args(["config", "check", "--all", "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn nested_includes_resolve_from_the_declaring_file_and_parent_wins() {
+    let fixture = ConfigFixture::new("include = [\"nested/parent.toml\"]\n", "");
+    let nested = fixture.user_config_path().parent().unwrap().join("nested");
+    fs::create_dir(&nested).unwrap();
+    test_file::write_user_controlled(
+        &nested.join("parent.toml"),
+        "include = [\"child.toml\"]\nlog_verbosity = \"debug\"\n",
+    )
+    .unwrap();
+    test_file::write_user_controlled(
+        &nested.join("child.toml"),
+        "include = [\"../shared.toml\"]\nlog_verbosity = \"trace\"\n",
+    )
+    .unwrap();
+    test_file::write_user_controlled(
+        &nested.parent().unwrap().join("shared.toml"),
+        "command_history = false\n",
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&output.stdout);
+    assert_eq!(report["effective"]["log_verbosity"], "debug");
+    assert_same_file(
+        &report["sources"]["files"][0]["parent"],
+        &nested.join("child.toml"),
+    );
+    assert_same_file(
+        &report["sources"]["files"][1]["parent"],
+        &nested.join("parent.toml"),
+    );
+}
+
+#[test]
+fn literal_aliases_keep_distinct_origins_when_another_binding_is_replaced() {
+    let fixture = ConfigFixture::new(
+        r#"
+include = ["bindings.toml"]
+default_host = "office.shared"
+[hosts.office]
+transport = "local"
+adapter = "fake"
+"#,
+        "",
+    );
+    let bindings = fixture
+        .user_config_path()
+        .parent()
+        .unwrap()
+        .join("bindings.toml");
+    test_file::write_user_controlled(
+        &bindings,
+        r#"
+[hosts.office]
+transport = "local"
+adapter = "fake"
+desktop_user = "replaced"
+[hosts."office.shared"]
+transport = "local"
+adapter = "fake"
+"#,
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&output.stdout);
+    assert_same_file(
+        &report["sources"]["values"]["hosts.\"office.shared\".adapter"]["config_file"],
+        &bindings,
+    );
+    assert_same_file(
+        &report["sources"]["values"]["hosts.office.adapter"]["config_file"],
+        fixture.user_config_path(),
+    );
+    assert!(
+        report["sources"]["values"]
+            .get("hosts.office.desktop_user")
+            .is_none()
+    );
+    assert!(report["effective"]["hosts"]["office"]["desktop_user"].is_null());
+}
+
+#[test]
+fn setup_persists_desktop_selection_in_the_include_that_owns_the_binding() {
+    let root_config = "include = [\"binding.toml\"]\ndefault_host = \"local-demo\"\n";
+    let fixture = ConfigFixture::new(root_config, "");
+    let binding = fixture
+        .user_config_path()
+        .parent()
+        .unwrap()
+        .join("binding.toml");
+    test_file::write_user_controlled(
+        &binding,
+        r#"
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+"#,
+    )
+    .unwrap();
+    fixture
+        .command()
+        .args([
+            "setup",
+            "--host",
+            "local-demo",
+            "--component",
+            "desktop",
+            "--no-input",
+            "--yes",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(fixture.user_config_path()).unwrap(),
+        root_config
+    );
+    let persisted: toml::Value = toml::from_str(&fs::read_to_string(&binding).unwrap()).unwrap();
+    assert_eq!(
+        persisted["hosts"]["local-demo"]["desktop_user"].as_str(),
+        Some("local-demo-user")
+    );
+    fixture
+        .command()
+        .args(["config", "check", "--all", "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn include_cycles_and_paths_outside_the_source_are_typed_errors() {
+    let fixture = ConfigFixture::new("include = [\"cycle.toml\"]\n", "");
+    let cycle = fixture
+        .user_config_path()
+        .parent()
+        .unwrap()
+        .join("cycle.toml");
+    test_file::write_user_controlled(&cycle, "include = [\"user-config.toml\"]\n").unwrap();
+    let output = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    let error = parse_json(&output.stderr);
+    assert_eq!(error["code"], "config-include-cycle");
+    assert_eq!(
+        error["details"]["include_chain"].as_array().unwrap().len(),
+        3
+    );
+
+    fixture.write_user_config("");
+    fs::write(
+        fixture
+            .resolved_project_config()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("outside.toml"),
+        "",
+    )
+    .unwrap();
+    fixture.write_project_config("include = [\"../outside.toml\"]\n");
+    let output = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&output.stderr)["code"],
+        "config-include-outside-source"
+    );
+}
+
+#[test]
+fn includes_validate_overridden_files_and_reject_project_owned_credentials() {
+    let fixture = ConfigFixture::new(
+        "include = [\"invalid.toml\"]\nlog_verbosity = \"info\"\n",
+        "",
+    );
+    let invalid = fixture
+        .user_config_path()
+        .parent()
+        .unwrap()
+        .join("invalid.toml");
+    test_file::write_user_controlled(&invalid, "log_verbosity = \"not-a-level\"\n").unwrap();
+    fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66);
+    fixture.write_user_config("");
+    fixture.write_project_config("include = [\"secret.toml\"]\n");
+    fs::write(
+        fixture
+            .resolved_project_config()
+            .parent()
+            .unwrap()
+            .join("secret.toml"),
+        "[hosts.office.provider_auth]\nprovider = { kind = \"env\", name = \"INCLUDE_CANARY\" }\n",
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&output.stderr)["code"],
+        "project-secret-source-not-allowed"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("INCLUDE_CANARY"));
+}
+
+#[test]
+fn include_entries_reject_missing_files_globs_urls_and_shell_syntax() {
+    let fixture = ConfigFixture::new("", "");
+    test_file::write_user_controlled(
+        &fixture
+            .user_config_path()
+            .parent()
+            .unwrap()
+            .join("%HOME%.toml"),
+        "",
+    )
+    .unwrap();
+    for entry in [
+        "missing.toml",
+        "*.toml",
+        "https://example.test/config.toml",
+        "~/config.toml",
+        "$HOME/config.toml",
+        "%HOME%.toml",
+    ] {
+        fixture.write_user_config(&format!(
+            "include = [{}]\n",
+            serde_json::to_string(entry).unwrap()
+        ));
+        let output = fixture
+            .command()
+            .args(["config", "check", "--json"])
+            .assert()
+            .code(66)
+            .get_output()
+            .clone();
+        assert_eq!(
+            parse_json(&output.stderr)["code"],
+            "config-include-invalid",
+            "{entry}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn includes_reject_symlinks_even_when_the_target_is_inside_the_source() {
+    let fixture = ConfigFixture::new("include = [\"linked.toml\"]\n", "");
+    let root = fixture.user_config_path().parent().unwrap();
+    test_file::write_user_controlled(&root.join("regular.toml"), "").unwrap();
+    std::os::unix::fs::symlink(root.join("regular.toml"), root.join("linked.toml")).unwrap();
+    let output = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert_eq!(parse_json(&output.stderr)["code"], "config-include-invalid");
+}
+
+#[test]
+fn expired_trusted_profiles_are_explainable_but_cannot_authorize_maintenance() {
+    let fixture = ConfigFixture::new(
+        r#"
+include = ["consent.toml"]
+profile = "maintenance"
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+[profiles.maintenance]
+trusted_profile = "limited"
+"#,
+        "",
+    );
+    let consent = fixture
+        .user_config_path()
+        .parent()
+        .unwrap()
+        .join("consent.toml");
+    test_file::write_user_controlled(
+        &consent,
+        r#"
+[trusted_profiles.limited]
+hosts = ["local-demo"]
+command_families = ["setup", "repair", "host_update", "self_update_remotes", "doctor_fix"]
+expires_at = "2000-01-01T00:00:00Z"
+"#,
+    )
+    .unwrap();
+    let explained = fixture
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let explained = parse_json(&explained.stdout);
+    let grant = &explained["values"]["noninteractive_mutation_consent"];
+    assert_eq!(grant["trusted_profile"]["expiration_state"], "expired");
+    assert_eq!(grant["command_families"]["setup"]["active"], false);
+    assert_same_file(&grant["trusted_profile"]["source"]["config_file"], &consent);
+    for args in [
+        vec!["config", "check", "--json"],
+        vec!["setup", "--no-input", "--json"],
+        vec!["repair", "--no-input", "--json"],
+        vec!["host", "update", "--no-input", "--json"],
+    ] {
+        let output = fixture
+            .command()
+            .args(args)
+            .assert()
+            .code(66)
+            .get_output()
+            .clone();
+        assert_eq!(
+            parse_json(&output.stderr)["code"],
+            "trusted-profile-expired"
+        );
+    }
+    fixture
+        .command()
+        .args(["setup", "--dry-run", "--no-input", "--json"])
+        .assert()
+        .success();
+    let explicit = fixture
+        .command()
+        .args(["setup", "--yes", "--no-input", "--json"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&explicit.stderr).contains("trusted-profile-expired"));
+}
+
+#[test]
+fn trusted_profile_expiration_is_explicit_and_all_checks_unselected_grants() {
+    let fixture = ConfigFixture::new(
+        r#"
+[profiles.work]
+trusted_profile = "durable"
+[trusted_profiles.durable]
+hosts = ["local-demo"]
+command_families = ["setup"]
+[trusted_profiles.expired]
+hosts = ["local-demo"]
+command_families = ["setup"]
+expires_at = "2000-01-01T00:00:00Z"
+"#,
+        "",
+    );
+    fixture
+        .command()
+        .args(["config", "check", "--profile", "work", "--json"])
+        .assert()
+        .success();
+    let output = fixture
+        .command()
+        .args(["config", "check", "--all", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&output.stderr)["code"],
+        "trusted-profile-expired"
+    );
+    let output = fixture
+        .command()
+        .args(["config", "explain", "--profile", "work", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&output.stdout)["values"]["noninteractive_mutation_consent"]["trusted_profile"]
+            ["expiration_state"],
+        "absent"
+    );
+}
 
 #[test]
 fn global_profile_overlays_merged_config_and_selected_host() {

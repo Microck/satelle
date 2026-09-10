@@ -47,7 +47,7 @@ subtle = "2.6.1"
 tempfile = "3.23.0"
 tar = "0.4.44"
 thiserror = "2.0.17"
-time = { version = "0.3.44", features = ["formatting", "parsing", "serde"] }
+time = { version = "0.3.44", features = ["formatting", "parsing", "serde", "serde-well-known"] }
 tokio = { version = "1.52.3", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26.4"
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }

@@ -51,6 +51,25 @@ not change SQLite log retention.
 The duration parser requires explicit units such as `500ms`, `30s`, or `2m`.
 Configuration does not perform environment-variable interpolation.
 
+## Explicit includes
+
+Declare `include = ["hosts.toml", "profiles.toml"]` at the top of a config file.
+Paths resolve relative to that file. Included files must be regular `.toml`
+files inside the top-level config directory, or inside `.satelle` for project
+configuration. Symlinks, globs, URLs, shell syntax, cycles, more than 64 levels,
+and more than 256 loaded files are rejected.
+
+Files apply in list order, then the including file applies last. User Host
+Bindings, named profiles, and Trusted Profiles replace complete definitions;
+included Host Bindings must supply their required fields. Project includes
+keep the project schema and cannot define credentials, trusted consent, or
+desktop authority. Every file is validated, including overridden definitions.
+
+`config check` lists all checked files. `config explain --json` also reports
+each file's parent and the exact file and TOML path behind each configured
+value in `sources.files` and `sources.values`. These commands do not resolve
+secret material.
+
 ## Named profiles
 
 Profiles can select a Host and overlay model, provider, timeouts, daemon idle
@@ -83,6 +102,14 @@ Select a profile with `--profile work`, `SATELLE_PROFILE=work`, or a config
 default. Source matters: environment or project selection cannot activate
 `yolo = true` or Trusted Profile consent. A Trusted Profile is never selected
 implicitly by a same-name profile.
+
+A Trusted Profile may set `expires_at = "2027-01-01T00:00:00Z"`. Use a quoted
+RFC 3339 UTC timestamp. At that instant the grant expires. Omit `expires_at`
+for a grant that lasts until you edit or remove it; Satelle never invents an
+expiry. `config check --all` checks every Trusted Profile, and `config explain`
+reports `absent`, `active`, or `expired`. An expired grant cannot authorize a
+mutation. Use explicit command consent or interactive confirmation, or review
+the expiry in the user file that defines it.
 
 Diagnostic verbosity accepts `off`, `info`, `debug`, or `trace`. Precedence is
 `--log-verbosity`, then `SATELLE_LOG`, then profile and user configuration.
