@@ -1,7 +1,7 @@
 'use client';
 
 import * as React from 'react';
-import { DEVICES, PLAYBACK_RATE, TIMING, devicePoint, layout, networkFrame, pointOnSignal, signalPath, smooth, type DeviceShape, type NetworkFrame } from './network-model';
+import { DEVICES, PLAYBACK_RATE, TIMING, devicePoint, layout, networkFrame, pointOnSignal, signalPath, type DeviceShape, type NetworkFrame } from './network-model';
 import './device-network.css';
 
 type State = { elapsed: number; compact: boolean; running: boolean; reduced: boolean };
@@ -102,15 +102,17 @@ export default class DeviceNetwork extends React.Component<Record<string, never>
   render() {
     const { elapsed, compact, running, reduced } = this.state;
     const frame = networkFrame(elapsed), box = layout(compact);
-    const path = signalPath(frame.sender, elapsed, compact);
-    const pulse = pointOnSignal(path, frame.signal);
-    const trail = pointOnSignal(path, Math.max(0, frame.signal - 0.055));
+    const sourcePath = signalPath(frame.sender, elapsed, compact);
+    const path = frame.acknowledging ? reverseSignal(sourcePath) : sourcePath;
+    const activeProgress = frame.acknowledging ? frame.ackSignal : frame.signal;
+    const pulse = pointOnSignal(path, activeProgress);
+    const signalOpacity = frame.sending ? frame.signalFade : frame.acknowledging ? frame.ackFade : 0;
     return <div className="dn-block" ref={node => { this.root = node; }}
       role="button" tabIndex={0} aria-label={`${running ? 'Pause' : 'Play'} device network animation`}
       aria-describedby="device-network-description" aria-keyshortcuts="Space Enter R"
       onClick={this.toggle} onKeyDown={this.keyDown}
       data-device-network="" data-playing={running} data-reduced={reduced} data-compact={compact}
-      data-elapsed={Math.round(elapsed)} data-cycle={frame.cycle} data-phase={frame.phase} data-sender={DEVICES[frame.sender].id}
+      data-elapsed={Math.round(elapsed)} data-cycle={frame.cycle} data-phase={frame.phase} data-sender={DEVICES[frame.sender].id} data-ack-sender={DEVICES[frame.sender].id} data-ack-progress={frame.ackSignal.toFixed(4)} data-ack-effect={frame.ackEffect.toFixed(4)}
       title="Click or press Space to pause/play. Press R to replay.">
       <span className="dn-sr" id="device-network-description">Illustration: different Controller computers send one task at a time to a configured Host. The laptop turns red, works, and returns to idle while keeping its Session. macOS, Windows and Linux Controllers are supported. Native Hosts require live readiness; this is not universal device support. Click, Space or Enter toggles playback. R restarts.</span>
       <div className="dn-corner" aria-hidden="true"><span className="dn-corner-dot" />CONTROLLER → HOST</div>
@@ -118,31 +120,37 @@ export default class DeviceNetwork extends React.Component<Record<string, never>
         <ellipse className="dn-orbit" cx={box.cx} cy={box.cy} rx={box.rx} ry={box.ry} />
         <ellipse className="dn-orbit dn-orbit-inner" cx={box.cx} cy={box.cy} rx={box.rx - 36} ry={box.ry - 23} />
         {DEVICES.map((device, i) => <path key={device.id} className="dn-route" d={signalPath(i, elapsed, compact).d} />)}
-        <path className="dn-active-route" d={path.d} opacity={frame.sending ? 0.48 : 0} />
-        <g className="dn-signal" data-signal="" data-visible={frame.sending} opacity={frame.sending ? 1 : 0}>
-          <path d={`M ${trail.x} ${trail.y} L ${pulse.x} ${pulse.y}`} />
-          <circle cx={pulse.x} cy={pulse.y} r={compact ? 4.2 : 3.6} />
+        <path className="dn-active-route" d={path.d} opacity={signalOpacity * 0.46} />
+        <g className="dn-signal" data-signal="" data-visible={frame.sending || frame.acknowledging} data-direction={frame.acknowledging ? "return" : "outgoing"} opacity={signalOpacity}>
+          <path className="dn-signal-trace" d={path.d} pathLength={1} strokeDasharray=".2 .8" strokeDashoffset={1 - activeProgress} />
+          <circle className="dn-signal-halo" cx={pulse.x} cy={pulse.y} r={compact ? 11 : 9} />
+          <circle className="dn-signal-dot" cx={pulse.x} cy={pulse.y} r={compact ? 4.2 : 3.6} />
         </g>
         {DEVICES.map((device, i) => {
           const point = devicePoint(i, elapsed, compact);
           return <g key={device.id} data-network-device={device.id} transform={`translate(${point.x} ${point.y}) rotate(${point.tilt}) scale(${box.deviceScale})`}>
-            <Device shape={device.shape} selected={i === frame.sender && frame.sending} />
+            <Device shape={device.shape} selected={i === frame.sender && frame.sending} acknowledged={i === frame.sender && frame.ackEffect > 0} />
           </g>;
         })}
         <g transform={`translate(${box.cx} ${box.cy}) scale(${box.hostScale})`}>
           <Host frame={frame} />
         </g>
       </svg>
-      <div className="dn-host-caption" aria-hidden="true"><strong>Your Host</strong><span data-active={frame.heat > 0}>{frame.phase === 'working' ? 'Working' : frame.phase === 'receiving' ? 'Receiving' : frame.phase === 'complete' ? 'Task complete' : 'Ready for the next task'}</span></div>
-      <span className="dn-sr" role="status" aria-live={running ? 'off' : 'polite'}>{frame.phase === 'working' ? 'The Host is working.' : 'The Host is waiting.'}</span>
+      <div className="dn-host-caption" aria-hidden="true"><strong>Your Host</strong><span data-active={frame.heat > 0}>{frame.phase === 'working' ? 'Working' : frame.phase === 'receiving' ? 'Receiving' : frame.phase === 'complete' ? 'Task complete' : frame.phase === 'acknowledging' ? 'Confirming' : frame.phase === 'cooling' ? 'Cooling down' : 'Ready for the next task'}</span></div>
+      <span className="dn-sr" role="status" aria-live={running ? 'off' : 'polite'}>{frame.phase === 'working' ? 'The Host is working.' : frame.phase === 'acknowledging' ? 'The Host is confirming completion.' : 'The Host is waiting.'}</span>
     </div>;
   }
 }
 
+function reverseSignal(path: ReturnType<typeof signalPath>) {
+  return { ...path, a: path.b, b: path.a, d: 'M ' + path.b.x + ' ' + path.b.y + ' Q ' + path.control.x + ' ' + path.control.y + ' ' + path.a.x + ' ' + path.a.y };
+}
+
 /** Desktop-class silhouettes only: these do not advertise a mobile app,
  * phone Host, arbitrary server desktop, or automatic discovery. */
-function Device({ shape, selected }: { shape: DeviceShape; selected: boolean }) {
-  return <g className="dn-device" data-selected={selected}>
+function Device({ shape, selected, acknowledged }: { shape: DeviceShape; selected: boolean; acknowledged: boolean }) {
+  return <g className="dn-device" data-selected={selected} data-acknowledged={acknowledged}>
+    {acknowledged && <ellipse className="dn-ack-ring" cx="0" cy="0" rx="52" ry="45" />}
     {shape === 'laptop' || shape === 'notebook' ? <>
       <rect x="-35" y="-32" width="70" height="46" rx="4" />
       <rect className="dn-device-screen" x="-29" y="-26" width="58" height="34" rx="1.5" />
@@ -180,7 +188,7 @@ function Device({ shape, selected }: { shape: DeviceShape; selected: boolean }) 
 
 function Host({ frame }: { frame: NetworkFrame }) {
   const p = frame.progress;
-  const complete = frame.phase === 'complete';
+  const complete = frame.progress >= 1;
   const echo = frame.phase === 'receiving' ? (frame.local - TIMING.arrive) / (TIMING.work - TIMING.arrive) : 1;
   return <g className="dn-host" data-network-host="" data-heat={frame.heat.toFixed(4)} data-working={frame.working} data-progress={p.toFixed(4)}>
     <ellipse className="dn-host-ground" cx="0" cy="89" rx="163" ry="15" />

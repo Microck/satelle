@@ -30,7 +30,7 @@ try {
   const positions = await block.locator('[data-network-device]').evaluateAll(xs=>xs.map(x=>x.getAttribute('transform')));
   const initialPixels = await block.screenshot();
   await page.evaluate(()=>{
-    const evidence={errors:[],senders:[],phases:[],workSamples:0,pulseSamples:0,idleSamples:0};
+    const evidence={errors:[],senders:[],acks:[],phases:[],workSamples:0,pulseSamples:0,ackSamples:0,coolingSamples:0,idleSamples:0};
     window.__deviceEvidence=evidence;
     function inspect(){
       const root=document.querySelector('[data-device-network]');if(!root)return;
@@ -43,6 +43,17 @@ try {
         evidence.pulseSamples++;
       }
       if(phase==='idle') {if(heat!==0||visible)evidence.errors.push('Idle Host remained active');evidence.idleSamples++;}
+      if(phase==='acknowledging') {
+        if(heat!==1||!visible)evidence.errors.push('Acknowledgment lost the active Host or pulse');
+        const target=root.querySelector(`[data-network-device="${root.dataset.sender}"] [data-acknowledged="true"]`);
+        if(Number(root.dataset.ackProgress)>0.8&&!target)evidence.errors.push('Return pulse reached the source without its acknowledgment effect');
+        if(target&&!evidence.acks.includes(root.dataset.sender))evidence.acks.push(root.dataset.sender);
+        evidence.ackSamples++;
+      }
+      if(phase==='cooling') {
+        if(visible||heat<0||heat>1)evidence.errors.push('Cooling phase ordering');
+        evidence.coolingSamples++;
+      }
       if(phase==='working') {
         if(heat!==1||host.dataset.working!=='true'||visible)evidence.errors.push('Work/arrival ordering');
         const fill=root.querySelector('.dn-progress-fill');
@@ -65,9 +76,10 @@ try {
   const proof=await page.evaluate(()=>{cancelAnimationFrame(window.__deviceRaf);return window.__deviceEvidence;});
   await writeFile(path.join(out,'sequence-proof.json'),JSON.stringify(proof,null,2));
   assert.deepEqual(proof.errors,[]);assert.equal(proof.senders.length,6);
-  for(const state of ['idle','sending','receiving','working','complete'])assert.ok(proof.phases.includes(state),state);
-  assert.ok(proof.pulseSamples>10&&proof.workSamples>10&&proof.idleSamples>10);
-  report.push('All six moving sources sent signals in order; the Host only turned red after arrival, advanced actual screen progress, completed, and returned to idle.');
+  for(const state of ['idle','sending','receiving','working','complete','acknowledging','cooling'])assert.ok(proof.phases.includes(state),state);
+  assert.equal(proof.acks.length,6,'Every Controller receives a completion acknowledgment');
+  assert.ok(proof.pulseSamples>10&&proof.workSamples>10&&proof.ackSamples>10&&proof.coolingSamples>10&&proof.idleSamples>10);
+  report.push('All six moving sources sent signals in order; the Host only turned red after arrival, advanced actual screen progress, completed, sent a confirmation pulse back to the source, and returned to idle.');
   report.push('Mouse pause and keyboard resume freeze/restart all motion together.');
   await page.evaluate(()=>scrollTo(0,0));await wait(200);
   assert.equal(await block.getAttribute('data-playing'),'false');
