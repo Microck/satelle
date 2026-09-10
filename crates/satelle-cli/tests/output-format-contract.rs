@@ -454,13 +454,14 @@ fn stop_json_v1_has_one_closed_contract_for_stopped_and_already_terminal_turns()
 }
 
 #[test]
-fn every_machine_readable_leaf_help_lists_only_mvp_formats() {
+fn every_machine_readable_leaf_help_lists_only_its_supported_formats() {
     for args in [
         vec!["setup", "--help"],
         vec!["repair", "--help"],
         vec!["doctor", "--help"],
         vec!["config", "check", "--help"],
         vec!["config", "explain", "--help"],
+        vec!["config", "repair", "--help"],
         vec!["paths", "--help"],
         vec!["host", "start", "--help"],
         vec!["host", "status", "--help"],
@@ -474,14 +475,27 @@ fn every_machine_readable_leaf_help_lists_only_mvp_formats() {
         vec!["steer", "--help"],
         vec!["status", "--help"],
         vec!["stop", "--help"],
-        vec!["logs", "--help"],
+        vec!["skills", "get", "--help"],
+        vec!["skills", "path", "--help"],
+        vec!["mcp", "install", "--help"],
         vec!["support", "bundle", "--help"],
     ] {
         let output = satelle().args(args).assert().success().get_output().clone();
         let help = String::from_utf8_lossy(&output.stdout);
         assert!(help.contains("--format <FORMAT>"));
         assert!(help.contains("--json"));
-        assert!(help.contains("[possible values: human, json]"));
+        assert!(help.contains("[possible values: human, json, compact-json, toon, markdown]"));
+    }
+
+    for (args, formats) in [
+        (vec!["logs", "--help"], "[possible values: human, json]"),
+        (
+            vec!["skills", "list", "--help"],
+            "[possible values: human, json, compact-json, toon, markdown, csv]",
+        ),
+    ] {
+        let output = satelle().args(args).assert().success().get_output().clone();
+        assert!(String::from_utf8_lossy(&output.stdout).contains(formats));
     }
 
     for args in [
@@ -496,5 +510,141 @@ fn every_machine_readable_leaf_help_lists_only_mvp_formats() {
         let help = String::from_utf8_lossy(&output.stdout);
         assert!(!help.contains("--format"));
         assert!(!help.contains("--json"));
+    }
+}
+
+#[test]
+fn compact_and_markdown_results_recover_the_complete_canonical_value() {
+    let state = state_dir();
+    for command in [vec!["paths"], vec!["skills", "get", "satelle"]] {
+        let canonical = satelle()
+            .env("SATELLE_HOME", state.path())
+            .args(&command)
+            .args(["--json"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        for format in ["compact-json", "markdown"] {
+            let output = satelle()
+                .env("SATELLE_HOME", state.path())
+                .args(&command)
+                .args(["--format", format])
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            assert!(output.stderr.is_empty());
+            let text = std::str::from_utf8(&output.stdout).unwrap();
+            let json = if format == "markdown" {
+                text.strip_prefix("```json\n")
+                    .unwrap()
+                    .strip_suffix("\n```\n")
+                    .unwrap()
+            } else {
+                assert_eq!(text.lines().count(), 1);
+                text.strip_suffix('\n').unwrap()
+            };
+            assert_eq!(parse_json(json.as_bytes()), parse_json(&canonical.stdout));
+        }
+    }
+}
+
+#[test]
+fn skill_list_exposes_the_declared_toon_and_csv_reports() {
+    let toon = satelle()
+        .args(["skills", "list", "--format", "toon"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(toon.stderr.is_empty());
+    let toon = std::str::from_utf8(&toon.stdout).unwrap();
+    assert!(toon.contains("schema_version: satelle.skills.list.v1\n"));
+    assert!(toon.contains("skills[4]{description,name}:\n"));
+    assert!(!toon.contains("\u{1b}"));
+
+    let csv = satelle()
+        .args(["skills", "list", "--format", "csv"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(csv.stderr.is_empty());
+    let csv = std::str::from_utf8(&csv.stdout).unwrap();
+    let rows = csv.split("\r\n").collect::<Vec<_>>();
+    assert_eq!(rows[0], "schema_version,bundle_version,name,description");
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[5], "");
+    for (row, name) in
+        rows[1..5]
+            .iter()
+            .zip(["satelle", "satelle-setup", "satelle-use", "satelle-recover"])
+    {
+        assert!(row.starts_with(&format!(
+            "\"satelle.skills.list.v1\",\"{}\",\"{name}\",",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+}
+
+#[test]
+fn structured_formats_keep_typed_errors_and_event_conflicts() {
+    for format in ["json", "compact-json", "toon", "markdown"] {
+        let state = state_dir();
+        let output = satelle()
+            .env("SATELLE_HOME", state.path())
+            .args(["paths", "--format", format, "--unknown"])
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        assert_error_keys(&parse_json(&output.stderr));
+        assert!(!state.path().join("state").exists());
+        assert_output_conflict(
+            &["run", "--format", format, "--events", "json", "task"],
+            true,
+        );
+        assert_output_conflict(
+            &[
+                "steer",
+                "rs_invalid",
+                "--format",
+                format,
+                "--events",
+                "json",
+                "task",
+            ],
+            true,
+        );
+        assert_output_conflict(&["doctor", "--format", format, "--events"], true);
+        assert_output_conflict(&["paths", "--format", format, "--json"], true);
+    }
+}
+
+#[test]
+fn unsupported_formats_fail_before_configuration_or_host_access() {
+    for command in [
+        vec!["logs", "--format", "compact-json"],
+        vec!["logs", "--format", "toon"],
+        vec!["logs", "--format", "markdown"],
+        vec!["logs", "--format", "csv"],
+        vec!["paths", "--format", "csv"],
+        vec!["skills", "get", "satelle", "--format", "csv"],
+    ] {
+        let state = state_dir();
+        let output = satelle()
+            .env("SATELLE_HOME", state.path())
+            .env("SATELLE_CONFIG_FILE", state.path().join("missing.toml"))
+            .args(["--error-format", "json"])
+            .args(command)
+            .assert()
+            .code(64)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty());
+        assert_eq!(parse_json(&output.stderr)["code"], "invalid-usage");
+        assert!(!state.path().join("state").exists());
     }
 }

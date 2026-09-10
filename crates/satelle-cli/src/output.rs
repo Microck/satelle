@@ -1,8 +1,13 @@
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{ArgMatches, Args, ValueEnum};
 use satelle_core::session::{PublicSession, PublicTurn, TurnState};
-use satelle_core::{SatelleError, SessionId};
+use satelle_core::{ErrorCode, SatelleError, SessionId};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use time::OffsetDateTime;
+
+#[path = "output-toon.rs"]
+mod toon;
 
 use super::{
     Command, ConfigCommand, EventMode, HostCommand, HostStorageBackupCommand, HostStorageCommand,
@@ -13,6 +18,10 @@ use super::{
 pub(crate) enum OutputFormat {
     Human,
     Json,
+    CompactJson,
+    Toon,
+    Markdown,
+    Csv,
 }
 
 pub(crate) const CONFIG_REPAIR_SCHEMA_VERSION: &str = "satelle.config.repair.v1";
@@ -61,16 +70,81 @@ impl<'a> StatusReport<'a> {
 }
 
 impl OutputFormat {
-    pub(crate) const fn is_json(self) -> bool {
-        matches!(self, Self::Json)
+    pub(crate) const FINAL: [Self; 5] = [
+        Self::Human,
+        Self::Json,
+        Self::CompactJson,
+        Self::Toon,
+        Self::Markdown,
+    ];
+    pub(crate) const STREAM: [Self; 2] = [Self::Human, Self::Json];
+
+    pub(crate) fn parser(formats: &[Self]) -> impl TypedValueParser<Value = Self> {
+        PossibleValuesParser::new(
+            formats
+                .iter()
+                .map(|format| {
+                    format
+                        .to_possible_value()
+                        .expect("every output format has a CLI value")
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map(|value| {
+            Self::from_str(&value, false).expect("the parser accepts only declared output formats")
+        })
     }
+
+    pub(crate) const fn is_structured(self) -> bool {
+        !matches!(self, Self::Human)
+    }
+
+    pub(crate) fn print(self, value: &impl Serialize) -> Result<(), SatelleError> {
+        self.write(&mut std::io::stdout().lock(), value)
+    }
+
+    fn write(self, writer: &mut impl Write, value: &impl Serialize) -> Result<(), SatelleError> {
+        let encoded = match self {
+            Self::Json => return write_json(writer, value),
+            Self::CompactJson => serde_json::to_string(value),
+            Self::Markdown => {
+                serde_json::to_string_pretty(value).map(|json| format!("```json\n{json}\n```"))
+            }
+            Self::Toon => serde_json::to_value(value).map(|value| toon::encode(&value)),
+            Self::Human | Self::Csv => {
+                return Err(SatelleError::invalid_usage(
+                    "the selected format requires its command-specific renderer",
+                ));
+            }
+        }
+        .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
+        writeln!(writer, "{encoded}")
+            .map_err(|error| SatelleError::invalid_usage(error.to_string()))
+    }
+}
+
+fn write_json(writer: &mut impl Write, value: &impl Serialize) -> Result<(), SatelleError> {
+    serde_json::to_writer_pretty(&mut *writer, value).map_err(|source| SatelleError {
+        code: ErrorCode::InvalidUsage,
+        message: "could not serialize JSON output".to_string(),
+        recovery_command: None,
+        source_detail: Some(source.to_string()),
+        details: std::collections::BTreeMap::new(),
+    })?;
+    writeln!(writer).map_err(|source| SatelleError {
+        code: ErrorCode::InvalidUsage,
+        message: "could not write JSON output".to_string(),
+        recovery_command: None,
+        source_detail: Some(source.to_string()),
+        details: std::collections::BTreeMap::new(),
+    })
 }
 
 #[derive(Args, Clone, Copy, Debug, Default)]
 pub(crate) struct OutputArgs {
     // Preserve omission separately from explicit human output because JSON event streams conflict
     // with every explicit final-result selector, including `--format human`.
-    #[arg(long, value_enum, value_name = "FORMAT")]
+    #[arg(long, value_parser = OutputFormat::parser(&OutputFormat::FINAL), value_name = "FORMAT")]
     format: Option<OutputFormat>,
 
     #[arg(long, help = "Alias for --format json")]
@@ -144,7 +218,7 @@ impl Command {
 
     pub(super) fn requests_machine_errors(&self) -> bool {
         let (output, events) = self.output_request();
-        output.requests_json() || events.requests_json_errors()
+        output.requests_machine() || events.requests_json_errors()
     }
 }
 
@@ -192,7 +266,7 @@ fn parsed_output_selector(matches: &ArgMatches) -> bool {
             .try_get_one::<OutputFormat>("format")
             .ok()
             .flatten()
-            .is_some_and(|format| *format == OutputFormat::Json)
+            .is_some_and(|format| format.is_structured())
 }
 
 impl ConfigCommand {
@@ -329,8 +403,8 @@ impl OutputArgs {
         })
     }
 
-    pub(crate) const fn requests_json(self) -> bool {
-        self.json || matches!(self.format, Some(OutputFormat::Json))
+    pub(crate) const fn requests_machine(self) -> bool {
+        self.json || matches!(self.format, Some(format) if format.is_structured())
     }
 
     pub(crate) const fn is_explicit(self) -> bool {
@@ -403,7 +477,7 @@ mod tests {
 
     #[test]
     fn explicit_final_output_conflicts_with_other_final_or_streaming_selectors() {
-        for format in [OutputFormat::Human, OutputFormat::Json] {
+        for &format in OutputFormat::value_variants() {
             let alias_conflict = args(Some(format), true)
                 .resolve(EventOutput::None)
                 .expect_err("the alias and canonical selector must conflict");

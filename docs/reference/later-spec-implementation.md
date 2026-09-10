@@ -23,8 +23,8 @@ those pull requests merge, the integration branch gets a final pull request to
 | Host storage | Safe path-set migration | Pending |
 | API token lifecycle | Durable issuance, rotation, revocation, and one-time secret replies | Merged in PR #224 |
 | Transport authentication | Mutual TLS | Pending |
-| Native package repair | Launcher repair through the detected installation owner | Box verified; pull request pending |
-| Output formats | Lossless output formats | Pending |
+| Native package repair | Launcher repair through the detected installation owner | Merged in PR #225 |
+| Output formats | Lossless final results and fixed-column CSV | Box verified; pull request pending |
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit, diagnostic bundles | Pending |
 | Capture and observability | Raw protocol/subprocess exports, desktop snapshot, recording, native log sinks, telemetry | Pending |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
@@ -220,8 +220,10 @@ checks on all six targets. Its existing Windows log-cursor test passed on rerun.
 
 Box passed the native launcher and real npm, pnpm, and Bun repair tests,
 including package restoration, dry-run behavior, and validation failures. All
-66 release-packaging tests and generated documentation checks passed. Native
-pull request checks remain pending.
+66 release-packaging tests and generated documentation checks passed. PR #225
+passed Rust and npm checks on Linux, macOS, and Windows, documentation validation,
+and release installation checks on all six targets. Its existing macOS oversized
+request test passed on rerun.
 
 - `satelle native repair` runs in the JavaScript launcher before native binary
   resolution. It repairs the current platform package at the exact launcher
@@ -236,3 +238,27 @@ pull request checks remain pending.
   matching `SHA256SUMS` entry. A package-manager exit alone is insufficient.
 - Package assembly, prepack checks, and release archive validation bind the
   checksum to the same executable bytes that passed target validation.
+
+## Output format decisions
+
+Box passed all 592 active CLI unit tests, 10 output-contract tests, the pinned
+TOON reference check, workspace Clippy, and 58 documentation examples. Native
+pull request checks remain pending. The inline simplification review preserved
+the existing streaming JSON writer and error diagnostics; no new dead code
+remains.
+
+- Public commands with one final result accept compact JSON, TOON, and Markdown
+  through the existing `--format` selector. The format is carried to the final
+  presentation boundary; event streams and private subprocess protocols retain
+  their existing record shapes.
+- Compact JSON serializes the same report without indentation. Markdown wraps
+  the complete pretty JSON report in a fenced block, preserving nested values.
+- TOON follows the 4.1 specification, with two-space indentation, comma
+  delimiters, escaped C0 controls, and exact 64-bit integers. Its local encoder
+  does not change JSON serialization features or persistent payload ordering.
+  Shared fixtures compare the Rust encoder with the pinned upstream JavaScript
+  reference, including nested tables, strings, controls, and empty containers.
+- Only `skills list` exposes CSV. Its four-column contract repeats the schema
+  and bundle versions on every row and retains every skill name and description.
+- All structured formats share JSON's consent, event, error, and exit policy.
+  Command-specific parsers reject unsupported formats before loading config.

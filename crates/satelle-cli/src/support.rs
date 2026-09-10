@@ -3,7 +3,7 @@ use super::read;
 use super::transport::transport_for;
 use super::{
     CliFailure, ConfigContext, SelectedHost, SupportBundleCommand, SupportCommand, failure,
-    print_json, redacted_config_json,
+    redacted_config_json,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -241,8 +241,8 @@ fn export_bundle(
         created_at,
     };
 
-    if format.is_json() {
-        print_json(&report).map_err(failure)
+    if format.is_structured() {
+        format.print(&report).map_err(failure)
     } else {
         println!("Status: {}", report.status);
         println!("Host: {}", report.host);

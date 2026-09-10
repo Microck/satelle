@@ -9,22 +9,31 @@ use std::fmt::Write as _;
 
 #[derive(Clone, Copy)]
 pub(crate) enum HostUpdateOutput {
-    Human,
-    Json,
+    Format(crate::output::OutputFormat),
     Plain,
 }
 
 impl HostUpdateOutput {
     pub(crate) fn from_cli(format: crate::output::OutputFormat, plain: bool) -> Self {
-        match (plain, format) {
-            (true, _) => Self::Plain,
-            (false, crate::output::OutputFormat::Json) => Self::Json,
-            (false, crate::output::OutputFormat::Human) => Self::Human,
+        if plain {
+            Self::Plain
+        } else {
+            Self::Format(format)
         }
     }
 
-    pub(crate) fn is_json(self) -> bool {
-        matches!(self, Self::Json)
+    pub(crate) fn is_structured(self) -> bool {
+        matches!(self, Self::Format(format) if format.is_structured())
+    }
+
+    pub(crate) fn print(
+        self,
+        value: &impl serde::Serialize,
+    ) -> Result<(), satelle_core::SatelleError> {
+        match self {
+            Self::Format(format) => format.print(value),
+            Self::Plain => unreachable!("plain Host updates have their own record renderer"),
+        }
     }
 
     pub(crate) fn is_plain(self) -> bool {

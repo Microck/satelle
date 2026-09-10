@@ -1,10 +1,10 @@
-use super::{
-    CliFailure, SkillNameCommand, SkillsCommand, SkillsOutputCommand, failure, print_json,
-};
+use super::output::OutputFormat;
+use super::{CliFailure, SkillNameCommand, SkillsCommand, failure};
 use satelle_core::{ErrorCode, SatelleError, resolve_path_set};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 const BUNDLE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -67,15 +67,15 @@ struct SkillPathReport<'a> {
     path: String,
 }
 
-pub(super) fn run(command: SkillsCommand) -> Result<(), CliFailure> {
+pub(super) fn run(command: SkillsCommand, format: OutputFormat) -> Result<(), CliFailure> {
     match command {
-        SkillsCommand::List(command) => list(command),
-        SkillsCommand::Get(command) => get(command),
-        SkillsCommand::Path(command) => path(command),
+        SkillsCommand::List(_) => list(format),
+        SkillsCommand::Get(command) => get(command, format),
+        SkillsCommand::Path(command) => path(command, format),
     }
 }
 
-fn list(command: SkillsOutputCommand) -> Result<(), CliFailure> {
+fn list(format: OutputFormat) -> Result<(), CliFailure> {
     let report = SkillListReport {
         schema_version: "satelle.skills.list.v1",
         bundle_version: BUNDLE_VERSION,
@@ -87,8 +87,12 @@ fn list(command: SkillsOutputCommand) -> Result<(), CliFailure> {
             })
             .collect(),
     };
-    if command.output_args.requests_json() {
-        return print_json(&report).map_err(failure);
+    if format == OutputFormat::Csv {
+        return write_list_csv(&mut std::io::stdout().lock(), &report)
+            .map_err(|error| io_failure("write bundled skill list", error));
+    }
+    if format.is_structured() {
+        return format.print(&report).map_err(failure);
     }
     println!("Satelle Agent Skill Bundle {BUNDLE_VERSION}");
     for skill in report.skills {
@@ -97,23 +101,24 @@ fn list(command: SkillsOutputCommand) -> Result<(), CliFailure> {
     Ok(())
 }
 
-fn get(command: SkillNameCommand) -> Result<(), CliFailure> {
+fn get(command: SkillNameCommand, format: OutputFormat) -> Result<(), CliFailure> {
     let skill = bundled_skill(&command.name)?;
-    if command.output_args.requests_json() {
-        return print_json(&SkillReport {
-            schema_version: "satelle.skills.get.v1",
-            bundle_version: BUNDLE_VERSION,
-            name: skill.name,
-            content: skill.source,
-        })
-        .map_err(failure);
+    if format.is_structured() {
+        return format
+            .print(&SkillReport {
+                schema_version: "satelle.skills.get.v1",
+                bundle_version: BUNDLE_VERSION,
+                name: skill.name,
+                content: skill.source,
+            })
+            .map_err(failure);
     }
     println!("Satelle Agent Skill Bundle {BUNDLE_VERSION}");
     print!("{}", skill.source);
     Ok(())
 }
 
-fn path(command: SkillNameCommand) -> Result<(), CliFailure> {
+fn path(command: SkillNameCommand, format: OutputFormat) -> Result<(), CliFailure> {
     let skill = bundled_skill(&command.name)?;
     let cwd =
         std::env::current_dir().map_err(|error| io_failure("read current directory", error))?;
@@ -124,16 +129,41 @@ fn path(command: SkillNameCommand) -> Result<(), CliFailure> {
         .join(skill.name)
         .join("SKILL.md");
     materialize(&path, skill.source.as_bytes())?;
-    if command.output_args.requests_json() {
-        return print_json(&SkillPathReport {
-            schema_version: "satelle.skills.path.v1",
-            bundle_version: BUNDLE_VERSION,
-            name: skill.name,
-            path: path.display().to_string(),
-        })
-        .map_err(failure);
+    if format.is_structured() {
+        return format
+            .print(&SkillPathReport {
+                schema_version: "satelle.skills.path.v1",
+                bundle_version: BUNDLE_VERSION,
+                name: skill.name,
+                path: path.display().to_string(),
+            })
+            .map_err(failure);
     }
     println!("{}", path.display());
+    Ok(())
+}
+
+fn write_list_csv(writer: &mut impl Write, report: &SkillListReport<'_>) -> std::io::Result<()> {
+    writer.write_all(b"schema_version,bundle_version,name,description\r\n")?;
+    for skill in &report.skills {
+        for (index, field) in [
+            report.schema_version,
+            report.bundle_version,
+            skill.name,
+            skill.description,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index != 0 {
+                writer.write_all(b",")?;
+            }
+            // RFC 4180 permits quoting every field. Keep embedded line breaks
+            // and double quotes without inventing a second escaping grammar.
+            write!(writer, "\"{}\"", field.replace('"', "\"\""))?;
+        }
+        writer.write_all(b"\r\n")?;
+    }
     Ok(())
 }
 
@@ -204,6 +234,24 @@ mod tests {
     use super::*;
     use crate::Cli;
     use clap::Parser;
+
+    #[test]
+    fn csv_preserves_embedded_delimiters_quotes_and_line_breaks() {
+        let report = SkillListReport {
+            schema_version: "satelle.skills.list.v1",
+            bundle_version: "1.2.3",
+            skills: vec![SkillSummary {
+                name: "a,b",
+                description: "say \"yes\"\r\nnext line",
+            }],
+        };
+        let mut bytes = Vec::new();
+        write_list_csv(&mut bytes, &report).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "schema_version,bundle_version,name,description\r\n\"satelle.skills.list.v1\",\"1.2.3\",\"a,b\",\"say \"\"yes\"\"\r\nnext line\"\r\n"
+        );
+    }
 
     #[test]
     fn embedded_bytes_match_release_sources() {
