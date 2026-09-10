@@ -144,3 +144,120 @@ export function useTypewriter(beats: Beat[], reduced: boolean) {
     finish,
   };
 }
+
+/* ------------------------------------------------------------- retyping --- */
+
+const DELETE_MS = 24;
+const RETYPE_MS = 34;
+/**
+ * Text the Host is writing out for the first time runs faster than text it is
+ * replacing. Replacing a value is a deliberate edit and reads at a human rate;
+ * a block of code being written is output, and at 34ms a character a two line
+ * block took nearly four seconds, which is longer than any step should hold.
+ */
+export const TYPEIN_MS = 4;
+
+/**
+ * One tick cannot be shorter than a frame, so a rate faster than a frame is
+ * delivered as several characters per tick instead of several ticks per frame.
+ *
+ * Without this the schedule was a lie: every character cost a timeout plus a
+ * React commit and a paint, about 13ms rather than the 9ms asked for, and a six
+ * line block overran the step holding it by 780ms. Batching also cuts the
+ * renders for that block from 177 to about 60.
+ */
+const TICK_MS = 16;
+
+/**
+ * Animates a text value being replaced the way a person replaces it: the
+ * divergent tail is deleted one character at a time, then the new tail is
+ * typed. The common prefix is left alone, which is what an editor actually
+ * does, and it is what makes a formula repair read as an edit rather than as a
+ * swap.
+ *
+ * Deleting is faster than typing, because holding backspace is faster than
+ * choosing characters.
+ */
+export function useRetype(value: string, animate: boolean, typeIn = false, delayMs = 0) {
+  // `typeIn` is for text that appears rather than changes: a line the Turn has
+  // just written should be written, not pasted. Safe against the server render
+  // because content that types in only ever mounts after hydration.
+  const [shown, setShown] = useState(typeIn && animate ? '' : value);
+  // `delayMs` sequences several fields that appear at once. Without it every
+  // line of a block starts typing on the same frame, so a four line function
+  // grows to the right all at once instead of being written top to bottom.
+  const [waiting, setWaiting] = useState(delayMs > 0 && typeIn && animate);
+  const timer = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    if (!waiting) return;
+    const id = window.setTimeout(() => setWaiting(false), delayMs);
+    return () => window.clearTimeout(id);
+  }, [waiting, delayMs]);
+
+  // A text edit playing out over time is synchronisation with the clock, which
+  // is what an effect is for. One pending timeout at a time, cleared on every
+  // change, so a value that changes mid-edit redirects rather than racing.
+  useEffect(() => {
+    if (!animate) {
+      window.clearTimeout(timer.current);
+      setShown(value);
+      return;
+    }
+    if (waiting || shown === value) return;
+
+    // How much of the head the two versions agree on. Everything after it has
+    // to go before the new tail can be typed.
+    let shared = 0;
+    while (shared < shown.length && shared < value.length && shown[shared] === value[shared]) {
+      shared += 1;
+    }
+
+    const deleting = shown.length > shared;
+    const rate = deleting ? DELETE_MS : typeIn ? TYPEIN_MS : RETYPE_MS;
+    const tick = Math.max(rate, TICK_MS);
+    const per = Math.max(1, Math.round(tick / rate));
+    timer.current = window.setTimeout(
+      () =>
+        setShown((text) =>
+          deleting
+            ? text.slice(0, Math.max(shared, text.length - per))
+            : value.slice(0, Math.min(value.length, text.length + per)),
+        ),
+      tick,
+    );
+    return () => window.clearTimeout(timer.current);
+  }, [value, shown, animate, waiting, typeIn]);
+
+  return {
+    shown,
+    /** True while the edit is still playing out, including before it starts. */
+    editing: waiting || shown !== value,
+  };
+}
+
+/**
+ * The text of a field that the Host is editing, plus a caret while the edit is
+ * in flight. Drop it in place of the value and the field types itself.
+ */
+export function Retype({
+  value,
+  animate,
+  typeIn,
+  delayMs,
+}: {
+  value: string;
+  animate: boolean;
+  /** Write the text out on first appearance instead of replacing existing text. */
+  typeIn?: boolean;
+  /** Hold this long before starting, so a block of lines writes in order. */
+  delayMs?: number;
+}) {
+  const { shown, editing } = useRetype(value, animate, typeIn, delayMs);
+  return (
+    <>
+      {shown}
+      {editing ? <i className="sa-caret" data-blink="true" aria-hidden="true" /> : null}
+    </>
+  );
+}

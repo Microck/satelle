@@ -1,5 +1,6 @@
 'use client';
 
+import { useRetype } from '../typewriter';
 import type { Stage, StageProps } from '../stage';
 import './excel.css';
 
@@ -38,6 +39,9 @@ const ROWS: Row[] = [
   { id: 'Q3-1008', region: 'East', rep: 'Casey', product: 'Pulse Mouse', units: 4, price: 79, cost: 38, discount: 0.1, duplicate: true },
 ];
 
+/** The first repeated Order ID on the sheet, which is where the sweep starts. */
+const FIRST_DUPLICATE = ROWS.findIndex((row) => row.duplicate);
+
 const MONTHS = [
   { label: 'Jul', revenue: 13701.8, profit: 5562.8 },
   { label: 'Aug', revenue: 11826.35, profit: 4835.35 },
@@ -55,7 +59,75 @@ function revenueOf(row: Row, repaired: boolean) {
   return row.units * row.price * (1 - discount);
 }
 
-function Sheet({ step }: StageProps) {
+/**
+ * The one element the pointer aims at while it travels to step `next`, as a key
+ * the render matches against.
+ *
+ * The pointer measures the marked element live, against the render it is
+ * crossing, and that render is the sheet *after* step `next - 1`. So every key
+ * here has to name something already drawn at that point: where a step creates
+ * something, the key names what will hold it, or the control that makes it.
+ *
+ * Nothing here may resolve to the sheet tabs at the left of the strip or to the
+ * middle of the grid's bottom edge: the Controller window covers the Host's
+ * bottom left corner, measured at 1440 as out to x 0.583 and down from y 0.466
+ * of the stage, and a pointer under it is invisible. Nor to the formula bar,
+ * whose centre lands at 0.525, 0.026, under both the top of the control aura
+ * and the aura's own label pill at x 0.41 to 0.59.
+ */
+type Target =
+  | 'file'
+  | 'duplicate'
+  | 'revenue'
+  | 'profitHead'
+  | 'newSheet'
+  | 'summary'
+  | 'total'
+  | null;
+
+function targetOf(next: number): Target {
+  switch (next) {
+    // Opening the workbook and saving the copy both act on its name, which is
+    // the one drawn thing either message names.
+    case 1:
+    case 2:
+      return 'file';
+    // The duplicate rows themselves, while they are still on the sheet. A
+    // coordinate could only ever point at whatever took their place.
+    case 3:
+      return 'duplicate';
+    // Drawn J5: the Revenue cell of the broken row, which turns from the wrong
+    // figure to the right one and which shows the formula being written while
+    // it happens. The formula bar carries the same edit and keeps the caret,
+    // being the only field wide enough to read a formula at this size, but it
+    // cannot be the target: its centre is 17px from the top of the stage, under
+    // the aura's label.
+    case 4:
+      return 'revenue';
+    // The Profit column header, the first of the two columns the fill crosses.
+    case 5:
+      return 'profitHead';
+    // The Summary sheet does not exist yet, so the pointer works the control
+    // that makes one. That control is drawn at the right end of the tab strip
+    // because the sheet tabs at its left end are behind the Controller window.
+    case 6:
+      return 'newSheet';
+    // The pane the chart lands in. It is on screen by this step, so the thing
+    // that will hold the chart can be marked rather than the chart itself.
+    case 7:
+      return 'summary';
+    // The grand totals this step checks against Checks.txt. The check list is
+    // not drawn until the step commits; the totals it agrees with are.
+    case 8:
+      return 'total';
+    // Admitting the Turn touches nothing on the sheet, so nothing is marked and
+    // the step's own coordinate stands.
+    default:
+      return null;
+  }
+}
+
+function Sheet({ step, next, reduced }: StageProps) {
   // Step gates. Each one is the state *after* that action commits.
   const inSubmission = step >= 2;
   const deduped = step >= 3;
@@ -64,6 +136,7 @@ function Sheet({ step }: StageProps) {
   const summarised = step >= 6;
   const charted = step >= 7;
   const verified = step >= 8;
+  const target = targetOf(next);
 
   const rows = deduped ? ROWS.filter((row) => !row.duplicate) : ROWS;
   const activeCell = repaired ? 'J5' : step === 3 ? 'A5' : 'A1';
@@ -72,6 +145,20 @@ function Sheet({ step }: StageProps) {
     : step >= 1
       ? '=F5*G5'
       : '';
+  // The formula bar is typed rather than swapped, and the "repaired" badge
+  // waits for the typing to finish: it was appearing on the first keystroke,
+  // calling the formula repaired while it was still being written.
+  //
+  // It types only for the repair, which is the one step whose message says the
+  // Turn typed. The broken formula was in the workbook when it opened, so it is
+  // simply there beforehand: writing it out the moment the workbook opened put
+  // a blinking caret at the top of the sheet while the pointer was down in the
+  // tab strip clicking the file, which is two claims at once about where the
+  // Turn is working, and neither of them is what that step's message says.
+  const typed = useRetype(formula, !reduced && repaired);
+  // True while the repair is being written. The pointer stands on the cell, so
+  // the cell has to show the edit; see the overlay below.
+  const editing = repaired && typed.editing;
 
   return (
     <div className="xl">
@@ -80,8 +167,15 @@ function Sheet({ step }: StageProps) {
         <span className="xl-formula sa-mono">
           {formula ? (
             <>
-              {formula}
-              {repaired ? <span className="xl-fixed">repaired</span> : null}
+              {/* The repair rewrites this field, so it is typed rather than
+                  swapped: the broken formula's tail is deleted and the corrected
+                  one is written in its place. Watching `=F5*G5` become
+                  `=F5*G5*(1-I5)` is the clearest thing on the stage. */}
+              {typed.shown}
+              {typed.editing ? (
+                <i className="sa-caret" data-blink="true" aria-hidden="true" />
+              ) : null}
+              {repaired && !typed.editing ? <span className="xl-fixed">repaired</span> : null}
             </>
           ) : (
             <span className="sa-faint">fx</span>
@@ -100,7 +194,11 @@ function Sheet({ step }: StageProps) {
                 <th scope="col" className="xl-rownum" />
                 {['Order ID', 'Region', 'Rep', 'Product', 'Units', 'Price', 'Revenue', 'COGS', 'Profit', 'Margin %'].map(
                   (head) => (
-                    <th scope="col" key={head}>
+                    <th
+                      scope="col"
+                      key={head}
+                      data-cu-target={(target === 'profitHead' && head === 'Profit') || undefined}
+                    >
                       {head}
                     </th>
                   ),
@@ -121,14 +219,48 @@ function Sheet({ step }: StageProps) {
                     <th scope="row" className="xl-rownum">
                       {index + 2}
                     </th>
-                    <td>{row.id}</td>
+                    {/* Only the first of the repeated IDs is marked: two marks
+                        would leave the pointer's choice to document order. */}
+                    <td
+                      data-cu-target={
+                        (target === 'duplicate' && !deduped && index === FIRST_DUPLICATE) ||
+                        undefined
+                      }
+                    >
+                      {row.id}
+                    </td>
                     <td>{row.region}</td>
                     <td>{row.rep}</td>
                     <td className="xl-wide">{row.product}</td>
                     <td className="xl-num">{row.units}</td>
                     <td className="xl-num">{money(row.price)}</td>
-                    <td className="xl-num" data-fixed={row.broken && repaired}>
+                    {/* Marked whether or not the repair has landed: the cell is
+                        the same cell before and after, so the pointer that
+                        typed in it stays in it. */}
+                    <td
+                      className="xl-num"
+                      data-fixed={row.broken && repaired}
+                      data-editing={(row.broken && editing) || undefined}
+                      data-cu-target={(target === 'revenue' && row.broken) || undefined}
+                    >
                       {money(revenue)}
+                      {/* The edit, drawn in the cell the pointer is standing
+                          on. The caret stays in the formula bar, which is the
+                          only field wide enough to read the formula at this
+                          size, but a step whose message says it typed has to
+                          show something happening under the pointer: a cell
+                          whose number simply changes reads as the pointer
+                          having missed whatever did it.
+                          Drawn over the cell rather than in it, so thirteen
+                          characters of formula cannot widen an eight character
+                          column and shove the rest of the row sideways
+                          mid-edit. A spreadsheet's own edit box overhangs its
+                          neighbours in exactly this way. */}
+                      {row.broken && editing ? (
+                        <span className="xl-edit sa-mono" aria-hidden="true">
+                          {typed.shown}
+                        </span>
+                      ) : null}
                     </td>
                     <td className="xl-num">{money(cogs)}</td>
                     <td className="xl-num">{derived ? money(profit) : ''}</td>
@@ -149,7 +281,7 @@ function Sheet({ step }: StageProps) {
         </div>
 
         {summarised ? (
-          <div className="xl-summary">
+          <div className="xl-summary" data-cu-target={target === 'summary' || undefined}>
             <span className="sa-label">Summary</span>
             <div className="sa-scroll xl-summary-scroll">
               <table className="xl-grid xl-grid-summary">
@@ -170,7 +302,7 @@ function Sheet({ step }: StageProps) {
                     <td className="xl-num">{percent(month.profit / month.revenue)}</td>
                   </tr>
                 ))}
-                <tr className="xl-total">
+                <tr className="xl-total" data-cu-target={target === 'total' || undefined}>
                   <th scope="row">Grand Total</th>
                   <td className="xl-num">{money(GRAND.revenue)}</td>
                   <td className="xl-num">{money(GRAND.profit)}</td>
@@ -204,7 +336,14 @@ function Sheet({ step }: StageProps) {
             Summary
           </span>
         ) : null}
-        <span className="xl-file sa-faint">
+        {/* The control that adds a sheet, which is what the pointer works to
+            build the Summary sheet: the sheet itself cannot be marked before it
+            exists. Drawn at the right end of the strip because the Controller
+            window covers the left end, where the tabs are. */}
+        <span className="xl-newsheet" data-cu-target={target === 'newSheet' || undefined}>
+          + sheet
+        </span>
+        <span className="xl-file sa-faint" data-cu-target={target === 'file' || undefined}>
           {inSubmission ? 'submission/Q3_Sales_Submission.xlsx' : 'Q3_Sales_Challenge.xlsx'}
         </span>
       </div>
@@ -280,10 +419,11 @@ export const excelStage: Stage = {
     'Open Q3_Sales_Challenge.xlsx and read Instructions.txt and Checks.txt. Work in a copy named submission/Q3_Sales_Submission.xlsx. Remove duplicate records by Order ID, repair all Revenue and COGS formulas, and fill formulas down. Add Profit and Margin % formulas. Create a Summary sheet with Jul, Aug, and Sep, plus a Grand Total row. Add a line chart comparing monthly Revenue and Profit. Verify the grand totals against Checks.txt.',
   budget: { minutes: 18, steps: 140 },
   steps: [
-    // Pointer targets are fractions of the stage box, measured off the built
-    // page at 1440 with Chromium rather than guessed. Two of them are placed
-    // around the Controller window, which sits over the bottom left corner of
-    // the Host and hides the left end of the sheet tab strip.
+    // These coordinates are the fallback, for the server render and for a
+    // reader without JavaScript. What the pointer actually aims at is the
+    // element `targetOf` marks, measured live: the sheet reflows under almost
+    // every one of these steps, so a fixed coordinate went stale the moment the
+    // pointer set off for it.
     {
       event: 'turn_started',
       label: 'Turn admitted',
@@ -296,9 +436,8 @@ export const excelStage: Stage = {
       event: 'turn_progress',
       label: 'Read the brief',
       message: 'opened Q3_Sales_Challenge.xlsx, read Instructions.txt and Checks.txt',
-      // The workbook name in the tab strip is the drawn thing this message
-      // names. The sheet tabs at the other end of the strip are behind the
-      // Controller window, so the pointer works the right end of it.
+      // The workbook name in the tab strip, which is the drawn thing this
+      // message names and what the pointer is marked onto.
       at: { x: 0.915, y: 0.921 },
       act: 'click',
     },
@@ -308,7 +447,8 @@ export const excelStage: Stage = {
       message: 'saved a working copy as submission/Q3_Sales_Submission.xlsx',
       // Save As enters the copy's name, and the label under the caret becomes
       // it. The label is end-aligned, so its centre moves left as the longer
-      // submission path replaces the original name.
+      // submission path replaces the original name: the pointer is measured
+      // against the name it lands on and then stays where it typed.
       at: { x: 0.874, y: 0.921 },
       act: 'type',
     },
@@ -316,9 +456,9 @@ export const excelStage: Stage = {
       event: 'turn_progress',
       label: 'Remove duplicates',
       message: 'removed 4 duplicate Order ID rows, 30 unique orders remain',
-      // The duplicates are gone by the time this step draws, so the pointer
-      // rests where the selection ran: column A of row 5, the cell the
-      // reference box names at this step, dragged down the repeated IDs.
+      // Column A of row 5, the first of the repeated IDs. The pointer is
+      // marked onto that cell while the duplicates are still on the sheet,
+      // which is the layout it crosses; they are gone once it lands.
       at: { x: 0.086, y: 0.236 },
       act: 'drag',
     },
@@ -326,10 +466,10 @@ export const excelStage: Stage = {
       event: 'turn_progress',
       label: 'Repair formulas',
       message: 'repaired J5 to =F5*G5*(1-I5), filled Revenue and COGS through row 31',
-      // J5 itself: the Revenue cell of row 5, which turns from the broken
-      // figure to the repaired one under the caret. The formula bar mirrors the
-      // same edit but sits 17px from the top of the stage, inside the control
-      // ring, so the typing is shown in the cell.
+      // Drawn J5: the Revenue cell of row 5, which shows the formula being
+      // written and then the repaired figure. The formula bar mirrors the edit
+      // and holds the caret, but it sits 17px from the top of the stage, inside
+      // the control ring, so it cannot be where the pointer stands.
       at: { x: 0.665, y: 0.236 },
       act: 'type',
     },
@@ -347,9 +487,9 @@ export const excelStage: Stage = {
       event: 'turn_progress',
       label: 'Build the summary',
       message: 'built Summary sheet with Jul, Aug, Sep and a Grand Total row',
-      // The new pane's own Summary heading, on the word rather than the middle
-      // of the full-width label. The Summary sheet tab reads the same thing but
-      // the Controller window covers it.
+      // The new sheet control at the right end of the tab strip. The Summary
+      // sheet is not there to be pointed at yet, and its tab would land at the
+      // left end of the strip, which the Controller window covers.
       at: { x: 0.735, y: 0.088 },
       act: 'click',
     },
@@ -357,7 +497,7 @@ export const excelStage: Stage = {
       event: 'turn_progress',
       label: 'Insert the chart',
       message: 'inserted a line chart comparing monthly Revenue and Profit',
-      // The plot area, where the inserted chart lands.
+      // The Summary pane, which is what holds the chart once it is inserted.
       at: { x: 0.847, y: 0.456 },
       act: 'click',
     },
@@ -365,7 +505,8 @@ export const excelStage: Stage = {
       event: 'turn_completed',
       label: 'Verify totals',
       message: 'grand totals match Checks.txt, source workbook unchanged',
-      // The checks against Checks.txt. A read, so the pointer only moves.
+      // The Grand Total row the checks agree with. A read, so the pointer
+      // only moves.
       at: { x: 0.848, y: 0.629 },
     },
   ],

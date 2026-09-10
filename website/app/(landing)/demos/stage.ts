@@ -21,13 +21,18 @@ export type StageStep = {
   /** Short label for the step rail. Four words at most. */
   label: string;
   /**
-   * Where the pointer is when this action commits, as fractions of the stage
-   * box: { x: 0, y: 0 } is its top left, { x: 1, y: 1 } its bottom right.
+   * Fallback pointer position, as fractions of the stage box: { x: 0, y: 0 } is
+   * its top left, { x: 1, y: 1 } its bottom right.
    *
-   * This is what makes the hero read as Computer Use rather than as a log with
-   * pictures: the reader watches a cursor go to the thing the message names.
-   * Point it at the element this step actually changes. A step with no `at`
-   * leaves the pointer where the previous step put it.
+   * Used only when the stage does not mark a target element for this step, and
+   * on the server, where nothing can be measured. Prefer marking the element:
+   * a fixed coordinate cannot follow anything that moves, and most steps of
+   * most stages reflow the interior they act on. Coordinates measured against
+   * the layout *after* a step commits had the pointer travelling to whatever
+   * happened to sit there beforehand, which read as clicking at random.
+   *
+   * Coordinates are still right for a target that is a genuine point rather
+   * than an element: somewhere on a board canvas, a spot in a game viewport.
    */
   at?: { x: number; y: number };
   /**
@@ -41,6 +46,21 @@ export type StageStep = {
 export type StageProps = {
   /** Index into `steps`. The interior renders the state *after* this step. */
   step: number;
+  /**
+   * The step the pointer is on its way to, which is `step + 1` while it
+   * travels and `step` once it has landed.
+   *
+   * A stage uses this to put `data-cu-target` on the one element that step is
+   * about to act on, and the pointer measures that element live. The stage is
+   * the only thing that knows which element a given action belongs to, and it
+   * already has the step logic to decide.
+   *
+   * Mark an element that exists in the *current* render, since that is the
+   * layout the pointer is travelling through. For an action that creates
+   * something, mark whatever will hold it. Mark nothing when the action has no
+   * element, and the step's `at` is used instead.
+   */
+  next: number;
   /** True when the reader prefers reduced motion: settle instantly. */
   reduced: boolean;
 };
