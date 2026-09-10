@@ -1361,13 +1361,21 @@ fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, 
     let attachments = request
         .attachments()
         .iter()
-        .map(|attachment| {
-            satelle_host::AttachmentUpload::new(
-                attachment.media_type(),
-                attachment.size_bytes(),
-                attachment.sha256(),
-                attachment.data_base64(),
-            )
+        .map(|attachment| match attachment {
+            satelle_transport::ImageAttachment::Upload {
+                media_type,
+                size_bytes,
+                sha256,
+                data_base64,
+            } => satelle_host::AttachmentInput::upload(
+                media_type.clone(),
+                *size_bytes,
+                sha256.clone(),
+                data_base64.clone(),
+            ),
+            satelle_transport::ImageAttachment::HostFile { path } => {
+                satelle_host::AttachmentInput::host_file(path.clone())
+            }
         })
         .collect();
     satelle_host::TurnIntent::new(request.prompt(), request.execution_mode())

@@ -37,6 +37,26 @@ satelle steer <session_id> --host local-demo "Now open the settings page"
 Only one nonterminal Turn may exist in a Session, so wait for the current Turn
 to finish before steering.
 
+## Attach images
+
+`--image` reads a PNG or JPEG on the machine running the CLI. `--remote-image`
+reads an absolute path on the selected SSH or Direct Host:
+
+```sh
+satelle run --host workstation --image ./reference.png "Compare this image"
+satelle steer <session_id> --host workstation --remote-image /srv/reference.png "Use the Host image"
+```
+
+Both options are repeatable and share a limit of two images, 5 MiB each and
+10 MiB total. Use the Host's native path syntax, including a drive-qualified
+path for Windows. Relative remote paths, parent traversal, links, directories,
+and device files are rejected. The Host Daemon's OS user must be able to read
+the file. The selected Host must advertise image support.
+
+Remote images stay on the Host. Satelle removes its private staging copies
+when the Turn ends and preserves the source file. Replaying or cancelling an
+admitted request does not reopen the source image.
+
 ## Inspect state and logs
 
 ```sh

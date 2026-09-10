@@ -343,7 +343,7 @@
 - satelle image attachment paths provided to CLI commands are interpreted as local CLI machine paths by default @spec @mvp @implemented
 - satelle uploads local image attachments to the remote Host Daemon before passing them to Codex as supported image input @spec @mvp @implemented
 - when the remote Codex app-server supports image or localImage input, the authenticated capabilities response advertises a maximum of 2 attachments, 5242880 bytes per attachment, 10485760 aggregate attachment bytes, and exactly image/png and image/jpeg; otherwise it advertises zero attachment limits and no supported attachment media types @spec @mvp @implemented
-- before decoding attachments, satelle validates the whole request against the advertised count, declared sizes, encoded-length bounds, and declared media types; after decoding, it validates actual per-attachment and aggregate bytes, sniffed media types, and content digests, and starts no Turn when any attachment fails @spec @mvp @implemented
+- before decoding uploaded attachments, satelle validates the whole request against the advertised count, declared upload sizes, encoded-length bounds, and declared media types; after decoding uploads or resolving Host files, it validates actual per-attachment and aggregate bytes and sniffed media types, verifies upload content digests, and starts no Turn when any attachment fails @spec @phase4
 - Host Daemon attachment staging uses generated filenames instead of Client-provided path components @spec @mvp @implemented
 - attachment staging files are private to the daemon OS user @spec @mvp @implemented
 - satelle rejects path traversal, device files, directories, and unsupported symlinks as attachment inputs @spec @mvp @implemented
@@ -351,13 +351,18 @@
 - attachment cleanup failure creates a redacted cleanup diagnostic without exposing attachment content @spec @mvp @implemented
 - satelle deletes uploaded image attachments from the remote host after the turn by default @spec @mvp @implemented
 - satelle MVP does not retain uploaded image attachments after the turn for logs, status, diagnostics, setup ledgers, diagnostic bundles, or recording artifacts @spec @mvp @implemented
-- satelle MVP does not support remote-host path image attachments because attachment paths are interpreted as local CLI machine paths by default @spec @mvp @implemented
+- satelle --image paths resolve on the local CLI machine and --remote-image paths resolve only on the selected remote Host @spec @phase4
 - satelle post-MVP remote-host path image attachments use an explicit --remote-image <path> option rather than overloading ordinary image attachment paths or SSH-style host:path syntax @spec @later
 - satelle later --remote-image resolves paths on the selected remote Host and never on the local CLI machine @spec @later
 - satelle later --remote-image rejects use when no remote Host resolves unambiguously before path validation @spec @later
 - satelle later --remote-image validates remote file existence, readability by the Host Daemon OS user, supported image media type, and size limits before starting the Codex Turn @spec @later
 - satelle later --remote-image does not copy the remote image back to the local CLI machine during normal execution @spec @later
 - satelle later --remote-image follows the same no-retention default as uploaded local image attachments for logs, status, diagnostics, setup ledgers, diagnostic bundles, and recording artifacts @spec @later
+- satelle --remote-image requires an absolute native Host path, rejects parent traversal and symbolic links, and uses the same bounded regular-file reader as local image attachments @spec @phase4
+- satelle local and remote images share one attachment list and the same total count, per-image byte, aggregate byte, and PNG/JPEG limits @spec @phase4
+- satelle Turn request schema satelle.api.v8 represents each image as kind upload with media_type, size_bytes, sha256, and data_base64 or kind host_file with path; raw paths and image bytes are excluded from response, log, and Debug output @spec @contract @phase4
+- satelle remote image references enter the keyed request identity before Host file access; only a newly accepted execution reads the file, so idempotent replay and cancellation do not depend on the source file still existing @spec @contract @phase4
+- satelle resolves remote image bytes before committing a Session or Turn and removes generated attachment staging when execution ends; it never deletes the operator's source image @spec @phase4
 - satelle MVP does not support arbitrary file attachments until file transfer, storage, and remote path semantics are specified @spec @mvp @implemented
 - satelle run waits by default until the selected remote Turn reaches a terminal status such as completed, blocked, failed, or stopped @spec @mvp @implemented
 - prompt Turns use a 30 minute default and maximum execution timeout, configurable through timeouts.turn_execution as a human duration string with explicit units and a finite hard maximum of 24 hours @spec @mvp @implemented
@@ -629,24 +634,24 @@
 - satelle host update --no-input --yes follows the same human plan-output rule as --yes when human output mode is active @spec @mvp @implemented
 - satelle host update --quiet --yes suppresses non-error human plan and progress output but does not suppress final failure summaries or required recovery guidance @spec @mvp @implemented
 - satelle host update JSON output includes planned_actions before mutation and applied_actions after mutation instead of printing human plan text @mvp @spec @implemented
-- satelle host update exposes --plain for stable target records and retains --json as its complete automation contract for plans, results, and typed errors @spec @phase4
-- satelle host update help text directs scripts to --json for complete reports or --plain for fixed target records @spec @phase4
-- satelle later adds satelle host update --plain as a stable line-oriented scripting output mode narrower than --json and not a replacement for the complete JSON automation contract @spec @later
-- satelle host update --plain is mutually exclusive with --json and every explicit --format value and reports a typed output-mode-conflict usage error for either combination @spec @contract @later
-- satelle host update --plain writes only machine-readable plain records to stdout and writes diagnostics, prompts, progress, and errors to stderr @spec @later
-- satelle host update --plain disables colors, spinners, progress bars, tables, hyperlinks, and human summary prose even when stdout is a TTY @spec @later
-- satelle host update --plain emits UTF-8 LF-terminated records with TAB-separated fields and no header row @spec @later
-- satelle host update --plain v1 records use field order schema, host, component, phase, status, current_version, target_version, changed, restart_required, error_code, and recovery_command @spec @later
-- satelle host update --plain uses schema value satelle.host.update.plain.v1 for every v1 record @spec @later
-- satelle host update --plain escapes TAB, LF, CR, and backslash inside field values as \t, \n, \r, and \\ @spec @later
-- satelle host update --plain represents unavailable optional field values as - and represents booleans as true or false @spec @later
-- satelle host update --plain component, phase, status, and error_code fields use lowercase snake_case tokens instead of localized or human-formatted text @spec @later
-- satelle host update --plain emits one record for each planned, skipped, applied, failed, and postcheck-failed update target before emitting the final process exit status @spec @later
-- satelle host update --plain represents partial failure with status failed or postcheck_failed on the affected target records while preserving succeeded, unchanged, or skipped records for other targets @spec @later
-- satelle host update --plain failure records include the typed Satelle error code in error_code and a shell-safe recovery command in recovery_command when a recovery command exists @spec @later
-- satelle host update --plain exits with the same exit code class as the equivalent non-plain host update invocation @spec @later
-- satelle host update --plain compatibility policy freezes v1 field order and escaping rules until a new schema token such as satelle.host.update.plain.v2 is introduced @spec @later
-- satelle host update --plain may add new schema versions after v1 but does not change v1 field order, field meanings, escaping, or enum token meanings in a minor release @spec @later
+- satelle host update exposes --plain for stable target records and retains --json as its complete automation contract for plans, results, and typed errors @spec @phase4 @implemented
+- satelle host update help text directs scripts to --json for complete reports or --plain for fixed target records @spec @phase4 @implemented
+- satelle later adds satelle host update --plain as a stable line-oriented scripting output mode narrower than --json and not a replacement for the complete JSON automation contract @spec @phase4 @implemented
+- satelle host update --plain is mutually exclusive with --json and every explicit --format value and reports a typed output-mode-conflict usage error for either combination @spec @contract @phase4 @implemented
+- satelle host update --plain writes only machine-readable plain records to stdout and writes diagnostics, prompts, progress, and errors to stderr @spec @phase4 @implemented
+- satelle host update --plain disables colors, spinners, progress bars, tables, hyperlinks, and human summary prose even when stdout is a TTY @spec @phase4 @implemented
+- satelle host update --plain emits UTF-8 LF-terminated records with TAB-separated fields and no header row @spec @phase4 @implemented
+- satelle host update --plain v1 records use field order schema, host, component, phase, status, current_version, target_version, changed, restart_required, error_code, and recovery_command @spec @phase4 @implemented
+- satelle host update --plain uses schema value satelle.host.update.plain.v1 for every v1 record @spec @phase4 @implemented
+- satelle host update --plain escapes TAB, LF, CR, and backslash inside field values as \t, \n, \r, and \\ @spec @phase4 @implemented
+- satelle host update --plain represents unavailable optional field values as - and represents booleans as true or false @spec @phase4 @implemented
+- satelle host update --plain component, phase, status, and error_code fields use lowercase snake_case tokens instead of localized or human-formatted text @spec @phase4 @implemented
+- satelle host update --plain emits one record for each planned, skipped, applied, failed, and postcheck-failed update target before emitting the final process exit status @spec @phase4 @implemented
+- satelle host update --plain represents partial failure with status failed or postcheck_failed on the affected target records while preserving succeeded, unchanged, or skipped records for other targets @spec @phase4 @implemented
+- satelle host update --plain failure records include the typed Satelle error code in error_code and a shell-safe recovery command in recovery_command when a recovery command exists @spec @phase4 @implemented
+- satelle host update --plain exits with the same exit code class as the equivalent non-plain host update invocation @spec @phase4 @implemented
+- satelle host update --plain compatibility policy freezes v1 field order and escaping rules until a new schema token such as satelle.host.update.plain.v2 is introduced @spec @phase4 @implemented
+- satelle host update --plain may add new schema versions after v1 but does not change v1 field order, field meanings, escaping, or enum token meanings in a minor release @spec @phase4 @implemented
 - satelle host update reports unsupported selected update components as typed unsupported-update-component errors instead of silently ignoring an explicit component selection @implemented @mvp
 - satelle host update reports unsupported default update targets as skipped diagnostics when checking all supported update targets by default @spec @mvp @implemented
 - satelle host update exits 0 with status up_to_date and does not ask for mutation confirmation when all selected supported components are already current @mvp @spec @implemented
@@ -817,11 +822,11 @@
 - every Host Daemon JSON response and error declares one Satelle API schema version @spec @mvp @implemented
 - satelle rejects unsupported API schema versions before executing an operation @spec @mvp @implemented
 - satelle rejects incompatible CLI and Host Daemon protocol versions before executing a mutating request @spec @contract @mvp @implemented
-- authenticated Host Daemon mutations require exactly one Satelle-Protocol-Version header whose value is a canonical unsigned decimal without leading zeroes, and MVP supports only value 9 @spec @contract @mvp @implemented
+- authenticated Host Daemon mutations require exactly one Satelle-Protocol-Version header whose value is a canonical unsigned decimal without leading zeroes, and phase 4 supports only value 15 @spec @contract @phase4
 - protocol compatibility is checked after authentication, control-scope authorization, request correlation, and Host Identity pinning but before mutation query or cookie validation, control rate limiting, idempotency validation, request-body decoding, or Host calls @spec @contract @mvp @implemented
 - missing, malformed, duplicate, and unsupported Satelle-Protocol-Version values return HTTP 426 with code incompatible-protocol, category compatibility, retryable false, and schema_version satelle.error.v1 @spec @contract @mvp @implemented
-- incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["9"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @mvp @implemented
-- DaemonClient sends Satelle-Protocol-Version 9 on every mutating request and does not require the header for authenticated reads used to diagnose or recover version skew @spec @contract @mvp @implemented
+- incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["15"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @phase4
+- DaemonClient sends Satelle-Protocol-Version 15 on every mutating request and does not require the header for authenticated reads used to diagnose or recover version skew @spec @contract @phase4
 - POST /v1/sessions, POST /v1/sessions/{session_id}/turns, POST /v1/sessions/{session_id}/stop, POST /v1/setup/api-token, POST /v1/setup/api-token/{token_id}/activate, and POST /v1/setup/api-token/{token_id}/abort enforce protocol compatibility, and future POST /v1/doctor routes use the same mutation gate when implemented @spec @contract @mvp @implemented
 - satelle API JSON decoding rejects unknown fields instead of ignoring misspelled security, authority, or execution-policy fields @spec @mvp @implemented
 - satelle API endpoints reject unsupported content types before reading operation data @spec @mvp @implemented
@@ -832,7 +837,7 @@
 - Satelle Session, diagnostic, setup, and secret-provisioning responses include Cache-Control: no-store @spec @mvp @implemented
 - Host Daemon shutdown stops accepting new HTTP connections, drains in-flight HTTP requests for a finite configured grace period that defaults to 5 seconds, and returns a typed shutdown-timeout result after aborting the serving task when the grace period expires @spec @contract @mvp @implemented
 - satelle Host Daemon does not enable cross-origin browser access by default @spec @mvp @implemented
-- satelle Host Daemon Turn request bodies use the exact schema_version token satelle.api.v2 while unchanged stop request bodies use satelle.api.v1 @spec @contract @mvp @implemented
+- satelle Host Daemon Turn request bodies use the exact schema_version token satelle.api.v8 while unchanged stop request bodies use satelle.api.v1 @spec @contract @phase4
 - authenticated Host Daemon requests use Satelle-Request-Id for caller-supplied UUIDv7 correlation and Satelle-Expected-Host-Identity for Host pinning; neither header grants authority or idempotency @spec @contract @mvp @implemented
 - authenticated Host Daemon HTTP requests without Satelle-Request-Id receive a generated canonical UUIDv7 except GET /v1/events, whose WebSocket upgrade contract requires a caller-supplied Satelle-Request-Id; malformed or duplicate supplied request-id headers are rejected @spec @contract @mvp @implemented
 - satelle Host Daemon MVP uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, GET /v1/events, GET /v1/setup/api-token/current, POST /v1/setup/api-token, POST /v1/setup/api-token/{token_id}/activate, and POST /v1/setup/api-token/{token_id}/abort as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @mvp @implemented

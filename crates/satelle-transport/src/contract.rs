@@ -50,10 +50,10 @@ pub(crate) use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v14 adds the authenticated, identity-pinned task artifact read.
-// The protocol remains a hard cut because older peers cannot distinguish the
-// closed redacted export contract from arbitrary Host file access.
-pub(crate) const PROTOCOL_VERSION: &str = "14";
+// Protocol v15 distinguishes Controller uploads from explicit Host image paths.
+// Older peers cannot interpret the tagged attachment request, so every protected
+// operation requires the current protocol before decoding its payload.
+pub(crate) const PROTOCOL_VERSION: &str = "15";
 
 macro_rules! define_schema_token {
     ($name:ident, $token:literal) => {
@@ -553,8 +553,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v14_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "14");
+    fn protocol_version_is_the_v15_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "15");
     }
 
     #[test]

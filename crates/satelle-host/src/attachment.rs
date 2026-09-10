@@ -13,38 +13,63 @@ const MAX_STALE_FILES_PER_START: usize = 1024;
 const FILE_PREFIX: &str = "satelle-image-";
 
 #[derive(Clone)]
-pub struct AttachmentUpload {
-    media_type: String,
-    size_bytes: u64,
-    sha256: String,
-    data_base64: String,
+pub enum AttachmentInput {
+    Upload {
+        media_type: String,
+        size_bytes: u64,
+        sha256: String,
+        data_base64: String,
+    },
+    HostFile {
+        path: String,
+    },
 }
 
-impl AttachmentUpload {
-    pub fn new(
+impl AttachmentInput {
+    pub fn upload(
         media_type: impl Into<String>,
         size_bytes: u64,
         sha256: impl Into<String>,
         data_base64: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::Upload {
             media_type: media_type.into(),
             size_bytes,
             sha256: sha256.into(),
             data_base64: data_base64.into(),
         }
     }
+
+    pub fn host_file(path: impl Into<String>) -> Self {
+        Self::HostFile { path: path.into() }
+    }
 }
 
-impl fmt::Debug for AttachmentUpload {
+impl fmt::Debug for AttachmentInput {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AttachmentUpload")
-            .field("media_type", &self.media_type)
-            .field("size_bytes", &self.size_bytes)
-            .field("data", &"[REDACTED]")
-            .finish()
+        match self {
+            Self::Upload {
+                media_type,
+                size_bytes,
+                ..
+            } => formatter
+                .debug_struct("AttachmentInput::Upload")
+                .field("media_type", media_type)
+                .field("size_bytes", size_bytes)
+                .finish_non_exhaustive(),
+            Self::HostFile { .. } => formatter
+                .debug_struct("AttachmentInput::HostFile")
+                .finish_non_exhaustive(),
+        }
     }
+}
+
+/// Input accepted before idempotency lookup. Host paths remain references until
+/// a new operation owns admission; replay and cancellation never reopen them.
+#[derive(Clone)]
+pub(crate) enum AcceptedImageAttachment {
+    Upload(VerifiedImageAttachment),
+    HostFile(String),
 }
 
 #[derive(Clone)]
@@ -65,50 +90,106 @@ impl fmt::Debug for VerifiedImageAttachment {
     }
 }
 
-pub(crate) fn verify_uploads(
-    uploads: Vec<AttachmentUpload>,
-) -> Result<Vec<VerifiedImageAttachment>, ()> {
-    if uploads.len() > MAX_ATTACHMENTS {
+pub(crate) fn accept_inputs(
+    inputs: Vec<AttachmentInput>,
+) -> Result<Vec<AcceptedImageAttachment>, ()> {
+    if inputs.len() > MAX_ATTACHMENTS {
         return Err(());
     }
     let mut declared_total = 0_usize;
-    let mut decoded_total = 0_usize;
-    uploads
+    inputs
         .into_iter()
-        .map(|upload| {
-            let declared_size = usize::try_from(upload.size_bytes).map_err(|_| ())?;
-            if declared_size > MAX_ATTACHMENT_BYTES {
-                return Err(());
+        .map(|input| match input {
+            AttachmentInput::HostFile { path } => {
+                let native = Path::new(&path);
+                if path.len() > 4096
+                    || path.contains('\0')
+                    || !native.is_absolute()
+                    || native
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                {
+                    return Err(());
+                }
+                Ok(AcceptedImageAttachment::HostFile(path))
             }
-            declared_total = declared_total.checked_add(declared_size).ok_or(())?;
-            if declared_total > MAX_TOTAL_BYTES
-                || upload.data_base64.len() > declared_size.div_ceil(3).checked_mul(4).ok_or(())?
-            {
-                return Err(());
-            }
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(upload.data_base64.as_bytes())
-                .map_err(|_| ())?;
-            if bytes.len() > MAX_ATTACHMENT_BYTES || bytes.len() != declared_size {
-                return Err(());
-            }
-            decoded_total = decoded_total.checked_add(bytes.len()).ok_or(())?;
-            if decoded_total > MAX_TOTAL_BYTES {
-                return Err(());
-            }
-            let media_type = sniff_media_type(&bytes).ok_or(())?;
-            if media_type != upload.media_type {
-                return Err(());
-            }
-            let digest = Sha256::digest(&bytes);
-            if !constant_time_hex_eq(&upload.sha256, digest.as_slice()) {
-                return Err(());
-            }
-            Ok(VerifiedImageAttachment {
+            AttachmentInput::Upload {
                 media_type,
-                bytes,
-                sha256: digest.into(),
-            })
+                size_bytes,
+                sha256,
+                data_base64,
+            } => {
+                let declared_size = usize::try_from(size_bytes).map_err(|_| ())?;
+                if declared_size > MAX_ATTACHMENT_BYTES {
+                    return Err(());
+                }
+                declared_total = declared_total.checked_add(declared_size).ok_or(())?;
+                if declared_total > MAX_TOTAL_BYTES
+                    || data_base64.len() > declared_size.div_ceil(3).checked_mul(4).ok_or(())?
+                {
+                    return Err(());
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data_base64.as_bytes())
+                    .map_err(|_| ())?;
+                if bytes.len() != declared_size {
+                    return Err(());
+                }
+                let sniffed = sniff_media_type(&bytes).ok_or(())?;
+                if sniffed != media_type {
+                    return Err(());
+                }
+                let digest = Sha256::digest(&bytes);
+                if !constant_time_hex_eq(&sha256, digest.as_slice()) {
+                    return Err(());
+                }
+                Ok(AcceptedImageAttachment::Upload(VerifiedImageAttachment {
+                    media_type: sniffed,
+                    bytes,
+                    sha256: digest.into(),
+                }))
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn resolve_images(
+    inputs: &[AcceptedImageAttachment],
+) -> Result<Vec<VerifiedImageAttachment>, satelle_core::SatelleError> {
+    let mut total = 0_usize;
+    inputs
+        .iter()
+        .map(|input| {
+            let image = match input {
+                AcceptedImageAttachment::Upload(image) => image.clone(),
+                AcceptedImageAttachment::HostFile(path) => {
+                    let bytes = satelle_core::read_bounded_regular_file_no_follow(
+                        Path::new(path),
+                        MAX_ATTACHMENT_BYTES,
+                    )
+                    .map_err(|_| {
+                        attachment_failure(
+                            "remote image is unavailable, unsafe, or exceeds the byte limit",
+                        )
+                    })?;
+                    let media_type = sniff_media_type(&bytes).ok_or_else(|| {
+                        attachment_failure("remote image has an unsupported media type")
+                    })?;
+                    let sha256 = Sha256::digest(&bytes).into();
+                    VerifiedImageAttachment {
+                        media_type,
+                        bytes,
+                        sha256,
+                    }
+                }
+            };
+            total += image.bytes.len();
+            if total > MAX_TOTAL_BYTES {
+                return Err(attachment_failure(
+                    "image attachments exceed the aggregate byte limit",
+                ));
+            }
+            Ok(image)
         })
         .collect()
 }
@@ -320,8 +401,8 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    fn upload(bytes: &[u8], media_type: &str, digest: Option<String>) -> AttachmentUpload {
-        AttachmentUpload::new(
+    fn upload(bytes: &[u8], media_type: &str, digest: Option<String>) -> AttachmentInput {
+        AttachmentInput::upload(
             media_type,
             bytes.len() as u64,
             digest.unwrap_or_else(|| {
@@ -337,11 +418,11 @@ mod tests {
     #[test]
     fn verification_rejects_declared_integrity_and_media_mismatches() {
         let png = b"\x89PNG\r\n\x1a\nfixture";
-        assert!(verify_uploads(vec![upload(png, "image/jpeg", None)]).is_err());
-        assert!(verify_uploads(vec![upload(png, "image/png", Some("00".repeat(32)))]).is_err());
-        assert!(verify_uploads(vec![upload(b"GIF89a-fake", "image/gif", None)]).is_err());
+        assert!(accept_inputs(vec![upload(png, "image/jpeg", None)]).is_err());
+        assert!(accept_inputs(vec![upload(png, "image/png", Some("00".repeat(32)))]).is_err());
+        assert!(accept_inputs(vec![upload(b"GIF89a-fake", "image/gif", None)]).is_err());
         assert!(
-            verify_uploads(vec![
+            accept_inputs(vec![
                 upload(png, "image/png", None),
                 upload(png, "image/png", None),
                 upload(png, "image/png", None),
@@ -352,18 +433,79 @@ mod tests {
 
     #[test]
     fn verification_bounds_declarations_and_encoded_data_before_decode() {
-        let oversized_declaration = AttachmentUpload::new(
+        let oversized_declaration = AttachmentInput::upload(
             "image/png",
             (MAX_ATTACHMENT_BYTES + 1) as u64,
             "00".repeat(32),
             "",
         );
-        assert!(verify_uploads(vec![oversized_declaration]).is_err());
+        assert!(accept_inputs(vec![oversized_declaration]).is_err());
 
         let oversized_encoding =
-            AttachmentUpload::new("image/png", 8, "00".repeat(32), "A".repeat(16));
+            AttachmentInput::upload("image/png", 8, "00".repeat(32), "A".repeat(16));
         assert_eq!(8_usize.div_ceil(3) * 4, 12);
-        assert!(verify_uploads(vec![oversized_encoding]).is_err());
+        assert!(accept_inputs(vec![oversized_encoding]).is_err());
+    }
+
+    #[test]
+    fn remote_images_share_upload_staging_and_preserve_the_source() {
+        let directory = crate::test_support::TestStateDir::new().expect("private image directory");
+        let root = directory.path().canonicalize().unwrap();
+        let source = root.join("operator-private.png");
+        let png = b"\x89PNG\r\n\x1a\nprivate-image";
+        fs::write(&source, png).unwrap();
+        let input = AttachmentInput::host_file(source.to_str().unwrap());
+        assert!(!format!("{input:?}").contains("operator-private"));
+        let accepted = accept_inputs(vec![upload(png, "image/png", None), input]).unwrap();
+        let verified = resolve_images(&accepted).unwrap();
+        assert_eq!(verified.len(), 2);
+        assert_eq!(verified[0].bytes, verified[1].bytes);
+        assert_eq!(verified[0].sha256, verified[1].sha256);
+        let store = AttachmentStore::open(root.join("staging")).unwrap();
+        let staged = store.stage(verified).unwrap();
+        let staged_paths = staged
+            .images()
+            .iter()
+            .map(|image| image.path().to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(staged.images()[1].bytes(), png);
+        drop(staged);
+        assert!(staged_paths.iter().all(|path| !path.exists()));
+        assert_eq!(fs::read(&source).unwrap(), png);
+    }
+
+    #[test]
+    fn remote_images_validate_host_paths_and_actual_files_before_staging() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        // PathBuf::join normalizes `..` in Windows verbatim paths. Preserve
+        // the raw reference so this case actually reaches traversal validation.
+        let traversal = format!(
+            "{}{sep}..{sep}private.png",
+            root.display(),
+            sep = std::path::MAIN_SEPARATOR
+        );
+        for path in ["relative.png".to_string(), traversal] {
+            assert!(accept_inputs(vec![AttachmentInput::host_file(path)]).is_err());
+        }
+        let missing = root.join("missing.png");
+        let accepted =
+            accept_inputs(vec![AttachmentInput::host_file(missing.to_str().unwrap())]).unwrap();
+        assert!(resolve_images(&accepted).is_err());
+        fs::write(&missing, b"GIF89a").unwrap();
+        assert!(resolve_images(&accepted).is_err());
+        let file = fs::OpenOptions::new().write(true).open(&missing).unwrap();
+        file.set_len((MAX_ATTACHMENT_BYTES + 1) as u64).unwrap();
+        drop(file);
+        assert!(resolve_images(&accepted).is_err());
+        #[cfg(unix)]
+        {
+            let link = root.join("image-link.png");
+            std::os::unix::fs::symlink(&missing, &link).unwrap();
+            let accepted =
+                accept_inputs(vec![AttachmentInput::host_file(link.to_str().unwrap())]).unwrap();
+            assert!(resolve_images(&accepted).is_err());
+        }
     }
 
     #[test]
@@ -377,8 +519,9 @@ mod tests {
         .unwrap();
         let root = state.path().join("attachments");
         let store = AttachmentStore::open(root.clone()).expect("attachment store");
-        let verified = verify_uploads(vec![upload(b"\x89PNG\r\n\x1a\nfixture", "image/png", None)])
+        let verified = accept_inputs(vec![upload(b"\x89PNG\r\n\x1a\nfixture", "image/png", None)])
             .expect("verified image");
+        let verified = resolve_images(&verified).expect("resolve accepted images");
         let staged = store.stage(verified).expect("stage image");
         let path = staged.images()[0].path().to_path_buf();
         assert!(path.starts_with(&root));

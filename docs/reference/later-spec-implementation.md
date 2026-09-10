@@ -17,9 +17,10 @@ those pull requests merge, the integration branch gets a final pull request to
 | Configuration composition and consent | Explicit includes, source attribution, Trusted Profile expiration | Merged in PR #218 |
 | Host credential sources | Executable helpers with bounded JSON protocol, Host home expansion | Merged in PR #219 |
 | Config repair | Deterministic local repair with backups and explicit consent | Merged in PR #220 |
-| Host update scripting | Stable target records through `host update --plain` | Box verified; pull request pending |
+| Host update scripting | Stable target records through `host update --plain` | Merged in PR #221 |
+| Remote image attachments | Host file resolution with bounded validation and no retention | Box verified; pull request pending |
 | Host operations | Storage migration, CLI/Host compatibility, explicit versions | Pending |
-| Transport and inputs | Mutual TLS, token lifecycle, remote image attachments | Pending |
+| Transport authentication | Mutual TLS and token lifecycle | Pending |
 | Output and package repair | Lossless output formats, launcher native repair | Pending |
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit, diagnostic bundles | Pending |
 | Capture and observability | Raw protocol/subprocess exports, desktop snapshot, recording, native log sinks, telemetry | Pending |
@@ -137,9 +138,9 @@ workspace Clippy, and the generated documentation contract.
 
 ## Host update scripting decisions
 
-Box verified the Host update unit tests, CLI integration tests, output contract
-tests, workspace Clippy, and generated documentation. Native pull request checks
-remain pending.
+The next 16 requirements passed the complete Rust suites and Clippy on Linux,
+macOS, and Windows, plus npm, documentation, and release validation. Box
+verified the Host update, CLI integration, and output contract tests.
 
 - `host update --plain` emits UTF-8, LF-terminated, tab-separated records with
   the fixed `satelle.host.update.plain.v1` schema and eleven fields.
@@ -149,3 +150,20 @@ remain pending.
   target fails. Prompts and diagnostics stay on stderr.
 - Plain output shares the existing consent and exit-status policy. It cannot
   combine with `--json` or an explicit `--format`; `--quiet` retains records.
+
+## Remote image contract decisions
+
+Box passed 9 attachment tests, 267 transport tests, 585 CLI unit tests, and
+19 focused CLI integration tests. Workspace Clippy and documentation checks
+also passed. Cross-platform pull request checks remain pending.
+
+- `run` and `steer` accept repeatable `--remote-image <HOST_PATH>` after resolving
+  the selected Host. The option requires SSH or Direct transport.
+- Paths use absolute native Host syntax. The Controller neither interprets nor
+  opens them. The Host applies bounded regular-file reads before admission.
+- Uploads and Host paths share a tagged attachment list in `satelle.api.v8` and
+  protocol version 15. No older request shape is accepted.
+- The keyed operation identity includes the path reference. A replay or
+  cancellation resolves from durable admission state without reopening files.
+- Remote files share the upload limits and private staging lifecycle. Cleanup
+  removes generated files and never removes the operator's source image.

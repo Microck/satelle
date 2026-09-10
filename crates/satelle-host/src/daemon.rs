@@ -23,7 +23,7 @@ use crate::EphemeralApiAuthenticator;
 use std::sync::Arc;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
-const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 6;
+const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 7;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
 const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 3;
 const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 2;
@@ -179,13 +179,13 @@ pub enum MutationAuthorityError {
     InvalidIdempotencyKey,
 }
 
-/// Prompt, provider intent, and verified image bytes accepted by the Host API.
+/// Prompt, provider intent, and image inputs accepted by the Host API.
 pub struct TurnIntent {
     prompt: String,
     execution_mode: TurnExecutionMode,
     provider_intent: crate::ProviderComputerUseIntent,
     turn_execution_timeout: Option<satelle_core::session::TimeoutPolicy>,
-    attachments: Vec<crate::attachment::VerifiedImageAttachment>,
+    attachments: Vec<crate::attachment::AcceptedImageAttachment>,
 }
 
 impl TurnIntent {
@@ -268,9 +268,9 @@ impl TurnIntent {
 
     pub fn with_attachments(
         mut self,
-        attachments: Vec<crate::AttachmentUpload>,
+        attachments: Vec<crate::AttachmentInput>,
     ) -> Result<Self, TurnIntentError> {
-        self.attachments = crate::attachment::verify_uploads(attachments)
+        self.attachments = crate::attachment::accept_inputs(attachments)
             .map_err(|()| TurnIntentError::InvalidAttachments)?;
         Ok(self)
     }
@@ -287,7 +287,7 @@ impl TurnIntent {
         &self.provider_intent
     }
 
-    pub(crate) fn attachments(&self) -> &[crate::attachment::VerifiedImageAttachment] {
+    pub(crate) fn attachments(&self) -> &[crate::attachment::AcceptedImageAttachment] {
         &self.attachments
     }
 }
@@ -388,18 +388,27 @@ struct CanonicalTurnCreate<'a> {
 }
 
 #[derive(Serialize)]
-struct CanonicalAttachment<'a> {
-    media_type: &'a str,
-    size_bytes: usize,
-    sha256: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CanonicalAttachment<'a> {
+    Upload {
+        media_type: &'a str,
+        size_bytes: usize,
+        sha256: String,
+    },
+    HostFile {
+        path: &'a str,
+    },
 }
 
-impl<'a> From<&'a crate::attachment::VerifiedImageAttachment> for CanonicalAttachment<'a> {
-    fn from(attachment: &'a crate::attachment::VerifiedImageAttachment) -> Self {
-        Self {
-            media_type: attachment.media_type(),
-            size_bytes: attachment.size_bytes(),
-            sha256: attachment.sha256_hex(),
+impl<'a> From<&'a crate::attachment::AcceptedImageAttachment> for CanonicalAttachment<'a> {
+    fn from(attachment: &'a crate::attachment::AcceptedImageAttachment) -> Self {
+        match attachment {
+            crate::attachment::AcceptedImageAttachment::Upload(image) => Self::Upload {
+                media_type: image.media_type(),
+                size_bytes: image.size_bytes(),
+                sha256: image.sha256_hex(),
+            },
+            crate::attachment::AcceptedImageAttachment::HostFile(path) => Self::HostFile { path },
         }
     }
 }
@@ -1336,7 +1345,9 @@ impl HostService {
                             .with_execution_mode(intent.execution_mode)
                             .with_provider_intent(intent.provider_intent.clone())
                             .with_turn_execution_timeout(Some(turn_execution_timeout))
-                            .with_attachments(intent.attachments.clone())
+                            .with_attachments(crate::attachment::resolve_images(
+                                &intent.attachments,
+                            )?)
                             .with_cancellation(registered_cancellation),
                         ),
                     )?;
@@ -1453,7 +1464,9 @@ impl HostService {
                             .with_execution_mode(intent.execution_mode)
                             .with_provider_intent(intent.provider_intent.clone())
                             .with_turn_execution_timeout(Some(turn_execution_timeout))
-                            .with_attachments(intent.attachments.clone())
+                            .with_attachments(crate::attachment::resolve_images(
+                                &intent.attachments,
+                            )?)
                             .with_cancellation(registered_cancellation),
                         ),
                     )?;
@@ -2280,10 +2293,10 @@ mod tests {
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )
         .expect("serialize Turn idempotency payload");
-        assert_eq!(turn.digest_schema_version, 6);
+        assert_eq!(turn.digest_schema_version, 7);
         assert_eq!(
             turn.as_slice(),
-            br#"{"digest_schema_version":6,"payload":{"operation":"session_create","prompt":"PRIVATE_DIGEST_VERSION_PROMPT","execution_mode":"yolo","model":"model-test","provider":"provider-test","model_from_project":true,"provider_from_project":false,"refresh_provider_smoke_test":true,"experimental_provider_computer_use":true,"turn_execution_timeout_seconds":1800,"attachments":[]}}"#
+            br#"{"digest_schema_version":7,"payload":{"operation":"session_create","prompt":"PRIVATE_DIGEST_VERSION_PROMPT","execution_mode":"yolo","model":"model-test","provider":"provider-test","model_from_project":true,"provider_from_project":false,"refresh_provider_smoke_test":true,"experimental_provider_computer_use":true,"turn_execution_timeout_seconds":1800,"attachments":[]}}"#
         );
 
         let stop = canonical_payload(
@@ -2489,7 +2502,7 @@ mod tests {
             .register_api_token(&token, "principal-image-test", ApiScopes::CONTROL, None)
             .expect("register API token");
         let image = || {
-            crate::AttachmentUpload::new(
+            crate::AttachmentInput::upload(
                 "image/png",
                 8,
                 "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6",

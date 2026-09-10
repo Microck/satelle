@@ -782,13 +782,15 @@ fn run_scenario_with_options(
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let verified = crate::attachment::verify_uploads(vec![crate::AttachmentUpload::new(
+        let verified = crate::attachment::accept_inputs(vec![crate::AttachmentInput::upload(
             "image/png",
             bytes.len() as u64,
             digest,
             base64::engine::general_purpose::STANDARD.encode(bytes),
         )])
         .expect("verify local image fixture");
+        let verified =
+            crate::attachment::resolve_images(&verified).expect("resolve local image fixture");
         crate::attachment::AttachmentStore::open(directory.path().join("attachments"))
             .expect("open attachment fixture store")
             .stage(verified)

@@ -4521,8 +4521,6 @@ fn injected_interrupt_after_local_run_admission_confirms_stop_before_exit_130() 
     assert_eq!(failure.phase(), TurnAdmissionPhase::Admitted);
     assert_eq!(failure.error().code, ErrorCode::Interrupted);
     assert_eq!(failure.error().exit_code(), 130);
-    assert_eq!(failure.events().len(), 1);
-    assert_eq!(failure.events()[0].event_type(), EventType::ActionRequired);
     assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 1);
     let (session_id, _) = failure
         .durable_handles()
@@ -4531,13 +4529,30 @@ fn injected_interrupt_after_local_run_admission_confirms_stop_before_exit_130() 
         .session_status(session_id)
         .expect("stopped Session remains readable");
     assert_eq!(status.activity(), &SessionActivity::Idle);
-    assert!(
-        status
-            .turns()
-            .last()
-            .expect("interrupted run has its Turn")
-            .state()
-            .is_terminal()
+    // observe_stop releases the fixture's execution, so either terminal write
+    // can win. The failure must retain exactly the events of that durable winner,
+    // including the single live event in both cases.
+    let expected_events: &[EventType] = match status
+        .turns()
+        .last()
+        .expect("interrupted run has its Turn")
+        .state()
+    {
+        TurnState::Stopped => &[EventType::ActionRequired],
+        TurnState::Completed => &[
+            EventType::ProviderSmoke,
+            EventType::ActionRequired,
+            EventType::TurnCompleted,
+        ],
+        state => panic!("interrupted fixture must be stopped or completed, got {state:?}"),
+    };
+    assert_eq!(
+        failure
+            .events()
+            .iter()
+            .map(SatelleEvent::event_type)
+            .collect::<Vec<_>>(),
+        expected_events
     );
 }
 
@@ -5610,7 +5625,7 @@ fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance
         "details": {
             "daemon_version": "0.0.9",
             "reason": "unsupported",
-            "supported_versions": ["14"],
+            "supported_versions": ["15"],
             "received_version": "11",
         },
         "docs_url": null,
