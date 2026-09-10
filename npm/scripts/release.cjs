@@ -634,6 +634,10 @@ function inspectNativeReleaseArchive(request, release) {
           `${request.label} does not contain ${selection.expectedName}@${selection.expectedVersion}`,
         );
       }
+    } else if (selection.kind === "checksums") {
+      if (contents.length > 1024) {
+        fail("release-integrity-mismatch", `${request.label} has oversized package checksums`);
+      }
     } else {
       fail("release-archive-invalid", `${request.label} has an unknown selected member check`);
     }
@@ -905,7 +909,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         !sameJson(manifest.os, [targetMetadata.os]) ||
         !sameJson(manifest.cpu, [targetMetadata.cpu]) ||
         !sameJson(manifest.libc, expectedLibc) ||
-        !sameJson(manifest.files, [targetMetadata.binaryPath]) ||
+        !sameJson(manifest.files, [targetMetadata.binaryPath, "SHA256SUMS"]) ||
         manifest.bin !== undefined ||
         manifest.scripts?.prepack !== "node ../scripts/verify-native-package.cjs"
       ) {
@@ -1806,6 +1810,10 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
       const version = expectedVersion(process.env.RELEASE_TAG);
 
       copyFileSync(packageManifestPath(targetMetadata.packageName), path.join(packageRoot, "package.json"));
+      writeFileSync(
+        path.join(packageRoot, "SHA256SUMS"),
+        `${sha256File(packagedBinary)}  ${targetMetadata.binaryPath}\n`,
+      );
       copyFileSync(
         path.join(npmRoot, "scripts", "verify-native-package.cjs"),
         path.join(assemblyRoot, "scripts", "verify-native-package.cjs"),
@@ -1994,6 +2002,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
                 member: `package/${metadata.binaryPath}`,
                 target: snapshot.target,
               },
+              { kind: "checksums", member: "package/SHA256SUMS" },
             ],
           },
         ];
@@ -2011,6 +2020,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         const expectedNpmMembers = [
           "package/package.json",
           `package/${metadata.binaryPath}`,
+          "package/SHA256SUMS",
         ].sort();
         const actualNpmMembers = npmInventory.members
           .filter(({ type }) => type === "file")
@@ -2041,6 +2051,17 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           fail(
             "release-native-digest-mismatch",
             `${snapshot.archive} executable differs from ${snapshot.npmArtifact}`,
+          );
+        }
+        const checksumsDigest = npmInventory.selections.find(
+          ({ member }) => member === "package/SHA256SUMS",
+        )?.sha256;
+        // The worker hashes the bounded checksum file from the same immutable
+        // snapshot. Comparing its digest binds the exact checksum text too.
+        if (checksumsDigest !== sha256Bytes(Buffer.from(`${npmDigest}  ${metadata.binaryPath}\n`))) {
+          fail(
+            "release-integrity-mismatch",
+            `${snapshot.npmArtifact} checksums differ from its executable`,
           );
         }
         return {
@@ -2334,6 +2355,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
     let packed;
     let packedManifest;
     let packedNativeBinary;
+    let packedNativeChecksums;
     try {
       members = new Set(
         runTar(["-tzf", artifactFileName], { cwd: artifactDirectory, encoding: "utf8" })
@@ -2412,6 +2434,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
       }
       if (
         target &&
+        fileName === matrix[target].binaryPath &&
         matrix[target].os !== "win32" &&
         ![3, 6, 9].every((index) => archiveEntries[0].permissions[index] === "x")
       ) {
@@ -2420,7 +2443,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           `${path.basename(artifactPath)} native binary is not executable`,
         );
       }
-      if (target) {
+      if (target && fileName === matrix[target].binaryPath) {
         try {
           packedNativeBinary = runTar(["-xOzf", artifactFileName, archiveName], {
             cwd: artifactDirectory,
@@ -2437,6 +2460,17 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           packedNativeBinary,
           `${path.basename(artifactPath)} member ${fileName}`,
         );
+      }
+      if (target && fileName === "SHA256SUMS") {
+        try {
+          packedNativeChecksums = runTar(["-xOzf", artifactFileName, archiveName], {
+            cwd: artifactDirectory,
+            maxBuffer: 1024,
+            encoding: "utf8",
+          });
+        } catch {
+          fail("release-integrity-mismatch", "native package SHA256SUMS cannot be read");
+        }
       }
       if (topLevelPackages.includes(packageName)) {
         const sourceFile = readFileSync(
@@ -2467,6 +2501,12 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           );
         }
       }
+    }
+    if (
+      target &&
+      packedNativeChecksums !== `${sha256Bytes(packedNativeBinary)}  ${matrix[target].binaryPath}\n`
+    ) {
+      fail("release-integrity-mismatch", "native package SHA256SUMS differs from its executable");
     }
     return packedNativeBinary;
   }

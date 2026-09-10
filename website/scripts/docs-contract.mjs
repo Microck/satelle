@@ -38,7 +38,7 @@ if (!existsSync(binary)) fail(`Satelle binary does not exist: ${binary}`);
 
 const releaseVersion = readPackageVersion(join(repositoryRoot, 'package.json'));
 const websiteVersion = readPackageVersion(join(repositoryRoot, 'website/package.json'));
-const binaryVersion = runBinary(['--version']).trim().replace(/^satelle\s+/, '');
+const binaryVersion = runSatelle(['--version']).trim().replace(/^satelle\s+/, '');
 
 if (binaryVersion !== releaseVersion || websiteVersion !== releaseVersion) {
   fail(`version mismatch: binary=${binaryVersion}, repository=${releaseVersion}, website=${websiteVersion}`);
@@ -65,7 +65,7 @@ console.log(
 
 function generateReference(version) {
   const commandSections = [];
-  const pending = [[]];
+  const pending = [[], ['native', 'repair']];
   const visited = new Set();
 
   while (pending.length > 0) {
@@ -74,7 +74,7 @@ function generateReference(version) {
     if (visited.has(key)) continue;
     visited.add(key);
 
-    const rawHelp = runBinary([...commandPath, '--help']).trimEnd();
+    const rawHelp = runSatelle([...commandPath, '--help']).trimEnd();
     const help = rawHelp.replace(/[ \t]+$/gm, '');
     const label = ['satelle', ...commandPath].join(' ');
     commandSections.push(`## \`${label}\`\n\n\`\`\`text\n${help}\n\`\`\``);
@@ -91,7 +91,7 @@ description: Binary-derived command help and public schema versions for Satelle 
 ---
 
 This page describes **Satelle ${version}**. The documentation contract regenerates
-the command sections from \`satelle --help\` and derives schema identifiers from
+the command sections from native binary and JavaScript launcher help and derives schema identifiers from
 public Satelle result and event schema sources. CI rejects hand-edited or stale output.
 
 ## Public schema versions
@@ -240,7 +240,7 @@ function validateShellExamples(files) {
         if (executable !== 'satelle' && !/(?:^|\/)satelle(?:\.exe)?$/.test(executable)) continue;
         const args = words.slice(1).map(normalizePlaceholder);
         try {
-          runBinary([...args, '--help']);
+          runSatelle([...args, '--help']);
         } catch (error) {
           fail(`${relative(repositoryRoot, file)} has an invalid Satelle example:\n  ${trimmed}\n${error.stderr?.toString() ?? error.message}`);
         }
@@ -290,8 +290,15 @@ function validateVisibleVersion(version) {
   if (!index.includes(`Satelle ${version}`)) fail(`docs/index.mdx does not identify Satelle ${version}`);
 }
 
-function runBinary(args) {
-  return execFileSync(binary, args, { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' } });
+function runSatelle(args) {
+  // Native repair belongs to the launcher and must provide help even when its
+  // optional native package is missing. Validate that actual command boundary.
+  const launcherCommand = args[0] === 'native';
+  const executable = launcherCommand ? process.execPath : binary;
+  const commandArgs = launcherCommand
+    ? [join(repositoryRoot, 'npm/satelle/bin/satelle.cjs'), ...args]
+    : args;
+  return execFileSync(executable, commandArgs, { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' } });
 }
 
 function readPackageVersion(path) {

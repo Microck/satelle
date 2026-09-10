@@ -4,7 +4,7 @@ description: Binary-derived command help and public schema versions for Satelle 
 ---
 
 This page describes **Satelle 0.1.10**. The documentation contract regenerates
-the command sections from `satelle --help` and derives schema identifiers from
+the command sections from native binary and JavaScript launcher help and derives schema identifiers from
 public Satelle result and event schema sources. CI rejects hand-edited or stale output.
 
 ## Public schema versions
@@ -76,6 +76,19 @@ Options:
 
   -V, --version
           Print version
+```
+
+## `satelle native repair`
+
+```text
+Usage: satelle native repair [--dry-run]
+
+Reinstall the exact native package through its package manager.
+Local repair records an exact optional dependency in the owning project.
+
+  --dry-run   Show the owner and repair command without changing files
+  --no-color  Use plain output
+  -h, --help  Show this help
 ```
 
 ## `satelle completions`

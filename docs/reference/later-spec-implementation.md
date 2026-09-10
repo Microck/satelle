@@ -21,9 +21,10 @@ those pull requests merge, the integration branch gets a final pull request to
 | Remote image attachments | Host file resolution with bounded validation and no retention | Merged in PR #222 |
 | Host versions | CLI/Host compatibility and explicit versions | Merged in PR #223 |
 | Host storage | Safe path-set migration | Pending |
-| API token lifecycle | Durable issuance, rotation, revocation, and one-time secret replies | Box verified; pull request pending |
+| API token lifecycle | Durable issuance, rotation, revocation, and one-time secret replies | Merged in PR #224 |
 | Transport authentication | Mutual TLS | Pending |
-| Output and package repair | Lossless output formats, launcher native repair | Pending |
+| Native package repair | Launcher repair through the detected installation owner | Box verified; pull request pending |
+| Output formats | Lossless output formats | Pending |
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit, diagnostic bundles | Pending |
 | Capture and observability | Raw protocol/subprocess exports, desktop snapshot, recording, native log sinks, telemetry | Pending |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
@@ -197,8 +198,9 @@ targets.
 
 Box passed 231 core tests, 753 Host tests, 271 transport tests, workspace
 Clippy, and 65 release-packaging tests. Generated documentation checks and the
-complete documentation site build passed. Native pull request checks remain
-pending.
+complete documentation site build passed. PR #224 passed Rust and npm checks
+on Linux, macOS, and Windows, documentation validation, and release installation
+checks on all six targets. Its existing Windows log-cursor test passed on rerun.
 
 - Durable admin credentials issue, rotate, and revoke individual tokens through
   the general token-management routes. SSH bootstrap credentials retain the
@@ -212,3 +214,25 @@ pending.
 - Schema 17 preserves existing provider-secret journals and checks foreign keys
   before committing the migration. A failed integrity check rolls back the
   schema change.
+
+
+## Native package repair decisions
+
+Box passed the native launcher and real npm, pnpm, and Bun repair tests,
+including package restoration, dry-run behavior, and validation failures. All
+66 release-packaging tests and generated documentation checks passed. Native
+pull request checks remain pending.
+
+- `satelle native repair` runs in the JavaScript launcher before native binary
+  resolution. It repairs the current platform package at the exact launcher
+  version through the proven installation owner, npm, pnpm, or Bun.
+- `--dry-run` reports the owner, installation root, and exact command without
+  changing files. Apply preserves local versus global scope and disables install
+  scripts. Local repair records the exact platform package as optional.
+- Missing or ambiguous ownership fails with `native-repair-owner-unknown` and
+  recovery guidance. The launcher never guesses an owner or downloads binaries.
+- Success requires the ordinary package resolver and version check, matching
+  platform metadata, a bounded regular executable inside the package, and a
+  matching `SHA256SUMS` entry. A package-manager exit alone is insufficient.
+- Package assembly, prepack checks, and release archive validation bind the
+  checksum to the same executable bytes that passed target validation.

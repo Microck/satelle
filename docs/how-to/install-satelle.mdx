@@ -69,6 +69,26 @@ All eight npm package identities are available from the public npm registry.
 The launcher selects its version-matched native optional dependency. Ordinary
 execution uses that installed local binary and does not fetch a replacement.
 
+### Repair the native package
+
+If the optional native package is missing or damaged, use the npm launcher:
+
+```sh
+satelle native repair --dry-run
+satelle native repair
+```
+
+Repair installs the launcher's exact version for the current platform through
+the detected npm, pnpm, or Bun installation owner. Local repair records the
+native package as an exact optional dependency in the owning project's manifest
+and lockfile. Global repair keeps the global installation scope. Package
+lifecycle scripts do not run.
+
+Success means the package version, platform metadata, executable path and
+permissions, and packaged `SHA256SUMS` digest all passed verification. An unknown
+or ambiguous installation owner requires the verified direct native release
+installation described below. Normal commands never run repair implicitly.
+
 ## Use a non-npm method
 
 Satelle MVP defines these first-party non-npm installation methods:

@@ -1,7 +1,8 @@
 "use strict";
 
 const { spawnSync } = require("node:child_process");
-const { existsSync, readFileSync, realpathSync } = require("node:fs");
+const { createHash } = require("node:crypto");
+const { existsSync, lstatSync, readFileSync, realpathSync } = require("node:fs");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 
@@ -10,10 +11,11 @@ const platformMatrix = require("../platforms.json");
 const packageInstallContextEnvironment = "SATELLE_PACKAGE_INSTALL_CONTEXT";
 
 class LauncherError extends Error {
-  constructor(code, message) {
+  constructor(code, message, exitCode = 1) {
     super(message);
     this.name = "LauncherError";
     this.code = code;
+    this.exitCode = exitCode;
   }
 }
 
@@ -455,7 +457,7 @@ function missingPackageError(target, recoveryContext = {}) {
       `The matching native package ${target.packageName} is missing`,
       `or does not contain ${target.binaryPath}.`,
       `Reinstall without omitting optional dependencies using \`${reinstallCommand(context)}\`,`,
-      `or use the direct native binary installation path.${unknownScopeHint}`,
+      `run \`satelle native repair\`, or use the direct native binary installation path.${unknownScopeHint}`,
     ].join(" "),
   );
 }
@@ -515,8 +517,136 @@ function executeNativeBinary(binaryPath, argumentsToForward, installContext) {
   return child.status === null ? 1 : child.status;
 }
 
+function nativeRepairOptions(argumentsToForward) {
+  const arguments_ = argumentsToForward.filter((argument) => argument !== "--no-color");
+  if (arguments_[0] !== "native") return undefined;
+  if (arguments_.length === 2 && ["--help", "-h"].includes(arguments_[1])) {
+    return { help: true, dryRun: false };
+  }
+  const options = arguments_.slice(2);
+  if (
+    arguments_[1] !== "repair" ||
+    options.some((option) => !["--dry-run", "--help", "-h"].includes(option))
+  ) {
+    throw new LauncherError("invalid-usage", "Use satelle native repair [--dry-run].", 64);
+  }
+  return {
+    help: options.includes("--help") || options.includes("-h"),
+    dryRun: options.includes("--dry-run"),
+  };
+}
+
+function nativeRepairPlan(target, installContext) {
+  if (!installContext || !["npm", "pnpm", "bun"].includes(installContext.manager)) {
+    throw new LauncherError(
+      "native-repair-owner-unknown",
+      "Cannot identify one package manager that owns this installation. Use the verified direct native binary installation path: https://github.com/Microck/satelle/releases/latest",
+    );
+  }
+  const { manager, scope, install_root: installRoot } = installContext;
+  const arguments_ = [manager === "npm" ? "install" : "add"];
+  if (scope === "global") {
+    arguments_.push("--global");
+  } else {
+    arguments_.push(
+      manager === "bun" ? "--optional" : "--save-optional",
+      manager === "bun" ? "--exact" : "--save-exact",
+    );
+    if (manager === "pnpm" && existsSync(path.join(installRoot, "pnpm-workspace.yaml"))) {
+      arguments_.push("--workspace-root");
+    }
+  }
+  // The package manager remains the sole writer of its installation graph.
+  // Force rematerialization of missing files without running lifecycle scripts.
+  arguments_.push("--force", "--ignore-scripts");
+  if (manager === "npm") arguments_.push("--include=optional", "--no-audit", "--no-fund");
+  arguments_.push(`${target.packageName}@${launcherVersion}`);
+  return {
+    manager,
+    scope,
+    cwd: scope === "global" ? path.dirname(installRoot) : installRoot,
+    command: packageManagerCommand(manager, process.platform),
+    arguments: arguments_,
+  };
+}
+
+function verifyRepairedNativePackage(target, searchFrom = path.resolve(__dirname, "..")) {
+  try {
+    // Use the ordinary resolver, including its exact package-version check.
+    const binaryPath = resolveNativeBinary(target, searchFrom);
+    const nativeRoot = path.dirname(path.dirname(binaryPath));
+    const manifest = JSON.parse(readFileSync(path.join(nativeRoot, "package.json"), "utf8"));
+    const expectedLibc = target.libc ? [target.libc] : undefined;
+    if (
+      manifest.name !== target.packageName ||
+      JSON.stringify(manifest.os) !== JSON.stringify([target.os]) ||
+      JSON.stringify(manifest.cpu) !== JSON.stringify([target.cpu]) ||
+      JSON.stringify(manifest.libc) !== JSON.stringify(expectedLibc)
+    ) {
+      throw new Error("package platform metadata does not match this runtime");
+    }
+    const binary = lstatSync(binaryPath);
+    if (
+      !binary.isFile() ||
+      binary.size === 0 ||
+      binary.size > 512 * 1024 * 1024 ||
+      (target.os !== "win32" && (binary.mode & 0o111) === 0) ||
+      realpathSync(binaryPath) !== path.join(realpathSync(nativeRoot), target.binaryPath)
+    ) {
+      throw new Error("package executable is not a regular executable inside its package");
+    }
+    const checksumsPath = path.join(nativeRoot, "SHA256SUMS");
+    const checksums = lstatSync(checksumsPath);
+    if (!checksums.isFile() || checksums.size > 1024) {
+      throw new Error("package checksum metadata is not a bounded regular file");
+    }
+    const digest = createHash("sha256").update(readFileSync(binaryPath)).digest("hex");
+    if (readFileSync(checksumsPath, "utf8") !== `${digest}  ${target.binaryPath}\n`) {
+      throw new Error("package checksum metadata does not match its executable");
+    }
+    return binaryPath;
+  } catch {
+    throw new LauncherError(
+      "native-repair-verification-failed",
+      `${target.packageName}@${launcherVersion} did not pass version, platform, executable-path, and release-integrity verification. Use the verified direct native release if package-manager reinstallation cannot repair it.`,
+    );
+  }
+}
+
+function repairNativePackage(target, launchContext, { dryRun }) {
+  const plan = nativeRepairPlan(target, packageInstallContext(launchContext));
+  if (dryRun) {
+    console.log(`Owner: ${plan.manager} (${plan.scope})`);
+    console.log(`Directory: ${plan.cwd}`);
+    console.log([plan.command, ...plan.arguments].join(" "));
+    return 0;
+  }
+  const child = spawnSync(plan.command, plan.arguments, {
+    cwd: plan.cwd,
+    stdio: ["ignore", 2, 2],
+    timeout: 300_000,
+    windowsHide: true,
+    shell: path.extname(plan.command).toLowerCase() === ".cmd",
+  });
+  if (child.status !== 0 || child.error) {
+    throw new LauncherError(
+      "native-repair-failed",
+      `${plan.manager} did not complete native package repair. Check its diagnostic output, then retry or use the verified direct native release.`,
+    );
+  }
+  const binaryPath = verifyRepairedNativePackage(target);
+  console.log(`Repaired ${target.packageName}@${launcherVersion}\n${binaryPath}`);
+  return 0;
+}
+
 function main({ packageName = "@microck/satelle", launcherPath = __filename } = {}) {
   try {
+    const argumentsToForward = process.argv.slice(2);
+    const repairOptions = nativeRepairOptions(argumentsToForward);
+    if (repairOptions?.help) {
+      console.log("Usage: satelle native repair [--dry-run]\n\nReinstall the exact native package through its package manager.\nLocal repair records an exact optional dependency in the owning project.\n\n  --dry-run   Show the owner and repair command without changing files\n  --no-color  Use plain output\n  -h, --help  Show this help");
+      return;
+    }
     const launchContext = detectForwardingContext({ packageName, launcherPath });
     const runtime = {
       platform: process.platform,
@@ -524,6 +654,10 @@ function main({ packageName = "@microck/satelle", launcherPath = __filename } = 
       libc: process.platform === "linux" ? detectLinuxLibc() : undefined,
     };
     const target = selectTarget(runtime);
+    if (repairOptions) {
+      process.exitCode = repairNativePackage(target, launchContext, repairOptions);
+      return;
+    }
     const packageManager = detectPackageManager({
       userAgent: process.env.npm_config_user_agent,
       execPath: process.env.npm_execpath,
@@ -539,7 +673,6 @@ function main({ packageName = "@microck/satelle", launcherPath = __filename } = 
       path.resolve(__dirname, ".."),
       recoveryContext,
     );
-    const argumentsToForward = process.argv.slice(2);
     const installContext = packageInstallContextForCommand(argumentsToForward, {
       packageName: launchContext.packageName,
       launcherPath: launchContext.launcherPath,
@@ -550,7 +683,7 @@ function main({ packageName = "@microck/satelle", launcherPath = __filename } = 
       throw error;
     }
     console.error(`satelle: ${error.code}: ${error.message}`);
-    process.exitCode = 1;
+    process.exitCode = error.exitCode;
   }
 }
 
@@ -565,8 +698,11 @@ module.exports = {
   executeNativeBinary,
   isSelfUpdate,
   main,
+  nativeRepairOptions,
+  nativeRepairPlan,
   packageInstallContext,
   packageInstallContextForCommand,
   resolveNativeBinary,
   selectTarget,
+  verifyRepairedNativePackage,
 };

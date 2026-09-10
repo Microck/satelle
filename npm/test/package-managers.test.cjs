@@ -2,6 +2,8 @@
 
 const assert = require("node:assert/strict");
 const { spawnSync } = require("node:child_process");
+const { createHash } = require("node:crypto");
+const { once } = require("node:events");
 const {
   chmodSync,
   copyFileSync,
@@ -18,6 +20,7 @@ const { createRequire } = require("node:module");
 const { tmpdir } = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const { Worker } = require("node:worker_threads");
 
 const repositoryRoot = path.resolve(__dirname, "../..");
 const sourceCanonicalRoot = path.join(repositoryRoot, "npm", "satelle");
@@ -177,6 +180,8 @@ function stagePackages(fixtureRoot) {
       if (process.platform !== "win32") {
         chmodSync(nativeBinaryPath, 0o755);
       }
+      const digest = createHash("sha256").update(readFileSync(nativeBinaryPath)).digest("hex");
+      writeFileSync(path.join(nativeRoot, "SHA256SUMS"), `${digest}  ${currentTarget.binaryPath}\n`);
     }
   }
 
@@ -195,7 +200,8 @@ function stagePackages(fixtureRoot) {
   unscopedManifest.dependencies["@microck/satelle"] = localTarballReference(canonicalArtifact);
   writeJson(path.join(unscopedRoot, "package.json"), unscopedManifest);
   const unscopedArtifact = packFixturePackage(unscopedRoot, packsRoot);
-  return { canonicalArtifact, unscopedArtifact };
+  const nativeArtifact = canonicalManifest.optionalDependencies[currentTarget.packageName].slice("file:".length);
+  return { canonicalArtifact, unscopedArtifact, nativeArtifact };
 }
 
 function installedBin(consumerRoot) {
@@ -363,5 +369,115 @@ test("npm exec, npx, pnpm dlx, and bunx execute the canonical package", (context
     );
     assert.equal(execution.stdout, JSON.stringify(expectedArguments), runner.name);
     assert.equal(execution.stderr, stderrSentinel, runner.name);
+  }
+});
+
+
+async function fixtureRegistry(context, nativeArtifact, manifest) {
+  // Serve an actual npm pack through a local registry while synchronous package
+  // managers run in the parent. The worker owns the HTTP server's event loop.
+  const worker = new Worker(`
+    const { createServer } = require("node:http");
+    const { readFileSync } = require("node:fs");
+    const { createHash } = require("node:crypto");
+    const { parentPort, workerData } = require("node:worker_threads");
+    const archive = readFileSync(workerData.nativeArtifact);
+    const integrity = "sha512-" + createHash("sha512").update(archive).digest("base64");
+    const manifest = workerData.manifest;
+    const server = createServer((request, response) => {
+      const pathname = decodeURIComponent(request.url.split("?", 1)[0]);
+      if (pathname === "/native.tgz") {
+        response.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": archive.length });
+        response.end(archive);
+      } else if (pathname === "/" + manifest.name) {
+        const version = { ...manifest, dist: { integrity, tarball: "http://127.0.0.1:" + server.address().port + "/native.tgz" } };
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ name: manifest.name, "dist-tags": { latest: manifest.version }, versions: { [manifest.version]: version }, time: { [manifest.version]: "2020-01-01T00:00:00.000Z" } }));
+      } else {
+        response.writeHead(404); response.end("unknown fixture package");
+      }
+    });
+    server.listen(0, "127.0.0.1", () => parentPort.postMessage(server.address().port));
+  `, { eval: true, workerData: { nativeArtifact, manifest } });
+  context.after(() => worker.terminate());
+  const [port] = await once(worker, "message");
+  return `http://127.0.0.1:${port}/`;
+}
+
+test("native repair uses real package managers to restore a missing native dependency", async (context) => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-native-repair-managers-"));
+  context.after(() => rmSync(fixtureRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }));
+  const { unscopedArtifact, nativeArtifact } = stagePackages(fixtureRoot);
+  const [targetId, target] = currentTargetEntry();
+  const nativeManifest = readJson(path.join(fixtureRoot, "packages", `satelle-${targetId}`, "package.json"));
+  const registry = await fixtureRegistry(context, nativeArtifact, nativeManifest);
+  const requiredManagers = new Set((process.env.SATELLE_REQUIRED_PACKAGE_MANAGERS || "npm").split(","));
+  for (const manager of packageManagers) {
+    if (!commandIsAvailable(manager)) {
+      assert.equal(requiredManagers.has(manager.name), false, `${manager.name} is required`);
+      continue;
+    }
+    const consumerRoot = path.join(fixtureRoot, `consumer-${manager.name}`);
+    mkdirSync(consumerRoot);
+    const manifestPath = path.join(consumerRoot, "package.json");
+    writeJson(manifestPath, {
+      name: `satelle-native-repair-${manager.name}`,
+      private: true,
+      dependencies: { satelle: localTarballReference(unscopedArtifact) },
+    });
+    const environment = {
+      ...process.env,
+      npm_config_registry: registry,
+      BUN_CONFIG_REGISTRY: registry,
+      PNPM_CONFIG_REGISTRY: registry,
+      npm_config_cache: path.join(consumerRoot, "npm-cache"),
+      BUN_INSTALL_CACHE_DIR: path.join(consumerRoot, "bun-cache"),
+      pnpm_config_store_dir: path.join(consumerRoot, "pnpm-store"),
+      npm_config_user_agent: "OpenAI File Downloader, XaiImageApiFetch/1.0",
+      NO_COLOR: "1",
+    };
+    const installed = spawnCommand(manager.executable, manager.installArguments, {
+      cwd: consumerRoot, encoding: "utf8", env: environment,
+    });
+    assert.equal(installed.status, 0, `${manager.name}: ${installed.stdout}\n${installed.stderr}`);
+    const executable = installedBin(consumerRoot);
+    assert.ok(executable);
+    const canonicalLauncher = createRequire(
+      realpathSync(path.join(consumerRoot, "node_modules", "satelle", "package.json")),
+    ).resolve("@microck/satelle/launcher");
+    const nativeManifestPath = createRequire(canonicalLauncher).resolve(`${target.packageName}/package.json`);
+    rmSync(path.dirname(nativeManifestPath), { recursive: true, force: true });
+    const before = readFileSync(manifestPath);
+    const preview = spawnCommand(executable, ["native", "repair", "--dry-run"], {
+      cwd: consumerRoot, encoding: "utf8", env: environment,
+    });
+    assert.equal(preview.status, 0, `${manager.name}: ${preview.stderr}`);
+    assert.ok(preview.stdout.includes(`Owner: ${manager.name} (local)`), preview.stdout);
+    assert.ok(preview.stdout.includes(`${target.packageName}@${nativeManifest.version}`), preview.stdout);
+    assert.ok(before.equals(readFileSync(manifestPath)), "dry-run preserves the owning manifest");
+    assert.equal(existsSync(nativeManifestPath), false, "dry-run does not recreate native files");
+    const repaired = spawnCommand(executable, ["native", "repair"], {
+      cwd: consumerRoot, encoding: "utf8", env: environment, timeout: 120_000,
+    });
+    assert.equal(repaired.status, 0, `${manager.name}: ${repaired.stdout}\n${repaired.stderr}`);
+    assert.match(repaired.stdout, /^Repaired @microck\/satelle-/);
+    const installedManifest = readJson(manifestPath);
+    assert.equal(installedManifest.optionalDependencies[target.packageName], nativeManifest.version);
+    assert.equal(installedManifest.dependencies.satelle, localTarballReference(unscopedArtifact));
+    assert.ok(launcher.verifyRepairedNativePackage(target, path.dirname(canonicalLauncher)));
+    if (manager.name === "npm") {
+      // A failed optional fetch may still make npm exit zero. Remove the npm
+      // executable from PATH to exercise an actual package-manager launch failure.
+      const emptyPath = path.join(consumerRoot, "empty-path");
+      mkdirSync(emptyPath);
+      const installedLauncher = path.join(consumerRoot, "node_modules", "satelle", "bin", "satelle.cjs");
+      const failed = spawnSync(process.execPath, [installedLauncher, "native", "repair"], {
+        cwd: consumerRoot, encoding: "utf8", timeout: 30_000,
+        env: { ...environment, PATH: emptyPath },
+      });
+      assert.equal(failed.status, 1, failed.stderr);
+      assert.equal(failed.stdout, "");
+      assert.match(failed.stderr, /native-repair-failed/);
+    }
   }
 });
