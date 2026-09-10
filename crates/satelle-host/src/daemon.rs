@@ -727,6 +727,18 @@ impl HostService {
             .authenticate_api_token(token, OffsetDateTime::now_utc())
     }
 
+    /// Records only the connection's verified leaf fingerprint and the
+    /// bearer-authenticated Principal. Transport headers cannot supply it.
+    pub fn record_client_certificate_auth(
+        &self,
+        principal: &ApiPrincipal,
+        request_id: uuid::Uuid,
+        certificate_sha256: &[u8; 32],
+    ) -> Result<(), SatelleError> {
+        self.runtime
+            .record_client_certificate_auth(principal, request_id, certificate_sha256)
+    }
+
     /// Authenticates an unexpired pending setup token for its one narrow
     /// recovery operation. The transport must additionally bind the principal
     /// to activation of the same token ID.

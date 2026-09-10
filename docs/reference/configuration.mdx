@@ -167,6 +167,13 @@ satelle config explain --host local-demo --json
 `--show-secret-references` is explicit. It never reads or prints secret
 material.
 
+Direct Host Bindings can set `client_certificate.certificate_file` and
+`client_certificate.private_key_file` to absolute PEM paths for mutual TLS.
+These user-level references follow the same explicit disclosure rule. The
+existing `ca_bundle` controls trust in the Host server, while the client
+certificate authenticates the Controller connection. See
+[client certificate setup](/docs/how-to/connect-remote#require-client-certificates).
+
 ## Repair local configuration
 
 ```sh

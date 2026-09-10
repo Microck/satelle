@@ -17,8 +17,8 @@ use crate::contract::{
     StopResponse, TaskArtifactsResponse, TurnRequest, provider_secret_upload_aad,
 };
 use crate::transport_tls::{
-    ReqwestTrustError, TlsFailureKind, classify_tls_error, configure_reqwest_trust,
-    find_error_in_tree,
+    ClientCertificate, ReqwestTrustError, TlsFailureKind, classify_tls_error,
+    configure_reqwest_trust, find_error_in_tree,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -157,14 +157,22 @@ impl DaemonClient {
         binding: &DirectHostBinding,
         token: ApiBearerToken,
         ca_bundle: Option<&[u8]>,
+        client_certificate: Option<&ClientCertificate>,
     ) -> Result<Self, DaemonClientError> {
-        Self::https_with_timeout(binding, token, ca_bundle, DIRECT_REQUEST_TIMEOUT)
+        Self::https_with_timeout(
+            binding,
+            token,
+            ca_bundle,
+            client_certificate,
+            DIRECT_REQUEST_TIMEOUT,
+        )
     }
 
     fn https_with_timeout(
         binding: &DirectHostBinding,
         token: ApiBearerToken,
         ca_bundle: Option<&[u8]>,
+        client_certificate: Option<&ClientCertificate>,
         request_timeout: Duration,
     ) -> Result<Self, DaemonClientError> {
         let expected_host_identity = binding.expected_host_identity().to_string();
@@ -175,10 +183,15 @@ impl DaemonClient {
             .https_only(true)
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
             .timeout(request_timeout);
-        let builder = configure_reqwest_trust(builder, ca_bundle).map_err(|error| match error {
-            ReqwestTrustError::InvalidCaBundle(error) => DaemonClientError::InvalidCaBundle(error),
-            ReqwestTrustError::EmptyCaBundle => DaemonClientError::EmptyCaBundle,
-        })?;
+        let builder =
+            configure_reqwest_trust(builder, ca_bundle, client_certificate).map_err(|error| {
+                match error {
+                    ReqwestTrustError::InvalidCaBundle(error) => {
+                        DaemonClientError::InvalidCaBundle(error)
+                    }
+                    ReqwestTrustError::EmptyCaBundle => DaemonClientError::EmptyCaBundle,
+                }
+            })?;
         let client = builder.build().map_err(DaemonClientError::Transport)?;
         Ok(Self {
             client,
@@ -1275,6 +1288,7 @@ mod tests {
             &binding,
             ApiBearerToken::generate().expect("generate token"),
             None,
+            None,
         )
         .expect("construct HTTPS client");
         let debug = format!("{client:?}");
@@ -1286,6 +1300,7 @@ mod tests {
                 &binding,
                 ApiBearerToken::generate().expect("generate token"),
                 Some(b"-----BEGIN CERTIFICATE-----\n%%%%\n-----END CERTIFICATE-----\n"),
+                None,
             ),
             Err(DaemonClientError::InvalidCaBundle(_))
         ));
@@ -1294,6 +1309,7 @@ mod tests {
                 &binding,
                 ApiBearerToken::generate().expect("generate token"),
                 Some(b""),
+                None,
             ),
             Err(DaemonClientError::EmptyCaBundle)
         ));
@@ -1341,6 +1357,7 @@ mod tests {
             &binding,
             ApiBearerToken::generate().expect("generate token"),
             None,
+            None,
         )
         .expect("construct HTTPS client");
         assert!(matches!(
@@ -1366,6 +1383,7 @@ mod tests {
         let client = DaemonClient::https(
             &binding,
             ApiBearerToken::generate().expect("generate token"),
+            None,
             None,
         )
         .expect("construct HTTPS client");
@@ -1433,7 +1451,7 @@ mod tests {
         let binding = direct_binding(&format!("https://localhost:{}", address.port()))
             .expect("construct trusted TLS binding");
         let certificate_pem = cert.pem();
-        let daemon = DaemonClient::https(&binding, token, Some(certificate_pem.as_bytes()))
+        let daemon = DaemonClient::https(&binding, token, Some(certificate_pem.as_bytes()), None)
             .expect("construct trusted HTTPS client");
         let response = daemon.host_status().expect("complete HTTPS Host status");
         assert_eq!(response.host_identity(), "host-windows-11");
@@ -1936,6 +1954,7 @@ mod tests {
             &binding,
             ApiBearerToken::generate().expect("generate token"),
             None,
+            None,
             Duration::from_millis(50),
         )
         .expect("construct bounded HTTPS client");
@@ -1994,6 +2013,7 @@ mod tests {
             &binding,
             ApiBearerToken::generate().expect("generate token"),
             None,
+            None,
         )
         .expect("construct untrusted HTTPS client");
         assert!(matches!(
@@ -2009,6 +2029,7 @@ mod tests {
             &binding,
             ApiBearerToken::generate().expect("generate token"),
             Some(certificate_pem.as_bytes()),
+            None,
         )
         .expect("construct hostname-mismatch HTTPS client");
         assert!(matches!(
@@ -2045,6 +2066,7 @@ mod tests {
             &binding,
             ApiBearerToken::generate().expect("generate token"),
             Some(certificate_pem.as_bytes()),
+            None,
         )
         .expect("construct expired-certificate HTTPS client");
         let error = client
@@ -2078,6 +2100,7 @@ mod tests {
         let client = DaemonClient::https(
             &binding,
             ApiBearerToken::generate().expect("generate token"),
+            None,
             None,
         )
         .expect("construct TLS-version client");

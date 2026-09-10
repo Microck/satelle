@@ -359,6 +359,7 @@ async fn direct_and_established_ssh_tunnel_share_session_error_and_event_contrac
             &direct_api_binding,
             direct_api_token,
             Some(&direct_ca_bundle),
+            None,
         )
         .expect("construct direct HTTPS client")
     })
@@ -368,6 +369,7 @@ async fn direct_and_established_ssh_tunnel_share_session_error_and_event_contrac
         &binding,
         copy_token(&running.token),
         Some(direct.ca_bundle()),
+        None,
     )
     .expect("construct direct WSS client");
     assert_transport_conformance(

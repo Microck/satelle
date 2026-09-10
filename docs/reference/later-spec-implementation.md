@@ -22,9 +22,9 @@ those pull requests merge, the integration branch gets a final pull request to
 | Host versions | CLI/Host compatibility and explicit versions | Merged in PR #223 |
 | Host storage | Safe path-set migration | Pending |
 | API token lifecycle | Durable issuance, rotation, revocation, and one-time secret replies | Merged in PR #224 |
-| Transport authentication | Mutual TLS | Pending |
+| Transport authentication | Mutual TLS | Box verified; pull request pending |
 | Native package repair | Launcher repair through the detected installation owner | Merged in PR #225 |
-| Output formats | Lossless final results and fixed-column CSV | Box verified; pull request pending |
+| Output formats | Lossless final results and fixed-column CSV | Merged in PR #226 |
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit, diagnostic bundles | Pending |
 | Capture and observability | Raw protocol/subprocess exports, desktop snapshot, recording, native log sinks, telemetry | Pending |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
@@ -35,6 +35,27 @@ those pull requests merge, the integration branch gets a final pull request to
 Package repository submissions, staged npm publishing, and native action relay
 retain the prerequisites declared in `.facts`. A missing external capability
 or approval is a blocker, never proof of implementation.
+
+## Mutual TLS contract decisions
+
+Box passed the full Rust workspace test suites. The final rerun passed workspace
+Clippy, 594 CLI unit tests, 23 configuration integration tests, and all 59
+documentation examples. Inline simplification review completed with one
+comment clarification and no unused code. Native pull request checks remain
+pending.
+
+- Direct HTTPS and WSS share one validated client certificate and key loaded
+  from user-owned absolute file references. Bearer scopes and Host Identity
+  checks remain authoritative for application operations.
+- Host listeners require an explicit client CA when mTLS is enabled. Optional
+  CRLs require valid signatures, expiry, and chain coverage. No network CRL
+  fetching or unknown-revocation fallback is used.
+- The existing secure TLS watcher reloads the complete material set. A valid
+  mTLS replacement closes existing connections; an invalid candidate retains
+  the current policy and produces a typed diagnostic.
+- Storage schema 18 adds bounded authentication audit metadata. Each protected
+  mTLS request commits its verified fingerprint and bearer Principal metadata
+  before dispatch. The SQLite log retention setting also governs these records.
 
 ## Configuration contract decisions
 
@@ -242,8 +263,9 @@ request test passed on rerun.
 ## Output format decisions
 
 Box passed all 592 active CLI unit tests, 10 output-contract tests, the pinned
-TOON reference check, workspace Clippy, and 58 documentation examples. Native
-pull request checks remain pending. The inline simplification review preserved
+TOON reference check, workspace Clippy, and 58 documentation examples. PR #226
+passed Rust and npm checks on Linux, macOS, and Windows, documentation validation,
+and release installation checks on all six targets. The inline simplification review preserved
 the existing streaming JSON writer and error diagnostics; no new dead code
 remains.
 

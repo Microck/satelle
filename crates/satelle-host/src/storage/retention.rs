@@ -70,6 +70,12 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         prune_expired_logs(&transaction, observed_at, self.log_retention)?;
+        transaction
+            .execute(
+                "DELETE FROM client_certificate_audit WHERE recorded_at_unix_nanos < ?1",
+                [retained_log_cutoff_nanos],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         prune_expired_admission_cancellations(&transaction, observed_at)?;
         prune_expired_sessionless_idempotency(&transaction, observed_at)?;
         let candidates =
@@ -100,6 +106,14 @@ fn retention_needs_pruning(
     log_retention: time::Duration,
 ) -> Result<bool, StorageError> {
     if logs_need_pruning(connection, observed_at, log_retention)? {
+        return Ok(true);
+    }
+    let expired_client_audit: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM client_certificate_audit WHERE recorded_at_unix_nanos < ?1)",
+        [retained_log_cutoff_nanos],
+        |row| row.get(0),
+    ).map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    if expired_client_audit {
         return Ok(true);
     }
     if admission_cancellations_need_pruning(connection, observed_at)? {

@@ -197,6 +197,40 @@ pub(super) async fn authorize(
             valid_request_id,
         );
     }
+    if let Some(fingerprint) = request
+        .extensions()
+        .get::<ConnectInfo<ConnectionContext>>()
+        .and_then(|connection| connection.0.client_fingerprint())
+    {
+        let service = Arc::clone(&state.service);
+        let audited_principal = principal.clone();
+        let audit_request_id = uuid::Uuid::parse_str(valid_request_id.as_str())
+            .expect("RequestId contains a canonical UUID");
+        if !matches!(
+            tokio::task::spawn_blocking(move || {
+                service.record_client_certificate_auth(
+                    &audited_principal,
+                    audit_request_id,
+                    &fingerprint,
+                )
+            })
+            .await,
+            Ok(Ok(()))
+        ) {
+            return api_error_response(
+                valid_request_id,
+                Some(state.host_identity.clone()),
+                ApiFailure {
+                    status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    code: ApiErrorCode::InternalError,
+                    category: ApiErrorCategory::Internal,
+                    retryable: false,
+                    message: "the Host Daemon could not record this authenticated client request",
+                    details: None,
+                },
+            );
+        }
+    }
     request.extensions_mut().insert(AuthorizedRequest {
         request_id: valid_request_id,
         request_id_was_supplied,

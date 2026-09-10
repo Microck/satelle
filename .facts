@@ -1931,11 +1931,19 @@
   command: cargo test --locked -p satelle-transport --test http liveness_is_exact_and_reveals_no_protected_metadata -- --exact
   tags: [spec, mvp, implemented, ci]
 - readiness details, versions, capabilities, Host Identity, and Session metadata require read scope @spec @mvp @implemented
-- satelle MVP does not support mTLS client certificate authentication for direct Host Daemon transport @spec @mvp @implemented
-- satelle later supports optional mutual TLS as defense in depth in addition to scoped bearer-token authentication and authorization @spec @later
-- satelle mTLS does not replace bearer token authorization because mTLS authenticates the client connection while Satelle still needs application-layer operation scopes and audit metadata @spec @later
-- satelle later mutual TLS uses user-level client certificate, private-key, and CA descriptors with certificate rotation, revocation, service reload, expiry, trust-chain, and cross-platform storage diagnostics @spec @later
-- satelle later maps a verified client certificate identity into audit metadata while bearer-token scopes remain authoritative for application operations @spec @later
+- satelle Direct Host Daemon transport optionally requires a verified client certificate at the TLS connection boundary in addition to the normal scoped bearer token @contract @phase4
+- satelle supports optional mutual TLS as defense in depth in addition to scoped bearer-token authentication and authorization @spec @phase4 @implemented
+- satelle mTLS does not replace bearer token authorization because mTLS authenticates the client connection while Satelle still needs application-layer operation scopes and audit metadata @spec @phase4 @implemented
+- satelle mutual TLS uses user-level client certificate, private-key, and CA descriptors with certificate rotation, revocation, service reload, expiry, trust-chain, and cross-platform storage diagnostics @spec @phase4 @implemented
+- satelle maps a verified client certificate identity into audit metadata while bearer-token scopes remain authoritative for application operations @spec @phase4 @implemented
+- satelle user-level Direct Host Bindings configure client_certificate with absolute certificate_file and private_key_file paths; project configuration and SSH or local transports cannot supply client certificate descriptors @spec @contract @phase4 @implemented
+- satelle HTTP and WebSocket Direct clients use the same client identity and Host CA trust policy; a configured ca_bundle replaces platform roots, and client certificates never replace Host Identity pinning or bearer-token checks @spec @contract @phase4 @implemented
+- satelle host start enables mTLS with --tls-client-ca <PEM_FILE> alongside its server certificate and key; optional --tls-client-crl <PEM_FILE> supplies signed revocation lists whose expiry and coverage are enforced during client authentication @spec @contract @phase4 @implemented
+- satelle reloads watched server and client trust material only after validating the complete replacement; a successful mTLS reload closes existing connections so the replacement policy applies at their next handshake @spec @contract @phase4 @implemented
+- satelle client certificate rotation takes effect when a new CLI invocation loads the descriptors; long-lived commands must be restarted after replacing their client identity @spec @contract @phase4 @implemented
+- satelle records the verified client leaf certificate SHA-256 fingerprint in audit metadata, never its private key or complete certificate, while the bearer token still determines Principal identity and operation scopes @spec @contract @phase4 @implemented
+- satelle commits an mTLS request audit record after bearer authentication and Host Identity validation, before dispatch; the record contains the request UUID, Principal reference, public token ID, credential revision, scopes, verified leaf SHA-256 fingerprint, and timestamp, with no request body, URL, certificate, or secret @spec @contract @phase4 @implemented
+- satelle retains mTLS request audit records for the configured SQLite log retention window; an audit write failure prevents dispatch of that request @spec @contract @phase4 @implemented
 - satelle Tailscale-backed direct transport still requires Satelle Host Daemon authentication and authorization because Tailscale reachability identity is not the Satelle operation permission model @spec @mvp @implemented
 - after explicit setup or trust acceptance, the CLI writes the observed stable Host Identity to expected_host_id in the user-level Host Binding @spec @mvp @implemented
 - any Host Binding with expected_host_id = null permits identity discovery only through explicit setup or trust acceptance and cannot start ordinary Session, log, or maintenance operations @spec @mvp @implemented

@@ -44,7 +44,13 @@ fn version_sixteen_store_with_pending_journal(state: &TempDir) {
         .unwrap();
     connection.execute_batch(predecessor).unwrap();
     connection
-        .execute("DELETE FROM schema_migrations WHERE version = 17", [])
+        .execute("DROP TABLE client_certificate_audit", [])
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM schema_migrations WHERE version IN (17, 18)",
+            [],
+        )
         .unwrap();
     connection.pragma_update(None, "user_version", 16).unwrap();
     connection

@@ -48,7 +48,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const RESTORE_ACTIVATION_JOURNAL: &str = ".satelle-restore-activation-v1";
 const RESTORE_ACTIVATION_JOURNAL_LIMIT: usize = 64 * 1024;
-const MIGRATIONS: [Migration; 17] = [
+const MIGRATIONS: [Migration; 18] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -150,6 +150,12 @@ const MIGRATIONS: [Migration; 17] = [
         sql: include_str!("0017-api-token-lifecycle.sql"),
         seeds_sensitive_state: false,
         irreversible: true,
+    },
+    Migration {
+        version: 18,
+        sql: include_str!("0018-client-certificate-audit.sql"),
+        seeds_sensitive_state: false,
+        irreversible: false,
     },
 ];
 

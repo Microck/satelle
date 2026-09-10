@@ -58,7 +58,8 @@ pub use control_plane::{
 };
 pub use credential_helper::{CredentialHelper, CredentialHelperDescriptorError};
 pub use direct_host_binding::{
-    ApiTokenSource, DirectHostBinding, DirectHostBindingError, SshHostBinding, SshHostBindingError,
+    ApiTokenSource, ClientCertificateSource, DirectHostBinding, DirectHostBindingError,
+    SshHostBinding, SshHostBindingError,
 };
 pub use events::{
     EVENT_SCHEMA_VERSION, EventSource, EventStateSubject, EventSubject, EventType, SatelleEvent,
@@ -150,6 +151,7 @@ impl SatelleConfig {
                 expected_host_id: None,
                 api_token: None,
                 ca_bundle: None,
+                client_certificate: None,
                 provider_auth: BTreeMap::new(),
                 provider_bindings: BTreeMap::new(),
             },
@@ -364,6 +366,8 @@ pub struct HostConfig {
     pub api_token: Option<ApiTokenSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_bundle: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_certificate: Option<ClientCertificateSource>,
     #[serde(default)]
     pub provider_auth: BTreeMap<String, ProviderSecretSource>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -3517,6 +3521,19 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
             );
         }
 
+        if let Some(certificate) = host_table
+            .get("client_certificate")
+            .and_then(toml::Value::as_table)
+        {
+            for key in ["certificate_file", "private_key_file"] {
+                collect_interpolation_for_value(
+                    &format!("{host_path}.client_certificate.{key}"),
+                    certificate.get(key),
+                    &mut interpolations,
+                );
+            }
+        }
+
         if let Some(network_table) = host_table.get("network").and_then(toml::Value::as_table) {
             for key in ["provider", "tailnet_name", "hostname"] {
                 collect_interpolation_for_value(
@@ -3899,6 +3916,25 @@ fn reject_provider_secret_source_errors(
                 ));
             }
         }
+        if let Some(certificate) = host_table.get("client_certificate") {
+            if host_table.get("transport").and_then(toml::Value::as_str) != Some("direct") {
+                return Err(SatelleError::config_error(
+                    format!("{host_path}.client_certificate requires direct transport"),
+                    None,
+                ));
+            }
+            for key in ["certificate_file", "private_key_file"] {
+                if let Some(file_path) = certificate.get(key).and_then(toml::Value::as_str)
+                    && !Path::new(file_path).is_absolute()
+                {
+                    return Err(SatelleError::secret_file_path_not_absolute(
+                        path,
+                        &format!("{host_path}.client_certificate.{key}"),
+                        file_path,
+                    ));
+                }
+            }
+        }
         let Some(provider_auth) = host_table
             .get("provider_auth")
             .and_then(toml::Value::as_table)
@@ -4204,11 +4240,24 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "expected_host_id",
                     "api_token",
                     "ca_bundle",
+                    "client_certificate",
                     "provider_auth",
                     "provider_bindings",
                 ],
                 &mut unknown_keys,
             );
+
+            if let Some(certificate) = host_table
+                .get("client_certificate")
+                .and_then(toml::Value::as_table)
+            {
+                collect_unknown_keys_for_table(
+                    &format!("{host_path}.client_certificate"),
+                    certificate,
+                    &["certificate_file", "private_key_file"],
+                    &mut unknown_keys,
+                );
+            }
 
             if let Some(network_table) = host_table.get("network").and_then(toml::Value::as_table) {
                 collect_unknown_keys_for_table(

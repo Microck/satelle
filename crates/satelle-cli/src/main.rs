@@ -576,7 +576,7 @@ struct PathsCommand {
 
 #[derive(Subcommand, Debug)]
 enum HostCommand {
-    Start(HostStartCommand),
+    Start(Box<HostStartCommand>),
     /// Internal owner-local request for a running SSH daemon to release its store.
     #[command(hide = true)]
     ReleaseState,
@@ -639,6 +639,12 @@ struct HostStartCommand {
     /// Owner-only PEM private key matching --tls-cert.
     #[arg(long, value_name = "PATH", requires = "tls_cert")]
     tls_key: Option<PathBuf>,
+    /// Require client certificates signed by this PEM CA bundle.
+    #[arg(long, value_name = "PATH", requires = "tls_cert")]
+    tls_client_ca: Option<PathBuf>,
+    /// Signed client revocation lists, including a current list for each issuing CA.
+    #[arg(long, value_name = "PATH", requires = "tls_client_ca")]
+    tls_client_crl: Option<PathBuf>,
     #[arg(long)]
     foreground: bool,
     /// Internal launchd service boundary. Path overrides in this process came
@@ -2779,10 +2785,12 @@ mod history_target_tests {
 
     fn host_start(foreground: bool, bootstrap_token_stdin: bool) -> Command {
         Command::Host {
-            command: HostCommand::Start(HostStartCommand {
+            command: HostCommand::Start(Box::new(HostStartCommand {
                 bind: "127.0.0.1:3001".to_string(),
                 tls_cert: None,
                 tls_key: None,
+                tls_client_ca: None,
+                tls_client_crl: None,
                 foreground,
                 launchd_service: false,
                 bootstrap_token_stdin,
@@ -2801,7 +2809,7 @@ mod history_target_tests {
                 operator_log_retained_files: None,
                 service_config: None,
                 output_args: OutputArgs::default(),
-            }),
+            })),
         }
     }
 
@@ -7596,6 +7604,17 @@ fn redact_schema_marked_config_values(
     path: &mut Vec<String>,
     show_secret_references: bool,
 ) {
+    if path.len() == 3 && path[0] == "hosts" && path[2] == "client_certificate" {
+        if !show_secret_references {
+            *value = json!({
+                "certificate_file": "[REDACTED]",
+                "private_key_file": "[REDACTED]",
+                "redacted": true,
+                "redaction_reason": "client_certificate_reference",
+            });
+        }
+        return;
+    }
     if CONFIG_SECRET_SOURCE_SCHEMA_PATHS.iter().any(|schema_path| {
         schema_path.len() == path.len()
             && schema_path
@@ -7706,6 +7725,23 @@ fn reveal_secret_source_descriptor(
 mod config_redaction_tests {
     use super::redact_schema_marked_config_values;
     use serde_json::json;
+
+    #[test]
+    fn client_certificate_descriptors_require_explicit_reference_disclosure() {
+        let configured = json!({"hosts": {"direct": {"client_certificate": {
+            "certificate_file": "/private/client-cert.pem", "private_key_file": "/private/client-key.pem"
+        }}}});
+        let mut hidden = configured.clone();
+        redact_schema_marked_config_values(&mut hidden, &mut Vec::new(), false);
+        assert!(!hidden.to_string().contains("/private/"));
+        assert_eq!(
+            hidden["hosts"]["direct"]["client_certificate"]["redacted"],
+            true
+        );
+        let mut visible = configured.clone();
+        redact_schema_marked_config_values(&mut visible, &mut Vec::new(), true);
+        assert_eq!(visible, configured);
+    }
 
     #[test]
     fn schema_marked_secret_fields_never_fall_back_to_raw_values() {
@@ -8353,7 +8389,7 @@ fn run_host(
 ) -> Result<(), CliFailure> {
     let machine_output = format.is_structured();
     match command {
-        HostCommand::Start(command) => start_host_daemon(command, config, format),
+        HostCommand::Start(command) => start_host_daemon(*command, config, format),
         HostCommand::ReleaseState => release_ssh_state_owner(),
         HostCommand::Trust(command) => trust_host(command, config, format),
         HostCommand::Status(command) => {
@@ -8874,18 +8910,14 @@ async fn bind_host_daemon(
 ) -> Result<(DaemonServer, Option<DaemonTlsWatcher>), CliFailure> {
     match tls {
         Some(tls) => {
-            let DaemonTlsFiles {
-                certificate_path,
-                private_key_path,
-                config,
-            } = tls;
+            let DaemonTlsFiles { paths, config } = tls;
             let server = DaemonServer::bind_tls(service, server_config, config)
                 .await
                 .map_err(daemon_server_failure)?;
             let reloader = server
                 .tls_reloader()
                 .expect("a TLS listener always exposes its reload handle");
-            let watcher = DaemonTlsWatcher::start(certificate_path, private_key_path, reloader)?;
+            let watcher = DaemonTlsWatcher::start(paths, reloader)?;
             Ok((server, Some(watcher)))
         }
         None => Ok((
@@ -9559,52 +9591,82 @@ fn install_diagnostics(
 }
 
 struct DaemonTlsFiles {
-    certificate_path: PathBuf,
-    private_key_path: PathBuf,
+    paths: DaemonTlsPaths,
     config: DaemonTlsConfig,
 }
 
+struct DaemonTlsPaths {
+    certificate: PathBuf,
+    private_key: PathBuf,
+    client_ca: Option<PathBuf>,
+    client_crl: Option<PathBuf>,
+}
+
+impl DaemonTlsPaths {
+    fn files(&self) -> impl Iterator<Item = &Path> {
+        [
+            Some(self.certificate.as_path()),
+            Some(self.private_key.as_path()),
+            self.client_ca.as_deref(),
+            self.client_crl.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
 fn daemon_tls_config(command: &HostStartCommand) -> Result<Option<DaemonTlsFiles>, CliFailure> {
-    let (certificate_path, private_key_path) =
-        match (command.tls_cert.as_deref(), command.tls_key.as_deref()) {
-            (None, None) => return Ok(None),
-            (Some(certificate_path), Some(private_key_path)) => {
-                (certificate_path, private_key_path)
-            }
-            _ => {
-                return Err(failure(SatelleError::invalid_usage(
-                    "--tls-cert and --tls-key must be provided together",
-                )));
-            }
-        };
-    // Absolute TLS paths do not depend on the process working directory. This
-    // matters for long-lived launchers whose original directory may be removed
-    // before the Host daemon starts.
-    let current_directory = (certificate_path.is_relative() || private_key_path.is_relative())
+    if command.tls_client_crl.is_some() && command.tls_client_ca.is_none() {
+        return Err(failure(SatelleError::invalid_usage(
+            "--tls-client-crl requires --tls-client-ca",
+        )));
+    }
+    if command.tls_client_ca.is_some() && (command.tls_cert.is_none() || command.tls_key.is_none())
+    {
+        return Err(failure(SatelleError::invalid_usage(
+            "--tls-client-ca requires --tls-cert and --tls-key",
+        )));
+    }
+    let (certificate, private_key) = match (command.tls_cert.as_deref(), command.tls_key.as_deref())
+    {
+        (None, None) => return Ok(None),
+        (Some(certificate), Some(private_key)) => (certificate, private_key),
+        _ => {
+            return Err(failure(SatelleError::invalid_usage(
+                "--tls-cert and --tls-key must be provided together",
+            )));
+        }
+    };
+    // Resolve the whole material set once. Long-lived services must not depend
+    // on a working directory that can disappear after launch.
+    let needs_current_directory = [
+        Some(certificate),
+        Some(private_key),
+        command.tls_client_ca.as_deref(),
+        command.tls_client_crl.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(Path::is_relative);
+    let current_directory = needs_current_directory
         .then(std::env::current_dir)
         .transpose()
         .map_err(|error| daemon_process_failure("tls-path-resolution-failed", error.to_string()))?;
-    let certificate_path =
-        absolute_path(certificate_path, current_directory.as_deref()).map_err(|reason| {
-            tls_file_failure("certificate path", certificate_path, reason.to_string())
-        })?;
-    let private_key_path =
-        absolute_path(private_key_path, current_directory.as_deref()).map_err(|reason| {
-            tls_file_failure("private-key path", private_key_path, reason.to_string())
-        })?;
-    let _boundary_guards = open_daemon_tls_boundaries(
-        &certificate_path,
-        &private_key_path,
-        TlsBoundaryOpenMode::CreateIfMissing,
-    )
-    .map_err(|error| tls_material_failure(error, &certificate_path, &private_key_path))?;
-    let config = read_daemon_tls_config(&certificate_path, &private_key_path)
-        .map_err(|error| tls_material_failure(error, &certificate_path, &private_key_path))?;
-    Ok(Some(DaemonTlsFiles {
-        certificate_path,
-        private_key_path,
-        config,
-    }))
+    let resolve = |path: &Path| {
+        absolute_path(path, current_directory.as_deref())
+            .map_err(|reason| tls_file_failure("material path", path, reason.to_string()))
+    };
+    let paths = DaemonTlsPaths {
+        certificate: resolve(certificate)?,
+        private_key: resolve(private_key)?,
+        client_ca: command.tls_client_ca.as_deref().map(resolve).transpose()?,
+        client_crl: command.tls_client_crl.as_deref().map(resolve).transpose()?,
+    };
+    let _boundary_guards = open_daemon_tls_boundaries(&paths, TlsBoundaryOpenMode::CreateIfMissing)
+        .map_err(|error| tls_material_failure(error, &paths))?;
+    let config =
+        read_daemon_tls_config(&paths).map_err(|error| tls_material_failure(error, &paths))?;
+    Ok(Some(DaemonTlsFiles { paths, config }))
 }
 
 fn absolute_path(path: &Path, current_directory: Option<&Path>) -> Result<PathBuf, &'static str> {
@@ -9652,6 +9714,10 @@ enum DaemonTlsMaterialError {
     Certificate(#[source] SecureFileError),
     #[error("the private-key file is unavailable or unsafe: {0}")]
     PrivateKey(#[source] SecureFileError),
+    #[error("the client CA file is unavailable or unsafe: {0}")]
+    ClientCa(#[source] SecureFileError),
+    #[error("the client revocation file is unavailable or unsafe: {0}")]
+    ClientCrl(#[source] SecureFileError),
     #[error("the replacement TLS configuration is invalid: {0}")]
     Configuration(#[source] DaemonTlsConfigError),
     #[error("the TLS listener stopped before the replacement could be installed")]
@@ -9664,6 +9730,8 @@ impl DaemonTlsMaterialError {
             Self::Boundary { .. } => "tls-reload-boundary-unavailable",
             Self::Certificate(_) => "tls-reload-certificate-unavailable",
             Self::PrivateKey(_) => "tls-reload-private-key-unavailable",
+            Self::ClientCa(_) => "tls-reload-client-ca-unavailable",
+            Self::ClientCrl(_) => "tls-reload-client-crl-unavailable",
             Self::Configuration(_) => "tls-reload-invalid-configuration",
             Self::ListenerStopped => "tls-reload-listener-stopped",
         }
@@ -9677,16 +9745,15 @@ enum TlsBoundaryOpenMode {
 }
 
 fn open_daemon_tls_boundaries(
-    certificate_path: &Path,
-    private_key_path: &Path,
+    paths: &DaemonTlsPaths,
     mode: TlsBoundaryOpenMode,
 ) -> Result<Vec<OwnerOnlyDirectory>, DaemonTlsMaterialError> {
     let open_boundary = match mode {
         TlsBoundaryOpenMode::CreateIfMissing => open_or_create_owner_only_directory,
         TlsBoundaryOpenMode::Existing => open_owner_only_directory,
     };
-    [certificate_path, private_key_path]
-        .into_iter()
+    paths
+        .files()
         .map(|path| {
             path.parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
@@ -9707,32 +9774,61 @@ fn open_daemon_tls_boundaries(
 }
 
 fn read_daemon_tls_config(
-    certificate_path: &Path,
-    private_key_path: &Path,
+    paths: &DaemonTlsPaths,
 ) -> Result<DaemonTlsConfig, DaemonTlsMaterialError> {
-    let certificate = read_owner_controlled_config_file(certificate_path)
+    let certificate = read_owner_controlled_config_file(&paths.certificate)
         .map_err(DaemonTlsMaterialError::Certificate)?;
-    let private_key = read_owner_only_secret_config_file(private_key_path)
+    let private_key = read_owner_only_secret_config_file(&paths.private_key)
         .map_err(DaemonTlsMaterialError::PrivateKey)?;
-    DaemonTlsConfig::from_pem(certificate.as_bytes(), private_key.as_bytes())
+    let client_ca = paths
+        .client_ca
+        .as_deref()
+        .map(read_owner_controlled_config_file)
+        .transpose()
+        .map_err(DaemonTlsMaterialError::ClientCa)?;
+    let client_crl = paths
+        .client_crl
+        .as_deref()
+        .map(read_owner_controlled_config_file)
+        .transpose()
+        .map_err(DaemonTlsMaterialError::ClientCrl)?;
+    let client_trust = client_ca
+        .as_ref()
+        .map(|ca| satelle_transport::DaemonClientTrust {
+            ca_pem: ca.as_bytes(),
+            crl_pem: client_crl.as_ref().map(|crl| crl.as_bytes()),
+        });
+    DaemonTlsConfig::from_pem(certificate.as_bytes(), private_key.as_bytes(), client_trust)
         .map_err(DaemonTlsMaterialError::Configuration)
 }
 
-fn tls_material_failure(
-    error: DaemonTlsMaterialError,
-    certificate_path: &Path,
-    private_key_path: &Path,
-) -> CliFailure {
+fn tls_material_failure(error: DaemonTlsMaterialError, paths: &DaemonTlsPaths) -> CliFailure {
     match error {
         DaemonTlsMaterialError::Boundary { path, source } => {
             tls_file_failure("file boundary", &path, source.to_string())
         }
         DaemonTlsMaterialError::Certificate(source) => {
-            tls_file_failure("certificate chain", certificate_path, source.to_string())
+            tls_file_failure("certificate chain", &paths.certificate, source.to_string())
         }
         DaemonTlsMaterialError::PrivateKey(source) => {
-            tls_file_failure("private key", private_key_path, source.to_string())
+            tls_file_failure("private key", &paths.private_key, source.to_string())
         }
+        DaemonTlsMaterialError::ClientCa(source) => tls_file_failure(
+            "client CA",
+            paths
+                .client_ca
+                .as_deref()
+                .expect("configured CA read failed"),
+            source.to_string(),
+        ),
+        DaemonTlsMaterialError::ClientCrl(source) => tls_file_failure(
+            "client revocation list",
+            paths
+                .client_crl
+                .as_deref()
+                .expect("configured CRL read failed"),
+            source.to_string(),
+        ),
         DaemonTlsMaterialError::Configuration(source) => tls_configuration_failure(source),
         DaemonTlsMaterialError::ListenerStopped => {
             daemon_process_failure("tls-reload-listener-stopped", error.to_string())
@@ -9748,21 +9844,13 @@ const TLS_DIRECTORY_WATCH_RETRY_INITIAL: Duration = Duration::from_millis(50);
 const TLS_DIRECTORY_WATCH_RETRY_MAX: Duration = Duration::from_secs(1);
 
 impl DaemonTlsWatcher {
-    fn start(
-        certificate_path: PathBuf,
-        private_key_path: PathBuf,
-        reloader: DaemonTlsReloader,
-    ) -> Result<Self, CliFailure> {
+    fn start(paths: DaemonTlsPaths, reloader: DaemonTlsReloader) -> Result<Self, CliFailure> {
         // Retaining these handles pins the boundary against replacement on
         // Windows. Unix reloads additionally revalidate the trusted ancestry
         // before every path-based read below.
-        let boundary_guards = open_daemon_tls_boundaries(
-            &certificate_path,
-            &private_key_path,
-            TlsBoundaryOpenMode::Existing,
-        )
-        .map_err(|error| tls_material_failure(error, &certificate_path, &private_key_path))?;
-        let watched_paths = Arc::new([certificate_path.clone(), private_key_path.clone()]);
+        let boundary_guards = open_daemon_tls_boundaries(&paths, TlsBoundaryOpenMode::Existing)
+            .map_err(|error| tls_material_failure(error, &paths))?;
+        let watched_paths = Arc::new(paths.files().map(Path::to_path_buf).collect::<Vec<_>>());
         let callback_paths = Arc::clone(&watched_paths);
         let file_directories = watched_paths
             .iter()
@@ -9789,9 +9877,7 @@ impl DaemonTlsWatcher {
         // Close the startup race between the initial TLS read and watcher
         // registration. Any rotation overlapping this authoritative re-read
         // also produces a watched event and is retried by the task below.
-        if let Err(error) =
-            reload_daemon_tls_config(&certificate_path, &private_key_path, &reloader)
-        {
+        if let Err(error) = reload_daemon_tls_config(&paths, &reloader) {
             report_daemon_tls_reload_error(&error);
         }
         let task = tokio::spawn(async move {
@@ -9802,9 +9888,7 @@ impl DaemonTlsWatcher {
             while reload_receiver.changed().await.is_ok() {
                 let watch_registration =
                     refresh_tls_directory_watches(&mut watcher, &file_directories);
-                if let Err(error) =
-                    reload_daemon_tls_config(&certificate_path, &private_key_path, &reloader)
-                {
+                if let Err(error) = reload_daemon_tls_config(&paths, &reloader) {
                     report_daemon_tls_reload_error(&error);
                 }
                 if let Err(error) = watch_registration {
@@ -9814,9 +9898,7 @@ impl DaemonTlsWatcher {
                     // ancestry may be execute-only. Re-read after polling has
                     // attached to a replacement boundary: its files may have
                     // arrived before the new watch existed.
-                    if let Err(error) =
-                        reload_daemon_tls_config(&certificate_path, &private_key_path, &reloader)
-                    {
+                    if let Err(error) = reload_daemon_tls_config(&paths, &reloader) {
                         report_daemon_tls_reload_error(&error);
                     }
                 }
@@ -9898,21 +9980,16 @@ fn signal_tls_reload(sender: &tokio::sync::watch::Sender<u64>) {
     // The generation counter coalesces repeated filesystem events in constant
     // memory. `changed()` marks one generation as observed before re-reading,
     // so an event arriving during that read advances the version and schedules
-    // another authoritative file-pair read.
+    // another authoritative material-set read.
     sender.send_modify(|generation| *generation = generation.wrapping_add(1));
 }
 
 fn reload_daemon_tls_config(
-    certificate_path: &Path,
-    private_key_path: &Path,
+    paths: &DaemonTlsPaths,
     reloader: &DaemonTlsReloader,
 ) -> Result<(), DaemonTlsMaterialError> {
-    let _boundary_guards = open_daemon_tls_boundaries(
-        certificate_path,
-        private_key_path,
-        TlsBoundaryOpenMode::Existing,
-    )?;
-    let config = read_daemon_tls_config(certificate_path, private_key_path)?;
+    let _boundary_guards = open_daemon_tls_boundaries(paths, TlsBoundaryOpenMode::Existing)?;
+    let config = read_daemon_tls_config(paths)?;
     reloader.reload(config).map_err(|error| match error {
         DaemonTlsReloadError::InvalidConfiguration(source) => {
             DaemonTlsMaterialError::Configuration(source)
@@ -9933,7 +10010,7 @@ impl Drop for DaemonTlsWatcher {
     }
 }
 
-fn tls_event_requires_reload(event: &Event, watched_paths: &[PathBuf; 2]) -> bool {
+fn tls_event_requires_reload(event: &Event, watched_paths: &[PathBuf]) -> bool {
     if event.need_rescan() {
         return true;
     }
@@ -9998,6 +10075,8 @@ mod daemon_tls_watcher_tests {
             bind: "127.0.0.1:3001".to_string(),
             tls_cert: tls_cert.map(PathBuf::from),
             tls_key: tls_key.map(PathBuf::from),
+            tls_client_ca: None,
+            tls_client_crl: None,
             foreground: true,
             launchd_service: false,
             bootstrap_token_stdin: false,
@@ -10043,10 +10122,48 @@ mod daemon_tls_watcher_tests {
     }
 
     #[test]
+    fn client_trust_flags_require_server_tls_and_crls_require_a_client_ca() {
+        let mut command = tls_command(None, None);
+        command.tls_client_ca = Some(PathBuf::from("client-ca.pem"));
+        assert!(
+            matches!(daemon_tls_config(&command), Err(error) if error.error.message == "--tls-client-ca requires --tls-cert and --tls-key")
+        );
+        command.tls_client_ca = None;
+        command.tls_client_crl = Some(PathBuf::from("clients.crl"));
+        assert!(
+            matches!(daemon_tls_config(&command), Err(error) if error.error.message == "--tls-client-crl requires --tls-client-ca")
+        );
+        for arguments in [
+            vec![
+                "satelle",
+                "host",
+                "start",
+                "--tls-client-ca",
+                "client-ca.pem",
+            ],
+            vec![
+                "satelle",
+                "host",
+                "start",
+                "--tls-cert",
+                "server.pem",
+                "--tls-key",
+                "server.key",
+                "--tls-client-crl",
+                "clients.crl",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
     fn reloads_only_for_tls_material_changes_or_rescan_requests() {
         let watched = [
             PathBuf::from("/host/tls/certificate.pem"),
             PathBuf::from("/host/tls/private-key.pem"),
+            PathBuf::from("/host/client-trust/ca.pem"),
+            PathBuf::from("/host/client-trust/clients.crl"),
         ];
         let certificate_change = Event::new(EventKind::Any).add_path(watched[0].clone());
         let unrelated_change =
@@ -10064,6 +10181,14 @@ mod daemon_tls_watcher_tests {
         let rescan = Event::new(EventKind::Any).set_flag(Flag::Rescan);
 
         assert!(tls_event_requires_reload(&certificate_change, &watched));
+        assert!(tls_event_requires_reload(
+            &Event::new(EventKind::Any).add_path(watched[2].clone()),
+            &watched
+        ));
+        assert!(tls_event_requires_reload(
+            &Event::new(EventKind::Any).add_path(watched[3].clone()),
+            &watched
+        ));
         assert!(tls_event_requires_reload(&directory_replacement, &watched));
         assert!(!tls_event_requires_reload(&read_open, &watched));
         assert!(!tls_event_requires_reload(&read_close, &watched));
@@ -10257,6 +10382,7 @@ mod daemon_tls_watcher_tests {
         let initial_tls = DaemonTlsConfig::from_pem(
             initial.cert.pem().as_bytes(),
             initial.signing_key.serialize_pem().as_bytes(),
+            None,
         )
         .expect("validate initial TLS configuration");
         let server = DaemonServer::bind_tls(
@@ -10289,8 +10415,12 @@ mod daemon_tls_watcher_tests {
             .expect("restrict replacement private key");
 
         let watcher = DaemonTlsWatcher::start(
-            certificate_path.clone(),
-            private_key_path.clone(),
+            DaemonTlsPaths {
+                certificate: certificate_path.clone(),
+                private_key: private_key_path.clone(),
+                client_ca: None,
+                client_crl: None,
+            },
             server
                 .tls_reloader()
                 .expect("TLS listener exposes its reload handle"),
@@ -10453,7 +10583,7 @@ fn tls_configuration_failure(error: DaemonTlsConfigError) -> CliFailure {
         code,
         message: format!("Host Daemon TLS configuration is invalid: {error}"),
         recovery_command: Some(
-            "replace the certificate chain or private key, then restart the Host Daemon"
+            "replace the invalid TLS certificate, key, CA bundle, or revocation list, then restart the Host Daemon"
                 .to_string(),
         ),
         source_detail: None,
@@ -10527,6 +10657,8 @@ mod bootstrap_startup_tests {
             bind: address.to_string(),
             tls_cert: None,
             tls_key: None,
+            tls_client_ca: None,
+            tls_client_crl: None,
             foreground: false,
             launchd_service: false,
             bootstrap_token_stdin: true,

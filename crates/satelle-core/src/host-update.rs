@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 // Protocol handling and storage migrations enforce the same values below their
 // own boundaries, so a release cannot advertise a separate compatibility state.
 pub const HOST_PROTOCOL_VERSION: &str = "15";
-pub const HOST_STORAGE_SCHEMA_VERSION: i64 = 17;
+pub const HOST_STORAGE_SCHEMA_VERSION: i64 = 18;
 pub const HOST_MINIMUM_CLI_VERSION: &str = "0.1.10";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

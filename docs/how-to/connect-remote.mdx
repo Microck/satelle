@@ -127,6 +127,55 @@ satelle host trust --host studio-mac \
   --expected-host-id <exact-host-id> --yes --no-input
 ```
 
+## Require client certificates
+
+To add mutual TLS, start the Host with its server certificate, key, and an
+explicit client CA bundle. The bearer token remains required and controls
+operation permissions.
+
+```sh
+satelle host start --bind 0.0.0.0:3001 --foreground \
+  --tls-cert /absolute/private/host-cert.pem \
+  --tls-key /absolute/private/host-key.pem \
+  --tls-client-ca /absolute/private/client-ca.pem \
+  --tls-client-crl /absolute/private/clients.crl
+```
+
+The CRL file is optional. When supplied, it must contain current, signed
+revocation lists covering the client chain. Include every CRL issuer in the
+client CA bundle. Missing revocation coverage and expired lists reject the
+connection. Satelle does not fetch revocation lists from the network.
+
+On the Controller, add absolute paths to the user-owned Direct Host Binding:
+
+```toml
+[hosts.studio-mac.client_certificate]
+certificate_file = "/absolute/private/client-cert.pem"
+private_key_file = "/absolute/private/client-key.pem"
+```
+
+The client certificate must permit client authentication and match its private
+key. The key must be owner-only. Certificates and trust files must be
+owner-controlled. Host-side material directories must be owner-only. Windows
+uses the same ownership boundary through ACL checks. SSH, local, and project
+configuration cannot supply a client identity. `config explain` hides these
+paths unless `--show-secret-references` is explicit.
+
+The Host watches all configured TLS files. A valid replacement installs the
+complete configuration and closes existing mTLS connections. Invalid material
+leaves the last valid configuration active and prints a specific reload
+diagnostic. Update certificates, CA bundles, and revocation lists before they
+expire. Each new CLI invocation loads the current client files; restart any
+long-lived command after rotating its client identity.
+
+Both HTTPS and WSS use the client identity and the existing Host CA policy.
+Client authentication never replaces Host identity pinning. The Host records
+the verified leaf certificate's SHA-256 fingerprint with the bearer Principal,
+public token ID, revision, scopes, request UUID, and time in SQLite's
+`client_certificate_audit` table. It retains these records for the configured
+SQLite log window. Audit records contain no certificate, private key, URL, or
+request body. An audit write failure prevents request dispatch.
+
 ## Verify before running work
 
 ```sh

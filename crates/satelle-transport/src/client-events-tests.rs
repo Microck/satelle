@@ -81,6 +81,7 @@ fn direct_event_client_rejects_invalid_ca_bundles() {
             &binding,
             ApiBearerToken::generate().expect("generate token"),
             Some(b"-----BEGIN CERTIFICATE-----\n%%%%\n-----END CERTIFICATE-----\n"),
+            None,
         ),
         Err(DaemonEventError::InvalidCaBundle)
     ));
@@ -89,6 +90,7 @@ fn direct_event_client_rejects_invalid_ca_bundles() {
             &binding,
             ApiBearerToken::generate().expect("generate token"),
             Some(b""),
+            None,
         ),
         Err(DaemonEventError::EmptyCaBundle)
     ));
@@ -108,7 +110,7 @@ async fn direct_event_client_completes_a_pinned_authenticated_wss_handshake() {
     );
     let binding = direct_binding(&format!("https://localhost:{}", address.port()))
         .expect("construct trusted direct Host Binding");
-    let client = DaemonEventClient::wss(&binding, token, Some(cert.pem().as_bytes()))
+    let client = DaemonEventClient::wss(&binding, token, Some(cert.pem().as_bytes()), None)
         .expect("construct WSS event client");
 
     let stream = client
@@ -140,6 +142,7 @@ async fn direct_event_client_bounds_the_entire_handshake_with_a_silent_peer() {
     let client = DaemonEventClient::wss(
         &binding,
         ApiBearerToken::generate().expect("generate token"),
+        None,
         None,
     )
     .expect("construct bounded WSS event client");
@@ -499,6 +502,7 @@ async fn direct_event_client_classifies_real_tls_failures() {
         &binding,
         ApiBearerToken::generate().expect("generate token"),
         None,
+        None,
     )
     .expect("construct platform-trust WSS client");
     assert!(matches!(
@@ -514,6 +518,7 @@ async fn direct_event_client_classifies_real_tls_failures() {
         &binding,
         ApiBearerToken::generate().expect("generate token"),
         Some(certificate_pem.as_bytes()),
+        None,
     )
     .expect("construct pinned WSS client");
     assert!(matches!(
@@ -548,6 +553,7 @@ async fn direct_event_client_classifies_real_tls_failures() {
         &binding,
         ApiBearerToken::generate().expect("generate token"),
         Some(ca_cert.pem().as_bytes()),
+        None,
     )
     .expect("construct expired-certificate WSS client");
     assert!(matches!(

@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use listener::{ConnectionActivity, ConnectionContext, LimitedTcpListener};
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
 use satelle_core::{ApiRateLimits, SatelleError};
 use satelle_host::{DaemonRuntimeCapabilities, HostService};
 use serde::Serialize;
@@ -207,7 +207,16 @@ pub enum TrustedProxyParseError {
 /// supplied chain link, rejects certificates outside their validity windows,
 /// and proves that the private key matches before a network listener is opened.
 #[derive(Clone)]
-pub struct DaemonTlsConfig(Arc<rustls::ServerConfig>);
+pub struct DaemonTlsConfig {
+    server: Arc<rustls::ServerConfig>,
+    requires_client_certificate: bool,
+}
+
+/// Explicit client trust anchors and optional signed revocation lists.
+pub struct DaemonClientTrust<'a> {
+    pub ca_pem: &'a [u8],
+    pub crl_pem: Option<&'a [u8]>,
+}
 
 impl fmt::Debug for DaemonTlsConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -221,6 +230,7 @@ impl DaemonTlsConfig {
     pub fn from_pem(
         certificate_chain_pem: &[u8],
         private_key_pem: &[u8],
+        client_trust: Option<DaemonClientTrust<'_>>,
     ) -> Result<Self, DaemonTlsConfigError> {
         let certificates = CertificateDer::pem_slice_iter(certificate_chain_pem)
             .collect::<Result<Vec<_>, _>>()
@@ -339,15 +349,97 @@ impl DaemonTlsConfig {
         }
         let private_key = PrivateKeyDer::from_pem_slice(private_key_pem)
             .map_err(|_| DaemonTlsConfigError::InvalidPrivateKey)?;
-        let server = rustls::ServerConfig::builder()
-            .with_no_client_auth()
+        let requires_client_certificate = client_trust.is_some();
+        let builder = rustls::ServerConfig::builder();
+        let builder = match client_trust {
+            Some(trust) => builder.with_client_cert_verifier(client_certificate_verifier(trust)?),
+            None => builder.with_no_client_auth(),
+        };
+        let server = builder
             .with_single_cert(certificates, private_key)
             .map_err(|error| match error {
                 rustls::Error::InconsistentKeys(_) => DaemonTlsConfigError::CertificateKeyMismatch,
                 _ => DaemonTlsConfigError::InvalidCertificateChain,
             })?;
-        Ok(Self(Arc::new(server)))
+        Ok(Self {
+            server: Arc::new(server),
+            requires_client_certificate,
+        })
     }
+}
+
+fn client_certificate_verifier(
+    trust: DaemonClientTrust<'_>,
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, DaemonTlsConfigError> {
+    let authorities = CertificateDer::pem_slice_iter(trust.ca_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| DaemonTlsConfigError::InvalidClientCa)?;
+    if authorities.is_empty() {
+        return Err(DaemonTlsConfigError::InvalidClientCa);
+    }
+    let now = x509_parser::time::ASN1Time::now();
+    let mut roots = rustls::RootCertStore::empty();
+    let mut parsed_authorities = Vec::with_capacity(authorities.len());
+    for encoded in &authorities {
+        let (remaining, certificate) = x509_parser::parse_x509_certificate(encoded)
+            .map_err(|_| DaemonTlsConfigError::InvalidClientCa)?;
+        let is_ca = certificate
+            .basic_constraints()
+            .map_err(|_| DaemonTlsConfigError::InvalidClientCa)?
+            .is_some_and(|extension| extension.value.ca);
+        let can_sign = certificate
+            .key_usage()
+            .map_err(|_| DaemonTlsConfigError::InvalidClientCa)?
+            .is_none_or(|extension| extension.value.key_cert_sign());
+        if !remaining.is_empty() || !is_ca || !can_sign {
+            return Err(DaemonTlsConfigError::InvalidClientCa);
+        }
+        if certificate.validity().not_after <= now || certificate.validity().not_before > now {
+            return Err(DaemonTlsConfigError::ClientCaOutsideValidity);
+        }
+        roots
+            .add(encoded.clone())
+            .map_err(|_| DaemonTlsConfigError::InvalidClientCa)?;
+        parsed_authorities.push(certificate);
+    }
+    let mut builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots));
+    if let Some(crl_pem) = trust.crl_pem {
+        let crls = CertificateRevocationListDer::pem_slice_iter(crl_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DaemonTlsConfigError::InvalidClientCrl)?;
+        if crls.is_empty() {
+            return Err(DaemonTlsConfigError::InvalidClientCrl);
+        }
+        for encoded in &crls {
+            let (remaining, crl) = x509_parser::parse_x509_crl(encoded)
+                .map_err(|_| DaemonTlsConfigError::InvalidClientCrl)?;
+            if !remaining.is_empty() {
+                return Err(DaemonTlsConfigError::InvalidClientCrl);
+            }
+            if crl.last_update() > now || crl.next_update().is_none_or(|expiry| expiry <= now) {
+                return Err(DaemonTlsConfigError::ClientCrlOutsideValidity);
+            }
+            // Require the issuing CA in the explicit bundle so bad replacement
+            // CRLs fail before installation, even when no client is connected.
+            let signature_valid = parsed_authorities.iter().any(|issuer| {
+                issuer.subject() == crl.issuer()
+                    && issuer
+                        .key_usage()
+                        .is_ok_and(|usage| usage.is_none_or(|usage| usage.value.crl_sign()))
+                    && crl.verify_signature(issuer.public_key()).is_ok()
+            });
+            if !signature_valid {
+                return Err(DaemonTlsConfigError::InvalidClientCrl);
+            }
+        }
+        // Rustls also checks signatures, full-chain revocation coverage and
+        // expiry at every handshake. Unknown revocation status stays denied.
+        builder = builder.with_crls(crls).enforce_revocation_expiration();
+    }
+    builder
+        .build()
+        .map(|verifier| verifier as Arc<dyn rustls::server::danger::ClientCertVerifier>)
+        .map_err(|_| DaemonTlsConfigError::InvalidClientCrl)
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
@@ -362,6 +454,18 @@ pub enum DaemonTlsConfigError {
     InvalidPrivateKey,
     #[error("the TLS certificate and private key do not match")]
     CertificateKeyMismatch,
+    #[error("the TLS client CA bundle is empty, malformed, or contains a non-CA certificate")]
+    InvalidClientCa,
+    #[error("a TLS client CA certificate is outside its validity window")]
+    ClientCaOutsideValidity,
+    #[error(
+        "the TLS client revocation list is empty, malformed, or not signed by a CA in the client bundle"
+    )]
+    InvalidClientCrl,
+    #[error(
+        "a TLS client revocation list is outside its validity window or has no next-update time"
+    )]
+    ClientCrlOutsideValidity,
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
@@ -374,15 +478,15 @@ pub enum DaemonTlsReloadError {
     ListenerStopped,
 }
 
-/// Cloneable control handle for replacing the TLS configuration used by
-/// future Host Daemon handshakes while the server task owns the listener.
+/// Replaces TLS material for future handshakes. A change involving client
+/// authentication also closes existing connections so they must reauthenticate.
 #[derive(Clone)]
-pub struct DaemonTlsReloader(watch::Sender<Arc<rustls::ServerConfig>>);
+pub struct DaemonTlsReloader(watch::Sender<DaemonTlsConfig>);
 
 impl DaemonTlsReloader {
     pub fn reload(&self, tls: DaemonTlsConfig) -> Result<(), DaemonTlsReloadError> {
         self.0
-            .send(tls.0)
+            .send(tls)
             .map_err(|_| DaemonTlsReloadError::ListenerStopped)
     }
 
@@ -390,8 +494,9 @@ impl DaemonTlsReloader {
         &self,
         certificate_chain_pem: &[u8],
         private_key_pem: &[u8],
+        client_trust: Option<DaemonClientTrust<'_>>,
     ) -> Result<(), DaemonTlsReloadError> {
-        let tls = DaemonTlsConfig::from_pem(certificate_chain_pem, private_key_pem)
+        let tls = DaemonTlsConfig::from_pem(certificate_chain_pem, private_key_pem, client_trust)
             .map_err(DaemonTlsReloadError::InvalidConfiguration)?;
         self.reload(tls)
     }
@@ -496,7 +601,7 @@ impl DaemonServer {
         let router = router(Arc::clone(&state));
         let (listener, tls_reloader) = match tls {
             Some(tls) => {
-                let (tls_reload, tls_config) = watch::channel(tls.0);
+                let (tls_reload, tls_config) = watch::channel(tls);
                 (
                     LimitedTcpListener::with_tls(listener, config.max_connections, tls_config),
                     Some(DaemonTlsReloader(tls_reload)),
@@ -549,11 +654,12 @@ impl DaemonServer {
         &self,
         certificate_chain_pem: &[u8],
         private_key_pem: &[u8],
+        client_trust: Option<DaemonClientTrust<'_>>,
     ) -> Result<(), DaemonTlsReloadError> {
         self.tls_reloader
             .as_ref()
             .ok_or(DaemonTlsReloadError::TlsNotConfigured)?
-            .reload_from_pem(certificate_chain_pem, private_key_pem)
+            .reload_from_pem(certificate_chain_pem, private_key_pem, client_trust)
     }
 
     pub fn tls_reloader(&self) -> Option<DaemonTlsReloader> {

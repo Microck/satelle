@@ -10,6 +10,8 @@ mod event_client;
 mod events;
 #[path = "http/logs.rs"]
 mod logs;
+#[path = "http/mutual-tls.rs"]
+mod mutual_tls;
 #[path = "http/protocol.rs"]
 mod protocol;
 #[path = "http/provider-auth.rs"]
@@ -1545,6 +1547,7 @@ async fn ssh_bootstrap_authentication_rejects_non_loopback_tls_before_listening(
     let tls = DaemonTlsConfig::from_pem(
         certified.cert.pem().as_bytes(),
         certified.signing_key.serialize_pem().as_bytes(),
+        None,
     )
     .expect("build validated TLS configuration");
 
@@ -3267,6 +3270,7 @@ async fn authenticated_https_is_served_by_a_non_loopback_tls_listener() {
     let tls = DaemonTlsConfig::from_pem(
         certified.cert.pem().as_bytes(),
         certified.signing_key.serialize_pem().as_bytes(),
+        None,
     )
     .expect("build validated TLS configuration");
     let server = DaemonServer::bind_tls(
@@ -3310,9 +3314,13 @@ async fn authenticated_https_is_served_by_a_non_loopback_tls_listener() {
     let binding =
         DirectHostBinding::from_host_config(&host_config).expect("construct direct Host Binding");
     let event_token = ApiBearerToken::parse(exposed.as_str()).expect("copy API token for WSS");
-    let event_client =
-        DaemonEventClient::wss(&binding, event_token, Some(certified.cert.pem().as_bytes()))
-            .expect("construct WSS client");
+    let event_client = DaemonEventClient::wss(
+        &binding,
+        event_token,
+        Some(certified.cert.pem().as_bytes()),
+        None,
+    )
+    .expect("construct WSS client");
     let event_stream = event_client
         .connect_events(vec![EventSubscription::Host])
         .await
@@ -3342,6 +3350,7 @@ async fn tls_reload_replaces_only_fully_validated_configuration() {
     let tls = DaemonTlsConfig::from_pem(
         initial.cert.pem().as_bytes(),
         initial.signing_key.serialize_pem().as_bytes(),
+        None,
     )
     .expect("validate initial TLS configuration");
     let server = DaemonServer::bind_tls(
@@ -3381,6 +3390,7 @@ async fn tls_reload_replaces_only_fully_validated_configuration() {
             .reload_tls_from_pem(
                 replacement.cert.pem().as_bytes(),
                 initial.signing_key.serialize_pem().as_bytes(),
+                None,
             )
             .expect_err("a mismatched replacement must fail"),
         DaemonTlsReloadError::InvalidConfiguration(DaemonTlsConfigError::CertificateKeyMismatch)
@@ -3407,6 +3417,7 @@ async fn tls_reload_replaces_only_fully_validated_configuration() {
         .reload_tls_from_pem(
             replacement.cert.pem().as_bytes(),
             replacement.signing_key.serialize_pem().as_bytes(),
+            None,
         )
         .expect("install replacement TLS configuration");
     request_status_over_established_tls(&mut established, &authorization, &host_identity).await;
@@ -3437,7 +3448,7 @@ async fn tls_reload_on_plaintext_server_fails_before_pem_validation() {
     assert_eq!(
         running
             .server
-            .reload_tls_from_pem(b"invalid certificate", b"invalid private key")
+            .reload_tls_from_pem(b"invalid certificate", b"invalid private key", None)
             .expect_err("a plaintext listener cannot reload TLS"),
         DaemonTlsReloadError::TlsNotConfigured
     );
@@ -3468,6 +3479,7 @@ async fn an_idle_tls_handshake_does_not_block_other_clients() {
     let tls = DaemonTlsConfig::from_pem(
         certified.cert.pem().as_bytes(),
         certified.signing_key.serialize_pem().as_bytes(),
+        None,
     )
     .expect("build validated TLS configuration");
     let server = DaemonServer::bind_tls(
@@ -3520,7 +3532,8 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
     assert_eq!(
         DaemonTlsConfig::from_pem(
             expired.pem().as_bytes(),
-            expired_key.serialize_pem().as_bytes()
+            expired_key.serialize_pem().as_bytes(),
+            None
         )
         .expect_err("expired certificate must fail before bind"),
         DaemonTlsConfigError::CertificateExpired
@@ -3547,7 +3560,7 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
         .expect("generate valid leaf certificate");
     let chain = format!("{}{}", leaf.pem(), expired_issuer.pem());
     assert_eq!(
-        DaemonTlsConfig::from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes())
+        DaemonTlsConfig::from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes(), None)
             .expect_err("expired intermediate must fail before bind"),
         DaemonTlsConfigError::CertificateExpired
     );
@@ -3578,7 +3591,7 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
         .expect("generate unrelated issuer certificate");
     let chain = format!("{}{}", leaf.pem(), unrelated.pem());
     assert_eq!(
-        DaemonTlsConfig::from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes())
+        DaemonTlsConfig::from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes(), None)
             .expect_err("unrelated intermediate must fail before bind"),
         DaemonTlsConfigError::InvalidCertificateChain
     );
@@ -3619,7 +3632,7 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
         .expect("generate path-length leaf certificate");
     let chain = format!("{}{}{}", leaf.pem(), intermediate.pem(), root.pem());
     assert_eq!(
-        DaemonTlsConfig::from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes())
+        DaemonTlsConfig::from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes(), None)
             .expect_err("exceeded path-length constraint must fail before bind"),
         DaemonTlsConfigError::InvalidCertificateChain
     );
@@ -3654,7 +3667,8 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
     assert_eq!(
         DaemonTlsConfig::from_pem(
             constrained_chain.as_bytes(),
-            constrained_leaf_key.serialize_pem().as_bytes()
+            constrained_leaf_key.serialize_pem().as_bytes(),
+            None
         )
         .expect_err("name-constrained chain must fail closed before bind"),
         DaemonTlsConfigError::InvalidCertificateChain
@@ -3668,7 +3682,8 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
     assert_eq!(
         DaemonTlsConfig::from_pem(
             nameless_leaf.pem().as_bytes(),
-            nameless_key.serialize_pem().as_bytes()
+            nameless_key.serialize_pem().as_bytes(),
+            None
         )
         .expect_err("leaf without a DNS or IP subject alternative name must fail before bind"),
         DaemonTlsConfigError::InvalidCertificateChain
@@ -3689,7 +3704,8 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
     assert_eq!(
         DaemonTlsConfig::from_pem(
             unsupported_leaf.pem().as_bytes(),
-            unsupported_key.serialize_pem().as_bytes()
+            unsupported_key.serialize_pem().as_bytes(),
+            None
         )
         .expect_err("unsupported critical certificate extension must fail before bind"),
         DaemonTlsConfigError::InvalidCertificateChain
@@ -3709,7 +3725,8 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
     assert_eq!(
         DaemonTlsConfig::from_pem(
             ca_leaf.pem().as_bytes(),
-            ca_leaf_key.serialize_pem().as_bytes()
+            ca_leaf_key.serialize_pem().as_bytes(),
+            None
         )
         .expect_err("CA certificate must not be accepted as the server leaf"),
         DaemonTlsConfigError::InvalidCertificateChain
@@ -3727,7 +3744,8 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
     assert_eq!(
         DaemonTlsConfig::from_pem(
             client_only.pem().as_bytes(),
-            client_only_key.serialize_pem().as_bytes()
+            client_only_key.serialize_pem().as_bytes(),
+            None
         )
         .expect_err("client-only certificate must fail before bind"),
         DaemonTlsConfigError::InvalidCertificateChain
@@ -3745,7 +3763,8 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
     assert_eq!(
         DaemonTlsConfig::from_pem(
             signing_only.pem().as_bytes(),
-            signing_only_key.serialize_pem().as_bytes()
+            signing_only_key.serialize_pem().as_bytes(),
+            None
         )
         .expect_err("certificate-signing-only leaf must fail before bind"),
         DaemonTlsConfigError::InvalidCertificateChain
@@ -3757,7 +3776,8 @@ fn tls_configuration_rejects_expired_certificates_and_mismatched_keys() {
     assert_eq!(
         DaemonTlsConfig::from_pem(
             certificate.cert.pem().as_bytes(),
-            unrelated_key.serialize_pem().as_bytes()
+            unrelated_key.serialize_pem().as_bytes(),
+            None
         )
         .expect_err("certificate and key mismatch must fail before bind"),
         DaemonTlsConfigError::CertificateKeyMismatch
