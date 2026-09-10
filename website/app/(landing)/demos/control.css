@@ -76,6 +76,7 @@
      when a blur or animated scale is applied to them. Motion belongs on the
      position transition and the separate press ring. */
   --ctl-ease: cubic-bezier(0.4, 0.02, 0.2, 1);
+
   position: absolute;
   z-index: 4;
   pointer-events: none;
@@ -106,6 +107,7 @@
      which is invisible in use and worse to read in a diagram. */
   transform-origin: 1.5px 1.5px;
   /* Geometric precision keeps the diagonal edges stable at small sizes. */
+  /* stylelint-disable-next-line value-keyword-case -- Preserve SVG-canonical spelling. */
   shape-rendering: geometricPrecision;
 }
 
@@ -153,7 +155,7 @@
    anything had visibly clicked it. Beginning at full opacity means the first
    frame that does get painted already shows the press. */
 @keyframes ctl-press {
-  from {
+  0% {
     opacity: 1;
     scale: 1.9;
   }
@@ -165,7 +167,7 @@
     opacity: 1;
     scale: 1;
   }
-  to {
+  100% {
     opacity: 0;
     scale: 0.92;
   }

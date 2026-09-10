@@ -70,6 +70,7 @@
 
 .fl-page {
   --fl-h: 17rem;
+
   position: relative;
   flex: none;
   height: var(--fl-h);

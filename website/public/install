@@ -189,6 +189,10 @@ command -v gh >/dev/null 2>&1 || {
   printf '%s\n' "gh is required to verify the signed release tag and Sigstore attestation" >&2
   exit 1
 }
+gh auth status >/dev/null 2>&1 || {
+  printf '%s\n' "gh is not authenticated; run 'gh auth login' or set GH_TOKEN before installing" >&2
+  exit 1
+}
 command -v jq >/dev/null 2>&1 || {
   printf '%s\n' "jq is required to validate the release binary JSON contract" >&2
   exit 1

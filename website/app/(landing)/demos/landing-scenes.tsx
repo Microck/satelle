@@ -168,7 +168,9 @@ export function SimpleChatScene({ frame, moving }: data.SceneProps) {
 /** Classic Unicode block cells rendered independently of fallback font spacing. */
 export function Clawd() {
     const quadrants: Record<string, number[]> = { '█': [0, 1, 2, 3], '▐': [1, 3], '▛': [0, 1, 2], '▜': [0, 1, 3], '▌': [0, 2], '▝': [1], '▘': [0] };
-    return <svg className="rf-clawd" viewBox="0 0 80 48" shapeRendering="crispEdges" role="img" aria-label="Classic Clawd terminal mascot">{data.CLAWD.split('\n').flatMap((line, y) => Array.from(line).flatMap((glyph, x) => (quadrants[glyph] ?? []).map(q => <rect key={`${x}-${y}-${q}`} x={x * 10 + (q % 2) * 5} y={y * 16 + Math.floor(q / 2) * 8} width="5" height="8" fill="currentColor"/>)))}</svg>;
+    const lines = data.CLAWD.split('\n');
+    const columns = Math.max(...lines.map(line => Array.from(line).length));
+    return <svg className="rf-clawd" viewBox={`0 0 ${columns * 10} ${lines.length * 16}`} shapeRendering="crispEdges" role="img" aria-label="Classic Clawd terminal mascot">{lines.flatMap((line, y) => Array.from(line).flatMap((glyph, x) => (quadrants[glyph] ?? []).map(q => <rect key={`${x}-${y}-${q}`} x={x * 10 + (q % 2) * 5} y={y * 16 + Math.floor(q / 2) * 8} width="5" height="8" fill="currentColor"/>)))}</svg>;
 }
 function Terminal({ frame }: data.SceneProps) {
     return <div className="rf-terminal">

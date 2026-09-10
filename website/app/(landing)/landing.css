@@ -9,21 +9,21 @@
 /* ---------------------------------------------------------------- fonts --- */
 
 @font-face {
-  font-family: 'Geist';
+  font-family: Geist;
   src: url('/fonts/geist-400.woff2') format('woff2');
   font-weight: 400;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
-  font-family: 'Geist';
+  font-family: Geist;
   src: url('/fonts/geist-500.woff2') format('woff2');
   font-weight: 500;
   font-style: normal;
   font-display: swap;
 }
 @font-face {
-  font-family: 'Geist';
+  font-family: Geist;
   src: url('/fonts/geist-600.woff2') format('woff2');
   font-weight: 600;
   font-style: normal;
@@ -285,7 +285,7 @@
   font-weight: 400;
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
+  text-rendering: optimizelegibility;
   /* The viewer paints its own ground behind the page, so state this explicitly. */
   min-height: 100vh;
   overflow-x: clip;

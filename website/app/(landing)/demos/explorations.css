@@ -41,6 +41,7 @@
 .sa .wf-request {display:flex;gap:9px;padding:11px 13px;background:var(--sa-3);color:var(--sa-12);font-size:12px;line-height:1.5;min-height:51px;flex-shrink:0;}
 .sa .wf-request-mark {color:var(--sa-11);font-size:16px;}
 .sa .sw-cursor {position:absolute;left:0;top:0;z-index:30;pointer-events:none;will-change:transform;}
+/* stylelint-disable-next-line value-keyword-case -- Preserve SVG-canonical spelling. */
 .sa .sw-cursor svg,.sa .rf-cursor svg {shape-rendering:geometricPrecision;}
 .sa .sw-cursor i {position:absolute;left:-8px;top:-8px;border:2px solid var(--sa-6);border-radius:50%;width:24px;height:24px;}
 .sa .wf-modal-shade {position:absolute;inset:0;background:color-mix(in srgb, var(--sa-0) 55%, transparent);display:flex;align-items:center;justify-content:center;z-index:5;padding:14px;}

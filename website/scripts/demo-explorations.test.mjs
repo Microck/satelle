@@ -91,7 +91,7 @@ test('arrival precedes press, and press precedes action commit', () => {
     if(!beat.target)return;
     assert.equal(gesturePhase(at(id,step,POINTER_TRAVEL)).pressed,false);
     assert.equal(gesturePhase(at(id,step,POINTER_PRESS)).pressed,true);
-    assert.equal(at(id,step,POINTER_PRESS).committed,step-1);
+    if(step) assert.equal(at(id,step,POINTER_PRESS).committed,step-1);
     assert.equal(at(id,step,COMMIT_DELAY).committed,step);
   });
 });

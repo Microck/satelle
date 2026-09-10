@@ -161,7 +161,7 @@ export default function DeskDemo() {
   // The action whose effects are on screen. While the pointer is still on its
   // way to `state.step`, the Host still shows the previous one, so at the very
   // first step this is -1 and the application sits untouched with an empty log.
-  const committed = state.phase === 'acted' ? state.step : state.step - 1;
+  const committed = reduced || state.phase === 'acted' ? state.step : state.step - 1;
   const last = stage.steps.length - 1;
   const finished = committed === last;
   const turnState = finished ? 'completed' : 'running';
@@ -188,10 +188,18 @@ export default function DeskDemo() {
     return () => window.clearTimeout(id);
   }, [reduced, started, state.auto, state.phase, state.step, state.stage, stage.steps]);
 
-  // Reduced motion never animates, so it opens on the finished Turn.
+  // Without pointer travel, every reader-selected step commits immediately.
   useEffect(() => {
-    if (reduced) dispatch({ type: 'settle', step: lastStepOf('excel') });
-  }, [reduced]);
+    if (reduced && state.phase === 'travel') {
+      dispatch({ type: 'settle', step: state.step });
+    }
+  }, [reduced, state.stage, state.step, state.phase]);
+
+  // On entry or a task switch, show that task's finished Turn. Keep this after
+  // the travel effect so its final step wins when both effects run together.
+  useEffect(() => {
+    if (reduced) dispatch({ type: 'settle', step: lastStepOf(state.stage) });
+  }, [reduced, state.stage]);
 
   return (
     <div className="desk">
