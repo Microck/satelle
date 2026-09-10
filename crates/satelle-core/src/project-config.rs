@@ -297,6 +297,34 @@ fn parse(path: &Path, mut value: toml::Value) -> Result<ParsedProjectConfig, Sat
     })
 }
 
+fn reject_credential_helpers(
+    path: &Path,
+    table: &toml::map::Map<String, toml::Value>,
+    prefix: &str,
+) -> Result<(), SatelleError> {
+    for &key in CREDENTIAL_HELPER_KEYS {
+        if table.contains_key(key) {
+            return Err(SatelleError::project_credential_helper_not_allowed(
+                path,
+                &format!("{prefix}{key}"),
+                key,
+            ));
+        }
+    }
+    if let Some(sources) = table.get("provider_auth").and_then(toml::Value::as_table) {
+        for (provider, descriptor) in sources {
+            if descriptor.get("kind").and_then(toml::Value::as_str) == Some("executable-helper") {
+                return Err(SatelleError::project_credential_helper_not_allowed(
+                    path,
+                    &format!("{prefix}provider_auth.{}", super::config_toml_key(provider)),
+                    "provider_auth",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reject_forbidden_keys(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
     let Some(table) = value.as_table() else {
         return Ok(());
@@ -334,13 +362,7 @@ fn reject_forbidden_keys(path: &Path, value: &toml::Value) -> Result<(), Satelle
         );
     }
 
-    for &key in CREDENTIAL_HELPER_KEYS {
-        if table.contains_key(key) {
-            return Err(SatelleError::project_credential_helper_not_allowed(
-                path, key, key,
-            ));
-        }
-    }
+    reject_credential_helpers(path, table, "")?;
 
     for &key in SECRET_SOURCE_KEYS {
         if table.contains_key(key) {
@@ -417,15 +439,7 @@ fn reject_forbidden_keys(path: &Path, value: &toml::Value) -> Result<(), Satelle
             ));
         }
 
-        for &key in CREDENTIAL_HELPER_KEYS {
-            if host_table.contains_key(key) {
-                return Err(SatelleError::project_credential_helper_not_allowed(
-                    path,
-                    &format!("{host_path}.{key}"),
-                    key,
-                ));
-            }
-        }
+        reject_credential_helpers(path, host_table, &format!("{host_path}."))?;
 
         for &key in SECRET_SOURCE_KEYS {
             if host_table.contains_key(key) {

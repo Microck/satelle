@@ -8829,6 +8829,23 @@ fn response_connection_lost(error: &reqwest::Error) -> bool {
 // safely. Validate that recovery boundary at the transport boundary instead
 // of collapsing it into the generic remote API error used for other codes.
 fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
+    if matches!(
+        error.code(),
+        ApiErrorCode::SecretFileTildeFormUnsupported | ApiErrorCode::SecretFileHomeUnavailable
+    ) {
+        let Some(details) = error
+            .details()
+            .and_then(satelle_core::secret_file_error_details)
+        else {
+            return SatelleError::remote_api_error(host, "invalid-daemon-response");
+        };
+        let mut mapped = api_code_error(host, error.code());
+        mapped.details = details.clone().into_iter().collect();
+        mapped
+            .details
+            .insert("host".to_string(), serde_json::json!(host));
+        return mapped;
+    }
     if error.code() == ApiErrorCode::HostBusy {
         return map_host_busy_api_error(host, error);
     }
@@ -9221,6 +9238,10 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::ProviderSecretSourceRequired
             | ApiErrorCode::ProviderSecretProvisioningRequired
             | ApiErrorCode::ProviderSecretOverwriteRequired
+            | ApiErrorCode::CredentialHelperArgvInvalid
+            | ApiErrorCode::CredentialHelperTimeout
+            | ApiErrorCode::SecretFileTildeFormUnsupported
+            | ApiErrorCode::SecretFileHomeUnavailable
             | ApiErrorCode::ProviderSecretResolutionFailed
             | ApiErrorCode::ExperimentalProviderNotValidated
             | ApiErrorCode::CapacityExceeded
@@ -9269,6 +9290,32 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
             ErrorCode::ProjectProviderSelectionNotAllowed,
             "the project is not allowed to select this provider binding",
         ),
+        ApiErrorCode::CredentialHelperArgvInvalid => provider_secret_api_error(
+            host,
+            ErrorCode::CredentialHelperArgvInvalid,
+            "the credential helper executable path is not absolute for the target Host",
+        ),
+        ApiErrorCode::CredentialHelperTimeout => provider_secret_api_error(
+            host,
+            ErrorCode::CredentialHelperTimeout,
+            "the Host credential helper exceeded its timeout",
+        ),
+        ApiErrorCode::SecretFileTildeFormUnsupported => {
+            satelle_core::SecretFilePathError::TildeFormUnsupported.diagnostic(
+                None,
+                None,
+                Some(host),
+                None,
+            )
+        }
+        ApiErrorCode::SecretFileHomeUnavailable => {
+            satelle_core::SecretFilePathError::HomeUnavailable.diagnostic(
+                None,
+                None,
+                Some(host),
+                None,
+            )
+        }
         ApiErrorCode::ProviderSecretResolutionFailed => provider_secret_api_error(
             host,
             ErrorCode::ProviderSecretResolutionFailed,
@@ -9450,8 +9497,18 @@ fn local_daemon_artifact_error(path: &Path, error: SecureFileError) -> SatelleEr
 }
 
 fn read_local_daemon_endpoint(path: &Path) -> Result<LocalDaemonEndpoint, SatelleError> {
-    let encoded = read_owner_only_secret_config_file(path)
-        .map_err(|error| local_daemon_artifact_error(path, error))?;
+    optional_local_daemon_endpoint(path)?
+        .ok_or_else(|| local_daemon_artifact_error(path, SecureFileError::UnsafeOrUnavailable))
+}
+
+fn optional_local_daemon_endpoint(
+    path: &Path,
+) -> Result<Option<LocalDaemonEndpoint>, SatelleError> {
+    let Some(encoded) = satelle_core::read_optional_owner_only_secret_config_file(path)
+        .map_err(|error| local_daemon_artifact_error(path, error))?
+    else {
+        return Ok(None);
+    };
     let endpoint = serde_json::from_str::<LocalDaemonEndpoint>(&encoded)
         .map_err(|_| local_daemon_artifact_error(path, SecureFileError::UnsafeOrUnavailable))?;
     if endpoint.schema_version != "satelle.local-daemon-endpoint.v3"
@@ -9465,20 +9522,7 @@ fn read_local_daemon_endpoint(path: &Path) -> Result<LocalDaemonEndpoint, Satell
             SecureFileError::UnsafeOrUnavailable,
         ));
     }
-    Ok(endpoint)
-}
-
-fn optional_local_daemon_endpoint(
-    path: &Path,
-) -> Result<Option<LocalDaemonEndpoint>, SatelleError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => read_local_daemon_endpoint(path).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(local_daemon_artifact_error(
-            path,
-            SecureFileError::UnsafeOrUnavailable,
-        )),
-    }
+    Ok(Some(endpoint))
 }
 
 fn remove_stale_local_daemon_endpoint(

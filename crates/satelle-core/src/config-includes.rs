@@ -82,24 +82,37 @@ impl ConfigSources {
     fn record_fields(&mut self, prefix: &str, value: &toml::Value, file: &ConfigFileSource) {
         if let Some(table) = value.as_table() {
             for (key, child) in table {
+                let helper_environment = key == "environment"
+                    && value.get("kind").and_then(toml::Value::as_str) == Some("executable-helper");
                 let key = config_toml_key(key);
                 let path = if prefix.is_empty() {
                     key
                 } else {
                     format!("{prefix}.{key}")
                 };
-                self.record_fields(&path, child, file);
+                if helper_environment {
+                    // A helper environment is one descriptor field. Recording
+                    // its private key names as TOML paths would reveal them in
+                    // config explain even after the descriptor is redacted.
+                    self.record_field(&path, file);
+                } else {
+                    self.record_fields(&path, child, file);
+                }
             }
         } else {
-            self.values.insert(
-                prefix.to_string(),
-                ConfigValueSource {
-                    config_file: file.path.clone(),
-                    toml_path: prefix.to_string(),
-                    source: file.source,
-                },
-            );
+            self.record_field(prefix, file);
         }
+    }
+
+    fn record_field(&mut self, path: &str, file: &ConfigFileSource) {
+        self.values.insert(
+            path.to_string(),
+            ConfigValueSource {
+                config_file: file.path.clone(),
+                toml_path: path.to_string(),
+                source: file.source,
+            },
+        );
     }
 
     pub(super) fn extend(&mut self, higher: &Self) {

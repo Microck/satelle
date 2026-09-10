@@ -7492,7 +7492,48 @@ fn redacted_config_json(
 ) -> serde_json::Value {
     let mut value = serde_json::to_value(config).unwrap_or_else(|_| json!({}));
     redact_schema_marked_config_values(&mut value, &mut Vec::new(), show_secret_references);
+    if show_secret_references {
+        normalize_revealed_file_sources(config, &mut value);
+    }
     value
+}
+
+fn normalize_revealed_file_sources(
+    config: &satelle_core::SatelleConfig,
+    value: &mut serde_json::Value,
+) {
+    let home = std::cell::OnceCell::new();
+    for (host_alias, host) in &config.hosts {
+        for (auth_alias, source) in &host.provider_auth {
+            let ProviderSecretSource::File { path } = source else {
+                continue;
+            };
+            if !path.to_str().is_some_and(|path| path.starts_with('~')) {
+                continue;
+            }
+            let descriptor = &mut value["hosts"][host_alias]["provider_auth"][auth_alias];
+            // A remote or persistent service may run as a different account.
+            // Inspection must not substitute the Controller's local home.
+            if host.transport != TransportKind::Local
+                || host.setup_mode == Some(satelle_core::SetupMode::Persistent)
+            {
+                descriptor["path"] = json!(null);
+                descriptor["normalization_status"] = json!("remote_home_not_checked");
+                continue;
+            }
+            let home = home.get_or_init(satelle_core::resolver_account_home);
+            match satelle_core::expand_secret_file_path(path, home.as_deref()) {
+                Ok(path) => {
+                    descriptor["path"] = json!(path);
+                    descriptor["normalization_status"] = json!("expanded");
+                }
+                Err(_) => {
+                    descriptor["path"] = json!(null);
+                    descriptor["normalization_status"] = json!("home_unavailable");
+                }
+            }
+        }
+    }
 }
 
 const CONFIG_SECRET_SOURCE_SCHEMA_PATHS: &[&[&str]] = &[
@@ -7543,6 +7584,20 @@ fn redact_secret_source_descriptor(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown")
         .to_string();
+
+    if kind == "executable-helper" {
+        *descriptor = json!({
+            "kind": kind,
+            "executable": "[REDACTED]",
+            "argv": "[REDACTED]",
+            "timeout": descriptor.get("timeout").cloned().unwrap_or(json!("10s")),
+            "environment_keys": "[REDACTED]",
+            "redacted": true,
+            "redaction_reason": "credential_helper_reference",
+            "source": "user_config",
+        });
+        return;
+    }
 
     *descriptor = if show_secret_references {
         reveal_secret_source_descriptor(&kind, descriptor)

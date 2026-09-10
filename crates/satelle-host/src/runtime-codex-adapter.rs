@@ -13,8 +13,8 @@ use crate::codex_session::{
     run_codex_session_with_native_action_completion, run_codex_session_with_timeout_cancellation,
 };
 use crate::provider_auth::{
-    ProviderAuthResolutionError, ProviderHostPlatform, ProviderSmokeCredentialFingerprinter,
-    ResolvedProviderSecret, resolve_provider_secret,
+    ProviderAuthResolutionError, ProviderSmokeCredentialFingerprinter, ResolvedProviderSecret,
+    resolve_provider_secret,
 };
 use crate::{DEFAULT_MODEL_BINDING, DEFAULT_PROVIDER_BINDING, READINESS_CANCELLATION_GRACE};
 use satelle_core::session::{
@@ -87,6 +87,7 @@ struct NativeSmokeFailure {
 }
 
 struct ProviderProbePersistence<'a> {
+    host: &'a str,
     cancellation: Option<&'a super::request::AdmissionCancellation>,
     persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
@@ -632,7 +633,7 @@ impl ProductionComputerUseAdapter {
         let candidate_secret_supplied = persistence.provider_secret.is_some();
         let provider_secret = match persistence.provider_secret.take() {
             Some(secret) => Some(secret),
-            None => resolve_provider_child_secret(binding).map_err(|error| {
+            None => resolve_provider_child_secret(binding, persistence.host).map_err(|error| {
                 Box::new(ProviderSmokeAttemptFailure {
                     evidence: None,
                     error: Box::new(error),
@@ -732,6 +733,7 @@ impl ProductionComputerUseAdapter {
             })?;
         let provider_secret = provider_secret_after_live_smoke(
             binding,
+            persistence.host,
             &provider_credential_fingerprint,
             &self.provider_smoke_fingerprinter,
             candidate_secret_supplied,
@@ -1091,6 +1093,7 @@ fn provider_child_model_provider(binding: &ResolvedProviderBinding) -> Option<&s
 
 pub(crate) fn resolve_provider_child_secret(
     binding: &ResolvedProviderBinding,
+    host: &str,
 ) -> Result<Option<ResolvedProviderSecret>, SatelleError> {
     let endpoint = binding.endpoint();
     if let Some(endpoint) = endpoint {
@@ -1107,27 +1110,46 @@ pub(crate) fn resolve_provider_child_secret(
     }
     match auth_source {
         None => Ok(None),
-        Some(source) => resolve_provider_secret(source, ProviderHostPlatform::current())
-            .map(Some)
-            .map_err(|error| {
-                let reason = match error {
-                    ProviderAuthResolutionError::UnsupportedKind => {
-                        "provider_auth_kind_unsupported"
-                    }
-                    ProviderAuthResolutionError::Unresolved => "provider_auth_unresolved",
-                    ProviderAuthResolutionError::InvalidFilePath => "provider_auth_path_invalid",
-                };
-                provider_secret_resolution_error(reason)
-            }),
+        Some(source) => resolve_provider_secret(
+            source,
+            &crate::credential_helper::CredentialHelperRequest::new(
+                binding.requested_provider_alias(),
+                binding.model_provider(),
+                host,
+            ),
+        )
+        .map(Some)
+        .map_err(|error| {
+            let reason = match error {
+                ProviderAuthResolutionError::FilePath(error) => {
+                    return error.diagnostic(None, None, Some(host), Some(std::env::consts::OS));
+                }
+                ProviderAuthResolutionError::InvalidHelperArgv => {
+                    let mut error =
+                        provider_secret_resolution_error("credential_helper_argv_invalid");
+                    error.code = ErrorCode::CredentialHelperArgvInvalid;
+                    return error;
+                }
+                ProviderAuthResolutionError::HelperTimeout => {
+                    let mut error = provider_secret_resolution_error("credential_helper_timeout");
+                    error.code = ErrorCode::CredentialHelperTimeout;
+                    return error;
+                }
+                ProviderAuthResolutionError::UnsupportedKind => "provider_auth_kind_unsupported",
+                ProviderAuthResolutionError::Unresolved => "provider_auth_unresolved",
+            };
+            provider_secret_resolution_error(reason)
+        }),
     }
 }
 
 fn resolve_execution_provider_secret(
     binding: &ResolvedProviderBinding,
+    host: &str,
     preflight_fingerprint: &str,
     fingerprinter: &ProviderSmokeCredentialFingerprinter,
 ) -> Result<Option<ResolvedProviderSecret>, SatelleError> {
-    let provider_secret = resolve_provider_child_secret(binding)?;
+    let provider_secret = resolve_provider_child_secret(binding, host)?;
     let execution_fingerprint = fingerprinter
         .fingerprint(binding.binding_digest(), provider_secret.as_ref())
         .ok_or_else(|| adapter_failure("provider_smoke_hmac_key_unavailable"))?;
@@ -1141,6 +1163,7 @@ fn resolve_execution_provider_secret(
 
 fn provider_secret_after_live_smoke(
     binding: &ResolvedProviderBinding,
+    host: &str,
     preflight_fingerprint: &str,
     fingerprinter: &ProviderSmokeCredentialFingerprinter,
     candidate_secret_supplied: bool,
@@ -1152,7 +1175,7 @@ fn provider_secret_after_live_smoke(
         // incorrectly consult the old or intentionally absent destination.
         return Ok(None);
     }
-    resolve_execution_provider_secret(binding, preflight_fingerprint, fingerprinter)
+    resolve_execution_provider_secret(binding, host, preflight_fingerprint, fingerprinter)
 }
 
 pub(crate) fn validate_provider_endpoint(endpoint: &str) -> Result<(), SatelleError> {
@@ -2215,7 +2238,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
 
     fn preflight_terminal(
         &self,
-        _host: &str,
+        host: &str,
         cached: Option<ReadinessEvidence>,
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
@@ -2223,6 +2246,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
         let mut persist_thread_ref = |_value: &str| Ok(());
         let mut persist_turn_ref = |_value: &str| Ok(());
         let mut persistence = ProviderProbePersistence {
+            host,
             cancellation: None,
             persist_thread_ref: &mut persist_thread_ref,
             persist_turn_ref: &mut persist_turn_ref,
@@ -2473,7 +2497,7 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
 
     fn preflight_terminal_with_provider_probe(
         &self,
-        _host: &str,
+        host: &str,
         cached: Option<ReadinessEvidence>,
         cached_provider: Option<ProviderSmokeResult>,
         provider_intent: &ProviderComputerUseIntent,
@@ -2483,6 +2507,7 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
         persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
     ) -> AdapterPreflight {
         let mut persistence = ProviderProbePersistence {
+            host,
             cancellation: Some(cancellation),
             persist_thread_ref,
             persist_turn_ref,
@@ -2926,6 +2951,30 @@ mod tests {
     }
 
     #[test]
+    fn credential_helper_receives_the_authorized_provider_and_target_host() {
+        let (_directory, helper) = crate::credential_helper::tests::helper("success", "10s");
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new("model-alias", "provider-alias", "model", "openai")
+                .with_auth_source(satelle_core::ProviderSecretSource::ExecutableHelper(helper)),
+            ProviderBindingSource::HostOwned,
+        );
+        let secret = resolve_provider_child_secret(&binding, "host-alias")
+            .expect("the Host resolver sends the authorized binding and Host alias")
+            .expect("the helper returned a credential");
+        assert!(secret.expose_to_provider(|value| value == "test-provider-secret"));
+
+        let (_directory, helper) = crate::credential_helper::tests::helper("sleep", "200ms");
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new("model-alias", "provider-alias", "model", "openai")
+                .with_auth_source(satelle_core::ProviderSecretSource::ExecutableHelper(helper)),
+            ProviderBindingSource::HostOwned,
+        );
+        let error = resolve_provider_child_secret(&binding, "host-alias").unwrap_err();
+        assert_eq!(error.code, ErrorCode::CredentialHelperTimeout);
+        assert_eq!(error.details["reason"], "credential_helper_timeout");
+    }
+
+    #[test]
     fn provider_credential_rotation_cannot_cross_preflight_execution_boundary() {
         let environment = ScopedEnvironmentVariable(format!(
             "SATELLE_PROVIDER_ROTATION_TEST_{}",
@@ -2947,8 +2996,8 @@ mod tests {
             }),
             ProviderBindingSource::HostOwned,
         );
-        let smoked_secret =
-            resolve_provider_child_secret(&binding).expect("resolve the credential used by smoke");
+        let smoked_secret = resolve_provider_child_secret(&binding, "test-host")
+            .expect("resolve the credential used by smoke");
         let fingerprinter = ProviderSmokeCredentialFingerprinter::for_test([0x5a; 32]);
         let preflight_fingerprint = fingerprinter
             .fingerprint(binding.binding_digest(), smoked_secret.as_ref())
@@ -2959,9 +3008,13 @@ mod tests {
         unsafe {
             std::env::set_var(&environment.0, "rotated-provider-secret");
         }
-        let rotation_error =
-            resolve_execution_provider_secret(&binding, &preflight_fingerprint, &fingerprinter)
-                .expect_err("rotation after smoke must fail before admission");
+        let rotation_error = resolve_execution_provider_secret(
+            &binding,
+            "test-host",
+            &preflight_fingerprint,
+            &fingerprinter,
+        )
+        .expect_err("rotation after smoke must fail before admission");
         assert_eq!(
             rotation_error.code,
             ErrorCode::ProviderSecretResolutionFailed
@@ -2976,9 +3029,13 @@ mod tests {
         unsafe {
             std::env::set_var(&environment.0, "preflight-provider-secret");
         }
-        let provider_secret =
-            resolve_execution_provider_secret(&binding, &preflight_fingerprint, &fingerprinter)
-                .expect("an unchanged credential remains admissible");
+        let provider_secret = resolve_execution_provider_secret(
+            &binding,
+            "test-host",
+            &preflight_fingerprint,
+            &fingerprinter,
+        )
+        .expect("an unchanged credential remains admissible");
         let prepared_secret = crate::runtime::adapter::PreparedProviderSecret::new(provider_secret);
         unsafe {
             std::env::set_var(&environment.0, "post-admission-provider-secret");
@@ -3045,11 +3102,12 @@ mod tests {
         drop(request);
 
         assert!(
-            resolve_provider_child_secret(&binding).is_err(),
+            resolve_provider_child_secret(&binding, "test-host").is_err(),
             "the destination is intentionally absent before candidate commit"
         );
         let prepared = provider_secret_after_live_smoke(
             &binding,
+            "test-host",
             &candidate_fingerprint,
             &fingerprinter,
             true,
@@ -3079,8 +3137,8 @@ mod tests {
             }),
             ProviderBindingSource::HostOwned,
         );
-        let smoked_secret =
-            resolve_provider_child_secret(&binding).expect("resolve the preflight credential");
+        let smoked_secret = resolve_provider_child_secret(&binding, "test-host")
+            .expect("resolve the preflight credential");
         let fingerprinter = ProviderSmokeCredentialFingerprinter::for_test([0x5a; 32]);
         let preflight_fingerprint = fingerprinter
             .fingerprint(binding.binding_digest(), smoked_secret.as_ref())
@@ -3092,6 +3150,7 @@ mod tests {
         }
         let candidate_prepared = provider_secret_after_live_smoke(
             &binding,
+            "test-host",
             &preflight_fingerprint,
             &fingerprinter,
             true,
@@ -3101,6 +3160,7 @@ mod tests {
 
         let normal_error = provider_secret_after_live_smoke(
             &binding,
+            "test-host",
             &preflight_fingerprint,
             &fingerprinter,
             false,
@@ -3128,7 +3188,7 @@ mod tests {
             ProviderBindingSource::HostOwned,
         );
 
-        let error = resolve_provider_child_secret(&binding)
+        let error = resolve_provider_child_secret(&binding, "test-host")
             .expect_err("endpoint-less custom-provider credentials must fail closed");
         assert_eq!(
             error.details["reason"],
@@ -3853,6 +3913,7 @@ mod tests {
         let mut persist_thread_ref = |_value: &str| Ok(());
         let mut persist_turn_ref = |_value: &str| Ok(());
         let mut persistence = ProviderProbePersistence {
+            host: "test-host",
             cancellation: None,
             persist_thread_ref: &mut persist_thread_ref,
             persist_turn_ref: &mut persist_turn_ref,
@@ -4081,6 +4142,7 @@ mod tests {
             let mut persist_turn_ref =
                 |_value: &str| std::fs::write(&turn_marker, b"turn").map_err(|_| ());
             let mut persistence = ProviderProbePersistence {
+                host: "test-host",
                 cancellation: None,
                 persist_thread_ref: &mut persist_thread_ref,
                 persist_turn_ref: &mut persist_turn_ref,

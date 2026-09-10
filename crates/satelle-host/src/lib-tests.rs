@@ -210,7 +210,7 @@ impl ComputerUseAdapter for SecretBoundaryAdapter {
             .resolved_provider_binding()
             .expect("Host must inject the authoritative provider binding");
         drop(crate::runtime::resolve_provider_child_secret_for_test(
-            binding,
+            binding, host,
         )?);
         FakeComputerUseAdapter.preflight(host, provider_intent)
     }
@@ -749,6 +749,48 @@ fn provider_descriptor_config(auth_source: Option<String>) -> satelle_core::Host
         )]),
     );
     config
+}
+
+#[test]
+fn secret_file_home_is_canonical_in_user_and_host_owned_bindings() {
+    let state = TestStateDir::new().expect("temporary Host state");
+    let home = satelle_core::resolver_account_home().expect("Host account home");
+    let input = satelle_core::ProviderSecretSource::File {
+        path: PathBuf::from("~/satelle-canonical-home-reference/token"),
+    };
+    let expected = satelle_core::ProviderSecretSource::File {
+        path: home.join("satelle-canonical-home-reference/token"),
+    };
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), DoctorRefreshAdapter, None);
+    let prepared = service
+        .prepare_provider_binding_authorization(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            ProviderBindingAuthorization::new("review", "openai", "provider-model", "openai")
+                .with_auth_source(input.clone()),
+        )
+        .expect("prepare the user binding without opening the secret file");
+    assert_eq!(prepared.auth_source(), Some(&expected));
+    assert!(prepared.has_valid_binding_digest());
+
+    let mut config = provider_descriptor_config(Some("home-file".to_string()));
+    config.provider_auth.insert("home-file".to_string(), input);
+    let host_config_state = TestStateDir::new().expect("separate Host-owned config state");
+    let runtime = RuntimeHandle::new_with_provider_policy(
+        Ok(host_config_state.path().to_path_buf()),
+        DoctorRefreshAdapter,
+        crate::runtime::RuntimeProviderPolicy::from_host_config(&config),
+    );
+    let resolved = runtime
+        .resolve_provider_binding(LOCAL_DEMO_HOST, &provider_intent_with_missing_descriptor())
+        .expect("resolve the Host-owned config binding");
+    let ProviderBindingResolution::Ready(binding) = resolved else {
+        panic!("the configured File descriptor must be present");
+    };
+    assert_eq!(binding.auth_source(), Some(&expected));
+    assert!(binding.has_valid_binding_digest());
 }
 
 fn service_with_provider_descriptor<A: ComputerUseAdapter>(
@@ -3075,7 +3117,7 @@ fn unresolved_host_secret_maps_to_the_typed_public_error_without_descriptor_text
         satelle_core::ProviderBindingSource::HostOwned,
     );
 
-    let error = crate::runtime::resolve_provider_child_secret_for_test(&binding)
+    let error = crate::runtime::resolve_provider_child_secret_for_test(&binding, LOCAL_DEMO_HOST)
         .expect_err("the missing Host environment secret must fail closed");
 
     assert_eq!(ErrorCode::ProviderSecretResolutionFailed, error.code);

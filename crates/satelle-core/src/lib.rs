@@ -15,6 +15,8 @@ mod authority;
 mod config_includes;
 #[path = "control-plane.rs"]
 pub mod control_plane;
+#[path = "credential-helper.rs"]
+mod credential_helper;
 #[path = "daemon-service.rs"]
 pub mod daemon_service;
 #[path = "direct-host-binding.rs"]
@@ -27,6 +29,8 @@ pub mod ids;
 mod profiles;
 #[path = "project-config.rs"]
 mod project_config;
+#[path = "secret-file-path.rs"]
+mod secret_file_path;
 #[path = "secure-file.rs"]
 mod secure_file;
 pub mod session;
@@ -50,6 +54,7 @@ pub use control_plane::{
     ControlPlaneCapability, ControlPlaneCapabilitySet, ControlPlaneFailureReason,
     ControlPlaneOperation, IncompatibleControlPlaneDetails, IncompatibleControlPlaneDetailsError,
 };
+pub use credential_helper::{CredentialHelper, CredentialHelperDescriptorError};
 pub use direct_host_binding::{
     ApiTokenSource, DirectHostBinding, DirectHostBindingError, SshHostBinding, SshHostBindingError,
 };
@@ -59,6 +64,10 @@ pub use events::{
 };
 pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
+pub use secret_file_path::{
+    SecretFilePathError, expand_secret_file_path, resolver_account_home, secret_file_error_details,
+    validate_secret_file_path,
+};
 pub use secure_file::{
     OwnerOnlyDirectory, OwnerOnlySecretFilePaths, SecureFileError, SshIdentityCommitRecord,
     cleanup_owner_only_secret_file, keyed_owner_only_secret_file_comparison_digest,
@@ -68,9 +77,9 @@ pub use secure_file::{
     owner_only_secret_destination_exists, persist_new_owner_only_config_file,
     persist_new_owner_only_secret_file, publish_new_owner_only_directory,
     publish_owner_only_secret_file, read_bounded_regular_file_no_follow,
-    read_owner_controlled_config_file, read_owner_only_secret_config_file,
-    read_owner_only_secret_file, read_trusted_ca_bundle_file, rollback_owner_only_secret_file,
-    stage_owner_only_secret_file, sync_owner_only_directory,
+    read_optional_owner_only_secret_config_file, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    rollback_owner_only_secret_file, stage_owner_only_secret_file, sync_owner_only_directory,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";
@@ -462,6 +471,7 @@ pub enum ProviderSecretSource {
     File { path: PathBuf },
     CredentialStore { service: String, account: String },
     HostStore { name: String },
+    ExecutableHelper(CredentialHelper),
 }
 
 /// Secret-free Host preview returned before an interactive provisioning
@@ -686,6 +696,7 @@ where
         "file" => &["kind", "path"],
         "credential-store" => &["kind", "service", "account"],
         "host-store" => &["kind", "name"],
+        "executable-helper" => &["kind", "argv", "timeout", "environment"],
         _ => &["kind"],
     };
     if let Some(field) = object
@@ -3519,6 +3530,16 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
                 };
 
                 for key in ["kind", "variable", "path", "service", "account", "name"] {
+                    // Home shorthand has its own typed grammar diagnostic.
+                    if key == "path"
+                        && source_table.get("kind").and_then(toml::Value::as_str) == Some("file")
+                        && source_table
+                            .get(key)
+                            .and_then(toml::Value::as_str)
+                            .is_some_and(|path| path.contains('~'))
+                    {
+                        continue;
+                    }
                     collect_interpolation_for_value(
                         &format!("{source_path}.{key}"),
                         source_table.get(key),
@@ -3871,9 +3892,74 @@ fn reject_provider_secret_source_errors(
                 ));
             }
 
-            // File paths belong to the target Host's filesystem grammar.
-            // The controller can validate descriptor shape, but only the Host
-            // can decide whether a POSIX or Windows path is absolute.
+            if kind == "executable-helper" {
+                let argv = source_table
+                    .get("argv")
+                    .and_then(toml::Value::as_array)
+                    .and_then(|items| {
+                        items
+                            .iter()
+                            .map(|item| item.as_str().map(str::to_owned))
+                            .collect::<Option<Vec<_>>>()
+                    });
+                if argv
+                    .as_ref()
+                    .is_none_or(|argv| !credential_helper::valid_argv(argv))
+                {
+                    return Err(SatelleError {
+                        code: ErrorCode::CredentialHelperArgvInvalid,
+                        message: "credential helper argv requires an absolute executable and literal arguments".to_string(),
+                        recovery_command: Some("configure an absolute Host helper executable with literal arguments".to_string()),
+                        source_detail: None,
+                        details: BTreeMap::from([
+                            ("config_file".to_string(), Value::String(path.display().to_string())),
+                            ("toml_path".to_string(), Value::String(format!("{source_path}.argv"))),
+                        ]),
+                    });
+                }
+                if let Some(timeout) = source_table.get("timeout")
+                    && timeout.as_str().and_then(ExplicitDuration::parse).is_none()
+                {
+                    return Err(SatelleError::duration_unit_required(
+                        path,
+                        &format!("{source_path}.timeout"),
+                    ));
+                }
+                // Serde errors can quote a malformed value. Keep helper argv
+                // and environment values outside diagnostic output even when
+                // the descriptor itself cannot be decoded.
+                if source_value
+                    .clone()
+                    .try_into::<ProviderSecretSource>()
+                    .is_err()
+                {
+                    return Err(SatelleError::config_error(
+                        format!(
+                            "invalid credential helper descriptor at {source_path} in {}",
+                            path.display()
+                        ),
+                        None,
+                    ));
+                }
+            }
+
+            if kind == "file"
+                && let Some(file_path) = source_table.get("path").and_then(toml::Value::as_str)
+            {
+                // Local Hosts use this platform. A remote Host's grammar is
+                // unknown here; accept either syntax without resolving home.
+                let local =
+                    host_table.get("transport").and_then(toml::Value::as_str) == Some("local");
+                validate_secret_file_path(Path::new(file_path), local.then_some(cfg!(windows)))
+                    .map_err(|error| {
+                        error.diagnostic(
+                            Some(path),
+                            Some(&format!("{source_path}.path")),
+                            Some(alias),
+                            local.then_some(std::env::consts::OS),
+                        )
+                    })?;
+            }
         }
     }
 
@@ -3943,8 +4029,13 @@ fn reject_provider_binding_errors(path: &Path, value: &toml::Value) -> Result<()
     Ok(())
 }
 
-const SUPPORTED_SECRET_SOURCE_KINDS: &[&str] =
-    &["environment", "file", "credential-store", "host-store"];
+const SUPPORTED_SECRET_SOURCE_KINDS: &[&str] = &[
+    "environment",
+    "file",
+    "credential-store",
+    "host-store",
+    "executable-helper",
+];
 
 fn reject_desktop_session_selector_conflicts(
     path: &Path,
@@ -4132,7 +4223,13 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     collect_unknown_keys_for_table(
                         &format!("{host_path}.provider_auth.{provider_alias}"),
                         source_table,
-                        &["kind", "variable", "path", "service", "account", "name"],
+                        if source_table.get("kind").and_then(toml::Value::as_str)
+                            == Some("executable-helper")
+                        {
+                            &["kind", "argv", "timeout", "environment"]
+                        } else {
+                            &["kind", "variable", "path", "service", "account", "name"]
+                        },
                         &mut unknown_keys,
                     );
                 }
@@ -4460,8 +4557,12 @@ pub enum ErrorCode {
     ProjectProviderSelectionNotAllowed,
     ProjectSecretSourceNotAllowed,
     ProjectCredentialHelperNotAllowed,
+    CredentialHelperArgvInvalid,
+    CredentialHelperTimeout,
     UnsupportedSecretSourceKind,
     SecretFilePathNotAbsolute,
+    SecretFileTildeFormUnsupported,
+    SecretFileHomeUnavailable,
     DesktopSessionSelectorConflict,
     DesktopBindingRequired,
     DesktopSessionUnavailable,
@@ -4603,8 +4704,12 @@ impl ErrorCode {
             Self::ProjectProviderSelectionNotAllowed => "project-provider-selection-not-allowed",
             Self::ProjectSecretSourceNotAllowed => "project-secret-source-not-allowed",
             Self::ProjectCredentialHelperNotAllowed => "project-credential-helper-not-allowed",
+            Self::CredentialHelperArgvInvalid => "credential-helper-argv-invalid",
+            Self::CredentialHelperTimeout => "credential-helper-timeout",
             Self::UnsupportedSecretSourceKind => "unsupported-secret-source-kind",
             Self::SecretFilePathNotAbsolute => "secret-file-path-not-absolute",
+            Self::SecretFileTildeFormUnsupported => "secret-file-tilde-form-unsupported",
+            Self::SecretFileHomeUnavailable => "secret-file-home-unavailable",
             Self::DesktopSessionSelectorConflict => "desktop-session-selector-conflict",
             Self::DesktopBindingRequired => "desktop-binding-required",
             Self::DesktopSessionUnavailable => "desktop-session-unavailable",
@@ -4768,8 +4873,11 @@ impl ErrorCode {
             | Self::ProjectProviderSelectionNotAllowed
             | Self::ProjectSecretSourceNotAllowed
             | Self::ProjectCredentialHelperNotAllowed
+            | Self::CredentialHelperArgvInvalid
             | Self::UnsupportedSecretSourceKind
             | Self::SecretFilePathNotAbsolute
+            | Self::SecretFileTildeFormUnsupported
+            | Self::SecretFileHomeUnavailable
             | Self::DesktopSessionSelectorConflict
             | Self::PlatformDirectoriesUnavailable
             | Self::PathOverrideNotAbsolute
@@ -4808,6 +4916,7 @@ impl ErrorCode {
             | Self::SetupPartiallyApplied
             | Self::StorageBusy
             | Self::StorageIntegrityFailed
+            | Self::CredentialHelperTimeout
             | Self::ProviderSecretResolutionFailed
             | Self::SelfUpdateRollbackFailed
             | Self::SelfUpdateVerificationFailed
@@ -5372,9 +5481,7 @@ impl SatelleError {
                 "config file {} uses unsupported composition key '{key}'",
                 path.display()
             ),
-            recovery_command: Some(
-                "remove include, imports, extends, or fragments keys".to_string(),
-            ),
+            recovery_command: Some("remove imports, extends, or fragments keys".to_string()),
             source_detail: None,
             details: BTreeMap::new(),
         }
@@ -5405,7 +5512,7 @@ impl SatelleError {
                 config_file.display()
             ),
             recovery_command: Some(
-                "use environment, file, credential-store, or host-store Secret Sources".to_string(),
+                "use environment, file, credential-store, host-store, or executable-helper Secret Sources".to_string(),
             ),
             source_detail: None,
             details,

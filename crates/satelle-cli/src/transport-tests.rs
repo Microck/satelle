@@ -34,6 +34,54 @@ use std::time::Duration;
 // Native CI can take several seconds to schedule a freshly admitted worker.
 const INTERRUPT_TEST_COORDINATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(unix)]
+#[test]
+fn local_daemon_endpoint_removal_is_absence_during_relaunch() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let host_config = SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .unwrap();
+    let launch = LocalDaemonLaunchConfig::new(
+        host_config,
+        ApiRateLimits::default(),
+        "host-test".to_string(),
+        state.path(),
+    );
+    let endpoint = launch.endpoint(SocketAddr::from((Ipv4Addr::LOCALHOST, 12345)));
+    let encoded = serde_json::to_vec(&endpoint).unwrap();
+    let path = launch.endpoint_path().to_path_buf();
+    let reads = thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            for _ in 0..2_000 {
+                persist_new_owner_only_config_file(&path, &encoded).unwrap();
+                fs::remove_file(&path).unwrap();
+            }
+        });
+        let mut reads = 0;
+        let mut failure = None;
+        while !writer.is_finished() {
+            match optional_local_daemon_endpoint(&path) {
+                Ok(Some(observed)) => assert_eq!(observed, endpoint),
+                Ok(None) => {}
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+            reads += 1;
+        }
+        writer.join().expect("endpoint publisher completed");
+        assert!(
+            failure.is_none(),
+            "an exiting daemon may remove its valid endpoint: {failure:?}"
+        );
+        reads
+    });
+    assert!(reads > 0);
+    assert!(optional_local_daemon_endpoint(&path).unwrap().is_none());
+}
+
 #[test]
 fn local_daemon_config_identity_tracks_host_config_and_rate_limits() {
     let host_config = SatelleConfig::defaults()

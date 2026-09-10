@@ -1,10 +1,11 @@
 use hmac::{Hmac, KeyInit, Mac};
 use satelle_core::{
-    ProviderAuthValidationOutcome, ProviderSecretSource, read_owner_only_secret_file,
+    ProviderAuthValidationOutcome, ProviderSecretSource, SecretFilePathError,
+    expand_secret_file_path, read_owner_only_secret_file, resolver_account_home,
+    validate_secret_file_path,
 };
 use sha2::Sha256;
 use std::fmt;
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -177,8 +178,12 @@ pub(crate) enum ProviderAuthResolutionError {
     UnsupportedKind,
     #[error("the provider secret could not be resolved")]
     Unresolved,
-    #[error("the provider secret file path is not absolute for the target Host")]
-    InvalidFilePath,
+    #[error(transparent)]
+    FilePath(#[from] SecretFilePathError),
+    #[error("the credential helper executable is not absolute for the target Host")]
+    InvalidHelperArgv,
+    #[error("the credential helper exceeded its timeout")]
+    HelperTimeout,
 }
 
 /// Path grammar is selected from the target Host, not the Controller that
@@ -199,44 +204,54 @@ impl ProviderHostPlatform {
     }
 }
 
+/// Both user-authorized bindings and Host-owned configuration enter through
+/// this boundary. Persist only the effective absolute File reference so reads,
+/// provisioning, recovery, and metadata checks use the same destination.
+pub(crate) fn prepare_provider_binding(
+    mut authorization: satelle_core::ProviderBindingAuthorization,
+    source: satelle_core::ProviderBindingSource,
+    host: &str,
+) -> Result<satelle_core::ResolvedProviderBinding, satelle_core::SatelleError> {
+    crate::validate_provider_binding_authorization(&authorization)?;
+    if let Some(ProviderSecretSource::File { path }) = authorization.auth_source() {
+        let home = path
+            .to_str()
+            .filter(|path| path.starts_with('~'))
+            .and_then(|_| resolver_account_home());
+        let path = expand_secret_file_path(path, home.as_deref()).map_err(|error| {
+            error.diagnostic(None, None, Some(host), Some(std::env::consts::OS))
+        })?;
+        authorization = authorization.with_auth_source(ProviderSecretSource::File { path });
+    }
+    Ok(satelle_core::ResolvedProviderBinding::from_authorization(
+        authorization,
+        source,
+    ))
+}
+
 /// Resolves a secret only at the explicit provider smoke/run boundary.
 ///
 /// Callers must not invoke this function while rendering status or other
 /// read-only diagnostics.
 pub(crate) fn resolve_provider_secret(
     source: &ProviderSecretSource,
-    target_platform: ProviderHostPlatform,
+    helper_request: &crate::credential_helper::CredentialHelperRequest<'_>,
 ) -> Result<ResolvedProviderSecret, ProviderAuthResolutionError> {
     let value = match source {
         ProviderSecretSource::Environment { variable } => std::env::var_os(variable)
             .and_then(|value| value.into_string().ok())
             .map(Zeroizing::new)
             .ok_or(ProviderAuthResolutionError::Unresolved)?,
-        ProviderSecretSource::File { path } => {
-            if !is_absolute_for_target(path, target_platform) {
-                return Err(ProviderAuthResolutionError::InvalidFilePath);
-            }
-            read_owner_only_secret_file(path)
-                .map_err(|_| ProviderAuthResolutionError::Unresolved)?
+        ProviderSecretSource::File { path } => read_owner_only_secret_file(path)
+            .map_err(|_| ProviderAuthResolutionError::Unresolved)?,
+        ProviderSecretSource::ExecutableHelper(helper) => {
+            crate::credential_helper::resolve(helper, helper_request)?
         }
         ProviderSecretSource::CredentialStore { .. } | ProviderSecretSource::HostStore { .. } => {
             return Err(ProviderAuthResolutionError::UnsupportedKind);
         }
     };
     Ok(ResolvedProviderSecret { value })
-}
-
-fn is_absolute_for_target(path: &Path, target_platform: ProviderHostPlatform) -> bool {
-    let Some(path) = path.to_str() else {
-        return false;
-    };
-    if path.starts_with('~') {
-        return false;
-    }
-    match target_platform {
-        ProviderHostPlatform::Posix => path.starts_with('/'),
-        ProviderHostPlatform::Windows => is_absolute_windows_path(path),
-    }
 }
 
 /// Validates a descriptor's target-Host grammar without reading the
@@ -247,8 +262,9 @@ pub(crate) fn validate_provider_secret_source_descriptor(
 ) -> Result<(), ProviderAuthResolutionError> {
     match source {
         ProviderSecretSource::Environment { variable } if !variable.trim().is_empty() => Ok(()),
-        ProviderSecretSource::File { path } if is_absolute_for_target(path, target_platform) => {
-            Ok(())
+        ProviderSecretSource::File { path } => {
+            validate_secret_file_path(path, Some(target_platform == ProviderHostPlatform::Windows))
+                .map_err(ProviderAuthResolutionError::from)
         }
         ProviderSecretSource::CredentialStore { service, account }
             if !service.trim().is_empty() && !account.trim().is_empty() =>
@@ -256,31 +272,17 @@ pub(crate) fn validate_provider_secret_source_descriptor(
             Ok(())
         }
         ProviderSecretSource::HostStore { name } if !name.trim().is_empty() => Ok(()),
-        ProviderSecretSource::File { .. } => Err(ProviderAuthResolutionError::InvalidFilePath),
+        ProviderSecretSource::ExecutableHelper(helper)
+            if helper
+                .executable_is_absolute_for(target_platform == ProviderHostPlatform::Windows) =>
+        {
+            Ok(())
+        }
+        ProviderSecretSource::ExecutableHelper(_) => {
+            Err(ProviderAuthResolutionError::InvalidHelperArgv)
+        }
         _ => Err(ProviderAuthResolutionError::Unresolved),
     }
-}
-
-fn is_absolute_windows_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    let drive_qualified = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/');
-    if drive_qualified {
-        return true;
-    }
-
-    let Some(remainder) = path.strip_prefix(r"\\").or_else(|| path.strip_prefix("//")) else {
-        return false;
-    };
-    let mut components = remainder
-        .split(['\\', '/'])
-        .filter(|component| !component.is_empty());
-    matches!(
-        (components.next(), components.next()),
-        (Some(server), Some(share)) if server != "." && server != ".." && share != "." && share != ".."
-    )
 }
 
 /// Classifies already-observed provider-auth evidence without reading a
@@ -307,7 +309,10 @@ pub(crate) fn diagnose_provider_secret(
             ProviderAuthValidationOutcome::UnsupportedDescriptorKind
         }
         Some(Err(
-            ProviderAuthResolutionError::Unresolved | ProviderAuthResolutionError::InvalidFilePath,
+            ProviderAuthResolutionError::Unresolved
+            | ProviderAuthResolutionError::FilePath(_)
+            | ProviderAuthResolutionError::HelperTimeout
+            | ProviderAuthResolutionError::InvalidHelperArgv,
         )) => ProviderAuthValidationOutcome::UnresolvedHostSecret,
         Some(Ok(())) if smoke_failed => {
             ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed
@@ -323,6 +328,14 @@ mod tests {
     #[cfg(unix)]
     use satelle_core::persist_new_owner_only_secret_file;
     use std::path::{Path, PathBuf};
+
+    fn helper_request() -> crate::credential_helper::CredentialHelperRequest<'static> {
+        crate::credential_helper::CredentialHelperRequest::new(
+            "test-provider",
+            "openai",
+            "test-host",
+        )
+    }
 
     /// Owns one unique process-environment variable for the duration of a
     /// test. Unique names avoid cross-test interference while still exercising
@@ -414,12 +427,12 @@ mod tests {
             "descriptor diagnostics do not consult the process environment"
         );
         assert!(matches!(
-            resolve_provider_secret(&source, ProviderHostPlatform::Posix),
+            resolve_provider_secret(&source, &helper_request()),
             Err(ProviderAuthResolutionError::Unresolved)
         ));
 
         environment.set("provider-test-token");
-        let resolved = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
+        let resolved = resolve_provider_secret(&source, &helper_request())
             .expect("smoke and run call sites can resolve configured auth");
         assert!(
             resolved.matches_for_test("provider-test-token"),
@@ -434,13 +447,13 @@ mod tests {
         let binding_digest = "a".repeat(64);
 
         environment.set("first-provider-token");
-        let first = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
+        let first = resolve_provider_secret(&source, &helper_request())
             .expect("resolve the first environment credential");
         let first_fingerprint =
             provider_smoke_credential_fingerprint_for_test(&binding_digest, Some(&first));
 
         environment.set("rotated-provider-token");
-        let rotated = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
+        let rotated = resolve_provider_secret(&source, &helper_request())
             .expect("resolve the rotated environment credential");
         let rotated_fingerprint =
             provider_smoke_credential_fingerprint_for_test(&binding_digest, Some(&rotated));
@@ -463,6 +476,19 @@ mod tests {
     #[test]
     fn file_paths_follow_the_target_host_absolute_path_rules() {
         assert_eq!(
+            prepare_provider_binding(
+                satelle_core::ProviderBindingAuthorization::new(
+                    "model", "provider", "model", "openai"
+                )
+                .with_auth_source(file_source(Path::new("relative/provider-token"))),
+                satelle_core::ProviderBindingSource::UserConfig,
+                "local",
+            )
+            .unwrap_err()
+            .code,
+            satelle_core::ErrorCode::SecretFilePathNotAbsolute
+        );
+        assert_eq!(
             Ok(()),
             validate_provider_secret_source_descriptor(
                 &file_source(Path::new("/satelle/provider-token")),
@@ -470,19 +496,21 @@ mod tests {
             )
         );
         assert!(matches!(
-            resolve_provider_secret(
+            validate_provider_secret_source_descriptor(
                 &file_source(Path::new("relative/provider-token")),
                 ProviderHostPlatform::Posix,
             ),
-            Err(ProviderAuthResolutionError::InvalidFilePath)
+            Err(ProviderAuthResolutionError::FilePath(
+                SecretFilePathError::NotAbsolute
+            ))
         ));
-        assert!(matches!(
-            resolve_provider_secret(
+        assert_eq!(
+            validate_provider_secret_source_descriptor(
                 &file_source(Path::new("~/provider-token")),
                 ProviderHostPlatform::Posix,
             ),
-            Err(ProviderAuthResolutionError::InvalidFilePath)
-        ));
+            Ok(())
+        );
 
         assert_eq!(
             Ok(()),
@@ -496,15 +524,68 @@ mod tests {
             r"\rooted-on-current-drive",
             "relative/provider-token",
             "/posix/provider-token",
-            r"~\provider-token",
         ] {
             assert!(matches!(
-                resolve_provider_secret(
+                validate_provider_secret_source_descriptor(
                     &file_source(Path::new(invalid_path)),
                     ProviderHostPlatform::Windows,
                 ),
-                Err(ProviderAuthResolutionError::InvalidFilePath)
+                Err(ProviderAuthResolutionError::FilePath(
+                    SecretFilePathError::NotAbsolute
+                ))
             ));
+        }
+        assert_eq!(
+            validate_provider_secret_source_descriptor(
+                &file_source(Path::new(r"~\provider-token")),
+                ProviderHostPlatform::Windows
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn secret_file_home_resolution_reads_only_the_daemon_accounts_private_file() {
+        let home = resolver_account_home().expect("the Host test account has a home");
+        let directory = tempfile::Builder::new()
+            .prefix("satelle-provider-home-")
+            .tempdir_in(&home)
+            .expect("create a private fixture in the real account home");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // TempDir inherits the process umask, which may allow group writes.
+            // The production writer rejects writable ancestors as well as files.
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make the fixture ancestor private");
+        }
+        // The production writer creates this child with owner-only permissions.
+        let path = directory.path().join("private").join("token");
+        satelle_core::persist_new_owner_only_secret_file(&path, "home-provider-token")
+            .expect("persist the fixture through the production owner-only writer");
+        let relative = path.strip_prefix(&home).unwrap();
+        let shorthand = PathBuf::from("~").join(relative);
+        let binding = prepare_provider_binding(
+            satelle_core::ProviderBindingAuthorization::new("model", "provider", "model", "openai")
+                .with_auth_source(file_source(&shorthand)),
+            satelle_core::ProviderBindingSource::UserConfig,
+            "local",
+        )
+        .expect("normalize the input before constructing the Host binding");
+        let source = binding.auth_source().unwrap();
+        assert_eq!(source, &file_source(&path));
+        assert!(binding.has_valid_binding_digest());
+        let secret = resolve_provider_secret(source, &helper_request())
+            .expect("read the canonical Host file reference");
+        assert!(secret.matches_for_test("home-provider-token"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(
+                resolve_provider_secret(source, &helper_request()).unwrap_err(),
+                ProviderAuthResolutionError::Unresolved
+            );
         }
     }
 
@@ -520,9 +601,8 @@ mod tests {
         let secure_path = directory.path().join("secure-token");
         persist_new_owner_only_secret_file(&secure_path, "secure-provider-token")
             .expect("persist an owner-only provider credential");
-        let resolved =
-            resolve_provider_secret(&file_source(&secure_path), ProviderHostPlatform::Posix)
-                .expect("resolve an owner-only credential file");
+        let resolved = resolve_provider_secret(&file_source(&secure_path), &helper_request())
+            .expect("resolve an owner-only credential file");
         assert!(resolved.matches_for_test("secure-provider-token"));
 
         let insecure_path = directory.path().join("insecure-token");
@@ -531,7 +611,7 @@ mod tests {
         std::fs::set_permissions(&insecure_path, std::fs::Permissions::from_mode(0o644))
             .expect("make the credential readable by other users");
         assert!(matches!(
-            resolve_provider_secret(&file_source(&insecure_path), ProviderHostPlatform::Posix,),
+            resolve_provider_secret(&file_source(&insecure_path), &helper_request()),
             Err(ProviderAuthResolutionError::Unresolved)
         ));
     }
@@ -549,14 +629,14 @@ mod tests {
             .expect("persist the first owner-only provider credential");
         let source = file_source(&path);
         let binding_digest = "b".repeat(64);
-        let first = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
+        let first = resolve_provider_secret(&source, &helper_request())
             .expect("resolve the first file credential");
         let first_fingerprint =
             provider_smoke_credential_fingerprint_for_test(&binding_digest, Some(&first));
 
         std::fs::write(&path, "rotated-file-provider-token")
             .expect("rotate the owner-only provider credential");
-        let rotated = resolve_provider_secret(&source, ProviderHostPlatform::Posix)
+        let rotated = resolve_provider_secret(&source, &helper_request())
             .expect("resolve the rotated file credential");
         let rotated_fingerprint =
             provider_smoke_credential_fingerprint_for_test(&binding_digest, Some(&rotated));
@@ -578,7 +658,7 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                resolve_provider_secret(&source, ProviderHostPlatform::Posix),
+                resolve_provider_secret(&source, &helper_request()),
                 Err(ProviderAuthResolutionError::UnsupportedKind)
             ));
             assert_eq!(

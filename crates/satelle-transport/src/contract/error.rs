@@ -45,6 +45,10 @@ pub enum ApiErrorCode {
     ProviderSecretProvisioningRequired,
     ProviderSecretOverwriteRequired,
     ProviderSecretResolutionFailed,
+    CredentialHelperTimeout,
+    CredentialHelperArgvInvalid,
+    SecretFileTildeFormUnsupported,
+    SecretFileHomeUnavailable,
     ExperimentalProviderNotValidated,
     StorageBusy,
     StorageIntegrityFailed,
@@ -101,6 +105,10 @@ impl ApiErrorCode {
             Self::ProviderSecretProvisioningRequired => "provider-secret-provisioning-required",
             Self::ProviderSecretOverwriteRequired => "provider-secret-overwrite-required",
             Self::ProviderSecretResolutionFailed => "provider-secret-resolution-failed",
+            Self::CredentialHelperTimeout => "credential-helper-timeout",
+            Self::CredentialHelperArgvInvalid => "credential-helper-argv-invalid",
+            Self::SecretFileTildeFormUnsupported => "secret-file-tilde-form-unsupported",
+            Self::SecretFileHomeUnavailable => "secret-file-home-unavailable",
             Self::ExperimentalProviderNotValidated => "experimental-provider-not-validated",
             Self::StorageBusy => "storage-busy",
             Self::StorageIntegrityFailed => "storage-integrity-failed",
@@ -173,6 +181,22 @@ mod tests {
             (
                 ApiErrorCode::ProjectProviderSelectionNotAllowed,
                 "project-provider-selection-not-allowed",
+            ),
+            (
+                ApiErrorCode::CredentialHelperArgvInvalid,
+                "credential-helper-argv-invalid",
+            ),
+            (
+                ApiErrorCode::CredentialHelperTimeout,
+                "credential-helper-timeout",
+            ),
+            (
+                ApiErrorCode::SecretFileTildeFormUnsupported,
+                "secret-file-tilde-form-unsupported",
+            ),
+            (
+                ApiErrorCode::SecretFileHomeUnavailable,
+                "secret-file-home-unavailable",
             ),
             (
                 ApiErrorCode::ProviderSecretResolutionFailed,

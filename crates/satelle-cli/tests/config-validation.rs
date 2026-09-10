@@ -679,6 +679,117 @@ fn secret_source_command_canary_child() {
     }
 }
 
+#[test]
+fn credential_helpers_are_validated_and_redacted_without_execution() {
+    let executable =
+        toml::Value::String(std::env::current_exe().unwrap().display().to_string()).to_string();
+    let fixture = ConfigFixture::new(
+        &format!(
+            r#"
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[hosts.local-demo.provider_auth.openai]
+kind = "executable-helper"
+argv = [{executable}, "--exact", "secret_source_command_canary_child", "--nocapture"]
+environment = {{ PRIVATE_HELPER_ACCOUNT = "private-account" }}
+"#
+        ),
+        "",
+    );
+    let canary = fixture.user_config_path().with_extension("executed");
+    fixture
+        .command()
+        .env("SATELLE_TEST_COMMAND_CANARY_PATH", &canary)
+        .args(["config", "check", "--json"])
+        .assert()
+        .success();
+    for options in [
+        vec!["config", "explain", "--json"],
+        vec!["config", "explain", "--show-secret-references", "--json"],
+    ] {
+        let output = fixture
+            .command()
+            .env("SATELLE_TEST_COMMAND_CANARY_PATH", &canary)
+            .args(options)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let report = parse_json(&output.stdout);
+        let source = &report["effective"]["hosts"]["local-demo"]["provider_auth"]["openai"];
+        assert_eq!(source["kind"], "executable-helper");
+        assert_eq!(source["timeout"], "10s");
+        assert_eq!(source["redacted"], true);
+        let encoded = String::from_utf8(output.stdout).unwrap();
+        for private in [
+            "secret_source_command_canary_child",
+            "PRIVATE_HELPER_ACCOUNT",
+            "private-account",
+        ] {
+            assert!(!encoded.contains(private), "explain revealed {private}");
+        }
+    }
+    assert!(!canary.exists(), "config inspection executed the helper");
+}
+
+#[test]
+fn credential_helper_invalid_argv_timeout_and_placement_are_typed_errors() {
+    let fixture = ConfigFixture::new("", "");
+    for (descriptor, expected) in [
+        ("argv = []", "credential-helper-argv-invalid"),
+        ("argv = 'helper --token'", "credential-helper-argv-invalid"),
+        ("argv = ['helper']", "credential-helper-argv-invalid"),
+        (
+            "argv = ['/bin/sh', '-c', 'private-inline-script']",
+            "credential-helper-argv-invalid",
+        ),
+        (
+            "argv = ['/absolute/helper']\ntimeout = 10",
+            "duration-unit-required",
+        ),
+        (
+            "argv = ['/absolute/helper']\nenvironment = { 'BAD-KEY' = 'private-value' }",
+            "configuration-error",
+        ),
+        (
+            "argv = ['/absolute/helper']\nenvironment = { 'VALID_KEY' = ['private-value'] }",
+            "configuration-error",
+        ),
+    ] {
+        fixture.write_user_config(&format!("[hosts.local-demo]\ntransport = 'local'\nadapter = 'fake'\n[hosts.local-demo.provider_auth.openai]\nkind = 'executable-helper'\n{descriptor}\n"));
+        let output = fixture
+            .command()
+            .args(["config", "check", "--json"])
+            .assert()
+            .code(66)
+            .get_output()
+            .clone();
+        assert_eq!(parse_json(&output.stderr)["code"], expected, "{descriptor}");
+        assert!(
+            !String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("private-")
+        );
+    }
+    fixture.write_user_config("");
+    for prefix in ["hosts.local-demo.", ""] {
+        fixture.write_project_config(&format!("[{prefix}provider_auth.openai]\nkind = 'executable-helper'\nargv = ['/absolute/helper']\n"));
+        let output = fixture
+            .command()
+            .args(["config", "check", "--json"])
+            .assert()
+            .code(66)
+            .get_output()
+            .clone();
+        assert_eq!(
+            parse_json(&output.stderr)["code"],
+            "project-credential-helper-not-allowed"
+        );
+    }
+}
+
 fn clean_satelle_command() -> Command {
     let mut command = Command::cargo_bin("satelle").expect("satelle binary should build");
     for name in [
@@ -960,4 +1071,129 @@ allow_project_selection = true
     assert_eq!(error["code"], "unknown-config-key");
     assert!(!String::from_utf8_lossy(&output.stdout).contains(raw_secret));
     assert!(!String::from_utf8_lossy(&output.stderr).contains(raw_secret));
+}
+
+#[test]
+fn secret_file_home_inspection_uses_the_local_account_and_defers_remote_accounts() {
+    let fixture = ConfigFixture::new(
+        r#"
+default_host = "local"
+[hosts.local]
+transport = "local"
+adapter = "fake"
+[hosts.local.provider_auth.work]
+kind = "file"
+path = "~/satelle-home-inspection-missing/token"
+[hosts.remote]
+transport = "ssh"
+adapter = "codex"
+address = "unused.invalid"
+[hosts.remote.provider_auth.work]
+kind = "file"
+path = "~/satelle-home-inspection-missing/token"
+"#,
+        "",
+    );
+    fixture
+        .command()
+        .args(["config", "check", "--all", "--json"])
+        .assert()
+        .success();
+    let hidden = fixture
+        .command()
+        .args(["config", "explain", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(!String::from_utf8_lossy(&hidden.stdout).contains("satelle-home-inspection-missing"));
+    let home = satelle_core::resolver_account_home().expect("test account has a home");
+    let overridden_home = fixture.user_config_path().parent().unwrap();
+    // Windows discovers application directories before loading configuration.
+    // Keep that discovery valid while proving the account home ignores overrides.
+    std::fs::create_dir_all(overridden_home.join("AppData/Local")).unwrap();
+    std::fs::create_dir_all(overridden_home.join("AppData/Roaming")).unwrap();
+    let shown = fixture
+        .command()
+        .env("HOME", overridden_home)
+        .env("USERPROFILE", overridden_home)
+        .args(["config", "explain", "--show-secret-references", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report = parse_json(&shown.stdout);
+    let local = &report["effective"]["hosts"]["local"]["provider_auth"]["work"];
+    assert_eq!(
+        local["path"],
+        serde_json::json!(home.join("satelle-home-inspection-missing").join("token"))
+    );
+    assert_eq!(local["normalization_status"], "expanded");
+    let remote = &report["effective"]["hosts"]["remote"]["provider_auth"]["work"];
+    assert_eq!(remote["path"], serde_json::Value::Null);
+    assert_eq!(remote["normalization_status"], "remote_home_not_checked");
+}
+
+#[test]
+fn secret_file_home_syntax_errors_have_typed_redacted_source_details() {
+    let fixture = ConfigFixture::new("", "");
+    for path in [
+        "~another/token",
+        r"~domain\user",
+        "~~/token",
+        "/private/~/token",
+        "~/$PRIVATE_NAME",
+        "~/%PRIVATE_NAME%",
+        "~/$(private-command)",
+        "~/`private-command`",
+    ] {
+        let source = serde_json::json!({"hosts":{"local":{"transport":"local","adapter":"fake","provider_auth":{"work":{"kind":"file","path":path}}}}});
+        fixture.write_user_config(&toml::to_string(&source).unwrap());
+        let output = fixture
+            .command()
+            .args(["config", "check", "--host", "local", "--json"])
+            .assert()
+            .code(66)
+            .get_output()
+            .clone();
+        let error = parse_json(&output.stderr);
+        assert_eq!(
+            error["code"], "secret-file-tilde-form-unsupported",
+            "{path}"
+        );
+        assert_eq!(error["details"]["host"], "local");
+        assert_eq!(
+            error["details"]["toml_path"],
+            "hosts.local.provider_auth.work.path"
+        );
+        assert_eq!(error["details"]["secret_source_kind"], "file");
+        assert!(error["details"]["config_file"].is_string());
+        assert!(error["details"]["supported_forms"].is_array());
+        assert!(error["suggested_commands"].is_array());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(path));
+    }
+}
+
+#[test]
+fn secret_file_home_shorthand_does_not_authorize_project_secret_sources() {
+    let fixture = ConfigFixture::new(
+        "",
+        r#"
+[hosts.local.provider_auth.work]
+kind = "file"
+path = "~/private-token"
+"#,
+    );
+    let output = fixture
+        .command()
+        .args(["config", "check", "--json"])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json(&output.stderr)["code"],
+        "project-secret-source-not-allowed"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("private-token"));
 }
