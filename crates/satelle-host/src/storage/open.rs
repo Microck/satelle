@@ -48,7 +48,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const RESTORE_ACTIVATION_JOURNAL: &str = ".satelle-restore-activation-v1";
 const RESTORE_ACTIVATION_JOURNAL_LIMIT: usize = 64 * 1024;
-const MIGRATIONS: [Migration; 16] = [
+const MIGRATIONS: [Migration; 17] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -142,6 +142,12 @@ const MIGRATIONS: [Migration; 16] = [
     Migration {
         version: 16,
         sql: include_str!("0016_normalized_log_events.sql"),
+        seeds_sensitive_state: false,
+        irreversible: true,
+    },
+    Migration {
+        version: 17,
+        sql: include_str!("0017-api-token-lifecycle.sql"),
         seeds_sensitive_state: false,
         irreversible: true,
     },
@@ -619,7 +625,9 @@ pub(super) fn open_parts_with_locked_preflight(
     verify_database_readable(&connection)?;
     configure_connection(&connection)?;
     apply_migrations(&mut connection, state_root, &state_directory)?;
-    verify_integrity(&connection)?;
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|source| sqlite_error(StorageErrorKind::OpenFailed, source))?;
     #[cfg(windows)]
     restrict_database_files(&state_directory)?;
     Ok((connection, ownership_lock, state_directory))
@@ -972,8 +980,11 @@ fn configure_connection(connection: &Connection) -> Result<(), StorageError> {
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(|source| sqlite_error(StorageErrorKind::OpenFailed, source))?;
+    // SQLite requires foreign-key enforcement to be disabled before a table
+    // rebuild transaction. apply_migrations checks all references before it
+    // commits; open_parts enables enforcement before publishing the connection.
     connection
-        .pragma_update(None, "foreign_keys", "ON")
+        .pragma_update(None, "foreign_keys", "OFF")
         .map_err(|source| sqlite_error(StorageErrorKind::OpenFailed, source))?;
     let journal_mode: String = connection
         .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
@@ -1110,6 +1121,7 @@ fn apply_migrations(
     {
         return Err(StorageError::new(StorageErrorKind::MigrationIntegrity));
     }
+    verify_integrity(&transaction)?;
     transaction
         .commit()
         .map_err(|source| sqlite_error(StorageErrorKind::MigrationFailed, source))

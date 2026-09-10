@@ -1,0 +1,109 @@
+---
+title: API tokens
+description: Issue, rotate, and revoke scoped Host Daemon credentials.
+---
+
+Token management requires a durable bearer token with `admin` scope.
+The temporary SSH bootstrap credential can only use the setup token flow.
+
+## Requests
+
+Send these headers with each mutation:
+
+| Header | Value |
+| --- | --- |
+| `Authorization` | `Bearer <admin-token>` |
+| `Satelle-Expected-Host-Identity` | The pinned Host identity |
+| `Satelle-Protocol-Version` | `15` |
+| `Idempotency-Key` | One unique key for the intended operation |
+| `Content-Type` | `application/json` |
+
+Use the same idempotency key and payload to resolve a lost response. Changing
+the payload under an existing key returns `idempotency-key-conflict`.
+
+## Issue a token
+
+Send `POST /v1/api-tokens`:
+
+```json
+{
+  "schema_version": "satelle.api-token.issue.v1",
+  "scopes": ["control"],
+  "expires_at": "2030-01-01T00:00:00Z"
+}
+```
+
+`scopes` must contain at least one of `read`, `control`, `admin`, or
+`diagnostics_sensitive`. Control includes read, and admin includes control.
+Sensitive diagnostics require their separate scope. Duplicate scopes and their
+order do not change the request's meaning.
+
+Omit `expires_at`, or set it to `null`, for no expiry. An explicit expiry must
+be a future RFC 3339 time in UTC.
+
+The first successful request returns HTTP 201 with a flat response:
+
+```json
+{
+  "schema_version": "satelle.api-token.v1",
+  "request_id": "<request-id>",
+  "host_identity": "<host-identity>",
+  "token_id": "<token-id>",
+  "principal_ref": "<principal-reference>",
+  "credential_revision": 1,
+  "scopes": ["control"],
+  "expires_at": "2030-01-01T00:00:00Z",
+  "revoked_at": null,
+  "bearer_token": "<one-time-token>"
+}
+```
+
+Save the raw token in an owner-only file. The Host stores its verifier and
+metadata, but cannot return the secret again. Responses use
+`Cache-Control: no-store`.
+
+## Rotate a token
+
+Send `POST /v1/api-tokens/{token_id}/rotate`:
+
+```json
+{
+  "schema_version": "satelle.api-token.rotate.v1",
+  "expected_credential_revision": 1
+}
+```
+
+HTTP 200 returns the same response shape with a new `bearer_token` and the next
+credential revision. The token ID, Principal identity, scopes, and expiry stay
+the same. The old credential stops authenticating before the Host returns the
+replacement. Expired and revoked tokens cannot rotate.
+
+## Revoke a token
+
+Send `POST /v1/api-tokens/{token_id}/revoke`:
+
+```json
+{
+  "schema_version": "satelle.api-token.revoke.v1",
+  "expected_credential_revision": 2
+}
+```
+
+HTTP 200 returns the token metadata with `revoked_at` set and `bearer_token`
+equal to `null`. Other tokens continue to work. Repeating the same request
+returns the original revocation result.
+
+## Resolve a lost response
+
+A repeated successful issuance or rotation returns HTTP 409 with
+`code: "token-secret-not-replayable"`. Its `details.token` contains the original
+metadata, even after a Host restart. The operation does not run again.
+
+If the secret was lost, use an active admin credential to revoke that token,
+then issue a new token with a new key. A repeated setup issuance reports the
+same error with the original `token_id` and `pending_expires_at`; abort that
+pending token through the setup flow before issuing another.
+
+`api-token-state-conflict` means the expected revision no longer matches or
+the token's current state prevents the operation. No credential changes occur.
+An unknown token returns HTTP 404 with `api-token-not-found`.

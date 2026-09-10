@@ -431,10 +431,11 @@ mod ssh_identity_commit_tests {
         (14, "fnv1a64:fb04115e0082c148"),
         (15, "fnv1a64:efae7b5838392fa8"),
         (16, "fnv1a64:8478b3aeb5aaa616"),
+        (17, "fnv1a64:a9700dd704d41b44"),
     ];
     const EXPECTED_SCHEMA_ROW_COUNT: usize = 71;
     const EXPECTED_SCHEMA_SHA256: &str =
-        "cb18a92b0454a5115622a829f3fb1523ad296b62421c9a40b397ab8f32005e8c";
+        "17d0a507046986b8d045687dbd72ee8ed9dbeaf36ebce7eb2fb6b5c8d69129f2";
 
     fn identity() -> HostIdentityRef {
         HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")
@@ -583,7 +584,7 @@ mod ssh_identity_commit_tests {
         let user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema user version");
-        assert_eq!(user_version, 16);
+        assert_eq!(user_version, 17);
 
         let schema = connection
             .prepare(
@@ -1069,6 +1070,9 @@ pub(crate) enum IdempotentOperation {
     ProviderBindingDeletion,
     SetupVerification,
     NativeReadinessInvalidation,
+    ApiTokenIssue,
+    ApiTokenRotate,
+    ApiTokenRevoke,
 }
 
 #[derive(Clone)]

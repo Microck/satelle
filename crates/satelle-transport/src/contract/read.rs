@@ -93,6 +93,9 @@ enum Operation {
     SetupApiTokenActivate,
     SetupApiTokenAbort,
     ProviderSecretProvisioning,
+    ApiTokenIssue,
+    ApiTokenRotate,
+    ApiTokenRevoke,
 }
 
 impl Operation {
@@ -115,6 +118,9 @@ impl Operation {
             Self::SetupApiTokenActivate => "setup_api_token_activate",
             Self::SetupApiTokenAbort => "setup_api_token_abort",
             Self::ProviderSecretProvisioning => "provider_secret_provisioning",
+            Self::ApiTokenIssue => "api_token_issue",
+            Self::ApiTokenRotate => "api_token_rotate",
+            Self::ApiTokenRevoke => "api_token_revoke",
         }
     }
 }
@@ -320,6 +326,9 @@ impl CapabilitiesResponse {
                 Operation::SetupApiTokenActivate,
                 Operation::SetupApiTokenAbort,
                 Operation::ProviderSecretProvisioning,
+                Operation::ApiTokenIssue,
+                Operation::ApiTokenRotate,
+                Operation::ApiTokenRevoke,
             ],
             runtime_capabilities: RuntimeCapabilities {
                 codex_runtime,

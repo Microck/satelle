@@ -19,9 +19,10 @@ those pull requests merge, the integration branch gets a final pull request to
 | Config repair | Deterministic local repair with backups and explicit consent | Merged in PR #220 |
 | Host update scripting | Stable target records through `host update --plain` | Merged in PR #221 |
 | Remote image attachments | Host file resolution with bounded validation and no retention | Merged in PR #222 |
-| Host versions | CLI/Host compatibility and explicit versions | Box verified; pull request pending |
+| Host versions | CLI/Host compatibility and explicit versions | Merged in PR #223 |
 | Host storage | Safe path-set migration | Pending |
-| Transport authentication | Mutual TLS and token lifecycle | Pending |
+| API token lifecycle | Durable issuance, rotation, revocation, and one-time secret replies | Box verified; pull request pending |
+| Transport authentication | Mutual TLS | Pending |
 | Output and package repair | Lossless output formats, launcher native repair | Pending |
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit, diagnostic bundles | Pending |
 | Capture and observability | Raw protocol/subprocess exports, desktop snapshot, recording, native log sinks, telemetry | Pending |
@@ -174,7 +175,9 @@ plus documentation and release installation checks on all six targets.
 
 Box passed 231 core tests, 589 CLI unit tests, 19 focused CLI integration
 tests, and 65 release-packaging tests. Workspace Clippy and documentation
-checks passed. Cross-platform pull request checks remain pending.
+checks passed. PR #223 passed Rust and npm checks on Linux, macOS, and
+Windows, documentation validation, and installation checks on all six release
+targets.
 
 - `host update --component host --version <version>` selects a stable release.
   The option cannot combine with Codex updates or `--component all`.
@@ -189,3 +192,23 @@ checks passed. Cross-platform pull request checks remain pending.
 - The existing artifact verifier, replacement handshake, and pinned recovery
   identity also apply to selected releases. There is no automatic downgrade or
   storage downgrade, and no update channel.
+
+## API token lifecycle decisions
+
+Box passed 231 core tests, 753 Host tests, 271 transport tests, workspace
+Clippy, and 65 release-packaging tests. Generated documentation checks and the
+complete documentation site build passed. Native pull request checks remain
+pending.
+
+- Durable admin credentials issue, rotate, and revoke individual tokens through
+  the general token-management routes. SSH bootstrap credentials retain the
+  separate pending setup flow.
+- Rotation preserves token identity, Principal identity, scopes, and expiry.
+  The previous verifier stops authenticating before the replacement is returned.
+- Each mutation and its non-secret idempotency outcome commit in one storage
+  transaction. Replays return original metadata, including after restart.
+- Issuance and rotation return a raw secret once. A successful duplicate returns
+  `token-secret-not-replayable`; revocation replays its original successful result.
+- Schema 17 preserves existing provider-secret journals and checks foreign keys
+  before committing the migration. A failed integrity check rolls back the
+  schema change.

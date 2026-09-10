@@ -1,4 +1,6 @@
 mod api_json;
+#[path = "api-tokens.rs"]
+mod api_tokens;
 mod auth;
 mod events;
 mod host_error;
@@ -1085,7 +1087,16 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_control,
         ));
+    let api_token_routes = Router::new()
+        .route("/v1/api-tokens", post(api_tokens::issue))
+        .route("/v1/api-tokens/{token_id}/rotate", post(api_tokens::rotate))
+        .route("/v1/api-tokens/{token_id}/revoke", post(api_tokens::revoke))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
     let protected = read_routes
+        .merge(api_token_routes)
         .merge(host_update_maintenance_route)
         .merge(bootstrap_maintenance_routes)
         .merge(setup_routes)

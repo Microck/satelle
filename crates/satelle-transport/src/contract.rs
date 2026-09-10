@@ -1,3 +1,5 @@
+#[path = "contract/api-tokens.rs"]
+mod api_tokens;
 mod error;
 mod events;
 mod logs;
@@ -5,6 +7,9 @@ mod read;
 mod session;
 mod setup;
 
+pub use api_tokens::{
+    ApiTokenIssueRequest, ApiTokenResponse, ApiTokenRevokeRequest, ApiTokenRotateRequest,
+};
 pub(crate) use error::ApiErrorCategory;
 pub use error::{ApiError, ApiErrorCode};
 pub(crate) use events::MAX_EVENT_SUBSCRIPTIONS;

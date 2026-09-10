@@ -16,7 +16,7 @@ const LIMIT: usize = 1;
 
 type SharedResult = Result<OperationOutcome, SatelleError>;
 
-/// The three daemon mutation result shapes that can participate in one shared
+/// The daemon mutation result shapes that can participate in one shared
 /// in-flight operation. Keeping this enum private to the capacity seam avoids
 /// type-erased follower results while preserving one Host-global slot.
 #[derive(Clone)]
@@ -26,11 +26,21 @@ pub(crate) enum OperationOutcome {
         turn_id: TurnId,
     },
     Stop(RuntimeStopOutcome),
+    ApiToken(crate::ApiTokenMutationOutcome),
     ProviderBindingAuthorization(PublicResolvedProviderBinding),
     ProviderSecretProvisioning(ProviderSecretProvisioningResult),
 }
 
 impl OperationOutcome {
+    pub(crate) fn into_api_token(self) -> Result<crate::ApiTokenMutationOutcome, SatelleError> {
+        match self {
+            Self::ApiToken(outcome) => Ok(outcome),
+            _ => Err(crate::runtime::integrity_error(
+                "the operation-capacity result had the wrong response type",
+            )),
+        }
+    }
+
     pub(crate) fn admission(session: PublicSession, turn_id: TurnId) -> Self {
         Self::Admission { session, turn_id }
     }
@@ -58,6 +68,7 @@ impl OperationOutcome {
         match self {
             Self::Admission { session, .. } => Ok(session),
             Self::Stop(_)
+            | Self::ApiToken(_)
             | Self::ProviderBindingAuthorization(_)
             | Self::ProviderSecretProvisioning(_) => Err(crate::runtime::integrity_error(
                 "the operation-capacity result had the wrong response type",
@@ -69,6 +80,7 @@ impl OperationOutcome {
         match self {
             Self::Stop(outcome) => Ok(outcome),
             Self::Admission { .. }
+            | Self::ApiToken(_)
             | Self::ProviderBindingAuthorization(_)
             | Self::ProviderSecretProvisioning(_) => Err(crate::runtime::integrity_error(
                 "the operation-capacity result had the wrong response type",
@@ -81,11 +93,12 @@ impl OperationOutcome {
     ) -> Result<PublicResolvedProviderBinding, SatelleError> {
         match self {
             Self::ProviderBindingAuthorization(binding) => Ok(binding),
-            Self::Admission { .. } | Self::Stop(_) | Self::ProviderSecretProvisioning(_) => {
-                Err(crate::runtime::integrity_error(
-                    "the operation-capacity result had the wrong response type",
-                ))
-            }
+            Self::Admission { .. }
+            | Self::Stop(_)
+            | Self::ApiToken(_)
+            | Self::ProviderSecretProvisioning(_) => Err(crate::runtime::integrity_error(
+                "the operation-capacity result had the wrong response type",
+            )),
         }
     }
 
@@ -102,6 +115,9 @@ impl OperationOutcome {
             )),
             Self::ProviderSecretProvisioning(_) => Err(crate::runtime::integrity_error(
                 "an admission cancellation received a provider secret provisioning result",
+            )),
+            Self::ApiToken(_) => Err(crate::runtime::integrity_error(
+                "an admission cancellation received an API token result",
             )),
         }
     }

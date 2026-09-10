@@ -1,7 +1,10 @@
 use super::codec::format_time;
-use super::{StorageError, StorageErrorKind};
+use super::sql::{insert_terminal_json_idempotency, matching_idempotency};
+use super::{IdempotencyInput, IdempotentOperation, Storage, StorageError, StorageErrorKind};
 use crate::api_auth::{
-    ApiBearerToken, ApiPrincipal, ApiScopes, ApiTokenVerifier, validate_token_id,
+    ApiBearerToken, ApiPrincipal, ApiScopes, ApiTokenMetadata, ApiTokenMutation,
+    ApiTokenMutationOutcome, ApiTokenMutationResult, ApiTokenRejection, ApiTokenVerifier,
+    validate_token_id,
 };
 use crate::provider_auth::ProviderSmokeHmacKey;
 use hmac::{Hmac, KeyInit, Mac};
@@ -262,6 +265,17 @@ struct StoredToken {
 }
 
 impl StoredToken {
+    fn metadata(&self) -> ApiTokenMetadata {
+        ApiTokenMetadata {
+            token_id: self.token_id.clone(),
+            principal_ref: self.principal_ref.clone(),
+            credential_revision: self.credential_revision,
+            scopes: self.scopes.scopes(),
+            expires_at: self.expires_at,
+            revoked_at: self.revoked_at,
+        }
+    }
+
     fn principal(&self) -> ApiPrincipal {
         ApiPrincipal {
             token_id: self.token_id.clone(),
@@ -273,6 +287,161 @@ impl StoredToken {
             durable_setup_pending: self.token_state == ApiTokenState::SetupPending,
             durable_setup_active: self.token_state == ApiTokenState::SetupActive,
         }
+    }
+}
+
+impl ApiTokenMutation {
+    pub(crate) const fn operation(&self) -> IdempotentOperation {
+        match self {
+            Self::Issue { .. } => IdempotentOperation::ApiTokenIssue,
+            Self::Rotate { .. } => IdempotentOperation::ApiTokenRotate,
+            Self::Revoke { .. } => IdempotentOperation::ApiTokenRevoke,
+        }
+    }
+}
+
+impl Storage {
+    pub(crate) fn api_token_mutation_replay(
+        &self,
+        input: &IdempotencyInput,
+    ) -> Result<Option<ApiTokenMutationOutcome>, StorageError> {
+        token_mutation_replay(&self.connection, input)
+    }
+
+    /// The verifier and replay record commit together. Only this call retains
+    /// the generated token; the database and capacity followers receive metadata.
+    pub(crate) fn mutate_api_token(
+        &mut self,
+        input: &IdempotencyInput,
+        mutation: &ApiTokenMutation,
+        at: OffsetDateTime,
+    ) -> Result<ApiTokenMutationResult, StorageError> {
+        super::sql::require_operation(input, mutation.operation())?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(operation_failed)?;
+        if let Some(outcome) = token_mutation_replay(&transaction, input)? {
+            return Ok(ApiTokenMutationResult {
+                outcome,
+                bearer_token: None,
+            });
+        }
+        let mutation_result = apply_token_mutation(&transaction, mutation, at)?;
+        let suffix = match mutation_result.outcome {
+            ApiTokenMutationOutcome::Completed(_) => "completed",
+            ApiTokenMutationOutcome::Rejected(_) => "rejected",
+        };
+        let durable_outcome = format!(
+            "v1.{}.{suffix}",
+            super::codec::idempotent_operation_token(input.operation)
+        );
+        let metadata_json = serde_json::to_string(&mutation_result.outcome).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::OperationFailed, source)
+        })?;
+        insert_terminal_json_idempotency(
+            &transaction,
+            input,
+            &durable_outcome,
+            &metadata_json,
+            at,
+        )?;
+        transaction.commit().map_err(operation_failed)?;
+        Ok(mutation_result)
+    }
+}
+
+fn token_mutation_replay(
+    connection: &Connection,
+    input: &IdempotencyInput,
+) -> Result<Option<ApiTokenMutationOutcome>, StorageError> {
+    matching_idempotency(connection, input)?
+        .map(|record| {
+            let json = record
+                .result_json
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+            serde_json::from_str(&json)
+                .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+        })
+        .transpose()
+}
+
+fn apply_token_mutation(
+    connection: &Connection,
+    mutation: &ApiTokenMutation,
+    at: OffsetDateTime,
+) -> Result<ApiTokenMutationResult, StorageError> {
+    let (token_id, expected_revision, rotating) = match mutation {
+        ApiTokenMutation::Issue { scopes, expires_at } => {
+            if expires_at.is_some_and(|expiry| expiry <= at) {
+                return Ok(rejected_token_mutation(ApiTokenRejection::InvalidExpiry));
+            }
+            let token = ApiBearerToken::generate().map_err(|source| {
+                StorageError::with_source(StorageErrorKind::OperationFailed, source)
+            })?;
+            let principal_ref = format!("api-{}", token.token_id());
+            let registration =
+                ApiTokenRegistration::new(&token, &principal_ref, 1, *scopes, *expires_at, at)?;
+            register_api_token_in_connection(connection, registration)?;
+            return Ok(ApiTokenMutationResult {
+                outcome: ApiTokenMutationOutcome::Completed(ApiTokenMetadata {
+                    token_id: token.token_id().to_string(),
+                    principal_ref,
+                    credential_revision: 1,
+                    scopes: scopes.scopes(),
+                    expires_at: *expires_at,
+                    revoked_at: None,
+                }),
+                bearer_token: Some(token),
+            });
+        }
+        ApiTokenMutation::Rotate {
+            token_id,
+            expected_credential_revision,
+        } => (token_id, expected_credential_revision, true),
+        ApiTokenMutation::Revoke {
+            token_id,
+            expected_credential_revision,
+        } => (token_id, expected_credential_revision, false),
+    };
+    let Some(stored) = load_token(connection, token_id)? else {
+        return Ok(rejected_token_mutation(ApiTokenRejection::NotFound));
+    };
+    let mut stored = stored.validate()?;
+    if stored.credential_revision != *expected_revision
+        || stored.revoked_at.is_some()
+        || !stored.token_state.authenticates()
+        || (rotating && stored.expires_at.is_some_and(|expiry| expiry <= at))
+    {
+        return Ok(rejected_token_mutation(ApiTokenRejection::StateConflict));
+    }
+    let bearer_token = if rotating {
+        let replacement =
+            ApiBearerToken::generate_for_id(stored.token_id.clone()).map_err(|source| {
+                StorageError::with_source(StorageErrorKind::OperationFailed, source)
+            })?;
+        replace_api_token_credential(connection, &replacement, &mut stored, at)?;
+        Some(replacement)
+    } else {
+        connection
+            .execute(
+                "UPDATE api_tokens SET revoked_at = ?1 WHERE token_id = ?2",
+                params![format_time(at)?, token_id],
+            )
+            .map_err(operation_failed)?;
+        stored.revoked_at = Some(at);
+        None
+    };
+    Ok(ApiTokenMutationResult {
+        outcome: ApiTokenMutationOutcome::Completed(stored.metadata()),
+        bearer_token,
+    })
+}
+
+fn rejected_token_mutation(rejection: ApiTokenRejection) -> ApiTokenMutationResult {
+    ApiTokenMutationResult {
+        outcome: ApiTokenMutationOutcome::Rejected(rejection),
+        bearer_token: None,
     }
 }
 
@@ -569,7 +738,15 @@ pub(super) fn register_api_token(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(operation_failed)?;
-    let stored = load_token(&transaction, &registration.token_id)?
+    register_api_token_in_connection(&transaction, registration)?;
+    transaction.commit().map_err(operation_failed)
+}
+
+fn register_api_token_in_connection(
+    connection: &Connection,
+    registration: ApiTokenRegistration,
+) -> Result<(), StorageError> {
+    let stored = load_token(connection, &registration.token_id)?
         .map(StoredTokenRow::validate)
         .transpose()?;
     if let Some(stored) = stored {
@@ -588,12 +765,11 @@ pub(super) fn register_api_token(
         if !same {
             return Err(StorageError::new(StorageErrorKind::IdempotencyConflict));
         }
-        transaction.commit().map_err(operation_failed)?;
         return Ok(());
     }
 
     let created_at = format_time(registration.created_at)?;
-    transaction
+    connection
         .execute(
             "INSERT INTO api_tokens (token_id, principal_ref, credential_revision, verifier, scopes, created_at, credential_updated_at, expires_at, token_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -610,7 +786,7 @@ pub(super) fn register_api_token(
             ],
         )
         .map_err(operation_failed)?;
-    transaction.commit().map_err(operation_failed)
+    Ok(())
 }
 
 pub(super) fn authenticate_api_token(
@@ -702,15 +878,27 @@ pub(super) fn rotate_api_token(
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(operation_failed)?;
-    let stored = load_token(&transaction, replacement.token_id())?
+    let mut stored = load_token(&transaction, replacement.token_id())?
         .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?
         .validate()?;
-    if stored.revoked_at.is_some()
+    if stored.expires_at.is_some_and(|expires_at| expires_at <= at)
+        || stored.revoked_at.is_some()
         || !stored.token_state.authenticates()
         || stored.credential_revision != expected_credential_revision
     {
         return Err(StorageError::new(StorageErrorKind::StateConflict));
     }
+    replace_api_token_credential(&transaction, replacement, &mut stored, at)?;
+    transaction.commit().map_err(operation_failed)?;
+    Ok(stored.principal())
+}
+
+fn replace_api_token_credential(
+    connection: &Connection,
+    replacement: &ApiBearerToken,
+    stored: &mut StoredToken,
+    at: OffsetDateTime,
+) -> Result<(), StorageError> {
     let replacement_verifier = replacement.verifier();
     if bool::from(
         stored
@@ -720,10 +908,11 @@ pub(super) fn rotate_api_token(
     ) {
         return Err(StorageError::new(StorageErrorKind::InvalidInput));
     }
-    let next_revision = expected_credential_revision
+    let next_revision = stored
+        .credential_revision
         .checked_add(1)
         .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
-    let changed = transaction
+    let changed = connection
         .execute(
             "UPDATE api_tokens SET credential_revision = ?1, verifier = ?2, credential_updated_at = ?3 WHERE token_id = ?4 AND credential_revision = ?5 AND revoked_at IS NULL",
             params![
@@ -732,7 +921,7 @@ pub(super) fn rotate_api_token(
                 replacement_verifier.as_bytes().as_slice(),
                 format_time(at)?,
                 replacement.token_id(),
-                i64::try_from(expected_credential_revision)
+                i64::try_from(stored.credential_revision)
                     .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?,
             ],
         )
@@ -740,17 +929,8 @@ pub(super) fn rotate_api_token(
     if changed != 1 {
         return Err(StorageError::new(StorageErrorKind::StateConflict));
     }
-    transaction.commit().map_err(operation_failed)?;
-    Ok(ApiPrincipal {
-        token_id: stored.token_id,
-        principal_ref: stored.principal_ref,
-        credential_revision: next_revision,
-        scopes: stored.scopes,
-        expires_at: stored.expires_at,
-        process_local_ssh_bootstrap: false,
-        durable_setup_pending: false,
-        durable_setup_active: stored.token_state == ApiTokenState::SetupActive,
-    })
+    stored.credential_revision = next_revision;
+    Ok(())
 }
 
 pub(super) fn activate_api_token(

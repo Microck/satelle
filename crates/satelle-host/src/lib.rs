@@ -34,7 +34,9 @@ mod windows_native_probe;
 
 use api_auth::EphemeralApiAuthenticator;
 pub use api_auth::{
-    ApiBearerToken, ApiBearerTokenError, ApiPrincipal, ApiScopes, contains_api_bearer_token,
+    ApiBearerToken, ApiBearerTokenError, ApiPrincipal, ApiScope, ApiScopes, ApiTokenMetadata,
+    ApiTokenMutation, ApiTokenMutationOutcome, ApiTokenMutationResult, ApiTokenRejection,
+    contains_api_bearer_token,
 };
 pub use attachment::AttachmentInput;
 use codex_capabilities::{

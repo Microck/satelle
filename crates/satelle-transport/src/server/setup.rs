@@ -47,7 +47,7 @@ pub(super) struct PendingProviderSecretUpload {
     private_key: Zeroizing<Vec<u8>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 pub(super) struct SetupTokenIssuance {
     token_id: String,
     pending_expires_at: String,
@@ -1186,11 +1186,14 @@ pub(super) async fn issue_api_token(
         Ok(Err(Some(error))) => return host_error::response(&state, &authorized, &error),
         Ok(Err(None)) | Err(_) => return host_error::task_failure(&state, &authorized),
     };
+    let Some(bearer_token) = bearer_token else {
+        return super::api_tokens::secret_not_replayable(&state, &authorized, &issuance);
+    };
     let response = DurableTokenIssuanceResponse::new(
         authorized.request_id().clone(),
         state.host_identity.clone(),
         issuance.token_id,
-        bearer_token.map(|token| token.as_str().to_string()),
+        Some(bearer_token.as_str().to_string()),
         issuance.pending_expires_at,
     );
     authenticated_json_response(

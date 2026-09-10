@@ -480,6 +480,9 @@ pub(super) fn idempotent_operation_token(operation: IdempotentOperation) -> &'st
         IdempotentOperation::ProviderBindingDeletion => "provider_binding_deletion",
         IdempotentOperation::SetupVerification => "setup_verification",
         IdempotentOperation::NativeReadinessInvalidation => "native_readiness_invalidation",
+        IdempotentOperation::ApiTokenIssue => "api_token_issue",
+        IdempotentOperation::ApiTokenRotate => "api_token_rotate",
+        IdempotentOperation::ApiTokenRevoke => "api_token_revoke",
     }
 }
 

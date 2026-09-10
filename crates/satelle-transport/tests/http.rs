@@ -1,3 +1,5 @@
+#[path = "http/api-tokens.rs"]
+mod api_tokens;
 #[path = "http/conformance.rs"]
 mod conformance;
 #[path = "http/desktop-sessions.rs"]
@@ -55,7 +57,7 @@ use tracing::metadata::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-const EXPECTED_OPERATIONS: [&str; 17] = [
+const EXPECTED_OPERATIONS: [&str; 20] = [
     "live",
     "capabilities",
     "maintenance_update_evidence",
@@ -73,6 +75,9 @@ const EXPECTED_OPERATIONS: [&str; 17] = [
     "setup_api_token_activate",
     "setup_api_token_abort",
     "provider_secret_provisioning",
+    "api_token_issue",
+    "api_token_rotate",
+    "api_token_revoke",
 ];
 
 const BLOCKING_SPAN_ATTRIBUTE_MARKER: &str = "trace-blocking-span-attribute-connected";
@@ -1579,6 +1584,26 @@ async fn setup_token_mutations_reject_bodies_before_changing_token_state() {
     let address = server.local_addr();
     let client = reqwest::Client::new();
 
+    let general_issue = setup_mutation_request(
+        &client,
+        address,
+        &bootstrap_token,
+        &host_identity,
+        "/v1/api-tokens",
+        "bootstrap-general-issue",
+    )
+    .json(&serde_json::json!({
+        "schema_version": "satelle.api-token.issue.v1", "scopes": ["admin"]
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(general_issue.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        general_issue.json::<Value>().await.unwrap()["code"],
+        "authorization-insufficient-scope"
+    );
+
     let invalid_issue = setup_mutation_request(
         &client,
         address,
@@ -3082,16 +3107,19 @@ async fn ssh_bootstrap_issues_and_activates_one_durable_restart_credential() {
         let token_id = issuance.token_id().to_string();
         let replayed_issuance = bootstrap_client
             .issue_durable_setup_token("issue-durable-setup-token")
-            .expect("replay issuance with the same idempotency key");
-        assert_eq!(replayed_issuance.token_id(), token_id);
+            .expect_err("a replay returns typed non-replayability with the original metadata");
+        let DaemonClientError::Api { status, error } = replayed_issuance else {
+            panic!("a token replay must return the typed API error");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error.code(), ApiErrorCode::TokenSecretNotReplayable);
+        let replay = serde_json::to_value(error).unwrap();
+        assert_eq!(replay["details"]["token"]["token_id"], token_id);
         assert_eq!(
-            replayed_issuance.pending_expires_at(),
+            replay["details"]["token"]["pending_expires_at"],
             issuance.pending_expires_at()
         );
-        assert!(
-            replayed_issuance.into_bearer_token().is_none(),
-            "an idempotent replay must never re-expose the one-time secret"
-        );
+        assert!(replay["details"]["token"].get("bearer_token").is_none());
         let raw_token = issuance
             .into_bearer_token()
             .expect("first durable issuance carries the secret");

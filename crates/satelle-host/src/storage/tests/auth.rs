@@ -9,6 +9,238 @@ const PAYLOAD_CANARY: &[u8] = b"PRIVATE_CANONICAL_PROMPT_PAYLOAD_CANARY";
 const PROVIDER_SECRET_CANARY: &str = "PRIVATE_PROVIDER_SECRET_RESTART_CANARY";
 
 #[test]
+fn token_lifecycle_replays_metadata_after_restart_and_preserves_authority() {
+    use crate::{ApiTokenMutation, ApiTokenMutationOutcome};
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let expiry = at(0) + time::Duration::days(1);
+    let issue = ApiTokenMutation::Issue {
+        scopes: ApiScopes::CONTROL | ApiScopes::DIAGNOSTICS_SENSITIVE,
+        expires_at: Some(expiry),
+    };
+    let issue_input = idempotency(IdempotentOperation::ApiTokenIssue, "issue-token", at(0));
+    let issued = storage
+        .mutate_api_token(&issue_input, &issue, at(0))
+        .unwrap();
+    let original_token = issued.bearer_token.unwrap();
+    let ApiTokenMutationOutcome::Completed(original) = issued.outcome else {
+        panic!("token must be issued")
+    };
+    assert_eq!(original.credential_revision, 1);
+    drop(storage);
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let replay = storage
+        .mutate_api_token(&issue_input, &issue, at(1))
+        .unwrap();
+    assert_eq!(
+        replay.outcome,
+        ApiTokenMutationOutcome::Completed(original.clone())
+    );
+    assert!(replay.bearer_token.is_none());
+    let rotate = ApiTokenMutation::Rotate {
+        token_id: original.token_id.clone(),
+        expected_credential_revision: 1,
+    };
+    let rotate_input = idempotency(IdempotentOperation::ApiTokenRotate, "rotate-token", at(2));
+    let rotated = storage
+        .mutate_api_token(&rotate_input, &rotate, at(2))
+        .unwrap();
+    let replacement = rotated.bearer_token.unwrap();
+    let ApiTokenMutationOutcome::Completed(current) = rotated.outcome else {
+        panic!("token must rotate")
+    };
+    assert_eq!(current.token_id, original.token_id);
+    assert_eq!(current.principal_ref, original.principal_ref);
+    assert_eq!(current.scopes, original.scopes);
+    assert_eq!(current.expires_at, original.expires_at);
+    assert_eq!(current.credential_revision, 2);
+    assert!(
+        storage
+            .authenticate_api_token(&original_token, at(3))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .authenticate_api_token(&replacement, at(3))
+            .unwrap()
+            .is_some()
+    );
+    let stale = storage
+        .mutate_api_token(
+            &idempotency(IdempotentOperation::ApiTokenRotate, "stale-rotate", at(3)),
+            &rotate,
+            at(3),
+        )
+        .unwrap();
+    assert_eq!(
+        stale.outcome,
+        ApiTokenMutationOutcome::Rejected(crate::ApiTokenRejection::StateConflict)
+    );
+    let revoke = ApiTokenMutation::Revoke {
+        token_id: original.token_id,
+        expected_credential_revision: 2,
+    };
+    let revoke_input = idempotency(IdempotentOperation::ApiTokenRevoke, "revoke-token", at(4));
+    let revoked = storage
+        .mutate_api_token(&revoke_input, &revoke, at(4))
+        .unwrap();
+    assert!(revoked.bearer_token.is_none());
+    assert!(
+        storage
+            .authenticate_api_token(&replacement, at(5))
+            .unwrap()
+            .is_none()
+    );
+    drop(storage);
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    assert_eq!(
+        storage
+            .mutate_api_token(&revoke_input, &revoke, at(5))
+            .unwrap()
+            .outcome,
+        revoked.outcome
+    );
+    let replay = storage
+        .mutate_api_token(&rotate_input, &rotate, at(5))
+        .unwrap();
+    assert_eq!(replay.outcome, ApiTokenMutationOutcome::Completed(current));
+    assert!(replay.bearer_token.is_none());
+    storage.checkpoint_for_test();
+    let database = fs::read(state.path().join("satelle.sqlite3")).unwrap();
+    for token in [&original_token, &replacement] {
+        assert!(!contains_bytes(&database, token.expose().as_bytes()));
+    }
+}
+
+#[test]
+fn token_verifier_changes_roll_back_when_replay_record_cannot_commit() {
+    use crate::ApiTokenMutation;
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let issued = storage
+        .mutate_api_token(
+            &idempotency(IdempotentOperation::ApiTokenIssue, "before-failure", at(0)),
+            &ApiTokenMutation::Issue {
+                scopes: ApiScopes::READ,
+                expires_at: None,
+            },
+            at(0),
+        )
+        .unwrap();
+    let token = issued.bearer_token.unwrap();
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "CREATE TRIGGER reject_token_replay BEFORE INSERT ON idempotency_records
+         BEGIN SELECT RAISE(ABORT, 'injected replay write failure'); END;",
+        )
+        .unwrap();
+    for (operation, mutation) in [
+        (
+            IdempotentOperation::ApiTokenIssue,
+            ApiTokenMutation::Issue {
+                scopes: ApiScopes::ADMIN,
+                expires_at: None,
+            },
+        ),
+        (
+            IdempotentOperation::ApiTokenRotate,
+            ApiTokenMutation::Rotate {
+                token_id: token.token_id().to_string(),
+                expected_credential_revision: 1,
+            },
+        ),
+        (
+            IdempotentOperation::ApiTokenRevoke,
+            ApiTokenMutation::Revoke {
+                token_id: token.token_id().to_string(),
+                expected_credential_revision: 1,
+            },
+        ),
+    ] {
+        assert!(
+            storage
+                .mutate_api_token(
+                    &idempotency(operation, "failed-operation", at(1)),
+                    &mutation,
+                    at(1)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .authenticate_api_token(&token, at(2))
+                .unwrap()
+                .unwrap()
+                .credential_revision(),
+            1
+        );
+        let count: i64 = storage
+            .connection_for_test()
+            .query_row("SELECT count(*) FROM api_tokens", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+}
+
+#[test]
+fn expired_tokens_cannot_rotate_but_can_be_revoked() {
+    use crate::{ApiTokenMutation, ApiTokenMutationOutcome, ApiTokenRejection};
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let issued = storage
+        .mutate_api_token(
+            &idempotency(IdempotentOperation::ApiTokenIssue, "expiring-token", at(0)),
+            &ApiTokenMutation::Issue {
+                scopes: ApiScopes::READ,
+                expires_at: Some(at(1)),
+            },
+            at(0),
+        )
+        .unwrap();
+    let token = issued.bearer_token.unwrap();
+    let rotated = storage
+        .mutate_api_token(
+            &idempotency(
+                IdempotentOperation::ApiTokenRotate,
+                "expired-rotation",
+                at(2),
+            ),
+            &ApiTokenMutation::Rotate {
+                token_id: token.token_id().to_string(),
+                expected_credential_revision: 1,
+            },
+            at(2),
+        )
+        .unwrap();
+    assert_eq!(
+        rotated.outcome,
+        ApiTokenMutationOutcome::Rejected(ApiTokenRejection::StateConflict)
+    );
+    assert!(rotated.bearer_token.is_none());
+    let revoked = storage
+        .mutate_api_token(
+            &idempotency(
+                IdempotentOperation::ApiTokenRevoke,
+                "expired-revocation",
+                at(3),
+            ),
+            &ApiTokenMutation::Revoke {
+                token_id: token.token_id().to_string(),
+                expected_credential_revision: 1,
+            },
+            at(3),
+        )
+        .unwrap();
+    let ApiTokenMutationOutcome::Completed(metadata) = revoked.outcome else {
+        panic!("expired token remains revocable")
+    };
+    assert_eq!(metadata.revoked_at, Some(at(3)));
+    assert_eq!(metadata.credential_revision, 1);
+}
+
+#[test]
 fn daemon_identity_and_idempotency_hmac_survive_restart() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, recovery) = Storage::open(state.path()).expect("open new storage");

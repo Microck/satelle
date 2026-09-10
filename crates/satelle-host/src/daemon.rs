@@ -776,6 +776,72 @@ impl HostService {
         Ok(principal)
     }
 
+    pub fn mutate_api_token(
+        &self,
+        mutation: &crate::ApiTokenMutation,
+        authority: &MutationAuthority,
+    ) -> Result<crate::ApiTokenMutationResult, SatelleError> {
+        use crate::operation_capacity::{OperationOutcome, OperationRequest};
+        if authority.principal.is_ssh_bootstrap()
+            || !authority.principal.scopes().allows(ApiScopes::ADMIN)
+        {
+            return Ok(crate::ApiTokenMutationResult {
+                outcome: crate::ApiTokenMutationOutcome::Rejected(
+                    crate::ApiTokenRejection::InsufficientScope,
+                ),
+                bearer_token: None,
+            });
+        }
+        let operation = mutation.operation();
+        let payload = canonical_payload(mutation, 1)?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            &authority.principal,
+            operation,
+            &authority.idempotency_key,
+            payload.as_slice(),
+            payload.digest_schema_version,
+        )?;
+        let requested_at = OffsetDateTime::now_utc();
+        // The request key is scoped to a Principal. Journal operation IDs are
+        // globally unique, so a second admin may safely choose the same key.
+        let input = crate::storage::IdempotencyInput::new(
+            identity.principal_ref(),
+            operation,
+            identity.key(),
+            uuid::Uuid::now_v7().to_string(),
+            identity.request_digest(),
+            identity.digest_schema_version(),
+            identity.hmac_key_version(),
+            requested_at,
+            requested_at + crate::storage::IDEMPOTENCY_RETENTION,
+        )
+        .map_err(crate::runtime::storage_failure)?;
+        let mut bearer_token = None;
+        let outcome = self
+            .operation_capacity
+            .execute(
+                OperationRequest::new(operation, &identity),
+                || {
+                    self.runtime
+                        .api_token_mutation_replay(&input, &authority.principal)
+                        .map(|outcome| outcome.map(OperationOutcome::ApiToken))
+                },
+                || {
+                    let mutation_result =
+                        self.runtime
+                            .mutate_api_token(&input, mutation, &authority.principal)?;
+                    bearer_token = mutation_result.bearer_token;
+                    Ok(OperationOutcome::ApiToken(mutation_result.outcome))
+                },
+            )?
+            .into_api_token()?;
+        Ok(crate::ApiTokenMutationResult {
+            outcome,
+            bearer_token,
+        })
+    }
+
     /// Generates a durable credential in a short-lived pending state. The raw
     /// token leaves the Host exactly once in the setup response; activation is
     /// a separate transaction after the Controller has synced its token file.
@@ -2234,6 +2300,70 @@ mod tests {
         let error =
             observation.expect_err("maintenance evidence must respect the occupied Host capacity");
         assert_eq!(error.code, satelle_core::ErrorCode::CapacityExceeded);
+    }
+
+    #[test]
+    fn token_replay_and_conflict_precede_the_shared_capacity_check() {
+        let state = crate::TestStateDir::new().unwrap();
+        let service = HostService::local_demo_for_tests_at(state.path()).unwrap();
+        service.initialize_daemon().unwrap();
+        let admin = ApiBearerToken::generate().unwrap();
+        service
+            .register_api_token(&admin, "token-test-admin", ApiScopes::ADMIN, None)
+            .unwrap();
+        let principal = service.authenticate_api_token(&admin).unwrap().unwrap();
+        let authority = MutationAuthority::new(principal.clone(), "token-replay").unwrap();
+        let mutation = crate::ApiTokenMutation::Issue {
+            scopes: ApiScopes::READ,
+            expires_at: None,
+        };
+        let first = service.mutate_api_token(&mutation, &authority).unwrap();
+        let capacity = Arc::clone(&service.operation_capacity);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            capacity.execute_exclusive(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv().unwrap();
+        let replay = service.mutate_api_token(&mutation, &authority);
+        let conflict = service.mutate_api_token(
+            &crate::ApiTokenMutation::Issue {
+                scopes: ApiScopes::CONTROL,
+                expires_at: None,
+            },
+            &authority,
+        );
+        let busy = service.mutate_api_token(
+            &mutation,
+            &MutationAuthority::new(principal, "another-token").unwrap(),
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        let replay = replay.unwrap();
+        assert_eq!(replay.outcome, first.outcome);
+        assert!(replay.bearer_token.is_none());
+        assert_eq!(
+            conflict.err().unwrap().code,
+            satelle_core::ErrorCode::IdempotencyKeyConflict
+        );
+        assert_eq!(
+            busy.err().unwrap().code,
+            satelle_core::ErrorCode::CapacityExceeded
+        );
+        service.revoke_api_token(admin.token_id()).unwrap();
+        assert_eq!(
+            service
+                .mutate_api_token(&mutation, &authority)
+                .unwrap()
+                .outcome,
+            crate::ApiTokenMutationOutcome::Rejected(
+                crate::ApiTokenRejection::AuthenticationFailed
+            )
+        );
     }
 
     #[cfg(target_os = "linux")]
