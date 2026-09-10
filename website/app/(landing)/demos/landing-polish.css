@@ -1,0 +1,48 @@
+/* Restrained semantic accents, not vendor color themes. Playback uses the
+   focusable scene itself; there is no footer, toolbar or icon overlay. */
+.sa .sx-card {position:relative;}
+.sa .sx-card-body {margin-bottom:18px;}
+.sa .sw-player {position:static;cursor:default;}
+.sa .sw-player:focus-visible {outline:2px solid var(--sa-accent-text);outline-offset:3px;}
+.sa .sw-a11y-status {position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0;}
+.sa .rf-host-browser,.sa .rf-terminal-layer {inset:0;}
+.sa .rf-terminal-layer {transform-origin:left bottom;}
+.sa .rf-terminal {border-bottom:0;}
+/* Leave breathing room at the browser edge without a tiny fixture caption. */
+.sa .rf-buy-viewport {margin-bottom:9px;}
+/* MCP receipts: the real Satelle mark, structured tools and a clear state. */
+.sa .rf-assistant>div {flex:1;}
+.sa .rf-mcp-activity {border:1px solid var(--sa-6);border-radius:7px;background:var(--sa-2);margin:0 0 10px;padding:10px 11px;max-width:100%;font-size:12px;line-height:1.45;}
+.sa .rf-mcp-heading {display:flex;align-items:center;gap:8px;}
+.sa .rf-mcp-logo {--sa-accent:var(--sa-11);width:29px;height:29px;display:grid;place-items:center;border:1px solid var(--sa-6);border-radius:6px;background:var(--sa-3);flex:none;}
+.sa .rf-mcp-heading>b {font-size:12px;font-weight:500;display:flex;align-items:center;gap:6px;}
+.sa .rf-mcp-heading>b small {font:12px/1.2 var(--font-mono);letter-spacing:.04em;margin:0;color:var(--sa-10);}
+.sa .rf-mcp-state {display:inline-flex;align-items:center;gap:4px;margin-left:auto;font-size:12px;text-transform:capitalize;color:var(--sa-10);white-space:nowrap;}
+.sa .rf-mcp-activity[data-mcp-state='completed'] .rf-mcp-state {color:var(--sa-12);}
+.sa .rf-mcp-detail {display:flex;align-items:center;flex-wrap:wrap;gap:7px;justify-content:space-between;border-top:1px solid var(--sa-6);margin-top:8px;padding-top:8px;color:var(--sa-11);}
+.sa .rf-mcp-tools {display:flex;gap:4px;flex-wrap:wrap;}
+.sa .rf-mcp-tools code {padding:2px 5px;border:1px solid var(--sa-6);border-radius:4px;background:var(--sa-3);color:var(--sa-10);font:12px/1.4 var(--font-mono);}
+.sa .rf-review-notes {padding:13px 16px;margin:0 0 23px;border:1px solid var(--sa-6);border-radius:6px;font:13px/1.65 var(--font-sans);color:var(--sa-11);scroll-margin-top:70px;}
+.sa .rf-review-notes>summary {color:var(--sa-12);cursor:pointer;}
+.sa .rf-review-notes>p {margin:12px 0;}
+.sa .rf-review-notes>a {color:var(--sa-12);}
+@container (max-width:360px) {
+  .sa .rf-mcp-activity {padding:8px;}
+  .sa .rf-mcp-heading {gap:6px;}
+  .sa .rf-mcp-heading>b {display:block;}
+  .sa .rf-mcp-heading>b small {display:block;margin-top:1px;}
+  .sa .rf-mcp-state {font-size:12px;gap:3px;}
+  .sa .rf-mcp-detail {gap:6px;}
+}
+@media (max-width:440px) { .sa .sx-card-body {margin-bottom:12px;} }
+
+/* The screenshot's redundant QA instruction strip is removed from layout. */
+.sa .rf-qa > .rf-request {display:none;}
+/* V12-style emphasis communicates state. Most text, surfaces, logos and chart
+   lines remain neutral; only the finding, live spinner and success marks tint. */
+.sa .rf-qa-finding[data-found='true'] {border-left-color:var(--sa-warn);}
+.sa .rf-qa-finding[data-found='true'] > small {color:var(--sa-warn);}
+.sa .rf-buy-viewport[data-broken='true']::after {border-color:var(--sa-warn);}
+.sa .rf-mcp-activity[data-mcp-state='running'] .rf-mcp-state > svg {color:var(--sa-accent-text);}
+.sa .rf-mcp-activity[data-mcp-state='completed'] .rf-mcp-state {color:var(--sa-ok);}
+.sa .rf-chat-file > b,.sa .rf-delivered > span:last-child,.sa .rf-upload-note > b {color:var(--sa-ok);}

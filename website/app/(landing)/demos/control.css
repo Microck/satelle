@@ -1,0 +1,200 @@
+/* Computer Use presentation: the screen aura and the driven pointer.
+ *
+ * The shapes and numbers here are taken from the shipping implementations
+ * rather than invented, so an operator who has seen one recognises this. Where
+ * a value could not be recovered it is marked.
+ *
+ * Sources:
+ *   Claude in Chrome extension (fcoeoabgfenejglbffodgkkbkcdhcgfn),
+ *     assets/agent-visual-indicator.js: the screen-edge glow, verbatim below.
+ *   Codex Desktop Computer Use extension (hehggadaopoacecdllhhajmbjkdcmajg),
+ *     content-scripts/codex.js: the cursor's geometry, glow, and motion model.
+ *   ~/.codex/computer-use/config.json: the local overlay's accent and label.
+ */
+
+/* ---------------------------------------------------------------- aura --- */
+
+/* Not a border. Three stacked inset shadows with no line and no radius, which
+ * is what the shipped overlay uses: 15/25/35px at 0.7/0.5/0.2. A hard 2px ring
+ * was the first attempt and read as window chrome rather than as a screen
+ * under someone else's control.
+ *
+ * Codex's own local overlay is a native Metal fog effect whose radii are
+ * compiled in and could not be read, so the structure here is the one that
+ * could be, in Satelle's crimson instead of a blue accent.
+ */
+.ctl-ring {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+  opacity: 0;
+  box-shadow:
+    inset 0 0 15px color-mix(in srgb, var(--sa-accent) 70%, transparent),
+    inset 0 0 25px color-mix(in srgb, var(--sa-accent) 50%, transparent),
+    inset 0 0 35px color-mix(in srgb, var(--sa-accent) 20%, transparent);
+  transition: opacity var(--mo-overlay) ease-in-out;
+}
+
+.ctl-ring[data-held='true'] {
+  opacity: 1;
+}
+
+/* Both shipped overlays name what is happening in a pill rather than a corner
+ * label. Codex's says "Codex is using your computer"; Anthropic's says "Claude
+ * is active in this tab group". Top centre because the Controller window covers
+ * the bottom left of the Host, which is where both of them put theirs. */
+.ctl-ring-label {
+  position: absolute;
+  top: var(--space-2xs);
+  left: 50%;
+  translate: -50% 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.25rem 0.625rem;
+  border-radius: var(--radius-full);
+  background: var(--sa-12);
+  color: var(--sa-0);
+  font-size: var(--step--2);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.ctl-ring-label::before {
+  content: '';
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--radius-full);
+  background: var(--sa-accent);
+}
+
+/* -------------------------------------------------------------- cursor --- */
+
+.ctl-cursor {
+  /* Keep the glyph itself unfiltered. Small diagonal SVGs become visibly soft
+     when a blur or animated scale is applied to them. Motion belongs on the
+     position transition and the separate press ring. */
+  --ctl-ease: cubic-bezier(0.4, 0.02, 0.2, 1);
+  position: absolute;
+  z-index: 4;
+  pointer-events: none;
+  /* Transitioned rather than animated, because a move has to start from
+     wherever the last step left the pointer, which a keyframe cannot know.
+     `left`/`top` rather than `translate`, because the target is a percentage of
+     the stage box and a percentage in `translate` resolves against the
+     element's own size. The duration is set per step from the distance. */
+  transition:
+    left var(--ctl-move, 420ms) var(--ctl-ease),
+    top var(--ctl-move, 420ms) var(--ctl-ease);
+  animation: ctl-enter 160ms ease-out both;
+}
+
+@keyframes ctl-enter {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.ctl-cursor-glyph {
+  display: block;
+  /* The tip, so the pointer's hotspot is the point it is aimed at. The shipped
+     cursor actually sits its click point about 7.5px back inside the arrowhead,
+     which is invisible in use and worse to read in a diagram. */
+  transform-origin: 1.5px 1.5px;
+  /* Geometric precision keeps the diagonal edges stable at small sizes. */
+  shape-rendering: geometricPrecision;
+}
+
+/* A click. The shipped implementations draw nothing here and carry the press
+   in their motion springs alone, which works at 60fps in a live session but
+   leaves a stepped demo with nothing to see: the pointer arrived and the
+   application changed with no visible cause in between.
+
+   So this is drawn, and drawn as a press rather than as a ripple: two rings
+   contracting onto the point, which reads as something being pushed rather than
+   as something radiating out of it. Keyed on the step, finite, and short enough
+   to finish well inside the dwell. */
+.ctl-press,
+.ctl-press::after {
+  position: absolute;
+  left: 0;
+  top: 0;
+  border-radius: var(--radius-full);
+  border: 2px solid var(--sa-accent);
+}
+
+.ctl-press {
+  width: 1.5rem;
+  height: 1.5rem;
+  margin: -0.75rem 0 0 -0.75rem;
+  animation: ctl-press 480ms var(--mo-ease-flat) both;
+}
+
+.ctl-press::after {
+  content: '';
+  inset: -0.375rem;
+  width: auto;
+  height: auto;
+  margin: 0;
+  opacity: 0.45;
+}
+
+/* Contracts onto the point, holds there long enough to be seen, then goes. The
+   first version was 300ms with no hold and was easy to miss entirely, which is
+   the whole complaint it exists to answer. */
+/* Starts visible. The commit that lands with this press re-renders the whole
+   drawn interior, which occupies the main thread and drops the animation's
+   first frames: fading in from zero meant the ring did not appear until about
+   250ms after the pointer arrived, so the application appeared to change before
+   anything had visibly clicked it. Beginning at full opacity means the first
+   frame that does get painted already shows the press. */
+@keyframes ctl-press {
+  from {
+    opacity: 1;
+    scale: 1.9;
+  }
+  55% {
+    opacity: 1;
+    scale: 1;
+  }
+  72% {
+    opacity: 1;
+    scale: 1;
+  }
+  to {
+    opacity: 0;
+    scale: 0.92;
+  }
+}
+
+/* A drag leaves a trail behind the pointer, aimed back along the travel and as
+   long as the travel was. A fixed angle was wrong for every move that did not
+   happen to go that way. */
+.ctl-cursor[data-act='drag']::before {
+  content: '';
+  position: absolute;
+  left: 0.25rem;
+  top: 0.25rem;
+  width: var(--ctl-trail, 0rem);
+  height: 2px;
+  transform-origin: left center;
+  transform: rotate(var(--ctl-back, 156deg));
+  background: linear-gradient(to right, var(--sa-accent), transparent);
+  opacity: 0.7;
+}
+
+/* No reduced-motion block here on purpose: landing.css already clamps every
+   animation and transition under `.sa` to 1ms with !important, which covers the
+   enter, the scoot, the landing shake, and the caret. A second copy here would
+   only look like care. */
+
+/* The typing caret is not here. A caret belongs at the insertion point in the
+   field being edited, not floating beside the mouse pointer, which is not a
+   thing any editor does. It lives in the drawn application now, via `Retype`,
+   and it appears for exactly as long as the edit takes. The version that hung
+   off the cursor was also invisible in practice: it ran for 1020ms inside a
+   420ms window, blinking off for half of each cycle. */

@@ -1,0 +1,788 @@
+/*
+ * Satelle landing page tokens and primitives.
+ *
+ * Imported only by app/(landing)/layout.tsx so the Fumadocs docs tree at /docs
+ * never inherits these values, and vice versa. Everything here is specified in
+ * website/DESIGN.md; change that document in the same commit as this file.
+ */
+
+/* ---------------------------------------------------------------- fonts --- */
+
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/geist-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/geist-500.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/geist-600.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('/fonts/geist-mono-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('/fonts/geist-mono-500.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Paint the document ground for landing pages only, so overscroll and any area
+   the page does not cover use Satelle's ground rather than the host's default.
+   Scoped with :has() so the Fumadocs tree at /docs, which shares this document,
+   keeps its own theme.
+
+   The user agent's 8px body margin is also cleared here: it was insetting the
+   whole page, so every measured edge sat 8px right of where the grid puts it. */
+:root:has(.sa),
+:root:has(.sa) body {
+  background: #f9faff;
+  color-scheme: light;
+}
+
+:root:has(.sa) body {
+  margin: 0;
+}
+
+/* The nav is sticky, so an anchor jump has to stop short of it or the target's
+   first line lands underneath. Stated here because --nav-height is declared on
+   .sa, which is not an ancestor of the scrolling element. */
+:root:has(.sa) {
+  scroll-padding-top: 4rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']):has(.sa),
+  :root:not([data-theme='light']):has(.sa) body {
+    background: #0f0d17;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme='dark']:has(.sa),
+:root[data-theme='dark']:has(.sa) body {
+  background: #0f0d17;
+  color-scheme: dark;
+}
+
+/* --------------------------------------------------------------- tokens --- */
+
+.sa {
+  /* Light ramp: the same hue drift run the other way, from a near-white ground
+     to the logo's own ink at step 12. satelle-logo-dark.svg exists precisely for
+     this surface. Every step is inside sRGB.
+       sa-10 4.86:1, sa-11 7.50:1, sa-12 18.48:1 on the ground. */
+  --sa-0: #FFFFFF;
+  --sa-1: #F9FAFF;
+  --sa-2: #F4F5F9;
+  --sa-3: #ECEDF2;
+  --sa-4: #E4E5EA;
+  --sa-5: #DBDCE2;
+  --sa-6: #D1D2D8;
+  --sa-7: #C2C4CA;
+  /* Border step. Never used as text: it measures about 3:1 either way. */
+  --sa-8: #8B8B94;
+  --sa-9: #696973;
+  --sa-10: #5A5A63;
+  --sa-11: #52515B;
+  --sa-12: #0F0D17;
+
+  --sa-accent: #e5184d;
+  --sa-accent-text: #c4003d;
+  --sa-accent-quiet: #fdeaef;
+
+  --sa-ok: #0a7c4a;
+  --sa-live: #c4003d;
+  --sa-warn: #96620a;
+  --sa-stop: #6d6e76;
+  --sa-fail: #c51d28;
+
+  --font-sans: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, 'SF Mono', 'Menlo', 'Consolas', monospace;
+
+  /* Utopia, 320px -> 1215px (20rem -> 75.94rem, matching --grid-max-width),
+     16px base at ratio 1.125 growing to 18px at ratio 1.2. */
+  --step--2: clamp(0.75rem, 0.7277rem + 0.1117vw, 0.8125rem);
+  --step--1: clamp(0.8889rem, 0.8715rem + 0.0869vw, 0.9375rem);
+  --step-0: clamp(1rem, 0.9553rem + 0.2235vw, 1.125rem);
+  --step-1: clamp(1.125rem, 1.0446rem + 0.4022vw, 1.35rem);
+  --step-2: clamp(1.2656rem, 1.1389rem + 0.6335vw, 1.62rem);
+  --step-3: clamp(1.4238rem, 1.2379rem + 0.9299vw, 1.944rem);
+  --step-4: clamp(1.6018rem, 1.3405rem + 1.3067vw, 2.3328rem);
+  --step-5: clamp(1.802rem, 1.4455rem + 1.7829vw, 2.7994rem);
+  --step-6: clamp(2.0273rem, 1.5511rem + 2.381vw, 3.3592rem);
+
+  --space-3xs: clamp(0.25rem, 0.2388rem + 0.0559vw, 0.2812rem);
+  --space-2xs: clamp(0.5rem, 0.4777rem + 0.1117vw, 0.5625rem);
+  --space-xs: clamp(0.75rem, 0.7165rem + 0.1676vw, 0.8438rem);
+  --space-s: clamp(1rem, 0.9553rem + 0.2235vw, 1.125rem);
+  --space-m: clamp(1.5rem, 1.433rem + 0.3352vw, 1.6875rem);
+  --space-l: clamp(2rem, 1.9106rem + 0.4469vw, 2.25rem);
+  --space-xl: clamp(3rem, 2.8659rem + 0.6704vw, 3.375rem);
+  --space-2xl: clamp(4rem, 3.8212rem + 0.8938vw, 4.5rem);
+  --space-3xl: clamp(6rem, 5.7319rem + 1.3407vw, 6.75rem);
+  --space-4xl: clamp(8rem, 7.6425rem + 1.7876vw, 9rem);
+
+  --space-s-m: clamp(1rem, 0.7542rem + 1.229vw, 1.6875rem);
+  --space-m-l: clamp(1.5rem, 1.2319rem + 1.3407vw, 2.25rem);
+  --space-l-xl: clamp(2rem, 1.5084rem + 2.458vw, 3.375rem);
+  --space-xl-2xl: clamp(3rem, 2.4637rem + 2.6814vw, 4.5rem);
+  --space-2xl-3xl: clamp(4rem, 3.0168rem + 4.916vw, 6.75rem);
+  --space-3xl-4xl: clamp(6rem, 4.9274rem + 5.3629vw, 9rem);
+
+  /* Measured off the reference: its content column spans x=27..1398 at a 1440
+     viewport, so 1376px of column against 32px gutters, 95.7% of the page. An
+     earlier 75.94rem (1215px) left 158px gutters, which squeezed the two-up demo
+     cards to 545px and made every demo grow vertically to compensate. The Utopia
+     scales keep their own 75.94rem clamp ceiling; this is layout only. */
+  --grid-max-width: 86rem;
+  --grid-gutter: var(--space-m);
+  --grid-edge: max(var(--grid-gutter), (100% - var(--grid-max-width)) / 2);
+  --measure: 34rem;
+  /* v12's hero text column measures 832px. Its section copy is narrower. */
+  --measure-hero: 52rem;
+
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+  --radius-full: 9999px;
+
+  --mo-instant: 0ms;
+  --mo-state: 150ms;
+  --mo-popover: 200ms;
+  --mo-overlay: 300ms;
+  --mo-ease: cubic-bezier(0.175, 0.885, 0.32, 1.1);
+  --mo-ease-flat: cubic-bezier(0.25, 1, 0.5, 1);
+  --mo-stagger: 24ms;
+
+  --nav-height: 3.25rem;
+
+  /* Shadow colour is theme state, not a constant: 60% black is soot on a near
+     white ground. Tinted toward the logo ink so shadows stay in the hue family. */
+  --sa-shadow: 15 13 23;
+  --sa-shadow-strength: 0.16;
+
+  --sa-stage-warm: rgb(196 0 61 / 0.13);
+  --sa-stage-cool: rgb(84 72 196 / 0.11);
+}
+
+/* ----------------------------------------------------------------- dark --- */
+
+/* Three states, not two. An explicit choice stamps data-theme on the root; the
+   default "system" setting stamps nothing, and only prefers-color-scheme
+   separates light from dark there. The media query is guarded so an explicit
+   light choice still beats a dark operating system, and the attribute rule is
+   repeated so the toggle wins in the other direction too. The values are stated
+   twice on purpose: CSS has no way to name one block and apply it from two
+   selectors without a preprocessor. */
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .sa {
+  /* Dark ramp: OKLCH interpolation between the logo ink (#0F0D17) and the logo
+     tail (#D6D8E0). Hue drifts 293.2 -> 274.9 as lightness rises, so dark steps
+     stay violet and light steps stay cool. Every step is inside sRGB. */
+  --sa-0: #08060f;
+  --sa-1: #0f0d17;
+  --sa-2: #171620;
+  --sa-3: #1f1e28;
+  --sa-4: #272631;
+  --sa-5: #32313c;
+  --sa-6: #3f3e49;
+  --sa-7: #575761;
+  /* Border step. Never used as text: it measures about 3:1 either way. */
+  --sa-8: #676872;
+  --sa-9: #90919b;
+  --sa-10: #a9aab3;
+  --sa-11: #c3c5ce;
+  --sa-12: #d6d8e0;
+
+  --sa-accent: #e5184d;
+  --sa-accent-text: #ef5469;
+  --sa-accent-quiet: #2a0f1c;
+
+  --sa-ok: #3fcf8e;
+  --sa-live: #e5184d;
+  --sa-warn: #e8b339;
+  --sa-stop: #80818b;
+  --sa-fail: #f2555a;
+
+  --sa-shadow: 0 0 0;
+  --sa-shadow-strength: 0.6;
+
+  --sa-stage-warm: rgb(229 24 77 / 0.16);
+  --sa-stage-cool: rgb(120 104 255 / 0.14);
+  }
+}
+
+:root[data-theme='dark'] .sa {
+  /* Dark ramp: OKLCH interpolation between the logo ink (#0F0D17) and the logo
+     tail (#D6D8E0). Hue drifts 293.2 -> 274.9 as lightness rises, so dark steps
+     stay violet and light steps stay cool. Every step is inside sRGB. */
+  --sa-0: #08060f;
+  --sa-1: #0f0d17;
+  --sa-2: #171620;
+  --sa-3: #1f1e28;
+  --sa-4: #272631;
+  --sa-5: #32313c;
+  --sa-6: #3f3e49;
+  --sa-7: #575761;
+  /* Border step. Never used as text: it measures about 3:1 either way. */
+  --sa-8: #676872;
+  --sa-9: #90919b;
+  --sa-10: #a9aab3;
+  --sa-11: #c3c5ce;
+  --sa-12: #d6d8e0;
+
+  --sa-accent: #e5184d;
+  --sa-accent-text: #ef5469;
+  --sa-accent-quiet: #2a0f1c;
+
+  --sa-ok: #3fcf8e;
+  --sa-live: #e5184d;
+  --sa-warn: #e8b339;
+  --sa-stop: #80818b;
+  --sa-fail: #f2555a;
+
+  --sa-shadow: 0 0 0;
+  --sa-shadow-strength: 0.6;
+
+  --sa-stage-warm: rgb(229 24 77 / 0.16);
+  --sa-stage-cool: rgb(120 104 255 / 0.14);
+  }
+
+/* ------------------------------------------------------------- elements --- */
+
+.sa *,
+.sa *::before,
+.sa *::after {
+  box-sizing: border-box;
+}
+
+.sa {
+  background: var(--sa-1);
+  color: var(--sa-12);
+  font-family: var(--font-sans);
+  font-size: var(--step-0);
+  font-weight: 400;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* The viewer paints its own ground behind the page, so state this explicitly. */
+  min-height: 100vh;
+  overflow-x: clip;
+}
+
+.sa :where(h1, h2, h3, h4, p, ul, ol, figure, dl) {
+  margin: 0;
+}
+
+/* Every heading on v12.sh is weight 400, including its h1. Satelle sat at 500
+   throughout, which made the page read considerably heavier than the reference
+   at the same sizes. Weight is carried by size and color, not by bolding. */
+.sa :where(h1, h2, h3, h4) {
+  font-weight: 400;
+  text-wrap: balance;
+}
+
+.sa :where(p) {
+  text-wrap: pretty;
+}
+
+.sa :where(button) {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.sa :where(a) {
+  color: inherit;
+  text-decoration: none;
+}
+
+.sa :where(code, kbd, samp, pre) {
+  font-family: var(--font-mono);
+  font-size: 0.9375em;
+  font-variant-numeric: tabular-nums;
+}
+
+.sa :where(svg) {
+  display: block;
+  flex: none;
+}
+
+.sa :where(:focus-visible) {
+  outline: 2px solid var(--sa-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.sa ::selection {
+  background: var(--sa-accent);
+  color: #fff;
+}
+
+/* --------------------------------------------------------------- layout --- */
+
+/* Three tracks: gutter, content, gutter. A child can still sit full-bleed by
+   asking for `grid-column: 1 / -1` while everything else lines up on the same
+   column. An earlier version declared twelve columns plus a column-gap, but the
+   gap either side of the content span was charged against the content, so the
+   column came out 108px narrower than the token asked for. Nothing on the page
+   addressed an individual column, so the twelve tracks bought only that bug. */
+.sa-grid {
+  display: grid;
+  grid-template-columns:
+    minmax(var(--grid-gutter), 1fr)
+    minmax(0, var(--grid-max-width))
+    minmax(var(--grid-gutter), 1fr);
+}
+
+.sa-grid > * {
+  grid-column: 2;
+  min-width: 0;
+}
+
+/* Section rhythm is deliberately tighter than the reference site's. Satelle's
+   sections are dense instruments rather than marketing panels, and the extra air
+   read as hesitation between them. */
+.sa-section {
+  padding-block: var(--space-2xl-3xl);
+}
+
+.sa-section + .sa-section {
+  padding-block-start: 0;
+}
+
+.sa-rule {
+  border: 0;
+  border-block-start: 1px solid var(--sa-6);
+  margin: 0;
+}
+
+/* ------------------------------------------------------------ type util --- */
+
+/* Small uppercase mono label. Used for structural labels inside demo chrome
+   and for section eyebrows that name a command rather than a category. */
+.sa-label {
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--sa-9);
+}
+
+.sa-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Reserved for the closing call to action, which is the one heading the
+   reference sets larger than the rest (37.32px against 31.10px). */
+.sa-display {
+  font-size: var(--step-4);
+  line-height: 1.16;
+  letter-spacing: -0.018em;
+  font-weight: 400;
+}
+
+.sa-lead {
+  font-size: var(--step-1);
+  line-height: 1.45;
+  color: var(--sa-10);
+  max-width: var(--measure);
+}
+
+.sa-muted {
+  color: var(--sa-10);
+}
+
+.sa-faint {
+  color: var(--sa-9);
+}
+
+/* Section head: a statement, then one supporting line below it. No gray
+   category label above the headline. */
+.sa-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  margin-block-end: var(--space-m-l);
+}
+
+/* v12 sets its section headings at exactly the same size as its h1, 31.10px,
+   which is --step-3 on this scale. The supporting line sits at body size, not
+   at --step-1, so the head reads as one block rather than two competing ones. */
+.sa-head h2 {
+  font-size: var(--step-3);
+  line-height: 1.2;
+  letter-spacing: -0.014em;
+  max-width: 26ch;
+}
+
+/* A caveat beside the heading, at label scale, not a paragraph under it. */
+.sa-head-note {
+  font-size: var(--step--1);
+  line-height: 1.5;
+  color: var(--sa-9);
+  max-width: 64ch;
+}
+
+/* ------------------------------------------------------------- controls --- */
+
+.sa-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: 0.5rem 0.875rem;
+  border-radius: var(--radius-md);
+  font-size: var(--step--1);
+  font-weight: 500;
+  border: 1px solid transparent;
+  transition:
+    background var(--mo-state) var(--mo-ease-flat),
+    border-color var(--mo-state) var(--mo-ease-flat),
+    color var(--mo-state) var(--mo-ease-flat);
+}
+
+.sa-btn-primary {
+  background: var(--sa-accent);
+  color: #fff;
+}
+
+.sa-btn-primary:hover {
+  background: #f22a5d;
+}
+
+/* A demo's advance control. Same shape as the primary button, ramp colours: it
+   drives the demo rather than asking the reader to do something. */
+.sa-btn-step {
+  background: var(--sa-12);
+  color: var(--sa-1);
+}
+
+.sa-btn-step:hover {
+  background: var(--sa-11);
+}
+
+.sa-btn-ghost {
+  border-color: var(--sa-6);
+  color: var(--sa-12);
+}
+
+.sa-btn-ghost:hover {
+  background: var(--sa-4);
+  border-color: var(--sa-7);
+}
+
+.sa-link {
+  color: var(--sa-accent-text);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--sa-accent-text) 40%, transparent);
+  text-underline-offset: 0.2em;
+  text-decoration-thickness: 1px;
+}
+
+.sa-link:hover {
+  text-decoration-color: var(--sa-accent-text);
+}
+
+/* ---------------------------------------------------------------- state --- */
+
+/* Discrete state marks. No pulsing: the dot changes color when an event
+   arrives, which is the information the reader needs. */
+.sa-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--radius-full);
+  background: var(--sa-8);
+  flex: none;
+  transition: background var(--mo-state) var(--mo-ease-flat);
+}
+
+.sa-dot[data-state='starting'],
+.sa-dot[data-state='running'] {
+  background: var(--sa-live);
+}
+.sa-dot[data-state='completed'] {
+  background: var(--sa-ok);
+}
+.sa-dot[data-state='blocked'],
+.sa-dot[data-state='recovery_pending'] {
+  background: var(--sa-warn);
+}
+.sa-dot[data-state='failed'] {
+  background: var(--sa-fail);
+}
+.sa-dot[data-state='stopped'] {
+  background: var(--sa-stop);
+}
+
+.sa-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  color: var(--sa-11);
+}
+
+/* -------------------------------------------------------------- windows --- */
+
+/* Two window types, kept visually distinct on purpose: the Controller is the
+   operator's terminal and the reader's agency lives there; the Host is the
+   controlled desktop and is never presented as directly clickable chrome. */
+.sa-win {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--sa-6);
+  border-radius: var(--radius-xl);
+  background: var(--sa-2);
+  overflow: hidden;
+}
+
+.sa-win[data-kind='controller'] {
+  background: var(--sa-0);
+}
+
+.sa-win[data-focused='true'] {
+  border-color: var(--sa-7);
+}
+
+/* Three columns so the title can sit optically centered while the lights stay
+   pinned left and status stays pinned right, which is how the reference draws
+   its window bars. */
+.sa-win-bar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, auto);
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: 0.375rem var(--space-2xs);
+  background: var(--sa-3);
+  border-block-end: 1px solid var(--sa-6);
+  font-family: var(--font-mono);
+  font-size: var(--step--2);
+  color: var(--sa-10);
+  min-height: 2rem;
+}
+
+/* Traffic lights. Inert by design: they are window furniture, not controls, so
+   they are aria-hidden and never focusable. */
+.sa-win-lights {
+  display: flex;
+  align-items: center;
+  gap: 0.3125rem;
+  padding-inline: 0.1875rem;
+}
+
+.sa-win-lights i {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--radius-full);
+  background: var(--sa-7);
+}
+
+.sa-win[data-focused='true'] .sa-win-lights i:first-child {
+  background: var(--sa-accent);
+}
+
+.sa-win[data-kind='controller'] .sa-win-bar {
+  background: var(--sa-2);
+}
+
+.sa-win-bar-grip {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5em;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  touch-action: none;
+  border-radius: var(--radius-sm);
+}
+
+.sa-win-body {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ------------------------------------------------------------- terminal --- */
+
+.sa-term {
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  line-height: 1.6;
+  color: var(--sa-11);
+  padding: var(--space-xs);
+  overflow: auto;
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+  font-variant-numeric: tabular-nums;
+  scrollbar-width: thin;
+  scrollbar-color: var(--sa-6) transparent;
+}
+
+.sa-term b {
+  color: var(--sa-12);
+  font-weight: 500;
+}
+
+/* A shell prompt is punctuation, not emphasis. */
+.sa-term-prompt {
+  color: var(--sa-9);
+}
+
+.sa-term-dim {
+  color: var(--sa-9);
+}
+
+.sa-term-ok {
+  color: var(--sa-ok);
+}
+.sa-term-warn {
+  color: var(--sa-warn);
+}
+.sa-term-fail {
+  color: var(--sa-fail);
+}
+
+/* -------------------------------------------------------------- motion --- */
+
+/* Read off the reference site rather than invented. Its whole motion vocabulary
+   is four keyframes: a 0.24s enter on each section, a 0.12s fade on each row or
+   line as it lands, a hard 0.8s caret blink, and a 1.4s pulse on a live marker.
+   The two infinite ones are deliberate here: a terminal caret that does not
+   blink reads as a screenshot, which is the single thing these demos must not
+   look like. They animate opacity only, on elements a few pixels wide. */
+
+@keyframes sa-enter {
+  from {
+    opacity: 0;
+    transform: translateY(0.25rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes sa-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Hard on/off, as the reference's is: no easing, no half-lit frames. */
+@keyframes sa-caret-blink {
+  0%,
+  48% {
+    opacity: 1;
+  }
+  49%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* A row or a printed line arriving. */
+.sa-in {
+  animation: sa-fade-in 0.12s var(--mo-ease-flat) both;
+}
+
+/* A block that has just been revealed. */
+.sa-enter {
+  animation: sa-enter 0.24s var(--mo-ease-flat) both;
+}
+
+.sa-caret {
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  vertical-align: text-bottom;
+  background: var(--sa-11);
+}
+
+/* Blinks while the script it belongs to is still running, and stops when the
+   demo settles, so a finished page carries no live animation at all. */
+.sa-caret[data-blink='true'] {
+  animation: sa-caret-blink 0.8s steps(1, end) infinite;
+}
+
+/* ------------------------------------------------------------- captions --- */
+
+/* Read by screen readers before the demo, and visible to everyone: says what
+   is interactive and what is only illustrative. */
+.sa-caption {
+  font-size: var(--step--1);
+  color: var(--sa-9);
+  max-width: 56ch;
+  margin-block-end: var(--space-s);
+}
+
+.sa-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* --------------------------------------------------------- scroll frame --- */
+
+/* Any frame wider than the column scrolls inside itself. The page body never
+   scrolls sideways. */
+.sa-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--sa-6) transparent;
+}
+
+/* ------------------------------------------------------- reduced motion --- */
+
+@media (prefers-reduced-motion: reduce) {
+  .sa *,
+  .sa *::before,
+  .sa *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+
+  .sa .sa-caret[data-blink='true'] {
+    animation: none;
+  }
+}
