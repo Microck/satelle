@@ -64,9 +64,10 @@ pub(crate) use self::setup_ledger::{
     MaintenanceLeaseCapability, MaintenanceLeaseState, MaintenanceRecoverySubject,
 };
 pub use self::setup_ledger::{
-    SetupActionPlan, SetupActionRecord, SetupActionSkipReason, SetupActionStatus,
-    SetupOperationKind, SetupRepairAction, SetupRepairDecision, SetupRepairPlan,
-    SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus,
+    SetupActionCounts, SetupActionPlan, SetupActionRecord, SetupActionSkipReason,
+    SetupActionStatus, SetupHistory, SetupOperationKind, SetupRepairAction, SetupRepairDecision,
+    SetupRepairPlan, SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord,
+    SetupRunStatus, SetupRunSummary,
 };
 
 pub(crate) fn plan_migration_backup_cleanup(

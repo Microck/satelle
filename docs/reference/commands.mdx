@@ -109,6 +109,22 @@ eligible refresh scope and requires explicit units.
 diagnostic, updates the normal Host readiness cache, and reports whether the
 result was refreshed. It does not create a Session or admit a prompt Turn.
 
+## Support bundles
+
+`satelle support bundle --host <alias> --output <path>` writes a private local
+archive. It includes configuration shape, versions, readiness, normalized
+logs, transport diagnostics, and setup-ledger summaries. It does not upload
+the archive.
+
+`setup_ledger.json` contains the 200 most recent Host maintenance operations,
+ordered by start time. Each entry reports operation kind, status, timestamps,
+and counts of planned, started, completed, failed, skipped, and uncertain
+actions. `truncated` reports omitted older operations. Private references,
+action labels, recovery text, and raw subprocess streams are excluded.
+
+If a category cannot be read, the manifest lists it under `not_collected` with
+the failure reason. An available empty history is reported as collected.
+
 ## Host version compatibility
 
 Use `satelle host update --host <alias> --component host --version <version>`

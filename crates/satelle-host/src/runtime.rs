@@ -2950,6 +2950,13 @@ impl RuntimeHandle {
         mutate(&mut storage, operation.capability()).map_err(model::storage_failure)
     }
 
+    pub(crate) fn setup_history(&self) -> Result<crate::SetupHistory, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .setup_history()
+            .map_err(model::storage_failure)
+    }
+
     pub(crate) fn load_setup_run(
         &self,
         run_id: &str,

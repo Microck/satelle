@@ -4,6 +4,7 @@ use crate::runtime::VerifiedSetupPostconditions;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use satelle_core::host_update::HostUpdateRecoveryIdentity;
 use satelle_core::session::DesktopBindingRef;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 
@@ -51,7 +52,8 @@ enum StartedActionOutcome<'a> {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SetupOperationKind {
     Setup,
     Repair,
@@ -86,7 +88,8 @@ impl SetupOperationKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SetupRunStatus {
     Running,
     Completed,
@@ -382,6 +385,109 @@ pub struct SetupRunRecord {
     finished_at: Option<OffsetDateTime>,
     actions: Vec<SetupActionRecord>,
     host_update_recovery_identity: Option<HostUpdateRecoveryIdentity>,
+}
+
+const SETUP_HISTORY_LIMIT: usize = 200;
+
+/// This diagnostic projection contains typed statuses, timestamps, and
+/// aggregate counts. Keep private references and free-form action text in the
+/// maintenance ledger.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupHistory {
+    pub runs: Vec<SetupRunSummary>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupRunSummary {
+    pub operation_kind: SetupOperationKind,
+    pub status: SetupRunStatus,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub finished_at: Option<OffsetDateTime>,
+    pub actions: SetupActionCounts,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupActionCounts {
+    pub planned: u64,
+    pub started: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    pub outcome_unknown: u64,
+}
+
+impl Storage {
+    pub(crate) fn setup_history(&self) -> Result<SetupHistory, StorageError> {
+        // Limit runs before joining actions. UTC timestamps sort chronologically
+        // without their trailing Z, including exact seconds before fractions.
+        // One extra row reports truncation without loading the retained ledger.
+        let mut statement = self
+            .connection
+            .prepare(
+                "WITH recent_runs AS (
+                SELECT run_id, operation_kind, status, started_at, finished_at
+                FROM setup_runs WHERE host_identity_ref = ?1
+                ORDER BY rtrim(started_at, 'Z') DESC, run_id DESC LIMIT ?2
+             )
+             SELECT r.operation_kind, r.status, r.started_at, r.finished_at,
+                    COALESCE(SUM(a.status = 'planned'), 0),
+                    COALESCE(SUM(a.status = 'started'), 0),
+                    COALESCE(SUM(a.status = 'completed'), 0),
+                    COALESCE(SUM(a.status = 'failed'), 0),
+                    COALESCE(SUM(a.status = 'skipped'), 0),
+                    COALESCE(SUM(a.status = 'outcome_unknown'), 0)
+             FROM recent_runs r LEFT JOIN setup_actions a ON a.run_id = r.run_id
+             GROUP BY r.run_id ORDER BY rtrim(r.started_at, 'Z') DESC, r.run_id DESC",
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let identity = self.host_identity()?;
+        let query_limit = i64::try_from(SETUP_HISTORY_LIMIT + 1)
+            .expect("setup history limit fits SQLite integer");
+        let mut rows = statement
+            .query(params![identity.as_str(), query_limit])
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let mut runs = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
+        {
+            let read_error = |source| sqlite_error(StorageErrorKind::InvalidStoredState, source);
+            let count = |column| -> Result<u64, StorageError> {
+                let value = row.get::<_, i64>(column).map_err(read_error)?;
+                Ok(u64::try_from(value).expect("SQLite action counts are non-negative"))
+            };
+            runs.push(SetupRunSummary {
+                operation_kind: SetupOperationKind::parse(
+                    &row.get::<_, String>(0).map_err(read_error)?,
+                )?,
+                status: SetupRunStatus::parse(&row.get::<_, String>(1).map_err(read_error)?)?,
+                started_at: parse_time(&row.get::<_, String>(2).map_err(read_error)?)?,
+                finished_at: row
+                    .get::<_, Option<String>>(3)
+                    .map_err(read_error)?
+                    .as_deref()
+                    .map(parse_time)
+                    .transpose()?,
+                actions: SetupActionCounts {
+                    planned: count(4)?,
+                    started: count(5)?,
+                    completed: count(6)?,
+                    failed: count(7)?,
+                    skipped: count(8)?,
+                    outcome_unknown: count(9)?,
+                },
+            });
+        }
+        let truncated = runs.len() > SETUP_HISTORY_LIMIT;
+        runs.truncate(SETUP_HISTORY_LIMIT);
+        Ok(SetupHistory { runs, truncated })
+    }
 }
 
 impl SetupRunRecord {

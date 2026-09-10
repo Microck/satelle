@@ -40,6 +40,130 @@ fn begin_setup_run(storage: &mut Storage, plan: &SetupRunPlan) -> MaintenanceLea
 }
 
 #[test]
+fn setup_history_projects_action_states_without_private_ledger_fields() {
+    const PRIVATE: &str = "PRIVATE_SETUP_HISTORY_CANARY";
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let plan = SetupRunPlan::new(
+        PRIVATE,
+        SetupOperationKind::Repair,
+        Some(DesktopBindingRef::new(PRIVATE).unwrap()),
+        at(1),
+        vec![
+            SetupActionPlan::new(PRIVATE, PRIVATE, true).unwrap(),
+            SetupActionPlan::new("second-action", PRIVATE, true).unwrap(),
+        ],
+    )
+    .unwrap();
+    let capability = begin_setup_run(&mut storage, &plan);
+    assert_eq!(storage.setup_history().unwrap().runs[0].actions.planned, 2);
+    storage
+        .start_setup_action(&capability, PRIVATE, at(2))
+        .unwrap();
+    let running = storage.setup_history().unwrap();
+    assert_eq!(running.runs[0].status, SetupRunStatus::Running);
+    assert_eq!(running.runs[0].actions.started, 1);
+    assert_eq!(running.runs[0].actions.planned, 1);
+    storage
+        .fail_setup_action(
+            &capability,
+            PRIVATE,
+            PRIVATE,
+            Some(23),
+            Some(PRIVATE),
+            at(3),
+        )
+        .unwrap();
+    storage
+        .skip_setup_action(
+            &capability,
+            "second-action",
+            SetupActionSkipReason::DependencyFailed,
+            at(4),
+        )
+        .unwrap();
+    storage
+        .finish_setup_run_and_release_maintenance(&capability, at(5))
+        .unwrap();
+    // SQLite can hold its database file open on Windows, so filesystem
+    // snapshots cannot prove this query is read-only portably. The connection
+    // write counter verifies the contract without copying a live database.
+    let changes_before = storage.connection.total_changes();
+    let history = storage.setup_history().unwrap();
+    assert_eq!(storage.connection.total_changes(), changes_before);
+    assert!(!history.truncated);
+    assert_eq!(history.runs.len(), 1);
+    assert_eq!(history.runs[0].operation_kind, SetupOperationKind::Repair);
+    assert_eq!(history.runs[0].status, SetupRunStatus::Failed);
+    assert_eq!(history.runs[0].finished_at, Some(at(5)));
+    assert_eq!(history.runs[0].actions.failed, 1);
+    assert_eq!(history.runs[0].actions.skipped, 1);
+    assert_eq!(history.runs[0].actions.completed, 0);
+    let encoded = serde_json::to_vec(&history).unwrap();
+    satelle_test_contract::assert_privacy_canaries_absent("setup history", &encoded, &[PRIVATE]);
+}
+
+#[test]
+fn setup_history_orders_and_bounds_recent_runs_and_marks_truncation() {
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    for index in 0..201 {
+        let started_at = at(1) + time::Duration::nanoseconds(index);
+        let plan = SetupRunPlan::new(
+            format!("history-{index:03}"),
+            SetupOperationKind::Setup,
+            None,
+            started_at,
+            vec![SetupActionPlan::new("one-action", "Private action label", true).unwrap()],
+        )
+        .unwrap();
+        let capability = begin_setup_run(&mut storage, &plan);
+        storage
+            .skip_setup_action(
+                &capability,
+                "one-action",
+                SetupActionSkipReason::NotRequired,
+                started_at + time::Duration::seconds(1),
+            )
+            .unwrap();
+        storage
+            .finish_setup_run_and_release_maintenance(
+                &capability,
+                started_at + time::Duration::seconds(2),
+            )
+            .unwrap();
+        if index == 199 {
+            let history = storage.setup_history().unwrap();
+            assert_eq!(history.runs.len(), 200);
+            assert!(!history.truncated);
+        }
+    }
+    let history = storage.setup_history().unwrap();
+    assert_eq!(history.runs.len(), 200);
+    assert!(history.truncated);
+    assert_eq!(
+        history.runs.first().unwrap().started_at,
+        at(1) + time::Duration::nanoseconds(200)
+    );
+    assert_eq!(
+        history.runs.last().unwrap().started_at,
+        at(1) + time::Duration::nanoseconds(1)
+    );
+    assert!(
+        history
+            .runs
+            .windows(2)
+            .all(|pair| pair[0].started_at > pair[1].started_at)
+    );
+    assert!(
+        history
+            .runs
+            .iter()
+            .all(|run| run.actions.skipped == 1 && run.status == SetupRunStatus::Completed)
+    );
+}
+
+#[test]
 fn setup_action_ledger_migrates_and_persists_ordered_state_transitions() {
     let state = TempDir::new().expect("temporary state directory");
     let (mut storage, _) = Storage::open(state.path()).expect("open storage");

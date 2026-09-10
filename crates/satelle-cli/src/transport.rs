@@ -495,6 +495,7 @@ pub(crate) trait TransportClient: Send {
     fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifacts, SatelleError>;
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError>;
     fn logs(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError>;
+    fn setup_history(&self) -> Result<satelle_host::SetupHistory, SatelleError>;
 }
 
 pub(crate) struct TaskArtifacts {
@@ -1166,6 +1167,10 @@ impl TransportClient for LocalTransport {
             return Err(SatelleError::host_not_found(self.alias.clone()));
         }
         self.service.daemon_log_page(query)
+    }
+
+    fn setup_history(&self) -> Result<satelle_host::SetupHistory, SatelleError> {
+        self.service.setup_history()
     }
 }
 
@@ -7664,6 +7669,10 @@ impl TransportClient for SshSetupTransport {
     fn logs(&self, _query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
         Err(self.unsupported("logs"))
     }
+
+    fn setup_history(&self) -> Result<satelle_host::SetupHistory, SatelleError> {
+        Err(self.unsupported("setup history"))
+    }
 }
 
 impl TransportClient for DirectTransport {
@@ -7968,6 +7977,13 @@ impl TransportClient for DirectTransport {
             .logs(query)
             .map(|response| response.page().clone())
             .map_err(|error| direct_logs_error(&self.alias, error))
+    }
+
+    fn setup_history(&self) -> Result<satelle_host::SetupHistory, SatelleError> {
+        self.client
+            .setup_history()
+            .map(satelle_transport::SetupHistoryResponse::into_history)
+            .map_err(|error| direct_transport_error(&self.alias, error))
     }
 }
 

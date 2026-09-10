@@ -20,6 +20,8 @@ mod provider_auth;
 mod raw_wire;
 #[path = "http/sessions.rs"]
 mod sessions;
+#[path = "http/setup-history.rs"]
+mod setup_history;
 #[path = "http/setup-readiness.rs"]
 mod setup_readiness;
 #[path = "http/storage-migration.rs"]
@@ -61,7 +63,7 @@ use tracing::metadata::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-const EXPECTED_OPERATIONS: [&str; 24] = [
+const EXPECTED_OPERATIONS: [&str; 25] = [
     "live",
     "capabilities",
     "maintenance_update_evidence",
@@ -86,6 +88,7 @@ const EXPECTED_OPERATIONS: [&str; 24] = [
     "storage_migration_complete",
     "storage_migration_source_plan",
     "storage_migration_source_cleanup",
+    "setup_history",
 ];
 
 const BLOCKING_SPAN_ATTRIBUTE_MARKER: &str = "trace-blocking-span-attribute-connected";

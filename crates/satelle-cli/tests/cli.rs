@@ -2560,7 +2560,27 @@ fn support_bundle_help_describes_the_redacted_export() {
 
 #[test]
 fn support_bundle_writes_a_redacted_archive_and_json_report() {
+    const PRIVATE: &str = "PRIVATE_SUPPORT_SETUP_HISTORY";
     let state = state_dir();
+    let service = satelle_host::HostService::local_demo_for_tests_at(state.path()).unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    let plan = satelle_host::SetupRunPlan::new(
+        PRIVATE,
+        satelle_host::SetupOperationKind::Repair,
+        None,
+        now,
+        vec![satelle_host::SetupActionPlan::new(PRIVATE, PRIVATE, true).unwrap()],
+    )
+    .unwrap();
+    let mut operation = service.begin_setup_run(&plan).unwrap();
+    service
+        .start_setup_action(&operation, PRIVATE, now)
+        .unwrap();
+    service
+        .fail_setup_action(&operation, PRIVATE, PRIVATE, Some(23), Some(PRIVATE), now)
+        .unwrap();
+    service.finish_setup_run(&mut operation, now).unwrap();
+    drop(service);
     let bundle_path = state.path().join("support-bundle.tar.gz");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -2578,7 +2598,7 @@ fn support_bundle_writes_a_redacted_archive_and_json_report() {
     let report = parse_json_output(&output.stdout);
     assert_eq!(report["schema_version"], "satelle.support.bundle.v1");
     assert_eq!(report["redaction_policy_version"], "satelle.redaction.v1");
-    assert_eq!(report["status"], "partial");
+    assert_eq!(report["status"], "ok");
     assert!(
         report["included"]
             .as_array()
@@ -2587,14 +2607,36 @@ fn support_bundle_writes_a_redacted_archive_and_json_report() {
             .any(|value| value == "version")
     );
     assert!(
-        report["not_collected"]
+        report["included"]
             .as_array()
-            .expect("not_collected categories")
+            .expect("included categories")
             .iter()
-            .any(|value| value["category"] == "setup_ledger")
+            .any(|value| value == "setup_ledger")
     );
     assert!(bundle_path.exists());
     assert!(report["artifact_byte_size"].as_u64().expect("byte size") > 0);
+    let archive = flate2::read::GzDecoder::new(fs::File::open(&bundle_path).unwrap());
+    let mut archive = tar::Archive::new(archive);
+    let mut history = None;
+    for entry in archive.entries().unwrap() {
+        let entry = entry.unwrap();
+        let is_history = entry.path().unwrap() == std::path::Path::new("setup_ledger.json");
+        let contents: Value = serde_json::from_reader(entry).unwrap();
+        assert_privacy_canaries_absent(
+            "support bundle member",
+            &serde_json::to_vec(&contents).unwrap(),
+            &[PRIVATE],
+        );
+        if is_history {
+            history = Some(contents);
+        }
+    }
+    let history = history.expect("the archive contains setup history");
+    assert_eq!(history["truncated"], false);
+    assert_eq!(history["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(history["runs"][0]["operation_kind"], "repair");
+    assert_eq!(history["runs"][0]["actions"]["failed"], 1);
+    assert_eq!(history["runs"][0]["status"], "failed");
 
     satelle()
         .env("SATELLE_STATE_DIR", state.path())

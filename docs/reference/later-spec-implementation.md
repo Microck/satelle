@@ -20,12 +20,13 @@ those pull requests merge, the integration branch gets a final pull request to
 | Host update scripting | Stable target records through `host update --plain` | Merged in PR #221 |
 | Remote image attachments | Host file resolution with bounded validation and no retention | Merged in PR #222 |
 | Host versions | CLI/Host compatibility and explicit versions | Merged in PR #223 |
-| Host storage | Safe path-set migration | Open in PR #236; native checks in progress |
+| Host storage | Safe path-set migration | Merged in PR #236 |
 | API token lifecycle | Durable issuance, rotation, revocation, and one-time secret replies | Merged in PR #224 |
 | Transport authentication | Mutual TLS | Merged in PR #228 |
 | Native package repair | Launcher repair through the detected installation owner | Merged in PR #225 |
 | Output formats | Lossless final results and fixed-column CSV | Merged in PR #226 |
-| Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit, diagnostic bundles | Pending |
+| Support bundle history | Bounded, redacted Host setup-ledger summaries | Ready for review |
+| Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit | Pending |
 | Capture and observability | Raw protocol/subprocess exports, desktop snapshot, recording, native log sinks, telemetry | Pending |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Pending |

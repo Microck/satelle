@@ -312,6 +312,12 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
+    pub fn setup_history(&self) -> Result<crate::SetupHistoryResponse, DaemonClientError> {
+        let (request, request_id) =
+            self.protected_request(Method::GET, "/v1/diagnostics/setup-history")?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
     pub fn desktop_sessions(&self) -> Result<HostDesktopSessionsResponse, DaemonClientError> {
         let (request, request_id) =
             self.protected_request(Method::GET, "/v1/host/desktop-sessions")?;

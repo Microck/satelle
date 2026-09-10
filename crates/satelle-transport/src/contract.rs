@@ -21,7 +21,7 @@ pub use logs::LogsPageResponse;
 pub(crate) use read::effective_limits;
 pub use read::{
     CapabilitiesResponse, EffectiveLimits, HostDesktopSessionsResponse, HostPathsResponse,
-    HostStatusResponse, LiveResponse, MaintenanceUpdateEvidenceResponse,
+    HostStatusResponse, LiveResponse, MaintenanceUpdateEvidenceResponse, SetupHistoryResponse,
 };
 pub use satelle_core::{
     ProviderAuthObservationSource, ProviderAuthValidationMode, ProviderAuthValidationOutcome,
