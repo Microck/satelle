@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle-cli:\n    type: patch\n---\n\n## Windows native startup and doctor diagnostics\n\nFix Windows native Computer Use startup failing to read `kernel.js` by granting\nthe Codex sandbox read and execute access to each session's private bridge\nfiles. Keep those files until process shutdown is confirmed.\n\nReport doctor timeouts from the current probe execution instead of showing\nstale timeout diagnostics.\n"
-    filename: 2026-09-08-windows-native-startup.md
+  - content: "---\npackages:\n  cargo:satelle-cli:\n    type: patch\n---\n\n## Windows bootstrap maintenance and slow-daemon startup\n\nAdmit the managed-setup action shapes in bootstrap maintenance so full setup\nno longer fails at maintenance begin. Report bootstrap-busy when the Windows\nlock holder exits with the busy code, and wait out the daemon's own readiness\nbudgets before declaring a slow Windows daemon unreachable.\n"
+    filename: 2026-09-11-windows-bootstrap-maintenance.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - 2026-09-08-windows-native-startup.md
+      - 2026-09-11-windows-bootstrap-maintenance.md
     id: cargo:satelle-cli
     updated: true
   - id: cargo:satelle-core
