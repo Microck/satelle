@@ -30,7 +30,7 @@ Global options include `--no-color`, `--profile <name>`, and
 | `satelle mcp install` | Configure a supported AI client to call Satelle MCP | Implemented |
 | `satelle skills list` / `get` / `path` | Discover and materialize the release-matched Agent Skill Bundle | Implemented |
 | `satelle support bundle` | Export a redacted support bundle | Implemented |
-| `satelle self update` | Update the executable and optional remotes | Verified local update and optional stable-release single-Host handoff implemented; prerelease and explicit multi-Host handoffs remain unavailable |
+| `satelle self update` | Update the executable and optional remotes | Verified local update and optional single-Host handoff implemented; explicit multi-Host handoffs remain unavailable |
 | `satelle completions` | Generate shell completions | Implemented |
 
 `setup` application is transport-specific. Local setup is dry-run planning
@@ -43,7 +43,7 @@ Direct and SSH-tunneled transports support ordinary Session operations. Live
 combinations fail with a typed error.
 
 Use `satelle <command> --help` as the exact option reference for the binary you
-are running. Pre-release commands may change before the first stable release.
+are running.
 The [generated CLI and schema reference](/docs/reference/generated-cli) records
 the complete help tree and public schema identifiers for Satelle 0.1.10.
 

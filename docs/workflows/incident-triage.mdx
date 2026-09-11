@@ -1,0 +1,102 @@
+---
+title: Incident triage and disaster recovery
+description: Step-by-step runbook for diagnosing blockers, repairing Host state, and exporting redacted support bundles.
+---
+
+When a task fails or a Host becomes unreachable, follow this systematic triage
+process to identify root causes and restore operation safely.
+
+## Triage workflow overview
+
+```text
+1. Validate Configuration ----> Invalid syntax or unresolvable paths?
+             |
+             v
+2. Run Diagnostic Probes  ----> Transport, Codex runtime, or display blocker?
+             |
+             v
+3. Inspect Host Logs     ----> Check error entries with cursor pagination
+             |
+             v
+4. Apply Targeted Repair  ----> Plan changes with dry-run before applying
+             |
+             v
+5. Export Support Bundle  ----> Package redacted diagnostics for escalation
+```
+
+## Step 1: Validate local configuration
+
+Before diagnosing remote hosts, ensure the local configuration is well-formed:
+
+```sh
+satelle config check --all --json
+satelle config explain --host local-demo --json
+satelle paths --json
+```
+
+If configuration validation reports an error, resolve the missing field or bad path
+first.
+
+## Step 2: Run diagnostic probes
+
+Run comprehensive health checks against the target Host:
+
+```sh
+satelle doctor --host local-demo --scope all --json
+```
+
+To narrow the scope when a specific subsystem is suspected:
+
+```sh
+satelle doctor --host local-demo --scope transport --json
+satelle doctor --host local-demo --scope computer-use --refresh --json
+```
+
+Every detected blocker returns a structured finding, evidence, and recommended
+recovery steps.
+
+## Step 3: Inspect normalized logs
+
+Examine recent errors and warnings from the Host Daemon:
+
+```sh
+satelle logs --host local-demo --level warn --tail 100 --json
+```
+
+Filter by specific subsystem components:
+
+```sh
+satelle logs --host local-demo --source codex_adapter --since 15m --json
+```
+
+## Step 4: Apply targeted repair
+
+When a Host is misconfigured or has fallen out of sync, run a repair plan:
+
+```sh
+satelle repair --host local-demo --dry-run --json
+```
+
+Review the planned actions. If acceptable, execute the repair with explicit consent:
+
+```sh
+satelle repair --host local-demo --yes
+```
+
+## Step 5: Export a redacted support bundle
+
+If an issue cannot be resolved through standard triage, export an archive of
+redacted diagnostics:
+
+```sh
+satelle support bundle --host local-demo --output support-bundle.tar.gz --yes
+```
+
+<Callout title="Security and privacy guarantees" type="info">
+  The support bundle exports diagnostic logs, configuration summaries, and system
+  metadata while strictly redacting:
+  - Provider API keys and secret tokens
+  - Session prompts, user inputs, and chat transcripts
+  - Desktop screenshots and window titles
+  - Local credentials and private keys
+</Callout>

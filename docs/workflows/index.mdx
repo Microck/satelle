@@ -1,0 +1,61 @@
+---
+title: Workflows overview
+description: Practical end-to-end workflows for operating, automating, and troubleshooting Satelle.
+---
+
+import { Terminal, Network, Bot, CheckCircle2, AlertTriangle } from 'lucide-react';
+
+Satelle coordinates durable native Computer Use across operator-controlled Hosts.
+These workflows demonstrate proven operating patterns for interactive tasks,
+remote fleet control, agent integrations, automated CI validation, and incident
+triage.
+
+<Cards>
+  <Card
+    icon={<Terminal />}
+    title="Interactive Steering"
+    href="/docs/workflows/interactive-steering"
+  >
+    Launch tasks, observe live execution streams, steer ongoing sessions, and handle graceful stops.
+  </Card>
+  <Card
+    icon={<Network />}
+    title="Remote Fleet Operations"
+    href="/docs/workflows/remote-fleet"
+  >
+    Manage macOS and Windows Hosts over SSH tunnels or direct HTTPS with pinned identities.
+  </Card>
+  <Card
+    icon={<Bot />}
+    title="AI Agent & MCP Integration"
+    href="/docs/workflows/agent-integration"
+  >
+    Connect AI agents via Model Context Protocol, the embedded Agent Skills bundle, and JSON automation.
+  </Card>
+  <Card
+    icon={<CheckCircle2 />}
+    title="CI/CD Desktop Verification"
+    href="/docs/workflows/ci-cd-verification"
+  >
+    Run automated desktop tests, pre-flight readiness checks, and extract execution artifacts in CI pipelines.
+  </Card>
+  <Card
+    icon={<AlertTriangle />}
+    title="Incident Triage & Recovery"
+    href="/docs/workflows/incident-triage"
+  >
+    Diagnose host blockers, inspect normalized logs with pagination, and export redacted support bundles.
+  </Card>
+</Cards>
+
+## Core principles across all workflows
+
+1. **The Host owns execution:** The Host Daemon manages the session lifecycle,
+   desktop interactions, and provider secrets. A network disconnect does not
+   abort an active session or corrupt state.
+2. **Durable session handles:** Every session produces a stable `session_id`.
+   Use this handle across commands and processes to inspect, steer, or stop work.
+3. **Structured outputs for automation:** Use `--json` for predictable automation,
+   and `--events human` or `--events json` for live streaming observation.
+4. **Zero credential leakage:** Provider secrets remain resolved on the Host.
+   Logs and diagnostic outputs redact sensitive tokens by default.
