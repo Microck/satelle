@@ -36,6 +36,19 @@ const SERVICE_DEFINITION_LIMIT: usize = 64 * 1024;
 const TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT: usize = 1024 * 1024;
 const START_OUTPUT_LIMIT: u64 = 16 * 1024;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+// Slack added to the daemon's own readiness budgets when the controller waits
+// for a Windows bootstrap ready frame. A healthy daemon can legitimately need
+// its full native + provider budgets before it prints ready; giving up earlier
+// orphans that daemon and wedges the bootstrap lock behind an unrecoverable
+// claim.
+const BOOTSTRAP_READY_SLACK: Duration = Duration::from_secs(30);
+
+fn windows_bootstrap_ready_timeout(native: Duration, provider: Duration) -> Duration {
+    native
+        .saturating_add(provider)
+        .saturating_add(BOOTSTRAP_READY_SLACK)
+        .max(PROCESS_TIMEOUT)
+}
 const BOOTSTRAP_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const MUTATION_EXECUTE: &str = "satelle-bootstrap-execute-v1";
 const BOOTSTRAP_LOCK_EXIT_GRACE: Duration = Duration::from_millis(500);
@@ -861,11 +874,13 @@ impl SshBootstrapProcess {
         }
         let start_command =
             bootstrap_lock.fenced_streaming_command(target, "daemon_start", &start_command)?;
+        let (native_timeout, provider_timeout) = readiness_probe_timeouts(host_config);
         Self::spawn(
             destination,
             start_command,
             Some(token),
             launch_mode.expected_port(),
+            windows_bootstrap_ready_timeout(native_timeout, provider_timeout),
         )
     }
 
@@ -914,6 +929,7 @@ impl SshBootstrapProcess {
         start_command: FencedMutationCommand,
         token: Option<&ApiBearerToken>,
         expected_port: Option<u16>,
+        ready_timeout: Duration,
     ) -> Result<Self, SshBootstrapError> {
         let FencedMutationCommand {
             remote_command,
@@ -1005,7 +1021,7 @@ impl SshBootstrapProcess {
             let paths = windows_input_paths
                 .as_ref()
                 .expect("Windows bootstrap starts always have mailbox paths");
-            wait_for_windows_bootstrap_start(destination, paths)
+            wait_for_windows_bootstrap_start(destination, paths, ready_timeout)
                 .map_err(|error| terminate_child(&mut child, error))?
         } else {
             let ready = ready_receiver
@@ -6786,6 +6802,7 @@ fn run_sftp_batch(
 fn wait_for_windows_bootstrap_start(
     destination: &str,
     paths: &WindowsFencedInputPaths,
+    ready_timeout: Duration,
 ) -> Result<HostStartReady, SshBootstrapError> {
     let directory = tempfile::tempdir().map_err(SshBootstrapError::LocalFile)?;
     let local_ready_path = directory.path().join("start-ready.json");
@@ -6793,7 +6810,7 @@ fn wait_for_windows_bootstrap_start(
     let remote_ready =
         windows_path_to_sftp(&paths.ready).and_then(|path| sftp_batch_quote(&path))?;
     let receive = format!("get {remote_ready} {local_ready}\nrm {remote_ready}\n");
-    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    let deadline = Instant::now() + ready_timeout;
     loop {
         let (received, classification) = run_sftp_batch(destination, &receive)?;
         if received {
@@ -9275,6 +9292,18 @@ mod tests {
         assert_occurs_before(&windows, "Win32_Process", "Remove-Item -LiteralPath");
         assert_occurs_before(&windows, "Win32_Service", "Remove-Item -LiteralPath");
         assert!(windows.matches("Test-SafeEntry").count() >= 3);
+    }
+
+    #[test]
+    fn windows_bootstrap_ready_timeout_covers_daemon_readiness_budgets() {
+        assert_eq!(
+            windows_bootstrap_ready_timeout(Duration::from_secs(180), Duration::from_secs(300)),
+            Duration::from_secs(510)
+        );
+        assert_eq!(
+            windows_bootstrap_ready_timeout(Duration::ZERO, Duration::ZERO),
+            PROCESS_TIMEOUT
+        );
     }
 
     #[test]
