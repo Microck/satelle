@@ -17,25 +17,32 @@ artifacts. The installer checks `gh` and `jq` before selecting or downloading a
 release; curl or wget alone is not sufficient.
 
 The Unix installer accepts an explicit version and installs into a user-owned
-directory without changing shell profiles:
+directory without changing shell profiles. For a verified installation, fetch
+the installer script at the signed release tag you peeled below, review it,
+then execute it. Never pipe the unversioned installer endpoint into a shell
+when verification matters:
 
 ```sh
-curl -fsSL https://satelle.micr.dev/install | \
-  sh -s -- --version X.Y.Z
+curl -fsSL -o install.sh \
+  https://raw.githubusercontent.com/Microck/satelle/refs/tags/vX.Y.Z/scripts/install.sh
+sh install.sh --version X.Y.Z
 ```
 
 `wget` is also supported:
 
 ```sh
-wget -qO- https://satelle.micr.dev/install | \
-  sh -s -- --version X.Y.Z
+wget -O install.sh \
+  https://raw.githubusercontent.com/Microck/satelle/refs/tags/vX.Y.Z/scripts/install.sh
+sh install.sh --version X.Y.Z
 ```
 
-The Windows installer is invoked with `Invoke-RestMethod` and accepts the same
-explicit version selection:
+The Windows installer requires PowerShell 7.4 or newer and accepts the same
+explicit version selection. Download it from the signed release tag, review
+it, and run it in `pwsh` before running:
 
 ```powershell
-& ([scriptblock]::Create((Invoke-RestMethod https://satelle.micr.dev/install.ps1))) -Version X.Y.Z
+Invoke-WebRequest -OutFile install.ps1 https://raw.githubusercontent.com/Microck/satelle/refs/tags/vX.Y.Z/scripts/install.ps1
+pwsh -NoProfile -File ./install.ps1 -Version X.Y.Z
 ```
 
 Both installers default to a user-writable `.local/bin` directory, leave PATH

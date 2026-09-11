@@ -66,7 +66,9 @@ for artifact archiving:
 satelle logs --host local-demo --session <session_id> --level warn --tail 200 --json
 ```
 
-<Callout title="Safe log retention" type="info">
-  Satelle normalizes log output and redacts provider secrets automatically, making
-  it safe to store pipeline logs in standard CI artifact storage.
+<Callout title="Redact before archiving" type="warn">
+  Satelle redacts provider secrets from normalized logs, but metadata such as
+  Host aliases, paths, tailnet names, and Session identifiers remains. Redact
+  metadata and restrict artifact access before uploading pipeline logs to CI
+  artifact storage.
 </Callout>
