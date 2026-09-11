@@ -8,12 +8,21 @@ if (!existsSync(canonicalUrl)) {
   console.warn('check-installer: skipping parity check outside a full checkout');
   process.exit(0);
 }
-const canonical = readFileSync(canonicalUrl);
-const published = readFileSync(new URL('../public/install', import.meta.url));
+const pairs = [
+  ['../../scripts/install.sh', '../public/install'],
+  ['../../scripts/install.ps1', '../public/install.ps1'],
+];
+for (const [canonicalPath, publishedPath] of pairs) {
+  const canonical = readFileSync(new URL(canonicalPath, import.meta.url));
+  const published = readFileSync(new URL(publishedPath, import.meta.url));
 
-if (!canonical.equals(published)) {
-  throw new Error(
-    'Installer copies differ. Update scripts/install.sh, then copy it to ' +
-    'website/public/install before building the website.',
-  );
+  if (!canonical.equals(published)) {
+    throw new Error(
+      'Installer copies differ. Update ' +
+        canonicalPath.replace('../../', '') +
+        ', then copy it to website/public/' +
+        publishedPath.replace('../public/', '') +
+        ' before building the website.',
+    );
+  }
 }

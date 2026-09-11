@@ -42,7 +42,7 @@ satelle logs --host <alias> --source codex_adapter --since 10m --json
 Normal logs are designed for operational diagnosis and exclude raw provider
 secrets. Export a redacted diagnostic bundle with `satelle support bundle` when
 normal logs are insufficient. Do not archive the whole state directory as a
-substitute. Automatic repair and doctor fix flows are also unavailable.
+substitute.
 
 Before sharing logs, redact Host aliases, usernames, addresses, tailnet names,
 Session identifiers, local paths, prompts, transcripts, and desktop content.

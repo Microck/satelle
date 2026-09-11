@@ -11,12 +11,14 @@
     "test:demos": "node --test scripts/demo-explorations.test.mjs scripts/device-network.test.mjs scripts/review-regressions.test.mjs"
   },
   "dependencies": {
+    "@tailwindcss/postcss": "^4.3.3",
     "fumadocs-core": "16.11.5",
     "fumadocs-mdx": "15.2.0",
     "fumadocs-ui": "16.11.5",
     "next": "16.2.10",
     "react": "19.2.7",
-    "react-dom": "19.2.7"
+    "react-dom": "19.2.7",
+    "tailwindcss": "^4.3.3"
   },
   "devDependencies": {
     "@types/mdx": "2.0.13",

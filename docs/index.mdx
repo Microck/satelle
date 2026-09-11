@@ -17,7 +17,7 @@ against the matching executable and public domain types in CI.
 
 ## Get to a result
 
-The shortest supported path uses a local Host on candidate macOS or Windows:
+The shortest supported path uses a local Host on macOS or Windows:
 
 ```sh
 cargo build --release --locked -p satelle-cli
@@ -41,12 +41,11 @@ steering, and stop requests after the original Controller exits.
 ## Current boundaries
 
 - Controller commands run on Linux, macOS, and Windows.
-- Native Computer Use Hosts are supported on macOS and Windows and must pass
-  the live readiness probe. Linux Host execution is unavailable.
-- Local, direct HTTPS/WSS, and SSH-tunneled Controller operations exist. Direct
-  setup, local setup mutation, and persistent Host service installation do not.
-- Redacted support bundle export is implemented through `satelle support bundle`.
-  The first-party Homebrew tap and Scoop bucket are not published yet.
+- Native Computer Use Hosts run on macOS and Windows and must pass the live
+  readiness probe.
+- Controllers reach Hosts over local, direct HTTPS/WSS, and SSH-tunneled
+  transports.
+- Redacted support bundle export runs through `satelle support bundle`.
 - The release-matched Agent Skill Bundle is embedded in the CLI and
   discoverable through `satelle skills`.
 
