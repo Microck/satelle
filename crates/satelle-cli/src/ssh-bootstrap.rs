@@ -36,6 +36,19 @@ const SERVICE_DEFINITION_LIMIT: usize = 64 * 1024;
 const TAILSCALE_SERVE_STATUS_OUTPUT_LIMIT: usize = 1024 * 1024;
 const START_OUTPUT_LIMIT: u64 = 16 * 1024;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+// Slack added to the daemon's own readiness budgets when the controller waits
+// for a Windows bootstrap ready frame. A healthy daemon can legitimately need
+// its full native + provider budgets before it prints ready; giving up earlier
+// orphans that daemon and wedges the bootstrap lock behind an unrecoverable
+// claim.
+const BOOTSTRAP_READY_SLACK: Duration = Duration::from_secs(30);
+
+fn windows_bootstrap_ready_timeout(native: Duration, provider: Duration) -> Duration {
+    native
+        .saturating_add(provider)
+        .saturating_add(BOOTSTRAP_READY_SLACK)
+        .max(PROCESS_TIMEOUT)
+}
 const BOOTSTRAP_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const MUTATION_EXECUTE: &str = "satelle-bootstrap-execute-v1";
 const BOOTSTRAP_LOCK_EXIT_GRACE: Duration = Duration::from_millis(500);
@@ -381,7 +394,12 @@ impl SshBootstrapLock {
         // The lock process must stay alive, so use its owner-only ready marker
         // through the same bounded filesystem protocol as later exchanges.
         let ready = if target.is_windows() {
-            wait_for_windows_bootstrap_ready(ssh_program, destination, request.operation_id())
+            wait_for_windows_bootstrap_ready(
+                ssh_program,
+                destination,
+                request.operation_id(),
+                &mut child,
+            )
         } else {
             match ready_receiver.recv_timeout(PROCESS_TIMEOUT) {
                 Ok(ready) => ready,
@@ -856,11 +874,13 @@ impl SshBootstrapProcess {
         }
         let start_command =
             bootstrap_lock.fenced_streaming_command(target, "daemon_start", &start_command)?;
+        let (native_timeout, provider_timeout) = readiness_probe_timeouts(host_config);
         Self::spawn(
             destination,
             start_command,
             Some(token),
             launch_mode.expected_port(),
+            windows_bootstrap_ready_timeout(native_timeout, provider_timeout),
         )
     }
 
@@ -909,6 +929,7 @@ impl SshBootstrapProcess {
         start_command: FencedMutationCommand,
         token: Option<&ApiBearerToken>,
         expected_port: Option<u16>,
+        ready_timeout: Duration,
     ) -> Result<Self, SshBootstrapError> {
         let FencedMutationCommand {
             remote_command,
@@ -1000,7 +1021,7 @@ impl SshBootstrapProcess {
             let paths = windows_input_paths
                 .as_ref()
                 .expect("Windows bootstrap starts always have mailbox paths");
-            wait_for_windows_bootstrap_start(destination, paths)
+            wait_for_windows_bootstrap_start(destination, paths, ready_timeout)
                 .map_err(|error| terminate_child(&mut child, error))?
         } else {
             let ready = ready_receiver
@@ -5666,6 +5687,7 @@ fn wait_for_windows_bootstrap_ready(
     ssh_program: &OsStr,
     destination: &str,
     operation_id: &str,
+    bootstrap_child: &mut Child,
 ) -> Result<BootstrapLockReady, SshBootstrapError> {
     let output = run_ssh_command_with_program(
         ssh_program,
@@ -5675,6 +5697,14 @@ fn wait_for_windows_bootstrap_ready(
     if !output.status.success() {
         return Err(if output.stderr.host_key_verification_failed() {
             SshBootstrapError::HostKeyVerificationRequired
+        // Windows OpenSSH buffers the lock process's BUSY line. Its exit status
+        // is authoritative when the filesystem readiness probe times out.
+        } else if bootstrap_child
+            .try_wait()
+            .map_err(SshBootstrapError::InspectSsh)?
+            .is_some_and(|status| status.code() == Some(bootstrap_lock::BUSY_EXIT_CODE))
+        {
+            SshBootstrapError::BootstrapBusy
         } else {
             SshBootstrapError::BootstrapLockTimedOut
         });
@@ -6772,6 +6802,7 @@ fn run_sftp_batch(
 fn wait_for_windows_bootstrap_start(
     destination: &str,
     paths: &WindowsFencedInputPaths,
+    ready_timeout: Duration,
 ) -> Result<HostStartReady, SshBootstrapError> {
     let directory = tempfile::tempdir().map_err(SshBootstrapError::LocalFile)?;
     let local_ready_path = directory.path().join("start-ready.json");
@@ -6779,7 +6810,7 @@ fn wait_for_windows_bootstrap_start(
     let remote_ready =
         windows_path_to_sftp(&paths.ready).and_then(|path| sftp_batch_quote(&path))?;
     let receive = format!("get {remote_ready} {local_ready}\nrm {remote_ready}\n");
-    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    let deadline = Instant::now() + ready_timeout;
     loop {
         let (received, classification) = run_sftp_batch(destination, &receive)?;
         if received {
@@ -9264,6 +9295,18 @@ mod tests {
     }
 
     #[test]
+    fn windows_bootstrap_ready_timeout_covers_daemon_readiness_budgets() {
+        assert_eq!(
+            windows_bootstrap_ready_timeout(Duration::from_secs(180), Duration::from_secs(300)),
+            Duration::from_secs(510)
+        );
+        assert_eq!(
+            windows_bootstrap_ready_timeout(Duration::ZERO, Duration::ZERO),
+            PROCESS_TIMEOUT
+        );
+    }
+
+    #[test]
     fn bootstrap_lock_ready_error_preserves_host_key_classification() {
         let host_key_error = classify_bootstrap_lock_ready_error(
             SshBootstrapError::InvalidBootstrapLockResponse,
@@ -9282,6 +9325,43 @@ mod tests {
             ordinary_error,
             SshBootstrapError::InvalidBootstrapLockResponse
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_ready_probe_preserves_an_exited_busy_lock_process() {
+        let directory = tempfile::tempdir().expect("temporary SSH program directory");
+        let fake_ssh = directory.path().join("ssh");
+        fs::write(
+            &fake_ssh,
+            format!("#!/bin/sh\nexit {}\n", bootstrap_lock::BUSY_EXIT_CODE),
+        )
+        .expect("write fake SSH");
+        let mut permissions = fs::metadata(&fake_ssh)
+            .expect("read fake SSH metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&fake_ssh, permissions).expect("make fake SSH executable");
+
+        let mut bootstrap_child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {}", bootstrap_lock::BUSY_EXIT_CODE))
+            .spawn()
+            .expect("spawn exited busy bootstrap process");
+        bootstrap_child
+            .wait()
+            .expect("wait for exited busy bootstrap process");
+
+        let error = match wait_for_windows_bootstrap_ready(
+            fake_ssh.as_os_str(),
+            "fake-ssh-host",
+            "busy-operation",
+            &mut bootstrap_child,
+        ) {
+            Ok(_) => panic!("busy bootstrap process must not report readiness"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SshBootstrapError::BootstrapBusy));
     }
 
     #[test]

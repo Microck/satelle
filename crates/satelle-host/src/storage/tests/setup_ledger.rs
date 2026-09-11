@@ -1901,3 +1901,67 @@ fn repair_adopts_and_replays_the_exact_interrupted_host_update_run() {
     );
     assert!(storage.maintenance_lease_state().unwrap().is_none());
 }
+
+#[test]
+fn bootstrap_maintenance_accepts_managed_setup_action_shapes() {
+    fn managed_plan(run_id: &str, actions: &[&str]) -> SetupRunPlan {
+        SetupRunPlan::new(
+            run_id,
+            SetupOperationKind::Setup,
+            None,
+            at(1),
+            actions
+                .iter()
+                .map(|action| SetupActionPlan::new(*action, "Managed setup action", true).unwrap())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    // Every action list the maintenance plans produce must pass the bootstrap
+    // admission gate, or full setup fails at maintenance begin. A managed
+    // on-demand setup was rejected here, surfacing as invalid-request.
+    for (run_id, actions) in [
+        ("pure-on-demand", vec!["bootstrap-handoff"]),
+        (
+            "managed-on-demand",
+            vec!["bootstrap-handoff", "managed-codex", "native-computer-use"],
+        ),
+        (
+            "managed-persistent",
+            vec![
+                "bootstrap-handoff",
+                "managed-codex",
+                "native-computer-use",
+                "path-set-directories",
+                "service-config",
+                "service-registration",
+                "service-start-or-restart",
+            ],
+        ),
+    ] {
+        let state = TempDir::new().expect("temporary state directory");
+        let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+        let plan = managed_plan(run_id, &actions);
+        let _capability = storage
+            .begin_bootstrap_maintenance(&plan, maintenance_owner(plan.run_id(), plan.started_at()))
+            .expect("managed setup shapes are valid maintenance plans");
+        let stored = storage
+            .load_setup_run(run_id)
+            .expect("load setup run")
+            .expect("setup run exists");
+        assert_eq!(SetupRunStatus::Running, stored.status());
+        assert_eq!(actions.len(), stored.actions().len());
+    }
+
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let unknown = managed_plan("unknown-shape", &["bootstrap-handoff", "unknown-action"]);
+    let rejected = storage
+        .begin_bootstrap_maintenance(
+            &unknown,
+            maintenance_owner(unknown.run_id(), unknown.started_at()),
+        )
+        .expect_err("unknown action shapes stay rejected");
+    assert_eq!(StorageErrorKind::InvalidInput, rejected.kind());
+}

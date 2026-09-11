@@ -3,7 +3,7 @@ title: Install Satelle
 description: Choose a Satelle installation method and keep its owner responsible for updates.
 ---
 
-Satelle 0.1.10 is available from npm, verified GitHub release artifacts, or
+Satelle 0.1.11 is available from npm, verified GitHub release artifacts, or
 from source. Choose one installation owner and use that same owner for
 upgrades and uninstall.
 
@@ -86,10 +86,10 @@ Install the latest verified release on Unix:
 curl -fsSL https://satelle.micr.dev/install | sh
 ```
 
-Install it on Windows PowerShell:
+Install it on Windows with PowerShell 7.4 or newer:
 
 ```powershell
-& ([scriptblock]::Create((Invoke-RestMethod https://satelle.micr.dev/install.ps1)))
+pwsh -NoProfile -Command "& ([scriptblock]::Create((Invoke-RestMethod https://satelle.micr.dev/install.ps1)))"
 ```
 
 Direct archives are available from the [latest GitHub release](https://github.com/Microck/satelle/releases/latest).

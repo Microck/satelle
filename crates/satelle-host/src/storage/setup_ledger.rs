@@ -629,9 +629,25 @@ impl Storage {
             .map(|action| action.action_id.as_str())
             .collect::<Vec<_>>();
         let on_demand_handoff = action_ids == ["bootstrap-handoff"];
+        // Managed setup extends the handoff with the Codex runtime and native
+        // Computer Use actions the controller applies through the same
+        // maintenance lease. Rejecting these shapes makes every full setup
+        // fail at maintenance begin with an unrecoverable input error.
+        let on_demand_handoff_with_managed_setup =
+            action_ids == ["bootstrap-handoff", "managed-codex", "native-computer-use"];
         let persistent_host_service = action_ids
             == [
                 "bootstrap-handoff",
+                "path-set-directories",
+                "service-config",
+                "service-registration",
+                "service-start-or-restart",
+            ];
+        let persistent_host_service_with_managed_setup = action_ids
+            == [
+                "bootstrap-handoff",
+                "managed-codex",
+                "native-computer-use",
                 "path-set-directories",
                 "service-config",
                 "service-registration",
@@ -649,7 +665,9 @@ impl Storage {
             ];
         if plan.run_id != owner.operation_id
             || (!on_demand_handoff
+                && !on_demand_handoff_with_managed_setup
                 && !persistent_host_service
+                && !persistent_host_service_with_managed_setup
                 && !persistent_host_stop
                 && !persistent_host_restart
                 && !host_update)

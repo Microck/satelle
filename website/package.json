@@ -1,6 +1,6 @@
 {
   "name": "satelle-docs",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "private": true,
   "scripts": {
     "prebuild": "npm run check:installer && npm run test:demos",
