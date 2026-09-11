@@ -1,49 +1,45 @@
 ---
 title: Command reference
-description: Current Satelle CLI command surface and implementation status.
+description: Satelle CLI command surface.
 ---
 
 Global options include `--no-color`, `--profile <name>`, and
 `--error-format human|json`. Most state-reading commands also accept `--json`.
 
-| Command | Purpose | Status |
-| --- | --- | --- |
-| `satelle setup` | Plan Host onboarding and apply SSH token handoff | Local planning and SSH token handoff implemented |
-| `satelle repair` | Repair a Host from live readiness evidence and retained action-ledger state | Implemented |
-| `satelle doctor` | Run diagnostic probes | Implemented |
-| `satelle config check` | Validate one or all local contexts | Implemented |
-| `satelle config explain` | Explain effective values and sources | Implemented |
-| `satelle paths` | Print resolved config, state, cache, and log paths | Implemented |
-| `satelle host start` | Run Host Daemon mode | Implemented |
-| `satelle host trust --host <alias>` | Authenticate a direct Host and pin its stable identity | Implemented |
-| `satelle host status` | Read Host status | Implemented |
-| `satelle host sessions` | List eligible native desktop sessions | Implemented |
-| `satelle host stop` / `restart` | Control Host service lifecycle | Not implemented |
-| `satelle host update` | Update remote components | Current Host and single selected remote Host updates implemented; explicit multi-Host selectors remain unavailable |
-| `satelle host storage migrate` | Run an explicit storage migration | Not implemented |
-| `satelle run` | Create a Session and first Turn | Implemented |
-| `satelle steer` | Add a follow-up Turn to a Session | Implemented |
-| `satelle status` | Read authoritative Session state | Implemented |
-| `satelle stop` | Stop the active Turn | Implemented |
-| `satelle logs` | Read normalized retained Host logs | Implemented |
-| `satelle mcp serve` | Serve the MCP interface over stdio | Implemented |
-| `satelle mcp install` | Configure a supported AI client to call Satelle MCP | Implemented |
-| `satelle skills list` / `get` / `path` | Discover and materialize the release-matched Agent Skill Bundle | Implemented |
-| `satelle support bundle` | Export a redacted support bundle | Implemented |
-| `satelle self update` | Update the executable and optional remotes | Verified local update and optional stable-release single-Host handoff implemented; prerelease and explicit multi-Host handoffs remain unavailable |
-| `satelle completions` | Generate shell completions | Implemented |
+| Command | Purpose |
+| --- | --- |
+| `satelle setup` | Plan Host onboarding and apply the SSH token handoff |
+| `satelle repair` | Repair a Host from live readiness evidence and retained action-ledger state |
+| `satelle doctor` | Run diagnostic probes |
+| `satelle config check` | Validate one or all local contexts |
+| `satelle config explain` | Explain effective values and sources |
+| `satelle paths` | Print resolved config, state, cache, and log paths |
+| `satelle host start` | Run Host Daemon mode |
+| `satelle host trust --host <alias>` | Authenticate a direct Host and pin its stable identity |
+| `satelle host status` | Read Host status |
+| `satelle host sessions` | List eligible native desktop sessions |
+| `satelle host update` | Update the current Host or one selected remote Host |
+| `satelle run` | Create a Session and first Turn |
+| `satelle steer` | Add a follow-up Turn to a Session |
+| `satelle status` | Read authoritative Session state |
+| `satelle stop` | Stop the active Turn |
+| `satelle logs` | Read normalized retained Host logs |
+| `satelle mcp serve` | Serve the MCP interface over stdio |
+| `satelle mcp install` | Configure a supported AI client to call Satelle MCP |
+| `satelle skills list` / `get` / `path` | Discover and materialize the release-matched Agent Skill Bundle |
+| `satelle support bundle` | Export a redacted support bundle |
+| `satelle self update` | Update the local executable with an optional single-Host handoff |
+| `satelle completions` | Generate shell completions |
 
-`setup` application is transport-specific. Local setup is dry-run planning
-only. SSH setup can apply the on-demand transport token handoff only. Direct
-setup, persistent Host service installation, and SSH setup for broader
-components are unavailable.
+`setup` application is transport-specific. Local setup is dry-run planning.
+SSH setup applies the on-demand transport token handoff.
 
 Direct and SSH-tunneled transports support ordinary Session operations. Live
-`doctor` probes are currently local-only; unsupported transport/scope
-combinations fail with a typed error.
+`doctor` probes run locally; unsupported transport/scope combinations fail
+with a typed error.
 
 Use `satelle <command> --help` as the exact option reference for the binary you
-are running. Pre-release commands may change before the first stable release.
+are running.
 The [generated CLI and schema reference](/docs/reference/generated-cli) records
 the complete help tree and public schema identifiers for Satelle 0.1.11.
 
@@ -69,10 +65,3 @@ eligible refresh scope and requires explicit units.
 `doctor --scope provider --refresh` runs the provider smoke probe as a
 diagnostic, updates the normal Host readiness cache, and reports whether the
 result was refreshed. It does not create a Session or admit a prompt Turn.
-
-## Unavailable command families
-
-Commands can appear in `--help` before their implementation is complete.
-Host stop/restart and storage migration currently return typed
-not-implemented errors. The embedded Agent Skill Bundle is
-version-matched to this source tree and available through `satelle skills`.

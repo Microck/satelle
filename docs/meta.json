@@ -1,4 +1,14 @@
 {
   "title": "Satelle",
-  "pages": ["index", "tutorial", "how-to", "reference", "explanation"]
+  "pages": [
+    "index",
+    "---Getting Started---",
+    "tutorial",
+    "how-to",
+    "---Guides & Workflows---",
+    "workflows",
+    "---Technical Reference---",
+    "reference",
+    "explanation"
+  ]
 }

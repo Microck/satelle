@@ -53,8 +53,8 @@ verification fails, setup revokes the pending credential and removes the new
 token file after the Host confirms it inactive. Unactivated pending credentials
 also expire automatically.
 
-Later `run` and `steer` commands start an unavailable on-demand daemon without
-another bootstrap token and authenticate with the durable token file.
+Later `run` and `steer` commands start the on-demand daemon if none is running,
+without another bootstrap token, and authenticate with the durable token file.
 
 ## Start the Host Daemon
 
@@ -77,10 +77,8 @@ satelle host start --bind 0.0.0.0:3001 \
 
 ## Configure direct HTTPS
 
-Direct HTTPS/WSS connections are supported with an operator-provisioned,
-file-backed token. Automatic direct-token provisioning is not implemented in
-this MVP: the SSH setup flow above cannot mint or provision credentials for a
-direct binding.
+Direct HTTPS/WSS connections use an operator-provisioned, file-backed token.
+Provision the token with your own tooling, then point the configuration at it.
 
 Create an owner-controlled user configuration with an HTTPS address, expected
 Host identity, token file descriptor, and CA bundle:
@@ -138,6 +136,5 @@ satelle run --host studio-mac --detach --json "Open the browser"
 For SSH Hosts, the same verification commands use the authenticated tunnel and
 the durable token created by setup.
 
-Direct setup is not implemented. Provision the direct token, TLS certificate,
-private key, and CA bundle through operator-controlled tooling before using
-`host trust`.
+Provision the direct token, TLS certificate, private key, and CA bundle
+through operator-controlled tooling before using `host trust`.

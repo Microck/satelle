@@ -133,8 +133,6 @@ test("installation docs freeze package identities, ownership, and cache contract
   const nonNpmMethods = [
     "Unix shell installer using `curl` or `wget`.",
     "Windows PowerShell installer using `Invoke-RestMethod`.",
-    "First-party Homebrew tap.",
-    "First-party Scoop bucket.",
     "Direct GitHub release archive download.",
   ];
   for (const [index, method] of nonNpmMethods.entries()) {
@@ -146,24 +144,13 @@ test("installation docs freeze package identities, ownership, and cache contract
 
   assert.match(
     normalizedInstallationGuide,
-    /npm, Homebrew, and Scoop own the upgrade and uninstall flow/,
+    /npm owns the upgrade and uninstall flow for installations it creates\./,
   );
   assert.match(
     normalizedInstallationGuide,
-    /The first-party Homebrew tap remains the canonical Homebrew path until Satelle is accepted into Homebrew core and core updates prove reliable\./,
+    /Direct archives and both installers follow the \[release archive verification contract\]\(.*?\)\./,
   );
-  assert.match(
-    normalizedInstallationGuide,
-    /The first-party Scoop bucket remains the canonical Scoop path until a Scoop Main manifest is accepted and its updates prove they do not lag normal Satelle releases\./,
-  );
-  assert.match(
-    normalizedInstallationGuide,
-    /GitHub release archives and the verified Unix and Windows installer scripts are published/,
-  );
-  assert.match(
-    normalizedInstallationGuide,
-    /The first-party Homebrew tap and Scoop bucket are not published yet/,
-  );
+  assert.doesNotMatch(installationGuide, /Homebrew tap|Scoop bucket/);
   assert.doesNotMatch(installationGuide, /\b(?:brew|scoop) install\b/);
   assert.match(
     normalizedInstallationGuide,
@@ -177,36 +164,23 @@ test("installation docs freeze package identities, ownership, and cache contract
     normalizedInstallationGuide,
     /Cold offline npm-registry installation and one-shot execution are not guaranteed\./,
   );
-  for (const excludedEcosystem of [
-    ".deb",
-    ".rpm",
-    "AUR",
-    "WinGet",
-    "Chocolatey",
-    "Nixpkgs",
-    "MacPorts",
-    "Homebrew core",
-    "Scoop Main",
-  ]) {
-    assert.ok(installationGuide.includes(excludedEcosystem), excludedEcosystem);
-  }
-
   for (const publicEntryPoint of [readme, documentationIndex]) {
     assert.ok(publicEntryPoint.includes("install-satelle"));
   }
 
-  const immutableInstallerRevision = "2a9bde9ec2fdc9c6289438d07a645b159866d00c";
-  for (const installerGuide of [installationGuide, releaseVerification]) {
-    assert.doesNotMatch(installerGuide, /Microck\/satelle\/main\/scripts\/install\.(?:sh|ps1)/);
-    assert.match(
-      installerGuide,
-      new RegExp(`Microck/satelle/${immutableInstallerRevision}/scripts/install\\.sh`),
-    );
-    assert.match(
-      installerGuide,
-      new RegExp(`Microck/satelle/${immutableInstallerRevision}/scripts/install\\.ps1`),
-    );
-  }
+  assert.doesNotMatch(installationGuide, /Microck\/satelle\/main\/scripts\/install\.(?:sh|ps1)/);
+  assert.match(installationGuide, /https:\/\/satelle\.micr\.dev\/install \| sh/);
+  assert.match(installationGuide, /https:\/\/satelle\.micr\.dev\/install\.ps1/);
+  assert.doesNotMatch(releaseVerification, /Microck\/satelle\/main\/scripts\/install\.(?:sh|ps1)/);
+  assert.doesNotMatch(releaseVerification, /satelle\.micr\.dev\/install \|/);
+  assert.match(
+    releaseVerification,
+    /Microck\/satelle\/refs\/tags\/vX\.Y\.Z\/scripts\/install\.sh/,
+  );
+  assert.match(
+    releaseVerification,
+    /Microck\/satelle\/refs\/tags\/vX\.Y\.Z\/scripts\/install\.ps1/,
+  );
   assert.match(securityPolicy, /Security fixes target the latest\s+published release/);
   assert.doesNotMatch(securityPolicy, /has not published a public release/);
   assert.doesNotMatch(readme, /\.\/target\/release\/satelle/);

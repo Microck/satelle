@@ -35,10 +35,9 @@ satelle setup --host local-demo --dry-run
 ```
 
 The dry run reports planned actions, required human input, readiness, and
-recovery commands. Local setup mutation is not implemented in this release, so
-do not rerun this local command with `--yes`. Complete any reported Host,
-runtime, desktop, or provider prerequisites through operator-controlled tools.
-Satelle does not silently answer operating-system permission prompts.
+recovery commands. Keep this local command a dry run: complete any reported
+Host, runtime, desktop, or provider prerequisites through operator-controlled
+tools. Satelle does not silently answer operating-system permission prompts.
 
 ## 3. Prove native readiness
 
@@ -82,10 +81,11 @@ You have completed the tutorial when the first Turn reached a terminal state,
 the fresh Controller read the same Session, and the final status confirms that
 the detached follow-up Turn stopped.
 
-## Current limitations
+## Supported scope
 
-- Native Host readiness is supported only on candidate macOS and Windows
-  Hosts that pass the live probe. Linux native Computer Use is unavailable.
-- SSH on-demand transport setup and tunneled operation are implemented, but
-  persistent remote service installation is not.
-- Local setup mutation and direct setup are not implemented.
+- Native Host readiness covers macOS and Windows Hosts that pass the live
+  probe.
+- SSH on-demand setup and tunneled operation run through the transport token
+  handoff.
+- The Host Daemon runs from the installed executable; start it before
+  connecting from a remote Controller.

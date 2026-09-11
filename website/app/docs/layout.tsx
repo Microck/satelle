@@ -1,8 +1,7 @@
 import { DocsLayout } from 'fumadocs-ui/layouts/docs';
 import { RootProvider } from 'fumadocs-ui/provider/next';
 import { source } from '@/lib/source';
-import 'fumadocs-ui/css/black.css';
-import 'fumadocs-ui/css/preset.css';
+import './docs.css';
 
 // The Fumadocs preset and provider live here rather than in the root layout so
 // the landing page at / is not styled by the docs theme.
