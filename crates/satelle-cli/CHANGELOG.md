@@ -1,3 +1,15 @@
+## satelle-cli@0.1.11
+
+### Windows bootstrap maintenance and slow-daemon startup
+
+Admit the managed-setup action shapes (`bootstrap-handoff`, `managed-codex`,
+`native-computer-use`, and the persistent-service variant) in bootstrap
+maintenance so full setup no longer fails at maintenance begin.
+
+Report bootstrap-busy when the Windows lock holder exits with the busy code
+instead of misclassifying the result, and wait out the daemon's own
+readiness budgets before declaring a slow Windows daemon unreachable.
+
 ## satelle-cli@0.1.10
 
 ### Windows native startup and doctor diagnostics
