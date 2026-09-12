@@ -10,8 +10,8 @@ use time::OffsetDateTime;
 mod toon;
 
 use super::{
-    Command, ConfigCommand, EventMode, HostCommand, HostStorageBackupCommand, HostStorageCommand,
-    HostStoreCommand, SelfSubcommand, SupportCommand,
+    Command, ConfigCommand, DesktopCommand, EventMode, HostCommand, HostStorageBackupCommand,
+    HostStorageCommand, HostStoreCommand, SelfSubcommand, SupportCommand,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -184,6 +184,9 @@ impl Command {
             Self::Config { command } => command.output_request(),
             Self::Paths(command) => (command.output_args, EventOutput::None),
             Self::Host { command } => command.output_request(),
+            Self::Desktop {
+                command: DesktopCommand::Snapshot(command),
+            } => (command.output_args, EventOutput::None),
             Self::SelfCtl { command } => command.output_request(),
             Self::Run(command) => (
                 command.output_args,

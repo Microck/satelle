@@ -358,6 +358,10 @@ enum Command {
         #[command(subcommand)]
         command: HostCommand,
     },
+    Desktop {
+        #[command(subcommand)]
+        command: DesktopCommand,
+    },
     #[command(name = "self")]
     SelfCtl {
         #[command(subcommand)]
@@ -384,6 +388,23 @@ enum Command {
         #[command(subcommand)]
         command: SupportCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum DesktopCommand {
+    Snapshot(DesktopSnapshotCommand),
+}
+
+#[derive(Args, Debug)]
+struct DesktopSnapshotCommand {
+    #[arg(long, required = true)]
+    host: String,
+    #[arg(long, required = true, value_name = "PATH")]
+    output: PathBuf,
+    #[arg(long)]
+    no_input: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2192,6 +2213,9 @@ fn execute_command(
         Command::Config { command } => run_config(command, config, output).map(|_| None),
         Command::Paths(command) => show_paths(command, config, output).map(|_| None),
         Command::Host { command } => run_host(command, config, output).map(|_| None),
+        Command::Desktop {
+            command: DesktopCommand::Snapshot(command),
+        } => run_desktop_snapshot(command, config, output).map(|_| None),
         Command::SelfCtl { command } => {
             run_self(command, config, output, no_color, *error_format).map(|_| None)
         }
@@ -2211,6 +2235,162 @@ fn execute_command(
             command: McpCommand::Install(command),
         } => run_mcp_install(command, profile, &config, output).map(|_| None),
         Command::Support { command } => support::run_support(command, config, output).map(|_| None),
+    }
+}
+
+fn run_desktop_snapshot(
+    command: DesktopSnapshotCommand,
+    config: ConfigContext<'_>,
+    output: OutputFormat,
+) -> Result<(), CliFailure> {
+    let selected = config.resolve_host(Some(&command.host))?;
+    if selected.config.transport != TransportKind::Local
+        && selected.config.expected_host_id.is_none()
+    {
+        return Err(failure(SatelleError::desktop_snapshot_target_required(
+            &selected.alias,
+        )));
+    }
+    let transport = transport::transport_for(&selected)?;
+    let sessions = transport.host_sessions(true).map_err(failure)?;
+    let policy = DesktopSelectionPolicy::from_host_config(&selected.config);
+    let desktop = satelle_core::resolve_desktop_session(&sessions, &policy).map_err(|error| {
+        let mapped = match error.code {
+            ErrorCode::DesktopBindingRequired => {
+                SatelleError::desktop_snapshot_target_required(&selected.alias)
+            }
+            ErrorCode::DesktopSessionAmbiguous => {
+                SatelleError::desktop_snapshot_ambiguous(&selected.alias)
+            }
+            ErrorCode::DesktopSessionPreferenceUnmatched
+            | ErrorCode::DesktopSessionNativeSelectorUnmatched => {
+                SatelleError::desktop_snapshot_target_required(&selected.alias)
+            }
+            _ => SatelleError::desktop_snapshot_permission_required(
+                "selected_desktop_session_unavailable",
+            ),
+        };
+        failure(mapped)
+    })?;
+    let output_path = if command.output.is_absolute() {
+        command.output.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| {
+                failure(SatelleError::desktop_snapshot_export_failed(
+                    &command.output,
+                ))
+            })?
+            .join(&command.output)
+    };
+
+    if command.no_input || !io::stdin().is_terminal() {
+        return Err(failure(SatelleError::desktop_snapshot_consent_required(
+            &output_path,
+        )));
+    }
+    eprintln!("Desktop snapshot export");
+    eprintln!("Output: {}", output_path.display());
+    eprintln!("Format: image/png");
+    eprintln!("Storage: one owner-only local file at the output path");
+    eprintln!(
+        "Redaction: {} removes PNG metadata",
+        satelle_core::sensitive_diagnostics::DESKTOP_SNAPSHOT_REDACTION_POLICY_VERSION
+    );
+    eprintln!(
+        "Unredacted risks: {}",
+        satelle_core::sensitive_diagnostics::DESKTOP_SNAPSHOT_RISKS.join(", ")
+    );
+    let confirmed = cliclack::confirm("Capture the current visible desktop?")
+        .initial_value(false)
+        .interact()
+        .unwrap_or(false);
+    if !confirmed {
+        return Err(failure(SatelleError::desktop_snapshot_consent_required(
+            &output_path,
+        )));
+    }
+
+    let request = satelle_transport::DesktopSnapshotCaptureRequest::new(
+        &selected.alias,
+        &desktop.desktop_user,
+        &desktop.session_id,
+    );
+    let artifact = transport
+        .capture_desktop_snapshot(&request)
+        .map_err(failure)?;
+    let snapshot_id = artifact.manifest.snapshot_id.clone();
+    let staging_path = output_path.with_file_name(format!(
+        ".{}.satelle-{}.staged",
+        output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("desktop-snapshot.png"),
+        snapshot_id
+    ));
+    if satelle_core::persist_new_owner_only_desktop_snapshot(
+        &output_path,
+        &staging_path,
+        &artifact.png,
+    )
+    .is_err()
+    {
+        let _ = transport.acknowledge_desktop_snapshot(
+            &snapshot_id,
+            satelle_core::sensitive_diagnostics::DesktopSnapshotExportOutcome::Failed,
+        );
+        let mut export_error = SatelleError::desktop_snapshot_export_failed(&output_path);
+        export_error.details.insert(
+            "staging_path".to_string(),
+            Value::String(staging_path.display().to_string()),
+        );
+        export_error.details.insert(
+            "cleanup_command".to_string(),
+            Value::String(local_artifact_cleanup_command(&staging_path)),
+        );
+        export_error.details.insert(
+            "snapshot_material_may_remain".to_string(),
+            Value::Bool(staging_path.try_exists().unwrap_or(true)),
+        );
+        return Err(failure(export_error));
+    }
+    transport
+        .acknowledge_desktop_snapshot(
+            &snapshot_id,
+            satelle_core::sensitive_diagnostics::DesktopSnapshotExportOutcome::Exported,
+        )
+        .map_err(|mut error| {
+            error.details.insert(
+                "output_path".to_string(),
+                Value::String(output_path.display().to_string()),
+            );
+            failure(error)
+        })?;
+
+    let report = serde_json::json!({
+        "schema_version": satelle_core::sensitive_diagnostics::DESKTOP_SNAPSHOT_SCHEMA_VERSION,
+        "source_host": artifact.manifest.source_host,
+        "host_identity": artifact.manifest.host_identity,
+        "desktop_binding": artifact.manifest.desktop_binding,
+        "desktop_session_identity": artifact.manifest.desktop_session_identity,
+        "output_path": output_path,
+        "artifact_format": artifact.manifest.artifact_format,
+        "artifact_format_version": artifact.manifest.artifact_format_version,
+        "artifact_byte_size": artifact.manifest.artifact_byte_size,
+        "redaction": {
+            "policy_version": artifact.manifest.redaction_policy_version,
+            "categories_applied": artifact.manifest.redaction_categories_applied,
+            "known_unredacted_visual_risk_categories": artifact.manifest.known_unredacted_visual_risk_categories,
+        },
+        "created_at": artifact.manifest.created_at,
+    });
+    if output.is_structured() {
+        output.print(&report).map_err(failure)
+    } else {
+        println!("Saved desktop snapshot to {}", output_path.display());
+        println!("Format: image/png");
+        println!("Size: {} bytes", artifact.manifest.artifact_byte_size);
+        Ok(())
     }
 }
 
@@ -2543,6 +2723,14 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 HostCommand::OfflineStorageBackupCleanupPlan(_) => None,
                 HostCommand::OfflineStorageMigration { .. } => None,
             },
+            session_id: None,
+        },
+        Command::Desktop {
+            command: DesktopCommand::Snapshot(command),
+        } => HistoryTarget {
+            family: "desktop-snapshot",
+            selects_host: true,
+            explicit_host: Some(command.host.as_str()),
             session_id: None,
         },
         Command::Run(command) => HistoryTarget {
@@ -4098,7 +4286,7 @@ impl RawSubprocessInvocation {
             );
             export_error.details.insert(
                 "cleanup_command".to_string(),
-                Value::String(raw_diagnostic_cleanup_command(&staging)),
+                Value::String(local_artifact_cleanup_command(&staging)),
             );
             export_error.details.insert(
                 "raw_material_may_remain".to_string(),
@@ -14436,7 +14624,7 @@ fn export_raw_protocol(
         );
         failure_error.details.insert(
             "cleanup_command".to_string(),
-            Value::String(raw_diagnostic_cleanup_command(&staging)),
+            Value::String(local_artifact_cleanup_command(&staging)),
         );
         failure_error.details.insert(
             "raw_material_may_remain".to_string(),
@@ -14483,7 +14671,7 @@ fn attach_raw_protocol_export_failure(
     );
 }
 
-fn raw_diagnostic_cleanup_command(path: &Path) -> String {
+fn local_artifact_cleanup_command(path: &Path) -> String {
     #[cfg(windows)]
     {
         format!(

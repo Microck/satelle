@@ -80,12 +80,13 @@ pub use secure_file::{
     open_or_create_owner_only_directory, open_or_create_owner_only_file,
     open_or_create_user_or_administrator_controlled_directory, open_owner_only_directory,
     open_user_or_administrator_controlled_directory, owner_only_secret_destination_exists,
-    persist_new_owner_only_config_file, persist_new_owner_only_diagnostic_file,
-    persist_new_owner_only_secret_file, publish_new_owner_only_directory,
-    publish_owner_only_secret_file, read_bounded_regular_file_no_follow,
-    read_optional_owner_only_secret_config_file, read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
-    rollback_owner_only_secret_file, stage_owner_only_secret_file, sync_owner_only_directory,
+    persist_new_owner_only_config_file, persist_new_owner_only_desktop_snapshot,
+    persist_new_owner_only_diagnostic_file, persist_new_owner_only_secret_file,
+    publish_new_owner_only_directory, publish_owner_only_secret_file,
+    read_bounded_regular_file_no_follow, read_optional_owner_only_secret_config_file,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file,
+    read_owner_only_secret_file, read_trusted_ca_bundle_file, rollback_owner_only_secret_file,
+    stage_owner_only_secret_file, sync_owner_only_directory,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";
@@ -1128,6 +1129,102 @@ impl SatelleError {
                 "output_path".to_string(),
                 Value::String(output.display().to_string()),
             )]),
+        }
+    }
+
+    pub fn desktop_snapshot_target_required(host_alias: &str) -> Self {
+        Self {
+            code: ErrorCode::DesktopSnapshotTargetRequired,
+            message: format!(
+                "Host `{host_alias}` must resolve to one trusted Host Identity and Desktop Binding"
+            ),
+            recovery_command: Some(format!(
+                "configure an exact Host identity and desktop selection for `{host_alias}`"
+            )),
+            source_detail: None,
+            details: BTreeMap::from([("host".to_string(), Value::String(host_alias.to_string()))]),
+        }
+    }
+
+    pub fn desktop_snapshot_ambiguous(host_alias: &str) -> Self {
+        Self {
+            code: ErrorCode::DesktopSnapshotAmbiguous,
+            message: format!(
+                "Host `{host_alias}` resolves to more than one current Desktop Binding"
+            ),
+            recovery_command: Some(format!(
+                "configure one exact desktop selection for `{host_alias}`"
+            )),
+            source_detail: None,
+            details: BTreeMap::from([("host".to_string(), Value::String(host_alias.to_string()))]),
+        }
+    }
+
+    pub fn desktop_snapshot_consent_required(output: &Path) -> Self {
+        Self {
+            code: ErrorCode::DesktopSnapshotConsentRequired,
+            message: "desktop snapshot capture requires interactive consent for this invocation"
+                .to_string(),
+            recovery_command: Some(format!(
+                "rerun `satelle desktop snapshot --host <alias> --output {}` in an interactive terminal",
+                shell_argument(&output.to_string_lossy())
+            )),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "output_path".to_string(),
+                Value::String(output.display().to_string()),
+            )]),
+        }
+    }
+
+    pub fn desktop_snapshot_permission_required(reason: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::DesktopSnapshotPermissionRequired,
+            message: "the Host cannot capture the current visible desktop".to_string(),
+            recovery_command: Some(
+                "grant native screen-capture access and rerun the snapshot command".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([("reason".to_string(), Value::String(reason.into()))]),
+        }
+    }
+
+    pub fn desktop_snapshot_redaction_failed() -> Self {
+        Self {
+            code: ErrorCode::DesktopSnapshotRedactionFailed,
+            message: "the Host could not apply the desktop snapshot redaction policy".to_string(),
+            recovery_command: Some(
+                "retry after verifying the native screen-capture runtime".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn desktop_snapshot_export_failed(output: &Path) -> Self {
+        Self {
+            code: ErrorCode::DesktopSnapshotExportFailed,
+            message: "the desktop snapshot could not be written to the requested output path"
+                .to_string(),
+            recovery_command: Some(format!(
+                "choose a new owner-only output path and rerun `satelle desktop snapshot --host <alias> --output {}`",
+                shell_argument(&output.to_string_lossy())
+            )),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "output_path".to_string(),
+                Value::String(output.display().to_string()),
+            )]),
+        }
+    }
+
+    pub fn desktop_snapshot_host_export_failed(reason: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::DesktopSnapshotExportFailed,
+            message: "the Host could not prepare the desktop snapshot for export".to_string(),
+            recovery_command: Some("verify Host storage health and retry the command".to_string()),
+            source_detail: None,
+            details: BTreeMap::from([("reason".to_string(), Value::String(reason.into()))]),
         }
     }
 
@@ -4738,6 +4835,12 @@ pub enum ErrorCode {
     RawDiagnosticsRedactionFailed,
     RawDiagnosticsStagingFailed,
     RawDiagnosticsExportFailed,
+    DesktopSnapshotTargetRequired,
+    DesktopSnapshotAmbiguous,
+    DesktopSnapshotConsentRequired,
+    DesktopSnapshotPermissionRequired,
+    DesktopSnapshotRedactionFailed,
+    DesktopSnapshotExportFailed,
     IncompatibleControlPlane,
     ComputerUseNotReady,
     NativeReadinessTimeout,
@@ -4902,6 +5005,12 @@ impl ErrorCode {
             Self::RawDiagnosticsRedactionFailed => "raw-diagnostics-redaction-failed",
             Self::RawDiagnosticsStagingFailed => "raw-diagnostics-staging-failed",
             Self::RawDiagnosticsExportFailed => "raw-diagnostics-export-failed",
+            Self::DesktopSnapshotTargetRequired => "desktop-snapshot-target-required",
+            Self::DesktopSnapshotAmbiguous => "desktop-snapshot-ambiguous",
+            Self::DesktopSnapshotConsentRequired => "desktop-snapshot-consent-required",
+            Self::DesktopSnapshotPermissionRequired => "desktop-snapshot-permission-required",
+            Self::DesktopSnapshotRedactionFailed => "desktop-snapshot-redaction-failed",
+            Self::DesktopSnapshotExportFailed => "desktop-snapshot-export-failed",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
             Self::NativeReadinessTimeout => "native-readiness-timeout",
@@ -4997,6 +5106,9 @@ impl ErrorCode {
             | Self::ConfigRepairConsentRequired
             | Self::RawDiagnosticsOutputRequired
             | Self::RawDiagnosticsConsentRequired
+            | Self::DesktopSnapshotTargetRequired
+            | Self::DesktopSnapshotAmbiguous
+            | Self::DesktopSnapshotConsentRequired
             | Self::InputRequired
             | Self::DesktopBindingRequired
             | Self::DoctorRefreshScopeRequired
@@ -5083,6 +5195,9 @@ impl ErrorCode {
             | Self::RawDiagnosticsRedactionFailed
             | Self::RawDiagnosticsStagingFailed
             | Self::RawDiagnosticsExportFailed
+            | Self::DesktopSnapshotPermissionRequired
+            | Self::DesktopSnapshotRedactionFailed
+            | Self::DesktopSnapshotExportFailed
             | Self::CredentialHelperTimeout
             | Self::ProviderSecretResolutionFailed
             | Self::SelfUpdateRollbackFailed
@@ -6268,6 +6383,36 @@ impl SatelleError {
             recovery_command: Some(format!("satelle stop {active_session_id}")),
             source_detail: None,
             details,
+        }
+    }
+
+    pub fn host_busy_operation(host: &str, active_operation_id: &str) -> Self {
+        Self {
+            code: ErrorCode::HostBusy,
+            message: format!("Host `{host}` is already controlling its authorized desktop"),
+            recovery_command: Some(format!(
+                "wait for operation `{active_operation_id}` to finish, then retry"
+            )),
+            source_detail: None,
+            details: BTreeMap::from([
+                ("host".to_string(), Value::String(host.to_string())),
+                (
+                    "active_operation_id".to_string(),
+                    Value::String(active_operation_id.to_string()),
+                ),
+            ]),
+        }
+    }
+
+    pub fn host_busy_without_owner(host: &str) -> Self {
+        Self {
+            code: ErrorCode::HostBusy,
+            message: format!("Host `{host}` is already controlling its authorized desktop"),
+            recovery_command: Some(
+                "wait for the current desktop control operation to finish, then retry".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([("host".to_string(), Value::String(host.to_string()))]),
         }
     }
 

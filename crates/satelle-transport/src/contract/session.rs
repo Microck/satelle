@@ -1,6 +1,8 @@
 use super::{AuthenticatedResponseContract, RequestId, define_schema_token};
 use satelle_core::sensitive_diagnostics::{
-    RawDiagnosticExportOutcome, RawProtocolArtifact, RawSubprocessCommand, RawSubprocessManifest,
+    DesktopSnapshotArtifact, DesktopSnapshotExportOutcome, DesktopSnapshotManifest,
+    MAX_DESKTOP_SNAPSHOT_BYTES, RawDiagnosticExportOutcome, RawProtocolArtifact,
+    RawSubprocessCommand, RawSubprocessManifest,
 };
 use satelle_core::session::{
     PublicSession, SessionStateRevision, TurnExecutionMode, TurnState, TurnStateRevision,
@@ -31,6 +33,14 @@ define_schema_token!(
 define_schema_token!(
     RawSubprocessPrepareSchema,
     "satelle.raw-subprocess-diagnostics.prepare.v1"
+);
+define_schema_token!(
+    DesktopSnapshotCaptureSchema,
+    "satelle.desktop-snapshot-capture.v1"
+);
+define_schema_token!(
+    DesktopSnapshotAcknowledgeSchema,
+    "satelle.desktop-snapshot-acknowledge.v1"
 );
 
 pub const MAX_IMAGE_ATTACHMENT_COUNT: usize = 2;
@@ -885,6 +895,180 @@ impl AuthenticatedResponseContract for RawSubprocessPrepareResponse {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopSnapshotCaptureRequest {
+    schema_version: DesktopSnapshotCaptureSchema,
+    source_host: String,
+    desktop_binding: String,
+    desktop_session_identity: String,
+}
+
+impl DesktopSnapshotCaptureRequest {
+    pub fn new(
+        source_host: impl Into<String>,
+        desktop_binding: impl Into<String>,
+        desktop_session_identity: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: DesktopSnapshotCaptureSchema,
+            source_host: source_host.into(),
+            desktop_binding: desktop_binding.into(),
+            desktop_session_identity: desktop_session_identity.into(),
+        }
+    }
+
+    pub fn source_host(&self) -> &str {
+        &self.source_host
+    }
+
+    pub fn desktop_binding(&self) -> &str {
+        &self.desktop_binding
+    }
+
+    pub fn desktop_session_identity(&self) -> &str {
+        &self.desktop_session_identity
+    }
+}
+
+impl ApiRequestContract for DesktopSnapshotCaptureRequest {
+    const SCHEMA_VERSION: &'static str = DesktopSnapshotCaptureSchema::TOKEN;
+}
+
+/// No Debug implementation: the encoded body contains unredacted desktop pixels.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopSnapshotCaptureResponse {
+    schema_version: DesktopSnapshotCaptureSchema,
+    request_id: RequestId,
+    host_identity: String,
+    manifest: DesktopSnapshotManifest,
+    png_base64: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DesktopSnapshotContractError;
+
+impl fmt::Display for DesktopSnapshotContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the desktop snapshot response violated its artifact contract")
+    }
+}
+
+impl std::error::Error for DesktopSnapshotContractError {}
+
+impl DesktopSnapshotCaptureResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        artifact: DesktopSnapshotArtifact,
+    ) -> Self {
+        use base64::Engine as _;
+        Self {
+            schema_version: DesktopSnapshotCaptureSchema,
+            request_id,
+            host_identity,
+            manifest: artifact.manifest,
+            png_base64: base64::engine::general_purpose::STANDARD.encode(artifact.png),
+        }
+    }
+
+    pub fn manifest(&self) -> &DesktopSnapshotManifest {
+        &self.manifest
+    }
+
+    pub fn into_artifact(self) -> Result<DesktopSnapshotArtifact, DesktopSnapshotContractError> {
+        use base64::Engine as _;
+        if !self.manifest.has_valid_contract()
+            || self.png_base64.len() > 4 * MAX_DESKTOP_SNAPSHOT_BYTES.div_ceil(3)
+        {
+            return Err(DesktopSnapshotContractError);
+        }
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(self.png_base64)
+            .map_err(|_| DesktopSnapshotContractError)?;
+        if png.len() != self.manifest.artifact_byte_size || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err(DesktopSnapshotContractError);
+        }
+        Ok(DesktopSnapshotArtifact {
+            manifest: self.manifest,
+            png,
+        })
+    }
+}
+
+impl AuthenticatedResponseContract for DesktopSnapshotCaptureResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopSnapshotAcknowledgeRequest {
+    schema_version: DesktopSnapshotAcknowledgeSchema,
+    outcome: DesktopSnapshotExportOutcome,
+}
+
+impl DesktopSnapshotAcknowledgeRequest {
+    pub fn new(outcome: DesktopSnapshotExportOutcome) -> Self {
+        Self {
+            schema_version: DesktopSnapshotAcknowledgeSchema,
+            outcome,
+        }
+    }
+
+    pub const fn outcome(&self) -> DesktopSnapshotExportOutcome {
+        self.outcome
+    }
+}
+
+impl ApiRequestContract for DesktopSnapshotAcknowledgeRequest {
+    const SCHEMA_VERSION: &'static str = DesktopSnapshotAcknowledgeSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopSnapshotAcknowledgeResponse {
+    schema_version: DesktopSnapshotAcknowledgeSchema,
+    request_id: RequestId,
+    host_identity: String,
+    outcome: DesktopSnapshotExportOutcome,
+}
+
+impl DesktopSnapshotAcknowledgeResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        outcome: DesktopSnapshotExportOutcome,
+    ) -> Self {
+        Self {
+            schema_version: DesktopSnapshotAcknowledgeSchema,
+            request_id,
+            host_identity,
+            outcome,
+        }
+    }
+
+    pub const fn outcome(&self) -> DesktopSnapshotExportOutcome {
+        self.outcome
+    }
+}
+
+impl AuthenticatedResponseContract for DesktopSnapshotAcknowledgeResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionCancellationOutcome {
@@ -1314,6 +1498,42 @@ mod tests {
                 "MVP Turn requests must not select {field}"
             );
         }
+    }
+
+    #[test]
+    fn desktop_snapshot_response_requires_an_exact_manifest_and_png_body() {
+        let png = b"\x89PNG\r\n\x1a\nfixture".to_vec();
+        let manifest = DesktopSnapshotManifest::new(
+            uuid::Uuid::now_v7().hyphenated().to_string(),
+            "local-demo",
+            "host-test",
+            "operator",
+            Some("desktop-session-1".to_string()),
+            png.len(),
+        );
+        let response = DesktopSnapshotCaptureResponse::new(
+            RequestId::new(),
+            "host-test".to_string(),
+            DesktopSnapshotArtifact {
+                manifest: manifest.clone(),
+                png: png.clone(),
+            },
+        );
+        let artifact = response.into_artifact().expect("decode matching artifact");
+        assert_eq!(artifact.manifest, manifest);
+        assert_eq!(artifact.png, png);
+
+        let mut mismatched = manifest;
+        mismatched.artifact_byte_size += 1;
+        let response = DesktopSnapshotCaptureResponse::new(
+            RequestId::new(),
+            "host-test".to_string(),
+            DesktopSnapshotArtifact {
+                manifest: mismatched,
+                png: b"\x89PNG\r\n\x1a\nfixture".to_vec(),
+            },
+        );
+        assert!(response.into_artifact().is_err());
     }
 
     #[test]

@@ -5631,7 +5631,7 @@ fn authenticated_direct_protocol_mismatch_retains_daemon_version_for_maintenance
         "details": {
             "daemon_version": "0.0.9",
             "reason": "unsupported",
-            "supported_versions": ["17"],
+            "supported_versions": ["18"],
             "received_version": "11",
         },
         "docs_url": null,
@@ -6716,7 +6716,7 @@ fn stop_not_confirmed_api_details_are_validated_and_preserved() {
 }
 
 #[test]
-fn host_busy_api_details_preserve_the_active_session_contract() {
+fn host_busy_api_details_preserve_the_closed_owner_contract() {
     let active_session_id = SessionId::new();
     let api_error = |details: serde_json::Value| {
         serde_json::from_value::<satelle_transport::ApiError>(serde_json::json!({
@@ -6747,6 +6747,24 @@ fn host_busy_api_details_preserve_the_active_session_contract() {
         mapped.details["active_session_id"],
         active_session_id.as_str()
     );
+
+    let mapped = map_api_error(
+        "direct-test",
+        &api_error(serde_json::json!({"host": "local-demo"})),
+    );
+    assert_eq!(mapped.code, ErrorCode::HostBusy);
+    assert_eq!(mapped.details.len(), 1);
+    assert_eq!(mapped.details["host"], "direct-test");
+
+    let mapped = map_api_error(
+        "direct-test",
+        &api_error(serde_json::json!({
+            "host": "local-demo",
+            "active_operation_id": "operation-1",
+        })),
+    );
+    assert_eq!(mapped.code, ErrorCode::HostBusy);
+    assert_eq!(mapped.details["active_operation_id"], "operation-1");
 
     let mapped = map_api_error(
         "direct-test",
@@ -6927,6 +6945,69 @@ fn desktop_selection_api_errors_round_trip_only_validated_details() {
         mapped.details.get("remote_code"),
         Some(&serde_json::json!("invalid-daemon-response"))
     );
+}
+
+#[test]
+fn desktop_snapshot_api_errors_preserve_only_the_closed_contract() {
+    let api_error = |code: ApiErrorCode, details: serde_json::Value| {
+        serde_json::from_value::<satelle_transport::ApiError>(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle_transport::RequestId::new().to_string(),
+            "host_identity": "host-direct-test",
+            "code": code.as_str(),
+            "category": "readiness",
+            "retryable": false,
+            "message": "desktop snapshot export failed",
+            "details": details,
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize desktop snapshot API error")
+    };
+
+    let mapped = map_api_error(
+        "direct-test",
+        &api_error(
+            ApiErrorCode::DesktopSnapshotPermissionRequired,
+            serde_json::json!({"reason": "screen_recording_permission_denied"}),
+        ),
+    );
+    assert_eq!(mapped.code, ErrorCode::DesktopSnapshotPermissionRequired);
+    assert_eq!(
+        mapped.details["reason"],
+        "screen_recording_permission_denied"
+    );
+
+    let malformed = map_api_error(
+        "direct-test",
+        &api_error(
+            ApiErrorCode::DesktopSnapshotPermissionRequired,
+            serde_json::json!({
+                "reason": "screen_recording_permission_denied",
+                "private": "must-not-cross"
+            }),
+        ),
+    );
+    assert_eq!(malformed.code, ErrorCode::RemoteExecution);
+    assert_eq!(malformed.details["remote_code"], "invalid-daemon-response");
+
+    let redaction = map_api_error(
+        "direct-test",
+        &api_error(
+            ApiErrorCode::DesktopSnapshotRedactionFailed,
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(redaction.code, ErrorCode::DesktopSnapshotRedactionFailed);
+
+    let export = map_api_error(
+        "direct-test",
+        &api_error(
+            ApiErrorCode::DesktopSnapshotExportFailed,
+            serde_json::Value::Null,
+        ),
+    );
+    assert_eq!(export.code, ErrorCode::DesktopSnapshotExportFailed);
 }
 
 #[test]

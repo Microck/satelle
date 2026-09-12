@@ -1,5 +1,7 @@
 mod auth;
 mod codec;
+#[path = "storage/desktop-snapshot.rs"]
+mod desktop_snapshot;
 mod logs;
 #[path = "storage/migration-requests.rs"]
 mod migration_requests;
@@ -455,10 +457,11 @@ mod ssh_identity_commit_tests {
         (18, "fnv1a64:4b489071db261e83"),
         (19, "fnv1a64:7f9ea3a158176b9c"),
         (20, "fnv1a64:349cb7810ef318f4"),
+        (21, "fnv1a64:63131767685873a3"),
     ];
-    const EXPECTED_SCHEMA_ROW_COUNT: usize = 76;
+    const EXPECTED_SCHEMA_ROW_COUNT: usize = 80;
     const EXPECTED_SCHEMA_SHA256: &str =
-        "02680650f6798b9489264bc93f9873f8702a875e379054862c7e0b5805cc0fe8";
+        "409ed1514f7d2da71f99ecc508862c45b1e35bc4022dd1bb71abae741ba95154";
 
     fn identity() -> HostIdentityRef {
         HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")
@@ -607,7 +610,7 @@ mod ssh_identity_commit_tests {
         let user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema user version");
-        assert_eq!(user_version, 20);
+        assert_eq!(user_version, 21);
 
         let schema = connection
             .prepare(

@@ -352,10 +352,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         }
         ErrorCode::RawDiagnosticsRedactionFailed
         | ErrorCode::RawDiagnosticsStagingFailed
-        | ErrorCode::RawDiagnosticsExportFailed => ErrorContract {
+        | ErrorCode::RawDiagnosticsExportFailed
+        | ErrorCode::DesktopSnapshotRedactionFailed
+        | ErrorCode::DesktopSnapshotExportFailed => ErrorContract {
             category: ErrorCategory::Storage,
             retryable: false,
-            outcome: "The raw diagnostic export did not complete.",
+            outcome: "The diagnostic export did not complete.",
             default_recovery: "inspect the reported cleanup state before requesting a new capture",
         },
         ErrorCode::StorageMigrationRollbackFailed => ErrorContract {
@@ -471,6 +473,9 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::DoctorFixConsentRequired
         | ErrorCode::ConfigRepairConsentRequired
         | ErrorCode::DesktopBindingRequired
+        | ErrorCode::DesktopSnapshotTargetRequired
+        | ErrorCode::DesktopSnapshotAmbiguous
+        | ErrorCode::DesktopSnapshotConsentRequired
         | ErrorCode::DoctorRefreshScopeRequired
         | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
         | ErrorCode::ExperimentalProviderOptInRequired
@@ -567,6 +572,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             retryable: false,
             outcome: "Satelle could not resolve the platform directories.",
             default_recovery: "configure the required platform directory and retry the command",
+        },
+        ErrorCode::DesktopSnapshotPermissionRequired => ErrorContract {
+            category: ErrorCategory::Readiness,
+            retryable: false,
+            outcome: "The desktop snapshot could not start.",
+            default_recovery: "grant native screen capture access and retry the command",
         },
         ErrorCode::NotImplemented => ErrorContract {
             category: ErrorCategory::Internal,

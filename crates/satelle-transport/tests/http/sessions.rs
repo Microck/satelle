@@ -4,6 +4,8 @@ use reqwest::Method;
 use satelle_core::StopResultOutcome;
 use satelle_core::session::{SessionActivity, TurnExecutionMode};
 use satelle_test_contract::assert_privacy_canaries_absent;
+#[cfg(target_os = "linux")]
+use satelle_transport::DesktopSnapshotCaptureRequest;
 use satelle_transport::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ImageAttachment,
     MAX_IMAGE_ATTACHMENT_BYTES, RawProtocolAcknowledgeRequest, RawProtocolDownloadResponse,
@@ -19,6 +21,47 @@ const STOP_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f03";
 const SECOND_CREATE_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f04";
 const CROSS_SESSION_TURN_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f05";
 const STALE_STOP_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f06";
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn desktop_snapshot_requires_sensitive_scope_and_reports_native_permission_readiness() {
+    let request =
+        DesktopSnapshotCaptureRequest::new("local-demo", "local-demo-user", "local-demo-console");
+    let control_only = RunningServer::start(ApiScopes::CONTROL).await;
+    let rejected = control_only
+        .mutation(
+            "/v1/diagnostics/desktop-snapshot",
+            "desktop-snapshot-without-sensitive",
+        )
+        .json(&request)
+        .send()
+        .await
+        .expect("send scope-rejected snapshot request");
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    control_only.server.shutdown().await.unwrap();
+
+    let running = RunningServer::start(ApiScopes::CONTROL | ApiScopes::DIAGNOSTICS_SENSITIVE).await;
+    let unavailable = running
+        .mutation(
+            "/v1/diagnostics/desktop-snapshot",
+            "desktop-snapshot-native-readiness",
+        )
+        .json(&request)
+        .send()
+        .await
+        .expect("send authorized snapshot request");
+    assert_eq!(unavailable.status(), StatusCode::FORBIDDEN);
+    let error: ApiError = unavailable.json().await.expect("decode snapshot error");
+    assert_eq!(
+        error.code(),
+        ApiErrorCode::DesktopSnapshotPermissionRequired
+    );
+    assert_eq!(
+        error.details(),
+        Some(&serde_json::json!({"reason": "native_platform_unsupported"}))
+    );
+    running.server.shutdown().await.unwrap();
+}
 
 #[tokio::test]
 async fn raw_protocol_capture_requires_sensitive_scope_and_supports_download_then_acknowledgement()
@@ -1528,7 +1571,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "17")
+        .header("Satelle-Protocol-Version", "18")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -2187,7 +2230,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "17")
+        request.header("Satelle-Protocol-Version", "18")
     } else {
         request
     }

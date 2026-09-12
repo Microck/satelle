@@ -12,6 +12,17 @@ pub const REDACTION_POLICY_VERSION: &str = "satelle.redaction.v1";
 pub const MAX_RAW_PROTOCOL_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PENDING_RAW_EXPORTS: usize = 8;
 pub const RAW_EXPORT_RETENTION_SECONDS: u64 = 600;
+pub const DESKTOP_SNAPSHOT_SCHEMA_VERSION: &str = "satelle.desktop.snapshot.v1";
+pub const DESKTOP_SNAPSHOT_ARTIFACT_FORMAT_VERSION: &str = "png.v1";
+pub const DESKTOP_SNAPSHOT_REDACTION_POLICY_VERSION: &str = "satelle.desktop-snapshot-redaction.v1";
+pub const MAX_DESKTOP_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+pub const DESKTOP_SNAPSHOT_REDACTION_CATEGORIES: &[&str] = &["png_ancillary_metadata"];
+pub const DESKTOP_SNAPSHOT_RISKS: &[&str] = &[
+    "visible_application_content",
+    "notifications",
+    "credentials_visible_on_screen",
+    "personal_data_visible_on_screen",
+];
 pub const REDACTION_CATEGORIES: &[&str] = &[
     "known_provider_secrets",
     "bearer_tokens",
@@ -88,6 +99,118 @@ impl RawDiagnosticFailure {
 pub enum RawDiagnosticExportOutcome {
     Exported,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopSnapshotExportOutcome {
+    Exported,
+    Failed,
+}
+
+impl DesktopSnapshotExportOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exported => "exported",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopSnapshotManifest {
+    pub snapshot_id: String,
+    pub source_host: String,
+    pub host_identity: String,
+    pub desktop_binding: String,
+    pub desktop_session_identity: Option<String>,
+    pub included: Vec<String>,
+    pub redaction_policy_version: String,
+    pub redaction_categories_applied: Vec<String>,
+    pub known_unredacted_visual_risk_categories: Vec<String>,
+    pub created_at: String,
+    pub artifact_format: String,
+    pub artifact_format_version: String,
+    pub artifact_byte_size: usize,
+}
+
+impl DesktopSnapshotManifest {
+    pub fn new(
+        snapshot_id: impl Into<String>,
+        source_host: impl Into<String>,
+        host_identity: impl Into<String>,
+        desktop_binding: impl Into<String>,
+        desktop_session_identity: Option<String>,
+        artifact_byte_size: usize,
+    ) -> Self {
+        Self {
+            snapshot_id: snapshot_id.into(),
+            source_host: source_host.into(),
+            host_identity: host_identity.into(),
+            desktop_binding: desktop_binding.into(),
+            desktop_session_identity,
+            included: vec!["current_visible_desktop_pixels".to_string()],
+            redaction_policy_version: DESKTOP_SNAPSHOT_REDACTION_POLICY_VERSION.to_string(),
+            redaction_categories_applied: DESKTOP_SNAPSHOT_REDACTION_CATEGORIES
+                .iter()
+                .map(|category| (*category).to_string())
+                .collect(),
+            known_unredacted_visual_risk_categories: DESKTOP_SNAPSHOT_RISKS
+                .iter()
+                .map(|category| (*category).to_string())
+                .collect(),
+            created_at: crate::utc_now(),
+            artifact_format: "image/png".to_string(),
+            artifact_format_version: DESKTOP_SNAPSHOT_ARTIFACT_FORMAT_VERSION.to_string(),
+            artifact_byte_size,
+        }
+    }
+
+    pub fn has_valid_contract(&self) -> bool {
+        let snapshot_id_is_uuidv7 = uuid::Uuid::parse_str(&self.snapshot_id)
+            .is_ok_and(|id| id.get_version() == Some(uuid::Version::SortRand));
+        let created_at_is_timestamp = time::OffsetDateTime::parse(
+            &self.created_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok();
+        snapshot_id_is_uuidv7
+            && !self.source_host.is_empty()
+            && !self.host_identity.is_empty()
+            && !self.desktop_binding.is_empty()
+            && self
+                .desktop_session_identity
+                .as_deref()
+                .is_some_and(|identity| !identity.is_empty())
+            && self
+                .included
+                .iter()
+                .map(String::as_str)
+                .eq(["current_visible_desktop_pixels"])
+            && self.redaction_policy_version == DESKTOP_SNAPSHOT_REDACTION_POLICY_VERSION
+            && self
+                .redaction_categories_applied
+                .iter()
+                .map(String::as_str)
+                .eq(DESKTOP_SNAPSHOT_REDACTION_CATEGORIES.iter().copied())
+            && self
+                .known_unredacted_visual_risk_categories
+                .iter()
+                .map(String::as_str)
+                .eq(DESKTOP_SNAPSHOT_RISKS.iter().copied())
+            && created_at_is_timestamp
+            && self.artifact_format == "image/png"
+            && self.artifact_format_version == DESKTOP_SNAPSHOT_ARTIFACT_FORMAT_VERSION
+            && (1..=MAX_DESKTOP_SNAPSHOT_BYTES).contains(&self.artifact_byte_size)
+    }
+}
+
+/// No Debug implementation: the image contains unredacted desktop pixels.
+#[derive(Clone)]
+pub struct DesktopSnapshotArtifact {
+    pub manifest: DesktopSnapshotManifest,
+    pub png: Vec<u8>,
 }
 
 impl RawDiagnosticExportOutcome {

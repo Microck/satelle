@@ -1212,7 +1212,15 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_control,
         ));
-    let raw_diagnostic_acknowledgement_route = Router::new()
+    let sensitive_diagnostic_routes = Router::new()
+        .route(
+            "/v1/diagnostics/desktop-snapshot",
+            post(sessions::capture_desktop_snapshot),
+        )
+        .route(
+            "/v1/diagnostics/desktop-snapshot/{snapshot_id}/acknowledge",
+            post(sessions::acknowledge_desktop_snapshot),
+        )
         .route(
             "/v1/diagnostics/raw-protocol/{turn_id}/acknowledge",
             post(sessions::acknowledge_raw_protocol_export),
@@ -1279,7 +1287,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         .merge(local_doctor_operation_route)
         .merge(local_daemon_relaunch_route)
         .merge(control_routes)
-        .merge(raw_diagnostic_acknowledgement_route)
+        .merge(sensitive_diagnostic_routes)
         .method_not_allowed_fallback(protected_method_not_allowed)
         .fallback(protected_not_found)
         .layer(middleware::from_fn_with_state(
