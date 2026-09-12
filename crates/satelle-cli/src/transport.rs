@@ -3,7 +3,7 @@ use crate::{CliFailure, SelectedHost, bootstrap_lock, failure, on_demand_idle_ti
 use satelle_core::AdapterKind;
 use satelle_core::daemon_service::{
     DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentHostStoragePolicy,
-    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV6, WindowsTaskDefinition,
+    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV7, WindowsTaskDefinition,
 };
 use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
@@ -370,6 +370,7 @@ pub(crate) struct AttachedTurnOutcome {
     pub(crate) session: PublicSession,
     pub(crate) turn_id: TurnId,
     pub(crate) provider_smoke: Option<serde_json::Value>,
+    pub(crate) recording: Option<satelle_core::recording::RecordingManifest>,
 }
 
 pub(crate) struct ProviderDescriptorValidationReport {
@@ -469,6 +470,12 @@ pub(crate) trait TransportClient: Send {
     ) -> Result<ProviderDescriptorValidationReport, SatelleError>;
     fn host_status(&self) -> Result<HostStatus, SatelleError>;
     fn telemetry_status(&self) -> Result<satelle_core::telemetry::TelemetryStatus, SatelleError>;
+    fn recording_preflight(
+        &self,
+        mode: satelle_core::recording::RecordingMode,
+        retention_ms: Option<u64>,
+        source_host: &str,
+    ) -> Result<satelle_core::recording::RecordingPreflight, SatelleError>;
     fn host_paths(
         &self,
     ) -> Result<satelle_core::daemon_service::DaemonResolvedPathSet, SatelleError>;
@@ -1118,6 +1125,16 @@ impl TransportClient for LocalTransport {
         self.service.telemetry_status()
     }
 
+    fn recording_preflight(
+        &self,
+        mode: satelle_core::recording::RecordingMode,
+        retention_ms: Option<u64>,
+        source_host: &str,
+    ) -> Result<satelle_core::recording::RecordingPreflight, SatelleError> {
+        self.service
+            .recording_preflight(mode, retention_ms, source_host)
+    }
+
     fn host_paths(
         &self,
     ) -> Result<satelle_core::daemon_service::DaemonResolvedPathSet, SatelleError> {
@@ -1156,6 +1173,7 @@ impl TransportClient for LocalTransport {
             session: outcome.session,
             turn_id,
             provider_smoke,
+            recording: outcome.recording,
         })
     }
 
@@ -1193,6 +1211,7 @@ impl TransportClient for LocalTransport {
             session: outcome.session,
             turn_id,
             provider_smoke,
+            recording: outcome.recording,
         })
     }
 
@@ -1510,6 +1529,7 @@ fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, 
                     .map(|capture| capture.source_host().to_string()),
             )
         })
+        .and_then(|intent| intent.with_recording(request.recording().cloned()))
         .map_err(|error| SatelleError::invalid_usage(error.to_string()))
 }
 
@@ -1865,7 +1885,7 @@ fn coordinate_setup(
 enum PreparedPersistentService {
     Windows {
         task: Box<WindowsTaskDefinition>,
-        config: Box<WindowsServiceConfigV6>,
+        config: Box<WindowsServiceConfigV7>,
     },
     Launchd(ssh_bootstrap::LaunchdServiceDefinition),
 }
@@ -2855,11 +2875,12 @@ impl SshSetupTransport {
                         artifact,
                     )
                     .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
-                let config = WindowsServiceConfigV6::new_with_telemetry(
+                let config = WindowsServiceConfigV7::new_with_policies(
                     "127.0.0.1:3001",
                     daemon_path_overrides,
                     storage_policy,
                     self.host_config.telemetry.clone(),
+                    self.host_config.recording.clone(),
                 )
                 .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
                 Ok(PreparedPersistentService::Windows {
@@ -2873,6 +2894,7 @@ impl SshSetupTransport {
                     daemon_path_overrides,
                     storage_policy,
                     self.host_config.telemetry.as_ref(),
+                    self.host_config.recording.as_ref(),
                 )
                 .map(PreparedPersistentService::Launchd)
                 .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error)),
@@ -3943,6 +3965,7 @@ pub(crate) fn preview_ssh_storage_restore(
                 &path_overrides,
                 resolved_persistent_storage_policy(&host.config),
                 host.config.telemetry.as_ref(),
+                host.config.recording.as_ref(),
             ),
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
@@ -4006,6 +4029,7 @@ pub(crate) fn plan_ssh_storage_backup_cleanup(
                 &path_overrides,
                 resolved_persistent_storage_policy(&host.config),
                 host.config.telemetry.as_ref(),
+                host.config.recording.as_ref(),
             ),
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
@@ -4645,6 +4669,7 @@ fn inspect_host_maintenance(
                                     &expected_path_overrides,
                                     resolved_persistent_storage_policy(&host.config),
                                     host.config.telemetry.as_ref(),
+                                    host.config.recording.as_ref(),
                                 ),
                             )
                             .map_err(|error| {
@@ -7732,6 +7757,15 @@ impl TransportClient for SshSetupTransport {
         Err(self.unsupported("telemetry status"))
     }
 
+    fn recording_preflight(
+        &self,
+        _mode: satelle_core::recording::RecordingMode,
+        _retention_ms: Option<u64>,
+        _source_host: &str,
+    ) -> Result<satelle_core::recording::RecordingPreflight, SatelleError> {
+        Err(self.unsupported("recording preflight"))
+    }
+
     fn host_paths(
         &self,
     ) -> Result<satelle_core::daemon_service::DaemonResolvedPathSet, SatelleError> {
@@ -8037,6 +8071,22 @@ impl TransportClient for DirectTransport {
         self.client
             .host_telemetry_status()
             .map(satelle_transport::HostTelemetryStatusResponse::into_status)
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn recording_preflight(
+        &self,
+        mode: satelle_core::recording::RecordingMode,
+        retention_ms: Option<u64>,
+        source_host: &str,
+    ) -> Result<satelle_core::recording::RecordingPreflight, SatelleError> {
+        self.client
+            .recording_preflight(&satelle_transport::RecordingPreflightRequest::new(
+                mode,
+                retention_ms,
+                source_host,
+            ))
+            .map(satelle_transport::RecordingPreflightResponse::into_preflight)
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 

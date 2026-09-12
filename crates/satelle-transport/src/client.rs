@@ -16,7 +16,8 @@ use crate::contract::{
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
     ProviderSecretUploadEnvelope, RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse,
     RawProtocolDownloadResponse, RawSubprocessBeginRequest, RawSubprocessBeginResponse,
-    RawSubprocessPrepareRequest, RawSubprocessPrepareResponse, RequestId, SessionResponse,
+    RawSubprocessPrepareRequest, RawSubprocessPrepareResponse, RecordingManifestResponse,
+    RecordingPreflightRequest, RecordingPreflightResponse, RequestId, SessionResponse,
     SetupRepairPlanRequest, SetupRepairPlanResponse, SetupVerificationRequest,
     SetupVerificationResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
     provider_secret_upload_aad,
@@ -31,7 +32,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use satelle_core::session::{EffectiveModelRef, ProviderBindingRef};
-use satelle_core::{DirectHostBinding, SessionId};
+use satelle_core::{DirectHostBinding, SessionId, TurnId};
 use satelle_host::{ApiBearerToken, LogPageMode, LogPageQuery};
 use serde::de::DeserializeOwned;
 use std::fmt;
@@ -316,6 +317,24 @@ impl DaemonClient {
         &self,
     ) -> Result<crate::HostTelemetryStatusResponse, DaemonClientError> {
         let (request, request_id) = self.protected_request(Method::GET, "/v1/host/telemetry")?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn recording_preflight(
+        &self,
+        request: &RecordingPreflightRequest,
+    ) -> Result<RecordingPreflightResponse, DaemonClientError> {
+        let path = "/v1/diagnostics/recording/preflight";
+        let (request_builder, request_id) = self.protected_request(Method::POST, path)?;
+        self.send_authenticated(request_builder.json(request), request_id, StatusCode::OK)
+    }
+
+    pub fn recording_manifest(
+        &self,
+        turn_id: &TurnId,
+    ) -> Result<RecordingManifestResponse, DaemonClientError> {
+        let path = format!("/v1/diagnostics/recording/{turn_id}");
+        let (request, request_id) = self.protected_request(Method::GET, &path)?;
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 

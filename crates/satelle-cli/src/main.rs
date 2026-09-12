@@ -44,7 +44,7 @@ use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 #[cfg(any(windows, test))]
-use satelle_core::daemon_service::WindowsServiceConfigV6;
+use satelle_core::daemon_service::WindowsServiceConfigV7;
 use satelle_core::daemon_service::{
     DaemonServicePlatform, PersistentHostStoragePolicy, PersistentServiceDecision,
     SetupModeSelection, SetupModeSource,
@@ -842,6 +842,9 @@ struct HostStartCommand {
     /// Internal Host telemetry policy serialized into a managed Host launch.
     #[arg(long, hide = true, value_name = "JSON")]
     telemetry_config_json: Option<String>,
+    /// Internal Host recording policy serialized into a managed Host launch.
+    #[arg(long, hide = true, value_name = "JSON")]
+    recording_config_json: Option<String>,
     /// Internal owner-only configuration used by the per-user Windows task.
     #[arg(
         long,
@@ -1287,6 +1290,8 @@ struct RunCommand {
     #[command(flatten)]
     raw_protocol_args: RawProtocolArgs,
     #[command(flatten)]
+    recording_args: RecordingArgs,
+    #[command(flatten)]
     output_args: OutputArgs,
     #[arg(
         value_name = "PROMPT_OR_DASH",
@@ -1367,6 +1372,8 @@ struct SteerCommand {
     #[command(flatten)]
     raw_protocol_args: RawProtocolArgs,
     #[command(flatten)]
+    recording_args: RecordingArgs,
+    #[command(flatten)]
     output_args: OutputArgs,
     #[arg(
         value_name = "PROMPT_OR_DASH",
@@ -1395,6 +1402,43 @@ struct RawProtocolArgs {
         help = "Confirm this invocation's raw diagnostic warning in noninteractive mode"
     )]
     yes: bool,
+}
+
+#[derive(Args, Clone, Debug)]
+struct RecordingArgs {
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        help = "Record this prospective Turn as events, transcript, screenshots, or video"
+    )]
+    record: Option<RecordingModeArg>,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        requires = "record",
+        help = "Retain this recording for a duration such as 30m, 24h, or 7d"
+    )]
+    record_retention: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RecordingModeArg {
+    Events,
+    Transcript,
+    Screenshots,
+    Video,
+}
+
+impl From<RecordingModeArg> for satelle_core::recording::RecordingMode {
+    fn from(value: RecordingModeArg) -> Self {
+        match value {
+            RecordingModeArg::Events => Self::Events,
+            RecordingModeArg::Transcript => Self::Transcript,
+            RecordingModeArg::Screenshots => Self::Screenshots,
+            RecordingModeArg::Video => Self::Video,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -3409,6 +3453,7 @@ mod history_target_tests {
                 operator_log_retained_files: None,
                 platform_log_sink: false,
                 telemetry_config_json: None,
+                recording_config_json: None,
                 service_config: None,
                 output_args: OutputArgs::default(),
             })),
@@ -9738,7 +9783,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.sqlite_log_retention_hours.is_some()
             || command.operator_log_retained_files.is_some()
             || command.platform_log_sink
-            || command.telemetry_config_json.is_some())
+            || command.telemetry_config_json.is_some()
+            || command.recording_config_json.is_some())
     {
         return Err(SatelleError::invalid_usage(
             "--service-config is an internal Windows service input and cannot be combined with ordinary Host start options",
@@ -9759,7 +9805,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.tls_cert.is_some()
             || command.tls_key.is_some()
             || command.platform_log_sink
-            || command.telemetry_config_json.is_some())
+            || command.telemetry_config_json.is_some()
+            || command.recording_config_json.is_some())
     {
         return Err(SatelleError::invalid_usage(
             "the managed local daemon launch descriptor cannot be combined with foreground, SSH bootstrap, identity bootstrap, or TLS inputs",
@@ -9942,7 +9989,22 @@ fn start_host_daemon_with(
     if let Some(config) = forwarded_telemetry.as_ref() {
         config.endpoint().map_err(failure)?;
     }
-    let (service_path_overrides, service_storage_policy, service_telemetry) =
+    let forwarded_recording = command
+        .recording_config_json
+        .as_deref()
+        .map(serde_json::from_str::<satelle_core::recording::RecordingPolicy>)
+        .transpose()
+        .map_err(|_| {
+            failure(SatelleError::invalid_usage(
+                "the managed Host recording policy is invalid",
+            ))
+        })?;
+    if let Some(policy) = forwarded_recording.as_ref() {
+        policy
+            .validate()
+            .map_err(|error| failure(SatelleError::invalid_usage(error)))?;
+    }
+    let (service_path_overrides, service_storage_policy, service_telemetry, service_recording) =
         if let Some(_service_config_path) = command.service_config.as_deref() {
             #[cfg(not(windows))]
             return Err(failure(SatelleError::invalid_usage(
@@ -9960,6 +10022,7 @@ fn start_host_daemon_with(
                     Some(path_overrides),
                     Some(service_config.storage_policy()),
                     service_config.telemetry().cloned(),
+                    service_config.recording().cloned(),
                 )
             }
         } else if command.launchd_service {
@@ -9984,9 +10047,10 @@ fn start_host_daemon_with(
                     .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?,
                 ),
                 forwarded_telemetry.clone(),
+                forwarded_recording.clone(),
             )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
     let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
         (true, Some(scope)) => Some(scope.api_scopes()),
@@ -10125,6 +10189,7 @@ fn start_host_daemon_with(
                 .expect("persistent service path overrides were checked"),
             service_storage_policy.expect("persistent service storage policy was checked"),
             service_telemetry,
+            service_recording,
         )
         .map_err(failure)?,
         (None, _, Some(token)) => {
@@ -10135,6 +10200,7 @@ fn start_host_daemon_with(
             host_config.timeouts = forwarded_readiness_timeouts;
             host_config.platform_log_sink = command.platform_log_sink;
             host_config.telemetry = forwarded_telemetry.clone();
+            host_config.recording = forwarded_recording.clone();
             if let Some(record) = initial_identity.as_ref() {
                 let committed =
                     HostService::commit_fresh_ssh_host_identity(&state_release_root, record)
@@ -10154,7 +10220,8 @@ fn start_host_daemon_with(
         (None, None, None)
             if forwarded_readiness_timeouts.is_some()
                 || command.platform_log_sink
-                || forwarded_telemetry.is_some() =>
+                || forwarded_telemetry.is_some()
+                || forwarded_recording.is_some() =>
         {
             let mut host_config = satelle_core::SatelleConfig::defaults()
                 .hosts
@@ -10163,6 +10230,7 @@ fn start_host_daemon_with(
             host_config.timeouts = forwarded_readiness_timeouts;
             host_config.platform_log_sink = command.platform_log_sink;
             host_config.telemetry = forwarded_telemetry;
+            host_config.recording = forwarded_recording;
             HostService::production_for_host(&host_config)
         }
         (None, None, None) => HostService::production(),
@@ -10291,7 +10359,7 @@ mod daemon_process_notice_tests {
 }
 
 #[cfg(any(windows, test))]
-fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV6, CliFailure> {
+fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV7, CliFailure> {
     if !path.is_absolute() {
         return Err(failure(SatelleError::invalid_usage(
             "Windows Host service config path must be absolute",
@@ -10345,7 +10413,7 @@ mod windows_service_config_tests {
         };
         let storage_policy = PersistentHostStoragePolicy::new(3_600_000, 30 * 24, 45 * 24, 12)
             .expect("build storage policy");
-        let expected = WindowsServiceConfigV6::new("127.0.0.1:3001", &overrides, storage_policy)
+        let expected = WindowsServiceConfigV7::new("127.0.0.1:3001", &overrides, storage_policy)
             .expect("build service config");
         write_owner_only_config(
             &path,
@@ -10397,7 +10465,7 @@ mod windows_service_config_tests {
 }
 
 #[cfg(windows)]
-fn apply_windows_service_environment(config: &WindowsServiceConfigV6) {
+fn apply_windows_service_environment(config: &WindowsServiceConfigV7) {
     const PATH_OVERRIDES: [&str; 5] = [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -11001,6 +11069,7 @@ mod daemon_tls_watcher_tests {
             operator_log_retained_files: None,
             platform_log_sink: false,
             telemetry_config_json: None,
+            recording_config_json: None,
             service_config: None,
             output_args: OutputArgs::default(),
         }
@@ -11585,6 +11654,7 @@ mod bootstrap_startup_tests {
             operator_log_retained_files: None,
             platform_log_sink: false,
             telemetry_config_json: None,
+            recording_config_json: None,
             service_config: None,
             output_args: OutputArgs::default(),
         };
@@ -14728,7 +14798,7 @@ fn turn_request_construction_carries_provider_aliases_refresh_and_one_shot_opt_i
     assert_eq!(
         serde_json::to_value(request).expect("TurnRequest should serialize"),
         json!({
-            "schema_version": "satelle.api.v9",
+            "schema_version": "satelle.api.v10",
             "prompt": "inspect the desktop",
             "execution_mode": "standard",
             "model": "vision",
@@ -14776,6 +14846,98 @@ fn prepare_raw_protocol_capture(
         raw.no_input,
         raw.yes,
     )
+}
+
+fn prepare_turn_recording(
+    recording: &RecordingArgs,
+    detach: bool,
+    transport: &dyn transport::TransportClient,
+    source_host: &str,
+) -> Result<Option<satelle_core::recording::RecordingRequest>, CliFailure> {
+    let Some(mode) = recording.record.map(Into::into) else {
+        return Ok(None);
+    };
+    if detach {
+        return Err(failure(SatelleError::invalid_usage(
+            "--record cannot be combined with --detach because this invocation must show the recording artifacts and expiry",
+        )));
+    }
+    let retention_ms = recording
+        .record_retention
+        .as_deref()
+        .map(|value| {
+            satelle_core::recording::RecordingRetention::parse(value)
+                .map(|retention| retention.milliseconds())
+                .ok_or_else(|| {
+                    failure(SatelleError::invalid_usage(
+                        "--record-retention must be a positive ms, s, m, h, or d duration of at most 30d",
+                    ))
+                })
+        })
+        .transpose()?;
+    let preflight = transport
+        .recording_preflight(mode, retention_ms, source_host)
+        .map_err(failure)?;
+
+    eprintln!("Recording mode: {}", preflight.mode.as_str());
+    eprintln!("Source Host: {}", preflight.source_host);
+    eprintln!(
+        "Allowed modes: {}",
+        preflight
+            .allowed_modes
+            .iter()
+            .map(|mode| mode.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    eprintln!("Default retention: {} ms", preflight.default_retention_ms);
+    eprintln!("Maximum retention: {} ms", preflight.max_retention_ms);
+    eprintln!("Selected retention: {} ms", preflight.retention_ms);
+    eprintln!("Recording root: {}", preflight.recording_root);
+    eprintln!("Expires at: {}", preflight.expires_at);
+    eprintln!("Redaction policy: {}", preflight.redaction_policy_version);
+    eprintln!(
+        "Known unredacted risks: {}",
+        preflight.known_unredacted_risk_categories.join(", ")
+    );
+    if preflight.mode.captures_pixels() {
+        eprintln!(
+            "Warning: pixel recordings cannot redact secrets or personal data that are visible on screen."
+        );
+    } else {
+        eprintln!(
+            "Warning: text redaction is best effort and may retain unknown secrets or sensitive Turn data."
+        );
+    }
+    if !io::stdin().is_terminal() {
+        return Err(failure(SatelleError::config_error(
+            "Turn recording requires explicit interactive consent for this invocation",
+            Some(
+                "run the command from an interactive terminal and approve the recording preflight"
+                    .to_string(),
+            ),
+        )));
+    }
+    let consented = cliclack::confirm("Record this Turn with these exact settings?")
+        .initial_value(false)
+        .interact()
+        .map_err(|error| {
+            failure(SatelleError::config_error(
+                "could not read Turn recording consent",
+                Some(error.to_string()),
+            ))
+        })?;
+    if !consented {
+        return Err(failure(SatelleError::config_error(
+            "Turn recording requires explicit consent for this invocation",
+            Some("repeat the command and approve the recording preflight".to_string()),
+        )));
+    }
+    Ok(Some(satelle_core::recording::RecordingRequest::new(
+        preflight.mode,
+        preflight.retention_ms,
+        preflight.source_host,
+    )))
 }
 
 fn prepare_raw_subprocess_capture(
@@ -15299,8 +15461,18 @@ fn run_prompt(
             supported_image_media_types,
         ),
     )?;
+    let recording = report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        prepare_turn_recording(
+            &command.recording_args,
+            command.detach,
+            transport.as_ref(),
+            &host.alias,
+        ),
+    )?;
     let effective_timeouts = effective_timeouts_json(&host.config, turn_execution_timeout_ms);
-    let request = build_turn_request(
+    let mut request = build_turn_request(
         prompt,
         yolo_policy.execution_mode(),
         &provider_selection,
@@ -15309,6 +15481,9 @@ fn run_prompt(
         raw_output.as_ref().map(|_| host.alias.as_str()),
     )
     .with_attachments(attachments);
+    if let Some(recording) = recording {
+        request = request.with_recording(recording);
+    }
     if command.detach {
         let session = transport.run_detached(&request).map_err(failure)?;
         return print_detached_session(
@@ -15573,8 +15748,18 @@ fn steer_prompt(
             supported_image_media_types,
         ),
     )?;
+    let recording = report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        prepare_turn_recording(
+            &command.recording_args,
+            command.detach,
+            transport.as_ref(),
+            &host.alias,
+        ),
+    )?;
     let effective_timeouts = effective_timeouts_json(&host.config, turn_execution_timeout_ms);
-    let request = build_turn_request(
+    let mut request = build_turn_request(
         prompt,
         yolo_policy.execution_mode(),
         &provider_selection,
@@ -15583,6 +15768,9 @@ fn steer_prompt(
         raw_output.as_ref().map(|_| host.alias.as_str()),
     )
     .with_attachments(attachments);
+    if let Some(recording) = recording {
+        request = request.with_recording(recording);
+    }
     if command.detach {
         let session = transport
             .steer_detached(&session_id, &request)
@@ -16052,6 +16240,7 @@ fn print_turn_session(
         session,
         turn_id,
         provider_smoke,
+        recording,
     } = outcome;
     let target_turn = session
         .turns()
@@ -16060,6 +16249,19 @@ fn print_turn_session(
         .expect("an attached Turn outcome retains its admitted target Turn");
     let session_id = session.session_id().clone();
     if options.effective_mode == EffectiveEventMode::Json {
+        if let Some(recording) = recording {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "type": "recording_manifest",
+                    "recording": recording,
+                }))
+                .map_err(|error| failure_for_admitted_session(
+                    SatelleError::invalid_usage(error.to_string()),
+                    &session_id,
+                ))?
+            );
+        }
         return Ok(session_id);
     }
 
@@ -16075,6 +16277,7 @@ fn print_turn_session(
             "status": target_turn.state(),
             "effective_timeouts": options.effective_timeouts,
             "provider_smoke": provider_smoke,
+            "recording": recording,
             "requested_model_alias": options.provider_selection.requested_model_alias,
             "requested_provider_alias": options.provider_selection.requested_provider_alias,
             "resolved_codex_model": options.provider_validation.resolved_binding.model(),
@@ -16094,6 +16297,14 @@ fn print_turn_session(
             println!("YOLO mode: active ({})", options.yolo_policy.source);
         }
         print_session_human(&session, target_turn, options.host);
+        if let Some(recording) = recording {
+            println!("Recording expires: {}", recording.expires_at);
+            println!("Recording manifest: {}", recording.manifest_path);
+            for artifact in recording.artifacts {
+                println!("Recording artifact: {}", artifact.path);
+            }
+            println!("Recording cleanup: {}", recording.cleanup_command);
+        }
     }
     Ok(session_id)
 }

@@ -117,6 +117,41 @@ impl DirectTransport {
             .map_err(|error| map_error(&self.alias, error))
     }
 
+    async fn wait_for_recording_manifest(
+        &self,
+        turn_id: &TurnId,
+    ) -> Result<satelle_core::recording::RecordingManifest, SatelleError> {
+        for attempt in 1..=100_u32 {
+            let requested_turn_id = turn_id.clone();
+            match self
+                .blocking_http(move |client| {
+                    client
+                        .recording_manifest(&requested_turn_id)
+                        .map(satelle_transport::RecordingManifestResponse::into_manifest)
+                })
+                .await
+            {
+                Ok(manifest) => return Ok(manifest),
+                Err(error) if error.code == ErrorCode::StateConflict && attempt < 100 => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded recording manifest loop always returns")
+    }
+
+    async fn attach_recording_manifest(
+        &self,
+        mut outcome: AttachedTurnOutcome,
+        recording_requested: bool,
+    ) -> Result<AttachedTurnOutcome, SatelleError> {
+        if recording_requested {
+            outcome.recording = Some(self.wait_for_recording_manifest(&outcome.turn_id).await?);
+        }
+        Ok(outcome)
+    }
+
     pub(super) async fn reconcile(
         &self,
         session_id: &SessionId,
@@ -327,6 +362,7 @@ impl DirectTransport {
                     session,
                     turn_id,
                     provider_smoke,
+                    recording: None,
                 });
             }
             let next_event = match buffered_events.pop_front() {
@@ -411,6 +447,7 @@ impl DirectTransport {
                                         session,
                                         turn_id,
                                         provider_smoke,
+                                        recording: None,
                                     });
                                 }
                             }
@@ -419,6 +456,7 @@ impl DirectTransport {
                                 session,
                                 turn_id,
                                 provider_smoke,
+                                recording: None,
                             });
                         }
                     }
@@ -463,6 +501,7 @@ impl DirectTransport {
                             session,
                             turn_id,
                             provider_smoke,
+                            recording: None,
                         });
                     }
                     on_event(event)?;
@@ -503,6 +542,7 @@ impl DirectTransport {
                                         session,
                                         turn_id,
                                         provider_smoke,
+                                        recording: None,
                                     });
                                 }
                                 break;
@@ -524,6 +564,7 @@ impl DirectTransport {
                                             session,
                                             turn_id,
                                             provider_smoke,
+                                            recording: None,
                                         });
                                     }
                                     Ok(None) => {}
@@ -582,6 +623,7 @@ impl DirectTransport {
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
         interrupt: &dyn InterruptSource,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
+        let recording_requested = request.recording().is_some();
         interrupt.arm().await.map_err(|_| {
             TurnAdmissionFailure::not_admitted(SatelleError::host_unreachable(&self.alias))
         })?;
@@ -716,9 +758,33 @@ impl DirectTransport {
             tokio::pin!(following);
             tokio::select! {
                 biased;
-                outcome = &mut following => return outcome.map_err(|error| {
-                    TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id)
-                }),
+                outcome = &mut following => {
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(mut error) => {
+                            if recording_requested
+                                && let Ok(manifest) = self.wait_for_recording_manifest(&turn_id).await
+                            {
+                                error.details.insert(
+                                    "recording".to_string(),
+                                    serde_json::to_value(manifest).unwrap_or(serde_json::Value::Null),
+                                );
+                            }
+                            return Err(TurnAdmissionFailure::admitted(
+                                error,
+                                admitted_snapshot,
+                                turn_id,
+                            ));
+                        }
+                    };
+                    return self.attach_recording_manifest(outcome, recording_requested)
+                        .await
+                        .map_err(|error| TurnAdmissionFailure::admitted(
+                            error,
+                            admitted_snapshot,
+                            turn_id,
+                        ));
+                },
                 signal = interrupt.wait() => signal,
             }
         };
@@ -769,6 +835,7 @@ impl DirectTransport {
         on_event: &mut dyn FnMut(SatelleEvent) -> Result<(), SatelleError>,
         interrupt: &dyn InterruptSource,
     ) -> Result<AttachedTurnOutcome, TurnAdmissionFailure> {
+        let recording_requested = request.recording().is_some();
         interrupt.arm().await.map_err(|_| {
             TurnAdmissionFailure::not_admitted(SatelleError::host_unreachable(&self.alias))
         })?;
@@ -908,9 +975,33 @@ impl DirectTransport {
             tokio::pin!(following);
             tokio::select! {
                 biased;
-                outcome = &mut following => return outcome.map_err(|error| {
-                    TurnAdmissionFailure::admitted(error, admitted_snapshot, turn_id)
-                }),
+                outcome = &mut following => {
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(mut error) => {
+                            if recording_requested
+                                && let Ok(manifest) = self.wait_for_recording_manifest(&turn_id).await
+                            {
+                                error.details.insert(
+                                    "recording".to_string(),
+                                    serde_json::to_value(manifest).unwrap_or(serde_json::Value::Null),
+                                );
+                            }
+                            return Err(TurnAdmissionFailure::admitted(
+                                error,
+                                admitted_snapshot,
+                                turn_id,
+                            ));
+                        }
+                    };
+                    return self.attach_recording_manifest(outcome, recording_requested)
+                        .await
+                        .map_err(|error| TurnAdmissionFailure::admitted(
+                            error,
+                            admitted_snapshot,
+                            turn_id,
+                        ));
+                },
                 signal = interrupt.wait() => signal,
             }
         };

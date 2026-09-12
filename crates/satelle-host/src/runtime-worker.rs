@@ -264,6 +264,7 @@ pub(super) struct ExecutionPlan {
     pub(super) attachments: crate::attachment::StagedAttachments,
     pub(super) live_events: super::request::LocalLiveEventBuffer,
     pub(super) raw_protocol_capture: Option<crate::raw_diagnostics::RawProtocolCapture>,
+    pub(super) recording_capture: Option<crate::recording::RecordingCapture>,
 }
 
 #[derive(Default)]
@@ -296,6 +297,7 @@ impl RuntimeEngine {
     pub(super) fn schedule(self: &Arc<Self>, plan: ExecutionPlan) -> Result<(), SatelleError> {
         let admitted_session = plan.work.session.clone();
         let admitted_subject = plan.work.subject.clone();
+        let recording_capture = plan.recording_capture.clone();
         // Dispatch defaults are thread-local. Capture the request's effective
         // subscriber before spawning so the detached prompt lifetime remains
         // inside the same non-global tracing boundary as admission.
@@ -307,12 +309,14 @@ impl RuntimeEngine {
                 let failure =
                     model::integrity_failure("the detached runtime worker registry was poisoned");
                 self.fail_unstarted_dispatch(&admitted_session, &admitted_subject)?;
+                self.abort_recording(recording_capture.as_ref())?;
                 return Err(failure);
             }
         };
         if let Err(failure) = workers.reap_finished() {
             drop(workers);
             self.fail_unstarted_dispatch(&admitted_session, &admitted_subject)?;
+            self.abort_recording(recording_capture.as_ref())?;
             return Err(failure);
         }
         let spawned = std::thread::Builder::new()
@@ -320,10 +324,12 @@ impl RuntimeEngine {
             .spawn(move || {
                 tracing::dispatcher::with_default(&dispatch, move || {
                     let subject = plan.work.subject.clone();
+                    let panic_recording = plan.recording_capture.clone();
                     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         engine.execute(plan)
                     }));
                     if execution.is_err() {
+                        let _preserved = engine.abort_recording(panic_recording.as_ref());
                         let _preserved = engine.preserve_unknown_execution(&subject);
                     }
                 });
@@ -337,6 +343,7 @@ impl RuntimeEngine {
                 drop(workers);
                 let failure = model::background_execution_failure(error);
                 self.fail_unstarted_dispatch(&admitted_session, &admitted_subject)?;
+                self.abort_recording(recording_capture.as_ref())?;
                 Err(failure)
             }
         }
@@ -347,14 +354,80 @@ impl RuntimeEngine {
         plan: ExecutionPlan,
     ) -> Result<RuntimeTurnOutcome, RuntimeTurnFailure> {
         let subject = plan.work.subject.clone();
+        let recording = plan.recording_capture.clone();
         match self.execute_once(plan) {
-            Ok((outcome, None)) => Ok(outcome),
-            Ok((outcome, Some(error))) => Err(RuntimeTurnFailure::new(error, outcome.events)),
-            Err(failure) => match self.preserve_unknown_execution(&subject) {
-                Ok(()) => Err(failure),
-                Err(error) => Err(RuntimeTurnFailure::new(error, failure.events)),
-            },
+            Ok((mut outcome, terminal_error)) => {
+                if let Some(capture) = recording.as_ref() {
+                    match self.finish_recording(capture, &outcome.events) {
+                        Ok(manifest) => outcome.recording = Some(manifest),
+                        Err(error) => {
+                            return Err(RuntimeTurnFailure::new(error, outcome.events));
+                        }
+                    }
+                }
+                match terminal_error {
+                    None => Ok(outcome),
+                    Some(mut error) => {
+                        if let Some(manifest) = outcome.recording {
+                            error.details.insert(
+                                "recording".to_string(),
+                                serde_json::to_value(manifest).unwrap_or(serde_json::Value::Null),
+                            );
+                        }
+                        Err(RuntimeTurnFailure::new(error, outcome.events))
+                    }
+                }
+            }
+            Err(mut failure) => {
+                if let Some(capture) = recording.as_ref()
+                    && let Ok(manifest) = self.finish_recording(capture, &failure.events)
+                {
+                    failure.error.details.insert(
+                        "recording".to_string(),
+                        serde_json::to_value(manifest).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                match self.preserve_unknown_execution(&subject) {
+                    Ok(()) => Err(failure),
+                    Err(error) => Err(RuntimeTurnFailure::new(error, failure.events)),
+                }
+            }
         }
+    }
+
+    fn finish_recording(
+        &self,
+        capture: &crate::recording::RecordingCapture,
+        events: &[satelle_core::SatelleEvent],
+    ) -> Result<satelle_core::recording::RecordingManifest, SatelleError> {
+        let manifest = match capture.finish(events) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                self.abort_recording(Some(capture))?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.lock_storage()?.finish_recording(&manifest) {
+            self.abort_recording(Some(capture))?;
+            return Err(model::storage_failure(error));
+        }
+        Ok(manifest)
+    }
+
+    fn abort_recording(
+        &self,
+        capture: Option<&crate::recording::RecordingCapture>,
+    ) -> Result<(), SatelleError> {
+        let Some(capture) = capture else {
+            return Ok(());
+        };
+        let recording_id = capture.recording_id()?;
+        let directory = capture.directory()?;
+        capture.abort()?;
+        self.lock_storage()?
+            .fail_recording(&recording_id)
+            .map_err(model::storage_failure)?;
+        super::remove_recording_directory(&directory)
     }
 
     fn execute_once(
@@ -424,7 +497,8 @@ impl RuntimeEngine {
             .with_admitted_app_approval(&plan.admitted_app_approval)
             .with_resolved_provider_binding(plan.resolved_provider_binding.as_ref())
             .with_resolved_provider_secret(resolved_provider_secret)
-            .with_raw_protocol_capture(plan.raw_protocol_capture.clone()),
+            .with_raw_protocol_capture(plan.raw_protocol_capture.clone())
+            .with_recording_capture(plan.recording_capture.clone()),
         );
         if plan.raw_protocol_capture.is_some() {
             self.raw_diagnostics.complete(

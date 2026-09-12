@@ -419,11 +419,14 @@ fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
             DROP TABLE provider_smoke_hmac_key;
             ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
             ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
-            DROP INDEX control_lease_desktop_snapshot_owner;
+            DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
             DROP TABLE desktop_snapshot_audit;
             DROP TABLE raw_diagnostic_audit;
             DROP TABLE client_certificate_audit;
-            DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16, 17, 18, 19, 20, 21);
+            DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22);
             PRAGMA user_version = 11;",
         )
         .expect("restore the exact version eleven storage schema");
@@ -435,7 +438,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_current_version() {
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(21_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(22_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -446,7 +449,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_current_version() {
     assert_eq!(
         vec![
             1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64, 11_i64, 12_i64,
-            13_i64, 14_i64, 15_i64, 16_i64, 17_i64, 18_i64, 19_i64, 20_i64, 21_i64,
+            13_i64, 14_i64, 15_i64, 16_i64, 17_i64, 18_i64, 19_i64, 20_i64, 21_i64, 22_i64,
         ],
         versions
     );
@@ -539,7 +542,10 @@ fn version_fifteen_logs_upgrade_preserves_rows_and_normalizes_lifecycle_sources(
         .expect("load the version fifteen Log cursor high-water mark");
     connection
         .execute_batch(
-            "DROP INDEX control_lease_desktop_snapshot_owner;
+            "DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
              DROP TABLE desktop_snapshot_audit;
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;",
@@ -560,7 +566,7 @@ fn version_fifteen_logs_upgrade_preserves_rows_and_normalizes_lifecycle_sources(
         "the destructive log-table rewrite must retain a rollback backup",
     );
     let connection = upgraded.connection_for_test();
-    assert_eq!(21_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(22_i64, pragma_integer(connection, "user_version"));
     assert_eq!(
         (lifecycle_cursor, "codex_adapter".to_string()),
         connection
@@ -659,7 +665,7 @@ fn version_eleven_provider_smoke_rows_upgrade_to_credential_scoped_cache() {
     let mut upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade the version eleven store");
     assert_eq!(
-        21_i64,
+        22_i64,
         pragma_integer(upgraded.connection_for_test(), "user_version")
     );
     let credential_columns: i64 = upgraded
@@ -762,7 +768,10 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     storage
         .connection_for_test()
         .execute_batch(
-            "DROP INDEX control_lease_desktop_snapshot_owner;
+            "DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
              DROP TABLE desktop_snapshot_audit;
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;",
@@ -771,7 +780,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     storage
         .connection_for_test()
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21)",
+            "DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)",
             [],
         )
         .expect("remove version eleven and twelve history");
@@ -784,7 +793,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     let upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade populated version ten storage");
     let connection = upgraded.connection_for_test();
-    assert_eq!(21_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(22_i64, pragma_integer(connection, "user_version"));
     assert_eq!(
         ("run".to_string(), "in_progress".to_string()),
         connection
@@ -1029,11 +1038,14 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              DROP TABLE provider_smoke_hmac_key;
              ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
              ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
+             DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
              DROP INDEX control_lease_desktop_snapshot_owner;
              DROP TABLE desktop_snapshot_audit;
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;
-             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21);
+             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22);
              PRAGMA user_version = 7;",
         )
         .expect("recreate the version seven token schema");
@@ -1041,7 +1053,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
 
     let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
     assert_eq!(
-        21_i64,
+        22_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
     let token_state: String = storage
@@ -2300,11 +2312,14 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              ALTER TABLE api_tokens DROP COLUMN token_state;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
+             DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
              DROP INDEX control_lease_desktop_snapshot_owner;
              DROP TABLE desktop_snapshot_audit;
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -2313,7 +2328,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        21_i64,
+        22_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -2412,11 +2427,14 @@ fn assert_version_one_corruption_rejected_before_migration(
              DROP INDEX idempotency_operation_identity;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
+             DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
              DROP INDEX control_lease_desktop_snapshot_owner;
              DROP TABLE desktop_snapshot_audit;
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -2484,11 +2502,14 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              DROP INDEX idempotency_operation_identity;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
+             DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
              DROP INDEX control_lease_desktop_snapshot_owner;
              DROP TABLE desktop_snapshot_audit;
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');

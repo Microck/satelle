@@ -213,6 +213,8 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "provider_smoke_hmac_key",
             "provider_smoke_results",
             "raw_diagnostic_audit",
+            "recording_artifacts",
+            "recording_audit",
             "schema_migrations",
             "session_private_refs",
             "sessions",
@@ -285,6 +287,40 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "artifact_format",
             "artifact_byte_size",
             "status",
+        ],
+    );
+
+    // Recording content stays in owner-private files. SQLite retains only
+    // ownership, lifecycle, integrity, and cleanup metadata.
+    assert_table_columns(
+        &storage,
+        "recording_audit",
+        &[
+            "recording_id",
+            "principal_ref",
+            "session_id",
+            "turn_id",
+            "host_alias",
+            "mode",
+            "recording_directory",
+            "manifest_path",
+            "manifest_json",
+            "created_at_unix_nanos",
+            "expires_at_unix_nanos",
+            "status",
+        ],
+    );
+    assert_table_columns(
+        &storage,
+        "recording_artifacts",
+        &[
+            "recording_id",
+            "artifact_path",
+            "artifact_type",
+            "created_at_unix_nanos",
+            "sha256",
+            "byte_size",
+            "retention_state",
         ],
     );
 

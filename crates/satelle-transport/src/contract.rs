@@ -38,7 +38,8 @@ pub use session::{
     MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL, MAX_IMAGE_ATTACHMENT_COUNT,
     RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse, RawProtocolCaptureRequest,
     RawProtocolDownloadResponse, RawSubprocessBeginRequest, RawSubprocessBeginResponse,
-    RawSubprocessPrepareRequest, RawSubprocessPrepareResponse, SUPPORTED_IMAGE_MEDIA_TYPES,
+    RawSubprocessPrepareRequest, RawSubprocessPrepareResponse, RecordingManifestResponse,
+    RecordingPreflightRequest, RecordingPreflightResponse, SUPPORTED_IMAGE_MEDIA_TYPES,
     SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
 };
 pub use setup::{
@@ -61,9 +62,9 @@ pub(crate) use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v18 adds audited desktop snapshot capture and acknowledgement.
-// Older peers cannot interpret the image-bearing response, so every protected
-// operation requires the current protocol before decoding its payload.
+// Protocol v20 adds consented Turn recording preflight and manifest retrieval.
+// Older peers cannot interpret recording-bearing Turn requests, so every
+// protected operation requires the current protocol before decoding its payload.
 pub(crate) const PROTOCOL_VERSION: &str = satelle_core::host_update::HOST_PROTOCOL_VERSION;
 
 macro_rules! define_schema_token {
@@ -564,8 +565,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v19_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "19");
+    fn protocol_version_is_the_v20_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "20");
     }
 
     #[test]

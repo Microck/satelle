@@ -151,6 +151,7 @@ pub(super) fn turn_outcome(
     super::RuntimeTurnOutcome {
         session: session.to_public(),
         events,
+        recording: None,
     }
 }
 

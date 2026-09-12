@@ -31,6 +31,7 @@ pub mod ids;
 mod profiles;
 #[path = "project-config.rs"]
 mod project_config;
+pub mod recording;
 #[path = "secret-file-path.rs"]
 mod secret_file_path;
 #[path = "secure-file.rs"]
@@ -144,6 +145,7 @@ impl SatelleConfig {
                 operator_log_retained_files: None,
                 platform_log_sink: false,
                 telemetry: None,
+                recording: None,
                 desktop_user: None,
                 desktop_session_preference: None,
                 desktop_session_native_selector: None,
@@ -363,6 +365,8 @@ pub struct HostConfig {
     pub platform_log_sink: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<telemetry::TelemetryConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<recording::RecordingPolicy>,
     pub desktop_user: Option<String>,
     pub desktop_session_preference: Option<DesktopSessionPreference>,
     pub desktop_session_native_selector: Option<DesktopSessionNativeSelector>,
@@ -3444,6 +3448,7 @@ fn parse_user_config_value(
     reject_desktop_session_selector_conflicts(path, &value)?;
     reject_provider_secret_source_errors(path, &value)?;
     reject_telemetry_config_errors(path, &value)?;
+    reject_recording_config_errors(path, &value)?;
     reject_provider_binding_errors(path, &value)?;
     reject_unknown_user_config_keys(path, &value)?;
     reject_trusted_profile_errors(path, &value)?;
@@ -4249,6 +4254,37 @@ fn reject_telemetry_config_errors(path: &Path, value: &toml::Value) -> Result<()
     Ok(())
 }
 
+fn reject_recording_config_errors(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
+    let validate = |toml_path: &str, value: &toml::Value| {
+        let policy = value
+            .clone()
+            .try_into::<recording::RecordingPolicy>()
+            .map_err(|_| {
+                SatelleError::config_error(
+                    format!(
+                        "invalid recording configuration at {toml_path} in {}",
+                        path.display()
+                    ),
+                    None,
+                )
+            })?;
+        policy.validate().map_err(|message| {
+            SatelleError::config_error(
+                format!("invalid recording configuration at {toml_path}: {message}"),
+                None,
+            )
+        })
+    };
+    if let Some(hosts) = value.get("hosts").and_then(toml::Value::as_table) {
+        for (alias, host) in hosts {
+            if let Some(policy) = host.get("recording") {
+                validate(&format!("hosts.{alias}.recording"), policy)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reject_provider_binding_errors(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
     let Some(hosts) = value.get("hosts").and_then(toml::Value::as_table) else {
         return Ok(());
@@ -4468,6 +4504,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "operator_log_retained_files",
                     "platform_log_sink",
                     "telemetry",
+                    "recording",
                     "desktop_user",
                     "desktop_session_preference",
                     "desktop_session_native_selector",
@@ -4514,6 +4551,15 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                         &mut unknown_keys,
                     );
                 }
+            }
+
+            if let Some(recording) = host_table.get("recording").and_then(toml::Value::as_table) {
+                collect_unknown_keys_for_table(
+                    &format!("{host_path}.recording"),
+                    recording,
+                    &["allowed_modes", "default_retention", "max_retention"],
+                    &mut unknown_keys,
+                );
             }
 
             if let Some(certificate) = host_table
@@ -4820,6 +4866,59 @@ deployment_label = "office-host"
         ] {
             parse_user_config(Path::new("/test/config.toml"), source)
                 .expect_err("reject invalid telemetry configuration");
+        }
+    }
+}
+
+#[cfg(test)]
+mod recording_config_tests {
+    use super::*;
+
+    #[test]
+    fn user_host_policy_enables_recording_and_profile_can_only_narrow_it() {
+        let parsed = parse_user_config(
+            Path::new("/test/config.toml"),
+            r#"
+[hosts.office]
+transport = "ssh"
+address = "operator@example.test"
+adapter = "codex"
+
+[hosts.office.recording]
+allowed_modes = ["events", "transcript"]
+default_retention = "24h"
+max_retention = "7d"
+
+[profiles.audit.recording]
+allowed_modes = ["events"]
+default_retention = "12h"
+max_retention = "24h"
+"#,
+        )
+        .expect("parse recording policy");
+        let mut host = parsed.config.hosts["office"].clone();
+        parsed.profiles["audit"].apply_to_host(
+            "office",
+            &mut host,
+            ProfileSelectionSource::CliFlag,
+        );
+        let policy = host.recording.expect("effective recording policy");
+        assert!(policy.permits(recording::RecordingMode::Events, 24 * 60 * 60 * 1_000));
+        assert!(!policy.permits(recording::RecordingMode::Transcript, 1));
+    }
+
+    #[test]
+    fn recording_policy_rejects_invalid_retention_and_unknown_keys() {
+        for body in [
+            "default_retention = \"2d\"\nmax_retention = \"1d\"",
+            "default_retention = \"forever\"",
+            "redact_pixels = true",
+        ] {
+            let raw = format!(
+                "[hosts.local-demo]\ntransport = \"local\"\nadapter = \"codex\"\n[hosts.local-demo.recording]\n{body}\n"
+            );
+            parse_user_config(Path::new("/test/config.toml"), &raw)
+                .expect_err("reject invalid recording policy");
         }
     }
 }

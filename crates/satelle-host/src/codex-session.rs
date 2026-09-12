@@ -104,6 +104,7 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) image_input_mode: crate::codex_capabilities::CodexImageInputMode,
     pub(crate) attachments: &'a [crate::attachment::StagedImage],
     pub(crate) raw_protocol_capture: Option<crate::raw_diagnostics::RawProtocolCapture>,
+    pub(crate) recording_capture: Option<crate::recording::RecordingCapture>,
 }
 
 impl CodexSessionRequest<'_> {
@@ -1067,6 +1068,13 @@ impl<'a> SessionExchange<'a> {
             }
             "item/started" | "item/completed" if self.turn_dispatch_attempted => {
                 self.validate_item_correlation(object)?;
+                if let Some(capture) = self.request.recording_capture.as_ref() {
+                    let params = required_object(object, "params")?;
+                    let item = params
+                        .get("item")
+                        .ok_or(CodexSessionError::MalformedMessage)?;
+                    capture.record_protocol_item(method, item);
+                }
                 if self.requires_native_action_evidence()
                     || self.request.native_action_evidence.is_some()
                 {

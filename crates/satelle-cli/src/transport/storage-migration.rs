@@ -404,6 +404,7 @@ impl RemoteMigration {
                     &overrides,
                     resolved_persistent_storage_policy(&host.config),
                     host.config.telemetry.as_ref(),
+                    None,
                 ),
             )
             .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?

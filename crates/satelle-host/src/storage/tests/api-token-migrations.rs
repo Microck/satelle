@@ -45,7 +45,10 @@ fn version_sixteen_store_with_pending_journal(state: &TempDir) {
     connection.execute_batch(predecessor).unwrap();
     connection
         .execute_batch(
-            "DROP INDEX control_lease_desktop_snapshot_owner;
+            "DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
              DROP TABLE desktop_snapshot_audit;
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;",
@@ -53,7 +56,7 @@ fn version_sixteen_store_with_pending_journal(state: &TempDir) {
         .unwrap();
     connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (17, 18, 19, 20, 21)",
+            "DELETE FROM schema_migrations WHERE version IN (17, 18, 19, 20, 21, 22)",
             [],
         )
         .unwrap();

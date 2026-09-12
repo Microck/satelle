@@ -29,6 +29,7 @@ const PROFILE_KEYS: &[&str] = &[
     "session_metadata_retention",
     "sqlite_log_retention",
     "operator_log_retained_files",
+    "recording",
 ];
 const TIMEOUT_KEYS: &[&str] = &["native_readiness", "provider_smoke_test", "turn_execution"];
 
@@ -92,6 +93,7 @@ pub(super) struct ProfileConfig {
     session_metadata_retention: Option<RetentionDuration>,
     sqlite_log_retention: Option<RetentionDuration>,
     operator_log_retained_files: Option<usize>,
+    recording: Option<crate::recording::RecordingPolicy>,
 }
 
 impl ProfileConfig {
@@ -190,6 +192,9 @@ impl ProfileConfig {
             }
             if let Some(retained_files) = self.operator_log_retained_files {
                 host.operator_log_retained_files = Some(retained_files);
+            }
+            if let (Some(base), Some(profile)) = (&mut host.recording, &self.recording) {
+                base.narrow(profile);
             }
         }
         if source.allows_user_policy()
@@ -350,6 +355,15 @@ fn validate_profile(path: &Path, name: &str, value: &toml::Value) -> Result<(), 
     let mut unknown_keys = Vec::<UnknownConfigKey>::new();
     collect_unknown_keys_for_table(&profile_path, table, PROFILE_KEYS, &mut unknown_keys);
 
+    if let Some(recording) = table.get("recording").and_then(toml::Value::as_table) {
+        collect_unknown_keys_for_table(
+            &format!("{profile_path}.recording"),
+            recording,
+            &["allowed_modes", "default_retention", "max_retention"],
+            &mut unknown_keys,
+        );
+    }
+
     if !unknown_keys.is_empty() {
         return Err(SatelleError::unknown_config_keys(path, unknown_keys));
     }
@@ -392,6 +406,29 @@ fn validate_profile(path: &Path, name: &str, value: &toml::Value) -> Result<(), 
             ),
             None,
         ));
+    }
+    if let Some(recording) = table.get("recording") {
+        let policy = recording
+            .clone()
+            .try_into::<crate::recording::RecordingPolicy>()
+            .map_err(|_| {
+                SatelleError::config_error(
+                    format!(
+                        "config file {} has invalid {profile_path}.recording",
+                        path.display()
+                    ),
+                    None,
+                )
+            })?;
+        policy.validate().map_err(|message| {
+            SatelleError::config_error(
+                format!(
+                    "config file {} has invalid {profile_path}.recording: {message}",
+                    path.display()
+                ),
+                None,
+            )
+        })?;
     }
 
     reject_profile_interpolation(path, &profile_path, table)?;

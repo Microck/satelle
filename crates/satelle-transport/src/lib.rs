@@ -33,6 +33,7 @@ pub use contract::{
     ProviderSecretUploadEnvelope, RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse,
     RawProtocolCaptureRequest, RawProtocolDownloadResponse, RawSubprocessBeginRequest,
     RawSubprocessBeginResponse, RawSubprocessPrepareRequest, RawSubprocessPrepareResponse,
+    RecordingManifestResponse, RecordingPreflightRequest, RecordingPreflightResponse,
     RepairMaintenanceRequest, RequestId, ResolvedProviderBinding, SUPPORTED_IMAGE_MEDIA_TYPES,
     SessionResponse, SetupHistoryResponse, SetupRepairDecision, SetupRepairOperationKind,
     SetupRepairPlanAction, SetupRepairPlanRequest, SetupRepairPlanResponse,

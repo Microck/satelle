@@ -30,8 +30,8 @@ those pull requests merge, the integration branch gets a final pull request to
 | Platform-native log sinks | Optional redacted mirrors with typed Doctor health | Merged in PR #241 |
 | Setup and repair subprocess exports | Selected bounded SSH output for one consented invocation | Merged in PR #242 |
 | Desktop snapshot export | Current native desktop capture with consent, redaction, and audit metadata | Merged in PR #243 |
-| Opt-in telemetry | Independent Controller and Host OTLP/HTTP export with private bounded queues | Ready for review |
-| Recording | Per-Turn recording modes and export policy | Pending |
+| Opt-in telemetry | Independent Controller and Host OTLP/HTTP export with private bounded queues | Merged in PR #244 |
+| Recording | Per-Turn recording modes and export policy | In PR #245 |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Pending |
 | Automation | Batch, watch, webhook notifications, REPL, command history | Pending |
@@ -58,7 +58,37 @@ or approval is a blocker, never proof of implementation.
   Capture and delivery run outside command and Host request completion. Disable
   clears unsent records without collector contact.
 - `satelle telemetry status` inspects the Controller. `--host <alias>` reads the
-  authenticated Host status. Protocol v19 adds the Host status operation.
+  authenticated Host status.
+
+## Turn recording decisions
+
+Box passed workspace format and Clippy, the complete Rust workspace, all 115
+npm checks, and the production documentation build.
+
+- `run` and `steer` accept `--record events|transcript|screenshots|video` for
+  one attached prospective Turn. `--record-retention` accepts a finite duration
+  through 30 days. The Host default is 24 hours.
+- The Controller reads the live Host policy, resolved recording root, expiry,
+  redaction version, and risk categories before asking for consent. Consent is
+  interactive, defaults to no, applies once, and cannot come from `--yes`, YOLO,
+  configuration, a profile, an environment variable, or an output flag.
+- User-owned Host configuration sets `recording.allowed_modes`,
+  `recording.default_retention`, and `recording.max_retention`. A user profile
+  may only narrow those modes and durations. Recording is disabled by default.
+- Event and transcript files apply the shared text redactor before the Host
+  writes them. Screenshot and video modes warn that visible pixels cannot be
+  redacted. Pixel capture is available on macOS and Windows Hosts.
+- Screenshots are private PNG files captured at Turn boundaries. Video is a
+  private one-frame-per-second Motion PNG AVI. Recording files and their
+  manifest stay under the Host's OS-native recording root.
+- Storage schema 22 records the Principal, Session, Turn, mode, artifact path,
+  timestamp, type, SHA-256 digest, size, expiry, and retention state. SQLite
+  never stores prompts, transcripts, screenshots, video frames, or artifact
+  bytes. Startup removes abandoned and expired recording directories.
+- Attached output reports the manifest path, every artifact path, expiry, and
+  cleanup command. Remote Controllers retrieve the completed manifest through
+  the authenticated `diagnostics:sensitive` contract after terminal status.
+  Protocol v20 and `satelle.api.v10` define this recording request boundary.
 
 ## Raw protocol diagnostic decisions
 
@@ -112,7 +142,7 @@ core tests, 120 transport library tests, and 155 HTTP transport tests.
   Project configuration cannot enable it. On-demand SSH launch arguments and
   persistent launchd and Windows service definitions carry the complete
   setting to the Host.
-- The closed Windows service configuration is now `satelle.host-service.v6`.
+- The closed Windows service configuration is now `satelle.host-service.v7`.
   It requires the native sink setting. Incomplete or older service files fail
   validation and setup rewrites the canonical file.
 - Each committed SQLite log entry is formatted once as the existing redacted
@@ -302,8 +332,8 @@ plus documentation and release installation checks on all six targets.
   the selected Host. The option requires SSH or Direct transport.
 - Paths use absolute native Host syntax. The Controller neither interprets nor
   opens them. The Host applies bounded regular-file reads before admission.
-- Uploads and Host paths share a tagged attachment list in `satelle.api.v9` and
-  protocol version 17. No older request shape is accepted.
+- Uploads and Host paths share the current tagged attachment list in
+  `satelle.api.v10` and protocol version 20. No older request shape is accepted.
 - The keyed operation identity includes the path reference. A replay or
   cancellation resolves from durable admission state without reopening files.
 - Remote files share the upload limits and private staging lifecycle. Cleanup

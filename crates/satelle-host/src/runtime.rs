@@ -88,6 +88,20 @@ fn artifact_time(value: time::OffsetDateTime) -> Result<String, SatelleError> {
         .map_err(|_| model::integrity_failure("stored task artifact time is invalid"))
 }
 
+fn remove_recording_directory(path: &Path) -> Result<(), SatelleError> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SatelleError::config_error(
+            format!(
+                "recording directory '{}' could not be removed",
+                path.display()
+            ),
+            Some(error.to_string()),
+        )),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_MAINTENANCE_START_AND_RETAIN: std::cell::Cell<bool> = const {
@@ -99,6 +113,7 @@ thread_local! {
 pub(crate) struct RuntimeTurnOutcome {
     pub(crate) session: PublicSession,
     pub(crate) events: Vec<SatelleEvent>,
+    pub(crate) recording: Option<satelle_core::recording::RecordingManifest>,
 }
 
 #[derive(Debug)]
@@ -221,12 +236,18 @@ struct AdmissionExecution<'a> {
     attachments: crate::attachment::StagedAttachments,
     live_events: request::LocalLiveEventBuffer,
     raw_protocol: Option<RawCaptureAdmission>,
+    recording: Option<RecordingAdmission>,
 }
 
 struct RawCaptureAdmission {
     principal_ref: String,
     source_host: String,
     command: RawDiagnosticCommand,
+}
+
+struct RecordingAdmission {
+    principal_ref: String,
+    request: satelle_core::recording::RecordingRequest,
 }
 
 /// The Host's closed resolution result for one exact model/provider pair.
@@ -384,6 +405,7 @@ impl RuntimeTurnOutcome {
         crate::TurnOutcome {
             session: self.session,
             events: self.events,
+            recording: self.recording,
         }
     }
 }
@@ -405,7 +427,7 @@ pub(crate) struct RuntimeAdmissionReplay {
 
 pub(crate) enum RuntimeAdmissionState {
     Missing,
-    Admitted(RuntimeAdmissionReplay),
+    Admitted(Box<RuntimeAdmissionReplay>),
     Cancelled,
     RecoveryPending,
 }
@@ -671,17 +693,20 @@ pub(crate) struct RuntimeEngine {
     process_identity: ProcessIdentity,
     attachment_store: crate::attachment::AttachmentStore,
     raw_diagnostics: crate::raw_diagnostics::RawDiagnosticExports,
+    recording_root: PathBuf,
+    recording_policy: satelle_core::recording::RecordingPolicy,
     session_metadata_retention: time::Duration,
     setup_ledger_retention: time::Duration,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct RuntimeStoragePolicy {
     session_metadata_retention: time::Duration,
     sqlite_log_retention: time::Duration,
     setup_ledger_retention: time::Duration,
     operator_log_retained_files: usize,
     platform_log_sink: bool,
+    recording_policy: satelle_core::recording::RecordingPolicy,
 }
 
 impl RuntimeStoragePolicy {
@@ -707,6 +732,7 @@ impl RuntimeStoragePolicy {
                 .operator_log_retained_files
                 .unwrap_or(satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES),
             platform_log_sink: config.platform_log_sink,
+            recording_policy: config.recording.clone().unwrap_or_default(),
         }
     }
 }
@@ -719,6 +745,7 @@ impl Default for RuntimeStoragePolicy {
             setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
             operator_log_retained_files: satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
             platform_log_sink: false,
+            recording_policy: satelle_core::recording::RecordingPolicy::default(),
         }
     }
 }
@@ -800,6 +827,25 @@ impl RuntimeEngine {
         storage
             .recover_desktop_snapshots(time::OffsetDateTime::now_utc())
             .map_err(model::storage_failure)?;
+        let abandoned_recordings = storage
+            .recover_recordings()
+            .map_err(model::storage_failure)?;
+        for directory in abandoned_recordings {
+            remove_recording_directory(&directory)?;
+        }
+        storage
+            .mark_abandoned_recordings_failed()
+            .map_err(model::storage_failure)?;
+        let observed_at = time::OffsetDateTime::now_utc();
+        let expired_recordings = storage
+            .expired_recordings(observed_at)
+            .map_err(model::storage_failure)?;
+        for directory in expired_recordings {
+            remove_recording_directory(&directory)?;
+        }
+        storage
+            .mark_recordings_expired(observed_at)
+            .map_err(model::storage_failure)?;
         storage.set_log_retention(storage_policy.sqlite_log_retention);
         if let Some(fingerprinter) = provider_smoke_fingerprinter {
             let key = storage
@@ -830,6 +876,8 @@ impl RuntimeEngine {
             process_identity,
             attachment_store,
             raw_diagnostics: crate::raw_diagnostics::RawDiagnosticExports::default(),
+            recording_root: state_root.join("recordings"),
+            recording_policy: storage_policy.recording_policy.clone(),
             session_metadata_retention: storage_policy.session_metadata_retention,
             setup_ledger_retention: storage_policy.setup_ledger_retention,
         });
@@ -940,10 +988,9 @@ impl RuntimeEngine {
                         ));
                     }
                 };
-                Ok(RuntimeAdmissionState::Admitted(RuntimeAdmissionReplay {
-                    outcome,
-                    turn_id,
-                }))
+                Ok(RuntimeAdmissionState::Admitted(Box::new(
+                    RuntimeAdmissionReplay { outcome, turn_id },
+                )))
             }
         }
     }
@@ -1261,6 +1308,10 @@ impl RuntimeEngine {
                     source_host,
                     command: RawDiagnosticCommand::Run,
                 });
+        let recording = command.recording.map(|request| RecordingAdmission {
+            principal_ref: command.identity.principal_ref().to_string(),
+            request,
+        });
         self.finish_admission(
             AdmissionExecution {
                 host: command.host,
@@ -1274,6 +1325,7 @@ impl RuntimeEngine {
                 attachments,
                 live_events: command.cancellation.live_event_buffer(),
                 raw_protocol,
+                recording,
             },
             outcome,
             context.lease_owner().clone(),
@@ -1342,6 +1394,10 @@ impl RuntimeEngine {
                     source_host,
                     command: RawDiagnosticCommand::Steer,
                 });
+        let recording = command.recording.map(|request| RecordingAdmission {
+            principal_ref: command.identity.principal_ref().to_string(),
+            request,
+        });
         self.finish_admission(
             AdmissionExecution {
                 host: LOCAL_DEMO_HOST,
@@ -1355,6 +1411,7 @@ impl RuntimeEngine {
                 attachments,
                 live_events: command.cancellation.live_event_buffer(),
                 raw_protocol,
+                recording,
             },
             outcome,
             context.lease_owner().clone(),
@@ -2293,6 +2350,16 @@ impl RuntimeEngine {
                         time::OffsetDateTime::now_utc(),
                     ))
                 });
+                let recording_capture = match execution.recording {
+                    Some(recording) => Some(self.begin_recording(
+                        &recording.principal_ref,
+                        &recording.request,
+                        work.subject.session_id(),
+                        work.subject.turn_id(),
+                        execution.prompt,
+                    )?),
+                    None => None,
+                };
                 let plan = ExecutionPlan {
                     host: execution.host.to_string(),
                     prompt: execution.prompt.to_string(),
@@ -2305,6 +2372,7 @@ impl RuntimeEngine {
                     attachments: execution.attachments,
                     live_events: execution.live_events,
                     raw_protocol_capture,
+                    recording_capture,
                 };
                 match execution.dispatch_preference {
                     request::DispatchPreference::Inline => self.execute(plan),
@@ -2315,6 +2383,73 @@ impl RuntimeEngine {
                 }
             }
         }
+    }
+
+    fn begin_recording(
+        &self,
+        principal_ref: &str,
+        request: &satelle_core::recording::RecordingRequest,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        prompt: &str,
+    ) -> Result<crate::recording::RecordingCapture, SatelleError> {
+        if !self
+            .recording_policy
+            .permits(request.mode, request.retention_ms)
+        {
+            return Err(SatelleError::invalid_usage(
+                "the selected Host recording policy does not permit this mode or retention",
+            ));
+        }
+        self.cleanup_expired_recordings(time::OffsetDateTime::now_utc())?;
+        let created_at = time::OffsetDateTime::now_utc();
+        let capture = crate::recording::RecordingCapture::begin(
+            &self.recording_root,
+            request,
+            session_id.clone(),
+            turn_id.clone(),
+            prompt,
+            created_at,
+        )?;
+        let recording_id = capture.recording_id()?;
+        let directory = capture.directory()?;
+        let expires_at = capture.expires_at()?;
+        if let Err(error) = self.lock_storage()?.begin_recording(
+            &recording_id,
+            principal_ref,
+            session_id,
+            turn_id,
+            &request.source_host,
+            request.mode,
+            &directory,
+            created_at,
+            expires_at,
+        ) {
+            let _ = std::fs::remove_dir_all(directory);
+            return Err(model::storage_failure(error));
+        }
+        if let Err(error) = capture.start() {
+            let _ = self.lock_storage()?.fail_recording(&recording_id);
+            let _ = std::fs::remove_dir_all(directory);
+            return Err(error);
+        }
+        Ok(capture)
+    }
+
+    fn cleanup_expired_recordings(
+        &self,
+        observed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        let directories = self
+            .lock_storage()?
+            .expired_recordings(observed_at)
+            .map_err(model::storage_failure)?;
+        for directory in directories {
+            remove_recording_directory(&directory)?;
+        }
+        self.lock_storage()?
+            .mark_recordings_expired(observed_at)
+            .map_err(model::storage_failure)
     }
 
     fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
@@ -2717,6 +2852,54 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    pub(crate) fn recording_preflight(
+        &self,
+        mode: satelle_core::recording::RecordingMode,
+        retention_ms: Option<u64>,
+        source_host: &str,
+    ) -> Result<satelle_core::recording::RecordingPreflight, SatelleError> {
+        if mode.captures_pixels() && !cfg!(any(target_os = "macos", target_os = "windows")) {
+            return Err(SatelleError::invalid_usage(
+                "screenshots and video recording are supported only on macOS and Windows Hosts",
+            ));
+        }
+        let lazy = self
+            .lazy
+            .lock()
+            .map_err(|_| integrity_error("the lazy runtime lock was poisoned"))?;
+        let policy = &lazy.storage_policy.recording_policy;
+        let retention_ms = retention_ms.unwrap_or(policy.default_retention.milliseconds());
+        let recording_root = lazy.state_root.clone()?.join("recordings");
+        satelle_core::recording::RecordingPreflight::new(
+            mode,
+            source_host,
+            policy,
+            recording_root.display().to_string(),
+            retention_ms,
+            time::OffsetDateTime::now_utc(),
+        )
+        .ok_or_else(|| {
+            SatelleError::config_error(
+                "the selected Host policy does not permit this recording",
+                Some(format!(
+                    "mode={} retention_ms={retention_ms}",
+                    mode.as_str()
+                )),
+            )
+        })
+    }
+
+    pub(crate) fn recording_manifest(
+        &self,
+        principal_ref: &str,
+        turn_id: &TurnId,
+    ) -> Result<Option<satelle_core::recording::RecordingManifest>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .recording_manifest(principal_ref, turn_id)
+            .map_err(model::storage_failure)
+    }
+
     pub(crate) fn readiness_probe_timeouts(&self) -> (std::time::Duration, std::time::Duration) {
         self.readiness_probe_driver.as_ref().map_or(
             (
@@ -4702,7 +4885,7 @@ impl RuntimeHandle {
             Arc::clone(&self.adapter),
             self.readiness_probe_driver.clone(),
             lazy.provider_policy.clone(),
-            lazy.storage_policy,
+            lazy.storage_policy.clone(),
             lazy.provider_smoke_fingerprinter.clone(),
         )?;
         lazy.engine = Some(Arc::clone(&engine));

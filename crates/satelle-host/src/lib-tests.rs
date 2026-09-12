@@ -94,6 +94,7 @@ fn production_service_reports_the_frozen_service_config_path_set() {
         )
         .expect("valid persistent storage policy"),
         None,
+        None,
     )
     .expect("valid persistent service configuration");
     let paths = service

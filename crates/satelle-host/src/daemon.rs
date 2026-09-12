@@ -192,6 +192,7 @@ pub struct TurnIntent {
     turn_execution_timeout: Option<satelle_core::session::TimeoutPolicy>,
     attachments: Vec<crate::attachment::AcceptedImageAttachment>,
     raw_protocol_source_host: Option<String>,
+    recording: Option<satelle_core::recording::RecordingRequest>,
 }
 
 impl TurnIntent {
@@ -210,6 +211,7 @@ impl TurnIntent {
             turn_execution_timeout: None,
             attachments: Vec::new(),
             raw_protocol_source_host: None,
+            recording: None,
         })
     }
 
@@ -295,6 +297,25 @@ impl TurnIntent {
         Ok(self)
     }
 
+    pub fn with_recording(
+        mut self,
+        recording: Option<satelle_core::recording::RecordingRequest>,
+    ) -> Result<Self, TurnIntentError> {
+        if recording.as_ref().is_some_and(|request| {
+            request.source_host.is_empty()
+                || request.source_host.len() > 256
+                || request.source_host.chars().any(char::is_control)
+                || satelle_core::recording::RecordingRetention::from_milliseconds(
+                    request.retention_ms,
+                )
+                .is_none()
+        }) {
+            return Err(TurnIntentError::InvalidRecordingRequest);
+        }
+        self.recording = recording;
+        Ok(self)
+    }
+
     pub(crate) fn prompt(&self) -> &str {
         &self.prompt
     }
@@ -314,6 +335,10 @@ impl TurnIntent {
     pub(crate) fn raw_protocol_source_host(&self) -> Option<&str> {
         self.raw_protocol_source_host.as_deref()
     }
+
+    pub(crate) const fn recording(&self) -> Option<&satelle_core::recording::RecordingRequest> {
+        self.recording.as_ref()
+    }
 }
 
 impl fmt::Debug for TurnIntent {
@@ -327,6 +352,10 @@ impl fmt::Debug for TurnIntent {
             .field(
                 "raw_protocol_capture",
                 &self.raw_protocol_source_host.is_some(),
+            )
+            .field(
+                "recording",
+                &self.recording.as_ref().map(|request| request.mode),
             )
             .finish_non_exhaustive()
     }
@@ -346,6 +375,8 @@ pub enum TurnIntentError {
     InvalidAttachments,
     #[error("the raw protocol source Host alias is invalid")]
     InvalidRawProtocolSourceHost,
+    #[error("the recording request is invalid")]
+    InvalidRecordingRequest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -597,6 +628,26 @@ impl HostService {
                 satelle_core::telemetry::TelemetryComponent::Host,
             )),
         }
+    }
+
+    /// Resolves the live Host recording policy and storage path before the
+    /// Controller asks for consent. Admission validates the same policy again.
+    pub fn recording_preflight(
+        &self,
+        mode: satelle_core::recording::RecordingMode,
+        retention_ms: Option<u64>,
+        source_host: &str,
+    ) -> Result<satelle_core::recording::RecordingPreflight, SatelleError> {
+        self.runtime
+            .recording_preflight(mode, retention_ms, source_host)
+    }
+
+    pub fn recording_manifest(
+        &self,
+        principal_ref: &str,
+        turn_id: &TurnId,
+    ) -> Result<Option<satelle_core::recording::RecordingManifest>, SatelleError> {
+        self.runtime.recording_manifest(principal_ref, turn_id)
     }
 
     /// Lets the transport skip task scheduling entirely when telemetry is off.
@@ -2198,7 +2249,7 @@ fn durable_admission_outcome(
             crate::operation_capacity::DurableAdmissionOutcome::RecoveryPending
         }
         crate::runtime::RuntimeAdmissionState::Admitted(replay) => {
-            let (session, turn_id) = replay.into_parts();
+            let (session, turn_id) = (*replay).into_parts();
             crate::operation_capacity::DurableAdmissionOutcome::Admitted(
                 crate::operation_capacity::OperationOutcome::admission(session, turn_id),
             )
