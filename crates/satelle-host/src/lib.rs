@@ -97,12 +97,12 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, Weak};
 use std::time::{Duration, Instant};
 use storage::Storage;
 pub use storage::{
-    OperatorLogFailureKind, OperatorLogSinkHealth, SetupActionCounts, SetupActionPlan,
-    SetupActionRecord, SetupActionSkipReason, SetupActionStatus, SetupHistory, SetupOperationKind,
-    SetupRepairAction, SetupRepairDecision, SetupRepairPlan, SetupRepairPostcondition,
-    SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, SetupRunSummary,
-    StorageMigrationCleanup, StorageMigrationItem, StorageMigrationItemKind, StorageMigrationPlan,
-    StorageMigrationStage,
+    OperatorLogFailureKind, OperatorLogSinkHealth, PlatformLogFailureKind, PlatformLogSinkHealth,
+    SetupActionCounts, SetupActionPlan, SetupActionRecord, SetupActionSkipReason,
+    SetupActionStatus, SetupHistory, SetupOperationKind, SetupRepairAction, SetupRepairDecision,
+    SetupRepairPlan, SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan, SetupRunRecord,
+    SetupRunStatus, SetupRunSummary, StorageMigrationCleanup, StorageMigrationItem,
+    StorageMigrationItemKind, StorageMigrationPlan, StorageMigrationStage,
 };
 use zeroize::Zeroizing;
 
@@ -3343,6 +3343,7 @@ impl HostService {
             })?,
         );
         config.operator_log_retained_files = Some(storage_policy.operator_log_retained_files());
+        config.platform_log_sink = storage_policy.platform_log_sink();
         Ok(Self::production_for_host(&config))
     }
 
@@ -3520,7 +3521,7 @@ impl HostService {
         options: DoctorOptions,
         provider_intent: &ProviderComputerUseIntent,
     ) -> DoctorExecutionResult {
-        match &self.mode {
+        let report = match &self.mode {
             HostMode::Production { snapshot, .. } => production_doctor_with_provider_intent(
                 self,
                 host,
@@ -3540,7 +3541,16 @@ impl HostService {
                     provider_intent,
                 )
                 .map_err(DoctorExecutionFailure::from),
-        }
+        };
+        report.map(|mut report| {
+            if scope_selection.contains(DoctorScope::Config)
+                && let Ok(PlatformLogSinkHealth::Degraded(kind)) =
+                    self.runtime.platform_log_sink_health()
+            {
+                apply_platform_log_sink_finding(&mut report, kind);
+            }
+            report
+        })
     }
 
     /// Runs Host-owned diagnostics when the controller is connected over a
@@ -6952,6 +6962,33 @@ fn recompute_doctor_summary(report: &mut DoctorReport) {
         .collect();
     report.recovery_commands.sort();
     report.recovery_commands.dedup();
+}
+
+fn apply_platform_log_sink_finding(report: &mut DoctorReport, failure: PlatformLogFailureKind) {
+    let finding_id = "config.platform_log_sink.degraded".to_string();
+    report.findings.push(DoctorFinding {
+        finding_id: finding_id.clone(),
+        scope: DoctorScope::Config.as_str().to_string(),
+        severity: "warning".to_string(),
+        fixability: DoctorFixability::Informational,
+        readiness_impact: "ready".to_string(),
+        summary: "the platform-native log mirror is degraded".to_string(),
+        evidence: vec![format!("failure={}", failure.as_str())],
+        recovery_command: None,
+    });
+    if let Some(probe) = report
+        .probe_results
+        .iter_mut()
+        .find(|probe| probe.scope == DoctorScope::Config.as_str())
+    {
+        probe.finding_ids.push(finding_id);
+    }
+    report.findings.sort_by(|left, right| {
+        left.scope
+            .cmp(&right.scope)
+            .then(left.finding_id.cmp(&right.finding_id))
+    });
+    report.summary.informational_findings += 1;
 }
 
 fn execution_blocker(verdict: &Phase0SupportVerdict) -> SatelleError {

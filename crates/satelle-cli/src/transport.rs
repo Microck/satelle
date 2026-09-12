@@ -3,7 +3,7 @@ use crate::{CliFailure, SelectedHost, bootstrap_lock, failure, on_demand_idle_ti
 use satelle_core::AdapterKind;
 use satelle_core::daemon_service::{
     DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentHostStoragePolicy,
-    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV4, WindowsTaskDefinition,
+    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV5, WindowsTaskDefinition,
 };
 use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
@@ -1796,7 +1796,7 @@ fn coordinate_setup(
 enum PreparedPersistentService {
     Windows {
         task: Box<WindowsTaskDefinition>,
-        config: Box<WindowsServiceConfigV4>,
+        config: Box<WindowsServiceConfigV5>,
     },
     Launchd(ssh_bootstrap::LaunchdServiceDefinition),
 }
@@ -2786,7 +2786,7 @@ impl SshSetupTransport {
                         artifact,
                     )
                     .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
-                let config = WindowsServiceConfigV4::new(
+                let config = WindowsServiceConfigV5::new(
                     "127.0.0.1:3001",
                     daemon_path_overrides,
                     storage_policy,

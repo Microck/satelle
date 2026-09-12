@@ -138,6 +138,7 @@ impl SatelleConfig {
                 session_metadata_retention: None,
                 sqlite_log_retention: None,
                 operator_log_retained_files: None,
+                platform_log_sink: false,
                 desktop_user: None,
                 desktop_session_preference: None,
                 desktop_session_native_selector: None,
@@ -349,6 +350,8 @@ pub struct HostConfig {
     pub session_metadata_retention: Option<RetentionDuration>,
     pub sqlite_log_retention: Option<RetentionDuration>,
     pub operator_log_retained_files: Option<usize>,
+    #[serde(default)]
+    pub platform_log_sink: bool,
     pub desktop_user: Option<String>,
     pub desktop_session_preference: Option<DesktopSessionPreference>,
     pub desktop_session_native_selector: Option<DesktopSessionNativeSelector>,
@@ -4267,6 +4270,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "session_metadata_retention",
                     "sqlite_log_retention",
                     "operator_log_retained_files",
+                    "platform_log_sink",
                     "desktop_user",
                     "desktop_session_preference",
                     "desktop_session_native_selector",
@@ -4506,7 +4510,7 @@ mod session_metadata_retention_tests {
     fn host_retention_and_operator_log_count_validate_at_config_boundary() {
         let parsed = parse_user_config(
             Path::new("/test/config.toml"),
-            "[hosts.local-demo]\ntransport = \"local\"\nadapter = \"codex\"\nsession_metadata_retention = \"30d\"\nsqlite_log_retention = \"45d\"\noperator_log_retained_files = 12\n",
+            "[hosts.local-demo]\ntransport = \"local\"\nadapter = \"codex\"\nsession_metadata_retention = \"30d\"\nsqlite_log_retention = \"45d\"\noperator_log_retained_files = 12\nplatform_log_sink = true\n",
         )
         .expect("parse bounded retention policy");
         let host = parsed.config.hosts.get(LOCAL_DEMO_HOST).unwrap();
@@ -4515,6 +4519,7 @@ mod session_metadata_retention_tests {
             30 * 24
         );
         assert_eq!(host.operator_log_retained_files, Some(12));
+        assert!(host.platform_log_sink);
         assert_eq!(host.sqlite_log_retention.as_ref().unwrap().hours(), 45 * 24);
 
         for field in [

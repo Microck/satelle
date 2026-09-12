@@ -247,7 +247,11 @@ fn operator_log_mirror_applies_reduced_retention_without_a_new_record() {
         .expect("write rotated operator log");
     }
 
-    let mirror = OperatorLogMirror::new(OperatorLogPolicy::for_test(log_root.clone(), 1, 2), 0);
+    let mirror = CommittedLogMirrors::new(
+        OperatorLogPolicy::for_test(log_root.clone(), 1, 2),
+        0,
+        false,
+    );
 
     assert_eq!(mirror.health(), OperatorLogSinkHealth::Healthy);
     assert!(log_root.join("satelle-host.log").exists());

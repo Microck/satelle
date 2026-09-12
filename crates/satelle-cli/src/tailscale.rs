@@ -816,6 +816,7 @@ mod tests {
             session_metadata_retention: None,
             sqlite_log_retention: None,
             operator_log_retained_files: None,
+            platform_log_sink: false,
             desktop_user: None,
             desktop_session_preference: None,
             desktop_session_native_selector: None,

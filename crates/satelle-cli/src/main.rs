@@ -44,7 +44,7 @@ use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 #[cfg(any(windows, test))]
-use satelle_core::daemon_service::WindowsServiceConfigV4;
+use satelle_core::daemon_service::WindowsServiceConfigV5;
 use satelle_core::daemon_service::{
     DaemonServicePlatform, PersistentHostStoragePolicy, PersistentServiceDecision,
     SetupModeSelection, SetupModeSource,
@@ -747,6 +747,9 @@ struct HostStartCommand {
     /// Internal resolved Operator Log File generation count for launchd.
     #[arg(long, hide = true, value_name = "COUNT", requires = "launchd_service")]
     operator_log_retained_files: Option<usize>,
+    /// Internal resolved platform-native log mirror opt-in for managed Host launches.
+    #[arg(long, hide = true)]
+    platform_log_sink: bool,
     /// Internal owner-only configuration used by the per-user Windows task.
     #[arg(
         long,
@@ -2902,6 +2905,7 @@ mod history_target_tests {
                 session_metadata_retention_hours: None,
                 sqlite_log_retention_hours: None,
                 operator_log_retained_files: None,
+                platform_log_sink: false,
                 service_config: None,
                 output_args: OutputArgs::default(),
             })),
@@ -8956,7 +8960,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.setup_ledger_retention_ms.is_some()
             || command.session_metadata_retention_hours.is_some()
             || command.sqlite_log_retention_hours.is_some()
-            || command.operator_log_retained_files.is_some())
+            || command.operator_log_retained_files.is_some()
+            || command.platform_log_sink)
     {
         return Err(SatelleError::invalid_usage(
             "--service-config is an internal Windows service input and cannot be combined with ordinary Host start options",
@@ -8975,7 +8980,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.initial_identity_operation_id.is_some()
             || command.initial_identity_record.is_some()
             || command.tls_cert.is_some()
-            || command.tls_key.is_some())
+            || command.tls_key.is_some()
+            || command.platform_log_sink)
     {
         return Err(SatelleError::invalid_usage(
             "the managed local daemon launch descriptor cannot be combined with foreground, SSH bootstrap, identity bootstrap, or TLS inputs",
@@ -9179,6 +9185,7 @@ fn start_host_daemon_with(
                             .operator_log_retained_files
                             .expect("launchd Operator Log retention was validated"),
                     )
+                    .map(|policy| policy.with_platform_log_sink(command.platform_log_sink))
                     .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?,
                 ),
             )
@@ -9329,6 +9336,7 @@ fn start_host_daemon_with(
                 .remove(LOCAL_DEMO_HOST)
                 .expect("the built-in local Host config exists");
             host_config.timeouts = forwarded_readiness_timeouts;
+            host_config.platform_log_sink = command.platform_log_sink;
             if let Some(record) = initial_identity.as_ref() {
                 let committed =
                     HostService::commit_fresh_ssh_host_identity(&state_release_root, record)
@@ -9345,17 +9353,18 @@ fn start_host_daemon_with(
             )
         }
         (None, Some(host), None) => HostService::production_for_host(&host.config),
-        (None, None, None) => match forwarded_readiness_timeouts {
-            Some(timeouts) => {
-                let mut host_config = satelle_core::SatelleConfig::defaults()
-                    .hosts
-                    .remove(LOCAL_DEMO_HOST)
-                    .expect("the built-in local Host config exists");
-                host_config.timeouts = Some(timeouts);
-                HostService::production_for_host(&host_config)
-            }
-            None => HostService::production(),
-        },
+        (None, None, None)
+            if forwarded_readiness_timeouts.is_some() || command.platform_log_sink =>
+        {
+            let mut host_config = satelle_core::SatelleConfig::defaults()
+                .hosts
+                .remove(LOCAL_DEMO_HOST)
+                .expect("the built-in local Host config exists");
+            host_config.timeouts = forwarded_readiness_timeouts;
+            host_config.platform_log_sink = command.platform_log_sink;
+            HostService::production_for_host(&host_config)
+        }
+        (None, None, None) => HostService::production(),
     };
     // The service retained only the verifier. Zeroize the raw bootstrap token
     // before the listener starts accepting requests.
@@ -9481,7 +9490,7 @@ mod daemon_process_notice_tests {
 }
 
 #[cfg(any(windows, test))]
-fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV4, CliFailure> {
+fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV5, CliFailure> {
     if !path.is_absolute() {
         return Err(failure(SatelleError::invalid_usage(
             "Windows Host service config path must be absolute",
@@ -9535,7 +9544,7 @@ mod windows_service_config_tests {
         };
         let storage_policy = PersistentHostStoragePolicy::new(3_600_000, 30 * 24, 45 * 24, 12)
             .expect("build storage policy");
-        let expected = WindowsServiceConfigV4::new("127.0.0.1:3001", &overrides, storage_policy)
+        let expected = WindowsServiceConfigV5::new("127.0.0.1:3001", &overrides, storage_policy)
             .expect("build service config");
         write_owner_only_config(
             &path,
@@ -9587,7 +9596,7 @@ mod windows_service_config_tests {
 }
 
 #[cfg(windows)]
-fn apply_windows_service_environment(config: &WindowsServiceConfigV4) {
+fn apply_windows_service_environment(config: &WindowsServiceConfigV5) {
     const PATH_OVERRIDES: [&str; 5] = [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -10189,6 +10198,7 @@ mod daemon_tls_watcher_tests {
             session_metadata_retention_hours: None,
             sqlite_log_retention_hours: None,
             operator_log_retained_files: None,
+            platform_log_sink: false,
             service_config: None,
             output_args: OutputArgs::default(),
         }
@@ -10771,6 +10781,7 @@ mod bootstrap_startup_tests {
             session_metadata_retention_hours: None,
             sqlite_log_retention_hours: None,
             operator_log_retained_files: None,
+            platform_log_sink: false,
             service_config: None,
             output_args: OutputArgs::default(),
         };

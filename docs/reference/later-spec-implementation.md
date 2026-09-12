@@ -27,6 +27,7 @@ those pull requests merge, the integration branch gets a final pull request to
 | Output formats | Lossless final results and fixed-column CSV | Merged in PR #226 |
 | Support bundle history | Bounded, redacted Host setup-ledger summaries | Merged in PR #238 |
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit | Ready for review |
+| Platform-native log sinks | Optional redacted mirrors with typed Doctor health | Ready for review |
 | Capture and observability | Raw protocol/subprocess exports, desktop snapshot, recording, native log sinks, telemetry | Pending |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Pending |
@@ -56,6 +57,26 @@ or approval is a blocker, never proof of implementation.
 - The Controller writes one new owner-only local file without replacement,
   verifies its exact bytes, then acknowledges success. Failure reports the
   staging path, cleanup command, and whether raw material may remain.
+
+## Platform-native log sink decisions
+
+- A user-owned Host Binding enables the mirror with `platform_log_sink = true`.
+  Project configuration cannot enable it. On-demand SSH launch arguments and
+  persistent launchd and Windows service definitions carry the complete
+  setting to the Host.
+- The closed Windows service configuration is now `satelle.host-service.v5`.
+  It requires the native sink setting. Incomplete or older service files fail
+  validation and setup rewrites the canonical file.
+- Each committed SQLite log entry is formatted once as the existing redacted
+  operator-log summary. The same line goes to the operator log file and to
+  journald, Windows Event Log, or macOS unified logging.
+- The native sink is best effort. A failed write advances the mirror cursor,
+  leaves SQLite and the daemon running, and reports a typed informational
+  `config.platform_log_sink.degraded` Doctor finding. A later successful write
+  clears the degraded health.
+- The operating system owns native log retention and queries. Native logging
+  does not change SQLite retention, operator-log rotation, `satelle logs`,
+  status, recovery, or support bundles.
 
 ## Host storage migration contract decisions
 

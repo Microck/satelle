@@ -32,6 +32,7 @@ provider_smoke_failure_cache_ttl = "10m"
 session_metadata_retention = "30d"
 sqlite_log_retention = "45d"
 operator_log_retained_files = 12
+platform_log_sink = false
 yolo = false
 
 [hosts.local-demo.timeouts]
@@ -47,6 +48,13 @@ Source descriptors. `session_metadata_retention` and `sqlite_log_retention`
 accept `h` or `d` values from 7 days through 365 days. They are independent.
 `operator_log_retained_files` keeps 1 through 100 rotated 10 MiB files and does
 not change SQLite log retention.
+
+Set `platform_log_sink = true` on a user-owned Host Binding to mirror the same
+redacted summaries to journald on Linux, Windows Event Log, or macOS unified
+logging. The setting is off by default. The operating system owns retention and
+queries for this mirror. A sink failure appears as an informational `config`
+Doctor finding and never changes SQLite logs, operator log files, or daemon
+availability. Project configuration cannot enable the sink.
 
 The duration parser requires explicit units such as `500ms`, `30s`, or `2m`.
 Configuration does not perform environment-variable interpolation.
