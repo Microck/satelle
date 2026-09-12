@@ -95,11 +95,12 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, Weak};
 use std::time::{Duration, Instant};
 use storage::Storage;
 pub use storage::{
-    OperatorLogFailureKind, OperatorLogSinkHealth, SetupActionPlan, SetupActionRecord,
-    SetupActionSkipReason, SetupActionStatus, SetupOperationKind, SetupRepairAction,
-    SetupRepairDecision, SetupRepairPlan, SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan,
-    SetupRunRecord, SetupRunStatus, StorageMigrationCleanup, StorageMigrationItem,
-    StorageMigrationItemKind, StorageMigrationPlan, StorageMigrationStage,
+    OperatorLogFailureKind, OperatorLogSinkHealth, SetupActionCounts, SetupActionPlan,
+    SetupActionRecord, SetupActionSkipReason, SetupActionStatus, SetupHistory, SetupOperationKind,
+    SetupRepairAction, SetupRepairDecision, SetupRepairPlan, SetupRepairPostcondition,
+    SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, SetupRunSummary,
+    StorageMigrationCleanup, StorageMigrationItem, StorageMigrationItemKind, StorageMigrationPlan,
+    StorageMigrationStage,
 };
 use zeroize::Zeroizing;
 
@@ -3162,6 +3163,10 @@ impl HostService {
 
     pub fn load_setup_run(&self, run_id: &str) -> Result<Option<SetupRunRecord>, SatelleError> {
         self.runtime.load_setup_run(run_id)
+    }
+
+    pub fn setup_history(&self) -> Result<SetupHistory, SatelleError> {
+        self.runtime.setup_history()
     }
 
     /// Plans repair from current live postconditions. Retained ledger records

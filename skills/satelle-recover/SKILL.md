@@ -45,6 +45,8 @@ For MCP failures, first confirm whether the server was intentionally started wit
 
 6. Escalate with a support bundle only after normal diagnostics are insufficient.
 
-Prefer redacted diagnostic bundles when the current binary exposes them. Avoid raw exports, screenshots, recordings, full transcripts, and provider payloads unless the user explicitly requests them.
+Use `satelle support bundle --host <alias> --output <path> --json` with a user-selected local destination. The archive includes redacted configuration shape, versions, readiness, normalized logs, transport diagnostics, and the 200 most recent setup-ledger summaries. Its manifest lists unavailable categories under `not_collected`; a partial bundle is evidence of those collection failures, not proof that the Host has no history.
 
-Completion criterion: the artifact scope and sensitivity are clear before capture.
+For an authorized noninteractive export, also pass `--no-input --yes`. Satelle does not upload the archive. Inspect its contents before sharing it, and request separate permission before any upload. Avoid raw exports, screenshots, recordings, full transcripts, and provider payloads unless the user explicitly requests them.
+
+Completion criterion: the local output path, collected categories, missing categories, and remaining sensitivity are clear. Preserve the original failure and recovery evidence alongside the bundle report.

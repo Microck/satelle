@@ -48,6 +48,7 @@ impl ProviderSecretUploadCapability {
 }
 define_schema_token!(HostStatusSchema, "satelle.host.status.v1");
 define_schema_token!(HostPathsSchema, "satelle.host.paths.v1");
+define_schema_token!(SetupHistorySchema, "satelle.setup-history.v1");
 define_schema_token!(
     HostDesktopSessionsSchema,
     "satelle.host.desktop-sessions.v1"
@@ -81,6 +82,7 @@ enum Operation {
     MaintenanceUpdateEvidence,
     HostStatus,
     HostPaths,
+    SetupHistory,
     HostDesktopSessions,
     SessionCreate,
     TurnCreate,
@@ -110,6 +112,7 @@ impl Operation {
             Self::MaintenanceUpdateEvidence => "maintenance_update_evidence",
             Self::HostStatus => "host_status",
             Self::HostPaths => "host_paths",
+            Self::SetupHistory => "setup_history",
             Self::HostDesktopSessions => "host_desktop_sessions",
             Self::SessionCreate => "session_create",
             Self::TurnCreate => "turn_create",
@@ -341,6 +344,7 @@ impl CapabilitiesResponse {
                 Operation::StorageMigrationComplete,
                 Operation::StorageMigrationSourcePlan,
                 Operation::StorageMigrationSourceCleanup,
+                Operation::SetupHistory,
             ],
             runtime_capabilities: RuntimeCapabilities {
                 codex_runtime,
@@ -598,6 +602,44 @@ impl AuthenticatedResponseContract for HostPathsResponse {
 
     fn host_identity(&self) -> &str {
         self.host_identity()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetupHistoryResponse {
+    schema_version: SetupHistorySchema,
+    request_id: RequestId,
+    host_identity: String,
+    history: satelle_host::SetupHistory,
+}
+
+impl SetupHistoryResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        history: satelle_host::SetupHistory,
+    ) -> Self {
+        Self {
+            schema_version: SetupHistorySchema,
+            request_id,
+            host_identity,
+            history,
+        }
+    }
+
+    pub fn into_history(self) -> satelle_host::SetupHistory {
+        self.history
+    }
+}
+
+impl AuthenticatedResponseContract for SetupHistoryResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
     }
 }
 

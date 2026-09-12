@@ -175,12 +175,13 @@ fn export_bundle(
         }
     }
 
-    // The Host diagnostic APIs do not expose setup ledger summaries yet, so
-    // the bundle reports the category as not_collected instead of guessing.
-    not_collected.push(NotCollectedCategory {
-        category: "setup_ledger".to_string(),
-        reason: "setup ledger summaries are not exposed by the Host diagnostic APIs".to_string(),
-    });
+    collect_file(
+        "setup_ledger",
+        &mut included,
+        &mut not_collected,
+        &mut files,
+        setup_history_json(&host),
+    );
 
     collect_file(
         "errors",
@@ -330,6 +331,14 @@ fn logs_json(host: &SelectedHost) -> Result<Value, String> {
         .logs(&query)
         .map_err(|error| error.message)?;
     serde_json::to_value(page.entries()).map_err(|error| error.to_string())
+}
+
+fn setup_history_json(host: &SelectedHost) -> Result<Value, String> {
+    let history = transport_for(host)
+        .map_err(collection_error)?
+        .setup_history()
+        .map_err(|error| error.message)?;
+    serde_json::to_value(history).map_err(|error| error.to_string())
 }
 
 fn transport_json(host: &SelectedHost) -> Result<Value, String> {

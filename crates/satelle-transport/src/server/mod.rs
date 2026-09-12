@@ -990,6 +990,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         .route("/v1/setup/api-token/current", get(setup::confirm_api_token))
         .route("/v1/host/status", get(host_status))
         .route("/v1/host/paths", get(host_paths))
+        .route("/v1/diagnostics/setup-history", get(setup_history))
         .route("/v1/host/desktop-sessions", get(host_desktop_sessions))
         .route("/v1/sessions/{session_id}", get(sessions::get_session))
         .route(
@@ -1512,6 +1513,28 @@ async fn host_paths(
     authenticated_json_response(
         StatusCode::OK,
         &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn setup_history(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let history = match tokio::task::spawn_blocking(move || service.setup_history()).await {
+        Ok(Ok(history)) => history,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    authenticated_json_response(
+        StatusCode::OK,
+        &crate::SetupHistoryResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            history,
+        ),
         authorized.request_id(),
         &state.host_identity,
     )
