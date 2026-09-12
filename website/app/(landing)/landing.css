@@ -86,7 +86,7 @@
 
 .sa {
   /* Light ramp: the same hue drift run the other way, from a near-white ground
-     to the logo's own ink at step 12. satelle-logo-dark.svg exists precisely for
+     to the logo's own ink at step 12. assets/brand/satelle-logo-dark.svg exists precisely for
      this surface. Every step is inside sRGB.
        sa-10 4.86:1, sa-11 7.50:1, sa-12 18.48:1 on the ground. */
   --sa-0: #FFFFFF;
@@ -156,7 +156,7 @@
   --grid-gutter: var(--space-m);
   --grid-edge: max(var(--grid-gutter), (100% - var(--grid-max-width)) / 2);
   --measure: 34rem;
-  /* v12's hero text column measures 832px. Its section copy is narrower. */
+  /* The hero text column measures 832px. Section copy is narrower. */
   --measure-hero: 52rem;
 
   --radius-sm: 0.25rem;
@@ -295,9 +295,8 @@
   margin: 0;
 }
 
-/* Every heading on v12.sh is weight 400, including its h1. Satelle sat at 500
-   throughout, which made the page read considerably heavier than the reference
-   at the same sizes. Weight is carried by size and color, not by bolding. */
+/* Headings stay at weight 400, including the h1. Weight is carried by size
+   and color, not by bolding. */
 .sa :where(h1, h2, h3, h4) {
   font-weight: 400;
   text-wrap: balance;
@@ -432,7 +431,7 @@
   margin-block-end: var(--space-m-l);
 }
 
-/* v12 sets its section headings at exactly the same size as its h1, 31.10px,
+/* Section headings sit at exactly the same size as the h1, 31.10px,
    which is --step-3 on this scale. The supporting line sits at body size, not
    at --step-1, so the head reads as one block rather than two competing ones. */
 .sa-head h2 {

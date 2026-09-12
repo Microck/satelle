@@ -1,4 +1,4 @@
-/* Landing page shell. The skeleton follows v12.sh: a small hero holding its own
+/* Landing page shell. The skeleton: a small hero holding its own
    demo, a proof band, gridded demo cards, a three-up band, a closing evidence
    section, a centered call to action, and a footer. Demo-specific CSS lives
    beside each demo component. */
@@ -36,7 +36,7 @@
   color: var(--sa-9);
 }
 
-/* v12 puts two pill buttons here rather than a row of text links. */
+/* Two pill buttons here rather than a row of text links. */
 .nav-links {
   display: flex;
   align-items: center;
@@ -67,8 +67,8 @@
 
 /* ------------------------------------------------------------------ hero --- */
 
-/* The hero holds the headline and the whole desk demo, as v12's does. It is
-   deliberately short: the reference opens at 31px, not at display scale. */
+/* The hero holds the headline and the whole desk demo. It is
+   deliberately short: it opens at 31px, not at display scale. */
 .hero {
   padding-block: var(--space-xl) var(--space-l);
   row-gap: var(--space-m-l);
@@ -95,7 +95,7 @@
   color: var(--sa-accent-text);
 }
 
-/* v12 carries the supporting sentence inside the h1, set in the muted ink. */
+/* The supporting sentence sits inside the h1, set in the muted ink. */
 .hero-title-sub {
   color: var(--sa-9);
 }
@@ -538,20 +538,6 @@
 
 .foot-inner a:hover {
   color: var(--sa-12);
-}
-
-/* The oversized mark bleeds off the bottom edge, as the reference's wordmark
-   does. Very low contrast: it is a watermark, not a graphic. */
-.foot-watermark {
-  position: absolute;
-  bottom: -38%;
-  left: var(--grid-edge);
-  /* The reference's watermark is a near-neutral ghost. Crimson at 5 percent
-     reads as a pink wash on the light ground, so it is desaturated here and
-     kept fainter than the dark theme needs. */
-  opacity: 0.05;
-  filter: grayscale(0.7);
-  pointer-events: none;
 }
 
 @media (min-width: 52rem) {

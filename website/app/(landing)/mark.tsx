@@ -1,5 +1,5 @@
 /**
- * The Satelle mark, traced from output/satelle-logo-edit/satelle-logo-light.svg.
+ * The Satelle mark, traced from assets/brand/satelle-logo-light.svg.
  *
  * Three shapes: two crimson strokes and a pale tail. The tail is the only part
  * that changes colour between the two logo files, so it is the piece that reads

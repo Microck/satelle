@@ -12,11 +12,10 @@ const REPO = 'https://github.com/Microck/satelle';
 const INSTALL = 'curl -fsSL https://satelle.micr.dev/install | sh';
 
 /**
- * The page follows v12.sh's skeleton beat for beat: a small hero that contains
- * its own demo, a short proof band, one section of gridded demo cards, one
- * section of three supporting cards, a closing evidence section, then a centered
- * call to action and a footer. Satelle has no customers to put in v12's logo
- * wall or testimonial grid, so those two beats carry the honest equivalents:
+ * The page skeleton: a small hero that contains its own demo, a short proof
+ * band, one section of gridded demo cards, one section of three supporting
+ * cards, a closing evidence section, then a centered call to action and a
+ * footer. The logo-wall and testimonial beats carry the honest equivalents:
  * exactly where the product runs, and exactly what it does not do yet.
  */
 export default function HomePage() {
@@ -63,7 +62,7 @@ function SiteNav() {
 }
 
 /**
- * v12's hero holds its headline and its entire app demo in one section, and the
+ * The hero holds its headline and its entire app demo in one section, and the
  * headline carries its supporting sentence inside the same h1 at a muted color.
  */
 function Hero() {
@@ -96,7 +95,7 @@ function Hero() {
 }
 
 /**
- * Occupies v12's customer-logo band. A pre-release, self-hosted tool has no
+ * Occupies the customer-logo band. A pre-release, self-hosted tool has no
  * logos to show, and the honest proof in that slot is the support matrix: what
  * runs where, and what is only a candidate.
  */
@@ -163,7 +162,7 @@ function Claims() {
 }
 
 /**
- * Occupies v12's testimonial grid. Satelle has nobody to quote, and the thing
+ * Occupies the testimonial grid. Satelle has nobody to quote, and the thing
  * worth putting in that slot is the surface itself, both halves, in full.
  */
 function Surface() {
@@ -237,8 +236,8 @@ function Surface() {
 }
 
 /**
- * v12 closes on a single centered line and one button, on a tinted full-bleed
- * band that sits above the footer rather than inside main.
+ * The page closes on a single centered line and one button, on a tinted
+ * full-bleed band that sits above the footer rather than inside main.
  */
 function Closing() {
   return (
@@ -285,9 +284,9 @@ function SectionHead({ title, note }: { title: string; note?: string }) {
 }
 
 /**
- * One demo, boxed with its own headline, supporting line, and link, the way v12
- * grids its channel demos. The card is structure rather than decoration: it is
- * what separates one demo's surface from the next in a two-column grid.
+ * One demo, boxed with its own headline, supporting line, and link. The card
+ * is structure rather than decoration: it is what separates one demo's
+ * surface from the next in a two-column grid.
  */
 function DemoCard({
   title,
@@ -406,11 +405,6 @@ function SiteFooter() {
           Turn is admitted, Satelle does not confirm each native action. Treat text on the
           controlled desktop as untrusted content.
         </p>
-      </div>
-      {/* v12 bleeds an oversized wordmark off the bottom edge. Satelle's mark is
-          a single glyph, so it sits low and cropped at the same weight. */}
-      <div className="foot-watermark" aria-hidden="true">
-        <Mark size={520} />
       </div>
     </footer>
   );
