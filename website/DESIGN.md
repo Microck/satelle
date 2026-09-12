@@ -4,8 +4,7 @@ The design language for `satelle.micr.dev`. The landing page at `/` and the
 Fumadocs documentation at `/docs` are separate visual systems: this document
 governs the landing page only, and nothing here is imported by the docs tree.
 
-Structure, rhythm, and the interactive-demo approach are modelled on
-[v12.sh](https://v12.sh). Color, voice, and every demo are Satelle's own.
+Structure, rhythm, color, voice, and every demo are Satelle's own.
 
 ## 1. What the page has to say
 
@@ -43,7 +42,7 @@ not a disclaimer to bury.
 
 ## 2. Color
 
-The entire palette derives from the two logo files in `output/satelle-logo-edit/`.
+The entire palette derives from the two logo files in `assets/brand/`.
 Those three values are the only fixed inputs:
 
 | Role | Hex | OKLCH | Source |
@@ -106,7 +105,7 @@ and its shared profile leaked a stored theme between runs. The checks:
   carries the colour;
 - `prefers-reduced-motion` leaves no element with a live transition or animation;
 - nothing clipped horizontally, at 1440 and at 390, excluding elements that
-  declare their own `text-overflow: ellipsis` or the footer's watermark;
+  declare their own `text-overflow: ellipsis`;
 - no text under 12px, measuring SVG glyphs through their screen CTM because a
   `viewBox` scales them;
 - every demo's control bar inside its card at both widths;
@@ -158,10 +157,10 @@ mean "look here". They never appear in the same component.
 **Geist Sans** and **Geist Mono**, self-hosted from `public/fonts/`, latin
 subset, weights 400/500/600, `font-display: swap`.
 
-Söhne, which v12.sh uses, is a commercial Klim license. The only copies
+Söhne is a commercial Klim license. The only copies
 available to download are unlicensed scrapes, so the site does not ship it.
-Geist is the same neo-grotesque lineage under OFL-1.1, and v12 already pairs its
-own display face with Geist Mono.
+Geist is the same neo-grotesque lineage under OFL-1.1, and pairs the display
+face with Geist Mono.
 
 ```
 --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, sans-serif
@@ -392,35 +391,32 @@ measured.
 
 ## 8. Page structure
 
-Measured off v12.sh at a 1440 viewport and matched beat for beat. The reference
-has five `<main>` children; so does this page. Its content column spans
-x=27..1398, 1371px against 27px gutters, 95.7% of the page; this page spans
-x=32..1408, 1376px. Its h1 is 31.104px at weight 400 in an 832px column, and
-carries its supporting sentence inside the same h1 at a muted color; so does
-this one. Every heading on both pages is weight 400.
+At a 1440 viewport the page has five `<main>` children. The content column
+spans x=32..1408, 1376px against 27px gutters, 95.7% of the page. The h1 is
+31.104px at weight 400 in an 832px column, and carries its supporting sentence
+inside the same h1 at a muted color. Every heading on the page is weight 400.
 
-| # | Beat | v12.sh | Satelle |
-| --- | --- | --- | --- |
-| nav | wordmark plus two pills | Book a call, Start a run | GitHub, Read the docs |
-| 1 | hero, holding its own demo | 1146px | 991px |
-| 2 | proof band | 281px, 12 customer logos | 325px, the six-cell support matrix |
-| 3 | demo grid, two by two | 1356px, four channel demos | 2215px, four Session demos |
-| 4 | three-up supporting cards | 738px | 417px |
-| 5 | fifth beat | 612px, six testimonials | 817px, implemented, not implemented, verify |
-| cta | centered line, one button, tinted band above the footer | | |
-| foot | five columns plus an oversized mark bleeding off the bottom | | |
+| # | Beat | Satelle |
+| --- | --- | --- |
+| nav | wordmark plus two pills | GitHub, Read the docs |
+| 1 | hero, holding its own demo | 991px |
+| 2 | proof band | 325px, the six-cell support matrix |
+| 3 | demo grid, two by two | 2215px, four Session demos |
+| 4 | three-up supporting cards | 417px |
+| 5 | fifth beat | 817px, implemented, not implemented, verify |
+| cta | centered line, one button, tinted band above the footer | |
+| foot | five columns | |
 
-Document height 5043px against 5596px. Content column x=27..1398 against
-x=32..1408. Cards 679px wide on both, and all four of this page's demo cards are
-850px tall against the reference's uniform 624px.
+Document height 5043px. Content column x=32..1408. Cards 679px wide, and all
+four demo cards are 850px tall.
 
 Satelle has no customers, so beats 2 and 5 carry the honest equivalents rather
 than being dropped: exactly where the product runs, and exactly what it does not
 do yet. Dropping them would have cost the page two structural beats and left the
 demos to carry the whole middle.
 
-Section 3 runs taller than the reference's because these demos carry more than
-v12's do: a probe table, a tool inventory, a three-path diagram. The cards are
+Section 3 runs tall because these demos carry a probe table, a tool inventory,
+a three-path diagram. The cards are
 identical to each other by construction, through `grid-auto-rows: 1fr` on the
 two-up grid, so the row takes the tallest demo and every card stretches to it.
 

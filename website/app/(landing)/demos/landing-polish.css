@@ -38,7 +38,7 @@
 
 /* The screenshot's redundant QA instruction strip is removed from layout. */
 .sa .rf-qa > .rf-request {display:none;}
-/* V12-style emphasis communicates state. Most text, surfaces, logos and chart
+/* Restrained emphasis communicates state. Most text, surfaces, logos and chart
    lines remain neutral; only the finding, live spinner and success marks tint. */
 .sa .rf-qa-finding[data-found='true'] {border-left-color:var(--sa-warn);}
 .sa .rf-qa-finding[data-found='true'] > small {color:var(--sa-warn);}
