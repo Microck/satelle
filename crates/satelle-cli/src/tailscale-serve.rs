@@ -438,7 +438,7 @@ fn report(host_alias: &str, setup_mode: &str, dry_run: bool, changed: bool) -> S
 mod tests {
     use super::*;
     use satelle_core::{AdapterKind, ApiTokenSource};
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::VecDeque;
     use std::path::PathBuf;
 
     const CLEAN_SERVE_STATUS: &[u8] = b"null";
@@ -956,7 +956,7 @@ mod tests {
 
     fn tailscale_host() -> HostConfig {
         HostConfig {
-            provider_bindings: std::collections::BTreeMap::new(),
+            desktop_bindings: std::collections::BTreeMap::new(),
             experimental_provider_computer_use_by_provider: std::collections::BTreeMap::new(),
             transport: TransportKind::Direct,
             adapter: AdapterKind::Codex,
@@ -979,9 +979,6 @@ mod tests {
             telemetry: None,
             recording: None,
             queue: satelle_core::queue::QueueConfig::default(),
-            desktop_user: None,
-            desktop_session_preference: None,
-            desktop_session_native_selector: None,
             daemon_home: None,
             daemon_config_file: None,
             daemon_state_dir: None,
@@ -997,7 +994,6 @@ mod tests {
             }),
             ca_bundle: None,
             client_certificate: None,
-            provider_auth: BTreeMap::new(),
         }
     }
 }

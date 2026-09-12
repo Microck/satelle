@@ -271,14 +271,30 @@ pub(crate) enum LogSubjectKind {
 pub enum LogSubject {
     Host,
     Turn {
+        desktop_binding: String,
         session_id: SessionId,
         turn_id: TurnId,
         session_state_revision: SessionStateRevision,
         turn_state_revision: TurnStateRevision,
     },
     Queue {
+        desktop_binding: String,
         queue_status: QueueStatus,
     },
+}
+
+impl LogSubject {
+    pub fn desktop_binding(&self) -> Option<&str> {
+        match self {
+            Self::Host => None,
+            Self::Turn {
+                desktop_binding, ..
+            } => Some(desktop_binding.as_str()),
+            Self::Queue {
+                desktop_binding, ..
+            } => Some(desktop_binding.as_str()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,7 +305,7 @@ impl Serialize for LogEntrySchema {
     where
         S: Serializer,
     {
-        serializer.serialize_str("satelle.logs.entry.v1")
+        serializer.serialize_str("satelle.logs.entry.v2")
     }
 }
 
@@ -299,11 +315,11 @@ impl<'de> Deserialize<'de> for LogEntrySchema {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        if value == "satelle.logs.entry.v1" {
+        if value == "satelle.logs.entry.v2" {
             Ok(Self)
         } else {
             Err(serde::de::Error::custom(
-                "expected schema_version satelle.logs.entry.v1",
+                "expected schema_version satelle.logs.entry.v2",
             ))
         }
     }
@@ -382,11 +398,18 @@ impl DaemonLogEntry {
         if self.event.subject_kind() != subject_kind {
             return Err("the Log Entry event contradicts its subject");
         }
-        if let LogSubject::Queue { queue_status } = &self.subject {
+        if let LogSubject::Queue { queue_status, .. } = &self.subject {
             queue_status.validate()?;
             if !self.event.matches_queue_status(queue_status.status) {
                 return Err("the Log Entry event contradicts its queue status");
             }
+        }
+        if self
+            .subject
+            .desktop_binding()
+            .is_some_and(|binding| satelle_core::session::DesktopBindingRef::new(binding).is_err())
+        {
+            return Err("the Log Entry desktop binding is invalid");
         }
         if self.source != self.event.source() {
             return Err("the Log Entry source contradicts its event");
@@ -567,6 +590,8 @@ pub struct LogPageQuery {
     cursor: Option<LogCursor>,
     limit: usize,
     session_id: Option<SessionId>,
+    // This is an internal authorization filter. It never crosses the wire.
+    desktop_bindings: Option<BTreeSet<String>>,
     sources: Option<LogSources>,
     minimum_severity: LogSeverity,
     since: Option<OffsetDateTime>,
@@ -596,6 +621,7 @@ impl LogPageQuery {
             cursor,
             limit,
             session_id: None,
+            desktop_bindings: None,
             sources: None,
             minimum_severity: LogSeverity::Info,
             since: None,
@@ -604,6 +630,14 @@ impl LogPageQuery {
 
     pub fn with_session(mut self, session_id: SessionId) -> Self {
         self.session_id = Some(session_id);
+        self
+    }
+
+    pub fn with_desktop_bindings(
+        mut self,
+        desktop_bindings: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.desktop_bindings = Some(desktop_bindings.into_iter().collect());
         self
     }
 
@@ -647,11 +681,17 @@ impl LogPageQuery {
                 LogSubject::Turn { session_id, .. } if session_id == requested_session
             ) || matches!(
                 entry.subject(),
-                LogSubject::Queue { queue_status }
+                LogSubject::Queue { queue_status, .. }
                     if queue_status.session_id.as_ref() == Some(requested_session)
             )
         });
         session_matches
+            && self.desktop_bindings.as_ref().is_none_or(|bindings| {
+                entry
+                    .subject()
+                    .desktop_binding()
+                    .is_none_or(|binding| bindings.contains(binding))
+            })
             && self.includes_source(entry.source())
             && entry.severity() >= self.minimum_severity
             && self.since.is_none_or(|since| entry.timestamp() >= since)
@@ -669,6 +709,10 @@ impl LogPageQuery {
 
     pub const fn since(&self) -> Option<OffsetDateTime> {
         self.since
+    }
+
+    pub(crate) fn desktop_bindings(&self) -> Option<&BTreeSet<String>> {
+        self.desktop_bindings.as_ref()
     }
 }
 
@@ -750,6 +794,7 @@ impl<'de> Deserialize<'de> for LogPageQuery {
         let mut query =
             Self::new(wire.mode, wire.cursor, wire.limit).map_err(serde::de::Error::custom)?;
         query.session_id = wire.session_id;
+        query.desktop_bindings = None;
         query.sources = wire.sources;
         query.minimum_severity = wire.minimum_severity;
         query.since = wire.since;
@@ -915,6 +960,7 @@ mod tests {
         for (index, (event, source)) in events.into_iter().enumerate() {
             let subject = match event.subject_kind() {
                 LogSubjectKind::Turn => LogSubject::Turn {
+                    desktop_binding: "operator".to_string(),
                     session_id: SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
                         .unwrap(),
                     turn_id: TurnId::parse("rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21").unwrap(),
@@ -940,6 +986,7 @@ mod tests {
                     };
                     let admitted = status == satelle_core::queue::QueueRequestStatus::Admitted;
                     LogSubject::Queue {
+                        desktop_binding: "operator".to_string(),
                         queue_status: QueueStatus::new(
                             satelle_core::QueueRequestId::parse(
                                 "rq_01890a5d-ac96-7b7c-8f89-37c3d0a66e31",

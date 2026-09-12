@@ -66,6 +66,7 @@ struct RawLogRow {
     source: String,
     severity: String,
     event: String,
+    desktop_binding: Option<String>,
     session_id: Option<String>,
     turn_id: Option<String>,
     session_revision: Option<String>,
@@ -205,7 +206,7 @@ pub(super) fn load_log_records(
 ) -> Result<Vec<StoredLogRecord>, StorageError> {
     let mut statement = connection
         .prepare(
-            "SELECT log_cursor, recorded_at, source, severity, event_kind, session_id, turn_id, session_state_revision, turn_state_revision, queue_status_json FROM logs WHERE log_cursor > ?1 ORDER BY log_cursor LIMIT ?2",
+            "SELECT log_cursor, recorded_at, source, severity, event_kind, desktop_binding_ref, session_id, turn_id, session_state_revision, turn_state_revision, queue_status_json FROM logs WHERE log_cursor > ?1 ORDER BY log_cursor LIMIT ?2",
         )
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
     let rows = statement
@@ -216,11 +217,12 @@ pub(super) fn load_log_records(
                 source: row.get(2)?,
                 severity: row.get(3)?,
                 event: row.get(4)?,
-                session_id: row.get(5)?,
-                turn_id: row.get(6)?,
-                session_revision: row.get(7)?,
-                turn_revision: row.get(8)?,
-                queue_status_json: row.get(9)?,
+                desktop_binding: row.get(5)?,
+                session_id: row.get(6)?,
+                turn_id: row.get(7)?,
+                session_revision: row.get(8)?,
+                turn_revision: row.get(9)?,
+                queue_status_json: row.get(10)?,
             })
         })
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -261,11 +263,16 @@ pub(super) fn load_log_page_records(
     let storage = i64::from(query.includes_source(crate::LogSource::Storage));
     let codex_adapter = i64::from(query.includes_source(crate::LogSource::CodexAdapter));
     let minimum_severity = i64::from(query.minimum_severity().rank());
+    let desktop_bindings = query
+        .desktop_bindings()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
     let limit =
         i64::try_from(limit).map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
     let mut statement = connection
         .prepare(
-            "SELECT log_cursor, recorded_at, source, severity, event_kind, session_id, turn_id, session_state_revision, turn_state_revision, queue_status_json
+            "SELECT log_cursor, recorded_at, source, severity, event_kind, desktop_binding_ref, session_id, turn_id, session_state_revision, turn_state_revision, queue_status_json
              FROM logs
              WHERE (?1 = 0 OR log_cursor > ?2)
                AND (?3 IS NULL OR session_id = ?3)
@@ -277,6 +284,11 @@ pub(super) fn load_log_page_records(
                     OR (?8 = 1 AND source = 'codex_adapter')
                )
                AND CASE severity WHEN 'info' THEN 0 WHEN 'warning' THEN 1 WHEN 'error' THEN 2 END >= ?9
+               AND (
+                    ?11 IS NULL
+                    OR desktop_binding_ref IS NULL
+                    OR desktop_binding_ref IN (SELECT value FROM json_each(?11))
+               )
              ORDER BY
                CASE WHEN ?1 = 1 THEN log_cursor END ASC,
                CASE WHEN ?1 = 0 THEN log_cursor END DESC
@@ -296,6 +308,7 @@ pub(super) fn load_log_page_records(
                 codex_adapter,
                 minimum_severity,
                 limit,
+                desktop_bindings,
             ],
             |row| {
                 Ok(RawLogRow {
@@ -304,11 +317,12 @@ pub(super) fn load_log_page_records(
                     source: row.get(2)?,
                     severity: row.get(3)?,
                     event: row.get(4)?,
-                    session_id: row.get(5)?,
-                    turn_id: row.get(6)?,
-                    session_revision: row.get(7)?,
-                    turn_revision: row.get(8)?,
-                    queue_status_json: row.get(9)?,
+                    desktop_binding: row.get(5)?,
+                    session_id: row.get(6)?,
+                    turn_id: row.get(7)?,
+                    session_revision: row.get(8)?,
+                    turn_revision: row.get(9)?,
+                    queue_status_json: row.get(10)?,
                 })
             },
         )
@@ -726,28 +740,38 @@ fn parse_log_row(row: RawLogRow) -> Result<StoredLogRecord, StorageError> {
                     .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
             if row.session_id.as_deref() != queue_status.session_id.as_ref().map(SessionId::as_str)
                 || row.turn_id.as_deref() != queue_status.turn_id.as_ref().map(TurnId::as_str)
+                || row.desktop_binding.is_none()
             {
                 return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
             }
-            LogSubject::Queue { queue_status }
+            LogSubject::Queue {
+                desktop_binding: row.desktop_binding.expect("the queue binding was checked"),
+                queue_status,
+            }
         }
         None => match (
+            row.desktop_binding,
             row.session_id,
             row.turn_id,
             row.session_revision,
             row.turn_revision,
         ) {
-            (None, None, None, None) => LogSubject::Host,
-            (Some(session_id), Some(turn_id), Some(session_revision), Some(turn_revision)) => {
-                LogSubject::Turn {
-                    session_id: SessionId::parse(&session_id)
-                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
-                    turn_id: TurnId::parse(&turn_id)
-                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
-                    session_state_revision: parse_session_revision(&session_revision)?,
-                    turn_state_revision: parse_turn_revision(&turn_revision)?,
-                }
-            }
+            (None, None, None, None, None) => LogSubject::Host,
+            (
+                Some(desktop_binding),
+                Some(session_id),
+                Some(turn_id),
+                Some(session_revision),
+                Some(turn_revision),
+            ) => LogSubject::Turn {
+                desktop_binding,
+                session_id: SessionId::parse(&session_id)
+                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
+                turn_id: TurnId::parse(&turn_id)
+                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
+                session_state_revision: parse_session_revision(&session_revision)?,
+                turn_state_revision: parse_turn_revision(&turn_revision)?,
+            },
             _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
         },
     };

@@ -7,6 +7,9 @@ const TOKEN_ID: &str = "token-01890a5d-ac96-7b7c-8f89-37c3d0a66e31";
 const PRINCIPAL_ID: &str = "principal-01890a5d-ac96-7b7c-8f89-37c3d0a66e32";
 const PAYLOAD_CANARY: &[u8] = b"PRIVATE_CANONICAL_PROMPT_PAYLOAD_CANARY";
 const PROVIDER_SECRET_CANARY: &str = "PRIVATE_PROVIDER_SECRET_RESTART_CANARY";
+fn test_desktop_bindings() -> std::collections::BTreeSet<String> {
+    std::collections::BTreeSet::from(["desktop-test".to_string()])
+}
 
 #[test]
 fn client_certificate_audit_survives_restart_and_obeys_log_retention() {
@@ -15,8 +18,16 @@ fn client_certificate_audit_survives_restart_and_obeys_log_retention() {
     let token = crate::ApiBearerToken::generate().unwrap();
     storage
         .register_api_token(
-            ApiTokenRegistration::new(&token, "audit-principal", 1, ApiScopes::READ, None, at(0))
-                .unwrap(),
+            ApiTokenRegistration::new(
+                &token,
+                "audit-principal",
+                1,
+                ApiScopes::READ,
+                test_desktop_bindings(),
+                None,
+                at(0),
+            )
+            .unwrap(),
         )
         .unwrap();
     let principal = storage
@@ -74,6 +85,7 @@ fn token_lifecycle_replays_metadata_after_restart_and_preserves_authority() {
     let (mut storage, _) = Storage::open(state.path()).unwrap();
     let expiry = at(0) + time::Duration::days(1);
     let issue = ApiTokenMutation::Issue {
+        desktop_bindings: test_desktop_bindings(),
         scopes: ApiScopes::CONTROL | ApiScopes::DIAGNOSTICS_SENSITIVE,
         expires_at: Some(expiry),
     };
@@ -181,6 +193,7 @@ fn token_verifier_changes_roll_back_when_replay_record_cannot_commit() {
         .mutate_api_token(
             &idempotency(IdempotentOperation::ApiTokenIssue, "before-failure", at(0)),
             &ApiTokenMutation::Issue {
+                desktop_bindings: test_desktop_bindings(),
                 scopes: ApiScopes::READ,
                 expires_at: None,
             },
@@ -199,6 +212,7 @@ fn token_verifier_changes_roll_back_when_replay_record_cannot_commit() {
         (
             IdempotentOperation::ApiTokenIssue,
             ApiTokenMutation::Issue {
+                desktop_bindings: test_desktop_bindings(),
                 scopes: ApiScopes::ADMIN,
                 expires_at: None,
             },
@@ -252,6 +266,7 @@ fn expired_tokens_cannot_rotate_but_can_be_revoked() {
         .mutate_api_token(
             &idempotency(IdempotentOperation::ApiTokenIssue, "expiring-token", at(0)),
             &ApiTokenMutation::Issue {
+                desktop_bindings: test_desktop_bindings(),
                 scopes: ApiScopes::READ,
                 expires_at: Some(at(1)),
             },
@@ -422,6 +437,7 @@ fn token_authentication_persists_only_the_canonical_verifier() {
                 PRINCIPAL_ID,
                 1,
                 ApiScopes::READ | ApiScopes::CONTROL,
+                test_desktop_bindings(),
                 None,
                 at(1),
             )
@@ -485,6 +501,7 @@ fn token_rotation_is_atomic_and_invalidates_the_previous_secret() {
                 PRINCIPAL_ID,
                 1,
                 ApiScopes::ADMIN,
+                test_desktop_bindings(),
                 Some(at(10)),
                 at(1),
             )
@@ -547,6 +564,7 @@ fn pending_token_activation_atomically_removes_its_expiry() {
                 PRINCIPAL_ID,
                 1,
                 ApiScopes::CONTROL,
+                test_desktop_bindings(),
                 at(10),
                 at(1),
             )
@@ -618,6 +636,7 @@ fn pending_token_activation_compares_fractional_expiry_as_time() {
                 PRINCIPAL_ID,
                 1,
                 ApiScopes::CONTROL,
+                test_desktop_bindings(),
                 expiry,
                 at(1),
             )
@@ -648,6 +667,7 @@ fn setup_token_lifecycle_rejects_timestamps_before_creation() {
                 PRINCIPAL_ID,
                 1,
                 ApiScopes::CONTROL,
+                test_desktop_bindings(),
                 at(10),
                 at(5),
             )
@@ -698,6 +718,7 @@ fn expired_pending_token_cannot_be_activated() {
                 PRINCIPAL_ID,
                 1,
                 ApiScopes::CONTROL,
+                test_desktop_bindings(),
                 at(3),
                 at(1),
             )
@@ -738,6 +759,7 @@ fn ordinary_expiring_token_cannot_enter_the_setup_activation_path() {
                 PRINCIPAL_ID,
                 1,
                 ApiScopes::CONTROL,
+                test_desktop_bindings(),
                 Some(at(10)),
                 at(1),
             )
@@ -781,6 +803,7 @@ fn expired_revoked_and_unknown_tokens_share_the_absent_result() {
                 PRINCIPAL_ID,
                 1,
                 ApiScopes::READ,
+                test_desktop_bindings(),
                 Some(at(3)),
                 at(1),
             )

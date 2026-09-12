@@ -999,6 +999,11 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     continue;
                 };
+                // Accepted Windows sockets inherit the listener's nonblocking
+                // mode. The request reader needs blocking I/O with a deadline.
+                stream
+                    .set_nonblocking(false)
+                    .expect("make accepted collector socket blocking");
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                     .expect("collector read timeout");

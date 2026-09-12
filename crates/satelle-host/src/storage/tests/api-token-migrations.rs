@@ -45,7 +45,11 @@ fn version_sixteen_store_with_pending_journal(state: &TempDir) {
     connection.execute_batch(predecessor).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE recording_artifacts;
+            "DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP TABLE authorized_provider_bindings;
+             DROP TABLE recording_artifacts;
              DROP INDEX recording_audit_retention;
              DROP TABLE recording_audit;
              DROP INDEX control_lease_desktop_snapshot_owner;
@@ -55,9 +59,10 @@ fn version_sixteen_store_with_pending_journal(state: &TempDir) {
              DROP TABLE turn_admission_queue;",
         )
         .unwrap();
+    restore_authorized_provider_bindings_v12(connection);
     connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (17, 18, 19, 20, 21, 22, 23)",
+            "DELETE FROM schema_migrations WHERE version IN (17, 18, 19, 20, 21, 22, 23, 24)",
             [],
         )
         .unwrap();

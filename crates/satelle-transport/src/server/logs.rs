@@ -14,7 +14,17 @@ pub(super) async fn get_logs(
     LogsQuery(query): LogsQuery,
 ) -> Response {
     let service = Arc::clone(&state.service);
-    let page = match tokio::task::spawn_blocking(move || service.daemon_log_page(&query)).await {
+    let principal = authorized.principal().clone();
+    let page = match tokio::task::spawn_blocking(move || {
+        if let Some(session_id) = query.session_id() {
+            service.authorize_session_binding(&principal, session_id)?;
+        }
+        service.daemon_log_page(
+            &query.with_desktop_bindings(principal.desktop_bindings().iter().cloned()),
+        )
+    })
+    .await
+    {
         Ok(Ok(page)) => page,
         Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
         Err(_) => return host_error::task_failure(&state, &authorized),

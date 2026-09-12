@@ -136,6 +136,7 @@ pub(super) fn status() -> Value {
         json!({
             "session_id": session_id(),
             "host": {"type": "string"},
+            "desktop_binding": {"type": "string"},
             "status": {"enum": ["starting", "running", "recovery_pending", "completed", "blocked", "failed", "stopped"]},
             "created_at": {"type": "string", "format": "date-time"},
             "updated_at": {"type": "string", "format": "date-time"},
@@ -144,6 +145,7 @@ pub(super) fn status() -> Value {
         &[
             "session_id",
             "host",
+            "desktop_binding",
             "status",
             "created_at",
             "updated_at",

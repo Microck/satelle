@@ -371,7 +371,7 @@ impl HostAuthorityModel {
         Self {
             daemon_identity: HostDaemonIdentityAuthority::StableRandomGeneratedAndStored,
             daemon_account: HostDaemonAccountAuthority::OneDaemonOsAccount,
-            desktop_bindings: HostDesktopBindingCardinality::ExactlyOneExplicitlyAuthorized,
+            desktop_bindings: HostDesktopBindingCardinality::OneOrMoreExplicitlyAuthorized,
             responsibilities: vec![
                 HostDaemonResponsibility::HostChecks,
                 HostDaemonResponsibility::CodexAppServerLifecycle,
@@ -414,7 +414,7 @@ pub enum HostDaemonAccountAuthority {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostDesktopBindingCardinality {
-    ExactlyOneExplicitlyAuthorized,
+    OneOrMoreExplicitlyAuthorized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -431,7 +431,7 @@ pub enum HostDaemonResponsibility {
 pub struct SatelleHost {
     identity: HostIdentityRef,
     daemon_account: DaemonOsAccount,
-    desktop_binding: DesktopBindingRef,
+    desktop_bindings: Vec<DesktopBindingRef>,
 }
 
 impl SatelleHost {
@@ -440,17 +440,13 @@ impl SatelleHost {
         daemon_account: DaemonOsAccount,
         desktop_bindings: Vec<DesktopBindingRef>,
     ) -> Result<Self, AuthorityModelError> {
-        let mut desktop_bindings = desktop_bindings.into_iter();
-        let desktop_binding = desktop_bindings
-            .next()
-            .ok_or(AuthorityModelError::MissingDesktopBinding)?;
-        if desktop_bindings.next().is_some() {
-            return Err(AuthorityModelError::MultipleDesktopBindings);
+        if desktop_bindings.is_empty() {
+            return Err(AuthorityModelError::MissingDesktopBinding);
         }
         Ok(Self {
             identity,
             daemon_account,
-            desktop_binding,
+            desktop_bindings,
         })
     }
 
@@ -462,8 +458,8 @@ impl SatelleHost {
         &self.daemon_account
     }
 
-    pub fn desktop_binding(&self) -> &DesktopBindingRef {
-        &self.desktop_binding
+    pub fn desktop_bindings(&self) -> &[DesktopBindingRef] {
+        &self.desktop_bindings
     }
 }
 
@@ -872,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn host_model_requires_one_stored_daemon_identity_and_one_desktop_binding() {
+    fn host_model_requires_one_stored_daemon_identity_and_explicit_desktop_bindings() {
         let model = CorePublicModel::current();
         assert_eq!(
             model.host().daemon_identity(),
@@ -884,7 +880,7 @@ mod tests {
         );
         assert_eq!(
             model.host().desktop_bindings(),
-            HostDesktopBindingCardinality::ExactlyOneExplicitlyAuthorized
+            HostDesktopBindingCardinality::OneOrMoreExplicitlyAuthorized
         );
         assert_eq!(
             model.host().responsibilities(),
@@ -901,16 +897,16 @@ mod tests {
             .expect("one desktop binding is accepted");
         assert_eq!(satelle_host.identity(), &host());
         assert_eq!(satelle_host.daemon_account().as_str(), "daemon-account");
-        assert_eq!(satelle_host.desktop_binding(), &desktop());
+        assert_eq!(satelle_host.desktop_bindings(), &[desktop()]);
 
         assert_eq!(
             SatelleHost::new(host(), daemon_account(), Vec::new()),
             Err(AuthorityModelError::MissingDesktopBinding)
         );
-        assert_eq!(
-            SatelleHost::new(host(), daemon_account(), vec![desktop(), other_desktop()]),
-            Err(AuthorityModelError::MultipleDesktopBindings)
-        );
+        let multi_user =
+            SatelleHost::new(host(), daemon_account(), vec![desktop(), other_desktop()])
+                .expect("multiple explicit Desktop Bindings are accepted");
+        assert_eq!(multi_user.desktop_bindings(), &[desktop(), other_desktop()]);
     }
 
     #[test]
@@ -1116,6 +1112,7 @@ mod tests {
     fn public_session_json() -> Value {
         json!({
             "session_id": SESSION_ID,
+            "desktop_binding": "desktop-a",
             "display_name": null,
             "session_state_revision": 1,
             "created_at": "2024-01-01T00:00:00Z",

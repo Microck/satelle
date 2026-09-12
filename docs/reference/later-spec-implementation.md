@@ -32,8 +32,8 @@ those pull requests merge, the integration branch gets a final pull request to
 | Desktop snapshot export | Current native desktop capture with consent, redaction, and audit metadata | Merged in PR #243 |
 | Opt-in telemetry | Independent Controller and Host OTLP/HTTP export with private bounded queues | Merged in PR #244 |
 | Recording | Per-Turn recording modes and export policy | Merged in PR #245 |
-| Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | In PR #247 |
-| Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Pending |
+| Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Merged in PR #247 |
+| Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | PR #252 |
 | Automation | Batch, watch, webhook notifications, REPL, command history | Pending |
 | Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Pending |
 
@@ -78,9 +78,35 @@ or approval is a blocker, never proof of implementation.
 - Cancellation, expiry, admission, validation failure, and startup recovery
   remove private payloads. Position changes and terminal outcomes use durable
   state revisions, normalized logs, and the closed queue event set.
-- `queue status` and `queue cancel` use the public `rq_` identity. Protocol v21
-  and `satelle.api.v11` carry queue opt-in and the strict status and cancellation
+- `queue status` and `queue cancel` use the public `rq_` identity. Protocol v22
+  and `satelle.api.v12` carry queue opt-in and the strict status and cancellation
   response contracts.
+
+## Multiple desktop binding decisions
+
+- User-level Host configuration owns a map of Desktop Binding aliases. Each
+  binding carries one OS user, desktop selector preferences, provider bindings,
+  and provider Secret Sources. Project configuration cannot define or select a
+  Desktop Binding.
+- `run` and snapshot capture accept `--desktop-binding <alias>`. `steer` accepts
+  the same option and otherwise inherits the Session binding. A Host with more
+  than one binding rejects an unselected run with
+  `desktop-binding-ambiguous`.
+- API credentials carry an explicit set of Desktop Binding grants. Session,
+  event, artifact, log, provider authorization, secret provisioning, and queue
+  operations enforce those grants before returning binding-owned state.
+- Sessions, queue leases, provider authorization, provider secrets, Codex home
+  directories, work directories, readiness state, logs, and audit records all
+  carry the Desktop Binding identity. Log filtering happens before pagination.
+- A daemon can execute independent turns for different bindings at the same
+  time. It still allows only one active native execution per binding.
+- The native adapter accepts the daemon account's own OS user. A different OS
+  user fails with `desktop-binding-secure-handoff-unsupported` until the target
+  platform and native runtime provide a secure handoff.
+- Protocol version 22 and `satelle.api.v12` require the selected binding on Turn
+  requests. `satelle.session.v2`, `satelle.logs.entry.v2`, and
+  `satelle.api-token.issue.v2` expose the new binding contracts without an old
+  request fallback.
 
 ## Turn recording decisions
 
@@ -110,7 +136,7 @@ npm checks, and the production documentation build.
 - Attached output reports the manifest path, every artifact path, expiry, and
   cleanup command. Remote Controllers retrieve the completed manifest through
   the authenticated `diagnostics:sensitive` contract after terminal status.
-  Protocol v21 and `satelle.api.v11` define this recording request boundary.
+  Protocol v22 and `satelle.api.v12` define this recording request boundary.
 
 ## Raw protocol diagnostic decisions
 
@@ -355,7 +381,7 @@ plus documentation and release installation checks on all six targets.
 - Paths use absolute native Host syntax. The Controller neither interprets nor
   opens them. The Host applies bounded regular-file reads before admission.
 - Uploads and Host paths share the current tagged attachment list in
-  `satelle.api.v11` and protocol version 21. No older request shape is accepted.
+  `satelle.api.v12` and protocol version 22. No older request shape is accepted.
 - The keyed operation identity includes the path reference. A replay or
   cancellation resolves from durable admission state without reopening files.
 - Remote files share the upload limits and private staging lifecycle. Cleanup

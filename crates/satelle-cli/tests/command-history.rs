@@ -65,12 +65,14 @@ provider_alias = "history-provider"
 transport = "local"
 adapter = "fake"
 
-[hosts.local-demo.provider_bindings.history-provider.history-model]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_bindings.history-provider.history-model]
 model = "fake-model-v1"
 model_provider = "openai"
 auth_source = "test"
 
-[hosts.local-demo.provider_auth.test]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.test]
 kind = "environment"
 variable = "SATELLE_TEST_PROVIDER_TOKEN"
 "#,

@@ -1077,7 +1077,7 @@ fn write_entries_to(
             writeln!(stdout).map_err(log_output_error)?;
         } else {
             let queue_details = match entry.subject() {
-                LogSubject::Queue { queue_status } => format!(
+                LogSubject::Queue { queue_status, .. } => format!(
                     " request={} status={} position={} enqueued_at={} expires_at={} failure={}",
                     queue_status.queue_request_id,
                     queue_status.status.as_str(),
@@ -1287,6 +1287,7 @@ mod tests {
         let turn_id = satelle_core::TurnId::new();
         serde_json::from_value(serde_json::json!({
             "session_id": session_id,
+            "desktop_binding": "local-demo-desktop-v1",
             "display_name": null,
             "session_state_revision": 1,
             "created_at": "2024-01-01T00:00:00Z",
@@ -1457,7 +1458,7 @@ mod tests {
     fn page(cursor: u64) -> satelle_host::DaemonLogPage {
         serde_json::from_value(serde_json::json!({
             "entries": [{
-                "schema_version": "satelle.logs.entry.v1",
+                "schema_version": "satelle.logs.entry.v2",
                 "cursor": format!("slc1_{cursor:016x}"),
                 "timestamp": "2026-08-02T00:00:00Z",
                 "host_identity": "host-original",

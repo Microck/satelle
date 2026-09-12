@@ -17,6 +17,29 @@ fn host_log(at: OffsetDateTime, source: LogSource, severity: LogSeverity) -> Saf
     .expect("Host log record is valid")
 }
 
+fn turn_log(at: OffsetDateTime, desktop_binding: &str, suffix: u8) -> SafeLogRecord {
+    SafeLogRecord::new(
+        at,
+        LogSource::CodexAdapter,
+        LogSeverity::Info,
+        LogEvent::TurnStateCommitted,
+        crate::LogSubject::Turn {
+            desktop_binding: desktop_binding.to_string(),
+            session_id: satelle_core::SessionId::parse(&format!(
+                "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e{suffix:02x}"
+            ))
+            .expect("valid Session identifier"),
+            turn_id: satelle_core::TurnId::parse(&format!(
+                "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e{suffix:02x}"
+            ))
+            .expect("valid Turn identifier"),
+            session_state_revision: satelle_core::session::SessionStateRevision::initial(),
+            turn_state_revision: satelle_core::session::TurnStateRevision::initial(),
+        },
+    )
+    .expect("Turn log record is valid")
+}
+
 fn committed_host_log(
     storage: &mut Storage,
     at: OffsetDateTime,
@@ -429,6 +452,64 @@ fn log_pages_filter_before_limiting_and_resume_after_the_delivered_cursor() {
         )
         .expect_err("a cursor above the store high-water mark must be rejected");
     assert!(matches!(future, LogPageStorageError::CursorAhead));
+}
+
+#[test]
+fn log_pages_isolate_desktop_bindings_before_applying_the_page_limit() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let now = OffsetDateTime::now_utc();
+    for (binding, suffix) in [("bob", 1_u8), ("alice", 2_u8)] {
+        let session_id = session_id(&format!(
+            "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e{suffix:02x}"
+        ));
+        let turn_id = turn_id(&format!(
+            "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e{suffix:02x}"
+        ));
+        let session = Session::start(
+            session_id,
+            storage.host_identity().expect("load Host Identity"),
+            DesktopBindingRef::new(binding).expect("valid Desktop Binding"),
+            turn_id,
+            policy_for_binding(binding),
+            now,
+        )
+        .expect("construct binding-scoped Session");
+        storage
+            .begin_session(
+                &session,
+                &admission(
+                    IdempotentOperation::Run,
+                    &format!("binding-log-{suffix}"),
+                    &format!("binding-log-request-{suffix}"),
+                    now,
+                ),
+            )
+            .expect("admit binding-scoped Session");
+    }
+    storage
+        .connection_for_test()
+        .execute("DELETE FROM logs", [])
+        .expect("clear admission logs before the pagination assertion");
+    storage
+        .append_safe_log(&turn_log(now, "bob", 1))
+        .expect("append another binding's log");
+    let alice = storage
+        .append_safe_log(&turn_log(now + time::Duration::seconds(1), "alice", 2))
+        .expect("append authorized binding log");
+
+    let page = storage
+        .log_page(
+            &LogPageQuery::forward(None, 1)
+                .expect("valid query")
+                .with_desktop_bindings(["alice".to_string()]),
+            now + time::Duration::seconds(2),
+        )
+        .expect("read binding-scoped page");
+
+    assert_eq!(page.entries().len(), 1);
+    assert_eq!(page.entries()[0].cursor().position(), alice);
+    assert_eq!(page.entries()[0].subject().desktop_binding(), Some("alice"));
 }
 
 #[test]

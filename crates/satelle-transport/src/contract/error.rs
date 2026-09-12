@@ -37,6 +37,10 @@ pub enum ApiErrorCode {
     YoloNotSupported,
     YoloBlockedByNativeApproval,
     DesktopBindingRequired,
+    DesktopBindingAmbiguous,
+    DesktopBindingNotFound,
+    DesktopBindingUnauthorized,
+    DesktopBindingSecureHandoffUnsupported,
     DesktopSessionUnavailable,
     DesktopSessionAmbiguous,
     DesktopSessionPreferenceUnmatched,
@@ -112,6 +116,12 @@ impl ApiErrorCode {
             Self::YoloNotSupported => "yolo-not-supported",
             Self::YoloBlockedByNativeApproval => "yolo-blocked-by-native-approval",
             Self::DesktopBindingRequired => "desktop-binding-required",
+            Self::DesktopBindingAmbiguous => "desktop-binding-ambiguous",
+            Self::DesktopBindingNotFound => "desktop-binding-not-found",
+            Self::DesktopBindingUnauthorized => "desktop-binding-unauthorized",
+            Self::DesktopBindingSecureHandoffUnsupported => {
+                "desktop-binding-secure-handoff-unsupported"
+            }
             Self::DesktopSessionUnavailable => "desktop-session-unavailable",
             Self::DesktopSessionAmbiguous => "desktop-session-ambiguous",
             Self::DesktopSessionPreferenceUnmatched => "desktop-session-preference-unmatched",

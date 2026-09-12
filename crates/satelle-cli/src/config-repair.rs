@@ -73,14 +73,12 @@ pub(super) fn run(
     plan.resolved
         .config_check_contexts(command.host.as_deref(), false)
         .map_err(failure)?;
-    let provider =
-        super::resolve_provider_selection(&plan.resolved, &host, None, None, false, false)?;
-    if provider.missing_auth_source_name().is_some() {
-        return Err(failure(manual_action(
+    super::validate_config_provider_selections(&plan.resolved, &host).map_err(|_| {
+        failure(manual_action(
             &plan.resolved.user_config_path,
             ErrorCode::ModelProviderBindingMissing,
-        )));
-    }
+        ))
+    })?;
     let mut report = RepairReport {
         schema_version: CONFIG_REPAIR_SCHEMA_VERSION,
         status: "unchanged",

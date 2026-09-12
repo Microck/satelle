@@ -365,19 +365,25 @@ fn format_entry(entry: &DaemonLogEntry) -> Result<String, OperatorLogFailureKind
     let subject = match entry.subject() {
         LogSubject::Host => "subject=host".to_string(),
         LogSubject::Turn {
+            desktop_binding,
             session_id,
             turn_id,
             session_state_revision,
             turn_state_revision,
         } => format!(
-            "subject=turn session={} turn={} session_revision={} turn_revision={}",
+            "subject=turn desktop_binding={} session={} turn={} session_revision={} turn_revision={}",
+            desktop_binding.as_str(),
             session_id.as_str(),
             turn_id.as_str(),
             session_state_revision,
             turn_state_revision,
         ),
-        LogSubject::Queue { queue_status } => format!(
-            "subject=queue request={} status={} position={} enqueued_at={} expires_at={} failure={}",
+        LogSubject::Queue {
+            desktop_binding,
+            queue_status,
+        } => format!(
+            "subject=queue desktop_binding={} request={} status={} position={} enqueued_at={} expires_at={} failure={}",
+            desktop_binding.as_str(),
             queue_status.queue_request_id.as_str(),
             queue_status.status.as_str(),
             queue_status

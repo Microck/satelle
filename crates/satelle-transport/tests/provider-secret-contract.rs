@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 #[test]
 fn provisioning_metadata_is_versioned_and_carries_no_raw_secret_field() {
     let metadata = ProviderSecretProvisioningMetadata::new(
+        "local-demo-desktop-v1",
         ProviderBindingAuthorization::new("vision", "open_ai", "gpt-image", "openai")
             .with_auth_source(ProviderSecretSource::File {
                 path: PathBuf::from("/run/secrets/openai"),
@@ -21,7 +22,7 @@ fn provisioning_metadata_is_versioned_and_carries_no_raw_secret_field() {
 
     assert_eq!(
         value["schema_version"],
-        "satelle.provider-secret-provisioning.v1"
+        "satelle.provider-secret-provisioning.v2"
     );
     assert_eq!(value["overwrite_authorized"], true);
     assert!(value.get("secret").is_none());
@@ -31,7 +32,8 @@ fn provisioning_metadata_is_versioned_and_carries_no_raw_secret_field() {
 #[test]
 fn provisioning_metadata_rejects_unknown_secret_carriers() {
     let value = json!({
-        "schema_version": "satelle.provider-secret-provisioning.v1",
+        "schema_version": "satelle.provider-secret-provisioning.v2",
+        "desktop_binding": "local-demo-desktop-v1",
         "authorization": {
             "requested_model_alias": "vision",
             "requested_provider_alias": "open_ai",
@@ -113,6 +115,7 @@ fn prepared_provider_secret_debug_is_fully_redacted() {
     }))
     .expect("provider-secret preview should decode");
     let metadata = ProviderSecretProvisioningMetadata::new(
+        "local-demo-desktop-v1",
         ProviderBindingAuthorization::new(
             "model-debug-redaction-marker",
             "provider-debug-redaction-marker",

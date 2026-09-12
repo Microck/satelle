@@ -327,8 +327,9 @@ pub(super) async fn get_session(
     SessionPath(session_id): SessionPath,
 ) -> Response {
     let service = Arc::clone(&state.service);
+    let principal = authorized.principal().clone();
     let session = match host_call(&state, &authorized, move || {
-        service.session_status(&session_id)
+        service.authorize_session_binding(&principal, &session_id)
     })
     .await
     {
@@ -353,7 +354,9 @@ pub(super) async fn get_task_artifacts(
     SessionPath(session_id): SessionPath,
 ) -> Response {
     let service = Arc::clone(&state.service);
+    let principal = authorized.principal().clone();
     let artifacts = match host_call(&state, &authorized, move || {
+        service.authorize_session_binding(&principal, &session_id)?;
         service.task_artifacts(&session_id)
     })
     .await
@@ -848,6 +851,7 @@ fn turn_intent(
         turn_execution_timeout_ms,
         raw_protocol,
         recording,
+        desktop_binding,
     } = request.into_parts();
     let attachments = attachments
         .into_iter()
@@ -879,6 +883,7 @@ fn turn_intent(
         .and_then(|intent| {
             intent.with_raw_protocol_capture(raw_protocol.map(|capture| capture.into_source_host()))
         })
+        .and_then(|intent| intent.with_desktop_binding(desktop_binding))
         .and_then(|intent| intent.with_recording(recording))
 }
 
@@ -899,6 +904,7 @@ fn invalid_turn_request(
             "raw protocol source Host alias is invalid"
         }
         TurnIntentError::InvalidRecordingRequest => "recording request is invalid",
+        TurnIntentError::InvalidDesktopBinding => "Desktop Binding alias is invalid",
     };
     request_error(state, authorized, message)
 }

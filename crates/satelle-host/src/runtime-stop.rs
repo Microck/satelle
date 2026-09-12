@@ -83,8 +83,11 @@ impl RuntimeEngine {
                 let stop_committed = matches!(commit.outcome(), StopCommitOutcome::Stopped(_));
                 drop(storage);
                 if stop_committed {
-                    self.adapter
-                        .stop_committed(commit.session().id(), commit.turn_id());
+                    self.adapter.stop_committed(
+                        commit.session().desktop_binding(),
+                        commit.session().id(),
+                        commit.turn_id(),
+                    );
                 }
                 if matches!(
                     commit.outcome(),

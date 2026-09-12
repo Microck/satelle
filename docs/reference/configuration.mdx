@@ -248,7 +248,7 @@ the target Host. The executable and its settings must exist on that Host.
 Project configuration cannot define a helper.
 
 ```toml
-[hosts.local-demo.provider_auth.work]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.work]
 kind = "executable-helper"
 argv = ["/opt/credentials/provider-helper", "--account", "work"]
 timeout = "10s"

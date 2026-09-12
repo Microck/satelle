@@ -41,11 +41,15 @@ fn initial_session(storage: &Storage, session: &str, turn: &str, at: OffsetDateT
 }
 
 fn policy() -> ExecutionPolicy {
+    policy_for_binding("desktop-binding-1")
+}
+
+fn policy_for_binding(desktop_binding: &str) -> ExecutionPolicy {
     ExecutionPolicy::new(
         EffectiveModelRef::new("model-1").unwrap(),
         ProviderBindingRef::new("provider-1").unwrap(),
         DesktopTarget::new(
-            DesktopBindingRef::new("desktop-binding-1").unwrap(),
+            DesktopBindingRef::new(desktop_binding).unwrap(),
             "desktop-session-1",
         ),
         ApprovalPolicy::OnRequest,
@@ -53,6 +57,33 @@ fn policy() -> ExecutionPolicy {
         TimeoutPolicy::bounded_seconds(120).unwrap(),
         ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
     )
+}
+
+fn restore_authorized_provider_bindings_v12(connection: &Connection) {
+    connection
+        .execute_batch(
+            "CREATE TABLE authorized_provider_bindings (
+                provider_alias TEXT NOT NULL CHECK (length(trim(provider_alias)) > 0),
+                model_alias TEXT NOT NULL CHECK (length(trim(model_alias)) > 0),
+                model TEXT NOT NULL CHECK (length(trim(model)) > 0),
+                model_provider TEXT NOT NULL CHECK (length(trim(model_provider)) > 0),
+                endpoint TEXT,
+                auth_source_json TEXT,
+                source TEXT NOT NULL CHECK (source = 'user_config'),
+                experimental_provider_computer_use INTEGER NOT NULL
+                    CHECK (experimental_provider_computer_use IN (0, 1)),
+                allow_project_selection INTEGER NOT NULL
+                    CHECK (allow_project_selection IN (0, 1)),
+                binding_digest TEXT NOT NULL
+                    CHECK (
+                        length(binding_digest) = 64
+                        AND binding_digest NOT GLOB '*[^0-9a-f]*'
+                    ),
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (provider_alias, model_alias)
+            ) STRICT;",
+        )
+        .expect("restore the version twelve provider binding schema");
 }
 
 fn admission(

@@ -10411,7 +10411,7 @@ mod tests {
     #[test]
     fn path_change_releases_the_old_owner_before_the_new_daemon_becomes_authoritative() {
         let mut host = HostConfig {
-            provider_bindings: std::collections::BTreeMap::new(),
+            desktop_bindings: std::collections::BTreeMap::new(),
             experimental_provider_computer_use_by_provider: std::collections::BTreeMap::new(),
             transport: satelle_core::TransportKind::Ssh,
             adapter: satelle_core::AdapterKind::Codex,
@@ -10431,9 +10431,6 @@ mod tests {
             recording: None,
             queue: satelle_core::queue::QueueConfig::default(),
             daemon_idle_timeout: None,
-            desktop_user: None,
-            desktop_session_preference: None,
-            desktop_session_native_selector: None,
             daemon_home: Some(PathBuf::from("/srv/satelle home")),
             daemon_config_file: None,
             daemon_state_dir: Some(PathBuf::from("/srv/selected-state")),
@@ -10447,7 +10444,6 @@ mod tests {
             api_token: None,
             ca_bundle: None,
             client_certificate: None,
-            provider_auth: std::collections::BTreeMap::new(),
         };
         host.platform_log_sink = true;
         let unix_environment = RemoteTarget::LinuxX64Gnu

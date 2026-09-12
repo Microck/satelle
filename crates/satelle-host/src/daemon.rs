@@ -6,8 +6,8 @@ use crate::{
     ApiBearerToken, ApiPrincipal, ApiScopes, HostMode, HostService, ProductionCapabilitySnapshot,
 };
 use satelle_core::session::{
-    EffectiveModelRef, ProviderBindingRef, PublicSession, SessionStateRevision, TurnExecutionMode,
-    TurnStateRevision,
+    DesktopBindingRef, EffectiveModelRef, ProviderBindingRef, PublicSession, SessionStateRevision,
+    TurnExecutionMode, TurnStateRevision,
 };
 use satelle_core::{
     DesktopSessionRecord, DoctorReport, LOCAL_DEMO_HOST, ProviderAuthValidationMode,
@@ -23,10 +23,10 @@ use crate::EphemeralApiAuthenticator;
 use std::sync::Arc;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
-const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 8;
+const TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 9;
 const STOP_IDEMPOTENCY_DIGEST_SCHEMA_VERSION: u16 = 1;
-const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 3;
-const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 2;
+const PROVIDER_DESCRIPTOR_VALIDATION_DIGEST_SCHEMA_VERSION: u16 = 4;
+const PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION: u16 = 3;
 const PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION: u16 = 1;
 const SETUP_VERIFICATION_DIGEST_SCHEMA_VERSION: u16 = 1;
 const NATIVE_READINESS_INVALIDATION_DIGEST_SCHEMA_VERSION: u16 = 2;
@@ -193,6 +193,7 @@ pub struct TurnIntent {
     attachments: Vec<crate::attachment::AcceptedImageAttachment>,
     raw_protocol_source_host: Option<String>,
     recording: Option<satelle_core::recording::RecordingRequest>,
+    desktop_binding: Option<DesktopBindingRef>,
 }
 
 impl TurnIntent {
@@ -212,6 +213,7 @@ impl TurnIntent {
             attachments: Vec::new(),
             raw_protocol_source_host: None,
             recording: None,
+            desktop_binding: None,
         })
     }
 
@@ -252,6 +254,17 @@ impl TurnIntent {
             .provider_intent
             .with_experimental_provider_computer_use(enabled);
         self
+    }
+
+    pub fn with_desktop_binding(
+        mut self,
+        desktop_binding: Option<String>,
+    ) -> Result<Self, TurnIntentError> {
+        self.desktop_binding = desktop_binding
+            .map(DesktopBindingRef::new)
+            .transpose()
+            .map_err(|_| TurnIntentError::InvalidDesktopBinding)?;
+        Ok(self)
     }
 
     pub fn with_turn_execution_timeout_ms(
@@ -345,6 +358,10 @@ impl TurnIntent {
     pub(crate) const fn recording(&self) -> Option<&satelle_core::recording::RecordingRequest> {
         self.recording.as_ref()
     }
+
+    pub(crate) const fn desktop_binding(&self) -> Option<&DesktopBindingRef> {
+        self.desktop_binding.as_ref()
+    }
 }
 
 impl fmt::Debug for TurnIntent {
@@ -354,6 +371,7 @@ impl fmt::Debug for TurnIntent {
             .field("prompt_bytes", &self.prompt.len())
             .field("execution_mode", &self.execution_mode)
             .field("provider_intent", &self.provider_intent)
+            .field("desktop_binding", &self.desktop_binding)
             .field("attachment_count", &self.attachments.len())
             .field(
                 "raw_protocol_capture",
@@ -375,6 +393,8 @@ pub enum TurnIntentError {
     InvalidModel,
     #[error("the provider override is invalid")]
     InvalidProvider,
+    #[error("the Desktop Binding selector is invalid")]
+    InvalidDesktopBinding,
     #[error("the Turn execution timeout must be a whole number of seconds from 1s through 24h")]
     InvalidTurnExecutionTimeout,
     #[error("the image attachments failed bounded media or integrity validation")]
@@ -437,6 +457,7 @@ struct CanonicalSessionCreate<'a> {
     turn_execution_timeout_seconds: Option<u32>,
     attachments: &'a [CanonicalAttachment<'a>],
     raw_protocol_source_host: Option<&'a str>,
+    desktop_binding: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -454,6 +475,7 @@ struct CanonicalTurnCreate<'a> {
     turn_execution_timeout_seconds: Option<u32>,
     attachments: &'a [CanonicalAttachment<'a>],
     raw_protocol_source_host: Option<&'a str>,
+    desktop_binding: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -494,6 +516,7 @@ struct CanonicalSessionStop<'a> {
 struct CanonicalProviderDescriptorValidation<'a> {
     operation: &'static str,
     host: &'a str,
+    desktop_binding: &'a str,
     model_alias: &'a str,
     provider_alias: &'a str,
     mode: ProviderAuthValidationMode,
@@ -506,6 +529,7 @@ struct CanonicalProviderDescriptorValidation<'a> {
 struct CanonicalProviderBindingAuthorization<'a> {
     operation: &'static str,
     host: &'a str,
+    desktop_binding: &'a str,
     model_alias: &'a str,
     provider_alias: &'a str,
     authorization: &'a satelle_core::ProviderBindingAuthorization,
@@ -515,6 +539,7 @@ struct CanonicalProviderBindingAuthorization<'a> {
 struct CanonicalProviderSecretProvisioning<'a> {
     operation: &'static str,
     host: &'a str,
+    desktop_binding: &'a str,
     authorization: &'a satelle_core::ProviderBindingAuthorization,
     overwrite_authorized: bool,
     envelope_digest: &'a str,
@@ -523,6 +548,7 @@ struct CanonicalProviderSecretProvisioning<'a> {
 #[derive(Serialize)]
 struct CanonicalProviderBindingDeletion<'a> {
     operation: &'static str,
+    desktop_binding: &'a str,
     model_alias: &'a str,
     provider_alias: &'a str,
 }
@@ -602,8 +628,15 @@ impl HostService {
         scopes: ApiScopes,
         expires_at: OffsetDateTime,
     ) -> Self {
+        let desktop_bindings = self
+            .runtime
+            .configured_desktop_bindings()
+            .expect("an initialized Host runtime lock must remain available");
         self.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
-            token, scopes, expires_at,
+            token,
+            scopes,
+            expires_at,
+            desktop_bindings,
         )));
         self
     }
@@ -830,9 +863,16 @@ impl HostService {
         expires_at: Option<OffsetDateTime>,
     ) -> Result<ApiPrincipal, SatelleError> {
         let now = OffsetDateTime::now_utc();
-        let registration =
-            ApiTokenRegistration::new(token, principal_ref, 1, scopes, expires_at, now)
-                .map_err(crate::runtime::storage_error)?;
+        let registration = ApiTokenRegistration::new(
+            token,
+            principal_ref,
+            1,
+            scopes,
+            self.runtime.configured_desktop_bindings()?,
+            expires_at,
+            now,
+        )
+        .map_err(crate::runtime::storage_error)?;
         self.runtime.register_api_token(registration)?;
         let principal = self
             .runtime
@@ -944,6 +984,20 @@ impl HostService {
                 bearer_token: None,
             });
         }
+        if let crate::ApiTokenMutation::Issue {
+            desktop_bindings, ..
+        } = mutation
+        {
+            let configured = self.runtime.configured_desktop_bindings()?;
+            for binding in desktop_bindings {
+                if !configured.contains(binding) {
+                    return Err(SatelleError::desktop_binding_not_found(binding));
+                }
+                if !authority.principal.allows_desktop_binding(binding) {
+                    return Err(SatelleError::desktop_binding_unauthorized(binding));
+                }
+            }
+        }
         let operation = mutation.operation();
         let payload = canonical_payload(mutation, 1)?;
         let _identity_gate = self.operation_capacity.lock_identity_read()?;
@@ -1014,6 +1068,7 @@ impl HostService {
                 principal_ref,
                 1,
                 scopes,
+                self.runtime.configured_desktop_bindings()?,
                 pending_until,
                 now,
             )
@@ -1087,6 +1142,7 @@ impl HostService {
     pub fn validate_provider_descriptor_idempotent(
         &self,
         host: &str,
+        desktop_binding: &str,
         model_alias: &str,
         provider_alias: &str,
         options: crate::ProviderDescriptorValidationOptions,
@@ -1096,6 +1152,7 @@ impl HostService {
             &CanonicalProviderDescriptorValidation {
                 operation: "provider_descriptor_validation",
                 host,
+                desktop_binding,
                 model_alias,
                 provider_alias,
                 mode: options.mode(),
@@ -1119,15 +1176,26 @@ impl HostService {
         {
             return Ok(replay);
         }
-        let validation =
-            match self.validate_provider_descriptor(host, model_alias, provider_alias, options) {
-                Ok(validation) => validation,
-                Err(error) => {
-                    self.runtime
-                        .fail_provider_descriptor_validation(&identity, &error)?;
-                    return Err(error);
-                }
-            };
+        if !authority
+            .principal()
+            .allows_desktop_binding(desktop_binding)
+        {
+            return Err(SatelleError::desktop_binding_unauthorized(desktop_binding));
+        }
+        let validation = match self.validate_provider_descriptor(
+            host,
+            desktop_binding,
+            model_alias,
+            provider_alias,
+            options,
+        ) {
+            Ok(validation) => validation,
+            Err(error) => {
+                self.runtime
+                    .fail_provider_descriptor_validation(&identity, &error)?;
+                return Err(error);
+            }
+        };
         let public_validation = PublicProviderDescriptorValidation::from(&validation);
         self.runtime
             .complete_provider_descriptor_validation(&identity, &public_validation)?;
@@ -1137,6 +1205,7 @@ impl HostService {
     pub fn authorize_provider_binding_idempotent(
         &self,
         host: &str,
+        desktop_binding: &str,
         model_alias: &str,
         provider_alias: &str,
         authorization: satelle_core::ProviderBindingAuthorization,
@@ -1146,12 +1215,23 @@ impl HostService {
             &CanonicalProviderBindingAuthorization {
                 operation: "provider_binding_authorization",
                 host,
+                desktop_binding,
                 model_alias,
                 provider_alias,
                 authorization: &authorization,
             },
             PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION,
         )?;
+        let desktop_binding = DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_binding_not_found(desktop_binding))?;
+        if !authority
+            .principal()
+            .allows_desktop_binding(desktop_binding.as_str())
+        {
+            return Err(SatelleError::desktop_binding_unauthorized(
+                desktop_binding.as_str(),
+            ));
+        }
         let _identity_gate = self.operation_capacity.lock_identity_read()?;
         let identity = self.runtime.authenticated_request_identity(
             &authority.principal,
@@ -1180,6 +1260,7 @@ impl HostService {
                     self.runtime
                         .authorize_provider_binding_idempotent(
                             &operation_identity,
+                            &desktop_binding,
                             model_alias,
                             provider_alias,
                             || {
@@ -1189,7 +1270,11 @@ impl HostService {
                                     provider_alias,
                                     authorization,
                                 )?;
-                                self.validate_provider_binding_candidate(host, &binding)
+                                self.validate_provider_binding_candidate(
+                                    host,
+                                    &desktop_binding,
+                                    &binding,
+                                )
                                     .map(|()| binding)
                             },
                         )
@@ -1205,7 +1290,7 @@ impl HostService {
 
     pub fn provision_provider_secret_idempotent(
         &self,
-        host: &str,
+        desktop_binding: &str,
         authorization: satelle_core::ProviderBindingAuthorization,
         secret: zeroize::Zeroizing<String>,
         overwrite_authorized: bool,
@@ -1215,13 +1300,24 @@ impl HostService {
         let canonical_payload = canonical_payload(
             &CanonicalProviderSecretProvisioning {
                 operation: "provider_secret_provisioning",
-                host,
+                host: satelle_core::LOCAL_DEMO_HOST,
+                desktop_binding,
                 authorization: &authorization,
                 overwrite_authorized,
                 envelope_digest,
             },
             PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION,
         )?;
+        let desktop_binding = DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_binding_not_found(desktop_binding))?;
+        if !authority
+            .principal()
+            .allows_desktop_binding(desktop_binding.as_str())
+        {
+            return Err(SatelleError::desktop_binding_unauthorized(
+                desktop_binding.as_str(),
+            ));
+        }
         let _identity_gate = self.operation_capacity.lock_identity_read()?;
         let identity = self.runtime.authenticated_request_identity(
             &authority.principal,
@@ -1248,7 +1344,8 @@ impl HostService {
                 },
                 || {
                     self.provision_provider_secret(
-                        host,
+                        satelle_core::LOCAL_DEMO_HOST,
+                        desktop_binding.as_str(),
                         authorization,
                         secret,
                         overwrite_authorized,
@@ -1267,6 +1364,7 @@ impl HostService {
     pub fn replay_provider_secret_provisioning_idempotent(
         &self,
         host: &str,
+        desktop_binding: &str,
         authorization: satelle_core::ProviderBindingAuthorization,
         overwrite_authorized: bool,
         envelope_digest: &str,
@@ -1276,12 +1374,19 @@ impl HostService {
             &CanonicalProviderSecretProvisioning {
                 operation: "provider_secret_provisioning",
                 host,
+                desktop_binding,
                 authorization: &authorization,
                 overwrite_authorized,
                 envelope_digest,
             },
             PROVIDER_SECRET_PROVISIONING_DIGEST_SCHEMA_VERSION,
         )?;
+        if !authority
+            .principal()
+            .allows_desktop_binding(desktop_binding)
+        {
+            return Err(SatelleError::desktop_binding_unauthorized(desktop_binding));
+        }
         let _identity_gate = self.operation_capacity.lock_identity_read()?;
         let identity = self.runtime.authenticated_request_identity(
             &authority.principal,
@@ -1295,6 +1400,7 @@ impl HostService {
 
     pub fn delete_provider_binding_idempotent(
         &self,
+        desktop_binding: &str,
         model_alias: &str,
         provider_alias: &str,
         authority: &MutationAuthority,
@@ -1302,11 +1408,22 @@ impl HostService {
         let canonical_payload = canonical_payload(
             &CanonicalProviderBindingDeletion {
                 operation: "provider_binding_deletion",
+                desktop_binding,
                 model_alias,
                 provider_alias,
             },
             PROVIDER_BINDING_MUTATION_DIGEST_SCHEMA_VERSION,
         )?;
+        let desktop_binding = DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_binding_not_found(desktop_binding))?;
+        if !authority
+            .principal()
+            .allows_desktop_binding(desktop_binding.as_str())
+        {
+            return Err(SatelleError::desktop_binding_unauthorized(
+                desktop_binding.as_str(),
+            ));
+        }
         let _identity_gate = self.operation_capacity.lock_identity_read()?;
         let identity = self.runtime.authenticated_request_identity(
             &authority.principal,
@@ -1318,6 +1435,7 @@ impl HostService {
         self.operation_capacity.execute_exclusive(|| {
             self.runtime.delete_provider_binding_idempotent(
                 &identity,
+                &desktop_binding,
                 model_alias,
                 provider_alias,
                 || {
@@ -1476,6 +1594,61 @@ impl HostService {
         })
     }
 
+    fn resolve_run_desktop_binding(
+        &self,
+        intent: &TurnIntent,
+        authority: &MutationAuthority,
+    ) -> Result<DesktopBindingRef, SatelleError> {
+        let configured = self.runtime.configured_desktop_bindings()?;
+        let selected = match intent.desktop_binding() {
+            Some(binding) => binding.clone(),
+            None if configured.len() == 1 => DesktopBindingRef::new(
+                configured
+                    .first()
+                    .expect("a single configured Desktop Binding exists")
+                    .clone(),
+            )
+            .map_err(|_| SatelleError::desktop_binding_ambiguous(configured.clone()))?,
+            None => return Err(SatelleError::desktop_binding_ambiguous(configured)),
+        };
+        if !configured.contains(selected.as_str()) {
+            return Err(SatelleError::desktop_binding_not_found(selected.as_str()));
+        }
+        if !authority
+            .principal()
+            .allows_desktop_binding(selected.as_str())
+        {
+            return Err(SatelleError::desktop_binding_unauthorized(
+                selected.as_str(),
+            ));
+        }
+        Ok(selected)
+    }
+
+    fn resolve_steer_desktop_binding(
+        &self,
+        session_id: &SessionId,
+        intent: &TurnIntent,
+        authority: &MutationAuthority,
+    ) -> Result<DesktopBindingRef, SatelleError> {
+        let stored =
+            DesktopBindingRef::new(self.runtime.status(session_id.clone())?.desktop_binding())
+                .map_err(|_| SatelleError::desktop_binding_not_found("invalid"))?;
+        if intent
+            .desktop_binding()
+            .is_some_and(|selected| selected != &stored)
+        {
+            return Err(SatelleError::state_conflict());
+        }
+        if !authority
+            .principal()
+            .allows_desktop_binding(stored.as_str())
+        {
+            return Err(SatelleError::desktop_binding_unauthorized(stored.as_str()));
+        }
+        Ok(stored)
+    }
+
     pub fn admit_run(
         &self,
         intent: &TurnIntent,
@@ -1491,6 +1664,7 @@ impl HostService {
         cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
         self.ensure_image_attachments_supported(intent)?;
+        let desktop_binding = self.resolve_run_desktop_binding(intent, authority)?;
         let turn_execution_timeout = self.effective_turn_execution_timeout(intent);
         let canonical_payload = canonical_payload(
             &CanonicalSessionCreate {
@@ -1518,6 +1692,7 @@ impl HostService {
                     .map(CanonicalAttachment::from)
                     .collect::<Vec<_>>(),
                 raw_protocol_source_host: intent.raw_protocol_source_host(),
+                desktop_binding: Some(desktop_binding.as_str()),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -1563,6 +1738,7 @@ impl HostService {
                             )
                             .with_execution_mode(intent.execution_mode)
                             .with_provider_intent(intent.provider_intent.clone())
+                            .with_desktop_binding(desktop_binding.clone())
                             .with_turn_execution_timeout(Some(turn_execution_timeout))
                             .with_attachments(crate::attachment::resolve_images(
                                 &intent.attachments,
@@ -1607,6 +1783,7 @@ impl HostService {
         cancellation: AdmissionCancellation,
     ) -> Result<PublicSession, SatelleError> {
         self.ensure_image_attachments_supported(intent)?;
+        let desktop_binding = self.resolve_steer_desktop_binding(session_id, intent, authority)?;
         let turn_execution_timeout = self.effective_turn_execution_timeout(intent);
         let canonical_payload = canonical_payload(
             &CanonicalTurnCreate {
@@ -1635,6 +1812,7 @@ impl HostService {
                     .map(CanonicalAttachment::from)
                     .collect::<Vec<_>>(),
                 raw_protocol_source_host: intent.raw_protocol_source_host(),
+                desktop_binding: Some(desktop_binding.as_str()),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -1684,6 +1862,7 @@ impl HostService {
                             )
                             .with_execution_mode(intent.execution_mode)
                             .with_provider_intent(intent.provider_intent.clone())
+                            .with_desktop_binding(desktop_binding.clone())
                             .with_turn_execution_timeout(Some(turn_execution_timeout))
                             .with_attachments(crate::attachment::resolve_images(
                                 &intent.attachments,
@@ -1711,6 +1890,7 @@ impl HostService {
         intent: &TurnIntent,
         authority: &MutationAuthority,
     ) -> Result<AdmissionCancellationResult, SatelleError> {
+        let desktop_binding = self.resolve_run_desktop_binding(intent, authority)?;
         let turn_execution_timeout = self.effective_turn_execution_timeout(intent);
         let canonical_payload = canonical_payload(
             &CanonicalSessionCreate {
@@ -1738,6 +1918,7 @@ impl HostService {
                     .map(CanonicalAttachment::from)
                     .collect::<Vec<_>>(),
                 raw_protocol_source_host: intent.raw_protocol_source_host(),
+                desktop_binding: Some(desktop_binding.as_str()),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -1781,6 +1962,7 @@ impl HostService {
         intent: &TurnIntent,
         authority: &MutationAuthority,
     ) -> Result<AdmissionCancellationResult, SatelleError> {
+        let desktop_binding = self.resolve_steer_desktop_binding(session_id, intent, authority)?;
         let turn_execution_timeout = self.effective_turn_execution_timeout(intent);
         let canonical_payload = canonical_payload(
             &CanonicalTurnCreate {
@@ -1809,6 +1991,7 @@ impl HostService {
                     .map(CanonicalAttachment::from)
                     .collect::<Vec<_>>(),
                 raw_protocol_source_host: intent.raw_protocol_source_host(),
+                desktop_binding: Some(desktop_binding.as_str()),
             },
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )?;
@@ -1873,6 +2056,7 @@ impl HostService {
         expected_turn_id: Option<&TurnId>,
         authority: &MutationAuthority,
     ) -> Result<StopAdmission, SatelleError> {
+        self.authorize_session_binding(authority.principal(), session_id)?;
         let canonical_payload = canonical_payload(
             &CanonicalSessionStop {
                 operation: "session_stop",
@@ -1923,6 +2107,20 @@ impl HostService {
 
     pub fn session_status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
         self.runtime.status(session_id.clone())
+    }
+
+    pub fn authorize_session_binding(
+        &self,
+        principal: &ApiPrincipal,
+        session_id: &SessionId,
+    ) -> Result<PublicSession, SatelleError> {
+        let session = self.session_status(session_id)?;
+        if !principal.allows_desktop_binding(session.desktop_binding()) {
+            return Err(SatelleError::desktop_binding_unauthorized(
+                session.desktop_binding(),
+            ));
+        }
+        Ok(session)
     }
 
     pub(crate) fn effective_turn_execution_timeout(
@@ -2020,6 +2218,16 @@ impl HostService {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_queue_config_for_tests(
+        self,
+        config: satelle_core::queue::QueueConfig,
+    ) -> Result<Self, SatelleError> {
+        self.runtime.set_queue_config_for_tests(config)?;
+        Ok(self)
+    }
+
+    #[doc(hidden)]
     #[cfg(feature = "test-support")]
     pub fn with_adapter_for_tests_at<A: crate::ComputerUseAdapter>(
         state_root: impl Into<std::path::PathBuf>,
@@ -2047,6 +2255,7 @@ impl HostService {
     pub fn authorize_provider_binding_without_validation_for_tests(
         &self,
         host: &str,
+        desktop_binding: &str,
         model_alias: &str,
         provider_alias: &str,
         authorization: satelle_core::ProviderBindingAuthorization,
@@ -2057,7 +2266,10 @@ impl HostService {
             provider_alias,
             authorization,
         )?;
-        self.runtime.authorize_provider_binding(&binding)
+        let desktop_binding = DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_binding_not_found(desktop_binding))?;
+        self.runtime
+            .authorize_provider_binding(&desktop_binding, &binding)
     }
 }
 
@@ -2316,6 +2528,147 @@ mod tests {
     use crate::api_auth::EphemeralApiAuthenticator;
     use std::sync::Arc;
 
+    fn broker_principal(desktop_bindings: &[&str]) -> ApiPrincipal {
+        ApiPrincipal {
+            token_id: "token-broker-test".to_string(),
+            principal_ref: "principal-broker-test".to_string(),
+            credential_revision: 1,
+            scopes: ApiScopes::CONTROL,
+            desktop_bindings: desktop_bindings
+                .iter()
+                .map(|binding| (*binding).to_string())
+                .collect(),
+            expires_at: None,
+            process_local_ssh_bootstrap: false,
+            durable_setup_pending: false,
+            durable_setup_active: false,
+        }
+    }
+
+    fn multi_binding_service(state: &crate::TestStateDir) -> HostService {
+        let mut config = satelle_core::SatelleConfig::defaults()
+            .hosts
+            .remove(LOCAL_DEMO_HOST)
+            .expect("built-in Host config exists");
+        config.desktop_bindings = [
+            (
+                "alice".to_string(),
+                satelle_core::DesktopBindingConfig {
+                    desktop_user: "alice".to_string(),
+                    desktop_session_preference: None,
+                    desktop_session_native_selector: None,
+                    provider_auth: Default::default(),
+                    provider_bindings: Default::default(),
+                },
+            ),
+            (
+                "bob".to_string(),
+                satelle_core::DesktopBindingConfig {
+                    desktop_user: "bob".to_string(),
+                    desktop_session_preference: None,
+                    desktop_session_native_selector: None,
+                    provider_auth: Default::default(),
+                    provider_bindings: Default::default(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        config.daemon_state_dir = Some(state.path().to_path_buf());
+        config.daemon_log_dir = Some(state.path().join("logs"));
+        HostService::production_for_host(&config)
+    }
+
+    #[test]
+    fn broker_requires_an_unambiguous_authorized_desktop_binding() {
+        let state = crate::TestStateDir::new().expect("temporary state directory");
+        let service = multi_binding_service(&state);
+        let principal = broker_principal(&["alice"]);
+        let authority = MutationAuthority::new(principal, "broker-binding-selection").unwrap();
+        let base = TurnIntent::new("prompt", TurnExecutionMode::Standard).unwrap();
+
+        let ambiguous = service
+            .resolve_run_desktop_binding(&base, &authority)
+            .expect_err("multiple bindings require an explicit selection");
+        assert_eq!(
+            ambiguous.code,
+            satelle_core::ErrorCode::DesktopBindingAmbiguous
+        );
+        assert_eq!(
+            ambiguous.details["desktop_bindings"],
+            serde_json::json!(["alice", "bob"])
+        );
+
+        let unauthorized = TurnIntent::new("prompt", TurnExecutionMode::Standard)
+            .unwrap()
+            .with_desktop_binding(Some("bob".to_string()))
+            .unwrap();
+        assert_eq!(
+            service
+                .resolve_run_desktop_binding(&unauthorized, &authority)
+                .expect_err("the principal has no grant for Bob")
+                .code,
+            satelle_core::ErrorCode::DesktopBindingUnauthorized
+        );
+
+        let authorized = base
+            .with_desktop_binding(Some("alice".to_string()))
+            .unwrap();
+        assert_eq!(
+            service
+                .resolve_run_desktop_binding(&authorized, &authority)
+                .expect("Alice is configured and granted")
+                .as_str(),
+            "alice"
+        );
+    }
+
+    #[test]
+    fn broker_hides_sessions_from_principals_without_the_binding_grant() {
+        let state = crate::TestStateDir::new().expect("temporary state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic service");
+        let session = service
+            .runtime
+            .run(RunCommand::attached(
+                LOCAL_DEMO_HOST,
+                "PRIVATE_BROKER_SESSION",
+            ))
+            .expect("create a stored session");
+        let principal = broker_principal(&["another-binding"]);
+
+        assert_eq!(
+            service
+                .authorize_session_binding(&principal, session.session.session_id())
+                .expect_err("the principal cannot read another binding's session")
+                .code,
+            satelle_core::ErrorCode::DesktopBindingUnauthorized
+        );
+    }
+
+    #[test]
+    fn broker_admin_cannot_delegate_a_desktop_binding_it_cannot_access() {
+        let state = crate::TestStateDir::new().expect("temporary state directory");
+        let service = multi_binding_service(&state);
+        let mut principal = broker_principal(&["alice"]);
+        principal.scopes = ApiScopes::ADMIN;
+        let authority = MutationAuthority::new(principal, "broker-token-delegation").unwrap();
+        let mutation = crate::ApiTokenMutation::Issue {
+            scopes: ApiScopes::CONTROL,
+            desktop_bindings: std::collections::BTreeSet::from(["bob".to_string()]),
+            expires_at: None,
+        };
+
+        let error = match service.mutate_api_token(&mutation, &authority) {
+            Ok(_) => panic!("an admin cannot delegate an ungranted binding"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code,
+            satelle_core::ErrorCode::DesktopBindingUnauthorized
+        );
+    }
+
     #[test]
     fn provider_intent_builder_preserves_explicit_computer_use_opt_in() {
         let intent = TurnIntent::new("prompt", TurnExecutionMode::Standard)
@@ -2474,6 +2827,9 @@ mod tests {
         let authority = MutationAuthority::new(principal.clone(), "token-replay").unwrap();
         let mutation = crate::ApiTokenMutation::Issue {
             scopes: ApiScopes::READ,
+            desktop_bindings: std::collections::BTreeSet::from([
+                "local-demo-desktop-v1".to_string()
+            ]),
             expires_at: None,
         };
         let first = service.mutate_api_token(&mutation, &authority).unwrap();
@@ -2492,6 +2848,9 @@ mod tests {
         let conflict = service.mutate_api_token(
             &crate::ApiTokenMutation::Issue {
                 scopes: ApiScopes::CONTROL,
+                desktop_bindings: std::collections::BTreeSet::from([
+                    "local-demo-desktop-v1".to_string()
+                ]),
                 expires_at: None,
             },
             &authority,
@@ -2568,6 +2927,7 @@ mod tests {
         let turn = canonical_payload(
             &CanonicalSessionCreate {
                 operation: "session_create",
+                desktop_binding: Some("local-demo-desktop-v1"),
                 prompt: "PRIVATE_DIGEST_VERSION_PROMPT",
                 execution_mode: TurnExecutionMode::Yolo,
                 model: Some("model-test"),
@@ -2583,10 +2943,10 @@ mod tests {
             TURN_IDEMPOTENCY_DIGEST_SCHEMA_VERSION,
         )
         .expect("serialize Turn idempotency payload");
-        assert_eq!(turn.digest_schema_version, 8);
+        assert_eq!(turn.digest_schema_version, 9);
         assert_eq!(
             turn.as_slice(),
-            br#"{"digest_schema_version":8,"payload":{"operation":"session_create","prompt":"PRIVATE_DIGEST_VERSION_PROMPT","execution_mode":"yolo","model":"model-test","provider":"provider-test","model_from_project":true,"provider_from_project":false,"refresh_provider_smoke_test":true,"experimental_provider_computer_use":true,"turn_execution_timeout_seconds":1800,"attachments":[],"raw_protocol_source_host":"remote"}}"#
+            br#"{"digest_schema_version":9,"payload":{"operation":"session_create","prompt":"PRIVATE_DIGEST_VERSION_PROMPT","execution_mode":"yolo","model":"model-test","provider":"provider-test","model_from_project":true,"provider_from_project":false,"refresh_provider_smoke_test":true,"experimental_provider_computer_use":true,"turn_execution_timeout_seconds":1800,"attachments":[],"raw_protocol_source_host":"remote","desktop_binding":"local-demo-desktop-v1"}}"#
         );
 
         let stop = canonical_payload(
@@ -2680,6 +3040,7 @@ mod tests {
             &token,
             ApiScopes::READ,
             OffsetDateTime::now_utc() + time::Duration::minutes(15),
+            std::collections::BTreeSet::from(["local-demo-desktop-v1".to_string()]),
         )));
 
         let principal = service

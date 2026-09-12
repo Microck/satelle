@@ -49,11 +49,11 @@ pub use setup::{
     ManagedSetupActionResponse, NativeReadinessInvalidationRequest,
     NativeReadinessInvalidationResponse, NativeReadinessInvalidationScope,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
-    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
-    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, RepairMaintenanceRequest, SetupRepairDecision,
-    SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
+    ProviderBindingDeletionRequest, ProviderBindingDeletionResponse,
+    ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
+    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
+    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, RepairMaintenanceRequest,
+    SetupRepairDecision, SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
     SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairPreviousStatus, SetupRepairProbe,
     SetupRepairRunStatus, SetupVerificationRequest, SetupVerificationResponse,
     StorageMigrationCleanupResponse, StorageMigrationPathsRequest,
@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_the_v20_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "21");
+        assert_eq!(PROTOCOL_VERSION, "22");
     }
 
     #[test]

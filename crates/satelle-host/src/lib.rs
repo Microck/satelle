@@ -3266,7 +3266,16 @@ impl HostService {
             provider_smoke_timeout,
             provider_smoke_success_ttl,
             provider_smoke_failure_ttl,
-            desktop_selection: satelle_core::DesktopSelectionPolicy::from_host_config(config),
+            desktop_bindings: config
+                .desktop_bindings
+                .iter()
+                .map(|(alias, binding)| {
+                    (
+                        alias.clone(),
+                        satelle_core::DesktopSelectionPolicy::from_binding_config(binding),
+                    )
+                })
+                .collect(),
         };
         let adapter = ProductionComputerUseAdapter::with_readiness_policy(
             Arc::clone(&snapshot),
@@ -3380,7 +3389,10 @@ impl HostService {
     ) -> Self {
         let mut service = Self::production_for_host(config);
         service.bootstrap_auth = Some(Arc::new(EphemeralApiAuthenticator::new(
-            token, scopes, expires_at,
+            token,
+            scopes,
+            expires_at,
+            config.desktop_bindings.keys().cloned().collect(),
         )));
         service
     }
@@ -3416,17 +3428,17 @@ impl HostService {
     /// The deterministic adapter requires both the compile-time feature and a
     /// separate Satelle-owned CLI opt-in. It is not present in default builds.
     #[cfg(feature = "test-support")]
-    pub fn local_demo_for_tests() -> Result<Self, SatelleError> {
+    pub fn local_demo_for_tests(config: &satelle_core::HostConfig) -> Result<Self, SatelleError> {
+        let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+            satelle_core::state_dir(),
+            FakeComputerUseAdapter,
+            FakeComputerUseAdapter,
+        );
+        runtime.configure_host_policy_for_tests(config)?;
         Ok(Self {
-            runtime: RuntimeHandle::new_with_readiness_probe_driver(
-                satelle_core::state_dir(),
-                FakeComputerUseAdapter,
-                FakeComputerUseAdapter,
-            ),
+            runtime,
             operation_capacity: Arc::new(OperationCapacity::default()),
-            turn_execution_timeout: configured_turn_execution_timeout(
-                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
-            ),
+            turn_execution_timeout: configured_turn_execution_timeout(config),
             mode: HostMode::TestFake {
                 image_attachments: true,
             },
@@ -3438,13 +3450,15 @@ impl HostService {
 
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
-    pub fn pending_local_demo_for_tests() -> Result<Self, SatelleError> {
+    pub fn pending_local_demo_for_tests(
+        config: &satelle_core::HostConfig,
+    ) -> Result<Self, SatelleError> {
+        let runtime = RuntimeHandle::new(satelle_core::state_dir(), PendingComputerUseAdapter);
+        runtime.configure_host_policy_for_tests(config)?;
         Ok(Self {
-            runtime: RuntimeHandle::new(satelle_core::state_dir(), PendingComputerUseAdapter),
+            runtime,
             operation_capacity: Arc::new(OperationCapacity::default()),
-            turn_execution_timeout: configured_turn_execution_timeout(
-                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
-            ),
+            turn_execution_timeout: configured_turn_execution_timeout(config),
             mode: HostMode::TestFake {
                 image_attachments: true,
             },
@@ -3456,16 +3470,18 @@ impl HostService {
 
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
-    pub fn readiness_failing_local_demo_for_tests() -> Result<Self, SatelleError> {
+    pub fn readiness_failing_local_demo_for_tests(
+        config: &satelle_core::HostConfig,
+    ) -> Result<Self, SatelleError> {
+        let runtime = RuntimeHandle::new(
+            satelle_core::state_dir(),
+            ReadinessFailingComputerUseAdapter,
+        );
+        runtime.configure_host_policy_for_tests(config)?;
         Ok(Self {
-            runtime: RuntimeHandle::new(
-                satelle_core::state_dir(),
-                ReadinessFailingComputerUseAdapter,
-            ),
+            runtime,
             operation_capacity: Arc::new(OperationCapacity::default()),
-            turn_execution_timeout: configured_turn_execution_timeout(
-                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
-            ),
+            turn_execution_timeout: configured_turn_execution_timeout(config),
             mode: HostMode::TestFake {
                 image_attachments: true,
             },
@@ -3477,13 +3493,15 @@ impl HostService {
 
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
-    pub fn resolved_secret_canary_local_demo_for_tests() -> Result<Self, SatelleError> {
+    pub fn resolved_secret_canary_local_demo_for_tests(
+        config: &satelle_core::HostConfig,
+    ) -> Result<Self, SatelleError> {
+        let runtime = RuntimeHandle::new(satelle_core::state_dir(), ResolvedSecretCanaryAdapter);
+        runtime.configure_host_policy_for_tests(config)?;
         Ok(Self {
-            runtime: RuntimeHandle::new(satelle_core::state_dir(), ResolvedSecretCanaryAdapter),
+            runtime,
             operation_capacity: Arc::new(OperationCapacity::default()),
-            turn_execution_timeout: configured_turn_execution_timeout(
-                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
-            ),
+            turn_execution_timeout: configured_turn_execution_timeout(config),
             mode: HostMode::TestFake {
                 image_attachments: true,
             },
@@ -3495,13 +3513,15 @@ impl HostService {
 
     #[doc(hidden)]
     #[cfg(feature = "test-support")]
-    pub fn failing_local_demo_for_tests() -> Result<Self, SatelleError> {
+    pub fn failing_local_demo_for_tests(
+        config: &satelle_core::HostConfig,
+    ) -> Result<Self, SatelleError> {
+        let runtime = RuntimeHandle::new(satelle_core::state_dir(), FailingComputerUseAdapter);
+        runtime.configure_host_policy_for_tests(config)?;
         Ok(Self {
-            runtime: RuntimeHandle::new(satelle_core::state_dir(), FailingComputerUseAdapter),
+            runtime,
             operation_capacity: Arc::new(OperationCapacity::default()),
-            turn_execution_timeout: configured_turn_execution_timeout(
-                &satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
-            ),
+            turn_execution_timeout: configured_turn_execution_timeout(config),
             mode: HostMode::TestFake {
                 image_attachments: true,
             },
@@ -3831,6 +3851,7 @@ impl HostService {
     pub fn authorize_provider_binding(
         &self,
         host: &str,
+        desktop_binding: &str,
         model_alias: &str,
         provider_alias: &str,
         authorization: ProviderBindingAuthorization,
@@ -3841,9 +3862,11 @@ impl HostService {
             provider_alias,
             authorization,
         )?;
-        let previous_digest = self
-            .runtime
-            .provider_binding_digest(model_alias, provider_alias)?;
+        let desktop_binding = satelle_core::session::DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_binding_not_found(desktop_binding))?;
+        let previous_digest =
+            self.runtime
+                .provider_binding_digest(&desktop_binding, model_alias, provider_alias)?;
         let missing_file_destination = matches!(
             binding.auth_source(),
             Some(satelle_core::ProviderSecretSource::File { path })
@@ -3853,21 +3876,35 @@ impl HostService {
                 )
         );
         if !missing_file_destination {
-            self.validate_provider_binding_candidate(host, &binding)?;
+            self.validate_provider_binding_candidate(host, &desktop_binding, &binding)?;
         }
-        self.runtime
-            .authorize_provider_binding_if_unchanged(&binding, previous_digest.as_deref())?;
+        self.runtime.authorize_provider_binding_if_unchanged(
+            &desktop_binding,
+            &binding,
+            previous_digest.as_deref(),
+        )?;
         Ok(binding)
     }
 
     pub fn preview_provider_secret_provisioning(
         &self,
         host: &str,
+        desktop_binding: &str,
         authorization: ProviderBindingAuthorization,
         // Preview remains on the mutation-authorized route so provisioning
         // cannot bypass the authority checked at the transport boundary.
         _authority: &MutationAuthority,
     ) -> Result<ProviderSecretProvisioningPreview, SatelleError> {
+        let desktop_binding = satelle_core::session::DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_binding_not_found(desktop_binding))?;
+        if !_authority
+            .principal()
+            .allows_desktop_binding(desktop_binding.as_str())
+        {
+            return Err(SatelleError::desktop_binding_unauthorized(
+                desktop_binding.as_str(),
+            ));
+        }
         let model_alias = authorization.requested_model_alias().to_string();
         let provider_alias = authorization.requested_provider_alias().to_string();
         let binding = self.prepare_provider_binding_authorization(
@@ -3888,6 +3925,7 @@ impl HostService {
     fn provision_provider_secret(
         &self,
         host: &str,
+        desktop_binding: &str,
         authorization: ProviderBindingAuthorization,
         secret: Zeroizing<String>,
         overwrite_authorized: bool,
@@ -3910,7 +3948,9 @@ impl HostService {
             Some(satelle_core::ProviderSecretSource::File { path }) => path.clone(),
             _ => return Err(provider_secret_source_error()),
         };
-        let intent = Self::provider_candidate_intent(&binding)?;
+        let desktop_binding = satelle_core::session::DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_binding_not_found(desktop_binding))?;
+        let intent = Self::provider_candidate_intent(desktop_binding, &binding)?;
         // Native readiness owns its own durable probe lease. Complete that
         // phase before T0 so staged provider validation can reuse the exact
         // evidence without competing with the provider-secret lease.
@@ -4181,6 +4221,7 @@ impl HostService {
     }
 
     fn provider_candidate_intent(
+        desktop_binding: satelle_core::session::DesktopBindingRef,
         binding: &ResolvedProviderBinding,
     ) -> Result<ProviderComputerUseIntent, SatelleError> {
         Ok(ProviderComputerUseIntent::new(
@@ -4196,12 +4237,14 @@ impl HostService {
             ),
             true,
         )
+        .with_desktop_binding(desktop_binding)
         .with_resolved_provider_binding(binding.clone())
         .with_experimental_provider_computer_use(binding.experimental_provider_computer_use()))
     }
 
     pub fn delete_provider_binding(
         &self,
+        desktop_binding: &str,
         model_alias: &str,
         provider_alias: &str,
     ) -> Result<bool, SatelleError> {
@@ -4209,13 +4252,16 @@ impl HostService {
             .map_err(|_| SatelleError::config_error("the model alias is invalid", None))?;
         satelle_core::session::ProviderBindingRef::new(provider_alias)
             .map_err(|_| SatelleError::config_error("the provider alias is invalid", None))?;
+        let desktop_binding = satelle_core::session::DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_binding_not_found(desktop_binding))?;
         self.runtime
-            .delete_provider_binding(model_alias, provider_alias)
+            .delete_provider_binding(&desktop_binding, model_alias, provider_alias)
     }
 
     pub fn validate_provider_descriptor(
         &self,
         host: &str,
+        desktop_binding: &str,
         model_alias: &str,
         provider_alias: &str,
         options: ProviderDescriptorValidationOptions,
@@ -4226,6 +4272,8 @@ impl HostService {
         };
         let mode = options.mode();
 
+        let desktop_binding = satelle_core::session::DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_binding_not_found(desktop_binding))?;
         let intent =
             if model_alias == DEFAULT_MODEL_BINDING && provider_alias == DEFAULT_PROVIDER_BINDING {
                 ProviderComputerUseIntent::new(
@@ -4253,6 +4301,7 @@ impl HostService {
                 options.provider_from_project(),
             )
             .with_experimental_provider_computer_use(options.experimental_provider_computer_use());
+        let intent = intent.with_desktop_binding(desktop_binding);
         let (resolved_binding, deferred_outcome, deferred_source) =
             match self.resolve_provider_binding(host, &intent)? {
                 ProviderBindingResolution::Ready(binding) => {
@@ -4345,9 +4394,10 @@ impl HostService {
     fn validate_provider_binding_candidate(
         &self,
         host: &str,
+        desktop_binding: &satelle_core::session::DesktopBindingRef,
         binding: &ResolvedProviderBinding,
     ) -> Result<(), SatelleError> {
-        let intent = Self::provider_candidate_intent(binding)?;
+        let intent = Self::provider_candidate_intent(desktop_binding.clone(), binding)?;
         let readiness = self.runtime.refresh_provider_smoke(host, &intent)?;
         if readiness.resolved_provider_binding() != Some(binding) {
             return Err(crate::runtime::integrity_error(
@@ -4713,12 +4763,15 @@ impl HostService {
     ) -> Result<satelle_core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
         let desktop_binding = satelle_core::session::DesktopBindingRef::new(desktop_binding)
             .map_err(|_| SatelleError::desktop_snapshot_target_required(source_host))?;
+        let desktop_user = self
+            .runtime
+            .desktop_user_for_binding(desktop_binding.as_str())?;
         let matching = self
             .daemon_desktop_sessions()?
             .into_iter()
             .filter(|session| {
                 session.session_id == desktop_session_identity
-                    && session.desktop_user == desktop_binding.as_str()
+                    && session.desktop_user == desktop_user
                     && session.state == "active"
                     && session.session_kind == "visible_desktop"
                     && session.is_console != session.is_remote

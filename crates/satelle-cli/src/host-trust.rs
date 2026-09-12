@@ -181,28 +181,51 @@ pub(crate) fn persist_desktop_selection(
                 recovery_command,
             )
         })?;
+    if host.get("desktop_bindings").is_none() {
+        host.insert("desktop_bindings", Item::Table(Table::new()));
+    }
+    let desktop_bindings = host
+        .get_mut("desktop_bindings")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| {
+            config_error_with_recovery(
+                config_path,
+                "the Host Binding desktop_bindings value is not a table",
+                None,
+                recovery_command,
+            )
+        })?;
+    if desktop_bindings.get(desktop_user).is_none() {
+        desktop_bindings.insert(desktop_user, Item::Table(Table::new()));
+    }
+    let binding = desktop_bindings
+        .get_mut(desktop_user)
+        .and_then(Item::as_table_like_mut)
+        .expect("the Desktop Binding table was inserted above");
     let preference = preference.map(|value| match value {
         DesktopSessionPreference::Only => "only",
         DesktopSessionPreference::Console => "console",
     });
-    let unchanged = host.get("desktop_user").and_then(toml_edit::Item::as_str)
+    let unchanged = binding
+        .get("desktop_user")
+        .and_then(toml_edit::Item::as_str)
         == Some(desktop_user)
-        && host
+        && binding
             .get("desktop_session_preference")
             .and_then(toml_edit::Item::as_str)
             == preference
-        && host.get("desktop_session_native_selector").is_none();
+        && binding.get("desktop_session_native_selector").is_none();
     if unchanged {
         return Ok(false);
     }
 
-    host.insert("desktop_user", value(desktop_user));
+    binding.insert("desktop_user", value(desktop_user));
     if let Some(preference) = preference {
-        host.insert("desktop_session_preference", value(preference));
+        binding.insert("desktop_session_preference", value(preference));
     } else {
-        host.remove("desktop_session_preference");
+        binding.remove("desktop_session_preference");
     }
-    host.remove("desktop_session_native_selector");
+    binding.remove("desktop_session_native_selector");
     let contents = document.to_string();
     if new_config {
         persist_new_config(config_path, contents.as_bytes(), recovery_command)?;
@@ -315,6 +338,7 @@ pub(crate) fn create_owner_only_directory_tree(
 pub(crate) fn persist_provider_auth_descriptor(
     config_path: &Path,
     host_alias: &str,
+    desktop_binding: &str,
     auth_source_name: &str,
     descriptor: &ProviderSecretSource,
 ) -> Result<bool, SatelleError> {
@@ -352,10 +376,30 @@ pub(crate) fn persist_provider_auth_descriptor(
                 None,
             )
         })?;
-    if host.get("provider_auth").is_none() {
-        host.insert("provider_auth", Item::Table(Table::new()));
+    let desktop_bindings = host
+        .get_mut("desktop_bindings")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| {
+            trust_config_error(
+                config_path,
+                "the Host Binding desktop_bindings value is not a table",
+                None,
+            )
+        })?;
+    let binding = desktop_bindings
+        .get_mut(desktop_binding)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| {
+            trust_config_error(
+                config_path,
+                &format!("the Host Binding does not contain Desktop Binding {desktop_binding}"),
+                None,
+            )
+        })?;
+    if binding.get("provider_auth").is_none() {
+        binding.insert("provider_auth", Item::Table(Table::new()));
     }
-    let provider_auth = host
+    let provider_auth = binding
         .get_mut("provider_auth")
         .and_then(Item::as_table_like_mut)
         .ok_or_else(|| {
@@ -959,12 +1003,13 @@ mod tests {
         let default_local = &SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST];
         assert_eq!(local.transport, default_local.transport);
         assert_eq!(local.adapter, default_local.adapter);
-        assert_eq!(local.desktop_user.as_deref(), Some("desktop-user"));
+        let binding = &local.desktop_bindings["desktop-user"];
+        assert_eq!(binding.desktop_user, "desktop-user");
         assert_eq!(
-            local.desktop_session_preference,
+            binding.desktop_session_preference,
             Some(DesktopSessionPreference::Console)
         );
-        assert!(local.desktop_session_native_selector.is_none());
+        assert!(binding.desktop_session_native_selector.is_none());
         read_owner_only_secret_config_file(&config)
             .expect("materialized config must be owner-only");
         drop(
@@ -1039,9 +1084,10 @@ mod tests {
         assert_eq!(parsed.command_history, Some(false));
         assert_eq!(local.transport, default_local.transport);
         assert_eq!(local.adapter, default_local.adapter);
-        assert_eq!(local.desktop_user.as_deref(), Some("desktop-user"));
+        let binding = &local.desktop_bindings["desktop-user"];
+        assert_eq!(binding.desktop_user, "desktop-user");
         assert_eq!(
-            local.desktop_session_preference,
+            binding.desktop_session_preference,
             Some(DesktopSessionPreference::Only)
         );
     }
@@ -1055,6 +1101,10 @@ mod tests {
             "transport = \"direct\" # keep inline comment\n",
             "adapter = \"codex\"\n",
             "address = \"https://host.example.test\"\n",
+            "\n[hosts.remote.desktop_bindings.operator]\n",
+            "desktop_user = \"operator\"\n",
+            "\n[hosts.remote.desktop_bindings.observer]\n",
+            "desktop_user = \"observer\"\n",
         );
         let (_directory, config) = secure_config(original);
         #[cfg(windows)]
@@ -1130,6 +1180,8 @@ mod tests {
             "transport = \"direct\"\n",
             "adapter = \"codex\"\n",
             "address = \"https://host.example.test\"\n",
+            "\n[hosts.remote.desktop_bindings.operator]\n",
+            "desktop_user = \"operator\"\n",
         );
         let (_directory, config) = secure_config(original);
         let descriptor = ProviderSecretSource::Environment {
@@ -1137,23 +1189,37 @@ mod tests {
         };
 
         assert!(
-            persist_provider_auth_descriptor(&config, "remote", "openai", &descriptor).unwrap()
+            persist_provider_auth_descriptor(&config, "remote", "operator", "openai", &descriptor,)
+                .unwrap()
         );
         let updated = fs::read_to_string(&config).unwrap();
-        assert!(updated.contains("[hosts.remote.provider_auth.openai]"));
+        assert!(updated.contains("[hosts.remote.desktop_bindings.operator.provider_auth.openai]"));
         assert!(updated.contains("kind = \"environment\""));
         assert!(updated.contains("variable = \"SATELLE_PROVIDER_TOKEN\""));
+        assert!(!updated.contains("desktop_bindings.observer.provider_auth"));
         assert!(!updated.contains("secret"));
         assert!(
-            !persist_provider_auth_descriptor(&config, "remote", "openai", &descriptor).unwrap()
+            !persist_provider_auth_descriptor(
+                &config,
+                "remote",
+                "operator",
+                "openai",
+                &descriptor,
+            )
+            .unwrap()
         );
         assert_eq!(fs::read_to_string(&config).unwrap(), updated);
     }
 
     #[test]
     fn credential_helper_persistence_compares_nested_settings_and_literal_argv() {
-        let (_directory, config) =
-            secure_config("[hosts.local]\ntransport = \"local\"\nadapter = \"fake\"\n");
+        let (_directory, config) = secure_config(concat!(
+            "[hosts.local]\n",
+            "transport = \"local\"\n",
+            "adapter = \"fake\"\n",
+            "\n[hosts.local.desktop_bindings.operator]\n",
+            "desktop_user = \"operator\"\n",
+        ));
         for (argument, account) in [("first argument", "one"), ("second argument", "two")] {
             let descriptor = ProviderSecretSource::ExecutableHelper(
                 satelle_core::CredentialHelper::new(
@@ -1167,17 +1233,32 @@ mod tests {
                 .unwrap(),
             );
             assert!(
-                persist_provider_auth_descriptor(&config, "local", "auth", &descriptor).unwrap()
+                persist_provider_auth_descriptor(
+                    &config,
+                    "local",
+                    "operator",
+                    "auth",
+                    &descriptor,
+                )
+                .unwrap()
             );
             let saved = fs::read_to_string(&config).unwrap();
             let parsed: toml::Value = toml::from_str(&saved).unwrap();
-            let reloaded: ProviderSecretSource = parsed["hosts"]["local"]["provider_auth"]["auth"]
-                .clone()
-                .try_into()
-                .unwrap();
+            let reloaded: ProviderSecretSource =
+                parsed["hosts"]["local"]["desktop_bindings"]["operator"]["provider_auth"]["auth"]
+                    .clone()
+                    .try_into()
+                    .unwrap();
             assert_eq!(reloaded, descriptor);
             assert!(
-                !persist_provider_auth_descriptor(&config, "local", "auth", &descriptor).unwrap()
+                !persist_provider_auth_descriptor(
+                    &config,
+                    "local",
+                    "operator",
+                    "auth",
+                    &descriptor,
+                )
+                .unwrap()
             );
             assert_eq!(fs::read_to_string(&config).unwrap(), saved);
         }

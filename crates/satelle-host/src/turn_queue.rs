@@ -10,10 +10,42 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
 
-pub(crate) const QUEUE_PAYLOAD_SCHEMA_VERSION: &str = "satelle.queue.payload.v1";
+pub(crate) const QUEUE_PAYLOAD_SCHEMA_VERSION: &str = "satelle.queue.payload.v2";
 const MAX_QUEUE_PAYLOAD_BYTES: usize = 16 * 1_024 * 1_024;
+
+struct QueueWorkerOwner {
+    service: Option<HostService>,
+    active_threads: Arc<AtomicUsize>,
+}
+
+impl QueueWorkerOwner {
+    fn new(service: HostService, active_threads: Arc<AtomicUsize>) -> Self {
+        active_threads.fetch_add(1, Ordering::AcqRel);
+        Self {
+            service: Some(service),
+            active_threads,
+        }
+    }
+
+    fn service(&self) -> &HostService {
+        self.service
+            .as_ref()
+            .expect("a live queue worker retains its Host service")
+    }
+}
+
+impl Drop for QueueWorkerOwner {
+    fn drop(&mut self) {
+        // Shutdown can report idle only after the thread releases the service
+        // clone that retains the storage ownership lock.
+        self.service.take();
+        self.active_threads.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +61,7 @@ pub(crate) struct QueuedPrincipal {
     principal_ref: String,
     credential_revision: u64,
     scopes: u8,
+    desktop_bindings: BTreeSet<String>,
     #[serde(with = "time::serde::rfc3339::option")]
     expires_at: Option<OffsetDateTime>,
 }
@@ -50,6 +83,7 @@ impl QueuedPrincipal {
             principal_ref: principal.principal_ref().to_string(),
             credential_revision: principal.credential_revision(),
             scopes: principal.scopes().bits(),
+            desktop_bindings: principal.desktop_bindings().clone(),
             expires_at: principal.expires_at(),
         })
     }
@@ -67,6 +101,7 @@ impl QueuedPrincipal {
             principal_ref: self.principal_ref.clone(),
             credential_revision: self.credential_revision,
             scopes,
+            desktop_bindings: self.desktop_bindings.clone(),
             expires_at: self.expires_at,
             process_local_ssh_bootstrap: false,
             durable_setup_pending: false,
@@ -90,6 +125,7 @@ pub(crate) struct QueuedTurnPayload {
     operation: QueuedOperation,
     explicit_queue: bool,
     session_id: Option<SessionId>,
+    desktop_binding: String,
     principal: QueuedPrincipal,
     idempotency_key: String,
     prompt: String,
@@ -119,6 +155,11 @@ impl QueuedTurnPayload {
             operation,
             explicit_queue,
             session_id,
+            desktop_binding: intent
+                .desktop_binding()
+                .ok_or_else(|| queue_storage_error("capture the selected Desktop Binding"))?
+                .as_str()
+                .to_string(),
             principal: QueuedPrincipal::capture(authority.principal())?,
             idempotency_key: authority.idempotency_key().to_string(),
             prompt: intent.prompt().to_string(),
@@ -183,6 +224,7 @@ impl QueuedTurnPayload {
         self,
     ) -> Result<(TurnIntent, MutationAuthority, Option<SessionId>), SatelleError> {
         let intent = TurnIntent::new(self.prompt, self.execution_mode)
+            .and_then(|intent| intent.with_desktop_binding(Some(self.desktop_binding)))
             .and_then(|intent| {
                 intent.with_provider_intent(
                     self.model,
@@ -378,8 +420,10 @@ impl HostService {
         let now = OffsetDateTime::now_utc();
         self.runtime.expire_turn_queue(now)?;
         let queue_request_id = QueueRequestId::new();
-        let desktop_binding = self.runtime.queue_desktop_binding()?;
-        let lease_key = self.runtime.queue_lease_key(&desktop_binding)?;
+        let desktop_binding = intent
+            .desktop_binding()
+            .expect("the Host selects a Desktop Binding before queue admission");
+        let lease_key = self.runtime.queue_lease_key(desktop_binding.as_str())?;
         let expires_at = now
             .checked_add(time::Duration::milliseconds(
                 i64::try_from(config.ttl_ms()).expect("queue TTL fits i64"),
@@ -390,6 +434,7 @@ impl HostService {
             .enqueue_turn_queue(
                 &queue_request_id,
                 &lease_key,
+                desktop_binding,
                 payload.principal().token_id(),
                 payload.principal().credential_revision(),
                 authority.principal().principal_ref(),
@@ -487,21 +532,18 @@ impl HostService {
         if !self.runtime.try_start_queue_worker() {
             return;
         }
-        let service = self.clone();
+        let worker =
+            QueueWorkerOwner::new(self.clone(), self.runtime.queue_worker_thread_counter());
         if std::thread::Builder::new()
             .name("satelle-turn-queue".to_string())
             .spawn(move || {
+                let service = worker.service();
                 service.drain_turn_queue();
                 service.runtime.finish_queue_worker();
                 // Close the insertion/exit race: an enqueue that observed the
                 // old worker as running is visible before this recheck.
                 if !service.runtime.queue_worker_shutdown_requested()
-                    && service
-                        .runtime
-                        .queue_desktop_binding()
-                        .and_then(|binding| service.runtime.queue_lease_key(&binding))
-                        .and_then(|lease| service.runtime.next_queued_turn(&lease))
-                        .is_ok_and(|next| next.is_some())
+                    && service.next_queued_turn().is_ok_and(|next| next.is_some())
                 {
                     service.start_queue_worker();
                 }
@@ -532,12 +574,7 @@ impl HostService {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
             }
-            let record = match self
-                .runtime
-                .queue_desktop_binding()
-                .and_then(|binding| self.runtime.queue_lease_key(&binding))
-                .and_then(|lease| self.runtime.next_queued_turn(&lease))
-            {
+            let record = match self.next_queued_turn() {
                 Ok(Some(record)) => record,
                 Ok(None) | Err(_) => return,
             };
@@ -644,6 +681,31 @@ impl HostService {
                 }
             }
         }
+    }
+
+    fn next_queued_turn(&self) -> Result<Option<crate::storage::StoredQueueRecord>, SatelleError> {
+        let mut next = None;
+        for binding in self.runtime.configured_desktop_bindings()? {
+            let lease = self.runtime.queue_lease_key(&binding)?;
+            let Some(candidate) = self.runtime.next_queued_turn(&lease)? else {
+                continue;
+            };
+            if next
+                .as_ref()
+                .is_none_or(|current: &crate::storage::StoredQueueRecord| {
+                    (
+                        candidate.status.enqueued_at.as_str(),
+                        candidate.status.queue_request_id.as_str(),
+                    ) < (
+                        current.status.enqueued_at.as_str(),
+                        current.status.queue_request_id.as_str(),
+                    )
+                })
+            {
+                next = Some(candidate);
+            }
+        }
+        Ok(next)
     }
 }
 

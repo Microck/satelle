@@ -41,7 +41,7 @@ define_schema_token!(
 );
 define_schema_token!(
     ProviderBindingAuthorizationSchema,
-    "satelle.provider-binding-authorization.v2"
+    "satelle.provider-binding-authorization.v3"
 );
 define_schema_token!(
     ProviderBindingAuthorizationResponseSchema,
@@ -52,8 +52,12 @@ define_schema_token!(
     "satelle.provider-binding-deletion-response.v1"
 );
 define_schema_token!(
+    ProviderBindingDeletionSchema,
+    "satelle.provider-binding-deletion.v2"
+);
+define_schema_token!(
     ProviderDescriptorValidationSchema,
-    "satelle.provider-binding-validation.v5"
+    "satelle.provider-binding-validation.v6"
 );
 define_schema_token!(
     ProviderDescriptorValidationResponseSchema,
@@ -61,7 +65,7 @@ define_schema_token!(
 );
 define_schema_token!(
     ProviderSecretProvisioningSchema,
-    "satelle.provider-secret-provisioning.v1"
+    "satelle.provider-secret-provisioning.v2"
 );
 define_schema_token!(
     ProviderSecretProvisioningResponseSchema,
@@ -373,12 +377,14 @@ impl AuthenticatedResponseContract for SetupRepairPlanResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ProviderBindingAuthorizationRequest {
     schema_version: ProviderBindingAuthorizationSchema,
+    desktop_binding: String,
     #[serde(flatten)]
     authorization: ProviderBindingAuthorization,
 }
 
 const PROVIDER_BINDING_AUTHORIZATION_REQUEST_FIELDS: &[&str] = &[
     "schema_version",
+    "desktop_binding",
     "requested_model_alias",
     "requested_provider_alias",
     "model",
@@ -411,6 +417,7 @@ impl<'de> Deserialize<'de> for ProviderBindingAuthorizationRequest {
         #[derive(Deserialize)]
         struct WireRequest {
             schema_version: ProviderBindingAuthorizationSchema,
+            desktop_binding: String,
             #[serde(flatten)]
             authorization: ProviderBindingAuthorization,
         }
@@ -419,17 +426,30 @@ impl<'de> Deserialize<'de> for ProviderBindingAuthorizationRequest {
             serde_json::from_value(Value::Object(fields)).map_err(serde::de::Error::custom)?;
         Ok(Self {
             schema_version: request.schema_version,
+            desktop_binding: request.desktop_binding,
             authorization: request.authorization,
         })
     }
 }
 
 impl ProviderBindingAuthorizationRequest {
-    pub fn new(authorization: ProviderBindingAuthorization) -> Self {
+    pub fn new(
+        desktop_binding: impl Into<String>,
+        authorization: ProviderBindingAuthorization,
+    ) -> Self {
         Self {
             schema_version: ProviderBindingAuthorizationSchema,
+            desktop_binding: desktop_binding.into(),
             authorization,
         }
+    }
+
+    pub fn desktop_binding(&self) -> &str {
+        &self.desktop_binding
+    }
+
+    pub fn into_parts(self) -> (String, ProviderBindingAuthorization) {
+        (self.desktop_binding, self.authorization)
     }
 
     pub fn authorization(&self) -> &ProviderBindingAuthorization {
@@ -447,16 +467,46 @@ impl ApiRequestContract for ProviderBindingAuthorizationRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProviderBindingDeletionRequest {
+    schema_version: ProviderBindingDeletionSchema,
+    desktop_binding: String,
+}
+
+impl ProviderBindingDeletionRequest {
+    pub fn new(desktop_binding: impl Into<String>) -> Self {
+        Self {
+            schema_version: ProviderBindingDeletionSchema,
+            desktop_binding: desktop_binding.into(),
+        }
+    }
+
+    pub fn desktop_binding(&self) -> &str {
+        &self.desktop_binding
+    }
+}
+
+impl ApiRequestContract for ProviderBindingDeletionRequest {
+    const SCHEMA_VERSION: &'static str = ProviderBindingDeletionSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderSecretProvisioningMetadata {
     schema_version: ProviderSecretProvisioningSchema,
+    desktop_binding: String,
     authorization: ProviderBindingAuthorization,
     overwrite_authorized: bool,
 }
 
 impl ProviderSecretProvisioningMetadata {
-    pub fn new(authorization: ProviderBindingAuthorization, overwrite_authorized: bool) -> Self {
+    pub fn new(
+        desktop_binding: impl Into<String>,
+        authorization: ProviderBindingAuthorization,
+        overwrite_authorized: bool,
+    ) -> Self {
         Self {
             schema_version: ProviderSecretProvisioningSchema,
+            desktop_binding: desktop_binding.into(),
             authorization,
             overwrite_authorized,
         }
@@ -464,6 +514,10 @@ impl ProviderSecretProvisioningMetadata {
 
     pub fn authorization(&self) -> &ProviderBindingAuthorization {
         &self.authorization
+    }
+
+    pub fn desktop_binding(&self) -> &str {
+        &self.desktop_binding
     }
 
     pub fn into_authorization(self) -> ProviderBindingAuthorization {
@@ -712,6 +766,7 @@ impl AuthenticatedResponseContract for ProviderSecretProvisioningResponse {
 #[serde(deny_unknown_fields)]
 pub struct ProviderDescriptorValidationRequest {
     schema_version: ProviderDescriptorValidationSchema,
+    desktop_binding: String,
     mode: ProviderAuthValidationMode,
     model_from_project: bool,
     provider_from_project: bool,
@@ -721,12 +776,14 @@ pub struct ProviderDescriptorValidationRequest {
 
 impl ProviderDescriptorValidationRequest {
     pub fn new(
+        desktop_binding: impl Into<String>,
         mode: ProviderAuthValidationMode,
         model_from_project: bool,
         provider_from_project: bool,
     ) -> Self {
         Self {
             schema_version: ProviderDescriptorValidationSchema,
+            desktop_binding: desktop_binding.into(),
             mode,
             model_from_project,
             provider_from_project,
@@ -736,6 +793,10 @@ impl ProviderDescriptorValidationRequest {
 
     pub const fn mode(&self) -> ProviderAuthValidationMode {
         self.mode
+    }
+
+    pub fn desktop_binding(&self) -> &str {
+        &self.desktop_binding
     }
 
     pub const fn model_from_project(&self) -> bool {
@@ -1471,6 +1532,7 @@ mod provider_binding_contract_tests {
     #[test]
     fn authorization_is_explicit_and_validation_is_alias_scoped() {
         let authorization = ProviderBindingAuthorizationRequest::new(
+            "local-demo-desktop-v1",
             ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai")
                 .with_allow_project_selection(true)
                 .with_experimental_provider_computer_use(true),
@@ -1478,7 +1540,8 @@ mod provider_binding_contract_tests {
         assert_eq!(
             serde_json::to_value(authorization).unwrap(),
             json!({
-                "schema_version": "satelle.provider-binding-authorization.v2",
+                "schema_version": "satelle.provider-binding-authorization.v3",
+                "desktop_binding": "local-demo-desktop-v1",
                 "requested_model_alias": "vision",
                 "requested_provider_alias": "open_ai",
                 "model": "gpt-5.6",
@@ -1491,6 +1554,7 @@ mod provider_binding_contract_tests {
         assert_eq!(
             serde_json::to_value(
                 ProviderDescriptorValidationRequest::new(
+                    "operator",
                     ProviderAuthValidationMode::RefreshProviderSmoke,
                     true,
                     false,
@@ -1499,7 +1563,8 @@ mod provider_binding_contract_tests {
             )
             .unwrap(),
             json!({
-                "schema_version": "satelle.provider-binding-validation.v5",
+                "schema_version": "satelle.provider-binding-validation.v6",
+                "desktop_binding": "operator",
                 "model_from_project": true,
                 "provider_from_project": false,
                 "mode": "refresh_provider_smoke",
@@ -1524,7 +1589,7 @@ mod provider_binding_contract_tests {
         );
         assert!(
             serde_json::from_value::<ProviderBindingAuthorizationRequest>(json!({
-                "schema_version": "satelle.provider-binding-authorization.v2",
+                "schema_version": "satelle.provider-binding-authorization.v3",
                 "requested_model_alias": "vision",
                 "requested_provider_alias": "open_ai",
                 "model": "gpt-5.6",
@@ -1575,7 +1640,8 @@ mod provider_binding_contract_tests {
     #[test]
     fn validation_rejects_caller_binding_material() {
         let request = json!({
-            "schema_version": "satelle.provider-binding-validation.v5",
+            "schema_version": "satelle.provider-binding-validation.v6",
+            "desktop_binding": "operator",
             "model_from_project": false,
             "provider_from_project": false,
             "mode": "cached",
@@ -1680,7 +1746,8 @@ mod tests {
     fn provider_binding_authorization_rejects_unknown_top_level_fields() {
         let error =
             serde_json::from_value::<ProviderBindingAuthorizationRequest>(serde_json::json!({
-                "schema_version": "satelle.provider-binding-authorization.v2",
+                "schema_version": "satelle.provider-binding-authorization.v3",
+                "desktop_binding": "local-demo-desktop-v1",
                 "requested_model_alias": "default",
                 "requested_provider_alias": "openai",
                 "model": "gpt-5",

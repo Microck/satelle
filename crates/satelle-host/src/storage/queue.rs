@@ -5,6 +5,7 @@ use super::{Storage, StorageError, StorageErrorKind, sqlite_error};
 use crate::{LogEvent, LogSeverity};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use satelle_core::queue::{QueueFailure, QueueRequestStatus, QueueStatus};
+use satelle_core::session::DesktopBindingRef;
 use satelle_core::{QueueRequestId, SessionId, TurnId};
 use time::OffsetDateTime;
 
@@ -34,6 +35,7 @@ impl TurnQueueOperation {
 pub(crate) struct NewQueueRecord<'a> {
     pub(crate) queue_request_id: &'a QueueRequestId,
     pub(crate) lease_key: &'a str,
+    pub(crate) desktop_binding: DesktopBindingRef,
     pub(crate) token_id: &'a str,
     pub(crate) credential_revision: u64,
     pub(crate) principal_ref: &'a str,
@@ -50,6 +52,7 @@ pub(crate) struct NewQueueRecord<'a> {
 #[derive(Clone, Debug)]
 pub(crate) struct StoredQueueRecord {
     pub(crate) status: QueueStatus,
+    pub(crate) desktop_binding: DesktopBindingRef,
     pub(crate) lease_key: String,
     pub(crate) operation: TurnQueueOperation,
     pub(crate) payload_file: String,
@@ -119,8 +122,8 @@ impl Storage {
                     queue_request_id, lease_key, token_id, credential_revision,
                     principal_ref, operation, idempotency_key, request_digest,
                     payload_file, payload_sha256, status, enqueued_at, expires_at,
-                    session_id, state_revision
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', ?11, ?12, ?13, 1)",
+                    session_id, state_revision, desktop_binding_ref
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', ?11, ?12, ?13, 1, ?14)",
                 params![
                     record.queue_request_id.as_str(),
                     record.lease_key,
@@ -136,6 +139,7 @@ impl Storage {
                     format_time(record.enqueued_at)?,
                     format_time(record.expires_at)?,
                     record.session_id.map(SessionId::as_str),
+                    record.desktop_binding.as_str(),
                 ],
             )
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -147,6 +151,7 @@ impl Storage {
             &queue_log(
                 LogEvent::TurnQueued,
                 LogSeverity::Info,
+                stored.desktop_binding.clone(),
                 stored.status.clone(),
                 record.enqueued_at,
             )?,
@@ -244,6 +249,7 @@ impl Storage {
                 &queue_log(
                     LogEvent::TurnQueueExpired,
                     LogSeverity::Info,
+                    record.desktop_binding.clone(),
                     record.status.clone(),
                     observed_at,
                 )?,
@@ -301,6 +307,7 @@ impl Storage {
                 &queue_log(
                     LogEvent::QueuePositionChanged,
                     LogSeverity::Info,
+                    record.desktop_binding.clone(),
                     record.status.clone(),
                     OffsetDateTime::now_utc(),
                 )?,
@@ -351,6 +358,7 @@ impl Storage {
                 &queue_log(
                     LogEvent::TurnQueueCancelled,
                     LogSeverity::Info,
+                    after.desktop_binding.clone(),
                     after.status.clone(),
                     OffsetDateTime::now_utc(),
                 )?,
@@ -451,6 +459,7 @@ impl Storage {
                 &queue_log(
                     LogEvent::TurnQueueValidationFailed,
                     LogSeverity::Warning,
+                    record.desktop_binding.clone(),
                     record.status.clone(),
                     OffsetDateTime::now_utc(),
                 )?,
@@ -523,7 +532,13 @@ fn update_terminal(
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
         insert_safe_log(
             &transaction,
-            &queue_log(event, severity, record.status, OffsetDateTime::now_utc())?,
+            &queue_log(
+                event,
+                severity,
+                record.desktop_binding.clone(),
+                record.status,
+                OffsetDateTime::now_utc(),
+            )?,
         )?;
     }
     transaction
@@ -593,7 +608,7 @@ fn load_queue_record_where<P: rusqlite::Params>(
     let sql = format!(
         "SELECT queue_request_id, operation, payload_file, payload_sha256, status,
                 enqueued_at, expires_at, session_id, turn_id, failure_code,
-                failure_message, state_revision, lease_key
+                failure_message, state_revision, lease_key, desktop_binding_ref
          FROM turn_admission_queue WHERE {predicate}"
     );
     connection
@@ -612,6 +627,7 @@ fn load_queue_record_where<P: rusqlite::Params>(
                 row.get::<_, Option<String>>(10)?,
                 row.get::<_, i64>(11)?,
                 row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(13)?,
             ))
         })
         .optional()
@@ -637,6 +653,7 @@ fn decode_queue_record(
         Option<String>,
         i64,
         String,
+        Option<String>,
     ),
 ) -> Result<StoredQueueRecord, StorageError> {
     let (
@@ -653,7 +670,12 @@ fn decode_queue_record(
         failure_message,
         state_revision,
         lease_key,
+        desktop_binding,
     ) = row;
+    let desktop_binding = DesktopBindingRef::new(
+        desktop_binding.ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?,
+    )
+    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
     let queue_request_id = QueueRequestId::parse(&queue_request_id)
         .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
     let operation = TurnQueueOperation::parse(&operation)?;
@@ -705,6 +727,7 @@ fn decode_queue_record(
             failure,
             state_revision,
         ),
+        desktop_binding,
         lease_key,
         operation,
         payload_file,
@@ -736,6 +759,7 @@ mod tests {
         NewQueueRecord {
             queue_request_id: id,
             lease_key: "host-test:desktop-test",
+            desktop_binding: DesktopBindingRef::new("desktop-test").unwrap(),
             token_id: "tok_test",
             credential_revision: 1,
             principal_ref: "principal-test",

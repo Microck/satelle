@@ -154,6 +154,8 @@ adapter = "fake"
 [hosts.office]
 transport = "local"
 adapter = "fake"
+
+[hosts.office.desktop_bindings.operator]
 desktop_user = "replaced"
 [hosts."office.shared"]
 transport = "local"
@@ -179,10 +181,13 @@ adapter = "fake"
     );
     assert!(
         report["sources"]["values"]
-            .get("hosts.office.desktop_user")
+            .get("hosts.office.desktop_bindings.operator.desktop_user")
             .is_none()
     );
-    assert!(report["effective"]["hosts"]["office"]["desktop_user"].is_null());
+    assert!(
+        report["effective"]["hosts"]["office"]["desktop_bindings"]["operator"]["desktop_user"]
+            .is_null()
+    );
 }
 
 #[test]
@@ -224,7 +229,8 @@ adapter = "fake"
     );
     let persisted: toml::Value = toml::from_str(&fs::read_to_string(&binding).unwrap()).unwrap();
     assert_eq!(
-        persisted["hosts"]["local-demo"]["desktop_user"].as_str(),
+        persisted["hosts"]["local-demo"]["desktop_bindings"]["local-demo-user"]["desktop_user"]
+            .as_str(),
         Some("local-demo-user")
     );
     fixture
@@ -308,7 +314,7 @@ fn includes_validate_overridden_files_and_reject_project_owned_credentials() {
             .parent()
             .unwrap()
             .join("secret.toml"),
-        "[hosts.office.provider_auth]\nprovider = { kind = \"env\", name = \"INCLUDE_CANARY\" }\n",
+        "[hosts.office.desktop_bindings.operator]\ndesktop_user = \"local-demo-user\"\n[hosts.office.desktop_bindings.operator.provider_auth]\nprovider = { kind = \"env\", name = \"INCLUDE_CANARY\" }\n",
     )
     .unwrap();
     let output = fixture
@@ -320,7 +326,7 @@ fn includes_validate_overridden_files_and_reject_project_owned_credentials() {
         .clone();
     assert_eq!(
         parse_json(&output.stderr)["code"],
-        "project-secret-source-not-allowed"
+        "project-desktop-binding-not-allowed"
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("INCLUDE_CANARY"));
 }
@@ -511,7 +517,9 @@ provider_alias = "base-provider"
 transport = "local"
 adapter = "fake"
 
-[hosts.base-host.provider_bindings.base-provider.base-model]
+[hosts.base-host.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.base-host.desktop_bindings.operator.provider_bindings.base-provider.base-model]
 model = "base-model"
 model_provider = "base-provider"
 
@@ -522,7 +530,9 @@ daemon_idle_timeout = "12m"
 provider_smoke_success_cache_ttl = "1080m"
 provider_smoke_failure_cache_ttl = "8m"
 
-[hosts.work-host.provider_bindings.work-provider.work-model]
+[hosts.work-host.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.work-host.desktop_bindings.operator.provider_bindings.work-provider.work-model]
 model = "work-model"
 model_provider = "work-provider"
 
@@ -883,11 +893,13 @@ transport = "local"
 adapter = "fake"
 allow_project_selection = true
 
-[hosts.user-host.provider_bindings.openai.base-model]
+[hosts.user-host.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.user-host.desktop_bindings.operator.provider_bindings.openai.base-model]
 model = "base-model"
 model_provider = "openai"
 
-[hosts.user-host.provider_bindings.openai.audit-model]
+[hosts.user-host.desktop_bindings.operator.provider_bindings.openai.audit-model]
 model = "audit-model"
 model_provider = "openai"
 
@@ -895,7 +907,9 @@ model_provider = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local-demo.provider_bindings.openai.base-model]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_bindings.openai.base-model]
 model = "base-model"
 model_provider = "openai"
 
@@ -904,11 +918,13 @@ transport = "local"
 adapter = "fake"
 allow_project_selection = true
 
-[hosts.work-host.provider_bindings.openai.base-model]
+[hosts.work-host.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.work-host.desktop_bindings.operator.provider_bindings.openai.base-model]
 model = "base-model"
 model_provider = "openai"
 
-[hosts.work-host.provider_bindings.openai.work-model]
+[hosts.work-host.desktop_bindings.operator.provider_bindings.openai.work-model]
 model = "work-model"
 model_provider = "openai"
 allow_project_selection = true
@@ -980,7 +996,9 @@ provider_alias = "profile-provider"
 experimental_provider_computer_use = true
 yolo = true
 
-[hosts.local-demo.provider_bindings.profile-provider.profile-model]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_bindings.profile-provider.profile-model]
 model = "profile-model"
 model_provider = "openai"
 allow_project_selection = true
@@ -1089,7 +1107,9 @@ allow_project_selection = true
 model_alias = "review"
 provider_alias = "openai"
 
-[hosts.local-demo.provider_bindings.openai.review]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 "#,

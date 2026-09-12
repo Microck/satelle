@@ -52,22 +52,28 @@ pub(super) fn insert_safe_log(
     let effective_nanos = prior_nanos.map_or(requested_nanos, |prior| prior.max(requested_nanos));
     let effective_at = OffsetDateTime::from_unix_timestamp_nanos(i128::from(effective_nanos))
         .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
-    let (session_id, turn_id, session_revision, turn_revision, queue_status_json) =
+    let (desktop_binding, session_id, turn_id, session_revision, turn_revision, queue_status_json) =
         match record.subject() {
-            LogSubject::Host => (None, None, None, None, None),
+            LogSubject::Host => (None, None, None, None, None, None),
             LogSubject::Turn {
+                desktop_binding,
                 session_id,
                 turn_id,
                 session_state_revision,
                 turn_state_revision,
             } => (
+                Some(desktop_binding.as_str()),
                 Some(session_id.as_str()),
                 Some(turn_id.as_str()),
                 Some(format_revision(*session_state_revision)),
                 Some(format_turn_revision(*turn_state_revision)),
                 None,
             ),
-            LogSubject::Queue { queue_status } => (
+            LogSubject::Queue {
+                desktop_binding,
+                queue_status,
+            } => (
+                Some(desktop_binding.as_str()),
                 queue_status.session_id.as_ref().map(SessionId::as_str),
                 queue_status.turn_id.as_ref().map(TurnId::as_str),
                 None,
@@ -80,13 +86,14 @@ pub(super) fn insert_safe_log(
         };
     transaction
         .execute(
-            "INSERT INTO logs (recorded_at, recorded_at_unix_nanos, source, severity, event_kind, session_id, turn_id, session_state_revision, turn_state_revision, queue_status_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO logs (recorded_at, recorded_at_unix_nanos, source, severity, event_kind, desktop_binding_ref, session_id, turn_id, session_state_revision, turn_state_revision, queue_status_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 format_time(effective_at)?,
                 effective_nanos,
                 log_source_token(record.source),
                 log_severity_token(record.severity),
                 log_event_token(record.event),
+                desktop_binding,
                 session_id,
                 turn_id,
                 session_revision,
@@ -711,6 +718,7 @@ pub(super) fn load_recovery_subject(
     };
     Ok(RecoverySubject {
         session_id: session.id().clone(),
+        desktop_binding: session.desktop_binding().clone(),
         turn_id: turn_id.clone(),
         turn_state: turn.state(),
         expected_revisions: ExpectedRevisions::new(

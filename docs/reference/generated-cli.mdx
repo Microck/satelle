@@ -18,7 +18,7 @@ public Satelle result and event schema sources. CI rejects hand-edited or stale 
 | `EVENT_SCHEMA_VERSION` | `crates/satelle-core/src/events.rs` | `satelle.events.v2` |
 | `HostSessionsSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.host.sessions.v1` |
 | `HOST_UPDATE_PLAIN_SCHEMA_VERSION` | `crates/satelle-cli/src/output.rs` | `satelle.host.update.plain.v1` |
-| `LogEntrySchema` | `crates/satelle-host/src/log-page.rs` | `satelle.logs.entry.v1` |
+| `LogEntrySchema` | `crates/satelle-host/src/log-page.rs` | `satelle.logs.entry.v2` |
 | `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.run.v2` |
 | `SetupSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.setup.v2` |
 | `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.status.v2` |
@@ -374,18 +374,20 @@ Options:
 
       --no-color
           Disable colored human output
+      --desktop-binding <ALIAS>
+
       --log-verbosity <LEVEL>
           Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --model <ALIAS>
           Model alias; must resolve with the effective provider alias as one exact Host Provider Binding pair
       --profile <NAME>
           Apply a named user-level configuration profile
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --provider <ALIAS>
           Provider alias; must resolve with the effective model alias as one exact Host Provider Binding pair
       --detach
 
-      --error-format <FORMAT>
-          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --queue
           Persist this Turn until the Host can admit it
       --detach-on-interrupt
@@ -446,18 +448,20 @@ Options:
 
       --no-color
           Disable colored human output
+      --desktop-binding <ALIAS>
+
       --log-verbosity <LEVEL>
           Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --model <ALIAS>
           Model alias; must resolve with the effective provider alias as one exact Host Provider Binding pair
       --profile <NAME>
           Apply a named user-level configuration profile
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --provider <ALIAS>
           Provider alias; must resolve with the effective model alias as one exact Host Provider Binding pair
       --detach
 
-      --error-format <FORMAT>
-          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --queue
           Persist this Turn until the Host can admit it
       --detach-on-interrupt
@@ -906,15 +910,16 @@ Usage: satelle desktop snapshot [OPTIONS] --host <HOST> --output <PATH>
 
 Options:
       --host <HOST>
-      --no-color               Disable colored human output
-      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --no-color                 Disable colored human output
+      --desktop-binding <ALIAS>
+      --log-verbosity <LEVEL>    Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --output <PATH>
+      --profile <NAME>           Apply a named user-level configuration profile
+      --error-format <FORMAT>    Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --no-input
-      --profile <NAME>         Apply a named user-level configuration profile
-      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
-      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
-      --json                   Alias for --format json
-  -h, --help                   Print help
+      --format <FORMAT>          [possible values: human, json, compact-json, toon, markdown]
+      --json                     Alias for --format json
+  -h, --help                     Print help
 ```
 
 ## `satelle telemetry status`

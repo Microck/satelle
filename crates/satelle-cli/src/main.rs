@@ -449,6 +449,8 @@ enum DesktopCommand {
 struct DesktopSnapshotCommand {
     #[arg(long, required = true)]
     host: String,
+    #[arg(long, value_name = "ALIAS")]
+    desktop_binding: Option<String>,
     #[arg(long, required = true, value_name = "PATH")]
     output: PathBuf,
     #[arg(long)]
@@ -1230,6 +1232,8 @@ struct SelfUpdateRemoteStageCommand {
 struct RunCommand {
     #[arg(long)]
     host: Option<String>,
+    #[arg(long, value_name = "ALIAS")]
+    desktop_binding: Option<String>,
     #[arg(
         long,
         value_name = "ALIAS",
@@ -1315,6 +1319,8 @@ struct SteerCommand {
     session_id: String,
     #[arg(long)]
     host: Option<String>,
+    #[arg(long, value_name = "ALIAS")]
+    desktop_binding: Option<String>,
     #[arg(
         long,
         value_name = "ALIAS",
@@ -2660,7 +2666,10 @@ fn run_desktop_snapshot(
     }
     let transport = transport::transport_for(&selected)?;
     let sessions = transport.host_sessions(true).map_err(failure)?;
-    let policy = DesktopSelectionPolicy::from_host_config(&selected.config);
+    let (_, binding_config) =
+        select_desktop_binding(&selected.config, command.desktop_binding.as_deref())
+            .map_err(failure)?;
+    let policy = DesktopSelectionPolicy::from_binding_config(binding_config);
     let desktop = satelle_core::resolve_desktop_session(&sessions, &policy).map_err(|error| {
         let mapped = match error.code {
             ErrorCode::DesktopBindingRequired => {
@@ -4002,6 +4011,7 @@ fn explicit_lifecycle_json_host(command: &Command) -> Option<&str> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingSetupDesktopSelection {
+    binding_alias: String,
     desktop_user: String,
     preference: DesktopSessionPreference,
 }
@@ -4013,10 +4023,30 @@ impl PendingSetupDesktopSelection {
             DesktopSessionPreference::Console => "console",
         };
         format!(
-            "set Host Binding {host_alias} desktop_user to '{}' and desktop_session_preference to '{preference}'",
-            self.desktop_user
+            "set Host Binding {host_alias} Desktop Binding '{}' to OS user '{}' with desktop_session_preference '{preference}'",
+            self.binding_alias, self.desktop_user
         )
     }
+}
+
+fn apply_pending_desktop_selection(
+    host: &mut HostConfig,
+    selection: &PendingSetupDesktopSelection,
+) {
+    host.desktop_bindings
+        .entry(selection.binding_alias.clone())
+        .and_modify(|binding| {
+            binding.desktop_user.clone_from(&selection.desktop_user);
+            binding.desktop_session_preference = Some(selection.preference.clone());
+            binding.desktop_session_native_selector = None;
+        })
+        .or_insert_with(|| satelle_core::DesktopBindingConfig {
+            desktop_user: selection.desktop_user.clone(),
+            desktop_session_preference: Some(selection.preference.clone()),
+            desktop_session_native_selector: None,
+            provider_auth: BTreeMap::new(),
+            provider_bindings: BTreeMap::new(),
+        });
 }
 
 fn partition_setup_components(
@@ -4325,7 +4355,23 @@ fn resolve_setup_desktop_selection(
     interactive: bool,
     authenticated_bootstrap_user: Option<&str>,
 ) -> Result<Option<PendingSetupDesktopSelection>, SatelleError> {
-    let mut policy = DesktopSelectionPolicy::from_host_config(host_config);
+    let existing_binding = match host_config.desktop_bindings.len() {
+        0 => None,
+        1 => host_config.desktop_bindings.first_key_value(),
+        _ => {
+            return Err(SatelleError::desktop_binding_ambiguous(
+                host_config.desktop_bindings.keys().cloned(),
+            ));
+        }
+    };
+    let mut policy = existing_binding.map_or(
+        DesktopSelectionPolicy {
+            desktop_user: None,
+            preference: None,
+            native_selector: None,
+        },
+        |(_, binding)| DesktopSelectionPolicy::from_binding_config(binding),
+    );
     if policy.desktop_user.is_none()
         && let Some(authenticated_user) = authenticated_bootstrap_user
     {
@@ -4354,13 +4400,17 @@ fn resolve_setup_desktop_selection(
                     .clone()
                     .unwrap_or(DesktopSessionPreference::Only);
                 let selection = PendingSetupDesktopSelection {
+                    binding_alias: existing_binding
+                        .map_or_else(|| session.desktop_user.clone(), |(alias, _)| alias.clone()),
                     desktop_user: session.desktop_user.clone(),
                     preference,
                 };
-                if host_config.desktop_user.as_deref() == Some(selection.desktop_user.as_str())
-                    && host_config.desktop_session_preference.as_ref()
-                        == Some(&selection.preference)
-                {
+                if existing_binding.is_some_and(|(alias, binding)| {
+                    alias == &selection.binding_alias
+                        && binding.desktop_user == selection.desktop_user
+                        && binding.desktop_session_preference.as_ref()
+                            == Some(&selection.preference)
+                }) {
                     return Ok(None);
                 }
                 return Ok(Some(selection));
@@ -4941,7 +4991,11 @@ fn run_setup_inner(
         command.yes || command.dry_run || (!command.no_input && io::stdin().is_terminal()),
     )?;
     let mut provider_selection =
-        resolve_provider_selection(resolved, &host, None, None, false, false)?;
+        if (desktop_setup || command.dry_run) && host.config.desktop_bindings.is_empty() {
+            ProviderSelection::for_pending_setup_desktop(resolved, &host)?
+        } else {
+            resolve_provider_selection(resolved, &host, None, None, None, false, false)?
+        };
     if provider_auth_setup
         && host.config.transport == satelle_core::TransportKind::Local
         && let Some(authorization) = provider_selection.authorization.as_ref()
@@ -5119,6 +5173,9 @@ fn run_setup_inner(
         if let Some(selection) = &desktop_selection {
             report.planned_actions.push(selection.action(&host.alias));
             report.mutation_planned = true;
+            apply_pending_desktop_selection(&mut host.config, selection);
+            provider_selection =
+                resolve_provider_selection(resolved, &host, None, None, None, false, false)?;
         }
     } else if desktop_setup
         && !local_verification_only
@@ -5167,12 +5224,11 @@ fn run_setup_inner(
             ));
         } else {
             let validation = transport_for(&host)?.validate_provider_descriptor(
+                provider_selection.desktop_binding(),
                 model_alias,
                 provider_alias,
-                provider_selection.model_alias_from_project,
-                provider_selection.provider_alias_from_project,
-                satelle_core::ProviderAuthValidationMode::Cached,
-                provider_selection.experimental_provider_computer_use,
+                provider_selection
+                    .validation_options(satelle_core::ProviderAuthValidationMode::Cached),
             );
             match validation {
                 Ok(validation)
@@ -5201,7 +5257,7 @@ fn run_setup_inner(
                         && (!implicit_provider_defaults || host_setup_required) =>
                 {
                     provider_selection =
-                        resolve_provider_selection(resolved, &host, None, None, false, true)?;
+                        resolve_provider_selection(resolved, &host, None, None, None, false, true)?;
                 }
                 Err(error) => return Err(failure(error)),
             }
@@ -5220,7 +5276,13 @@ fn run_setup_inner(
                 && let Some(auth_source_name) = provider_selection.auth_source_name.clone()
             {
                 let descriptor = prompt_provider_auth_descriptor(&auth_source_name)?;
+                let desktop_binding = select_desktop_binding(&host.config, None)
+                    .map(|(alias, _)| alias.to_string())
+                    .map_err(failure)?;
                 host.config
+                    .desktop_bindings
+                    .get_mut(&desktop_binding)
+                    .expect("the selected Desktop Binding exists")
                     .provider_auth
                     .insert(auth_source_name.clone(), descriptor.clone());
                 pending_provider_auth = Some((auth_source_name.clone(), descriptor));
@@ -5230,7 +5292,7 @@ fn run_setup_inner(
                     host.alias
                 ));
                 provider_selection =
-                    resolve_provider_selection(resolved, &host, None, None, false, true)?;
+                    resolve_provider_selection(resolved, &host, None, None, None, false, true)?;
             }
             add_setup_required_inputs(&mut report, &provider_selection, provider_auth_setup);
             if report.required_input.is_empty()
@@ -5350,6 +5412,10 @@ fn run_setup_inner(
                     if !report.planned_actions.contains(&action) {
                         report.planned_actions.push(action);
                     }
+                    apply_pending_desktop_selection(&mut host.config, selection);
+                    provider_selection = resolve_provider_selection(
+                        resolved, &host, None, None, None, false, false,
+                    )?;
                 }
             }
             first_ssh_discovery = Some(discovery);
@@ -5415,9 +5481,7 @@ fn run_setup_inner(
                     &exact_setup_recovery_command,
                 )
                 .map_err(failure)?;
-                host.config.desktop_user = Some(selection.desktop_user.clone());
-                host.config.desktop_session_preference = Some(selection.preference.clone());
-                host.config.desktop_session_native_selector = None;
+                apply_pending_desktop_selection(&mut host.config, selection);
                 persisted_desktop_action = Some(selection.action(&host.alias));
             }
             report = run_host_setup_then_follow_up(
@@ -5466,6 +5530,7 @@ fn run_setup_inner(
                         };
                         let response = provision_provider_secret(
                             provider_transport.as_ref(),
+                            provider_selection.desktop_binding(),
                             &authorization,
                             &host.alias,
                             &command,
@@ -5552,9 +5617,10 @@ fn run_setup_inner(
                         &exact_setup_recovery_command,
                     )
                     .map_err(failure)?;
-                    host.config.desktop_user = Some(selection.desktop_user.clone());
-                    host.config.desktop_session_preference = Some(selection.preference.clone());
-                    host.config.desktop_session_native_selector = None;
+                    apply_pending_desktop_selection(&mut host.config, selection);
+                    provider_selection = resolve_provider_selection(
+                        resolved, &host, None, None, None, false, false,
+                    )?;
                     persisted_desktop_action = Some(selection.action(&host.alias));
                 }
             }
@@ -5572,12 +5638,11 @@ fn run_setup_inner(
                 transport_for(&host)?
             };
             let pending_authorization = match provider_transport.validate_provider_descriptor(
+                provider_selection.desktop_binding(),
                 model_alias,
                 provider_alias,
-                provider_selection.model_alias_from_project,
-                provider_selection.provider_alias_from_project,
-                satelle_core::ProviderAuthValidationMode::Cached,
-                provider_selection.experimental_provider_computer_use,
+                provider_selection
+                    .validation_options(satelle_core::ProviderAuthValidationMode::Cached),
             ) {
                 Ok(validation)
                     if validation.validation.outcome()
@@ -5596,6 +5661,7 @@ fn run_setup_inner(
                     ensure_file_provider_secret_source(&authorization)?;
                     let response = provision_provider_secret(
                         provider_transport.as_ref(),
+                        provider_selection.desktop_binding(),
                         &authorization,
                         &host.alias,
                         &command,
@@ -5638,27 +5704,31 @@ fn run_setup_inner(
                 Err(error) => return Err(failure(error)),
             };
             if let Some(authorization) = pending_authorization {
-                let authorization_requires_provisioning =
-                    match provider_transport.authorize_provider_binding(authorization) {
-                        Ok(_) => false,
-                        Err(error)
-                            if file_authorization_requires_provisioning(authorization, &error) =>
-                        {
-                            true
-                        }
-                        Err(error) => return Err(failure(error)),
-                    };
+                let authorization_requires_provisioning = match provider_transport
+                    .authorize_provider_binding(provider_selection.desktop_binding(), authorization)
+                {
+                    Ok(_) => false,
+                    Err(error)
+                        if file_authorization_requires_provisioning(authorization, &error) =>
+                    {
+                        true
+                    }
+                    Err(error) => return Err(failure(error)),
+                };
                 let validation = if authorization_requires_provisioning {
                     None
                 } else {
                     let cached = provider_transport
                         .validate_provider_descriptor(
+                            provider_selection.desktop_binding(),
                             authorization.requested_model_alias(),
                             authorization.requested_provider_alias(),
-                            provider_selection.model_alias_from_project,
-                            provider_selection.provider_alias_from_project,
-                            satelle_core::ProviderAuthValidationMode::Cached,
-                            authorization.experimental_provider_computer_use(),
+                            satelle_host::ProviderDescriptorValidationOptions::new(
+                                satelle_core::ProviderAuthValidationMode::Cached,
+                                provider_selection.model_alias_from_project,
+                                provider_selection.provider_alias_from_project,
+                                authorization.experimental_provider_computer_use(),
+                            ),
                         )
                         .map_err(failure)?;
                     if cached.validation.outcome()
@@ -5667,12 +5737,15 @@ fn run_setup_inner(
                         Some(
                             provider_transport
                                 .validate_provider_descriptor(
+                                    provider_selection.desktop_binding(),
                                     authorization.requested_model_alias(),
                                     authorization.requested_provider_alias(),
-                                    provider_selection.model_alias_from_project,
-                                    provider_selection.provider_alias_from_project,
-                                    satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
-                                    authorization.experimental_provider_computer_use(),
+                                    satelle_host::ProviderDescriptorValidationOptions::new(
+                                        satelle_core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                                        provider_selection.model_alias_from_project,
+                                        provider_selection.provider_alias_from_project,
+                                        authorization.experimental_provider_computer_use(),
+                                    ),
                                 )
                                 .map_err(failure)?,
                         )
@@ -5690,6 +5763,7 @@ fn run_setup_inner(
                     ensure_file_provider_secret_source(authorization)?;
                     let response = provision_provider_secret(
                         provider_transport.as_ref(),
+                        provider_selection.desktop_binding(),
                         authorization,
                         &host.alias,
                         &command,
@@ -5735,15 +5809,22 @@ fn run_setup_inner(
         if (provider_secret_setup_completed || provider_auth_validation.is_some())
             && let Some((auth_source_name, descriptor)) = &pending_provider_auth
         {
+            let desktop_binding = select_desktop_binding(&host.config, None)
+                .map(|(alias, _)| alias.to_string())
+                .map_err(failure)?;
             if let Err(error) = persist_provider_auth_descriptor(
                 &user_config_path,
                 &host.alias,
+                &desktop_binding,
                 auth_source_name,
                 descriptor,
             ) {
                 return Err(failure(error));
             }
             host.config
+                .desktop_bindings
+                .get_mut(&desktop_binding)
+                .expect("the selected Desktop Binding exists")
                 .provider_auth
                 .insert(auth_source_name.clone(), descriptor.clone());
             persisted_provider_auth_action = Some(format!(
@@ -6000,13 +6081,7 @@ fn inspect_first_ssh_host_during_setup(
                 .as_deref()
                 .unwrap_or("not pinned")
         );
-        println!(
-            "Desktop Binding: {}",
-            host.config
-                .desktop_user
-                .as_deref()
-                .unwrap_or("not configured")
-        );
+        println!("Desktop Binding: {}", desktop_binding_summary(&host.config));
         let confirmed = cliclack::confirm(format!(
             "Trust exact observed Host Identity '{observed_identity}' for Host '{}'?",
             host.alias
@@ -6150,7 +6225,8 @@ fn add_missing_provider_descriptor_required_input(
             "the effective provider binding requires host-resolved Secret Source descriptor '{auth_source_name}'; raw provider secrets are not accepted through setup"
         ),
         recovery_command: format!(
-            "add [hosts.<alias>.provider_auth.{auth_source_name}] to user-level config, then rerun satelle setup --no-input --json"
+            "add [hosts.<alias>.desktop_bindings.{}.provider_auth.{auth_source_name}] to user-level config, then rerun satelle setup --no-input --json",
+            provider_selection.desktop_binding()
         ),
     });
     report.recovery_commands.push(
@@ -6191,7 +6267,8 @@ fn add_setup_required_inputs(
             "the effective provider binding requires host-resolved Secret Source descriptor '{auth_source_name}'; raw provider secrets are not accepted through setup"
         ),
         recovery_command: format!(
-            "add [hosts.<alias>.provider_auth.{auth_source_name}] to user-level config, then rerun satelle setup --no-input --json"
+            "add [hosts.<alias>.desktop_bindings.{}.provider_auth.{auth_source_name}] to user-level config, then rerun satelle setup --no-input --json",
+            provider_selection.desktop_binding()
         ),
     });
     report.recovery_commands.push(
@@ -6358,6 +6435,7 @@ fn plan_provider_secret_provisioning(
 
 fn provision_provider_secret(
     provider_transport: &dyn transport::TransportClient,
+    desktop_binding: &str,
     authorization: &ProviderBindingAuthorization,
     host_alias: &str,
     command: &SetupCommand,
@@ -6396,8 +6474,11 @@ fn provision_provider_secret(
         "provider-secret-provision-{}",
         satelle_transport::RequestId::new()
     );
-    let preview_metadata =
-        satelle_transport::ProviderSecretProvisioningMetadata::new(authorization.clone(), true);
+    let preview_metadata = satelle_transport::ProviderSecretProvisioningMetadata::new(
+        desktop_binding,
+        authorization.clone(),
+        true,
+    );
     let preview = provider_transport
         .preview_provider_secret_provisioning(&preview_metadata, &idempotency_key)
         .map_err(failure)?;
@@ -6449,6 +6530,7 @@ fn provision_provider_secret(
     // by the next operation only after this dedicated confirmation.
     let overwrite_authorized = confirmed;
     let metadata = satelle_transport::ProviderSecretProvisioningMetadata::new(
+        desktop_binding,
         authorization.clone(),
         overwrite_authorized,
     );
@@ -8606,32 +8688,35 @@ fn normalize_revealed_file_sources(
 ) {
     let home = std::cell::OnceCell::new();
     for (host_alias, host) in &config.hosts {
-        for (auth_alias, source) in &host.provider_auth {
-            let ProviderSecretSource::File { path } = source else {
-                continue;
-            };
-            if !path.to_str().is_some_and(|path| path.starts_with('~')) {
-                continue;
-            }
-            let descriptor = &mut value["hosts"][host_alias]["provider_auth"][auth_alias];
-            // A remote or persistent service may run as a different account.
-            // Inspection must not substitute the Controller's local home.
-            if host.transport != TransportKind::Local
-                || host.setup_mode == Some(satelle_core::SetupMode::Persistent)
-            {
-                descriptor["path"] = json!(null);
-                descriptor["normalization_status"] = json!("remote_home_not_checked");
-                continue;
-            }
-            let home = home.get_or_init(satelle_core::resolver_account_home);
-            match satelle_core::expand_secret_file_path(path, home.as_deref()) {
-                Ok(path) => {
-                    descriptor["path"] = json!(path);
-                    descriptor["normalization_status"] = json!("expanded");
+        for (binding_alias, binding) in &host.desktop_bindings {
+            for (auth_alias, source) in &binding.provider_auth {
+                let ProviderSecretSource::File { path } = source else {
+                    continue;
+                };
+                if !path.to_str().is_some_and(|path| path.starts_with('~')) {
+                    continue;
                 }
-                Err(_) => {
+                let descriptor = &mut value["hosts"][host_alias]["desktop_bindings"][binding_alias]
+                    ["provider_auth"][auth_alias];
+                // A remote or persistent service may run as a different account.
+                // Inspection must not substitute the Controller's local home.
+                if host.transport != TransportKind::Local
+                    || host.setup_mode == Some(satelle_core::SetupMode::Persistent)
+                {
                     descriptor["path"] = json!(null);
-                    descriptor["normalization_status"] = json!("home_unavailable");
+                    descriptor["normalization_status"] = json!("remote_home_not_checked");
+                    continue;
+                }
+                let home = home.get_or_init(satelle_core::resolver_account_home);
+                match satelle_core::expand_secret_file_path(path, home.as_deref()) {
+                    Ok(path) => {
+                        descriptor["path"] = json!(path);
+                        descriptor["normalization_status"] = json!("expanded");
+                    }
+                    Err(_) => {
+                        descriptor["path"] = json!(null);
+                        descriptor["normalization_status"] = json!("home_unavailable");
+                    }
                 }
             }
         }
@@ -8640,7 +8725,7 @@ fn normalize_revealed_file_sources(
 
 const CONFIG_SECRET_SOURCE_SCHEMA_PATHS: &[&[&str]] = &[
     &["hosts", "*", "api_token"],
-    &["hosts", "*", "provider_auth", "*"],
+    &["hosts", "*", "desktop_bindings", "*", "provider_auth", "*"],
 ];
 
 fn redact_schema_marked_config_values(
@@ -8798,11 +8883,15 @@ mod config_redaction_tests {
                         "kind": "file",
                         "path": CANARY,
                     },
-                    "provider_auth": {
-                        "operator-auth": {
-                            "kind": "auth-command",
-                            "argv": ["/usr/bin/credential-helper", CANARY],
-                            "secret": CANARY,
+                    "desktop_bindings": {
+                        "operator": {
+                            "provider_auth": {
+                                "operator-auth": {
+                                    "kind": "auth-command",
+                                    "argv": ["/usr/bin/credential-helper", CANARY],
+                                    "secret": CANARY,
+                                },
+                            },
                         },
                     },
                 },
@@ -8815,14 +8904,10 @@ mod config_redaction_tests {
         assert_eq!(selected["transport"], "direct");
         assert_eq!(selected["api_token"]["value"], serde_json::Value::Null);
         assert_eq!(selected["api_token"]["redacted"], true);
-        assert_eq!(
-            selected["provider_auth"]["operator-auth"]["value"],
-            serde_json::Value::Null
-        );
-        assert_eq!(
-            selected["provider_auth"]["operator-auth"]["redaction_reason"],
-            "secret_source_reference"
-        );
+        let provider_auth =
+            &selected["desktop_bindings"]["operator"]["provider_auth"]["operator-auth"];
+        assert_eq!(provider_auth["value"], serde_json::Value::Null);
+        assert_eq!(provider_auth["redaction_reason"], "secret_source_reference");
         assert!(
             !serde_json::to_string(&value)
                 .expect("redacted config should serialize")
@@ -8832,17 +8917,22 @@ mod config_redaction_tests {
         let mut revealed = json!({
             "hosts": {
                 "selected": {
-                    "provider_auth": {
-                        "operator-auth": {
-                            "kind": "auth-command",
-                            "argv": ["/usr/bin/credential-helper", CANARY],
+                    "desktop_bindings": {
+                        "operator": {
+                            "provider_auth": {
+                                "operator-auth": {
+                                    "kind": "auth-command",
+                                    "argv": ["/usr/bin/credential-helper", CANARY],
+                                },
+                            },
                         },
                     },
                 },
             },
         });
         redact_schema_marked_config_values(&mut revealed, &mut Vec::new(), true);
-        let unknown = &revealed["hosts"]["selected"]["provider_auth"]["operator-auth"];
+        let unknown = &revealed["hosts"]["selected"]["desktop_bindings"]["operator"]["provider_auth"]
+            ["operator-auth"];
         assert_eq!(unknown["value"], serde_json::Value::Null);
         assert_eq!(unknown["redacted"], true);
         assert_eq!(
@@ -8913,7 +9003,17 @@ fn model_provider_config_json(
         .provider_alias
         .as_deref()
         .zip(config.config.model_alias.as_deref())
-        .and_then(|(provider, model)| selected_host_config.provider_binding(provider, model));
+        .and_then(|(provider, model)| {
+            (selected_host_config.desktop_bindings.len() == 1)
+                .then(|| {
+                    selected_host_config
+                        .desktop_bindings
+                        .first_key_value()
+                        .expect("one Desktop Binding exists")
+                        .0
+                })
+                .and_then(|desktop| selected_host_config.provider_binding(desktop, provider, model))
+        });
     let binding_status = match (
         config.config.model_alias.as_ref(),
         config.config.provider_alias.as_ref(),
@@ -9100,6 +9200,7 @@ fn resolve_experimental_provider_computer_use(
 
 #[derive(Clone, Debug)]
 struct ProviderSelection {
+    desktop_binding: Option<String>,
     requested_model_alias: Option<String>,
     requested_provider_alias: Option<String>,
     model_alias_from_project: bool,
@@ -9110,6 +9211,45 @@ struct ProviderSelection {
 }
 
 impl ProviderSelection {
+    fn for_pending_setup_desktop(
+        config: &ResolvedConfig,
+        host: &SelectedHost,
+    ) -> Result<Self, CliFailure> {
+        let requested_model_alias = config.config.model_alias.clone();
+        let requested_provider_alias = config.config.provider_alias.clone();
+        validate_explicit_provider_alias_pair(
+            requested_model_alias.as_deref(),
+            requested_provider_alias.as_deref(),
+        )
+        .map_err(failure)?;
+        if requested_model_alias.is_some() || requested_provider_alias.is_some() {
+            return Err(provider_selection_error(
+                ErrorCode::ModelProviderBindingMissing,
+                &host.alias,
+                requested_model_alias.as_deref(),
+                requested_provider_alias.as_deref(),
+                "the selected Host has no Desktop Binding for the requested provider aliases",
+                "configure a Desktop Binding with the exact provider_bindings entry",
+            ));
+        }
+        Ok(Self {
+            desktop_binding: None,
+            requested_model_alias,
+            requested_provider_alias,
+            model_alias_from_project: config.model_alias_from_project(),
+            provider_alias_from_project: config.provider_alias_from_project(),
+            authorization: None,
+            auth_source_name: None,
+            experimental_provider_computer_use: false,
+        })
+    }
+
+    fn desktop_binding(&self) -> &str {
+        self.desktop_binding
+            .as_deref()
+            .expect("a Host operation has resolved its Desktop Binding")
+    }
+
     fn validation_aliases(&self) -> (&str, &str) {
         (
             self.requested_model_alias
@@ -9142,6 +9282,57 @@ impl ProviderSelection {
                 .is_some_and(|authorization| authorization.auth_source().is_none())
         })
     }
+
+    fn validation_options(
+        &self,
+        mode: satelle_core::ProviderAuthValidationMode,
+    ) -> satelle_host::ProviderDescriptorValidationOptions {
+        satelle_host::ProviderDescriptorValidationOptions::new(
+            mode,
+            self.model_alias_from_project,
+            self.provider_alias_from_project,
+            self.experimental_provider_computer_use,
+        )
+    }
+}
+
+/// Validates provider intent for every locally configured Desktop Binding.
+/// Config inspection has no runtime binding selector, so it must not apply the
+/// single-binding rule used by run, steer, setup, and Host operations.
+fn validate_config_provider_selections(
+    config: &ResolvedConfig,
+    host: &SelectedHost,
+) -> Result<(), CliFailure> {
+    if host.config.desktop_bindings.is_empty() {
+        return validate_explicit_provider_alias_pair(
+            config.config.model_alias.as_deref(),
+            config.config.provider_alias.as_deref(),
+        )
+        .map_err(failure);
+    }
+
+    for desktop_binding in host.config.desktop_bindings.keys() {
+        let provider = resolve_provider_selection(
+            config,
+            host,
+            Some(desktop_binding),
+            None,
+            None,
+            false,
+            false,
+        )?;
+        if let Some(auth_source_name) = provider.missing_auth_source_name() {
+            return Err(failure(SatelleError::config_error(
+                format!(
+                    "Host Binding '{}' Desktop Binding '{desktop_binding}' has provider authentication outcome missing_descriptor because provider_auth entry '{auth_source_name}' is absent",
+                    host.alias
+                ),
+                None,
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn projected_experimental_provider_computer_use(
@@ -9161,6 +9352,7 @@ fn projected_experimental_provider_computer_use(
 fn resolve_provider_selection(
     config: &ResolvedConfig,
     host: &SelectedHost,
+    desktop_binding: Option<&str>,
     model_override: Option<&str>,
     provider_override: Option<&str>,
     command_experimental: bool,
@@ -9186,6 +9378,9 @@ fn resolve_provider_selection(
         &host.config,
         config,
     );
+    let selected_desktop_binding = select_desktop_binding(&host.config, desktop_binding)
+        .map(|(alias, _)| alias.to_string())
+        .map_err(failure)?;
 
     let (Some(model_alias), Some(provider_alias)) = (
         requested_model_alias.as_deref(),
@@ -9193,6 +9388,7 @@ fn resolve_provider_selection(
     ) else {
         if requested_model_alias.is_none() && requested_provider_alias.is_none() {
             return Ok(ProviderSelection {
+                desktop_binding: Some(selected_desktop_binding),
                 requested_model_alias,
                 requested_provider_alias,
                 model_alias_from_project,
@@ -9211,9 +9407,13 @@ fn resolve_provider_selection(
             "set both model_alias and provider_alias, or pass both --model and --provider",
         ));
     };
-    let Some(binding) = host.config.provider_binding(provider_alias, model_alias) else {
+    let Some(binding) =
+        host.config
+            .provider_binding(&selected_desktop_binding, provider_alias, model_alias)
+    else {
         if !require_local_binding {
             return Ok(ProviderSelection {
+                desktop_binding: Some(selected_desktop_binding),
                 requested_model_alias,
                 requested_provider_alias,
                 model_alias_from_project,
@@ -9237,6 +9437,7 @@ fn resolve_provider_selection(
         return Err(failure(
             SatelleError::project_provider_selection_not_allowed(
                 &host.alias,
+                &selected_desktop_binding,
                 provider_alias,
                 model_alias,
             ),
@@ -9255,11 +9456,16 @@ fn resolve_provider_selection(
         authorization = authorization.with_endpoint(endpoint);
     }
     if let Some(auth_source) = binding.auth_source.as_deref()
-        && let Some(descriptor) = host.config.provider_auth.get(auth_source)
+        && let Some(descriptor) = host
+            .config
+            .desktop_bindings
+            .get(&selected_desktop_binding)
+            .and_then(|binding| binding.provider_auth.get(auth_source))
     {
         authorization = authorization.with_auth_source(descriptor.clone());
     }
     Ok(ProviderSelection {
+        desktop_binding: Some(selected_desktop_binding),
         requested_model_alias,
         requested_provider_alias,
         model_alias_from_project,
@@ -9819,13 +10025,7 @@ fn trust_host(
             "Current expected Host Identity: {}",
             previous_identity.as_deref().unwrap_or("not pinned")
         );
-        println!(
-            "Desktop Binding: {}",
-            host.config
-                .desktop_user
-                .as_deref()
-                .unwrap_or("not configured")
-        );
+        println!("Desktop Binding: {}", desktop_binding_summary(&host.config));
         let confirmed = cliclack::confirm("Trust this Host Identity?")
             .initial_value(false)
             .interact()
@@ -12074,29 +12274,118 @@ fn show_host_sessions(
     }
 }
 
+fn desktop_binding_summary(host: &HostConfig) -> String {
+    if host.desktop_bindings.is_empty() {
+        "not configured".to_string()
+    } else {
+        host.desktop_bindings
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 fn apply_current_desktop_selection(report: &mut HostSessionsReport, host: &HostConfig) {
     for session in &mut report.sessions {
         session.selected_by_current_config = false;
     }
 
-    let policy = DesktopSelectionPolicy::from_host_config(host);
-    if let Ok(selected) = resolve_desktop_session(report, &policy) {
-        let selected_id = selected.session_id.clone();
-        if let Some(session) = report
-            .sessions
-            .iter_mut()
-            .find(|session| session.session_id == selected_id)
-        {
-            session.selected_by_current_config = true;
+    for binding in host.desktop_bindings.values() {
+        let policy = DesktopSelectionPolicy::from_binding_config(binding);
+        if let Ok(selected) = resolve_desktop_session(report, &policy) {
+            let selected_id = selected.session_id.clone();
+            if let Some(session) = report
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == selected_id)
+            {
+                session.selected_by_current_config = true;
+            }
         }
     }
+    #[cfg(feature = "test-support")]
+    if host.desktop_bindings.is_empty() && test_support_adapter_selected() {
+        let policy = DesktopSelectionPolicy::from_binding_config(test_support_desktop_binding());
+        if let Ok(selected) = resolve_desktop_session(report, &policy) {
+            let selected_id = selected.session_id.clone();
+            if let Some(session) = report
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == selected_id)
+            {
+                session.selected_by_current_config = true;
+            }
+        }
+    }
+}
+
+fn select_desktop_binding<'a>(
+    host: &'a HostConfig,
+    requested: Option<&str>,
+) -> Result<(&'a str, &'a satelle_core::DesktopBindingConfig), SatelleError> {
+    if let Some(requested) = requested {
+        #[cfg(feature = "test-support")]
+        if host.desktop_bindings.is_empty()
+            && test_support_adapter_selected()
+            && requested == "local-demo-desktop-v1"
+        {
+            return Ok(("local-demo-desktop-v1", test_support_desktop_binding()));
+        }
+        return host
+            .desktop_bindings
+            .get_key_value(requested)
+            .map(|(alias, binding)| (alias.as_str(), binding))
+            .ok_or_else(|| SatelleError::desktop_binding_not_found(requested));
+    }
+    if host.desktop_bindings.len() == 1 {
+        let (alias, binding) = host
+            .desktop_bindings
+            .first_key_value()
+            .expect("one Desktop Binding exists");
+        return Ok((alias, binding));
+    }
+    #[cfg(feature = "test-support")]
+    if host.desktop_bindings.is_empty() && test_support_adapter_selected() {
+        return Ok(("local-demo-desktop-v1", test_support_desktop_binding()));
+    }
+    Err(SatelleError::desktop_binding_ambiguous(
+        host.desktop_bindings.keys().cloned(),
+    ))
+}
+
+#[cfg(feature = "test-support")]
+fn test_support_adapter_selected() -> bool {
+    std::env::var("SATELLE_TEST_SUPPORT_ADAPTER")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.as_str(),
+                "fake" | "pending" | "failing" | "readiness-failing" | "resolved-secret-canary"
+            )
+        })
+}
+
+#[cfg(feature = "test-support")]
+fn test_support_desktop_binding() -> &'static satelle_core::DesktopBindingConfig {
+    static BINDING: std::sync::LazyLock<satelle_core::DesktopBindingConfig> =
+        std::sync::LazyLock::new(|| satelle_core::DesktopBindingConfig {
+            desktop_user: "local-demo-user".to_string(),
+            desktop_session_preference: None,
+            desktop_session_native_selector: None,
+            provider_auth: BTreeMap::new(),
+            provider_bindings: BTreeMap::new(),
+        });
+    &BINDING
 }
 
 fn resolve_execution_desktop(
     transport: &dyn transport::TransportClient,
     host: &SelectedHost,
+    desktop_binding: Option<&str>,
 ) -> Result<(), CliFailure> {
-    let policy = DesktopSelectionPolicy::from_host_config(&host.config);
+    let (_, binding) = select_desktop_binding(&host.config, desktop_binding).map_err(failure)?;
+    let policy = DesktopSelectionPolicy::from_binding_config(binding);
     if !desktop_policy_is_active(&policy) {
         return Ok(());
     }
@@ -14930,6 +15219,7 @@ fn turn_request_construction_carries_provider_aliases_refresh_and_one_shot_opt_i
             })
             .with_experimental_provider_computer_use(true);
     let selection = ProviderSelection {
+        desktop_binding: Some("local-demo-desktop-v1".to_string()),
         requested_model_alias: Some("vision".to_string()),
         requested_provider_alias: Some("anthropic".to_string()),
         model_alias_from_project: true,
@@ -14953,8 +15243,9 @@ fn turn_request_construction_carries_provider_aliases_refresh_and_one_shot_opt_i
     assert_eq!(
         serde_json::to_value(request).expect("TurnRequest should serialize"),
         json!({
-            "schema_version": "satelle.api.v11",
+            "schema_version": "satelle.api.v12",
             "prompt": "inspect the desktop",
+            "desktop_binding": "local-demo-desktop-v1",
             "execution_mode": "standard",
             "model": "vision",
             "provider": "anthropic",
@@ -15461,6 +15752,15 @@ fn run_prompt(
     );
     let mut event_output = TurnEventOutput::new(effective_mode, command.verbose);
     let explicit_host_alias = command.host.as_deref();
+    report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        validate_explicit_provider_alias_pair(
+            command.model.as_deref(),
+            command.provider.as_deref(),
+        )
+        .map_err(failure),
+    )?;
     let prompt = report_not_admitted(
         &mut event_output,
         explicit_host_alias,
@@ -15505,6 +15805,7 @@ fn run_prompt(
         resolve_provider_selection(
             config,
             &host,
+            command.desktop_binding.as_deref(),
             command.model.as_deref(),
             command.provider.as_deref(),
             command.experimental_provider_computer_use,
@@ -15541,6 +15842,7 @@ fn run_prompt(
         }
     };
     let provider_validation = match transport.validate_provider_descriptor(
+        provider_selection.desktop_binding(),
         provider_selection
             .requested_model_alias
             .as_deref()
@@ -15549,10 +15851,7 @@ fn run_prompt(
             .requested_provider_alias
             .as_deref()
             .unwrap_or("codex-default"),
-        provider_selection.model_alias_from_project,
-        provider_selection.provider_alias_from_project,
-        satelle_core::ProviderAuthValidationMode::Cached,
-        provider_selection.experimental_provider_computer_use,
+        provider_selection.validation_options(satelle_core::ProviderAuthValidationMode::Cached),
     ) {
         Ok(validation) => validation,
         Err(error) => {
@@ -15598,7 +15897,11 @@ fn run_prompt(
     report_not_admitted(
         &mut event_output,
         Some(&host.alias),
-        resolve_execution_desktop(transport.as_ref(), &host),
+        resolve_execution_desktop(
+            transport.as_ref(),
+            &host,
+            command.desktop_binding.as_deref(),
+        ),
     )?;
     let turn_execution_timeout_ms = report_not_admitted(
         &mut event_output,
@@ -15768,6 +16071,15 @@ fn steer_prompt(
     );
     let mut event_output = TurnEventOutput::new(effective_mode, command.verbose);
     let explicit_host_alias = command.host.as_deref();
+    report_not_admitted(
+        &mut event_output,
+        explicit_host_alias,
+        validate_explicit_provider_alias_pair(
+            command.model.as_deref(),
+            command.provider.as_deref(),
+        )
+        .map_err(failure),
+    )?;
     let prompt = report_not_admitted(
         &mut event_output,
         explicit_host_alias,
@@ -15804,48 +16116,80 @@ fn steer_prompt(
         command.yolo,
         command.no_yolo,
     );
+    let transport =
+        report_not_admitted(&mut event_output, Some(&host.alias), transport_for(&host))?;
+    let selected_desktop_binding = match command.desktop_binding.as_deref() {
+        Some(binding) => report_not_admitted(
+            &mut event_output,
+            Some(&host.alias),
+            select_desktop_binding(&host.config, Some(binding))
+                .map(|(alias, _)| alias.to_string())
+                .map_err(failure),
+        )?,
+        None => match transport.status(&session_id) {
+            Ok(session) => session.desktop_binding().to_string(),
+            Err(error) => {
+                let error = if host.config.transport == satelle_core::TransportKind::Direct
+                    && error.code == ErrorCode::HostUnreachable
+                {
+                    SatelleError::direct_daemon_unreachable(&host.alias)
+                } else {
+                    error
+                };
+                let status_failure = failure(error);
+                if !command.detach {
+                    if let Ok(provider_selection) = resolve_provider_selection(
+                        config,
+                        &host,
+                        None,
+                        command.model.as_deref(),
+                        command.provider.as_deref(),
+                        command.experimental_provider_computer_use,
+                        false,
+                    ) {
+                        event_output
+                            .emit_preflight(
+                                &host,
+                                "steer",
+                                config,
+                                TurnPreflight {
+                                    yolo_policy: &yolo_policy,
+                                    provider_selection: &provider_selection,
+                                    provider_validation: None,
+                                    refresh_provider_smoke_test: command
+                                        .refresh_provider_smoke_test,
+                                },
+                            )
+                            .map_err(failure)?;
+                    }
+                    event_output
+                        .emit_command_failed(
+                            &host.alias,
+                            &status_failure.error,
+                            TurnAdmissionPhase::NotAdmitted,
+                            None,
+                        )
+                        .map_err(failure)?;
+                }
+                return Err(status_failure);
+            }
+        },
+    };
     let provider_selection = report_not_admitted(
         &mut event_output,
         Some(&host.alias),
         resolve_provider_selection(
             config,
             &host,
+            Some(&selected_desktop_binding),
             command.model.as_deref(),
             command.provider.as_deref(),
             command.experimental_provider_computer_use,
             false,
         ),
     )?;
-    let transport = match transport_for(&host) {
-        Ok(transport) => transport,
-        Err(transport_failure) => {
-            if !command.detach {
-                event_output
-                    .emit_preflight(
-                        &host,
-                        "steer",
-                        config,
-                        TurnPreflight {
-                            yolo_policy: &yolo_policy,
-                            provider_selection: &provider_selection,
-                            provider_validation: None,
-                            refresh_provider_smoke_test: command.refresh_provider_smoke_test,
-                        },
-                    )
-                    .map_err(failure)?;
-                event_output
-                    .emit_command_failed(
-                        &host.alias,
-                        &transport_failure.error,
-                        TurnAdmissionPhase::NotAdmitted,
-                        None,
-                    )
-                    .map_err(failure)?;
-            }
-            return Err(transport_failure);
-        }
-    };
     let provider_validation = match transport.validate_provider_descriptor(
+        provider_selection.desktop_binding(),
         provider_selection
             .requested_model_alias
             .as_deref()
@@ -15854,10 +16198,7 @@ fn steer_prompt(
             .requested_provider_alias
             .as_deref()
             .unwrap_or("codex-default"),
-        provider_selection.model_alias_from_project,
-        provider_selection.provider_alias_from_project,
-        satelle_core::ProviderAuthValidationMode::Cached,
-        provider_selection.experimental_provider_computer_use,
+        provider_selection.validation_options(satelle_core::ProviderAuthValidationMode::Cached),
     ) {
         Ok(validation) => validation,
         Err(error) => {
@@ -15903,7 +16244,15 @@ fn steer_prompt(
     report_not_admitted(
         &mut event_output,
         Some(&host.alias),
-        resolve_execution_desktop(transport.as_ref(), &host),
+        if command.desktop_binding.is_some() {
+            resolve_execution_desktop(
+                transport.as_ref(),
+                &host,
+                command.desktop_binding.as_deref(),
+            )
+        } else {
+            Ok(())
+        },
     )?;
     let turn_execution_timeout_ms = report_not_admitted(
         &mut event_output,
@@ -16081,6 +16430,7 @@ fn build_turn_request(
         .with_experimental_provider_computer_use(
             provider_selection.experimental_provider_computer_use,
         )
+        .with_desktop_binding(provider_selection.desktop_binding().to_string())
         .with_turn_execution_timeout_ms(turn_execution_timeout_ms);
     match raw_protocol_source_host {
         Some(source_host) => request.with_raw_protocol_capture(source_host),
@@ -16568,6 +16918,7 @@ fn print_turn_session(
         options.format.print(&json!({
             "schema_version": options.schema_version,
             "session_id": session.session_id(),
+            "desktop_binding": session.desktop_binding(),
             "status": target_turn.state(),
             "effective_timeouts": options.effective_timeouts,
             "provider_smoke": provider_smoke,
@@ -16623,6 +16974,7 @@ fn print_detached_session(
         options.format.print(&json!({
             "schema_version": options.schema_version,
             "session_id": session.session_id(),
+            "desktop_binding": session.desktop_binding(),
             "host": options.host,
             "status": latest_turn.state(),
             "created_at": session.created_at().format(&Rfc3339).expect("a public Session timestamp is RFC 3339 representable"),
@@ -16647,6 +16999,7 @@ fn print_detached_session(
             println!("YOLO mode: active ({})", options.yolo_policy.source);
         }
         println!("Session: {}", session.session_id());
+        println!("Desktop Binding: {}", session.desktop_binding());
         println!("Status: {}", status_label(latest_turn.state()));
     }
     Ok(session_id)
@@ -16974,6 +17327,7 @@ fn print_setup_human(report: &SetupReport) {
 fn print_session_human(session: &PublicSession, turn: &PublicTurn, host: &str) {
     println!("Session: {}", session.session_id());
     println!("Host: {host}");
+    println!("Desktop Binding: {}", session.desktop_binding());
     println!("Status: {}", status_label(turn.state()));
     println!("Turns: {}", session.turns().len());
     println!("Latest turn: {}", turn.turn_id());
@@ -17116,7 +17470,16 @@ mod setup_desktop_binding_tests {
     #[test]
     fn unavailable_configured_binding_is_not_rewritten() {
         let mut config = host_config();
-        config.desktop_user = Some("missing".to_string());
+        config.desktop_bindings.insert(
+            "missing".to_string(),
+            satelle_core::DesktopBindingConfig {
+                desktop_user: "missing".to_string(),
+                desktop_session_preference: None,
+                desktop_session_native_selector: None,
+                provider_auth: BTreeMap::new(),
+                provider_bindings: BTreeMap::new(),
+            },
+        );
         let error = resolve_setup_desktop_selection(
             &report(vec![session("console", "alice", true)]),
             &config,
@@ -17126,7 +17489,13 @@ mod setup_desktop_binding_tests {
         .expect_err("a missing configured user must fail");
 
         assert_eq!(error.code, ErrorCode::DesktopSessionUnavailable);
-        assert_eq!(config.desktop_user.as_deref(), Some("missing"));
+        assert_eq!(
+            config
+                .desktop_bindings
+                .get("missing")
+                .map(|binding| binding.desktop_user.as_str()),
+            Some("missing")
+        );
     }
 
     #[test]
@@ -17190,29 +17559,33 @@ mod setup_desktop_binding_tests {
     #[test]
     fn execution_desktop_probe_requires_an_explicit_policy() {
         let mut config = host_config();
-        assert!(!desktop_policy_is_active(
-            &DesktopSelectionPolicy::from_host_config(&config)
+        assert!(config.desktop_bindings.is_empty());
+
+        config.desktop_bindings.insert(
+            "operator".to_string(),
+            satelle_core::DesktopBindingConfig {
+                desktop_user: "operator".to_string(),
+                desktop_session_preference: None,
+                desktop_session_native_selector: None,
+                provider_auth: BTreeMap::new(),
+                provider_bindings: BTreeMap::new(),
+            },
+        );
+        let binding = config.desktop_bindings.get("operator").unwrap();
+        assert!(desktop_policy_is_active(
+            &DesktopSelectionPolicy::from_binding_config(binding)
         ));
 
-        config.desktop_user = Some("operator".to_string());
+        let binding = config.desktop_bindings.get_mut("operator").unwrap();
+        binding.desktop_session_preference = Some(DesktopSessionPreference::Only);
+        binding.desktop_session_native_selector =
+            Some(satelle_core::DesktopSessionNativeSelector {
+                platform: "windows".to_string(),
+                kind: "wts-session".to_string(),
+                value: "7".to_string(),
+            });
         assert!(desktop_policy_is_active(
-            &DesktopSelectionPolicy::from_host_config(&config)
-        ));
-
-        config.desktop_user = None;
-        config.desktop_session_preference = Some(DesktopSessionPreference::Only);
-        assert!(desktop_policy_is_active(
-            &DesktopSelectionPolicy::from_host_config(&config)
-        ));
-
-        config.desktop_session_preference = None;
-        config.desktop_session_native_selector = Some(satelle_core::DesktopSessionNativeSelector {
-            platform: "windows".to_string(),
-            kind: "wts-session".to_string(),
-            value: "7".to_string(),
-        });
-        assert!(desktop_policy_is_active(
-            &DesktopSelectionPolicy::from_host_config(&config)
+            &DesktopSelectionPolicy::from_binding_config(binding)
         ));
     }
 

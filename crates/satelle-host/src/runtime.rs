@@ -72,11 +72,11 @@ use satelle_core::{
     SatelleError, SatelleEvent, SessionId, TurnId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
@@ -619,17 +619,41 @@ fn readiness_probe_recovery_pending(kind: ReadinessProbeKind) -> SatelleError {
 
 fn require_project_binding_consent(
     host: &str,
+    desktop_binding: &DesktopBindingRef,
     provider_intent: &ProviderComputerUseIntent,
     binding: &ResolvedProviderBinding,
 ) -> Result<(), SatelleError> {
     if provider_intent.requires_project_binding_consent() && !binding.allow_project_selection() {
         return Err(SatelleError::project_provider_selection_not_allowed(
             host,
+            desktop_binding.as_str(),
             binding.requested_provider_alias(),
             binding.requested_model_alias(),
         ));
     }
     Ok(())
+}
+
+fn selected_provider_desktop_binding(
+    provider_intent: &ProviderComputerUseIntent,
+    configured: &BTreeMap<String, RuntimeDesktopProviderPolicy>,
+) -> Result<DesktopBindingRef, SatelleError> {
+    if let Some(binding) = provider_intent.desktop_binding() {
+        return Ok(binding.clone());
+    }
+    if configured.len() != 1 {
+        return Err(SatelleError::desktop_binding_ambiguous(
+            configured.keys().cloned(),
+        ));
+    }
+    DesktopBindingRef::new(
+        configured
+            .first_key_value()
+            .expect("one configured Desktop Binding exists")
+            .0
+            .clone(),
+    )
+    .map_err(|_| SatelleError::desktop_binding_not_found("invalid"))
 }
 
 fn model_provider_binding_missing(provider_intent: &ProviderComputerUseIntent) -> SatelleError {
@@ -712,7 +736,6 @@ pub(crate) struct RuntimeStoragePolicy {
     platform_log_sink: bool,
     recording_policy: satelle_core::recording::RecordingPolicy,
     queue_config: satelle_core::queue::QueueConfig,
-    queue_desktop_binding: String,
 }
 
 impl RuntimeStoragePolicy {
@@ -740,10 +763,6 @@ impl RuntimeStoragePolicy {
             platform_log_sink: config.platform_log_sink,
             recording_policy: config.recording.clone().unwrap_or_default(),
             queue_config: config.queue.clone(),
-            queue_desktop_binding: config
-                .desktop_user
-                .clone()
-                .unwrap_or_else(|| "default".to_string()),
         }
     }
 }
@@ -758,24 +777,80 @@ impl Default for RuntimeStoragePolicy {
             platform_log_sink: false,
             recording_policy: satelle_core::recording::RecordingPolicy::default(),
             queue_config: satelle_core::queue::QueueConfig::default(),
-            queue_desktop_binding: "default".to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeProviderPolicy {
+    desktop_bindings: BTreeMap<String, RuntimeDesktopProviderPolicy>,
+    experimental_provider_computer_use: Option<bool>,
+    experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
+}
+
+impl Default for RuntimeProviderPolicy {
+    fn default() -> Self {
+        Self {
+            desktop_bindings: BTreeMap::from([(
+                "local-demo-desktop-v1".to_string(),
+                RuntimeDesktopProviderPolicy {
+                    desktop_user: "local-demo-user".to_string(),
+                    ..RuntimeDesktopProviderPolicy::default()
+                },
+            )]),
+            experimental_provider_computer_use: None,
+            experimental_provider_computer_use_by_provider: BTreeMap::new(),
         }
     }
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct RuntimeProviderPolicy {
+struct RuntimeDesktopProviderPolicy {
+    desktop_user: String,
     provider_bindings: BTreeMap<String, BTreeMap<String, satelle_core::ProviderBindingConfig>>,
     provider_auth: BTreeMap<String, satelle_core::ProviderSecretSource>,
-    experimental_provider_computer_use: Option<bool>,
-    experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
 }
 
 impl RuntimeProviderPolicy {
     pub(crate) fn from_host_config(config: &satelle_core::HostConfig) -> Self {
         Self {
-            provider_bindings: config.provider_bindings.clone(),
-            provider_auth: config.provider_auth.clone(),
+            desktop_bindings: config
+                .desktop_bindings
+                .iter()
+                .map(|(alias, binding)| {
+                    (
+                        alias.clone(),
+                        RuntimeDesktopProviderPolicy {
+                            desktop_user: binding.desktop_user.clone(),
+                            provider_bindings: binding.provider_bindings.clone(),
+                            provider_auth: binding.provider_auth.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            experimental_provider_computer_use: config.experimental_provider_computer_use,
+            experimental_provider_computer_use_by_provider: config
+                .experimental_provider_computer_use_by_provider
+                .clone(),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn from_test_support_host_config(config: &satelle_core::HostConfig) -> Self {
+        Self {
+            desktop_bindings: config
+                .desktop_bindings
+                .iter()
+                .map(|(alias, binding)| {
+                    (
+                        alias.clone(),
+                        RuntimeDesktopProviderPolicy {
+                            desktop_user: binding.desktop_user.clone(),
+                            ..RuntimeDesktopProviderPolicy::default()
+                        },
+                    )
+                })
+                .collect(),
             experimental_provider_computer_use: config.experimental_provider_computer_use,
             experimental_provider_computer_use_by_provider: config
                 .experimental_provider_computer_use_by_provider
@@ -1969,8 +2044,13 @@ impl RuntimeEngine {
             (Some(model), Some(provider)) => (model.as_str(), provider.as_str()),
             _ => return Err(model_provider_binding_missing(provider_intent)),
         };
+        let desktop_binding = selected_provider_desktop_binding(
+            provider_intent,
+            &self.provider_policy.desktop_bindings,
+        )?;
         if let Some(resolution) = self.resolve_remote_host_binding(
             host,
+            &desktop_binding,
             requested_pair.0,
             requested_pair.1,
             provider_intent.requires_project_binding_consent(),
@@ -1979,22 +2059,27 @@ impl RuntimeEngine {
         }
         let binding = self
             .lock_storage()?
-            .load_authorized_provider_binding(requested_pair.0, requested_pair.1)
+            .load_authorized_provider_binding(&desktop_binding, requested_pair.0, requested_pair.1)
             .map_err(model::storage_failure)?
             .ok_or_else(|| model_provider_binding_missing(provider_intent))?;
-        require_project_binding_consent(host, provider_intent, &binding)?;
+        require_project_binding_consent(host, &desktop_binding, provider_intent, &binding)?;
         Ok(Some(ProviderBindingResolution::Ready(binding)))
     }
 
     fn resolve_remote_host_binding(
         &self,
         host: &str,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
         project_selection: bool,
     ) -> Result<Option<ProviderBindingResolution>, SatelleError> {
-        let Some(binding) = self
+        let desktop_policy = self
             .provider_policy
+            .desktop_bindings
+            .get(desktop_binding.as_str())
+            .ok_or_else(|| SatelleError::desktop_binding_not_found(desktop_binding.as_str()))?;
+        let Some(binding) = desktop_policy
             .provider_bindings
             .get(provider_alias)
             .and_then(|models| models.get(model_alias))
@@ -2004,6 +2089,7 @@ impl RuntimeEngine {
         if project_selection && !binding.allow_project_selection {
             return Err(SatelleError::project_provider_selection_not_allowed(
                 host,
+                desktop_binding.as_str(),
                 provider_alias,
                 model_alias,
             ));
@@ -2020,12 +2106,7 @@ impl RuntimeEngine {
         }
         let missing_auth_source_name =
             if let Some(auth_source_name) = binding.auth_source.as_deref() {
-                match self
-                    .provider_policy
-                    .provider_auth
-                    .get(auth_source_name)
-                    .cloned()
-                {
+                match desktop_policy.provider_auth.get(auth_source_name).cloned() {
                     Some(descriptor) => {
                         authorization = authorization.with_auth_source(descriptor);
                         None
@@ -2079,31 +2160,35 @@ impl RuntimeEngine {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn authorize_provider_binding(
         &self,
+        desktop_binding: &DesktopBindingRef,
         binding: &ResolvedProviderBinding,
     ) -> Result<(), SatelleError> {
         self.lock_storage()?
-            .authorize_provider_binding(binding, time::OffsetDateTime::now_utc())
+            .authorize_provider_binding(desktop_binding, binding, time::OffsetDateTime::now_utc())
             .map_err(model::storage_failure)
     }
 
     pub(crate) fn provider_binding_digest(
         &self,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
     ) -> Result<Option<String>, SatelleError> {
         self.lock_storage()?
-            .load_authorized_provider_binding(model_alias, provider_alias)
+            .load_authorized_provider_binding(desktop_binding, model_alias, provider_alias)
             .map(|binding| binding.map(|binding| binding.binding_digest().to_string()))
             .map_err(model::storage_failure)
     }
 
     pub(crate) fn authorize_provider_binding_if_unchanged(
         &self,
+        desktop_binding: &DesktopBindingRef,
         binding: &ResolvedProviderBinding,
         expected_previous_digest: Option<&str>,
     ) -> Result<(), SatelleError> {
         self.lock_storage()?
             .authorize_provider_binding_if_unchanged(
+                desktop_binding,
                 binding,
                 expected_previous_digest,
                 time::OffsetDateTime::now_utc(),
@@ -2113,11 +2198,12 @@ impl RuntimeEngine {
 
     pub(crate) fn delete_provider_binding(
         &self,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
     ) -> Result<bool, SatelleError> {
         self.lock_storage()?
-            .delete_authorized_provider_binding(model_alias, provider_alias)
+            .delete_authorized_provider_binding(desktop_binding, model_alias, provider_alias)
             .map_err(model::storage_failure)
     }
 
@@ -2651,7 +2737,9 @@ impl RuntimeEngine {
                 let turn_id = match entry.subject() {
                     LogSubject::Turn { turn_id, .. } => turn_id.as_str(),
                     LogSubject::Host => "host",
-                    LogSubject::Queue { queue_status } => queue_status.queue_request_id.as_str(),
+                    LogSubject::Queue { queue_status, .. } => {
+                        queue_status.queue_request_id.as_str()
+                    }
                 };
                 writeln!(
                     worklog,
@@ -2871,6 +2959,7 @@ pub(crate) struct RuntimeHandle {
     activity: Arc<DaemonActivity>,
     lazy: Arc<Mutex<LazyRuntime>>,
     queue_worker_running: Arc<AtomicBool>,
+    queue_worker_threads: Arc<AtomicUsize>,
     queue_worker_shutdown: Arc<AtomicBool>,
 }
 
@@ -2890,11 +2979,59 @@ impl RuntimeHandle {
             .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))
     }
 
-    pub(crate) fn queue_desktop_binding(&self) -> Result<String, SatelleError> {
+    pub(crate) fn configured_desktop_bindings(&self) -> Result<BTreeSet<String>, SatelleError> {
         self.lazy
             .lock()
-            .map(|lazy| lazy.storage_policy.queue_desktop_binding.clone())
+            .map(|lazy| {
+                lazy.provider_policy
+                    .desktop_bindings
+                    .keys()
+                    .cloned()
+                    .collect()
+            })
             .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_queue_config_for_tests(
+        &self,
+        config: satelle_core::queue::QueueConfig,
+    ) -> Result<(), SatelleError> {
+        self.lazy
+            .lock()
+            .map(|mut lazy| lazy.storage_policy.queue_config = config)
+            .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn configure_host_policy_for_tests(
+        &self,
+        config: &satelle_core::HostConfig,
+    ) -> Result<(), SatelleError> {
+        self.lazy
+            .lock()
+            .map(|mut lazy| {
+                // Test adapters still model user-configured Provider Bindings as
+                // Controller proposals. Only Desktop Binding ownership belongs
+                // to the fake Host before setup authorizes a provider binding.
+                lazy.provider_policy = RuntimeProviderPolicy::from_test_support_host_config(config);
+                lazy.storage_policy = RuntimeStoragePolicy::from_host_config(config);
+            })
+            .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))
+    }
+
+    pub(crate) fn desktop_user_for_binding(
+        &self,
+        desktop_binding: &str,
+    ) -> Result<String, SatelleError> {
+        self.lazy
+            .lock()
+            .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))?
+            .provider_policy
+            .desktop_bindings
+            .get(desktop_binding)
+            .map(|binding| binding.desktop_user.clone())
+            .ok_or_else(|| SatelleError::desktop_binding_not_found(desktop_binding))
     }
 
     pub(crate) fn try_start_queue_worker(&self) -> bool {
@@ -2908,6 +3045,10 @@ impl RuntimeHandle {
 
     pub(crate) fn finish_queue_worker(&self) {
         self.queue_worker_running.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn queue_worker_thread_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.queue_worker_threads)
     }
 
     pub(crate) fn prepare_queue_worker_for_daemon(&self) {
@@ -3619,6 +3760,7 @@ impl RuntimeHandle {
                 provider_smoke_fingerprinter: None,
             })),
             queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_threads: Arc::new(AtomicUsize::new(0)),
             queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -3648,6 +3790,7 @@ impl RuntimeHandle {
                 ),
             })),
             queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_threads: Arc::new(AtomicUsize::new(0)),
             queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -3682,6 +3825,7 @@ impl RuntimeHandle {
                 ),
             })),
             queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_threads: Arc::new(AtomicUsize::new(0)),
             queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -3710,6 +3854,7 @@ impl RuntimeHandle {
                 provider_smoke_fingerprinter: Some(provider_smoke_fingerprinter),
             })),
             queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_threads: Arc::new(AtomicUsize::new(0)),
             queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -3761,6 +3906,7 @@ impl RuntimeHandle {
                 ),
             })),
             queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_threads: Arc::new(AtomicUsize::new(0)),
             queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -3852,21 +3998,22 @@ impl RuntimeHandle {
                 error,
             );
         }
-        let readiness = match engine.preflight(
-            command.host,
-            &command.provider_intent,
-            &command.cancellation,
-        ) {
-            Ok(readiness) => readiness,
-            Err(error) => {
-                return self.resolve_precommit_failure(
-                    IdempotentOperation::Run,
-                    &command.identity,
-                    None,
-                    error,
-                );
-            }
-        };
+        let provider_intent = command
+            .provider_intent
+            .clone()
+            .with_desktop_binding(command.desktop_binding.clone());
+        let readiness =
+            match engine.preflight(command.host, &provider_intent, &command.cancellation) {
+                Ok(readiness) => readiness,
+                Err(error) => {
+                    return self.resolve_precommit_failure(
+                        IdempotentOperation::Run,
+                        &command.identity,
+                        None,
+                        error,
+                    );
+                }
+            };
         let identity = command.identity.clone();
         match engine.run(command, readiness) {
             Ok(outcome) => Ok(outcome),
@@ -3936,21 +4083,22 @@ impl RuntimeHandle {
                 error,
             );
         }
-        let readiness = match engine.preflight(
-            LOCAL_DEMO_HOST,
-            &command.provider_intent,
-            &command.cancellation,
-        ) {
-            Ok(readiness) => readiness,
-            Err(error) => {
-                return self.resolve_precommit_failure(
-                    IdempotentOperation::Steer,
-                    &command.identity,
-                    Some(&command.session_id),
-                    error,
-                );
-            }
-        };
+        let provider_intent = command
+            .provider_intent
+            .clone()
+            .with_desktop_binding(command.desktop_binding.clone());
+        let readiness =
+            match engine.preflight(LOCAL_DEMO_HOST, &provider_intent, &command.cancellation) {
+                Ok(readiness) => readiness,
+                Err(error) => {
+                    return self.resolve_precommit_failure(
+                        IdempotentOperation::Steer,
+                        &command.identity,
+                        Some(&command.session_id),
+                        error,
+                    );
+                }
+            };
         let identity = command.identity.clone();
         let session_id = command.session_id.clone();
         match engine.steer(command, readiness) {
@@ -4344,36 +4492,44 @@ impl RuntimeHandle {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn authorize_provider_binding(
         &self,
+        desktop_binding: &DesktopBindingRef,
         binding: &ResolvedProviderBinding,
     ) -> Result<(), SatelleError> {
-        self.engine()?.authorize_provider_binding(binding)
+        self.engine()?
+            .authorize_provider_binding(desktop_binding, binding)
     }
 
     pub(crate) fn provider_binding_digest(
         &self,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
     ) -> Result<Option<String>, SatelleError> {
         self.engine()?
-            .provider_binding_digest(model_alias, provider_alias)
+            .provider_binding_digest(desktop_binding, model_alias, provider_alias)
     }
 
     pub(crate) fn authorize_provider_binding_if_unchanged(
         &self,
+        desktop_binding: &DesktopBindingRef,
         binding: &ResolvedProviderBinding,
         expected_previous_digest: Option<&str>,
     ) -> Result<(), SatelleError> {
-        self.engine()?
-            .authorize_provider_binding_if_unchanged(binding, expected_previous_digest)
+        self.engine()?.authorize_provider_binding_if_unchanged(
+            desktop_binding,
+            binding,
+            expected_previous_digest,
+        )
     }
 
     pub(crate) fn delete_provider_binding(
         &self,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
     ) -> Result<bool, SatelleError> {
         self.engine()?
-            .delete_provider_binding(model_alias, provider_alias)
+            .delete_provider_binding(desktop_binding, model_alias, provider_alias)
     }
 
     #[cfg(test)]
@@ -4387,7 +4543,8 @@ impl RuntimeHandle {
 
     pub(crate) fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {
         Ok(self.engine()?.reap_finished_workers()?
-            && !self.queue_worker_running.load(Ordering::Acquire))
+            && !self.queue_worker_running.load(Ordering::Acquire)
+            && self.queue_worker_threads.load(Ordering::Acquire) == 0)
     }
 
     pub(crate) fn daemon_activity_snapshot(&self) -> Result<(bool, u64), SatelleError> {
@@ -4476,6 +4633,7 @@ impl RuntimeHandle {
         &self,
         queue_request_id: &QueueRequestId,
         lease_key: &str,
+        desktop_binding: &DesktopBindingRef,
         token_id: &str,
         credential_revision: u64,
         principal_ref: &str,
@@ -4493,6 +4651,7 @@ impl RuntimeHandle {
         let record = NewQueueRecord {
             queue_request_id,
             lease_key,
+            desktop_binding: desktop_binding.clone(),
             token_id,
             credential_revision,
             principal_ref,
@@ -5119,6 +5278,7 @@ impl RuntimeHandle {
     pub(crate) fn authorize_provider_binding_idempotent<F>(
         &self,
         identity: &RequestIdentity,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
         validate: F,
@@ -5144,12 +5304,13 @@ impl RuntimeHandle {
             };
         }
         let expected_previous_digest =
-            engine.provider_binding_digest(model_alias, provider_alias)?;
+            engine.provider_binding_digest(desktop_binding, model_alias, provider_alias)?;
         let validation = validate();
         let replay = engine
             .lock_storage()?
             .authorize_provider_binding_idempotent(
                 &idempotency,
+                desktop_binding,
                 expected_previous_digest.as_deref(),
                 completed_at,
                 || validation,
@@ -5165,6 +5326,7 @@ impl RuntimeHandle {
     pub(crate) fn delete_provider_binding_idempotent<F>(
         &self,
         identity: &RequestIdentity,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
         validate: F,
@@ -5183,9 +5345,9 @@ impl RuntimeHandle {
             .lock_storage()?
             .delete_provider_binding_idempotent(
                 &idempotency,
+                desktop_binding,
                 model_alias,
                 provider_alias,
-                completed_at,
                 validate,
                 model::storage_failure_ref,
             )

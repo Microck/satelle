@@ -675,6 +675,7 @@ impl PublicTurn {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PublicSession {
     session_id: SessionId,
+    desktop_binding: String,
     #[serde(skip_serializing)]
     display_name: Option<String>,
     session_state_revision: SessionStateRevision,
@@ -693,6 +694,10 @@ pub struct PublicSnapshotError;
 impl PublicSession {
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    pub fn desktop_binding(&self) -> &str {
+        &self.desktop_binding
     }
 
     pub fn display_name(&self) -> Option<&str> {
@@ -1423,6 +1428,7 @@ impl Session {
     pub fn to_public(&self) -> PublicSession {
         PublicSession {
             session_id: self.id.clone(),
+            desktop_binding: self.desktop_binding.as_str().to_string(),
             display_name: self.display_name.clone(),
             session_state_revision: self.revision,
             created_at: self.created_at,
@@ -2217,6 +2223,7 @@ mod tests {
             &[
                 "activity",
                 "created_at",
+                "desktop_binding",
                 "session_id",
                 "session_state_revision",
                 "turns",
@@ -2292,10 +2299,10 @@ mod tests {
     }
 
     #[test]
-    fn internal_identity_canaries_do_not_enter_the_public_projection() {
+    fn host_identity_stays_private_while_the_desktop_binding_is_public() {
         let host_canary = "CANARY_SECRET_do-not-serialize";
-        let desktop_canary = "upstream-thread-01890a5d-ac96-7b7c";
-        let desktop_binding = DesktopBindingRef::new(desktop_canary).unwrap();
+        let desktop_binding_name = "desktop-binding-public";
+        let desktop_binding = DesktopBindingRef::new(desktop_binding_name).unwrap();
         let mut session = Session::start(
             SessionId::parse(SESSION_ID).unwrap(),
             HostIdentityRef::new(host_canary).unwrap(),
@@ -2310,7 +2317,7 @@ mod tests {
 
         let json = serde_json::to_string(&session.to_public()).unwrap();
         assert!(!json.contains(host_canary));
-        assert!(!json.contains(desktop_canary));
+        assert!(json.contains(desktop_binding_name));
         assert!(json.contains("task_completed"));
         assert_eq!(
             "\"task_completed\"",

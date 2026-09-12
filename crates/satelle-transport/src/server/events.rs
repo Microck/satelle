@@ -513,6 +513,16 @@ async fn controller_loop(
                     }
                     Err(LiveEventReceiveError::Empty) => continue,
                 };
+                match event_visible_to_principal(&state, principal, &event).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(()) => {
+                        return ConnectionEnd::Failure {
+                            request_id: active_request_id,
+                            reason: WsCloseReason::InternalError,
+                        };
+                    }
+                }
                 if !subscriptions
                     .iter()
                     .any(|subscription: &EventSubscription| subscription.matches(&event))
@@ -619,6 +629,31 @@ async fn principal_is_active(
         .await
         .map_err(|_| ())?
         .map_err(|_| ())
+}
+
+async fn event_visible_to_principal(
+    state: &Arc<DaemonState>,
+    principal: &ApiPrincipal,
+    event: &satelle_core::SatelleEventBody,
+) -> Result<bool, ()> {
+    let Some(session_id) = event.session_id().cloned() else {
+        return Ok(true);
+    };
+    let service = Arc::clone(&state.service);
+    let principal = principal.clone();
+    tokio::task::spawn_blocking(move || {
+        service
+            .authorize_session_binding(&principal, &session_id)
+            .map(|_| true)
+            .or_else(|error| match error.code {
+                satelle_core::ErrorCode::DesktopBindingUnauthorized
+                | satelle_core::ErrorCode::SessionNotFound => Ok(false),
+                _ => Err(error),
+            })
+    })
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())
 }
 
 async fn subscribe_to_host(state: &Arc<DaemonState>) -> Result<LiveEventSubscription, ()> {

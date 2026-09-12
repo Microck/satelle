@@ -103,7 +103,16 @@ fn local_daemon_config_identity_tracks_host_config_and_rate_limits() {
     );
 
     let mut changed_host_config = host_config.clone();
-    changed_host_config.desktop_user = Some("another-user".to_string());
+    changed_host_config.desktop_bindings.insert(
+        "another-user".to_string(),
+        satelle_core::DesktopBindingConfig {
+            desktop_user: "another-user".to_string(),
+            desktop_session_preference: None,
+            desktop_session_native_selector: None,
+            provider_auth: Default::default(),
+            provider_bindings: Default::default(),
+        },
+    );
     assert_ne!(
         LocalDaemonConfigIdentity::new(changed_host_config, ApiRateLimits::default()),
         identity
@@ -781,13 +790,13 @@ impl ComputerUseAdapter for ArmCheckingAdapter {
     fn preflight(
         &self,
         _host: &str,
-        _intent: &ProviderComputerUseIntent,
+        intent: &ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
         assert!(
             self.armed.load(Ordering::Acquire),
             "the SIGINT source must be armed before the local admission thread starts"
         );
-        lifecycle_readiness()
+        lifecycle_readiness(intent)
     }
 
     fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -880,13 +889,13 @@ impl ComputerUseAdapter for InterruptLifecycleAdapter {
     fn preflight(
         &self,
         _host: &str,
-        _intent: &ProviderComputerUseIntent,
+        intent: &ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
         if self.block_preflight.swap(false, Ordering::AcqRel) {
             self.preflight_started.signal();
             self.preflight_release.wait();
         }
-        lifecycle_readiness()
+        lifecycle_readiness(intent)
     }
 
     fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
@@ -938,9 +947,13 @@ impl ComputerUseAdapter for InterruptLifecycleAdapter {
     }
 }
 
-fn lifecycle_readiness() -> Result<AdapterReadiness, SatelleError> {
-    let desktop_binding = DesktopBindingRef::new("interrupt-test-desktop")
-        .map_err(|error| SatelleError::not_implemented(format!("test desktop binding: {error}")))?;
+fn lifecycle_readiness(
+    intent: &ProviderComputerUseIntent,
+) -> Result<AdapterReadiness, SatelleError> {
+    let desktop_binding = intent
+        .desktop_binding()
+        .cloned()
+        .unwrap_or_else(|| DesktopBindingRef::new("local-demo-desktop-v1").unwrap());
     let execution_policy = ExecutionPolicy::new(
         EffectiveModelRef::new("interrupt-test-model")
             .map_err(|error| SatelleError::not_implemented(format!("test model: {error}")))?,
@@ -4084,6 +4097,7 @@ fn local_turn_request_provider_intent_reaches_host_preflight() {
         .service
         .authorize_provider_binding_without_validation_for_tests(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "model-explicit",
             "provider-explicit",
             satelle_core::ProviderBindingAuthorization::new(
@@ -4174,6 +4188,7 @@ fn stored_authorization_is_revalidated_by_alias_before_alias_only_turn_preflight
         .service
         .authorize_provider_binding_without_validation_for_tests(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             authorization,
@@ -4181,12 +4196,15 @@ fn stored_authorization_is_revalidated_by_alias_before_alias_only_turn_preflight
         .expect("seed the alias-scoped Provider Binding");
     let validation = transport
         .validate_provider_descriptor(
+            "local-demo-desktop-v1",
             "review",
             "openai",
-            false,
-            false,
-            satelle_core::ProviderAuthValidationMode::Cached,
-            false,
+            satelle_host::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
         )
         .expect("the distinct post-setup preflight resolves the authorized aliases");
     let resolved =
@@ -4827,6 +4845,7 @@ impl Drop for DirectFixture {
 fn host_provider_validation_drives_conflicting_controller_projection() {
     let fixture = DirectFixture::start();
     let controller_selection = ProviderSelection {
+        desktop_binding: Some("local-demo-desktop-v1".to_string()),
         requested_model_alias: Some("review".to_string()),
         requested_provider_alias: Some("openai".to_string()),
         model_alias_from_project: false,
@@ -4847,6 +4866,7 @@ fn host_provider_validation_drives_conflicting_controller_projection() {
         .service
         .authorize_provider_binding(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             satelle_core::ProviderBindingAuthorization::new(
@@ -4861,12 +4881,15 @@ fn host_provider_validation_drives_conflicting_controller_projection() {
     let validation = fixture
         .transport()
         .validate_provider_descriptor(
+            "local-demo-desktop-v1",
             "review",
             "openai",
-            controller_selection.model_alias_from_project,
-            controller_selection.provider_alias_from_project,
-            satelle_core::ProviderAuthValidationMode::Cached,
-            controller_selection.experimental_provider_computer_use,
+            satelle_host::ProviderDescriptorValidationOptions::new(
+                satelle_core::ProviderAuthValidationMode::Cached,
+                controller_selection.model_alias_from_project,
+                controller_selection.provider_alias_from_project,
+                controller_selection.experimental_provider_computer_use,
+            ),
         )
         .expect("validate the requested aliases over HTTP");
 
@@ -4892,6 +4915,7 @@ fn setup_accepts_matching_host_owned_provider_projection() {
     let authorization =
         satelle_core::ProviderBindingAuthorization::new("review", "openai", "gpt-5.2", "openai");
     let provider_selection = ProviderSelection {
+        desktop_binding: Some("local-demo-desktop-v1".to_string()),
         requested_model_alias: Some("review".to_string()),
         requested_provider_alias: Some("openai".to_string()),
         model_alias_from_project: false,
@@ -4944,6 +4968,7 @@ fn setup_rejects_conflicting_host_owned_provider_projection() {
         "openai",
     );
     let provider_selection = ProviderSelection {
+        desktop_binding: Some("local-demo-desktop-v1".to_string()),
         requested_model_alias: Some("review".to_string()),
         requested_provider_alias: Some("openai".to_string()),
         model_alias_from_project: false,

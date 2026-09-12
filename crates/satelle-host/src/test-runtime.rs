@@ -111,6 +111,13 @@ impl FakeComputerUseAdapter {
     ) -> Result<(DesktopBindingRef, ExecutionPolicy, crate::ReadinessCacheKey), SatelleError> {
         let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1")
             .map_err(|_| adapter_configuration_error("desktop binding"))?;
+        Self::readiness_contract_for_binding(desktop_binding, provider_computer_use)
+    }
+
+    fn readiness_contract_for_binding(
+        desktop_binding: DesktopBindingRef,
+        provider_computer_use: FeatureChoice,
+    ) -> Result<(DesktopBindingRef, ExecutionPolicy, crate::ReadinessCacheKey), SatelleError> {
         let execution_policy = ExecutionPolicy::new(
             EffectiveModelRef::new("fake-model-v1")
                 .map_err(|_| adapter_configuration_error("model binding"))?,
@@ -197,6 +204,14 @@ pub(super) struct ReadinessFailingComputerUseAdapter;
 
 #[cfg(feature = "test-support")]
 impl ComputerUseAdapter for ReadinessFailingComputerUseAdapter {
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<satelle_core::ResolvedProviderBinding, SatelleError> {
+        FakeComputerUseAdapter.resolve_provider_binding(host, provider_intent)
+    }
+
     fn preflight(
         &self,
         _host: &str,
@@ -223,6 +238,14 @@ impl ComputerUseAdapter for ReadinessFailingComputerUseAdapter {
 
 #[cfg(feature = "test-support")]
 impl ComputerUseAdapter for FailingComputerUseAdapter {
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<satelle_core::ResolvedProviderBinding, SatelleError> {
+        FakeComputerUseAdapter.resolve_provider_binding(host, provider_intent)
+    }
+
     fn preflight(
         &self,
         host: &str,
@@ -249,6 +272,14 @@ impl ComputerUseAdapter for FailingComputerUseAdapter {
 
 #[cfg(feature = "test-support")]
 impl ComputerUseAdapter for PendingComputerUseAdapter {
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &crate::ProviderComputerUseIntent,
+    ) -> Result<satelle_core::ResolvedProviderBinding, SatelleError> {
+        FakeComputerUseAdapter.resolve_provider_binding(host, provider_intent)
+    }
+
     fn preflight(
         &self,
         host: &str,
@@ -308,7 +339,13 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
         if !provider_intent.refresh() && provider_intent.resolved_provider_binding().is_none() {
             return Ok(None);
         }
-        let key = Self::readiness_contract()?.2;
+        let key = match provider_intent.desktop_binding() {
+            Some(binding) => {
+                Self::readiness_contract_for_binding(binding.clone(), FeatureChoice::Enabled)?
+            }
+            None => Self::readiness_contract()?,
+        }
+        .2;
         Ok(Some(match provider_intent.resolved_provider_binding() {
             Some(binding) => key.with_provider_binding(binding),
             None => key,
@@ -320,7 +357,13 @@ impl ComputerUseAdapter for FakeComputerUseAdapter {
         host: &str,
         provider_intent: &crate::ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, SatelleError> {
-        let (desktop_binding, execution_policy, readiness_key) = Self::readiness_contract()?;
+        let (desktop_binding, execution_policy, readiness_key) =
+            match provider_intent.desktop_binding() {
+                Some(binding) => {
+                    Self::readiness_contract_for_binding(binding.clone(), FeatureChoice::Enabled)?
+                }
+                None => Self::readiness_contract()?,
+            };
         let resolved_binding = self.resolve_provider_binding(host, provider_intent)?;
         let readiness_key = readiness_key.with_provider_binding(&resolved_binding);
         let observed_at = time::OffsetDateTime::now_utc();

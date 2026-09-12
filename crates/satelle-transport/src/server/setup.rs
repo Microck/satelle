@@ -8,11 +8,11 @@ use crate::contract::{
     NativeReadinessInvalidationResponse, NativeReadinessInvalidationScope,
     PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
-    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
-    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, RepairMaintenanceRequest, SetupRepairDecision,
-    SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
+    ProviderBindingDeletionRequest, ProviderBindingDeletionResponse,
+    ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
+    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
+    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, RepairMaintenanceRequest,
+    SetupRepairDecision, SetupRepairOperationKind, SetupRepairPlanAction, SetupRepairPlanRequest,
     SetupRepairPlanResponse, SetupRepairPostcondition, SetupRepairPreviousStatus,
     SetupRepairRunStatus, SetupVerificationRequest, SetupVerificationResponse,
     provider_secret_upload_aad,
@@ -281,6 +281,7 @@ pub(super) async fn validate_provider_descriptor(
     let validation = match tokio::task::spawn_blocking(move || {
         service.validate_provider_descriptor_idempotent(
             satelle_core::LOCAL_DEMO_HOST,
+            request.desktop_binding(),
             &model_alias,
             &provider_alias,
             options,
@@ -340,11 +341,13 @@ pub(super) async fn preview_provider_secret_provisioning(
     }
 
     let service = Arc::clone(&state.service);
+    let desktop_binding = request.desktop_binding().to_string();
     let authorization = request.authorization().clone();
     let preview_authority = authority.clone();
     let preview = match tokio::task::spawn_blocking(move || {
         service.preview_provider_secret_provisioning(
             satelle_core::LOCAL_DEMO_HOST,
+            &desktop_binding,
             authorization,
             &preview_authority,
         )
@@ -554,12 +557,14 @@ pub(super) async fn provision_provider_secret(
     };
     let service = Arc::clone(&state.service);
     let replay_authorization = envelope.metadata().authorization().clone();
+    let replay_desktop_binding = envelope.metadata().desktop_binding().to_string();
     let replay_overwrite_authorized = envelope.metadata().overwrite_authorized();
     let replay_envelope_digest = envelope_digest.clone();
     let replay_authority = authority.clone();
     let replay = match tokio::task::spawn_blocking(move || {
         service.replay_provider_secret_provisioning_idempotent(
             satelle_core::LOCAL_DEMO_HOST,
+            &replay_desktop_binding,
             replay_authorization,
             replay_overwrite_authorized,
             &replay_envelope_digest,
@@ -698,10 +703,11 @@ pub(super) async fn provision_provider_secret(
 
     let service = Arc::clone(&state.service);
     let overwrite_authorized = pending.metadata.overwrite_authorized();
+    let desktop_binding = pending.metadata.desktop_binding().to_string();
     let authorization = pending.metadata.into_authorization();
     let report = match tokio::task::spawn_blocking(move || {
         service.provision_provider_secret_idempotent(
-            satelle_core::LOCAL_DEMO_HOST,
+            &desktop_binding,
             authorization,
             secret,
             overwrite_authorized,
@@ -783,10 +789,11 @@ pub(super) async fn authorize_provider_binding(
     ApiJson(request): ApiJson<ProviderBindingAuthorizationRequest>,
 ) -> Response {
     let service = Arc::clone(&state.service);
-    let authorization = request.into_authorization();
+    let (desktop_binding, authorization) = request.into_parts();
     let binding = match tokio::task::spawn_blocking(move || {
         service.authorize_provider_binding_idempotent(
             satelle_core::LOCAL_DEMO_HOST,
+            &desktop_binding,
             &model_alias,
             &provider_alias,
             authorization,
@@ -817,10 +824,17 @@ pub(super) async fn delete_provider_binding(
     Extension(authorized): Extension<AuthorizedRequest>,
     Extension(authority): Extension<MutationAuthority>,
     Path((provider_alias, model_alias)): Path<(String, String)>,
+    ApiJson(request): ApiJson<ProviderBindingDeletionRequest>,
 ) -> Response {
     let service = Arc::clone(&state.service);
+    let desktop_binding = request.desktop_binding().to_string();
     let deleted = match tokio::task::spawn_blocking(move || {
-        service.delete_provider_binding_idempotent(&model_alias, &provider_alias, &authority)
+        service.delete_provider_binding_idempotent(
+            &desktop_binding,
+            &model_alias,
+            &provider_alias,
+            &authority,
+        )
     })
     .await
     {

@@ -42,6 +42,7 @@ pub(crate) enum SessionResultSchemaVersion {
 pub(crate) struct StatusReport<'a> {
     schema_version: SessionResultSchemaVersion,
     session_id: &'a SessionId,
+    desktop_binding: &'a str,
     host: &'a str,
     status: TurnState,
     #[serde(with = "time::serde::rfc3339")]
@@ -60,6 +61,7 @@ impl<'a> StatusReport<'a> {
         Self {
             schema_version: SessionResultSchemaVersion::StatusV2,
             session_id: session.session_id(),
+            desktop_binding: session.desktop_binding(),
             host,
             status: latest_turn.state(),
             created_at: session.created_at(),
@@ -438,6 +440,7 @@ mod tests {
     fn starting_public_session() -> PublicSession {
         serde_json::from_value(json!({
             "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+            "desktop_binding": "local-demo-desktop-v1",
             "display_name": null,
             "session_state_revision": 1,
             "created_at": "2024-01-01T00:00:00Z",

@@ -10,6 +10,16 @@ async fn storage_migration_completion_checks_admin_paths_and_durable_staging_bef
         .hosts
         .remove(satelle_core::LOCAL_DEMO_HOST)
         .unwrap();
+    config.desktop_bindings.insert(
+        "local-demo-desktop-v1".to_string(),
+        satelle_core::DesktopBindingConfig {
+            desktop_user: "local-demo-user".to_string(),
+            desktop_session_preference: None,
+            desktop_session_native_selector: None,
+            provider_auth: Default::default(),
+            provider_bindings: Default::default(),
+        },
+    );
     config.daemon_state_dir = Some(root.join("source"));
     config.daemon_log_dir = Some(root.join("source-logs"));
     config.daemon_config_file = Some(root.join("config.toml"));
@@ -79,7 +89,7 @@ async fn storage_migration_completion_checks_admin_paths_and_durable_staging_bef
             &source_server.host_identity,
         )
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .header("Idempotency-Key", &begin_key)
         .json(&StorageMigrationPathsRequest::new(source_paths.clone()))
         .send()
@@ -138,7 +148,7 @@ async fn storage_migration_completion_checks_admin_paths_and_durable_staging_bef
         .bearer_auth(read_token.expose().as_str())
         .header("Satelle-Expected-Host-Identity", &server.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .header("Idempotency-Key", "read-only-completion")
         .json(&request)
         .send()
@@ -216,7 +226,7 @@ async fn storage_migration_completion_checks_admin_paths_and_durable_staging_bef
     std::fs::write(&copied_log, b"original log\n").unwrap();
     let preview = server.request(&cleanup_endpoint).send().await.unwrap();
     assert_eq!(preview.status(), StatusCode::OK);
-    assert_eq!(preview.headers()["Satelle-Protocol-Version"], "21");
+    assert_eq!(preview.headers()["Satelle-Protocol-Version"], "22");
     assert!(std::path::Path::new(&source_paths.sqlite_store).exists());
     let cleaned = server
         .mutation(&cleanup_endpoint, "cleanup-source")

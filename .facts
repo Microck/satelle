@@ -22,7 +22,7 @@
 - a Satelle Computer Use Host Platform is an operating system on which Satelle supports native Computer Use execution @spec @mvp @implemented
 - a Satelle Host is one Host Daemon identity owned by one daemon OS account @spec @mvp @implemented
 - an MVP Satelle Host owns exactly one explicitly authorized Desktop Binding @spec @mvp @implemented
-- a later broker-capable Satelle Host may own multiple explicitly authorized Desktop Bindings @spec @later
+- a broker-capable Satelle Host may own multiple explicitly authorized Desktop Bindings @spec @implemented
 - a Satelle Host Identity is a stable random identifier generated and stored by one Host Daemon installation @spec @mvp @implemented
 - a Satelle Host Alias is a stable logical name used by projects, profiles, commands, and public output to select a Satelle Host @spec @mvp @implemented
 - a Satelle Host Binding is the user-level mapping from a Host Alias to a concrete transport endpoint, authentication descriptor, Desktop Binding, Host-owned provider configuration, and optional expected Host Identity before first trust @spec @mvp @implemented
@@ -71,7 +71,7 @@
 - label: a Satelle Native Desktop Session Selector is an advanced OS-specific selector copied from a Host Daemon session listing for one Computer Use Host Platform
   command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
-- a Satelle Multi-User Broker permits an authorized API Principal to select among multiple Desktop Bindings owned by one Host Identity at request time while preserving per-user authorization, isolation, and audit boundaries @spec @later
+- a Satelle Multi-User Broker permits an authorized API Principal to select among multiple Desktop Bindings owned by one Host Identity at request time while preserving per-user authorization, isolation, and audit boundaries @spec @implemented
 - a Satelle Secret Source is a typed reference to secret material stored outside Satelle config files, such as an operating-system credential store item, environment variable, file path, or remote-Host-owned provider auth store @spec @mvp @implemented
 - a Satelle Host-Resolved Secret Source is a Secret Source descriptor containing only a non-secret lookup reference and resolved by the target Host Daemon on the machine running the selected provider binding @spec @mvp @implemented
 - a Satelle File Secret Source is a Secret Source whose value is a path to a file containing secret material on the machine resolving that provider authentication binding @spec @mvp @implemented
@@ -152,7 +152,7 @@
   command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
   tags: [spec, contract, mvp, implemented, ci]
 - satelle status JSON v2 uses schema_version satelle.status.v2 @contract @mvp @implemented
-- satelle logs initial and followed JSON records each use schema_version satelle.logs.entry.v1 and emit exactly one record per line without a top-level wrapper @spec @contract @mvp @implemented
+- satelle logs initial and followed JSON records each use schema_version satelle.logs.entry.v2 and emit exactly one record per line without a top-level wrapper @spec @contract @mvp @implemented
 - satelle setup JSON v2 uses schema_version satelle.setup.v2 @contract @mvp @implemented
 - satelle repair JSON v1 uses schema_version satelle.repair.v1 @spec @contract @mvp @implemented
 - satelle doctor JSON v1 uses schema_version satelle.doctor.v1 @contract @mvp @implemented
@@ -366,7 +366,7 @@
 - satelle later --remote-image follows the same no-retention default as uploaded local image attachments for logs, status, diagnostics, setup ledgers, diagnostic bundles, and recording artifacts @spec @phase4 @implemented
 - satelle --remote-image requires an absolute native Host path, rejects parent traversal and symbolic links, and uses the same bounded regular-file reader as local image attachments @spec @phase4
 - satelle local and remote images share one attachment list and the same total count, per-image byte, aggregate byte, and PNG/JPEG limits @spec @phase4
-- satelle Turn request schema satelle.api.v11 represents each image as kind upload with media_type, size_bytes, sha256, and data_base64 or kind host_file with path; raw paths and image bytes are excluded from response, log, and Debug output @spec @contract @phase4
+- satelle Turn request schema satelle.api.v12 represents each image as kind upload with media_type, size_bytes, sha256, and data_base64 or kind host_file with path; raw paths and image bytes are excluded from response, log, and Debug output @spec @contract @phase4
 - satelle remote image references enter the keyed request identity before Host file access; only a newly accepted execution reads the file, so idempotent replay and cancellation do not depend on the source file still existing @spec @contract @phase4
 - satelle resolves remote image bytes before committing a Session or Turn and removes generated attachment staging when execution ends; it never deletes the operator's source image @spec @phase4
 - satelle MVP does not support arbitrary file attachments until file transfer, storage, and remote path semantics are specified @spec @mvp @implemented
@@ -514,12 +514,12 @@
 - label: satelle MVP does not provide a Satelle Multi-User Broker for one host alias to route across multiple Satelle Desktop Bindings
   command: cargo test --locked -p satelle-transport --lib contract::session::tests::mvp_turn_requests_cannot_route_across_desktop_bindings -- --exact
   tags: [spec, mvp, implemented]
-- a later Satelle Multi-User Broker fronts one Host Identity and routes an authorized Host Alias and API Principal to one of multiple explicitly authorized Desktop Bindings @spec @later
-- satelle post-MVP Satelle Multi-User Broker requires per-user authorization, separate Desktop Binding identity, session isolation, provider-auth isolation, path-set isolation, log attribution, audit records, and explicit user or session selection before prompt execution @spec @later
-- satelle post-MVP Satelle Multi-User Broker does not allow a daemon running as one OS user to control another OS user's desktop session unless the target operating system and native Computer Use runtime expose a supported secure handoff for that user @spec @later
-- satelle post-MVP Satelle Multi-User Broker treats each bound OS user's Codex authentication, native Computer Use app approvals, OS privacy permissions, provider credentials, and desktop session preferences as separate readiness state @spec @later
-- satelle post-MVP Satelle Multi-User Broker rejects ambiguous runtime user selection with a typed desktop-binding-ambiguous error instead of falling back to the console session or last-used user @spec @later
-- satelle project-level configuration cannot select or authorize a different remote desktop OS user for Satelle Multi-User Broker execution @spec @later
+- a Satelle Multi-User Broker fronts one Host Identity and routes an authorized Host Alias and API Principal to one of multiple explicitly authorized Desktop Bindings @spec @implemented
+- satelle Satelle Multi-User Broker requires per-user authorization, separate Desktop Binding identity, session isolation, provider-auth isolation, path-set isolation, log attribution, audit records, and explicit user or session selection before prompt execution @spec @implemented
+- satelle Satelle Multi-User Broker does not allow a daemon running as one OS user to control another OS user's desktop session unless the target operating system and native Computer Use runtime expose a supported secure handoff for that user @spec @implemented
+- satelle Satelle Multi-User Broker treats each bound OS user's Codex authentication, native Computer Use app approvals, OS privacy permissions, provider credentials, and desktop session preferences as separate readiness state @spec @implemented
+- satelle Satelle Multi-User Broker rejects ambiguous runtime user selection with a typed desktop-binding-ambiguous error instead of falling back to the console session or last-used user @spec @implemented
+- satelle project-level configuration cannot select or authorize a different remote desktop OS user for Satelle Multi-User Broker execution @spec @implemented
 - satelle setup supports --on-demand to select on_demand setup mode and report non-persistent service intent in setup output @implemented @mvp
 - satelle setup supports --persistent to explicitly request persistent service mode when configuration would otherwise select on_demand @implemented @mvp
 - satelle setup supports host configuration key setup_mode with values persistent and on_demand, where CLI flags take precedence over configuration @spec @mvp @implemented
@@ -857,7 +857,7 @@
 - authenticated Host Daemon mutations require exactly one Satelle-Protocol-Version header whose value is a canonical unsigned decimal without leading zeroes, and phase 4 supports only value 15 @spec @contract @phase4
 - protocol compatibility is checked after authentication, control-scope authorization, request correlation, and Host Identity pinning but before mutation query or cookie validation, control rate limiting, idempotency validation, request-body decoding, or Host calls @spec @contract @mvp @implemented
 - missing, malformed, duplicate, and unsupported Satelle-Protocol-Version values return HTTP 426 with code incompatible-protocol, category compatibility, retryable false, and schema_version satelle.error.v1 @spec @contract @mvp @implemented
-- incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["15"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @phase4
+- incompatible-protocol details contain exactly reason, supported_versions, and received_version; reason is missing, malformed, duplicate, or unsupported, supported_versions is ["22"], received_version is the validated canonical unsupported token or null, and arbitrary header bytes are never reflected @spec @contract @phase4
 - DaemonClient sends Satelle-Protocol-Version 15 on every mutating request and does not require the header for authenticated reads used to diagnose or recover version skew @spec @contract @phase4
 - POST /v1/sessions, POST /v1/sessions/{session_id}/turns, POST /v1/sessions/{session_id}/stop, POST /v1/setup/api-token, POST /v1/setup/api-token/{token_id}/activate, and POST /v1/setup/api-token/{token_id}/abort, POST /v1/api-tokens, POST /v1/api-tokens/{token_id}/rotate, and POST /v1/api-tokens/{token_id}/revoke enforce protocol compatibility, and future POST /v1/doctor routes use the same mutation gate when implemented @spec @contract @phase4
 - satelle API JSON decoding rejects unknown fields instead of ignoring misspelled security, authority, or execution-policy fields @spec @mvp @implemented
@@ -869,7 +869,7 @@
 - Satelle Session, diagnostic, setup, and secret-provisioning responses include Cache-Control: no-store @spec @mvp @implemented
 - Host Daemon shutdown stops accepting new HTTP connections, drains in-flight HTTP requests for a finite configured grace period that defaults to 5 seconds, and returns a typed shutdown-timeout result after aborting the serving task when the grace period expires @spec @contract @mvp @implemented
 - satelle Host Daemon does not enable cross-origin browser access by default @spec @mvp @implemented
-- satelle Host Daemon Turn request bodies use the exact schema_version token satelle.api.v11 while unchanged stop request bodies use satelle.api.v1 @spec @contract @phase4
+- satelle Host Daemon Turn request bodies use the exact schema_version token satelle.api.v12 while unchanged stop request bodies use satelle.api.v1 @spec @contract @phase4
 - authenticated Host Daemon requests use Satelle-Request-Id for caller-supplied UUIDv7 correlation and Satelle-Expected-Host-Identity for Host pinning; neither header grants authority or idempotency @spec @contract @mvp @implemented
 - authenticated Host Daemon HTTP requests without Satelle-Request-Id receive a generated canonical UUIDv7 except GET /v1/events, whose WebSocket upgrade contract requires a caller-supplied Satelle-Request-Id; malformed or duplicate supplied request-id headers are rejected @spec @contract @mvp @implemented
 - satelle Host Daemon uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, GET /v1/events, GET /v1/setup/api-token/current, POST /v1/setup/api-token, POST /v1/setup/api-token/{token_id}/activate, POST /v1/setup/api-token/{token_id}/abort, POST /v1/api-tokens, POST /v1/api-tokens/{token_id}/rotate, and POST /v1/api-tokens/{token_id}/revoke as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @phase4
@@ -884,11 +884,11 @@
 - GET /v1/logs returns schema_version satelle.logs.page.v1 in one flat envelope containing request_id, host_identity, entries, next_cursor, and truncated @spec @contract @mvp @implemented
 - a satelle.logs.page.v1 next_cursor is the last delivered Log Cursor when a forward page is truncated and otherwise advances to the Host-captured log high-water cursor even when no entry matches the filters @spec @contract @mvp @implemented
 - a satelle.logs.page.v1 truncated value is true when tail mode omitted older matching entries or forward mode has newer matching entries beyond the returned page @spec @contract @mvp @implemented
-- satelle.logs.entry.v1 contains exactly schema_version, cursor, timestamp, host_identity, source, severity, event, subject, message, and redacted; redacted is always true @spec @contract @mvp @implemented
-- satelle.logs.entry.v1 subject is either a host subject containing only kind host or a turn subject containing kind turn plus session_id, turn_id, session_state_revision, and turn_state_revision @spec @contract @mvp @implemented
-- satelle.logs.entry.v1 source tokens are host_daemon, storage, and codex_adapter; severity tokens are info, warn, and error; current event tokens are session_started, follow_up_started, native_readiness_summary, provider_smoke_summary, turn_state_committed, structured_execution_error, stop_confirmed, stop_not_confirmed, restart_recovery_pending, and store_opened @spec @contract @mvp @implemented
+- satelle.logs.entry.v2 contains exactly schema_version, cursor, timestamp, host_identity, source, severity, event, subject, message, and redacted; redacted is always true @spec @contract @mvp @implemented
+- satelle.logs.entry.v2 subject is a host subject containing only kind host, a turn subject containing kind turn plus desktop_binding, session_id, turn_id, session_state_revision, and turn_state_revision, or a queue subject containing kind queue plus desktop_binding and queue_status @spec @contract @mvp @implemented
+- satelle.logs.entry.v2 source tokens are host_daemon, storage, and codex_adapter; severity tokens are info, warn, and error; current event tokens are session_started, follow_up_started, native_readiness_summary, provider_smoke_summary, turn_state_committed, structured_execution_error, stop_confirmed, stop_not_confirmed, restart_recovery_pending, turn_queued, queue_position_changed, turn_dequeued, turn_queue_cancelled, turn_queue_expired, turn_queue_validation_failed, and store_opened @spec @contract @mvp @implemented
 - logs-cursor-expired uses HTTP 410 and schema_version satelle.error.v1; details.earliest_available_cursor contains the first retained entry cursor or null, while details.resume_cursor contains the exclusive cursor boundary that returns that first retained entry without skipping it @spec @contract @mvp @implemented
-- POST /v1/sessions, POST /v1/sessions/{session_id}/turns, and GET /v1/sessions/{session_id} return the exact response schema token satelle.session.v1 and one flat envelope containing request_id, host_identity, and the canonical PublicSession fields @spec @contract @mvp @implemented
+- POST /v1/sessions, POST /v1/sessions/{session_id}/turns, and GET /v1/sessions/{session_id} return the exact response schema token satelle.session.v2 and one flat envelope containing request_id, host_identity, and the canonical PublicSession fields @spec @contract @mvp @implemented
 - POST /v1/sessions and POST /v1/sessions/{session_id}/turns return HTTP 202 only after durable asynchronous Turn admission, while GET /v1/sessions/{session_id} returns HTTP 200 @spec @contract @mvp @implemented
 - POST /v1/sessions/{session_id}/stop returns the exact response schema token satelle.session.stop.v1 and one flat envelope containing request_id, host_identity, stop outcome fields, and canonical Session and Turn state revisions @spec @contract @mvp @implemented
 - the authenticated capabilities operations list uses the exact route-semantic tokens live, capabilities, host_status, host_paths, host_desktop_sessions, session_create, turn_create, session_read, session_stop, logs_read, events_read, setup_api_token_current, setup_api_token_issue, setup_api_token_activate, setup_api_token_abort, and provider_secret_provisioning for the currently available v1 routes and never advertises CLI run or steer command names @spec @contract @mvp @implemented
@@ -980,7 +980,7 @@
 - each completed satelle MCP doctor call contains one text content block with the compact JSON serialization of the same satelle.doctor.v1 report returned in structuredContent, including when readiness-blocking findings make isError true @spec @contract @mvp @implemented
 - each ordinary Satelle operational failure returned by tools/call sets structuredContent to the complete canonical direct satelle.error.v1 object containing schema_version, code, category, retryable, message, details, docs_url, and suggested_commands, with no outer error object or additional MCP-specific wrapper @spec @contract @mvp @implemented
 - each ordinary Satelle operational failure returned by tools/call contains one text content block with the compact JSON serialization of the same satelle.error.v1 envelope returned in structuredContent @spec @contract @mvp @implemented
-- a successful satelle MCP logs result contains one text content block with zero or more complete satelle.logs.entry.v1 JSON records separated and terminated by newline characters @spec @contract @mvp @implemented
+- a successful satelle MCP logs result contains one text content block with zero or more complete satelle.logs.entry.v2 JSON records separated and terminated by newline characters @spec @contract @mvp @implemented
 - a successful satelle MCP logs result omits structuredContent instead of inventing a logs collection wrapper that has no canonical Satelle schema @spec @contract @mvp @implemented
 - a satelle mcp serve request for an unknown JSON-RPC method returns the standard JSON-RPC method-not-found error code -32601 @spec @contract @mvp @implemented
 - a satelle MCP tools/call request for an unknown tool or arguments that do not satisfy the closed tool input schema returns the standard JSON-RPC invalid-params error code -32602 @spec @contract @mvp @implemented
@@ -1646,12 +1646,12 @@
 - satelle logs MVP does not support --export <path> or support bundle creation @implemented @mvp
 - satelle logs uses stdout as the data output contract instead of adding file destination flags in MVP @implemented @mvp
 - satelle logs human output writes log entries to stdout and diagnostics or command errors to stderr @implemented @mvp
-- satelle logs --json emits the initial matching set as one LF-terminated satelle.logs.entry.v1 JSON record per entry without a top-level wrapper @spec @contract @mvp @implemented
+- satelle logs --json emits the initial matching set as one LF-terminated satelle.logs.entry.v2 JSON record per entry without a top-level wrapper @spec @contract @mvp @implemented
 - satelle logs --json without --follow exits 0 with empty stdout when no entries match, while satelle logs --json --follow remains attached waiting for later matching entries until interrupted or failed @spec @contract @mvp @implemented
-- satelle logs JSON records use the exact satelle.logs.entry.v1 fields defined by the Host Daemon contract and add no CLI-only wrapper, target, or structured-fields properties @spec @contract @mvp @implemented
+- satelle logs JSON records use the exact satelle.logs.entry.v2 fields defined by the Host Daemon contract and add no CLI-only wrapper, target, or structured-fields properties @spec @contract @mvp @implemented
 - satelle logs supports --after <log_cursor> to return entries strictly after one previously delivered Log Cursor @spec @mvp @implemented
 - satelle logs reports a typed log-position-conflict usage error when --after is combined with --since or an explicit --tail @spec @mvp @implemented
-- satelle logs --json --follow continues the same newline-delimited satelle.logs.entry.v1 record stream after the initial matching set @spec @contract @mvp @implemented
+- satelle logs --json --follow continues the same newline-delimited satelle.logs.entry.v2 record stream after the initial matching set @spec @contract @mvp @implemented
 - satelle logs --follow exits 130 when interrupted by Ctrl-C and does not treat the interrupt as a remote host failure @spec @mvp @implemented
 - satelle logs --follow automatically attempts to reconnect when the log stream ends because of transient transport loss or Host Daemon restart @spec @mvp @implemented
 - satelle logs --follow resumes after reconnect by querying stored Satelle Log Entries newer than the last delivered log cursor instead of replaying missed live Satelle Events @spec @mvp @implemented
@@ -2500,7 +2500,7 @@
 
 ## phase-4-token-lifecycle
 - durable admin API Principals issue tokens with POST /v1/api-tokens, rotate one token with POST /v1/api-tokens/{token_id}/rotate, and revoke one token with POST /v1/api-tokens/{token_id}/revoke; process-local SSH bootstrap credentials cannot call these general token-management routes @spec @contract @phase4
-- token issuance accepts satelle.api-token.issue.v1 with a nonempty scopes array and optional future RFC 3339 UTC expires_at; the Host generates the token and a distinct stable API Principal identity @spec @contract @phase4
+- token issuance accepts satelle.api-token.issue.v2 with a nonempty scopes array, a required desktop_bindings array of valid Desktop Binding aliases, and optional future RFC 3339 UTC expires_at; control-bearing tokens require at least one Desktop Binding grant, and the Host generates the token and a distinct stable API Principal identity @spec @contract @phase4
 - token rotation and revocation accept satelle.api-token.rotate.v1 and satelle.api-token.revoke.v1 respectively, each with expected_credential_revision; a changed revision fails before mutation with api-token-state-conflict @spec @contract @phase4
 - token management returns a flat satelle.api-token.v1 envelope with request_id, host_identity, token_id, principal_ref, credential_revision, scopes, expires_at, revoked_at, and bearer_token; only a first successful issuance or rotation has a non-null bearer_token @spec @contract @phase4
 - token rotation preserves scopes and expiry, rejects expired or revoked tokens, and commits the verifier change and non-secret idempotency outcome in one SQLite transaction @spec @phase4
