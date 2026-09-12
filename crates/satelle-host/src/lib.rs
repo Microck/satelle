@@ -28,6 +28,7 @@ mod provider_probe;
 mod raw_diagnostics;
 mod runtime;
 mod storage;
+mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "test-runtime.rs"]
 mod test_runtime;
@@ -1388,6 +1389,7 @@ enum HostMode {
     Production {
         snapshot: Arc<RwLock<ProductionCapabilitySnapshot>>,
         daemon_paths: Box<Result<DaemonResolvedPathSet, SatelleError>>,
+        telemetry: telemetry::HostTelemetry,
     },
     #[cfg(any(test, feature = "test-support"))]
     TestFake { image_attachments: bool },
@@ -3236,6 +3238,7 @@ impl HostService {
         operator_log_root: Result<std::path::PathBuf, SatelleError>,
         daemon_paths: Result<DaemonResolvedPathSet, SatelleError>,
     ) -> Self {
+        let telemetry = telemetry::HostTelemetry::new(config.telemetry.clone(), state_root.clone());
         let snapshot = Arc::new(RwLock::new(ProductionCapabilitySnapshot::collect(None)));
         let working_directory = state_root
             .as_ref()
@@ -3281,6 +3284,7 @@ impl HostService {
             mode: HostMode::Production {
                 snapshot,
                 daemon_paths: Box::new(daemon_paths),
+                telemetry,
             },
             bootstrap_auth: None,
             bootstrap_maintenance: Arc::new(Mutex::new(None)),
@@ -3308,6 +3312,7 @@ impl HostService {
     pub fn production_for_service(
         overrides: &DaemonPathOverrides,
         storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
+        telemetry: Option<satelle_core::telemetry::TelemetryConfig>,
     ) -> Result<Self, SatelleError> {
         let mut config = satelle_core::SatelleConfig::defaults()
             .hosts
@@ -3345,6 +3350,7 @@ impl HostService {
         );
         config.operator_log_retained_files = Some(storage_policy.operator_log_retained_files());
         config.platform_log_sink = storage_policy.platform_log_sink();
+        config.telemetry = telemetry;
         Ok(Self::production_for_host(&config))
     }
 

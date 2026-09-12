@@ -21,6 +21,15 @@ default_host = "local-demo"
 model_alias = "default-model"
 provider_alias = "openai"
 
+[telemetry]
+enabled = true
+otlp_endpoint = "https://collector.example"
+deployment_label = "controller-production"
+
+[telemetry.authorization]
+kind = "environment"
+variable = "SATELLE_OTLP_TOKEN"
+
 [hosts.local-demo]
 transport = "local"
 adapter = "codex"
@@ -38,6 +47,11 @@ yolo = false
 [hosts.local-demo.timeouts]
 native_readiness = "120s"
 provider_smoke_test = "2m"
+
+[hosts.local-demo.telemetry]
+enabled = true
+otlp_endpoint = "https://host-collector.example"
+deployment_label = "desktop-production"
 ```
 
 Host fields include `transport`, `adapter`, `address`, `network`, `timeouts`,
@@ -55,6 +69,19 @@ logging. The setting is off by default. The operating system owns retention and
 queries for this mirror. A sink failure appears as an informational `config`
 Doctor finding and never changes SQLite logs, operator log files, or daemon
 availability. Project configuration cannot enable the sink.
+
+The top-level `telemetry` table controls Controller telemetry. A
+`hosts.<alias>.telemetry` table controls telemetry emitted by that Host. Each
+policy is off by default and must set both `enabled = true` and an
+`otlp_endpoint`. The endpoint must be an HTTPS origin with no credentials,
+query, fragment, or path. Loopback HTTP is allowed for a local collector.
+
+Telemetry sends OTLP/HTTP traces and metrics to `/v1/traces` and `/v1/metrics`
+on that origin. Optional bearer authorization comes from an `environment` or
+absolute owner-only `file` Secret Source on the emitting machine. Satelle does
+not accept an inline authorization value. Project configuration, profiles,
+setup, bootstrap, package installation, `--yes`, and Trusted Profile consent
+cannot enable telemetry.
 
 The duration parser requires explicit units such as `500ms`, `30s`, or `2m`.
 Configuration does not perform environment-variable interpolation.
@@ -161,8 +188,8 @@ native_readiness = "90s"
 
 The matching Host alias must already exist in user configuration and permit
 project selection. Project configuration cannot define addresses, TLS trust,
-tokens, desktop identity, daemon paths, Secret Sources, mutation consent,
-Trusted Profiles, destructive retention, or YOLO enablement.
+tokens, desktop identity, daemon paths, Secret Sources, telemetry, mutation
+consent, Trusted Profiles, destructive retention, or YOLO enablement.
 
 ## Inspect the result
 

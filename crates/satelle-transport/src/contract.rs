@@ -21,7 +21,8 @@ pub use logs::LogsPageResponse;
 pub(crate) use read::effective_limits;
 pub use read::{
     CapabilitiesResponse, EffectiveLimits, HostDesktopSessionsResponse, HostPathsResponse,
-    HostStatusResponse, LiveResponse, MaintenanceUpdateEvidenceResponse, SetupHistoryResponse,
+    HostStatusResponse, HostTelemetryStatusResponse, LiveResponse,
+    MaintenanceUpdateEvidenceResponse, SetupHistoryResponse,
 };
 pub use satelle_core::{
     ProviderAuthObservationSource, ProviderAuthValidationMode, ProviderAuthValidationOutcome,
@@ -563,8 +564,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v18_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "18");
+    fn protocol_version_is_the_v19_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "19");
     }
 
     #[test]

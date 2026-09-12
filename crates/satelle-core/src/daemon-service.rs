@@ -1,3 +1,4 @@
+use crate::telemetry::TelemetryConfig;
 use crate::{DaemonPathOverrides, SetupMode};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v5";
+pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v6";
 pub const DEFAULT_SETUP_LEDGER_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -443,6 +444,16 @@ pub fn render_launchd_user_plist(
     overrides: &DaemonPathOverrides,
     storage_policy: PersistentHostStoragePolicy,
 ) -> Result<String, WindowsServiceDefinitionError> {
+    render_launchd_user_plist_with_telemetry(binary, bind, overrides, storage_policy, None)
+}
+
+pub fn render_launchd_user_plist_with_telemetry(
+    binary: &Path,
+    bind: &str,
+    overrides: &DaemonPathOverrides,
+    storage_policy: PersistentHostStoragePolicy,
+    telemetry: Option<&TelemetryConfig>,
+) -> Result<String, WindowsServiceDefinitionError> {
     let binary = binary
         .to_str()
         .filter(|path| is_absolute_posix_path(path))
@@ -460,6 +471,19 @@ pub fn render_launchd_user_plist(
         "<string>--platform-log-sink</string>"
     } else {
         ""
+    };
+    let telemetry_argument = if let Some(config) = telemetry {
+        config
+            .endpoint()
+            .map_err(|_| WindowsServiceDefinitionError::InvalidServiceConfig)?;
+        let encoded = serde_json::to_string(config)
+            .map_err(|_| WindowsServiceDefinitionError::InvalidServiceConfig)?;
+        format!(
+            "<string>--telemetry-config-json</string><string>{}</string>",
+            xml_escape(&encoded)
+        )
+    } else {
+        String::new()
     };
     let mut environment = String::new();
     for entry in overrides.entries() {
@@ -490,6 +514,7 @@ pub fn render_launchd_user_plist(
             "<string>--sqlite-log-retention-hours</string><string>{}</string>",
             "<string>--operator-log-retained-files</string><string>{}</string>",
             "{}",
+            "{}",
             "</array><key>EnvironmentVariables</key><dict>{}</dict>",
             "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
             "</dict></plist>"
@@ -501,6 +526,7 @@ pub fn render_launchd_user_plist(
         storage_policy.sqlite_log_retention_hours,
         storage_policy.operator_log_retained_files,
         platform_log_argument,
+        telemetry_argument,
         environment
     ))
 }
@@ -637,14 +663,16 @@ impl PersistentHostStoragePolicy {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct WindowsServiceConfigV5 {
+pub struct WindowsServiceConfigV6 {
     schema: String,
     daemon_arguments: Vec<String>,
     environment: BTreeMap<String, String>,
     storage_policy: PersistentHostStoragePolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telemetry: Option<TelemetryConfig>,
 }
 
-impl WindowsServiceConfigV5 {
+impl WindowsServiceConfigV6 {
     pub fn new(
         bind: &str,
         overrides: &DaemonPathOverrides,
@@ -684,7 +712,22 @@ impl WindowsServiceConfigV5 {
             ],
             environment,
             storage_policy,
+            telemetry: None,
         };
+        config
+            .validate()
+            .map_err(|_| WindowsServiceDefinitionError::InvalidServiceConfig)?;
+        Ok(config)
+    }
+
+    pub fn new_with_telemetry(
+        bind: &str,
+        overrides: &DaemonPathOverrides,
+        storage_policy: PersistentHostStoragePolicy,
+        telemetry: Option<TelemetryConfig>,
+    ) -> Result<Self, WindowsServiceDefinitionError> {
+        let mut config = Self::new(bind, overrides, storage_policy)?;
+        config.telemetry = telemetry;
         config
             .validate()
             .map_err(|_| WindowsServiceDefinitionError::InvalidServiceConfig)?;
@@ -711,6 +754,10 @@ impl WindowsServiceConfigV5 {
 
     pub const fn storage_policy(&self) -> PersistentHostStoragePolicy {
         self.storage_policy
+    }
+
+    pub fn telemetry(&self) -> Option<&TelemetryConfig> {
+        self.telemetry.as_ref()
     }
 
     pub fn path_overrides(&self) -> DaemonPathOverrides {
@@ -756,11 +803,18 @@ impl WindowsServiceConfigV5 {
             return Err("invalid daemon environment");
         }
         self.storage_policy.validate()?;
+        if self
+            .telemetry
+            .as_ref()
+            .is_some_and(|config| config.endpoint().is_err())
+        {
+            return Err("invalid telemetry configuration");
+        }
         Ok(())
     }
 }
 
-impl<'de> Deserialize<'de> for WindowsServiceConfigV5 {
+impl<'de> Deserialize<'de> for WindowsServiceConfigV6 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -772,6 +826,7 @@ impl<'de> Deserialize<'de> for WindowsServiceConfigV5 {
             daemon_arguments: Vec<String>,
             environment: BTreeMap<String, String>,
             storage_policy: PersistentHostStoragePolicy,
+            telemetry: Option<TelemetryConfig>,
         }
 
         let wire = WireConfig::deserialize(deserializer)?;
@@ -780,6 +835,7 @@ impl<'de> Deserialize<'de> for WindowsServiceConfigV5 {
             daemon_arguments: wire.daemon_arguments,
             environment: wire.environment,
             storage_policy: wire.storage_policy,
+            telemetry: wire.telemetry,
         };
         config.validate().map_err(D::Error::custom)?;
         Ok(config)
@@ -1077,7 +1133,7 @@ mod tests {
             ..DaemonPathOverrides::default()
         };
         let enabled_policy = storage_policy().with_platform_log_sink(true);
-        let config = WindowsServiceConfigV5::new("127.0.0.1:3001", &overrides, enabled_policy)
+        let config = WindowsServiceConfigV6::new("127.0.0.1:3001", &overrides, enabled_policy)
             .expect("valid service config");
         assert_eq!(config.schema(), WINDOWS_SERVICE_CONFIG_SCHEMA);
         assert_eq!(
@@ -1116,6 +1172,34 @@ mod tests {
     }
 
     #[test]
+    fn windows_service_config_hard_cuts_v5_and_retains_host_telemetry() {
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            otlp_endpoint: Some("https://collector.example".to_string()),
+            authorization: None,
+            deployment_label: Some("windows-host".to_string()),
+        };
+        let config = WindowsServiceConfigV6::new_with_telemetry(
+            "127.0.0.1:3001",
+            &DaemonPathOverrides::default(),
+            storage_policy(),
+            Some(telemetry.clone()),
+        )
+        .expect("build service config with telemetry");
+        let encoded = serde_json::to_value(&config).expect("serialize service config");
+        assert_eq!(config.telemetry(), Some(&telemetry));
+        assert_eq!(
+            serde_json::from_value::<WindowsServiceConfigV6>(encoded.clone())
+                .expect("decode current service config"),
+            config
+        );
+
+        let mut legacy = encoded;
+        legacy["schema"] = serde_json::json!("satelle.host-service.v5");
+        assert!(serde_json::from_value::<WindowsServiceConfigV6>(legacy).is_err());
+    }
+
+    #[test]
     fn windows_service_config_rejects_arbitrary_or_invalid_configuration() {
         let invalid_arguments = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1123,7 +1207,7 @@ mod tests {
             "environment": {},
             "storage_policy": storage_policy()
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV5>(invalid_arguments).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV6>(invalid_arguments).is_err());
 
         let invalid_environment = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1131,7 +1215,7 @@ mod tests {
             "environment": {"PATH": "C:\\attacker"},
             "storage_policy": storage_policy()
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV5>(invalid_environment).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV6>(invalid_environment).is_err());
 
         let invalid_retention = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1144,7 +1228,7 @@ mod tests {
                 "operator_log_retained_files": 12
             }
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV5>(invalid_retention).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV6>(invalid_retention).is_err());
 
         let missing_platform_log_policy = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1158,7 +1242,7 @@ mod tests {
             }
         });
         assert!(
-            serde_json::from_value::<WindowsServiceConfigV5>(missing_platform_log_policy).is_err(),
+            serde_json::from_value::<WindowsServiceConfigV6>(missing_platform_log_policy).is_err(),
             "persistent service policy must use the current complete schema"
         );
     }
@@ -1419,6 +1503,24 @@ mod tests {
         )
         .expect("valid launchd definition without platform logging");
         assert!(!disabled_plist.contains("<string>--platform-log-sink</string>"));
+
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            otlp_endpoint: Some("https://collector.example".to_string()),
+            authorization: None,
+            deployment_label: Some("mac-host".to_string()),
+        };
+        let telemetry_plist = render_launchd_user_plist_with_telemetry(
+            Path::new("/Users/operator/satelle"),
+            "127.0.0.1:3001",
+            &DaemonPathOverrides::default(),
+            storage_policy(),
+            Some(&telemetry),
+        )
+        .expect("valid launchd definition with telemetry");
+        assert!(telemetry_plist.contains("<string>--telemetry-config-json</string>"));
+        assert!(telemetry_plist.contains("&quot;enabled&quot;:true"));
+        assert!(telemetry_plist.contains("https://collector.example"));
     }
 
     #[test]
@@ -1428,7 +1530,7 @@ mod tests {
             state_dir: Some(PathBuf::from(r"C:\Users\operator\Satelle\state")),
             ..DaemonPathOverrides::default()
         };
-        let config = WindowsServiceConfigV5::new("127.0.0.1:3001", &overrides, storage_policy())
+        let config = WindowsServiceConfigV6::new("127.0.0.1:3001", &overrides, storage_policy())
             .expect("valid Windows service config");
 
         assert_eq!(config.path_overrides(), overrides);

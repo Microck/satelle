@@ -29,8 +29,9 @@ those pull requests merge, the integration branch gets a final pull request to
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit | Merged in PR #239 |
 | Platform-native log sinks | Optional redacted mirrors with typed Doctor health | Merged in PR #241 |
 | Setup and repair subprocess exports | Selected bounded SSH output for one consented invocation | Merged in PR #242 |
-| Desktop snapshot export | Current native desktop capture with consent, redaction, and audit metadata | Ready for review |
-| Recording and telemetry | Per-Turn recording modes and opt-in telemetry | Pending |
+| Desktop snapshot export | Current native desktop capture with consent, redaction, and audit metadata | Merged in PR #243 |
+| Opt-in telemetry | Independent Controller and Host OTLP/HTTP export with private bounded queues | Ready for review |
+| Recording | Per-Turn recording modes and export policy | Pending |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Pending |
 | Automation | Batch, watch, webhook notifications, REPL, command history | Pending |
@@ -39,6 +40,25 @@ those pull requests merge, the integration branch gets a final pull request to
 Package repository submissions, staged npm publishing, and native action relay
 retain the prerequisites declared in `.facts`. A missing external capability
 or approval is a blocker, never proof of implementation.
+
+## Opt-in telemetry decisions
+
+- Controller policy lives in the top-level user `telemetry` table. Each Host
+  policy lives in its user-owned Host Binding and is propagated into local,
+  SSH, launchd, or Windows service startup. Project configuration and profiles
+  cannot define either policy.
+- OTLP/HTTP export accepts an HTTPS origin, with loopback HTTP for a local
+  collector. It sends JSON traces and metrics to the standard `/v1/traces` and
+  `/v1/metrics` paths. Optional bearer authorization resolves from an
+  environment or owner-only file Secret Source on the emitter.
+- Records contain timing, outcome, typed error, retry, queue-depth, and optional
+  process resource values. Resource attributes contain only Satelle version,
+  component, platform class, and an optional deployment label.
+- Each component has an owner-private queue capped at 10 MiB and 24 hours.
+  Capture and delivery run outside command and Host request completion. Disable
+  clears unsent records without collector contact.
+- `satelle telemetry status` inspects the Controller. `--host <alias>` reads the
+  authenticated Host status. Protocol v19 adds the Host status operation.
 
 ## Raw protocol diagnostic decisions
 
@@ -92,7 +112,7 @@ core tests, 120 transport library tests, and 155 HTTP transport tests.
   Project configuration cannot enable it. On-demand SSH launch arguments and
   persistent launchd and Windows service definitions carry the complete
   setting to the Host.
-- The closed Windows service configuration is now `satelle.host-service.v5`.
+- The closed Windows service configuration is now `satelle.host-service.v6`.
   It requires the native sink setting. Incomplete or older service files fail
   validation and setup rewrites the canonical file.
 - Each committed SQLite log entry is formatted once as the existing redacted

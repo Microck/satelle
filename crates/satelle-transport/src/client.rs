@@ -312,6 +312,13 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
+    pub fn host_telemetry_status(
+        &self,
+    ) -> Result<crate::HostTelemetryStatusResponse, DaemonClientError> {
+        let (request, request_id) = self.protected_request(Method::GET, "/v1/host/telemetry")?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
     pub fn host_paths(&self) -> Result<HostPathsResponse, DaemonClientError> {
         let (request, request_id) = self.protected_request(Method::GET, "/v1/host/paths")?;
         self.send_authenticated(request, request_id, StatusCode::OK)

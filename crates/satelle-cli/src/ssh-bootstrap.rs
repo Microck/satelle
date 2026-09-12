@@ -436,6 +436,7 @@ struct BootstrapStartContext<'a> {
     bootstrap_scope: SshBootstrapScope,
     bind: &'a str,
     platform_log_sink: bool,
+    telemetry: Option<&'a satelle_core::telemetry::TelemetryConfig>,
     initial_identity: Option<InitialHostIdentityCommit<'a>>,
 }
 
@@ -970,6 +971,7 @@ impl SshBootstrapProcess {
                 bootstrap_scope,
                 bind: launch_mode.bind(),
                 platform_log_sink: host_config.platform_log_sink,
+                telemetry: host_config.telemetry.as_ref(),
                 initial_identity: launch_mode.initial_identity(),
             },
         );
@@ -1015,10 +1017,13 @@ impl SshBootstrapProcess {
         let command = target.durable_start_command_with_environment(
             remote_binary.remote_path(),
             idle_timeout,
-            native_timeout,
-            provider_timeout,
+            ReadinessTimeouts {
+                native: native_timeout,
+                provider: provider_timeout,
+            },
             &environment,
             host_config.platform_log_sink,
+            host_config.telemetry.as_ref(),
         );
         let command = bootstrap_lock.fenced_command(target, "daemon_start", &command)?;
         require_success(run_fenced_ssh_command(
@@ -2706,6 +2711,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
                 bootstrap_scope,
                 bind,
                 platform_log_sink: false,
+                telemetry: None,
                 initial_identity: None,
             },
         )
@@ -2722,6 +2728,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             bootstrap_scope,
             bind,
             platform_log_sink,
+            telemetry,
             initial_identity,
         } = context;
         let timeout_args = format!(
@@ -2743,6 +2750,12 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         } else {
             ""
         };
+        let telemetry_json = telemetry.map(|config| {
+            serde_json::to_string(config).expect("validated telemetry configuration serializes")
+        });
+        let posix_telemetry_argument = telemetry_json.as_ref().map_or_else(String::new, |config| {
+            format!(" --telemetry-config-json {}", posix_quote(config))
+        });
         if self.is_windows() {
             let mut arguments = vec![
                 "host".to_string(),
@@ -2760,6 +2773,9 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             ];
             if platform_log_sink {
                 arguments.push("--platform-log-sink".to_string());
+            }
+            if let Some(config) = telemetry_json.as_ref() {
+                arguments.extend(["--telemetry-config-json".to_string(), config.clone()]);
             }
             if let Some(initial) = initial_identity {
                 arguments.extend([
@@ -2828,13 +2844,13 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             // outer login shell cannot reinterpret either identity value.
             let script = format!("{}exec \"$@\"", posix_environment(environment));
             let arguments = format!(
-                "{} host start --bootstrap-token-stdin {timeout_args}{platform_log_argument}{posix_identity_args} --json",
+                "{} host start --bootstrap-token-stdin {timeout_args}{platform_log_argument}{posix_telemetry_argument}{posix_identity_args} --json",
                 posix_quote(remote_binary),
             );
             format!("sh -c {} sh {arguments}", posix_quote(&script))
         } else {
             let script = format!(
-                "{}exec {remote_binary} host start --bootstrap-token-stdin {timeout_args}{platform_log_argument} --json",
+                "{}exec {remote_binary} host start --bootstrap-token-stdin {timeout_args}{platform_log_argument}{posix_telemetry_argument} --json",
                 posix_environment(environment),
             );
             format!("sh -c {}", posix_quote(&script))
@@ -2852,10 +2868,13 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         self.durable_start_command_with_environment(
             remote_binary,
             idle_timeout,
-            native_timeout,
-            provider_timeout,
+            ReadinessTimeouts {
+                native: native_timeout,
+                provider: provider_timeout,
+            },
             &[],
             false,
+            None,
         )
     }
 
@@ -2918,20 +2937,31 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         self,
         remote_binary: &str,
         idle_timeout: Duration,
-        native_timeout: Duration,
-        provider_timeout: Duration,
+        readiness_timeouts: ReadinessTimeouts,
         environment: &[(&'static str, &Path)],
         platform_log_sink: bool,
+        telemetry: Option<&satelle_core::telemetry::TelemetryConfig>,
     ) -> String {
         let mut timeout_args = format!(
             "--bootstrap-token-stdin --bootstrap-scope {} --on-demand-idle-timeout-ms {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
             SshBootstrapScope::Read.as_cli_value(),
             idle_timeout.as_millis(),
-            native_timeout.as_millis(),
-            provider_timeout.as_millis(),
+            readiness_timeouts.native.as_millis(),
+            readiness_timeouts.provider.as_millis(),
         );
         if platform_log_sink {
             timeout_args.push_str(" --platform-log-sink");
+        }
+        if let Some(config) = telemetry {
+            let encoded = serde_json::to_string(config)
+                .expect("validated telemetry configuration serializes");
+            if self.is_windows() {
+                timeout_args.push_str(" --telemetry-config-json ");
+                timeout_args.push_str(&windows_command_line_argument(&encoded));
+            } else {
+                timeout_args.push_str(" --telemetry-config-json ");
+                timeout_args.push_str(&posix_quote(&encoded));
+            }
         }
         if self.is_windows() {
             let script = format!(
@@ -2966,7 +2996,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
                     "if (-not [SatelleBootstrapNative]::SetStdHandle(-11,$nullHandle)) {{ throw 'stdout sink' }}; ",
                     "if (-not [SatelleBootstrapNative]::SetStdHandle(-12,$nullHandle)) {{ throw 'stderr sink' }}; ",
                     "$startInfo = New-Object System.Diagnostics.ProcessStartInfo; ",
-                    "$startInfo.FileName = $binary; $startInfo.Arguments = 'host start {} --json'; ",
+                    "$startInfo.FileName = $binary; $startInfo.Arguments = {}; ",
                     "$startInfo.UseShellExecute = $false; $startInfo.CreateNoWindow = $true; ",
                     "$startInfo.RedirectStandardInput = $true; ",
                     "$startInfo.RedirectStandardOutput = $false; ",
@@ -2989,7 +3019,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
                 ),
                 powershell_environment(environment),
                 powershell_quote(remote_binary),
-                timeout_args,
+                powershell_quote(&format!("host start {timeout_args} --json")),
             );
             powershell_encoded_command(&script)
         } else {
@@ -3419,7 +3449,7 @@ impl<'a> PersistentServiceRemote<'a> {
     pub(super) fn publish_windows_service_config(
         &mut self,
         task: &satelle_core::daemon_service::WindowsTaskDefinition,
-        config: &satelle_core::daemon_service::WindowsServiceConfigV5,
+        config: &satelle_core::daemon_service::WindowsServiceConfigV6,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
         let contents = serde_json::to_vec_pretty(config)
@@ -3492,14 +3522,16 @@ impl<'a> PersistentServiceRemote<'a> {
         artifact: &ManagedHostArtifact,
         overrides: &DaemonPathOverrides,
         storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
+        telemetry: Option<&satelle_core::telemetry::TelemetryConfig>,
     ) -> Result<LaunchdServiceDefinition, SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
         let binary = self.absolute_artifact_path(artifact);
-        let contents = satelle_core::daemon_service::render_launchd_user_plist(
+        let contents = satelle_core::daemon_service::render_launchd_user_plist_with_telemetry(
             Path::new(&binary),
             "127.0.0.1:3001",
             overrides,
             storage_policy,
+            telemetry,
         )
         .map_err(|_| SshBootstrapError::InvalidPersistentServiceDefinition)?;
         Ok(LaunchdServiceDefinition {
@@ -4832,7 +4864,7 @@ fn parse_service_path_overrides(
     output: &[u8],
 ) -> Result<DaemonPathOverrides, SshBootstrapError> {
     if target.is_windows() {
-        let config: satelle_core::daemon_service::WindowsServiceConfigV5 =
+        let config: satelle_core::daemon_service::WindowsServiceConfigV6 =
             serde_json::from_slice(output)
                 .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
         if config.bind() != "127.0.0.1:3001" {
@@ -4873,6 +4905,7 @@ struct ObservedLaunchdServiceDefinition {
     bind: SocketAddr,
     path_overrides: DaemonPathOverrides,
     storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
+    telemetry: Option<satelle_core::telemetry::TelemetryConfig>,
 }
 
 fn parse_launchd_service_definition(
@@ -4899,6 +4932,7 @@ fn parse_launchd_service_definition(
     const OPERATOR_LOG_RETENTION_PREFIX: &str =
         "</string><string>--operator-log-retained-files</string><string>";
     const PLATFORM_LOG_ARGUMENT: &str = "<string>--platform-log-sink</string>";
+    const TELEMETRY_PREFIX: &str = "<string>--telemetry-config-json</string><string>";
     const ENVIRONMENT_PREFIX: &str = "</array><key>EnvironmentVariables</key><dict>";
     const SUFFIX: &str = concat!(
         "</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
@@ -4940,6 +4974,20 @@ fn parse_launchd_service_definition(
     let (platform_log_sink, body) = match body.strip_prefix(PLATFORM_LOG_ARGUMENT) {
         Some(body) => (true, body),
         None => (false, body),
+    };
+    let (telemetry, body) = if let Some(encoded) = body.strip_prefix(TELEMETRY_PREFIX) {
+        let (encoded, body) = encoded
+            .split_once("</string>")
+            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        let encoded = decode_plist_text(encoded)?;
+        let telemetry = serde_json::from_str::<satelle_core::telemetry::TelemetryConfig>(&encoded)
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+        telemetry
+            .endpoint()
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+        (Some(telemetry), body)
+    } else {
+        (None, body)
     };
     let body = body
         .strip_prefix(ENVIRONMENT_PREFIX)
@@ -4986,6 +5034,7 @@ fn parse_launchd_service_definition(
         executable: binary,
         bind,
         storage_policy,
+        telemetry,
         path_overrides: daemon_path_overrides_from_environment(
             RemoteTarget::DarwinArm64,
             &entries,
@@ -5151,6 +5200,27 @@ fn same_windows_path_text(left: &str, right: &str) -> bool {
 pub(super) struct ManagedServiceExecutableObservation {
     path: String,
     sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ManagedServiceExpectation<'a> {
+    path_overrides: &'a DaemonPathOverrides,
+    storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
+    telemetry: Option<&'a satelle_core::telemetry::TelemetryConfig>,
+}
+
+impl<'a> ManagedServiceExpectation<'a> {
+    pub(super) const fn new(
+        path_overrides: &'a DaemonPathOverrides,
+        storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
+        telemetry: Option<&'a satelle_core::telemetry::TelemetryConfig>,
+    ) -> Self {
+        Self {
+            path_overrides,
+            storage_policy,
+            telemetry,
+        }
+    }
 }
 
 impl ManagedServiceExecutableObservation {
@@ -5345,16 +5415,14 @@ impl RemoteUserDirectories {
         destination: &str,
         path: &str,
         host_id: &str,
-        expected_path_overrides: &DaemonPathOverrides,
-        expected_storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
+        expected: ManagedServiceExpectation<'_>,
     ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         self.probe_managed_service_executable_with_program(
             OsStr::new("ssh"),
             destination,
             path,
             host_id,
-            expected_path_overrides,
-            expected_storage_policy,
+            expected,
         )
     }
 
@@ -5365,16 +5433,14 @@ impl RemoteUserDirectories {
         destination: &str,
         path: &str,
         host_id: &str,
-        expected_path_overrides: &DaemonPathOverrides,
-        expected_storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
+        expected: ManagedServiceExpectation<'_>,
     ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         self.probe_managed_service_executable_with_program(
             ssh_program.as_os_str(),
             destination,
             path,
             host_id,
-            expected_path_overrides,
-            expected_storage_policy,
+            expected,
         )
     }
 
@@ -5384,8 +5450,7 @@ impl RemoteUserDirectories {
         destination: &str,
         path: &str,
         host_id: &str,
-        expected_path_overrides: &DaemonPathOverrides,
-        expected_storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
+        expected: ManagedServiceExpectation<'_>,
     ) -> Result<Option<ManagedServiceExecutableObservation>, SshBootstrapError> {
         if host_id.is_empty()
             || !host_id
@@ -5420,7 +5485,7 @@ impl RemoteUserDirectories {
                     "$config=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json; ",
                     "$task=Get-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name} ",
                     "-ErrorAction SilentlyContinue; ",
-                    "if ($config.schema -cne 'satelle.host-service.v5' -or $null -eq $task) {{ ",
+                    "if ($config.schema -cne 'satelle.host-service.v6' -or $null -eq $task) {{ ",
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "[xml]$xml=Export-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name}; ",
                     "$root=$xml.Task; ",
@@ -5510,16 +5575,18 @@ impl RemoteUserDirectories {
                 .ok_or(SshBootstrapError::InvalidServiceObservation)?;
             let config = config.strip_suffix('\r').unwrap_or(config);
             let Ok(config) = serde_json::from_str::<
-                satelle_core::daemon_service::WindowsServiceConfigV5,
+                satelle_core::daemon_service::WindowsServiceConfigV6,
             >(config) else {
                 return Ok(None);
             };
-            let expected = satelle_core::daemon_service::WindowsServiceConfigV5::new(
-                "127.0.0.1:3001",
-                expected_path_overrides,
-                expected_storage_policy,
-            )
-            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+            let expected =
+                satelle_core::daemon_service::WindowsServiceConfigV6::new_with_telemetry(
+                    "127.0.0.1:3001",
+                    expected.path_overrides,
+                    expected.storage_policy,
+                    expected.telemetry.cloned(),
+                )
+                .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
             if config != expected {
                 return Ok(None);
             }
@@ -5535,8 +5602,9 @@ impl RemoteUserDirectories {
             return Ok(None);
         };
         if definition.bind != "127.0.0.1:3001".parse().expect("static socket address")
-            || definition.path_overrides != *expected_path_overrides
-            || definition.storage_policy != expected_storage_policy
+            || definition.path_overrides != *expected.path_overrides
+            || definition.storage_policy != expected.storage_policy
+            || definition.telemetry.as_ref() != expected.telemetry
         {
             return Ok(None);
         }
@@ -7914,11 +7982,18 @@ mod tests {
         let fake_ssh = directory.path().join("ssh");
         let audit_log = directory.path().join("arguments");
         let observed_digest = "aa".repeat(32);
-        let macos_plist = satelle_core::daemon_service::render_launchd_user_plist(
+        let telemetry = satelle_core::telemetry::TelemetryConfig {
+            enabled: true,
+            otlp_endpoint: Some("https://collector.example".to_string()),
+            authorization: None,
+            deployment_label: Some("mac-host".to_string()),
+        };
+        let macos_plist = satelle_core::daemon_service::render_launchd_user_plist_with_telemetry(
             Path::new("/Users/operator/Library/Caches/Satelle/host/v0.1.0/darwin-arm64/satelle"),
             "127.0.0.1:3001",
             &DaemonPathOverrides::default(),
             persistent_storage_policy(),
+            Some(&telemetry),
         )
         .expect("render canonical macOS service definition");
         fs::write(
@@ -7952,8 +8027,11 @@ mod tests {
                     "operator@example",
                     &service_path,
                     "host-123",
-                    &DaemonPathOverrides::default(),
-                    persistent_storage_policy(),
+                    ManagedServiceExpectation::new(
+                        &DaemonPathOverrides::default(),
+                        persistent_storage_policy(),
+                        Some(&telemetry),
+                    ),
                 )
                 .expect("run audited read-only service probe")
                 .as_ref()
@@ -7967,14 +8045,17 @@ mod tests {
                     "operator@example",
                     &service_path,
                     "host-123",
-                    &DaemonPathOverrides::default(),
-                    satelle_core::daemon_service::PersistentHostStoragePolicy::new(
-                        3_600_000,
-                        satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
-                        satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
-                        satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
-                    )
-                    .unwrap(),
+                    ManagedServiceExpectation::new(
+                        &DaemonPathOverrides::default(),
+                        satelle_core::daemon_service::PersistentHostStoragePolicy::new(
+                            3_600_000,
+                            satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+                            satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
+                            satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
+                        )
+                        .unwrap(),
+                        Some(&telemetry),
+                    ),
                 )
                 .expect("a drifted macOS retention is observable")
                 .is_none()
@@ -8040,8 +8121,11 @@ mod tests {
                     "operator@example",
                     &service_path,
                     "host-123",
-                    &DaemonPathOverrides::default(),
-                    persistent_storage_policy(),
+                    ManagedServiceExpectation::new(
+                        &DaemonPathOverrides::default(),
+                        persistent_storage_policy(),
+                        None,
+                    ),
                 )
                 .expect("a well-formed drifted launchd environment is observable")
                 .is_none()
@@ -8054,7 +8138,7 @@ mod tests {
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
                     "printf 'managed\\r\\n",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                    "{{\"schema\":\"satelle.host-service.v5\",",
+                    "{{\"schema\":\"satelle.host-service.v6\",",
                     "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                     "\"127.0.0.1:3001\"],\"environment\":{{}},",
                     "\"storage_policy\":{{\"setup_ledger_retention_ms\":2592000000,",
@@ -8081,8 +8165,11 @@ mod tests {
                     "operator@example",
                     &windows_service_path,
                     "host-123",
-                    &DaemonPathOverrides::default(),
-                    persistent_storage_policy(),
+                    ManagedServiceExpectation::new(
+                        &DaemonPathOverrides::default(),
+                        persistent_storage_policy(),
+                        None,
+                    ),
                 )
                 .expect("run audited Windows service probe")
                 .as_ref()
@@ -8098,14 +8185,17 @@ mod tests {
                     "operator@example",
                     &windows_service_path,
                     "host-123",
-                    &DaemonPathOverrides::default(),
-                    satelle_core::daemon_service::PersistentHostStoragePolicy::new(
-                        3_600_000,
-                        satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
-                        satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
-                        satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
-                    )
-                    .unwrap(),
+                    ManagedServiceExpectation::new(
+                        &DaemonPathOverrides::default(),
+                        satelle_core::daemon_service::PersistentHostStoragePolicy::new(
+                            3_600_000,
+                            satelle_core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+                            satelle_core::DEFAULT_SQLITE_LOG_RETENTION_HOURS,
+                            satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
+                        )
+                        .unwrap(),
+                        None,
+                    ),
                 )
                 .expect("a drifted Windows retention is observable")
                 .is_none()
@@ -8164,7 +8254,7 @@ mod tests {
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                "{\"schema\":\"satelle.host-service.v5\",",
+                "{\"schema\":\"satelle.host-service.v6\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                 "\"127.0.0.1:3002\"],\"environment\":{},",
                 "\"storage_policy\":{\"setup_ledger_retention_ms\":2592000000,",
@@ -8185,8 +8275,11 @@ mod tests {
                     "operator@example",
                     &windows_service_path,
                     "host-123",
-                    &DaemonPathOverrides::default(),
-                    persistent_storage_policy(),
+                    ManagedServiceExpectation::new(
+                        &DaemonPathOverrides::default(),
+                        persistent_storage_policy(),
+                        None,
+                    ),
                 )
                 .expect("a well-formed drifted Windows service config is observable")
                 .is_none()
@@ -8197,7 +8290,7 @@ mod tests {
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                "{\"schema\":\"satelle.host-service.v5\",",
+                "{\"schema\":\"satelle.host-service.v6\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                 "\"127.0.0.1:3001\"],",
                 "\"environment\":{\"SATELLE_HOME\":\"C:\\\\\\\\Drifted\"},",
@@ -8219,8 +8312,11 @@ mod tests {
                     "operator@example",
                     &windows_service_path,
                     "host-123",
-                    &DaemonPathOverrides::default(),
-                    persistent_storage_policy(),
+                    ManagedServiceExpectation::new(
+                        &DaemonPathOverrides::default(),
+                        persistent_storage_policy(),
+                        None,
+                    ),
                 )
                 .expect("a well-formed drifted Windows service environment is observable")
                 .is_none()
@@ -8689,7 +8785,7 @@ mod tests {
     #[test]
     fn persistent_service_path_override_parsers_are_closed() {
         let windows = br#"{
-          "schema":"satelle.host-service.v5",
+          "schema":"satelle.host-service.v6",
           "daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],
           "environment":{"SATELLE_STATE_DIR":"C:\\Users\\operator\\AppData\\Local\\Satelle\\state"},
           "storage_policy":{
@@ -8709,7 +8805,7 @@ mod tests {
         assert!(
             parse_service_path_overrides(
                 RemoteTarget::WindowsX64Msvc,
-                br#"{"schema":"satelle.host-service.v5","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"},"storage_policy":{"setup_ledger_retention_ms":3600000,"session_metadata_retention_hours":168,"sqlite_log_retention_hours":168,"operator_log_retained_files":5,"platform_log_sink":false}}"#,
+                br#"{"schema":"satelle.host-service.v6","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"},"storage_policy":{"setup_ledger_retention_ms":3600000,"session_metadata_retention_hours":168,"sqlite_log_retention_hours":168,"operator_log_retained_files":5,"platform_log_sink":false}}"#,
             )
             .is_err()
         );
@@ -9852,6 +9948,7 @@ mod tests {
                 bootstrap_scope: SshBootstrapScope::Admin,
                 bind: "127.0.0.1:0",
                 platform_log_sink: false,
+                telemetry: None,
                 initial_identity: Some(initial),
             },
         );
@@ -9873,6 +9970,7 @@ mod tests {
                 bootstrap_scope: SshBootstrapScope::Admin,
                 bind: "127.0.0.1:0",
                 platform_log_sink: false,
+                telemetry: None,
                 initial_identity: Some(initial),
             },
         );
@@ -9887,6 +9985,62 @@ mod tests {
         assert!(script.contains(
             "$startInfo.Arguments = 'host start --interactive-bootstrap --bootstrap-token-stdin"
         ));
+    }
+
+    #[test]
+    fn managed_ssh_launches_forward_host_telemetry_policy() {
+        let telemetry = satelle_core::telemetry::TelemetryConfig {
+            enabled: true,
+            otlp_endpoint: Some("https://collector.example".to_string()),
+            authorization: None,
+            deployment_label: Some("ssh-host".to_string()),
+        };
+        for target in [RemoteTarget::LinuxX64Gnu, RemoteTarget::WindowsX64Msvc] {
+            let fresh = target.start_command_with_environment(
+                if target.is_windows() {
+                    "satelle.exe"
+                } else {
+                    "/tmp/satelle"
+                },
+                ReadinessTimeouts {
+                    native: Duration::from_secs(1),
+                    provider: Duration::from_secs(2),
+                },
+                &[],
+                BootstrapStartContext {
+                    bootstrap_scope: SshBootstrapScope::Control,
+                    bind: "127.0.0.1:0",
+                    platform_log_sink: false,
+                    telemetry: Some(&telemetry),
+                    initial_identity: None,
+                },
+            );
+            let durable = target.durable_start_command_with_environment(
+                if target.is_windows() {
+                    "satelle.exe"
+                } else {
+                    "/tmp/satelle"
+                },
+                Duration::from_secs(60),
+                ReadinessTimeouts {
+                    native: Duration::from_secs(1),
+                    provider: Duration::from_secs(2),
+                },
+                &[],
+                false,
+                Some(&telemetry),
+            );
+            for command in [fresh, durable] {
+                let command = if target.is_windows() {
+                    decode_powershell_command(&command).expect("decode managed launch")
+                } else {
+                    command
+                };
+                assert!(command.contains("--telemetry-config-json"));
+                assert!(command.contains("collector.example"));
+                assert!(command.contains("ssh-host"));
+            }
+        }
     }
 
     #[test]
@@ -10137,6 +10291,7 @@ mod tests {
             sqlite_log_retention: None,
             operator_log_retained_files: None,
             platform_log_sink: false,
+            telemetry: None,
             daemon_idle_timeout: None,
             desktop_user: None,
             desktop_session_preference: None,
@@ -10171,6 +10326,7 @@ mod tests {
                 bootstrap_scope: SshBootstrapScope::Control,
                 bind: "127.0.0.1:3001",
                 platform_log_sink: false,
+                telemetry: None,
                 initial_identity: None,
             },
         );
@@ -10193,6 +10349,7 @@ mod tests {
                 bootstrap_scope: SshBootstrapScope::Admin,
                 bind: "127.0.0.1:0",
                 platform_log_sink: host.platform_log_sink,
+                telemetry: None,
                 initial_identity: None,
             },
         );
@@ -10220,6 +10377,7 @@ mod tests {
                 bootstrap_scope: SshBootstrapScope::Control,
                 bind: "127.0.0.1:3001",
                 platform_log_sink: false,
+                telemetry: None,
                 initial_identity: None,
             },
         );
@@ -10250,6 +10408,7 @@ mod tests {
                 bootstrap_scope: SshBootstrapScope::Control,
                 bind: "127.0.0.1:3001",
                 platform_log_sink: false,
+                telemetry: None,
                 initial_identity: None,
             },
         );
@@ -10267,6 +10426,7 @@ mod tests {
                 bootstrap_scope: SshBootstrapScope::Control,
                 bind: "127.0.0.1:3001",
                 platform_log_sink: false,
+                telemetry: None,
                 initial_identity: None,
             },
         );
@@ -10289,6 +10449,7 @@ mod tests {
                 bootstrap_scope: SshBootstrapScope::Control,
                 bind: "127.0.0.1:3001",
                 platform_log_sink: false,
+                telemetry: None,
                 initial_identity: None,
             },
         );
@@ -10308,6 +10469,7 @@ mod tests {
                 bootstrap_scope: SshBootstrapScope::Control,
                 bind: "127.0.0.1:3001",
                 platform_log_sink: false,
+                telemetry: None,
                 initial_identity: None,
             },
         );
@@ -11189,10 +11351,13 @@ mod tests {
         let empty = RemoteTarget::LinuxX64Gnu.durable_start_command_with_environment(
             "/tmp/satelle",
             Duration::from_secs(75),
-            Duration::from_millis(2_500),
-            Duration::from_millis(7_500),
+            ReadinessTimeouts {
+                native: Duration::from_millis(2_500),
+                provider: Duration::from_millis(7_500),
+            },
             &[],
             false,
+            None,
         );
         assert!(empty.contains(POSIX_DAEMON_ENVIRONMENT_CLEAR));
 
@@ -11200,10 +11365,13 @@ mod tests {
         let configured = RemoteTarget::LinuxX64Gnu.durable_start_command_with_environment(
             "/tmp/satelle",
             Duration::from_secs(75),
-            Duration::from_millis(2_500),
-            Duration::from_millis(7_500),
+            ReadinessTimeouts {
+                native: Duration::from_millis(2_500),
+                provider: Duration::from_millis(7_500),
+            },
             &environment,
             true,
+            None,
         );
         assert!(configured.contains(POSIX_DAEMON_ENVIRONMENT_CLEAR));
         assert!(configured.contains("SATELLE_STATE_DIR="));
@@ -11265,10 +11433,13 @@ mod tests {
         let durable = RemoteTarget::LinuxX64Gnu.durable_start_command_with_environment(
             daemon.to_str().expect("UTF-8 durable daemon path"),
             Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
+            ReadinessTimeouts {
+                native: Duration::from_secs(1),
+                provider: Duration::from_secs(1),
+            },
             &environment,
             false,
+            None,
         );
         assert_occurs_before(&durable, "exec 3<&0", POSIX_DAEMON_ENVIRONMENT_CLEAR);
         assert_occurs_before(&durable, "SATELLE_STATE_DIR=", "nohup ");
@@ -11343,10 +11514,13 @@ mod tests {
         let empty = RemoteTarget::WindowsX64Msvc.durable_start_command_with_environment(
             "Satelle/satelle.exe",
             Duration::from_secs(75),
-            Duration::from_millis(2_500),
-            Duration::from_millis(7_500),
+            ReadinessTimeouts {
+                native: Duration::from_millis(2_500),
+                provider: Duration::from_millis(7_500),
+            },
             &[],
             false,
+            None,
         );
         let empty_script = decode_powershell_command(&empty).expect("decode empty WMI launcher");
         assert_powershell_clears_daemon_environment(&empty_script);
@@ -11355,10 +11529,13 @@ mod tests {
         let command = RemoteTarget::WindowsX64Msvc.durable_start_command_with_environment(
             "Satelle/satelle.exe",
             Duration::from_secs(75),
-            Duration::from_millis(2_500),
-            Duration::from_millis(7_500),
+            ReadinessTimeouts {
+                native: Duration::from_millis(2_500),
+                provider: Duration::from_millis(7_500),
+            },
             &environment,
             true,
+            None,
         );
         let detached_script = decode_powershell_command(&command).expect("decode WMI launcher");
 

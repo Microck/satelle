@@ -93,6 +93,7 @@ fn production_service_reports_the_frozen_service_config_path_set() {
             satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
         )
         .expect("valid persistent storage policy"),
+        None,
     )
     .expect("valid persistent service configuration");
     let paths = service
@@ -1643,6 +1644,7 @@ fn unsupported_production_execution_is_blocked_without_state_admission() {
         mode: HostMode::Production {
             snapshot,
             daemon_paths: Box::new(test_daemon_paths(&state)),
+            telemetry: crate::telemetry::HostTelemetry::new(None, Ok(state.path().to_path_buf())),
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
@@ -1888,6 +1890,7 @@ fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_disc
         mode: HostMode::Production {
             snapshot,
             daemon_paths: Box::new(test_daemon_paths(&state)),
+            telemetry: crate::telemetry::HostTelemetry::new(None, Ok(state.path().to_path_buf())),
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
@@ -1964,6 +1967,7 @@ fn production_doctor_test_service(state: &TestStateDir) -> HostService {
         mode: HostMode::Production {
             snapshot,
             daemon_paths: Box::new(test_daemon_paths(state)),
+            telemetry: crate::telemetry::HostTelemetry::new(None, Ok(state.path().to_path_buf())),
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
@@ -1993,6 +1997,7 @@ fn fatal_doctor_failure_preserves_independent_terminal_probe_results() {
         mode: HostMode::Production {
             snapshot,
             daemon_paths: Box::new(test_daemon_paths(&state)),
+            telemetry: crate::telemetry::HostTelemetry::new(None, Ok(state.path().to_path_buf())),
         },
         bootstrap_auth: None,
         bootstrap_maintenance: Arc::new(Mutex::new(None)),
