@@ -48,7 +48,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const RESTORE_ACTIVATION_JOURNAL: &str = ".satelle-restore-activation-v1";
 const RESTORE_ACTIVATION_JOURNAL_LIMIT: usize = 64 * 1024;
-const MIGRATIONS: [Migration; 22] = [
+const MIGRATIONS: [Migration; 23] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -178,6 +178,12 @@ const MIGRATIONS: [Migration; 22] = [
     Migration {
         version: 22,
         sql: include_str!("0022-recording-audit.sql"),
+        seeds_sensitive_state: false,
+        irreversible: false,
+    },
+    Migration {
+        version: 23,
+        sql: include_str!("0023-turn-admission-queue.sql"),
         seeds_sensitive_state: false,
         irreversible: false,
     },

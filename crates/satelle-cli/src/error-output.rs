@@ -276,6 +276,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "Authentication failed.",
             default_recovery: "check the configured authentication and retry the command",
         },
+        ErrorCode::QueuedPrincipalNoLongerAuthorized => ErrorContract {
+            category: ErrorCategory::Authentication,
+            retryable: false,
+            outcome: "The queued credential is no longer authorized.",
+            default_recovery: "enqueue the Turn again with a current control credential",
+        },
         ErrorCode::AuthorizationInsufficientScope => ErrorContract {
             category: ErrorCategory::Authorization,
             retryable: false,
@@ -292,6 +298,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::HostBusy
         | ErrorCode::StateConflict
         | ErrorCode::StopNotConfirmed
+        | ErrorCode::QueueAlreadyAdmitted
         | ErrorCode::SelfUpdateLocked => ErrorContract {
             category: ErrorCategory::Conflict,
             retryable: true,
@@ -453,20 +460,21 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The SSH Host identity was not accepted.",
             default_recovery: "verify and trust the Host key, then retry the command",
         },
-        ErrorCode::CapacityExceeded => ErrorContract {
+        ErrorCode::CapacityExceeded | ErrorCode::QueueFull => ErrorContract {
             category: ErrorCategory::Capacity,
             retryable: true,
             outcome: "The requested work could not start.",
             default_recovery: "reduce concurrent work or wait for capacity, then retry",
         },
-        ErrorCode::HostNotFound | ErrorCode::SessionNotFound | ErrorCode::LogsCursorExpired => {
-            ErrorContract {
-                category: ErrorCategory::NotFound,
-                retryable: false,
-                outcome: "The requested Satelle resource was not found.",
-                default_recovery: "check the configured Host or Session identifier and retry",
-            }
-        }
+        ErrorCode::HostNotFound
+        | ErrorCode::SessionNotFound
+        | ErrorCode::QueueRequestNotFound
+        | ErrorCode::LogsCursorExpired => ErrorContract {
+            category: ErrorCategory::NotFound,
+            retryable: false,
+            outcome: "The requested Satelle resource was not found.",
+            default_recovery: "check the configured Host or Session identifier and retry",
+        },
         ErrorCode::InvalidUsage
         | ErrorCode::ScopeSelectionConflict
         | ErrorCode::PromptSourceConflict
@@ -500,6 +508,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
         | ErrorCode::ExperimentalProviderOptInRequired
         | ErrorCode::ModelProviderBindingMissing
+        | ErrorCode::QueueDisabled
         | ErrorCode::InputRequired => ErrorContract {
             category: ErrorCategory::InvalidRequest,
             retryable: false,

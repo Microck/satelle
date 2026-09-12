@@ -56,7 +56,7 @@
 - a Satelle Recording Mode is an explicitly consented prospective Turn capture of selected screenshots, desktop video, transcripts, or replayable events under finite retention and Host policy @spec @phase4 @implemented
 - a Satelle Config Include is an explicit reference from one Satelle TOML configuration file to another Satelle TOML configuration file loaded as part of the same user-level or project-level configuration source @spec @phase4 @implemented
 - a Satelle Executable Credential Helper is a Host-Resolved Secret Source that runs a user-configured executable on the machine resolving provider authentication and returns secret material through the Satelle credential-helper protocol @spec @phase4 @implemented
-- a Satelle Queued Turn Request is a Host Daemon-owned pending run or steer request waiting to start because the selected Control Lease is occupied @spec @later
+- a Satelle Queued Turn Request is a Host Daemon-owned pending run or steer request waiting to start because the selected Control Lease is occupied @spec @phase4 @implemented
 - a Satelle Platform-Native Log Sink is an OS-owned logging destination such as journald, Windows Event Log, or macOS unified logging that receives mirrored redacted Satelle Log Entries without becoming a Satelle-owned store @spec @phase4 @implemented
 - a Satelle Path Set is the runtime-resolved collection of config, cache, local state, operator log, SQLite store, and recording artifact paths for one OS user on one machine @spec @mvp @implemented
 - label: a Satelle Desktop Binding is one configured remote OS user account whose compatible visible desktop sessions a Host Daemon is authorized to observe and control
@@ -366,7 +366,7 @@
 - satelle later --remote-image follows the same no-retention default as uploaded local image attachments for logs, status, diagnostics, setup ledgers, diagnostic bundles, and recording artifacts @spec @phase4 @implemented
 - satelle --remote-image requires an absolute native Host path, rejects parent traversal and symbolic links, and uses the same bounded regular-file reader as local image attachments @spec @phase4
 - satelle local and remote images share one attachment list and the same total count, per-image byte, aggregate byte, and PNG/JPEG limits @spec @phase4
-- satelle Turn request schema satelle.api.v10 represents each image as kind upload with media_type, size_bytes, sha256, and data_base64 or kind host_file with path; raw paths and image bytes are excluded from response, log, and Debug output @spec @contract @phase4
+- satelle Turn request schema satelle.api.v11 represents each image as kind upload with media_type, size_bytes, sha256, and data_base64 or kind host_file with path; raw paths and image bytes are excluded from response, log, and Debug output @spec @contract @phase4
 - satelle remote image references enter the keyed request identity before Host file access; only a newly accepted execution reads the file, so idempotent replay and cancellation do not depend on the source file still existing @spec @contract @phase4
 - satelle resolves remote image bytes before committing a Session or Turn and removes generated attachment staging when execution ends; it never deletes the operator's source image @spec @phase4
 - satelle MVP does not support arbitrary file attachments until file transfer, storage, and remote path semantics are specified @spec @mvp @implemented
@@ -869,7 +869,7 @@
 - Satelle Session, diagnostic, setup, and secret-provisioning responses include Cache-Control: no-store @spec @mvp @implemented
 - Host Daemon shutdown stops accepting new HTTP connections, drains in-flight HTTP requests for a finite configured grace period that defaults to 5 seconds, and returns a typed shutdown-timeout result after aborting the serving task when the grace period expires @spec @contract @mvp @implemented
 - satelle Host Daemon does not enable cross-origin browser access by default @spec @mvp @implemented
-- satelle Host Daemon Turn request bodies use the exact schema_version token satelle.api.v10 while unchanged stop request bodies use satelle.api.v1 @spec @contract @phase4
+- satelle Host Daemon Turn request bodies use the exact schema_version token satelle.api.v11 while unchanged stop request bodies use satelle.api.v1 @spec @contract @phase4
 - authenticated Host Daemon requests use Satelle-Request-Id for caller-supplied UUIDv7 correlation and Satelle-Expected-Host-Identity for Host pinning; neither header grants authority or idempotency @spec @contract @mvp @implemented
 - authenticated Host Daemon HTTP requests without Satelle-Request-Id receive a generated canonical UUIDv7 except GET /v1/events, whose WebSocket upgrade contract requires a caller-supplied Satelle-Request-Id; malformed or duplicate supplied request-id headers are rejected @spec @contract @mvp @implemented
 - satelle Host Daemon uses GET /v1/live, GET /v1/capabilities, GET /v1/host/status, GET /v1/host/desktop-sessions, POST /v1/sessions, POST /v1/sessions/{session_id}/turns, GET /v1/sessions/{session_id}, POST /v1/sessions/{session_id}/stop, GET /v1/logs, GET /v1/events, GET /v1/setup/api-token/current, POST /v1/setup/api-token, POST /v1/setup/api-token/{token_id}/activate, POST /v1/setup/api-token/{token_id}/abort, POST /v1/api-tokens, POST /v1/api-tokens/{token_id}/rotate, and POST /v1/api-tokens/{token_id}/revoke as its canonical route set and exposes no run, steer, blocking-run, SSE, or HTTP logs-follow aliases @spec @contract @phase4
@@ -1438,7 +1438,7 @@
 - later queueing, recording, raw diagnostics, config composition, package expansion, telemetry, and multi-user features do not weaken MVP consent, isolation, redaction, or Host identity boundaries @spec @phase4 @later
 - phase 4A completes operational foundations: Config Includes, config repair, storage migration, credential helpers, Trusted Profile expiration, CLI-Host compatibility, explicit Host version selection, package repair, remote images, advanced output contracts, and mutual TLS @spec @phase4 @implemented
 - phase 4B completes sensitive observability only after shared redaction, retention, manifest, consent, and audit conformance: diagnostic bundles, Raw Diagnostic Exports, recording, Platform-Native Log Sinks, and telemetry @spec @phase4 @implemented
-- phase 4C completes durable queueing before the Multi-User Broker and proves restart recovery, cancellation, Principal reauthorization, isolation, and per-binding lease behavior before multi-user release @spec @phase4 @later
+- phase 4C completes durable queueing before the Multi-User Broker and proves restart recovery, cancellation, Principal reauthorization, isolation, and per-binding lease behavior before multi-user release @spec @phase4 @implemented
 - phase 4D completes Automation Workflows, ecosystem distribution expansion, and native action relay only after their versioned command, schema, capability, security, and acceptance contracts pass without weakening earlier phase gates @spec @phase4 @later
 
 # sessions
@@ -1491,7 +1491,7 @@
 - Turn admission requires both the selected Control Lease and absence of a Maintenance Lease for the same Host @spec @mvp @implemented
 - a maintenance operation that requires a live Computer Use postcheck retains its Maintenance Lease and atomically acquires an operation-owned postcheck Control sublease before running the probe @spec @mvp @implemented
 - no other Turn, probe, or maintenance operation is admitted while a maintenance operation owns its postcheck Control sublease @spec @mvp @implemented
-- a queued Turn Request does not start while a Maintenance Lease exists for its Host @spec @later
+- a queued Turn Request does not start while a Maintenance Lease exists for its Host @spec @phase4 @implemented
 - a maintenance operation without a live postcheck releases its Maintenance Lease only in the transaction that durably commits its final action-ledger state @spec @mvp @implemented
 - a maintenance operation with a live postcheck releases its postcheck Control sublease and Maintenance Lease only in the transaction that commits the final Readiness Result and final action-ledger state @spec @mvp @implemented
 - Control and Maintenance Leases contain an operation id, owner process identity, acquisition time, and heartbeat time @spec @mvp @implemented
@@ -1562,35 +1562,35 @@
 - satelle MVP allows multiple stored Sessions per Host but only one active native Computer Use Turn per Control Lease at a time @mvp @implemented
 - satelle run and steer report a typed host-busy error when they would start a second active Computer Use Turn for the same Control Lease @spec @mvp @implemented
 - satelle MVP does not automatically queue run or steer commands when a host is busy @implemented @mvp
-- satelle later explicit queueing is disabled by default and never changes MVP host-busy behavior unless the user opts in for the selected Host, selected profile, or specific run or steer command @spec @later
-- satelle run and steer use --queue as the exact per-command queue opt-in @spec @later
-- every accepted Queued Turn Request receives a public identifier using the exact rq_ prefix followed by a canonical lowercase UUIDv7 @spec @contract @later
-- enqueueing creates a Queued Turn Request but no upstream thread or Turn; queued run creates its Session, upstream thread, and starting Turn atomically only when admitted, while queued steer links to its existing Session @spec @later
-- satelle queue status <queue_request_id> and satelle queue cancel <queue_request_id> are the canonical inspection and cancellation commands @spec @later
-- satelle queue status JSON v1 uses schema_version satelle.queue.status.v1 and includes queue_request_id, status, position, enqueued_at, expires_at, session_id, turn_id, failure, and state revision fields where applicable @spec @contract @later
-- satelle queue cancel JSON v1 uses schema_version satelle.queue.cancel.v1 and includes queue_request_id, outcome, changed, session_id, and turn_id; outcome is cancelled or already_terminal @spec @contract @later
-- queue cancel on an already admitted request reports queue-already-admitted with its Session and Turn identifiers plus a stop command instead of attempting to cancel the queue record @spec @later
-- user-level Host and profile configuration use queue.enabled, queue.max_depth, and queue.ttl as the exact queue settings @spec @later
-- queue lifecycle results and events include queue_request_id and link the admitted Session and Turn identifiers when admission succeeds @spec @contract @later
-- satelle project-level configuration, install scripts, setup defaults, --yes, YOLO mode, Trusted Profile mutation consent, and transport defaults cannot enable queued prompt execution @spec @later
-- satelle queued run and steer requests preserve the one active native Computer Use Turn per Control Lease invariant by starting only after the current active Turn releases that Control Lease @spec @later
-- satelle queued run and steer requests are stored, ordered, and started by the target Host Daemon instead of by the local CLI process @spec @later
-- satelle queued run and steer requests revalidate host reachability, native Computer Use readiness, provider Computer Use compatibility, desktop session resolution, and session existence immediately before starting instead of treating enqueue-time preflight as authorization to execute later @spec @later
-- each Queued Turn Request stores the non-secret API Principal token id and token credential revision, immutable request digest, and requested execution policy without storing bearer-token material @spec @later
-- immediately before a queued request starts, the Host Daemon revalidates that its API Principal and token credential revision still exist, are not expired or revoked, retain the required scopes, and remain authorized by current Host, Desktop Binding, provider, YOLO, and execution-policy constraints @spec @later
-- token expiry, revocation, or rotation cancels not-yet-started queued requests authorized by the affected token credential revision and records a typed queued-principal-no-longer-authorized outcome @spec @later
-- satelle queued run and steer requests support explicit cancellation before they start and report typed errors for canceled, expired, full-queue, and pre-start-validation-failed outcomes @spec @later
-- satelle explicit queueing uses FIFO ordering within one Control Lease @spec @later
-- satelle queued Turn Requests default to a maximum queue depth of 16 per Control Lease @spec @later
-- queue.max_depth accepts values from 1 through 256 @spec @later
-- satelle queued Turn Requests expire after 1 hour by default @spec @later
-- queue.ttl is configurable per Host or profile with a finite maximum of 24 hours @spec @later
-- queued Turn Requests survive Host Daemon restart in the authoritative SQLite store @spec @later
-- explicit queueing warns that the queued prompt and attachment staging must be retained until the request starts, is cancelled, or expires @spec @later
-- queued prompt payloads are stored separately from Session and Turn metadata under the sensitive-state filesystem boundary @spec @later
-- queued prompt payloads and attachments are deleted after Turn admission, cancellation, expiry, or bounded crash-recovery cleanup @spec @later
-- satelle queue status and logs expose queued position, enqueue time, expiry time, and normalized pre-start failure without exposing raw prompt or attachment content @spec @later
-- Satelle Events distinguish turn_queued, queue_position_changed, turn_dequeued, turn_queue_cancelled, turn_queue_expired, and turn_queue_validation_failed @spec @later
+- satelle later explicit queueing is disabled by default and never changes MVP host-busy behavior unless the user opts in for the selected Host, selected profile, or specific run or steer command @spec @phase4 @implemented
+- satelle run and steer use --queue as the exact per-command queue opt-in @spec @phase4 @implemented
+- every accepted Queued Turn Request receives a public identifier using the exact rq_ prefix followed by a canonical lowercase UUIDv7 @spec @contract @phase4 @implemented
+- enqueueing creates a Queued Turn Request but no upstream thread or Turn; queued run creates its Session, upstream thread, and starting Turn atomically only when admitted, while queued steer links to its existing Session @spec @phase4 @implemented
+- satelle queue status <queue_request_id> and satelle queue cancel <queue_request_id> are the canonical inspection and cancellation commands @spec @phase4 @implemented
+- satelle queue status JSON v1 uses schema_version satelle.queue.status.v1 and includes queue_request_id, status, position, enqueued_at, expires_at, session_id, turn_id, failure, and state revision fields where applicable @spec @contract @phase4 @implemented
+- satelle queue cancel JSON v1 uses schema_version satelle.queue.cancel.v1 and includes queue_request_id, outcome, changed, session_id, and turn_id; outcome is cancelled or already_terminal @spec @contract @phase4 @implemented
+- queue cancel on an already admitted request reports queue-already-admitted with its Session and Turn identifiers plus a stop command instead of attempting to cancel the queue record @spec @phase4 @implemented
+- user-level Host and profile configuration use queue.enabled, queue.max_depth, and queue.ttl as the exact queue settings @spec @phase4 @implemented
+- queue lifecycle results and events include queue_request_id and link the admitted Session and Turn identifiers when admission succeeds @spec @contract @phase4 @implemented
+- satelle project-level configuration, install scripts, setup defaults, --yes, YOLO mode, Trusted Profile mutation consent, and transport defaults cannot enable queued prompt execution @spec @phase4 @implemented
+- satelle queued run and steer requests preserve the one active native Computer Use Turn per Control Lease invariant by starting only after the current active Turn releases that Control Lease @spec @phase4 @implemented
+- satelle queued run and steer requests are stored, ordered, and started by the target Host Daemon instead of by the local CLI process @spec @phase4 @implemented
+- satelle queued run and steer requests revalidate host reachability, native Computer Use readiness, provider Computer Use compatibility, desktop session resolution, and session existence immediately before starting instead of treating enqueue-time preflight as authorization to execute later @spec @phase4 @implemented
+- each Queued Turn Request stores the non-secret API Principal token id and token credential revision, immutable request digest, and requested execution policy without storing bearer-token material @spec @phase4 @implemented
+- immediately before a queued request starts, the Host Daemon revalidates that its API Principal and token credential revision still exist, are not expired or revoked, retain the required scopes, and remain authorized by current Host, Desktop Binding, provider, YOLO, and execution-policy constraints @spec @phase4 @implemented
+- token expiry, revocation, or rotation cancels not-yet-started queued requests authorized by the affected token credential revision and records a typed queued-principal-no-longer-authorized outcome @spec @phase4 @implemented
+- satelle queued run and steer requests support explicit cancellation before they start and report typed errors for canceled, expired, full-queue, and pre-start-validation-failed outcomes @spec @phase4 @implemented
+- satelle explicit queueing uses FIFO ordering within one Control Lease @spec @phase4 @implemented
+- satelle queued Turn Requests default to a maximum queue depth of 16 per Control Lease @spec @phase4 @implemented
+- queue.max_depth accepts values from 1 through 256 @spec @phase4 @implemented
+- satelle queued Turn Requests expire after 1 hour by default @spec @phase4 @implemented
+- queue.ttl is configurable per Host or profile with a finite maximum of 24 hours @spec @phase4 @implemented
+- queued Turn Requests survive Host Daemon restart in the authoritative SQLite store @spec @phase4 @implemented
+- explicit queueing warns that the queued prompt and attachment staging must be retained until the request starts, is cancelled, or expires @spec @phase4 @implemented
+- queued prompt payloads are stored separately from Session and Turn metadata under the sensitive-state filesystem boundary @spec @phase4 @implemented
+- queued prompt payloads and attachments are deleted after Turn admission, cancellation, expiry, or bounded crash-recovery cleanup @spec @phase4 @implemented
+- satelle queue status and logs expose queued position, enqueue time, expiry time, and normalized pre-start failure without exposing raw prompt or attachment content @spec @phase4 @implemented
+- Satelle Events distinguish turn_queued, queue_position_changed, turn_dequeued, turn_queue_cancelled, turn_queue_expired, and turn_queue_validation_failed @spec @phase4 @implemented
 - satelle maps each Satelle session to the underlying Codex thread, turn, and goal identifiers inside the Host Daemon adapter layer @spec @mvp @implemented
 - the Host Daemon durably persists each newly observed upstream Codex thread or Turn identifier before the Codex adapter continues waiting for later upstream work @mvp @implemented
 - persisting an upstream Codex identifier does not change Session or Turn lifecycle state, state revisions, safe logs, idempotency outcomes, or Control Lease ownership @mvp @implemented

@@ -33,6 +33,7 @@ mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "test-runtime.rs"]
 mod test_runtime;
+mod turn_queue;
 #[cfg(windows)]
 #[path = "windows-native-probe.rs"]
 mod windows_native_probe;
@@ -3315,6 +3316,7 @@ impl HostService {
         storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
         telemetry: Option<satelle_core::telemetry::TelemetryConfig>,
         recording: Option<satelle_core::recording::RecordingPolicy>,
+        queue: satelle_core::queue::QueueConfig,
     ) -> Result<Self, SatelleError> {
         let mut config = satelle_core::SatelleConfig::defaults()
             .hosts
@@ -3354,6 +3356,7 @@ impl HostService {
         config.platform_log_sink = storage_policy.platform_log_sink();
         config.telemetry = telemetry;
         config.recording = recording;
+        config.queue = queue;
         Ok(Self::production_for_host(&config))
     }
 

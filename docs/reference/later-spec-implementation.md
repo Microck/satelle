@@ -31,8 +31,8 @@ those pull requests merge, the integration branch gets a final pull request to
 | Setup and repair subprocess exports | Selected bounded SSH output for one consented invocation | Merged in PR #242 |
 | Desktop snapshot export | Current native desktop capture with consent, redaction, and audit metadata | Merged in PR #243 |
 | Opt-in telemetry | Independent Controller and Host OTLP/HTTP export with private bounded queues | Merged in PR #244 |
-| Recording | Per-Turn recording modes and export policy | In PR #245 |
-| Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
+| Recording | Per-Turn recording modes and export policy | Merged in PR #245 |
+| Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | In PR #247 |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Pending |
 | Automation | Batch, watch, webhook notifications, REPL, command history | Pending |
 | Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Pending |
@@ -59,6 +59,28 @@ or approval is a blocker, never proof of implementation.
   clears unsent records without collector contact.
 - `satelle telemetry status` inspects the Controller. `--host <alias>` reads the
   authenticated Host status.
+
+## Durable admission queue decisions
+
+- Queueing is disabled unless the selected user-owned Host or profile enables
+  it, or one `run` or `steer` command passes `--queue`. Project configuration,
+  setup defaults, consent flags, and transport defaults cannot enable it.
+- The Host owns FIFO order per Host Identity and Desktop Binding. Enqueueing a
+  run creates no Session, Turn, or upstream work. Enqueueing a steer retains
+  the existing Session identity without starting a Turn.
+- Private prompt and attachment payloads live outside SQLite under the Host's
+  sensitive-state boundary. SQLite stores durable queue metadata, request
+  identity, token id and credential revision, state revisions, and safe failure
+  details.
+- Admission rechecks the token revision and scope, Host and Desktop Binding,
+  current queue policy, maintenance and Control Leases, Session state, native
+  readiness, provider support, YOLO policy, and execution policy.
+- Cancellation, expiry, admission, validation failure, and startup recovery
+  remove private payloads. Position changes and terminal outcomes use durable
+  state revisions, normalized logs, and the closed queue event set.
+- `queue status` and `queue cancel` use the public `rq_` identity. Protocol v21
+  and `satelle.api.v11` carry queue opt-in and the strict status and cancellation
+  response contracts.
 
 ## Turn recording decisions
 
@@ -88,7 +110,7 @@ npm checks, and the production documentation build.
 - Attached output reports the manifest path, every artifact path, expiry, and
   cleanup command. Remote Controllers retrieve the completed manifest through
   the authenticated `diagnostics:sensitive` contract after terminal status.
-  Protocol v20 and `satelle.api.v10` define this recording request boundary.
+  Protocol v21 and `satelle.api.v11` define this recording request boundary.
 
 ## Raw protocol diagnostic decisions
 
@@ -333,7 +355,7 @@ plus documentation and release installation checks on all six targets.
 - Paths use absolute native Host syntax. The Controller neither interprets nor
   opens them. The Host applies bounded regular-file reads before admission.
 - Uploads and Host paths share the current tagged attachment list in
-  `satelle.api.v10` and protocol version 20. No older request shape is accepted.
+  `satelle.api.v11` and protocol version 21. No older request shape is accepted.
 - The keyed operation identity includes the path reference. A replay or
   cancellation resolves from durable admission state without reopening files.
 - Remote files share the upload limits and private staging lifecycle. Cleanup

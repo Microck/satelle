@@ -7,10 +7,13 @@ use uuid::{Uuid, Variant, Version};
 
 const SESSION_ID_PREFIX: &str = "rs_";
 const TURN_ID_PREFIX: &str = "rt_";
+const QUEUE_REQUEST_ID_PREFIX: &str = "rq_";
 
 /// JSON Schema pattern for the canonical public Session identifier format.
 pub const SESSION_ID_PATTERN: &str =
     "^rs_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
+pub const QUEUE_REQUEST_ID_PATTERN: &str =
+    "^rq_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 
 /// Explains why a public Satelle identifier could not be parsed.
 ///
@@ -173,6 +176,11 @@ define_public_id!(
     TurnId,
     TURN_ID_PREFIX,
     "a Satelle Turn identifier in rt_<canonical lowercase UUIDv7> form"
+);
+define_public_id!(
+    QueueRequestId,
+    QUEUE_REQUEST_ID_PREFIX,
+    "a Satelle queue request identifier in rq_<canonical lowercase UUIDv7> form"
 );
 
 #[cfg(test)]

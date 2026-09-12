@@ -52,23 +52,35 @@ pub(super) fn insert_safe_log(
     let effective_nanos = prior_nanos.map_or(requested_nanos, |prior| prior.max(requested_nanos));
     let effective_at = OffsetDateTime::from_unix_timestamp_nanos(i128::from(effective_nanos))
         .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
-    let (session_id, turn_id, session_revision, turn_revision) = match record.subject() {
-        LogSubject::Host => (None, None, None, None),
-        LogSubject::Turn {
-            session_id,
-            turn_id,
-            session_state_revision,
-            turn_state_revision,
-        } => (
-            Some(session_id.as_str()),
-            Some(turn_id.as_str()),
-            Some(format_revision(*session_state_revision)),
-            Some(format_turn_revision(*turn_state_revision)),
-        ),
-    };
+    let (session_id, turn_id, session_revision, turn_revision, queue_status_json) =
+        match record.subject() {
+            LogSubject::Host => (None, None, None, None, None),
+            LogSubject::Turn {
+                session_id,
+                turn_id,
+                session_state_revision,
+                turn_state_revision,
+            } => (
+                Some(session_id.as_str()),
+                Some(turn_id.as_str()),
+                Some(format_revision(*session_state_revision)),
+                Some(format_turn_revision(*turn_state_revision)),
+                None,
+            ),
+            LogSubject::Queue { queue_status } => (
+                queue_status.session_id.as_ref().map(SessionId::as_str),
+                queue_status.turn_id.as_ref().map(TurnId::as_str),
+                None,
+                None,
+                Some(
+                    serde_json::to_string(queue_status)
+                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?,
+                ),
+            ),
+        };
     transaction
         .execute(
-            "INSERT INTO logs (recorded_at, recorded_at_unix_nanos, source, severity, event_kind, session_id, turn_id, session_state_revision, turn_state_revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO logs (recorded_at, recorded_at_unix_nanos, source, severity, event_kind, session_id, turn_id, session_state_revision, turn_state_revision, queue_status_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 format_time(effective_at)?,
                 effective_nanos,
@@ -79,6 +91,7 @@ pub(super) fn insert_safe_log(
                 turn_id,
                 session_revision,
                 turn_revision,
+                queue_status_json,
             ],
         )
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;

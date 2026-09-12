@@ -15,6 +15,7 @@ mod path_migration;
 mod platform_log;
 #[path = "storage/provider-secret-journal.rs"]
 mod provider_secret_journal;
+mod queue;
 #[path = "storage/raw-diagnostics.rs"]
 mod raw_diagnostics;
 #[path = "storage/recording.rs"]
@@ -66,6 +67,9 @@ pub(crate) use self::provider_secret_journal::{
     ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
     ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay,
     provider_secret_file_paths,
+};
+pub(crate) use self::queue::{
+    NewQueueRecord, QueueEnqueueOutcome, StoredQueueRecord, TurnQueueOperation,
 };
 pub(crate) use self::retention::{
     DEFAULT_LOG_RETENTION, DEFAULT_SESSION_RETENTION, DEFAULT_SETUP_LEDGER_RETENTION,
@@ -461,10 +465,11 @@ mod ssh_identity_commit_tests {
         (20, "fnv1a64:349cb7810ef318f4"),
         (21, "fnv1a64:63131767685873a3"),
         (22, "fnv1a64:691b625c8486aa5a"),
+        (23, "fnv1a64:fe4ec60e156190f1"),
     ];
-    const EXPECTED_SCHEMA_ROW_COUNT: usize = 86;
+    const EXPECTED_SCHEMA_ROW_COUNT: usize = 92;
     const EXPECTED_SCHEMA_SHA256: &str =
-        "bd1041810dc2befc089df062dd58c9753c6b4479c73a15d6b46cd6c20885548f";
+        "8e34ad5eeb9cdf3d2a2e2e28c0eaea094873882cf023b3936894f0ec6f932bc9";
 
     fn identity() -> HostIdentityRef {
         HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")
@@ -613,7 +618,7 @@ mod ssh_identity_commit_tests {
         let user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema user version");
-        assert_eq!(user_version, 22);
+        assert_eq!(user_version, 23);
 
         let schema = connection
             .prepare(

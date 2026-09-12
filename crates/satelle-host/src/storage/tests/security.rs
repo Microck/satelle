@@ -221,6 +221,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "setup_actions",
             "setup_runs",
             "sqlite_sequence",
+            "turn_admission_queue",
             "turn_admission_readiness",
             "turn_policies",
             "turn_private_refs",
@@ -429,7 +430,35 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "turn_id",
             "session_state_revision",
             "turn_state_revision",
+            "queue_status_json",
             "redacted",
+        ],
+    );
+    // Queue payloads remain in the owner-private staging directory. SQLite
+    // retains admission authority, an integrity digest, lifecycle metadata,
+    // and the generated payload file name.
+    assert_table_columns(
+        &storage,
+        "turn_admission_queue",
+        &[
+            "queue_request_id",
+            "lease_key",
+            "token_id",
+            "credential_revision",
+            "principal_ref",
+            "operation",
+            "idempotency_key",
+            "request_digest",
+            "payload_file",
+            "payload_sha256",
+            "status",
+            "enqueued_at",
+            "expires_at",
+            "session_id",
+            "turn_id",
+            "failure_code",
+            "failure_message",
+            "state_revision",
         ],
     );
     assert_table_columns(

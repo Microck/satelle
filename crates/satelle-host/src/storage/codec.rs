@@ -70,6 +70,7 @@ struct RawLogRow {
     turn_id: Option<String>,
     session_revision: Option<String>,
     turn_revision: Option<String>,
+    queue_status_json: Option<String>,
 }
 
 pub(super) fn load_session_from_connection(
@@ -204,7 +205,7 @@ pub(super) fn load_log_records(
 ) -> Result<Vec<StoredLogRecord>, StorageError> {
     let mut statement = connection
         .prepare(
-            "SELECT log_cursor, recorded_at, source, severity, event_kind, session_id, turn_id, session_state_revision, turn_state_revision FROM logs WHERE log_cursor > ?1 ORDER BY log_cursor LIMIT ?2",
+            "SELECT log_cursor, recorded_at, source, severity, event_kind, session_id, turn_id, session_state_revision, turn_state_revision, queue_status_json FROM logs WHERE log_cursor > ?1 ORDER BY log_cursor LIMIT ?2",
         )
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
     let rows = statement
@@ -219,6 +220,7 @@ pub(super) fn load_log_records(
                 turn_id: row.get(6)?,
                 session_revision: row.get(7)?,
                 turn_revision: row.get(8)?,
+                queue_status_json: row.get(9)?,
             })
         })
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -263,7 +265,7 @@ pub(super) fn load_log_page_records(
         i64::try_from(limit).map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
     let mut statement = connection
         .prepare(
-            "SELECT log_cursor, recorded_at, source, severity, event_kind, session_id, turn_id, session_state_revision, turn_state_revision
+            "SELECT log_cursor, recorded_at, source, severity, event_kind, session_id, turn_id, session_state_revision, turn_state_revision, queue_status_json
              FROM logs
              WHERE (?1 = 0 OR log_cursor > ?2)
                AND (?3 IS NULL OR session_id = ?3)
@@ -306,6 +308,7 @@ pub(super) fn load_log_page_records(
                     turn_id: row.get(6)?,
                     session_revision: row.get(7)?,
                     turn_revision: row.get(8)?,
+                    queue_status_json: row.get(9)?,
                 })
             },
         )
@@ -680,6 +683,12 @@ pub(super) fn log_event_token(value: LogEvent) -> &'static str {
         LogEvent::StopConfirmed => "stop_confirmed",
         LogEvent::StopNotConfirmed => "stop_not_confirmed",
         LogEvent::RestartRecoveryPending => "restart_recovery_pending",
+        LogEvent::TurnQueued => "turn_queued",
+        LogEvent::QueuePositionChanged => "queue_position_changed",
+        LogEvent::TurnDequeued => "turn_dequeued",
+        LogEvent::TurnQueueCancelled => "turn_queue_cancelled",
+        LogEvent::TurnQueueExpired => "turn_queue_expired",
+        LogEvent::TurnQueueValidationFailed => "turn_queue_validation_failed",
         LogEvent::StoreOpened => "store_opened",
     }
 }
@@ -695,30 +704,52 @@ fn parse_log_event(value: &str) -> Result<LogEvent, StorageError> {
         "stop_confirmed" => Ok(LogEvent::StopConfirmed),
         "stop_not_confirmed" => Ok(LogEvent::StopNotConfirmed),
         "restart_recovery_pending" => Ok(LogEvent::RestartRecoveryPending),
+        "turn_queued" => Ok(LogEvent::TurnQueued),
+        "queue_position_changed" => Ok(LogEvent::QueuePositionChanged),
+        "turn_dequeued" => Ok(LogEvent::TurnDequeued),
+        "turn_queue_cancelled" => Ok(LogEvent::TurnQueueCancelled),
+        "turn_queue_expired" => Ok(LogEvent::TurnQueueExpired),
+        "turn_queue_validation_failed" => Ok(LogEvent::TurnQueueValidationFailed),
         "store_opened" => Ok(LogEvent::StoreOpened),
         _ => Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
     }
 }
 
 fn parse_log_row(row: RawLogRow) -> Result<StoredLogRecord, StorageError> {
-    let subject = match (
-        row.session_id,
-        row.turn_id,
-        row.session_revision,
-        row.turn_revision,
-    ) {
-        (None, None, None, None) => LogSubject::Host,
-        (Some(session_id), Some(turn_id), Some(session_revision), Some(turn_revision)) => {
-            LogSubject::Turn {
-                session_id: SessionId::parse(&session_id)
-                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
-                turn_id: TurnId::parse(&turn_id)
-                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
-                session_state_revision: parse_session_revision(&session_revision)?,
-                turn_state_revision: parse_turn_revision(&turn_revision)?,
+    let subject = match row.queue_status_json {
+        Some(queue_status_json) => {
+            if row.session_revision.is_some() || row.turn_revision.is_some() {
+                return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
             }
+            let queue_status =
+                serde_json::from_str::<satelle_core::queue::QueueStatus>(&queue_status_json)
+                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+            if row.session_id.as_deref() != queue_status.session_id.as_ref().map(SessionId::as_str)
+                || row.turn_id.as_deref() != queue_status.turn_id.as_ref().map(TurnId::as_str)
+            {
+                return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
+            }
+            LogSubject::Queue { queue_status }
         }
-        _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+        None => match (
+            row.session_id,
+            row.turn_id,
+            row.session_revision,
+            row.turn_revision,
+        ) {
+            (None, None, None, None) => LogSubject::Host,
+            (Some(session_id), Some(turn_id), Some(session_revision), Some(turn_revision)) => {
+                LogSubject::Turn {
+                    session_id: SessionId::parse(&session_id)
+                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
+                    turn_id: TurnId::parse(&turn_id)
+                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
+                    session_state_revision: parse_session_revision(&session_revision)?,
+                    turn_state_revision: parse_turn_revision(&turn_revision)?,
+                }
+            }
+            _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+        },
     };
     let record = SafeLogRecord::new(
         parse_time(&row.recorded_at)?,

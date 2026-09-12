@@ -210,6 +210,10 @@ impl Command {
                     EventOutput::None
                 },
             ),
+            Self::Queue { command } => match command {
+                super::QueueCommand::Status(command) => (command.output_args, EventOutput::None),
+                super::QueueCommand::Cancel(command) => (command.output_args, EventOutput::None),
+            },
             Self::Status(command) => (command.output_args, EventOutput::None),
             Self::Stop(command) => (command.output_args, EventOutput::None),
             Self::Session { .. } => (OutputArgs::default(), EventOutput::None),

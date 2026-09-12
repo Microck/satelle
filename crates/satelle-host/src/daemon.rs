@@ -332,6 +332,12 @@ impl TurnIntent {
         &self.attachments
     }
 
+    pub(crate) const fn turn_execution_timeout(
+        &self,
+    ) -> Option<satelle_core::session::TimeoutPolicy> {
+        self.turn_execution_timeout
+    }
+
     pub(crate) fn raw_protocol_source_host(&self) -> Option<&str> {
         self.raw_protocol_source_host.as_deref()
     }
@@ -679,6 +685,16 @@ impl HostService {
 
     pub fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {
         self.runtime.daemon_workers_idle()
+    }
+
+    /// Starts a daemon lifecycle that may drain durable queued Turns.
+    pub fn prepare_queue_worker_for_daemon(&self) {
+        self.runtime.prepare_queue_worker_for_daemon();
+    }
+
+    /// Stops queue admission before the transport waits for daemon workers.
+    pub fn request_queue_worker_shutdown(&self) {
+        self.runtime.request_queue_worker_shutdown();
     }
 
     pub fn daemon_activity_snapshot(&self) -> Result<DaemonActivitySnapshot, SatelleError> {

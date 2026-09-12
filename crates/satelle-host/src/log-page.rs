@@ -1,3 +1,4 @@
+use satelle_core::queue::QueueStatus;
 use satelle_core::session::{HostIdentityRef, SessionStateRevision, TurnStateRevision};
 use satelle_core::{SessionId, TurnId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -143,6 +144,12 @@ pub enum LogEvent {
     StopConfirmed,
     StopNotConfirmed,
     RestartRecoveryPending,
+    TurnQueued,
+    QueuePositionChanged,
+    TurnDequeued,
+    TurnQueueCancelled,
+    TurnQueueExpired,
+    TurnQueueValidationFailed,
     StoreOpened,
 }
 
@@ -158,6 +165,12 @@ impl LogEvent {
             Self::StopConfirmed => "stop_confirmed",
             Self::StopNotConfirmed => "stop_not_confirmed",
             Self::RestartRecoveryPending => "restart_recovery_pending",
+            Self::TurnQueued => "turn_queued",
+            Self::QueuePositionChanged => "queue_position_changed",
+            Self::TurnDequeued => "turn_dequeued",
+            Self::TurnQueueCancelled => "turn_queue_cancelled",
+            Self::TurnQueueExpired => "turn_queue_expired",
+            Self::TurnQueueValidationFailed => "turn_queue_validation_failed",
             Self::StoreOpened => "store_opened",
         }
     }
@@ -173,12 +186,55 @@ impl LogEvent {
             Self::StopConfirmed => "confirmed stop request",
             Self::StopNotConfirmed => "stop request requires recovery",
             Self::RestartRecoveryPending => "Turn requires restart recovery",
+            Self::TurnQueued => "queued Turn request",
+            Self::QueuePositionChanged => "queued Turn position changed",
+            Self::TurnDequeued => "admitted queued Turn request",
+            Self::TurnQueueCancelled => "cancelled queued Turn request",
+            Self::TurnQueueExpired => "queued Turn request expired",
+            Self::TurnQueueValidationFailed => "queued Turn failed pre-start validation",
             Self::StoreOpened => "opened Host state store",
         }
     }
 
-    pub(crate) const fn has_turn_subject(self) -> bool {
-        !matches!(self, Self::StoreOpened)
+    pub(crate) const fn subject_kind(self) -> LogSubjectKind {
+        match self {
+            Self::StoreOpened => LogSubjectKind::Host,
+            Self::TurnQueued
+            | Self::QueuePositionChanged
+            | Self::TurnDequeued
+            | Self::TurnQueueCancelled
+            | Self::TurnQueueExpired
+            | Self::TurnQueueValidationFailed => LogSubjectKind::Queue,
+            _ => LogSubjectKind::Turn,
+        }
+    }
+
+    pub(crate) const fn matches_queue_status(
+        self,
+        status: satelle_core::queue::QueueRequestStatus,
+    ) -> bool {
+        matches!(
+            (self, status),
+            (
+                Self::TurnQueued,
+                satelle_core::queue::QueueRequestStatus::Queued
+            ) | (
+                Self::QueuePositionChanged,
+                satelle_core::queue::QueueRequestStatus::Queued
+            ) | (
+                Self::TurnDequeued,
+                satelle_core::queue::QueueRequestStatus::Admitted
+            ) | (
+                Self::TurnQueueCancelled,
+                satelle_core::queue::QueueRequestStatus::Cancelled
+            ) | (
+                Self::TurnQueueExpired,
+                satelle_core::queue::QueueRequestStatus::Expired
+            ) | (
+                Self::TurnQueueValidationFailed,
+                satelle_core::queue::QueueRequestStatus::ValidationFailed
+            )
+        )
     }
 
     pub(crate) const fn source(self) -> LogSource {
@@ -188,13 +244,26 @@ impl LogEvent {
             | Self::NativeReadinessSummary
             | Self::StopConfirmed
             | Self::StopNotConfirmed
-            | Self::RestartRecoveryPending => LogSource::HostDaemon,
+            | Self::RestartRecoveryPending
+            | Self::TurnQueued
+            | Self::QueuePositionChanged
+            | Self::TurnDequeued
+            | Self::TurnQueueCancelled
+            | Self::TurnQueueExpired
+            | Self::TurnQueueValidationFailed => LogSource::HostDaemon,
             Self::ProviderSmokeSummary
             | Self::TurnStateCommitted
             | Self::StructuredExecutionError => LogSource::CodexAdapter,
             Self::StoreOpened => LogSource::Storage,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogSubjectKind {
+    Host,
+    Turn,
+    Queue,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -206,6 +275,9 @@ pub enum LogSubject {
         turn_id: TurnId,
         session_state_revision: SessionStateRevision,
         turn_state_revision: TurnStateRevision,
+    },
+    Queue {
+        queue_status: QueueStatus,
     },
 }
 
@@ -302,8 +374,19 @@ impl DaemonLogEntry {
         if self.cursor.position() == 0 {
             return Err("a Log Entry cannot use the retained-history origin cursor");
         }
-        if self.event.has_turn_subject() != matches!(self.subject, LogSubject::Turn { .. }) {
+        let subject_kind = match self.subject {
+            LogSubject::Host => LogSubjectKind::Host,
+            LogSubject::Turn { .. } => LogSubjectKind::Turn,
+            LogSubject::Queue { .. } => LogSubjectKind::Queue,
+        };
+        if self.event.subject_kind() != subject_kind {
             return Err("the Log Entry event contradicts its subject");
+        }
+        if let LogSubject::Queue { queue_status } = &self.subject {
+            queue_status.validate()?;
+            if !self.event.matches_queue_status(queue_status.status) {
+                return Err("the Log Entry event contradicts its queue status");
+            }
         }
         if self.source != self.event.source() {
             return Err("the Log Entry source contradicts its event");
@@ -562,6 +645,10 @@ impl LogPageQuery {
             matches!(
                 entry.subject(),
                 LogSubject::Turn { session_id, .. } if session_id == requested_session
+            ) || matches!(
+                entry.subject(),
+                LogSubject::Queue { queue_status }
+                    if queue_status.session_id.as_ref() == Some(requested_session)
             )
         });
         session_matches
@@ -817,19 +904,68 @@ mod tests {
             (LogEvent::StopConfirmed, LogSource::HostDaemon),
             (LogEvent::StopNotConfirmed, LogSource::HostDaemon),
             (LogEvent::RestartRecoveryPending, LogSource::HostDaemon),
+            (LogEvent::TurnQueued, LogSource::HostDaemon),
+            (LogEvent::QueuePositionChanged, LogSource::HostDaemon),
+            (LogEvent::TurnDequeued, LogSource::HostDaemon),
+            (LogEvent::TurnQueueCancelled, LogSource::HostDaemon),
+            (LogEvent::TurnQueueExpired, LogSource::HostDaemon),
+            (LogEvent::TurnQueueValidationFailed, LogSource::HostDaemon),
             (LogEvent::StoreOpened, LogSource::Storage),
         ];
         for (index, (event, source)) in events.into_iter().enumerate() {
-            let subject = if event.has_turn_subject() {
-                LogSubject::Turn {
+            let subject = match event.subject_kind() {
+                LogSubjectKind::Turn => LogSubject::Turn {
                     session_id: SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11")
                         .unwrap(),
                     turn_id: TurnId::parse("rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21").unwrap(),
                     session_state_revision: SessionStateRevision::initial(),
                     turn_state_revision: TurnStateRevision::initial(),
+                },
+                LogSubjectKind::Queue => {
+                    let status = match event {
+                        LogEvent::TurnQueued | LogEvent::QueuePositionChanged => {
+                            satelle_core::queue::QueueRequestStatus::Queued
+                        }
+                        LogEvent::TurnDequeued => satelle_core::queue::QueueRequestStatus::Admitted,
+                        LogEvent::TurnQueueCancelled => {
+                            satelle_core::queue::QueueRequestStatus::Cancelled
+                        }
+                        LogEvent::TurnQueueExpired => {
+                            satelle_core::queue::QueueRequestStatus::Expired
+                        }
+                        LogEvent::TurnQueueValidationFailed => {
+                            satelle_core::queue::QueueRequestStatus::ValidationFailed
+                        }
+                        _ => unreachable!(),
+                    };
+                    let admitted = status == satelle_core::queue::QueueRequestStatus::Admitted;
+                    LogSubject::Queue {
+                        queue_status: QueueStatus::new(
+                            satelle_core::QueueRequestId::parse(
+                                "rq_01890a5d-ac96-7b7c-8f89-37c3d0a66e31",
+                            )
+                            .unwrap(),
+                            status,
+                            (status == satelle_core::queue::QueueRequestStatus::Queued)
+                                .then_some(1),
+                            OffsetDateTime::UNIX_EPOCH,
+                            OffsetDateTime::UNIX_EPOCH + time::Duration::HOUR,
+                            admitted.then(|| {
+                                SessionId::parse("rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11").unwrap()
+                            }),
+                            admitted.then(|| {
+                                TurnId::parse("rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21").unwrap()
+                            }),
+                            (status == satelle_core::queue::QueueRequestStatus::ValidationFailed)
+                                .then(|| satelle_core::queue::QueueFailure {
+                                    code: "queue-validation-failed".to_string(),
+                                    message: "queued validation failed".to_string(),
+                                }),
+                            1,
+                        ),
+                    }
                 }
-            } else {
-                LogSubject::Host
+                LogSubjectKind::Host => LogSubject::Host,
             };
             let entry = DaemonLogEntry::from_parts(
                 u64::try_from(index + 1).unwrap(),
