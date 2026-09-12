@@ -210,12 +210,12 @@ impl RawDiagnosticExports {
             let capture =
                 RawProtocolCapture::failed(manifest.clone(), RawDiagnosticFailure::StagingFailed);
             if storage
-                .begin_raw_diagnostic_export(principal_ref, &manifest, created_at)
+                .begin_raw_diagnostic_export(principal_ref, &(&manifest).into(), created_at)
                 .is_ok()
             {
                 let _ = storage.finish_raw_diagnostic_export(
                     principal_ref,
-                    &turn_id,
+                    turn_id.as_str(),
                     RawDiagnosticExportOutcome::Failed,
                     created_at,
                 );
@@ -224,7 +224,7 @@ impl RawDiagnosticExports {
         }
         let capture = RawProtocolCapture::new(manifest.clone());
         if storage
-            .begin_raw_diagnostic_export(principal_ref, &manifest, created_at)
+            .begin_raw_diagnostic_export(principal_ref, &(&manifest).into(), created_at)
             .is_err()
         {
             capture.fail(RawDiagnosticFailure::StagingFailed);
@@ -264,7 +264,7 @@ impl RawDiagnosticExports {
         };
         if let Some(size) = size
             && storage_guard
-                .prepare_raw_diagnostic_export(turn_id, size)
+                .prepare_raw_diagnostic_export(turn_id.as_str(), size)
                 .is_err()
         {
             export = RawExportState::Failed(RawDiagnosticFailure::StagingFailed);
@@ -272,7 +272,7 @@ impl RawDiagnosticExports {
         if matches!(export, RawExportState::Failed(_)) {
             let _ = storage_guard.finish_raw_diagnostic_export(
                 &principal_ref,
-                turn_id,
+                turn_id.as_str(),
                 RawDiagnosticExportOutcome::Failed,
                 completed_at,
             );
@@ -363,7 +363,7 @@ impl RawDiagnosticExports {
             return Err(raw_export_unavailable());
         }
         storage
-            .finish_raw_diagnostic_export(principal_ref, turn_id, outcome, completed_at)
+            .finish_raw_diagnostic_export(principal_ref, turn_id.as_str(), outcome, completed_at)
             .map_err(crate::runtime::storage_failure)?;
         registry.entries.remove(turn_id);
         registry.generation = registry.generation.wrapping_add(1);
@@ -384,7 +384,7 @@ impl RawDiagnosticExports {
         for (turn_id, principal_ref) in expired {
             let _ = storage.finish_raw_diagnostic_export(
                 &principal_ref,
-                &turn_id,
+                turn_id.as_str(),
                 RawDiagnosticExportOutcome::Failed,
                 observed_at,
             );
@@ -421,7 +421,7 @@ impl RawDiagnosticExports {
             for (turn_id, principal_ref) in expired {
                 let _ = storage.finish_raw_diagnostic_export(
                     &principal_ref,
-                    &turn_id,
+                    turn_id.as_str(),
                     RawDiagnosticExportOutcome::Failed,
                     observed_at,
                 );
@@ -469,7 +469,7 @@ fn run_expiry_worker(registry: &(Mutex<RawExportRegistry>, Condvar), storage: &M
             for (turn_id, principal_ref) in expired {
                 let _ = storage.finish_raw_diagnostic_export(
                     &principal_ref,
-                    &turn_id,
+                    turn_id.as_str(),
                     RawDiagnosticExportOutcome::Failed,
                     now,
                 );

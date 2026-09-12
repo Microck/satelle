@@ -454,11 +454,11 @@ mod ssh_identity_commit_tests {
         (17, "fnv1a64:a9700dd704d41b44"),
         (18, "fnv1a64:4b489071db261e83"),
         (19, "fnv1a64:7f9ea3a158176b9c"),
-        (20, "fnv1a64:1e7ae2ad496f10ec"),
+        (20, "fnv1a64:349cb7810ef318f4"),
     ];
     const EXPECTED_SCHEMA_ROW_COUNT: usize = 76;
     const EXPECTED_SCHEMA_SHA256: &str =
-        "a3da92ef042de495d89c48dcf743dd6d2c80ead6eb3e5697a39fd385f819f4c3";
+        "02680650f6798b9489264bc93f9873f8702a875e379054862c7e0b5805cc0fe8";
 
     fn identity() -> HostIdentityRef {
         HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")

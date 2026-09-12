@@ -310,8 +310,8 @@ mod ssh_bootstrap;
 #[path = "ssh-tunnel.rs"]
 mod ssh_tunnel;
 
-pub(crate) use ssh_bootstrap::CacheCleanupReport;
 use ssh_bootstrap::SshBootstrapProcess;
+pub(crate) use ssh_bootstrap::{CacheCleanupReport, RawSubprocessCapture};
 use ssh_tunnel::SshTunnel;
 
 #[cfg(windows)]
@@ -502,6 +502,32 @@ pub(crate) trait TransportClient: Send {
         turn_id: &TurnId,
         outcome: satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome,
     ) -> Result<(), SatelleError>;
+    fn begin_raw_subprocess_export(
+        &self,
+        _request: &satelle_transport::RawSubprocessBeginRequest,
+    ) -> Result<satelle_core::sensitive_diagnostics::RawSubprocessManifest, SatelleError> {
+        Err(SatelleError::not_implemented(
+            "this transport cannot audit raw subprocess exports",
+        ))
+    }
+    fn prepare_raw_subprocess_export(
+        &self,
+        _invocation_id: &str,
+        _artifact_byte_size: usize,
+    ) -> Result<(), SatelleError> {
+        Err(SatelleError::not_implemented(
+            "this transport cannot prepare raw subprocess exports",
+        ))
+    }
+    fn acknowledge_raw_subprocess_export(
+        &self,
+        _invocation_id: &str,
+        _outcome: satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        Err(SatelleError::not_implemented(
+            "this transport cannot acknowledge raw subprocess exports",
+        ))
+    }
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError>;
     fn logs(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError>;
     fn setup_history(&self) -> Result<satelle_host::SetupHistory, SatelleError>;
@@ -8035,6 +8061,46 @@ impl TransportClient for DirectTransport {
                 &Self::idempotency_key(),
             )
             .map(|_| ())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn begin_raw_subprocess_export(
+        &self,
+        request: &satelle_transport::RawSubprocessBeginRequest,
+    ) -> Result<satelle_core::sensitive_diagnostics::RawSubprocessManifest, SatelleError> {
+        self.client
+            .begin_raw_subprocess_export(request, &Self::idempotency_key())
+            .map(satelle_transport::RawSubprocessBeginResponse::into_manifest)
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn prepare_raw_subprocess_export(
+        &self,
+        invocation_id: &str,
+        artifact_byte_size: usize,
+    ) -> Result<(), SatelleError> {
+        self.client
+            .prepare_raw_subprocess_export(
+                invocation_id,
+                &satelle_transport::RawSubprocessPrepareRequest::new(artifact_byte_size),
+                &Self::idempotency_key(),
+            )
+            .map(drop)
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn acknowledge_raw_subprocess_export(
+        &self,
+        invocation_id: &str,
+        outcome: satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.client
+            .acknowledge_raw_subprocess_export(
+                invocation_id,
+                &satelle_transport::RawProtocolAcknowledgeRequest::new(outcome),
+                &Self::idempotency_key(),
+            )
+            .map(drop)
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 

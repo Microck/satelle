@@ -4661,6 +4661,34 @@ impl HostService {
             .acknowledge_raw_protocol_export(principal_ref, turn_id, outcome)
     }
 
+    pub fn begin_raw_subprocess_export(
+        &self,
+        principal_ref: &str,
+        manifest: &satelle_core::sensitive_diagnostics::RawSubprocessManifest,
+    ) -> Result<(), SatelleError> {
+        self.runtime
+            .begin_raw_subprocess_export(principal_ref, manifest)
+    }
+
+    pub fn prepare_raw_subprocess_export(
+        &self,
+        invocation_id: &str,
+        artifact_byte_size: usize,
+    ) -> Result<(), SatelleError> {
+        self.runtime
+            .prepare_raw_subprocess_export(invocation_id, artifact_byte_size)
+    }
+
+    pub fn acknowledge_raw_subprocess_export(
+        &self,
+        principal_ref: &str,
+        invocation_id: &str,
+        outcome: satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.runtime
+            .acknowledge_raw_subprocess_export(principal_ref, invocation_id, outcome)
+    }
+
     pub fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {
         self.runtime.stop(StopCommand::new(session_id.clone()))
     }

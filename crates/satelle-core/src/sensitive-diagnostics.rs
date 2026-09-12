@@ -7,6 +7,7 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 pub const RAW_DIAGNOSTICS_SCHEMA_VERSION: &str = "satelle.raw-diagnostics.v1";
+pub const RAW_SUBPROCESS_DIAGNOSTICS_SCHEMA_VERSION: &str = "satelle.raw-subprocess-diagnostics.v1";
 pub const REDACTION_POLICY_VERSION: &str = "satelle.redaction.v1";
 pub const MAX_RAW_PROTOCOL_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PENDING_RAW_EXPORTS: usize = 8;
@@ -44,6 +45,22 @@ impl RawDiagnosticCommand {
         match self {
             Self::Run => "run",
             Self::Steer => "steer",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RawSubprocessCommand {
+    Setup,
+    Repair,
+}
+
+impl RawSubprocessCommand {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Repair => "repair",
         }
     }
 }
@@ -128,6 +145,148 @@ impl RawDiagnosticManifest {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RawSubprocessManifest {
+    pub artifact_format_version: String,
+    pub source_host: String,
+    pub host_identity: String,
+    pub command: RawSubprocessCommand,
+    pub invocation_id: String,
+    pub included: Vec<String>,
+    pub redaction_policy_version: String,
+    pub redaction_categories_applied: Vec<String>,
+    pub known_unredacted_risk_categories: Vec<String>,
+    pub created_at: String,
+}
+
+impl RawSubprocessManifest {
+    pub fn new(
+        source_host: impl Into<String>,
+        host_identity: impl Into<String>,
+        command: RawSubprocessCommand,
+        invocation_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            artifact_format_version: "1".to_string(),
+            source_host: source_host.into(),
+            host_identity: host_identity.into(),
+            command,
+            invocation_id: invocation_id.into(),
+            included: vec!["selected_subprocess_stdout".to_string()],
+            redaction_policy_version: REDACTION_POLICY_VERSION.to_string(),
+            redaction_categories_applied: REDACTION_CATEGORIES
+                .iter()
+                .map(|category| (*category).to_string())
+                .collect(),
+            known_unredacted_risk_categories: RAW_DIAGNOSTIC_RISKS
+                .iter()
+                .map(|category| (*category).to_string())
+                .collect(),
+            created_at: crate::utc_now(),
+        }
+    }
+}
+
+/// No Debug implementation: redacted subprocess streams remain sensitive.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSubprocessRecord {
+    pub command_id: String,
+    pub started_at: String,
+    pub completed_at: String,
+    pub exit_status: Option<i32>,
+    pub stdout: String,
+}
+
+/// No Debug implementation: redacted subprocess streams remain sensitive.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSubprocessArtifact {
+    pub schema_version: String,
+    pub manifest: RawSubprocessManifest,
+    pub records: Vec<RawSubprocessRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawDiagnosticAuditMetadata {
+    pub export_id: String,
+    pub source_host: String,
+    pub command: RawDiagnosticAuditCommand,
+    pub scope_kind: RawDiagnosticAuditScopeKind,
+    pub scope_ref: String,
+    pub included: Vec<String>,
+    pub redaction_policy_version: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawDiagnosticAuditCommand {
+    Run,
+    Steer,
+    Setup,
+    Repair,
+}
+
+impl RawDiagnosticAuditCommand {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Steer => "steer",
+            Self::Setup => "setup",
+            Self::Repair => "repair",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawDiagnosticAuditScopeKind {
+    Turn,
+    CommandInvocation,
+}
+
+impl RawDiagnosticAuditScopeKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::CommandInvocation => "command_invocation",
+        }
+    }
+}
+
+impl From<&RawDiagnosticManifest> for RawDiagnosticAuditMetadata {
+    fn from(manifest: &RawDiagnosticManifest) -> Self {
+        Self {
+            export_id: manifest.turn_id.as_str().to_string(),
+            source_host: manifest.source_host.clone(),
+            command: match manifest.command {
+                RawDiagnosticCommand::Run => RawDiagnosticAuditCommand::Run,
+                RawDiagnosticCommand::Steer => RawDiagnosticAuditCommand::Steer,
+            },
+            scope_kind: RawDiagnosticAuditScopeKind::Turn,
+            scope_ref: manifest.turn_id.as_str().to_string(),
+            included: manifest.included.clone(),
+            redaction_policy_version: manifest.redaction_policy_version.clone(),
+        }
+    }
+}
+
+impl From<&RawSubprocessManifest> for RawDiagnosticAuditMetadata {
+    fn from(manifest: &RawSubprocessManifest) -> Self {
+        Self {
+            export_id: manifest.invocation_id.clone(),
+            source_host: manifest.source_host.clone(),
+            command: match manifest.command {
+                RawSubprocessCommand::Setup => RawDiagnosticAuditCommand::Setup,
+                RawSubprocessCommand::Repair => RawDiagnosticAuditCommand::Repair,
+            },
+            scope_kind: RawDiagnosticAuditScopeKind::CommandInvocation,
+            scope_ref: manifest.invocation_id.clone(),
+            included: manifest.included.clone(),
+            redaction_policy_version: manifest.redaction_policy_version.clone(),
+        }
+    }
+}
+
 /// No Debug implementation: even redacted protocol messages remain sensitive.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -180,6 +339,23 @@ impl DiagnosticRedactor {
         }
         let message: Value = serde_json::from_slice(bytes).map_err(|_| DiagnosticRedactionError)?;
         self.redact_message(message, bytes.len())
+    }
+
+    /// Redacts one bounded UTF-8 subprocess stream. Invalid text fails closed
+    /// because replacing unknown byte sequences could hide secret boundaries.
+    pub fn redact_text(&self, bytes: &[u8]) -> Result<String, DiagnosticRedactionError> {
+        if bytes.len() > MAX_RAW_PROTOCOL_BYTES {
+            return Err(DiagnosticRedactionError);
+        }
+        let mut text = std::str::from_utf8(bytes)
+            .map_err(|_| DiagnosticRedactionError)?
+            .to_string();
+        for secret in &self.known_secrets {
+            text = text.replace(secret.as_str(), "[REDACTED]");
+        }
+        redact_authorization_text(&mut text);
+        redact_sensitive_assignments(&mut text);
+        Ok(text)
     }
 
     /// Redacts a message already parsed by the protocol reader or writer.
@@ -279,7 +455,41 @@ fn sensitive_field(name: &str) -> bool {
             | "clientcertificate"
             | "environment"
             | "env"
-    )
+    ) || [
+        "apikey",
+        "apitoken",
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "bearertoken",
+        "password",
+        "secret",
+        "clientsecret",
+        "credentials",
+        "privatekey",
+    ]
+    .iter()
+    .any(|suffix| normalized.ends_with(suffix))
+}
+
+fn redact_sensitive_assignments(text: &mut String) {
+    let mut redacted = String::with_capacity(text.len());
+    for segment in text.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        let separator = line.find(['=', ':']);
+        if let Some(separator) = separator
+            && sensitive_field(line[..separator].trim())
+        {
+            redacted.push_str(&line[..=separator]);
+            redacted.push_str("[REDACTED]");
+        } else {
+            redacted.push_str(line);
+        }
+        redacted.push_str(newline);
+    }
+    *text = redacted;
 }
 
 fn redact_authorization_text(text: &mut String) {
@@ -358,5 +568,21 @@ mod tests {
         let mut text = "日本語 Bearer CANARY\nBearER  Basic SECOND".to_string();
         redact_authorization_text(&mut text);
         assert_eq!(text, "日本語 Bearer [REDACTED]\nBearER  Basic [REDACTED]");
+    }
+
+    #[test]
+    fn redacts_bounded_subprocess_text_and_fails_closed_on_invalid_utf8() {
+        let mut redactor = DiagnosticRedactor::default();
+        redactor.add_known_secret("KNOWN_CANARY");
+        let redacted = redactor
+            .redact_text(
+                b"ordinary KNOWN_CANARY text\nOPENAI_API_KEY=KEY_CANARY\nAuthorization: custom CANARY\nerror: safe detail\n",
+            )
+            .unwrap();
+        assert_eq!(
+            redacted,
+            "ordinary [REDACTED] text\nOPENAI_API_KEY=[REDACTED]\nAuthorization:[REDACTED]\nerror: safe detail\n"
+        );
+        assert!(redactor.redact_text(&[0xff]).is_err());
     }
 }

@@ -3100,6 +3100,49 @@ impl RuntimeHandle {
         )
     }
 
+    pub(crate) fn begin_raw_subprocess_export(
+        &self,
+        principal_ref: &str,
+        manifest: &satelle_core::sensitive_diagnostics::RawSubprocessManifest,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .begin_raw_diagnostic_export(
+                principal_ref,
+                &manifest.into(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn prepare_raw_subprocess_export(
+        &self,
+        invocation_id: &str,
+        artifact_byte_size: usize,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .prepare_raw_diagnostic_export(invocation_id, artifact_byte_size)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn acknowledge_raw_subprocess_export(
+        &self,
+        principal_ref: &str,
+        invocation_id: &str,
+        outcome: RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .finish_raw_diagnostic_export(
+                principal_ref,
+                invocation_id,
+                outcome,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
     pub(crate) fn load_setup_run(
         &self,
         run_id: &str,

@@ -1217,6 +1217,18 @@ fn router(state: Arc<DaemonState>) -> Router {
             "/v1/diagnostics/raw-protocol/{turn_id}/acknowledge",
             post(sessions::acknowledge_raw_protocol_export),
         )
+        .route(
+            "/v1/diagnostics/raw-subprocess",
+            post(sessions::begin_raw_subprocess_export),
+        )
+        .route(
+            "/v1/diagnostics/raw-subprocess/{invocation_id}/prepare",
+            post(sessions::prepare_raw_subprocess_export),
+        )
+        .route(
+            "/v1/diagnostics/raw-subprocess/{invocation_id}/acknowledge",
+            post(sessions::acknowledge_raw_subprocess_export),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_control,

@@ -491,6 +491,17 @@ struct SetupCommand {
         help = "Require this exact Host identity during first-time SSH trust"
     )]
     expected_host_id: Option<String>,
+    #[arg(
+        long,
+        help = "Capture selected redacted setup subprocess output for this invocation"
+    )]
+    raw_subprocess_output: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the raw diagnostic artifact to this local path"
+    )]
+    output: Option<PathBuf>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -510,6 +521,17 @@ struct RepairCommand {
     yes: bool,
     #[arg(long)]
     no_input: bool,
+    #[arg(
+        long,
+        help = "Capture selected redacted repair subprocess output for this invocation"
+    )]
+    raw_subprocess_output: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the raw diagnostic artifact to this local path"
+    )]
+    output: Option<PathBuf>,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -3959,11 +3981,216 @@ mod setup_native_invalidation_tests {
     }
 }
 
+struct RawSubprocessInvocation {
+    output: PathBuf,
+    command: satelle_core::sensitive_diagnostics::RawSubprocessCommand,
+    invocation_id: String,
+    host: Option<SelectedHost>,
+    capture: Option<transport::RawSubprocessCapture>,
+}
+
+impl RawSubprocessInvocation {
+    fn new(
+        output: PathBuf,
+        command: satelle_core::sensitive_diagnostics::RawSubprocessCommand,
+    ) -> Self {
+        Self {
+            output,
+            command,
+            invocation_id: Uuid::now_v7().to_string(),
+            host: None,
+            capture: None,
+        }
+    }
+
+    fn begin(&mut self, host: &SelectedHost) -> Result<(), CliFailure> {
+        if self.capture.is_some() {
+            return Ok(());
+        }
+        let transport = transport_for(host)?;
+        let manifest = transport
+            .begin_raw_subprocess_export(&satelle_transport::RawSubprocessBeginRequest::new(
+                &host.alias,
+                self.command,
+                &self.invocation_id,
+            ))
+            .map_err(failure)?;
+        self.capture = match transport::RawSubprocessCapture::begin(manifest) {
+            Ok(capture) => Some(capture),
+            Err(_) => {
+                let _ = transport.acknowledge_raw_subprocess_export(
+                    &self.invocation_id,
+                    satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome::Failed,
+                );
+                return Err(failure(SatelleError::raw_diagnostics_failure(
+                    satelle_core::sensitive_diagnostics::RawDiagnosticFailure::RedactionFailed,
+                    "raw subprocess capture could not start",
+                )));
+            }
+        };
+        self.host = Some(host.clone());
+        Ok(())
+    }
+
+    fn export(mut self) -> Result<(), CliFailure> {
+        let export = self.export_inner();
+        if export.is_err()
+            && let Some(host) = &self.host
+            && let Ok(transport) = transport_for(host)
+        {
+            let _ = transport.acknowledge_raw_subprocess_export(
+                &self.invocation_id,
+                satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome::Failed,
+            );
+        }
+        export
+    }
+
+    fn export_inner(&mut self) -> Result<(), CliFailure> {
+        let host = self.host.as_ref().ok_or_else(|| {
+            failure(SatelleError::raw_diagnostics_failure(
+                satelle_core::sensitive_diagnostics::RawDiagnosticFailure::ExportFailed,
+                "the Host audit record could not be created before raw subprocess capture",
+            ))
+        })?;
+        let capture = self.capture.take().ok_or_else(|| {
+            failure(SatelleError::raw_diagnostics_failure(
+                satelle_core::sensitive_diagnostics::RawDiagnosticFailure::ExportFailed,
+                "raw subprocess capture did not start",
+            ))
+        })?;
+        let artifact = capture
+            .finish(&satelle_core::sensitive_diagnostics::DiagnosticRedactor::default())
+            .map_err(|_| {
+                failure(SatelleError::raw_diagnostics_failure(
+                    satelle_core::sensitive_diagnostics::RawDiagnosticFailure::RedactionFailed,
+                    "raw subprocess output could not be redacted; no artifact was produced",
+                ))
+            })?;
+        let bytes = serde_json::to_vec(&artifact).map_err(|_| {
+            failure(SatelleError::raw_diagnostics_failure(
+                satelle_core::sensitive_diagnostics::RawDiagnosticFailure::RedactionFailed,
+                "the redacted raw subprocess artifact could not be serialized",
+            ))
+        })?;
+        if bytes.len() > satelle_core::sensitive_diagnostics::MAX_RAW_PROTOCOL_BYTES {
+            return Err(failure(SatelleError::raw_diagnostics_failure(
+                satelle_core::sensitive_diagnostics::RawDiagnosticFailure::RedactionFailed,
+                "the redacted raw subprocess artifact exceeded its size limit",
+            )));
+        }
+        let transport = transport_for(host)?;
+        transport
+            .prepare_raw_subprocess_export(&self.invocation_id, bytes.len())
+            .map_err(failure)?;
+        let staging = self.output.with_file_name(format!(
+            ".satelle-raw-diagnostics-{}.tmp",
+            Uuid::now_v7().simple()
+        ));
+        if let Err(error) = persist_new_owner_only_diagnostic_file(&self.output, &staging, &bytes) {
+            let mut export_error = SatelleError::raw_diagnostics_failure(
+                satelle_core::sensitive_diagnostics::RawDiagnosticFailure::StagingFailed,
+                format!("could not publish raw subprocess artifact: {error}"),
+            );
+            export_error.details.insert(
+                "staging_path".to_string(),
+                Value::String(staging.display().to_string()),
+            );
+            export_error.details.insert(
+                "cleanup_command".to_string(),
+                Value::String(raw_diagnostic_cleanup_command(&staging)),
+            );
+            export_error.details.insert(
+                "raw_material_may_remain".to_string(),
+                Value::Bool(staging.try_exists().unwrap_or(true)),
+            );
+            return Err(failure(export_error));
+        }
+        transport
+            .acknowledge_raw_subprocess_export(
+                &self.invocation_id,
+                satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome::Exported,
+            )
+            .map_err(|mut error| {
+                error.details.insert(
+                    "output_path".to_string(),
+                    Value::String(self.output.display().to_string()),
+                );
+                failure(error)
+            })?;
+        eprintln!("Raw subprocess artifact: {}", self.output.display());
+        Ok(())
+    }
+}
+
+fn finish_raw_subprocess_invocation(
+    result: Result<(), CliFailure>,
+    raw: Option<RawSubprocessInvocation>,
+) -> Result<(), CliFailure> {
+    let Some(raw) = raw else {
+        return result;
+    };
+    let export = raw.export();
+    match (result, export) {
+        (Ok(()), export) => export,
+        (Err(mut command_failure), Ok(())) => {
+            command_failure
+                .error
+                .details
+                .insert("raw_subprocess_exported".to_string(), Value::Bool(true));
+            Err(command_failure)
+        }
+        (Err(mut command_failure), Err(export_failure)) => {
+            command_failure.error.details.insert(
+                "raw_subprocess_export_error".to_string(),
+                json!({
+                    "code": export_failure.error.code.as_str(),
+                    "message": export_failure.error.message,
+                    "recovery_command": export_failure.error.recovery_command,
+                    "details": export_failure.error.details,
+                }),
+            );
+            Err(command_failure)
+        }
+    }
+}
+
 fn run_setup(
     command: SetupCommand,
     config: ConfigContext<'_>,
     format: OutputFormat,
     exact_state_requires_identity_discovery: bool,
+) -> Result<(), CliFailure> {
+    let raw_output = prepare_raw_subprocess_capture(
+        command.raw_subprocess_output,
+        command.output.as_deref(),
+        command.no_input,
+        command.yes,
+        command.dry_run,
+        satelle_core::sensitive_diagnostics::RawSubprocessCommand::Setup,
+    )?;
+    let mut raw = raw_output.map(|output| {
+        RawSubprocessInvocation::new(
+            output,
+            satelle_core::sensitive_diagnostics::RawSubprocessCommand::Setup,
+        )
+    });
+    let result = run_setup_inner(
+        command,
+        config,
+        format,
+        exact_state_requires_identity_discovery,
+        raw.as_mut(),
+    );
+    finish_raw_subprocess_invocation(result, raw)
+}
+
+fn run_setup_inner(
+    command: SetupCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+    exact_state_requires_identity_discovery: bool,
+    mut raw: Option<&mut RawSubprocessInvocation>,
 ) -> Result<(), CliFailure> {
     let machine_output = format.is_structured();
     if let Some(expected) = command.expected_host_id.as_deref() {
@@ -4017,6 +4244,9 @@ fn run_setup(
         unresolved_path_rebind,
         exact_state_requires_identity_discovery,
     );
+    if !first_ssh_trust && let Some(raw) = raw.as_deref_mut() {
+        raw.begin(&host)?;
+    }
     let local_verification_only = local_setup_verification_only(
         &command,
         host.config.transport == satelle_core::TransportKind::Local,
@@ -4517,6 +4747,9 @@ fn run_setup(
             persist_host_identity(&user_config_path, &host.alias, &discovery.identity)
                 .map_err(failure)?;
             host.config.expected_host_id = Some(discovery.identity.clone());
+            if let Some(raw) = raw {
+                raw.begin(&host)?;
+            }
             transport =
                 setup_transport_if_required(host_setup_required, || transport_for_setup(&host))?;
         }
@@ -5769,6 +6002,41 @@ mod setup_consent_recovery_tests {
     use super::*;
 
     #[test]
+    fn setup_and_repair_parse_raw_subprocess_export_options() {
+        let setup = Cli::try_parse_from([
+            "satelle",
+            "setup",
+            "--raw-subprocess-output",
+            "--output",
+            "setup-raw.json",
+            "--no-input",
+            "--yes",
+        ])
+        .expect("parse setup raw subprocess options");
+        let Command::Setup(setup) = setup.command else {
+            panic!("expected setup command");
+        };
+        assert!(setup.raw_subprocess_output);
+        assert_eq!(setup.output, Some(PathBuf::from("setup-raw.json")));
+
+        let repair = Cli::try_parse_from([
+            "satelle",
+            "repair",
+            "--raw-subprocess-output",
+            "--output",
+            "repair-raw.json",
+            "--no-input",
+            "--yes",
+        ])
+        .expect("parse repair raw subprocess options");
+        let Command::Repair(repair) = repair.command else {
+            panic!("expected repair command");
+        };
+        assert!(repair.raw_subprocess_output);
+        assert_eq!(repair.output, Some(PathBuf::from("repair-raw.json")));
+    }
+
+    #[test]
     fn exact_pending_identity_resume_reenters_ssh_discovery() {
         assert!(ssh_identity_discovery_required(true, false, false, true));
         assert!(!ssh_identity_discovery_required(true, false, false, false));
@@ -5839,11 +6107,38 @@ fn run_repair(
     config: ConfigContext<'_>,
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
+    let raw_output = prepare_raw_subprocess_capture(
+        command.raw_subprocess_output,
+        command.output.as_deref(),
+        command.no_input,
+        command.yes,
+        command.dry_run,
+        satelle_core::sensitive_diagnostics::RawSubprocessCommand::Repair,
+    )?;
+    let mut raw = raw_output.map(|output| {
+        RawSubprocessInvocation::new(
+            output,
+            satelle_core::sensitive_diagnostics::RawSubprocessCommand::Repair,
+        )
+    });
+    let result = run_repair_inner(command, config, format, raw.as_mut());
+    finish_raw_subprocess_invocation(result, raw)
+}
+
+fn run_repair_inner(
+    command: RepairCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+    raw: Option<&mut RawSubprocessInvocation>,
+) -> Result<(), CliFailure> {
     let resolved = config.load()?;
     let host = resolved
         .resolve_host_with_project_source(command.host.as_deref())
         .map(SelectedHost::from)
         .map_err(failure)?;
+    if let Some(raw) = raw {
+        raw.begin(&host)?;
+    }
     let trusted_consent = trusted_profile_allows_mutation(
         resolved,
         &host.alias,
@@ -13961,23 +14256,96 @@ fn prepare_raw_protocol_capture(
     raw: &RawProtocolArgs,
     detach: bool,
 ) -> Result<Option<PathBuf>, CliFailure> {
-    if !raw.raw_protocol {
-        if raw.output.is_some() || raw.no_input || raw.yes {
-            return Err(failure(SatelleError::invalid_usage(
-                "--output, --no-input, and --yes require --raw-protocol for run and steer",
-            )));
-        }
-        return Ok(None);
-    }
-    if detach {
+    if detach && raw.raw_protocol {
         return Err(failure(SatelleError::invalid_usage(
             "--raw-protocol cannot be combined with --detach because this invocation must write and acknowledge the artifact",
         )));
     }
-    let requested = raw
-        .output
-        .as_deref()
-        .ok_or_else(|| failure(SatelleError::raw_diagnostics_output_required()))?;
+    prepare_raw_diagnostic_capture(
+        RawDiagnosticCaptureKind::Protocol,
+        raw.raw_protocol,
+        raw.output.as_deref(),
+        raw.no_input,
+        raw.yes,
+    )
+}
+
+fn prepare_raw_subprocess_capture(
+    enabled: bool,
+    requested: Option<&Path>,
+    no_input: bool,
+    yes: bool,
+    dry_run: bool,
+    command: satelle_core::sensitive_diagnostics::RawSubprocessCommand,
+) -> Result<Option<PathBuf>, CliFailure> {
+    if dry_run && enabled {
+        return Err(failure(SatelleError::invalid_usage(
+            "--raw-subprocess-output cannot be combined with --dry-run because dry-run performs no diagnostic export writes",
+        )));
+    }
+    prepare_raw_diagnostic_capture(
+        RawDiagnosticCaptureKind::Subprocess(command),
+        enabled,
+        requested,
+        no_input,
+        yes,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum RawDiagnosticCaptureKind {
+    Protocol,
+    Subprocess(satelle_core::sensitive_diagnostics::RawSubprocessCommand),
+}
+
+impl RawDiagnosticCaptureKind {
+    const fn flag(self) -> &'static str {
+        match self {
+            Self::Protocol => "--raw-protocol",
+            Self::Subprocess(_) => "--raw-subprocess-output",
+        }
+    }
+
+    const fn export_name(self) -> &'static str {
+        match self {
+            Self::Protocol => "raw protocol",
+            Self::Subprocess(satelle_core::sensitive_diagnostics::RawSubprocessCommand::Setup) => {
+                "raw setup subprocess"
+            }
+            Self::Subprocess(satelle_core::sensitive_diagnostics::RawSubprocessCommand::Repair) => {
+                "raw repair subprocess"
+            }
+        }
+    }
+
+    const fn has_dedicated_consent_flags(self) -> bool {
+        matches!(self, Self::Protocol)
+    }
+}
+
+fn prepare_raw_diagnostic_capture(
+    kind: RawDiagnosticCaptureKind,
+    enabled: bool,
+    requested: Option<&Path>,
+    no_input: bool,
+    yes: bool,
+) -> Result<Option<PathBuf>, CliFailure> {
+    if !enabled {
+        let unrelated_option = requested
+            .is_some()
+            .then_some("--output")
+            .or_else(|| (kind.has_dedicated_consent_flags() && no_input).then_some("--no-input"))
+            .or_else(|| (kind.has_dedicated_consent_flags() && yes).then_some("--yes"));
+        if let Some(unrelated_option) = unrelated_option {
+            return Err(failure(SatelleError::invalid_usage(format!(
+                "{unrelated_option} requires {}",
+                kind.flag()
+            ))));
+        }
+        return Ok(None);
+    }
+    let requested =
+        requested.ok_or_else(|| failure(SatelleError::raw_diagnostics_output_required()))?;
     let file_name = requested.file_name().ok_or_else(|| {
         failure(SatelleError::raw_diagnostics_failure(
             satelle_core::sensitive_diagnostics::RawDiagnosticFailure::StagingFailed,
@@ -14006,16 +14374,17 @@ fn prepare_raw_protocol_capture(
     }
 
     eprintln!(
-        "Warning: this raw protocol export may contain secrets, prompts, transcripts, provider payloads, visible desktop content, file paths, user names, host names, internal addresses, and other sensitive diagnostic data even after redaction."
+        "Warning: this {} export may contain secrets, prompts, transcripts, provider payloads, visible desktop content, file paths, user names, host names, internal addresses, and other sensitive diagnostic data even after redaction.",
+        kind.export_name()
     );
     eprintln!("Output: {}", output.display());
     eprintln!("Satelle will not upload this artifact automatically.");
     eprintln!("Normal Satelle diagnostics are unchanged.");
     eprintln!("Inspect the artifact before sharing it.");
 
-    let interactive = io::stdin().is_terminal() && !raw.no_input;
+    let interactive = io::stdin().is_terminal() && !no_input;
     let consented = if interactive {
-        cliclack::confirm("Create this raw protocol export?")
+        cliclack::confirm(format!("Create this {} export?", kind.export_name()))
             .initial_value(false)
             .interact()
             .map_err(|error| {
@@ -14025,7 +14394,7 @@ fn prepare_raw_protocol_capture(
                 ))
             })?
     } else {
-        raw.no_input && raw.yes
+        no_input && yes
     };
     if !consented {
         return Err(failure(SatelleError::raw_diagnostics_consent_required(
@@ -14188,6 +14557,66 @@ fn raw_protocol_consent_requires_one_exact_noninteractive_invocation() {
     )
     .unwrap_err();
     assert_eq!(unrelated.error.code, ErrorCode::InvalidUsage);
+}
+
+#[cfg(test)]
+#[test]
+fn raw_subprocess_consent_requires_one_exact_noninteractive_invocation() {
+    let state = satelle_host::test_support::TestStateDir::new().unwrap();
+    let output = state.path().join("setup-raw.json");
+    let prepared = match prepare_raw_subprocess_capture(
+        true,
+        Some(&output),
+        true,
+        true,
+        false,
+        satelle_core::sensitive_diagnostics::RawSubprocessCommand::Setup,
+    ) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => panic!("enabled capture should return the output path"),
+        Err(_) => panic!("explicit noninteractive consent should succeed"),
+    };
+    assert_eq!(
+        prepared,
+        state.path().canonicalize().unwrap().join("setup-raw.json")
+    );
+    assert!(!prepared.exists());
+
+    let unconfirmed = prepare_raw_subprocess_capture(
+        true,
+        Some(&output),
+        true,
+        false,
+        false,
+        satelle_core::sensitive_diagnostics::RawSubprocessCommand::Setup,
+    )
+    .unwrap_err();
+    assert_eq!(
+        unconfirmed.error.code,
+        ErrorCode::RawDiagnosticsConsentRequired
+    );
+
+    let dry_run = prepare_raw_subprocess_capture(
+        true,
+        Some(&output),
+        true,
+        true,
+        true,
+        satelle_core::sensitive_diagnostics::RawSubprocessCommand::Setup,
+    )
+    .unwrap_err();
+    assert_eq!(dry_run.error.code, ErrorCode::InvalidUsage);
+
+    let output_without_capture = prepare_raw_subprocess_capture(
+        false,
+        Some(&output),
+        false,
+        false,
+        false,
+        satelle_core::sensitive_diagnostics::RawSubprocessCommand::Setup,
+    )
+    .unwrap_err();
+    assert_eq!(output_without_capture.error.code, ErrorCode::InvalidUsage);
 }
 
 fn run_prompt(

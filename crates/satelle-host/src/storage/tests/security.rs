@@ -242,17 +242,18 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
         ],
     );
 
-    // Raw protocol bytes stay in memory. The durable audit records only who
-    // requested an export, its declared scope, size, timing, and outcome.
+    // Raw diagnostic bytes stay outside SQLite. The durable audit records only
+    // who requested an export, its declared scope, size, timing, and outcome.
     assert_table_columns(
         &storage,
         "raw_diagnostic_audit",
         &[
-            "turn_id",
-            "session_id",
+            "export_id",
             "principal_ref",
             "host_alias",
             "command",
+            "scope_kind",
+            "scope_ref",
             "data_categories",
             "redaction_policy_version",
             "created_at_unix_nanos",

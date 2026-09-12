@@ -142,6 +142,20 @@ action labels, recovery text, and raw subprocess streams are excluded.
 If a category cannot be read, the manifest lists it under `not_collected` with
 the failure reason. An available empty history is reported as collected.
 
+## Raw setup and repair subprocess output
+
+Use `--raw-subprocess-output --output <path>` with `satelle setup` or
+`satelle repair` to export selected redacted subprocess stdout from that one
+invocation. Noninteractive use requires `--no-input --yes` as explicit raw
+diagnostic consent. The command refuses an existing output path and does not
+support this export in dry-run mode.
+
+The artifact includes stable command identifiers, timestamps, exit status,
+and redaction metadata. Satelle excludes token-bearing subprocesses, provider
+traffic, prompts, transcripts, screenshots, and recordings. It does not add
+this output to logs, setup history, status, Doctor, Operator Log Files, caches,
+support bundles, or automatic uploads.
+
 ## Host version compatibility
 
 Use `satelle host update --host <alias> --component host --version <version>`
