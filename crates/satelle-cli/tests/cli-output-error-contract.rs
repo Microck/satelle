@@ -22,11 +22,12 @@ fn satelle() -> Command {
 }
 
 #[test]
-fn internal_failures_keep_their_typed_cause_and_exit_with_the_internal_class() {
-    let sandbox = tempfile::tempdir().expect("temporary Satelle home should be created");
+fn storage_migration_failures_keep_their_typed_cause_and_storage_exit_class() {
+    let sandbox = satelle_host::test_support::TestStateDir::new()
+        .expect("private temporary Satelle home should be created");
 
     let output = satelle()
-        .env("SATELLE_STATE_DIR", sandbox.path())
+        .env("SATELLE_STATE_DIR", sandbox.path().join("missing-source"))
         .env("SATELLE_LOG", "satelle=debug")
         .args([
             "host",
@@ -34,13 +35,13 @@ fn internal_failures_keep_their_typed_cause_and_exit_with_the_internal_class() {
             "migrate",
             "--host",
             "local-demo",
-            "--to",
-            "/tmp/satelle-state",
             "--dry-run",
             "--json",
         ])
+        .arg("--to")
+        .arg(sandbox.path().join("destination"))
         .assert()
-        .code(70)
+        .code(66)
         .get_output()
         .clone();
 
@@ -48,7 +49,7 @@ fn internal_failures_keep_their_typed_cause_and_exit_with_the_internal_class() {
     let error: Value =
         serde_json::from_slice(&output.stderr).expect("stderr should be one JSON error envelope");
     assert_eq!(error["schema_version"], "satelle.error.v1");
-    assert_eq!(error["code"], "not-implemented");
-    assert_eq!(error["category"], "internal");
+    assert_eq!(error["code"], "storage-migration-source-invalid");
+    assert_eq!(error["category"], "storage");
     assert_eq!(error["retryable"], false);
 }

@@ -1,10 +1,14 @@
 mod auth;
 mod codec;
 mod logs;
+#[path = "storage/migration-requests.rs"]
+mod migration_requests;
 mod open;
 mod operational;
 #[path = "storage/operator-log.rs"]
 mod operator_log;
+#[path = "storage/path-migration.rs"]
+mod path_migration;
 #[path = "storage/provider-secret-journal.rs"]
 mod provider_secret_journal;
 mod retention;
@@ -28,6 +32,7 @@ use self::codec::{
 pub(crate) use self::logs::LogPageStorageError;
 use self::logs::canonical_log;
 pub(crate) use self::logs::{SafeLogRecord, StoredLogRecord};
+pub(crate) use self::migration_requests::{StorageMigrationReply, StorageMigrationRequestState};
 #[cfg(test)]
 use self::open::DATABASE_FILE_NAME;
 #[cfg(all(test, unix))]
@@ -37,6 +42,14 @@ pub use self::operator_log::{OperatorLogFailureKind, OperatorLogSinkHealth};
 pub(crate) use self::operator_log::{OperatorLogMirror, OperatorLogPolicy};
 #[cfg(test)]
 pub(crate) use self::operator_log::{OperatorLogSink, OperatorLogWriteOutcome};
+pub use self::path_migration::{
+    StorageMigrationCleanup, StorageMigrationItem, StorageMigrationItemKind, StorageMigrationPlan,
+    StorageMigrationStage,
+};
+pub(crate) use self::path_migration::{
+    migration_requires_rollback, plan as plan_path_migration,
+    plan_for_operation as plan_owned_path_migration, stage as stage_path_migration,
+};
 pub(crate) use self::provider_secret_journal::{
     BeginProviderSecretProvisioning, PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
     PROVIDER_SECRET_PRIOR_HMAC_DOMAIN, ProviderSecretProvisioningJournal,
@@ -433,10 +446,11 @@ mod ssh_identity_commit_tests {
         (16, "fnv1a64:8478b3aeb5aaa616"),
         (17, "fnv1a64:a9700dd704d41b44"),
         (18, "fnv1a64:4b489071db261e83"),
+        (19, "fnv1a64:7f9ea3a158176b9c"),
     ];
     const EXPECTED_SCHEMA_ROW_COUNT: usize = 73;
     const EXPECTED_SCHEMA_SHA256: &str =
-        "bae0e76d386a73ca292882f940bc0a0483de8d2dfb6136cc20e7c10ee8af6dbc";
+        "9da9dd4ec9453f540c5dca2363ff51d070cde6bc840fadf611eab60a53fde021";
 
     fn identity() -> HostIdentityRef {
         HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")
@@ -585,7 +599,7 @@ mod ssh_identity_commit_tests {
         let user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema user version");
-        assert_eq!(user_version, 18);
+        assert_eq!(user_version, 19);
 
         let schema = connection
             .prepare(

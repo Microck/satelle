@@ -48,7 +48,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const RESTORE_ACTIVATION_JOURNAL: &str = ".satelle-restore-activation-v1";
 const RESTORE_ACTIVATION_JOURNAL_LIMIT: usize = 64 * 1024;
-const MIGRATIONS: [Migration; 18] = [
+const MIGRATIONS: [Migration; 19] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -156,6 +156,12 @@ const MIGRATIONS: [Migration; 18] = [
         sql: include_str!("0018-client-certificate-audit.sql"),
         seeds_sensitive_state: false,
         irreversible: false,
+    },
+    Migration {
+        version: 19,
+        sql: include_str!("0019-storage-migration-requests.sql"),
+        seeds_sensitive_state: false,
+        irreversible: true,
     },
 ];
 
@@ -750,7 +756,7 @@ pub(super) fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, St
 }
 
 #[cfg(unix)]
-fn open_state_root_read_only(state_root: &Path) -> Result<StateDirectory, StorageError> {
+pub(super) fn open_state_root_read_only(state_root: &Path) -> Result<StateDirectory, StorageError> {
     if !state_root.is_absolute() || state_root.parent().is_none() {
         return Err(StorageError::new(StorageErrorKind::UnsafeStatePath));
     }
@@ -855,7 +861,7 @@ pub(super) fn prepare_state_root(state_root: &Path) -> Result<StateDirectory, St
 }
 
 #[cfg(windows)]
-fn open_state_root_read_only(state_root: &Path) -> Result<StateDirectory, StorageError> {
+pub(super) fn open_state_root_read_only(state_root: &Path) -> Result<StateDirectory, StorageError> {
     windows::SecureStateDirectory::open_read_only(state_root)
         .map(|secure| StateDirectory { secure })
 }
@@ -868,6 +874,10 @@ fn acquire_ownership_lock(state_directory: &StateDirectory) -> Result<OwnershipL
         StorageErrorKind::LockUnavailable,
     )?
     .ok_or_else(|| StorageError::new(StorageErrorKind::LockUnavailable))?;
+    lock_store(file)
+}
+
+fn lock_store(file: File) -> Result<OwnershipLock, StorageError> {
     match file.try_lock() {
         Ok(()) => Ok(OwnershipLock(file)),
         Err(TryLockError::WouldBlock) => Err(StorageError::new(StorageErrorKind::StoreInUse)),
@@ -1163,11 +1173,56 @@ fn create_migration_backup(
     let backup_file_name =
         format!("satelle.sqlite3.migration-v{source_schema_version}-{backup_id}.backup");
     let manifest_file_name = format!("{backup_file_name}.json");
-    let backup_path = sqlite_leaf_path(state_root, state_directory, &backup_file_name);
+    let backup_file =
+        create_verified_sqlite_copy(source, state_root, state_directory, &backup_file_name)?;
+    let source_database_digest = digest_file(&backup_file, StorageErrorKind::MigrationFailed)?;
+
+    let created_at = OffsetDateTime::now_utc();
+    let manifest = MigrationBackupManifest {
+        manifest_version: BACKUP_FORMAT_VERSION,
+        backup_file: backup_file_name.clone(),
+        source_schema_version,
+        source_database_digest,
+        created_at: format_time(created_at)?,
+        satelle_version: env!("CARGO_PKG_VERSION").to_owned(),
+        restore_compatibility: RestoreCompatibility {
+            database_format: "sqlite3".to_owned(),
+            schema_version: source_schema_version,
+            explicit_restore_required: true,
+        },
+    };
+    let mut manifest_file = open_private_leaf(
+        state_directory,
+        &manifest_file_name,
+        LeafOpenMode::CreateNew,
+        StorageErrorKind::MigrationFailed,
+    )?
+    .ok_or_else(|| StorageError::new(StorageErrorKind::MigrationFailed))?;
+    serde_json::to_writer(&mut manifest_file, &manifest)
+        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
+    manifest_file
+        .write_all(b"\n")
+        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
+    manifest_file
+        .sync_all()
+        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
+    state_directory.sync()?;
+    Ok(())
+}
+
+/// Creates a new standalone SQLite copy through the anchored VFS. Both schema
+/// backups and path migration use this boundary before activating copied data.
+pub(super) fn create_verified_sqlite_copy(
+    source: &Connection,
+    state_root: &Path,
+    state_directory: &StateDirectory,
+    backup_file_name: &str,
+) -> Result<File, StorageError> {
+    let backup_path = sqlite_leaf_path(state_root, state_directory, backup_file_name);
 
     let backup_guard = open_private_leaf(
         state_directory,
-        &backup_file_name,
+        backup_file_name,
         LeafOpenMode::CreateNew,
         StorageErrorKind::MigrationFailed,
     )?
@@ -1214,11 +1269,11 @@ fn create_migration_backup(
     verify_integrity(&validation)?;
     drop(validation);
     #[cfg(windows)]
-    remove_sqlite_validation_sidecars(state_directory, &backup_file_name)?;
+    remove_sqlite_validation_sidecars(state_directory, backup_file_name)?;
 
     let backup_file = open_private_leaf(
         state_directory,
-        &backup_file_name,
+        backup_file_name,
         LeafOpenMode::Existing,
         StorageErrorKind::MigrationFailed,
     )?
@@ -1226,39 +1281,8 @@ fn create_migration_backup(
     backup_file
         .sync_all()
         .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
-    let source_database_digest = digest_file(&backup_file, StorageErrorKind::MigrationFailed)?;
-
-    let created_at = OffsetDateTime::now_utc();
-    let manifest = MigrationBackupManifest {
-        manifest_version: BACKUP_FORMAT_VERSION,
-        backup_file: backup_file_name.clone(),
-        source_schema_version,
-        source_database_digest,
-        created_at: format_time(created_at)?,
-        satelle_version: env!("CARGO_PKG_VERSION").to_owned(),
-        restore_compatibility: RestoreCompatibility {
-            database_format: "sqlite3".to_owned(),
-            schema_version: source_schema_version,
-            explicit_restore_required: true,
-        },
-    };
-    let mut manifest_file = open_private_leaf(
-        state_directory,
-        &manifest_file_name,
-        LeafOpenMode::CreateNew,
-        StorageErrorKind::MigrationFailed,
-    )?
-    .ok_or_else(|| StorageError::new(StorageErrorKind::MigrationFailed))?;
-    serde_json::to_writer(&mut manifest_file, &manifest)
-        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
-    manifest_file
-        .write_all(b"\n")
-        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
-    manifest_file
-        .sync_all()
-        .map_err(|source| StorageError::with_source(StorageErrorKind::MigrationFailed, source))?;
     state_directory.sync()?;
-    Ok(())
+    Ok(backup_file)
 }
 
 fn parse_migration_backup_file_name(file_name: &str) -> Option<MigrationBackupName> {
@@ -2815,11 +2839,29 @@ pub(super) fn cleanup_migration_backups_offline_exact(
 }
 
 pub(crate) struct OfflineStoreReset {
-    state_directory: StateDirectory,
+    pub(super) state_directory: StateDirectory,
     _ownership: OwnershipLock,
 }
 
 impl OfflineStoreReset {
+    /// Cleanup must not initialize an absent source or repair its permissions.
+    /// Its existing lock and maintenance journal identify the inactive copy.
+    pub(super) fn migration_source(state_root: &Path) -> Result<Self, StorageError> {
+        let state_directory = open_state_root_read_only(state_root)?;
+        let file = open_private_leaf(
+            &state_directory,
+            LOCK_FILE_NAME,
+            LeafOpenMode::ExistingPrivate,
+            StorageErrorKind::LockUnavailable,
+        )?
+        .ok_or_else(|| StorageError::new(StorageErrorKind::LockUnavailable))?;
+        let ownership = lock_store(file)?;
+        Ok(Self {
+            state_directory,
+            _ownership: ownership,
+        })
+    }
+
     pub(crate) fn reset_metadata(self) -> Result<Vec<String>, (Vec<String>, StorageError)> {
         let mut removed = Vec::new();
         for file_name in &PROTECTED_FILE_NAMES[2..] {
@@ -2839,6 +2881,68 @@ impl OfflineStoreReset {
         }
         Ok(removed)
     }
+}
+
+/// Pin a private file through content verification, then remove that identity.
+/// A changed source is retained even when the operator confirms cleanup.
+pub(super) fn verify_migrated_source_file(
+    path: &Path,
+    expected_digest: &[u8; 32],
+) -> Result<bool, StorageError> {
+    inspect_migrated_source_file(path, expected_digest, false)
+}
+
+pub(super) fn remove_verified_migrated_source_file(
+    path: &Path,
+    expected_digest: &[u8; 32],
+) -> Result<bool, StorageError> {
+    inspect_migrated_source_file(path, expected_digest, true)
+}
+
+fn inspect_migrated_source_file(
+    path: &Path,
+    expected_digest: &[u8; 32],
+    remove: bool,
+) -> Result<bool, StorageError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| StorageError::new(StorageErrorKind::UnsafeStatePath))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| StorageError::new(StorageErrorKind::UnsafeStatePath))?;
+    let directory = open_state_root_read_only(parent)?;
+    let Some(mut file) = open_private_leaf(
+        &directory,
+        name,
+        LeafOpenMode::ExistingPrivate,
+        StorageErrorKind::InvalidStoredState,
+    )?
+    else {
+        return Ok(false);
+    };
+    let identity = leaf_identity(&file, StorageErrorKind::InvalidStoredState)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let length = file.read(&mut buffer).map_err(|source| {
+            StorageError::with_source(StorageErrorKind::OperationFailed, source)
+        })?;
+        if length == 0 {
+            break;
+        }
+        digest.update(&buffer[..length]);
+    }
+    let actual: [u8; 32] = digest.finalize().into();
+    if &actual != expected_digest {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    drop(file);
+    if remove {
+        directory.delete_leaf(name, identity)?;
+        directory.sync_for(StorageErrorKind::OperationFailed)?;
+    }
+    Ok(true)
 }
 
 pub(super) fn begin_store_reset_offline(
@@ -3319,7 +3423,7 @@ fn migration_checksum(value: &str) -> String {
     format!("fnv1a64:{checksum:016x}")
 }
 
-fn verify_integrity(connection: &Connection) -> Result<(), StorageError> {
+pub(super) fn verify_integrity(connection: &Connection) -> Result<(), StorageError> {
     let mut statement = connection
         .prepare("PRAGMA integrity_check")
         .map_err(|source| sqlite_error(StorageErrorKind::IntegrityCheckFailed, source))?;

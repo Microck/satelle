@@ -420,7 +420,7 @@ fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
             ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
             ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
             DROP TABLE client_certificate_audit;
-            DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16, 17, 18);
+            DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16, 17, 18, 19);
             PRAGMA user_version = 11;",
         )
         .expect("restore the exact version eleven storage schema");
@@ -432,7 +432,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_sixteen() {
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(18_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(19_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -443,7 +443,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_version_sixteen() {
     assert_eq!(
         vec![
             1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64, 11_i64, 12_i64,
-            13_i64, 14_i64, 15_i64, 16_i64, 17_i64, 18_i64,
+            13_i64, 14_i64, 15_i64, 16_i64, 17_i64, 18_i64, 19_i64,
         ],
         versions
     );
@@ -552,7 +552,7 @@ fn version_fifteen_logs_upgrade_preserves_rows_and_normalizes_lifecycle_sources(
         "the destructive log-table rewrite must retain a rollback backup",
     );
     let connection = upgraded.connection_for_test();
-    assert_eq!(18_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(19_i64, pragma_integer(connection, "user_version"));
     assert_eq!(
         (lifecycle_cursor, "codex_adapter".to_string()),
         connection
@@ -651,7 +651,7 @@ fn version_eleven_provider_smoke_rows_upgrade_to_credential_scoped_cache() {
     let mut upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade the version eleven store");
     assert_eq!(
-        18_i64,
+        19_i64,
         pragma_integer(upgraded.connection_for_test(), "user_version")
     );
     let credential_columns: i64 = upgraded
@@ -758,7 +758,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     storage
         .connection_for_test()
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15, 16, 17, 18)",
+            "DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15, 16, 17, 18, 19)",
             [],
         )
         .expect("remove version eleven and twelve history");
@@ -771,7 +771,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     let upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade populated version ten storage");
     let connection = upgraded.connection_for_test();
-    assert_eq!(18_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(19_i64, pragma_integer(connection, "user_version"));
     assert_eq!(
         ("run".to_string(), "in_progress".to_string()),
         connection
@@ -816,19 +816,28 @@ fn durable_operation_vocabularies_are_closed_over_pr04_mutations() {
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
     let idempotent_operations = [
-        (IdempotentOperation::Run, "run"),
-        (IdempotentOperation::Steer, "steer"),
-        (IdempotentOperation::Stop, "stop"),
-        (IdempotentOperation::Setup, "setup"),
-        (IdempotentOperation::Repair, "repair"),
-        (IdempotentOperation::HostUpdate, "host_update"),
-        (IdempotentOperation::StorageMigration, "storage_migration"),
+        (IdempotentOperation::Run, "run", "v1.turn.starting"),
+        (IdempotentOperation::Steer, "steer", "v1.turn.starting"),
+        (IdempotentOperation::Stop, "stop", "v1.turn.starting"),
+        (IdempotentOperation::Setup, "setup", "v1.turn.starting"),
+        (IdempotentOperation::Repair, "repair", "v1.turn.starting"),
+        (
+            IdempotentOperation::HostUpdate,
+            "host_update",
+            "v1.turn.starting",
+        ),
+        (
+            IdempotentOperation::StorageMigration,
+            "storage_migration",
+            "v1.storage_migration.pending",
+        ),
         (
             IdempotentOperation::DestructiveMaintenance,
             "destructive_maintenance",
+            "v1.turn.starting",
         ),
     ];
-    for (operation, token) in idempotent_operations {
+    for (operation, token, durable_outcome) in idempotent_operations {
         assert_eq!(
             token,
             crate::storage::codec::idempotent_operation_token(operation)
@@ -840,7 +849,7 @@ fn durable_operation_vocabularies_are_closed_over_pr04_mutations() {
                     request_digest, digest_schema_version, hmac_key_version,
                     status, durable_outcome, created_at, expires_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, 1, 1, 'in_progress',
-                           'v1.turn.starting', ?6, ?7)",
+                           ?8, ?6, ?7)",
                 params![
                     format!("principal-{token}"),
                     token,
@@ -849,6 +858,7 @@ fn durable_operation_vocabularies_are_closed_over_pr04_mutations() {
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     at(1).format(&Rfc3339).unwrap(),
                     at(2).format(&Rfc3339).unwrap(),
+                    durable_outcome,
                 ],
             )
             .unwrap_or_else(|error| panic!("persist {token}: {error}"));
@@ -945,17 +955,21 @@ fn durable_operation_vocabularies_are_closed_over_pr04_mutations() {
 fn newer_schema_history_is_rejected_without_downgrade() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("open current storage");
+    let future_version = satelle_core::host_update::HOST_STORAGE_SCHEMA_VERSION + 1;
     storage
         .connection_for_test()
         .execute(
             "INSERT INTO schema_migrations (version, checksum, applied_at)
-             VALUES (19, ?1, '2026-07-21T00:00:00Z')",
-            ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+             VALUES (?1, ?2, '2026-07-21T00:00:00Z')",
+            params![
+                future_version,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ],
         )
         .expect("insert future migration");
     storage
         .connection_for_test()
-        .pragma_update(None, "user_version", 19)
+        .pragma_update(None, "user_version", future_version)
         .expect("mark future schema");
     drop(storage);
 
@@ -966,7 +980,7 @@ fn newer_schema_history_is_rejected_without_downgrade() {
     assert_eq!(error.kind(), StorageErrorKind::MigrationIntegrity);
     let connection = Connection::open(state.path().join(DATABASE_FILE_NAME))
         .expect("future database remains readable");
-    assert_eq!(pragma_integer(&connection, "user_version"), 19);
+    assert_eq!(pragma_integer(&connection, "user_version"), future_version);
 }
 
 #[test]
@@ -1003,7 +1017,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
              ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
              DROP TABLE client_certificate_audit;
-             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18);
+             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19);
              PRAGMA user_version = 7;",
         )
         .expect("recreate the version seven token schema");
@@ -1011,7 +1025,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
 
     let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
     assert_eq!(
-        18_i64,
+        19_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
     let token_state: String = storage
@@ -2271,7 +2285,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
              DROP TABLE client_certificate_audit;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -2280,7 +2294,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        18_i64,
+        19_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -2380,7 +2394,7 @@ fn assert_version_one_corruption_rejected_before_migration(
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
              DROP TABLE client_certificate_audit;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -2449,7 +2463,7 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
              DROP TABLE client_certificate_audit;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');

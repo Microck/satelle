@@ -98,7 +98,8 @@ pub use storage::{
     OperatorLogFailureKind, OperatorLogSinkHealth, SetupActionPlan, SetupActionRecord,
     SetupActionSkipReason, SetupActionStatus, SetupOperationKind, SetupRepairAction,
     SetupRepairDecision, SetupRepairPlan, SetupRepairPostcondition, SetupRepairProbe, SetupRunPlan,
-    SetupRunRecord, SetupRunStatus,
+    SetupRunRecord, SetupRunStatus, StorageMigrationCleanup, StorageMigrationItem,
+    StorageMigrationItemKind, StorageMigrationPlan, StorageMigrationStage,
 };
 use zeroize::Zeroizing;
 
@@ -2052,7 +2053,334 @@ fn storage_backup_cleanup_failure_reports_already_removed_names() {
     assert_eq!(error.recovery_command.as_deref(), Some(recovery_command));
 }
 
+#[derive(serde::Serialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+enum StorageMigrationRequest<'a> {
+    Begin {
+        operation_id: &'a str,
+        expected_paths: &'a DaemonResolvedPathSet,
+    },
+    Complete {
+        operation_id: &'a str,
+        expected_paths: &'a DaemonResolvedPathSet,
+    },
+    SourceCleanup {
+        operation_id: &'a str,
+    },
+}
+
+pub(crate) const STORAGE_MIGRATION_ACTION_ID: &str = "migrate-host-storage";
+pub(crate) const STORAGE_MIGRATION_ACTION_LABEL: &str =
+    "Migrate Host storage to the verified destination";
+
 impl HostService {
+    pub fn begin_storage_migration_idempotent(
+        &self,
+        operation_id: &str,
+        expected_paths: &DaemonResolvedPathSet,
+        authority: &MutationAuthority,
+    ) -> Result<(), SatelleError> {
+        self.execute_storage_migration_request(
+            StorageMigrationRequest::Begin {
+                operation_id,
+                expected_paths,
+            },
+            authority,
+        )?;
+        // A historical begin result is not ongoing permission to stop a Host.
+        // Recheck the lease after replay so a retired migration cannot stop
+        // work admitted after rollback, including from a new daemon process.
+        self.require_storage_migration_source(operation_id, expected_paths)
+    }
+
+    pub fn complete_storage_migration_idempotent(
+        &self,
+        operation_id: &str,
+        expected_paths: &DaemonResolvedPathSet,
+        authority: &MutationAuthority,
+    ) -> Result<(), SatelleError> {
+        self.execute_storage_migration_request(
+            StorageMigrationRequest::Complete {
+                operation_id,
+                expected_paths,
+            },
+            authority,
+        )
+        .map(|_| ())
+    }
+
+    pub fn cleanup_storage_migration_source_idempotent(
+        &self,
+        operation_id: &str,
+        authority: &MutationAuthority,
+    ) -> Result<StorageMigrationCleanup, SatelleError> {
+        match self.execute_storage_migration_request(
+            StorageMigrationRequest::SourceCleanup { operation_id },
+            authority,
+        )? {
+            storage::StorageMigrationReply::SourceCleaned(cleanup) => Ok(*cleanup),
+            storage::StorageMigrationReply::Acknowledged => Err(SatelleError::state_conflict()),
+        }
+    }
+
+    fn execute_storage_migration_request(
+        &self,
+        request: StorageMigrationRequest<'_>,
+        authority: &MutationAuthority,
+    ) -> Result<storage::StorageMigrationReply, SatelleError> {
+        use operation_capacity::{OperationOutcome, OperationRequest};
+        use storage::{IdempotentOperation, StorageMigrationReply, StorageMigrationRequestState};
+        let canonical = serde_json::to_vec(&request).map_err(|_| SatelleError::state_conflict())?;
+        let _identity_gate = self.operation_capacity.lock_identity_read()?;
+        let identity = self.runtime.authenticated_request_identity(
+            authority.principal(),
+            IdempotentOperation::StorageMigration,
+            authority.idempotency_key(),
+            &canonical,
+            1,
+        )?;
+        self.operation_capacity
+            .execute(
+                OperationRequest::new(IdempotentOperation::StorageMigration, &identity),
+                || {
+                    Ok(
+                        match self.runtime.storage_migration_request_state(&identity)? {
+                            Some(StorageMigrationRequestState::Completed(reply)) => {
+                                Some(OperationOutcome::StorageMigration(reply))
+                            }
+                            _ => None,
+                        },
+                    )
+                },
+                || {
+                    let cleanup_plan = match self
+                        .runtime
+                        .storage_migration_request_state(&identity)?
+                    {
+                        Some(StorageMigrationRequestState::Completed(reply)) => {
+                            return Ok(OperationOutcome::StorageMigration(reply));
+                        }
+                        Some(StorageMigrationRequestState::Pending(cleanup)) => cleanup,
+                        None => {
+                            let cleanup = match request {
+                                StorageMigrationRequest::SourceCleanup { operation_id } => Some(
+                                    Box::new(self.preview_storage_migration_source(operation_id)?),
+                                ),
+                                _ => None,
+                            };
+                            self.runtime
+                                .start_storage_migration_request(&identity, cleanup.as_deref())?;
+                            cleanup
+                        }
+                    };
+                    let reply = match request {
+                        StorageMigrationRequest::Begin {
+                            operation_id,
+                            expected_paths,
+                        } => {
+                            self.begin_storage_migration(operation_id, expected_paths)?;
+                            StorageMigrationReply::Acknowledged
+                        }
+                        StorageMigrationRequest::Complete {
+                            operation_id,
+                            expected_paths,
+                        } => {
+                            self.complete_storage_migration(operation_id, expected_paths)?;
+                            StorageMigrationReply::Acknowledged
+                        }
+                        StorageMigrationRequest::SourceCleanup { operation_id } => {
+                            let mut plan = cleanup_plan.ok_or_else(SatelleError::state_conflict)?;
+                            self.runtime.cleanup_storage_migration_source(
+                                operation_id,
+                                &self.daemon_resolved_paths()?,
+                                Some(&plan),
+                            )?;
+                            // Success establishes that every file from the original
+                            // plan is absent, including deletions before an interruption.
+                            plan.removed_files.clone_from(&plan.files);
+                            StorageMigrationReply::SourceCleaned(plan)
+                        }
+                    };
+                    self.runtime
+                        .finish_storage_migration_request(&identity, &reply)?;
+                    Ok(OperationOutcome::StorageMigration(reply))
+                },
+            )
+            .and_then(OperationOutcome::into_storage_migration)
+    }
+
+    fn require_storage_migration_source(
+        &self,
+        operation_id: &str,
+        expected_paths: &DaemonResolvedPathSet,
+    ) -> Result<(), SatelleError> {
+        if self.daemon_resolved_paths()? != *expected_paths {
+            return Err(SatelleError::state_conflict());
+        }
+        let existing = self
+            .load_setup_run(operation_id)?
+            .ok_or_else(SatelleError::state_conflict)?;
+        if existing.operation_kind() != SetupOperationKind::StorageMigration
+            || !matches!(
+                existing.status(),
+                SetupRunStatus::Running | SetupRunStatus::OutcomeUnknown
+            )
+            || existing.actions().len() != 1
+            || existing.actions()[0].action_id() != STORAGE_MIGRATION_ACTION_ID
+            || !storage::migration_requires_rollback(
+                Path::new(&expected_paths.state_root),
+                operation_id,
+            )?
+        {
+            return Err(SatelleError::state_conflict());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn begin_storage_migration(
+        &self,
+        operation_id: &str,
+        expected_paths: &DaemonResolvedPathSet,
+    ) -> Result<(), SatelleError> {
+        if self.daemon_resolved_paths()? != *expected_paths {
+            return Err(SatelleError::state_conflict());
+        }
+        let source_root = Path::new(&expected_paths.state_root);
+        let action_id = STORAGE_MIGRATION_ACTION_ID;
+        let action_label = STORAGE_MIGRATION_ACTION_LABEL;
+        if self.load_setup_run(operation_id)?.is_some() {
+            return self.require_storage_migration_source(operation_id, expected_paths);
+        }
+        let started_at = time::OffsetDateTime::now_utc();
+        let plan = SetupRunPlan::new(
+            operation_id,
+            SetupOperationKind::StorageMigration,
+            None,
+            started_at,
+            vec![SetupActionPlan::new(action_id, action_label, true)?],
+        )?;
+        let mut operation = self.begin_setup_run(&plan)?;
+        self.start_setup_action(&operation, action_id, started_at)?;
+        storage::begin_offline_storage_maintenance(
+            source_root,
+            operation_id,
+            action_id,
+            action_label,
+            started_at,
+        )
+        .map_err(runtime::storage_failure)?;
+        self.runtime.handoff_offline_maintenance(&mut operation);
+        Ok(())
+    }
+
+    pub fn plan_storage_migration(
+        source: &DaemonResolvedPathSet,
+        destination_root: &Path,
+    ) -> Result<StorageMigrationPlan, SatelleError> {
+        storage::plan_path_migration(source, destination_root)
+    }
+
+    /// Starts a durable maintenance operation and stages the selected storage.
+    /// The service coordinator completes this operation only after it has
+    /// restarted and verified the Host against the destination path set.
+    pub fn stage_storage_migration(
+        source: &satelle_core::daemon_service::DaemonResolvedPathSet,
+        destination_root: &std::path::Path,
+        operation_id: &str,
+    ) -> Result<StorageMigrationStage, SatelleError> {
+        let source_root = Path::new(&source.state_root);
+        let plan =
+            storage::plan_owned_path_migration(source, destination_root, Some(operation_id))?;
+        if !storage::migration_requires_rollback(source_root, operation_id)? {
+            Self::start_offline_storage_maintenance(
+                source_root,
+                operation_id,
+                STORAGE_MIGRATION_ACTION_ID,
+                STORAGE_MIGRATION_ACTION_LABEL,
+            )?;
+        }
+        storage::stage_path_migration(plan)
+    }
+
+    /// Completes the staged operation from the restarted Host. The request
+    /// cannot authorize a path switch or complete an unverified partial copy.
+    pub fn complete_storage_migration(
+        &self,
+        operation_id: &str,
+        expected_paths: &DaemonResolvedPathSet,
+    ) -> Result<(), SatelleError> {
+        if self.daemon_resolved_paths()? != *expected_paths {
+            return Err(SatelleError::state_conflict());
+        }
+        self.runtime
+            .verify_storage_migration(operation_id, expected_paths)?;
+        self.complete_offline_storage_maintenance(
+            Path::new(&expected_paths.state_root),
+            operation_id,
+            STORAGE_MIGRATION_ACTION_ID,
+            STORAGE_MIGRATION_ACTION_LABEL,
+        )
+    }
+
+    pub fn preview_storage_migration_source(
+        &self,
+        operation_id: &str,
+    ) -> Result<StorageMigrationCleanup, SatelleError> {
+        self.runtime.cleanup_storage_migration_source(
+            operation_id,
+            &self.daemon_resolved_paths()?,
+            None,
+        )
+    }
+
+    /// A stage failure may precede creation of its journal. Only retire this
+    /// exact operation; another unfinished operation retains its own authority.
+    pub fn rollback_storage_migration(
+        source_root: &Path,
+        operation_id: &str,
+    ) -> Result<(), SatelleError> {
+        let journal_present = storage::migration_requires_rollback(source_root, operation_id)?;
+        let action_id = STORAGE_MIGRATION_ACTION_ID;
+        let service = Self::production_for_offline_storage(source_root);
+        let existing = service
+            .load_setup_run(operation_id)?
+            .ok_or_else(SatelleError::state_conflict)?;
+        if existing.operation_kind() != SetupOperationKind::StorageMigration
+            || existing.actions().len() != 1
+            || existing.actions()[0].action_id() != action_id
+            || existing.status() == SetupRunStatus::Completed
+        {
+            return Err(SatelleError::state_conflict());
+        }
+        if journal_present {
+            storage::mark_offline_storage_maintenance_failed(source_root, operation_id, action_id)
+                .map_err(runtime::storage_failure)?;
+        }
+        // The SQLite lease may commit before the external journal can be
+        // written. Recovery still retires that exact owner after the source
+        // process stops; missing journal bytes must not strand its lease.
+        if existing.status() != SetupRunStatus::Failed {
+            let mut observer = OfflineStoragePostcondition {
+                action_id,
+                satisfied: false,
+            };
+            if service.reconcile_setup_maintenance(&mut observer)? != Some(SetupRunStatus::Failed) {
+                return Err(SatelleError::state_conflict());
+            }
+        }
+        if journal_present {
+            storage::finish_offline_storage_maintenance(
+                source_root,
+                operation_id,
+                action_id,
+                None,
+                true,
+            )
+            .map_err(runtime::storage_failure)?;
+        }
+        Ok(())
+    }
+
     pub fn validate_storage_restore(
         state_root: &std::path::Path,
         backup: &std::path::Path,
@@ -2162,7 +2490,22 @@ impl HostService {
         action_label: &str,
     ) -> Result<(), SatelleError> {
         let service = Self::production_for_offline_storage(state_root);
-        if let Some(existing) = service.load_setup_run(operation_id)? {
+        service.complete_offline_storage_maintenance(
+            state_root,
+            operation_id,
+            action_id,
+            action_label,
+        )
+    }
+
+    fn complete_offline_storage_maintenance(
+        &self,
+        state_root: &Path,
+        operation_id: &str,
+        action_id: &str,
+        action_label: &str,
+    ) -> Result<(), SatelleError> {
+        if let Some(existing) = self.load_setup_run(operation_id)? {
             if existing.operation_kind() != SetupOperationKind::StorageMigration
                 || existing.actions().len() != 1
                 || existing.actions()[0].action_id() != action_id
@@ -2190,7 +2533,7 @@ impl HostService {
                 action_id,
                 satisfied: true,
             };
-            let status = service.reconcile_setup_maintenance(&mut observer)?;
+            let status = self.reconcile_setup_maintenance(&mut observer)?;
             if status != Some(SetupRunStatus::Completed) {
                 return Err(SatelleError::state_conflict());
             }
@@ -2218,14 +2561,14 @@ impl HostService {
             started_at,
             vec![SetupActionPlan::new(action_id, action_label, true)?],
         )?;
-        let mut operation = service.begin_setup_run(&plan)?;
-        service.start_setup_action(&operation, action_id, started_at)?;
-        service.complete_setup_action_after_verified_postcondition(
+        let mut operation = self.begin_setup_run(&plan)?;
+        self.start_setup_action(&operation, action_id, started_at)?;
+        self.complete_setup_action_after_verified_postcondition(
             &operation,
             action_id,
             time::OffsetDateTime::now_utc(),
         )?;
-        service.finish_setup_run(&mut operation, time::OffsetDateTime::now_utc())?;
+        self.finish_setup_run(&mut operation, time::OffsetDateTime::now_utc())?;
         storage::finish_offline_storage_maintenance(
             state_root,
             operation_id,

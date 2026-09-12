@@ -774,9 +774,11 @@ Usage: satelle host storage [OPTIONS] <COMMAND>
 
 Commands:
   migrate
+  complete  Confirm a staged migration after a lost completion response
+  source
   restore
   backup
-  help     Print this message or the help of the given subcommand(s)
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
       --no-color               Disable colored human output
@@ -956,7 +958,7 @@ Options:
 ## `satelle host storage migrate`
 
 ```text
-Usage: satelle host storage migrate [OPTIONS]
+Usage: satelle host storage migrate [OPTIONS] --to <TO>
 
 Options:
       --host <HOST>
@@ -970,6 +972,43 @@ Options:
       --no-input
       --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host storage complete`
+
+```text
+Confirm a staged migration after a lost completion response
+
+Usage: satelle host storage complete [OPTIONS] --host <HOST> --operation-id <OPERATION_ID>
+
+Options:
+      --host <HOST>
+      --no-color                     Disable colored human output
+      --log-verbosity <LEVEL>        Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --operation-id <OPERATION_ID>
+      --profile <NAME>               Apply a named user-level configuration profile
+      --yes
+      --error-format <FORMAT>        Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --format <FORMAT>              [possible values: human, json, compact-json, toon, markdown]
+      --json                         Alias for --format json
+  -h, --help                         Print help
+```
+
+## `satelle host storage source`
+
+```text
+Usage: satelle host storage source [OPTIONS] <COMMAND>
+
+Commands:
+  cleanup
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
   -h, --help                   Print help
 ```
 
@@ -1028,6 +1067,26 @@ Options:
       --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
+```
+
+## `satelle host storage source cleanup`
+
+```text
+Usage: satelle host storage source cleanup [OPTIONS] --host <HOST> --operation-id <OPERATION_ID>
+
+Options:
+      --host <HOST>
+      --no-color                     Disable colored human output
+      --log-verbosity <LEVEL>        Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --operation-id <OPERATION_ID>
+      --dry-run
+      --profile <NAME>               Apply a named user-level configuration profile
+      --error-format <FORMAT>        Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --yes
+      --no-input
+      --format <FORMAT>              [possible values: human, json, compact-json, toon, markdown]
+      --json                         Alias for --format json
+  -h, --help                         Print help
 ```
 
 ## `satelle host storage backup cleanup`

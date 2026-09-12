@@ -226,7 +226,7 @@ fn expired_sessionless_idempotency(
              WHERE session_id IS NULL
                AND (
                    (operation = ?1 AND status IN ('in_progress', 'terminal'))
-                   OR (operation IN (?2, ?3, ?4, ?5, ?6) AND status = 'terminal')
+                   OR (operation IN (?2, ?3, ?4, ?5, ?6, ?7) AND status = 'terminal')
                )",
         )
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -239,6 +239,7 @@ fn expired_sessionless_idempotency(
                 idempotent_operation_token(IdempotentOperation::ProviderBindingDeletion),
                 idempotent_operation_token(IdempotentOperation::SetupVerification),
                 idempotent_operation_token(IdempotentOperation::NativeReadinessInvalidation),
+                idempotent_operation_token(IdempotentOperation::StorageMigration),
             ],
             |row| {
                 Ok((

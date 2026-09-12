@@ -48,7 +48,7 @@ fn version_sixteen_store_with_pending_journal(state: &TempDir) {
         .unwrap();
     connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (17, 18)",
+            "DELETE FROM schema_migrations WHERE version IN (17, 18, 19)",
             [],
         )
         .unwrap();

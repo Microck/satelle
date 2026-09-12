@@ -967,6 +967,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         ));
     let maintenance_read_route = Router::new()
         .route(
+            "/v1/maintenance/storage-migration/{operation_id}/source/cleanup",
+            get(setup::plan_storage_migration_cleanup),
+        )
+        .route(
             "/v1/maintenance/update-evidence",
             get(maintenance_update_evidence),
         )
@@ -1201,8 +1205,26 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_admin_mutation,
         ));
+    let storage_migration_route = Router::new()
+        .route(
+            "/v1/maintenance/storage-migration/{operation_id}/source/cleanup",
+            post(setup::apply_storage_migration_cleanup),
+        )
+        .route(
+            "/v1/maintenance/storage-migration/{operation_id}/complete",
+            post(setup::complete_storage_migration),
+        )
+        .route(
+            "/v1/maintenance/storage-migration/{operation_id}/begin",
+            post(setup::begin_storage_migration),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
     let protected = read_routes
         .merge(api_token_routes)
+        .merge(storage_migration_route)
         .merge(host_update_maintenance_route)
         .merge(bootstrap_maintenance_routes)
         .merge(setup_routes)

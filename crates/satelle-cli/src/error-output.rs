@@ -333,6 +333,21 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The Host state could not be read safely.",
             default_recovery: "run satelle doctor and repair the reported storage problem",
         },
+        ErrorCode::StorageMigrationSourceInvalid
+        | ErrorCode::StorageMigrationDestinationInvalid
+        | ErrorCode::StorageMigrationPathsOverlap
+        | ErrorCode::StorageMigrationDestinationNotEmpty => ErrorContract {
+            category: ErrorCategory::Storage,
+            retryable: false,
+            outcome: "The migration could not verify its storage paths.",
+            default_recovery: "inspect the reported paths and migration state before retrying",
+        },
+        ErrorCode::StorageMigrationRollbackFailed => ErrorContract {
+            category: ErrorCategory::Storage,
+            retryable: false,
+            outcome: "Migration failed to restore the previous Host.",
+            default_recovery: "follow the reported recovery requirements and commands before starting either Host",
+        },
         ErrorCode::SelfUpdateInstallOwnerUnknown
         | ErrorCode::SelfUpdateReceiptInvalid
         | ErrorCode::SelfUpdateVerificationFailed

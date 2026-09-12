@@ -96,6 +96,10 @@ enum Operation {
     ApiTokenIssue,
     ApiTokenRotate,
     ApiTokenRevoke,
+    StorageMigrationBegin,
+    StorageMigrationComplete,
+    StorageMigrationSourcePlan,
+    StorageMigrationSourceCleanup,
 }
 
 impl Operation {
@@ -121,6 +125,10 @@ impl Operation {
             Self::ApiTokenIssue => "api_token_issue",
             Self::ApiTokenRotate => "api_token_rotate",
             Self::ApiTokenRevoke => "api_token_revoke",
+            Self::StorageMigrationBegin => "storage_migration_begin",
+            Self::StorageMigrationComplete => "storage_migration_complete",
+            Self::StorageMigrationSourcePlan => "storage_migration_source_plan",
+            Self::StorageMigrationSourceCleanup => "storage_migration_source_cleanup",
         }
     }
 }
@@ -329,6 +337,10 @@ impl CapabilitiesResponse {
                 Operation::ApiTokenIssue,
                 Operation::ApiTokenRotate,
                 Operation::ApiTokenRevoke,
+                Operation::StorageMigrationBegin,
+                Operation::StorageMigrationComplete,
+                Operation::StorageMigrationSourcePlan,
+                Operation::StorageMigrationSourceCleanup,
             ],
             runtime_capabilities: RuntimeCapabilities {
                 codex_runtime,

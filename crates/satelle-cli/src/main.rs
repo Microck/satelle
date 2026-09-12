@@ -20,6 +20,8 @@ mod read;
 #[path = "self-update.rs"]
 mod self_update;
 mod skills;
+#[path = "storage-migration.rs"]
+mod storage_migration;
 mod support;
 mod tailscale;
 #[path = "tailscale-serve.rs"]
@@ -606,6 +608,11 @@ enum HostCommand {
     OfflineStorageRestorePreview(OfflineStorageRestorePreviewCommand),
     #[command(hide = true)]
     OfflineStorageBackupCleanupPlan(OfflineStorageBackupCleanupPlanCommand),
+    #[command(hide = true)]
+    OfflineStorageMigration {
+        #[command(subcommand)]
+        command: storage_migration::OfflineCommand,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -874,6 +881,12 @@ struct HostSessionsCommand {
 #[derive(Subcommand, Debug)]
 enum HostStorageCommand {
     Migrate(HostStorageMigrateCommand),
+    /// Confirm a staged migration after a lost completion response.
+    Complete(HostStorageCompleteCommand),
+    Source {
+        #[command(subcommand)]
+        command: HostStorageSourceCommand,
+    },
     Restore(HostStorageRestoreCommand),
     Backup {
         #[command(subcommand)]
@@ -881,18 +894,51 @@ enum HostStorageCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum HostStorageSourceCommand {
+    Cleanup(HostStorageSourceCleanupCommand),
+}
+
 #[derive(Args, Debug)]
-struct HostStorageMigrateCommand {
+struct HostStorageSourceCleanupCommand {
     #[arg(long)]
-    host: Option<String>,
+    host: String,
     #[arg(long)]
-    to: Option<String>,
+    operation_id: String,
     #[arg(long)]
     dry_run: bool,
     #[arg(long)]
     yes: bool,
     #[arg(long)]
     no_input: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Args, Debug)]
+struct HostStorageMigrateCommand {
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long)]
+    to: PathBuf,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    no_input: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Args, Debug)]
+struct HostStorageCompleteCommand {
+    #[arg(long)]
+    host: String,
+    #[arg(long)]
+    operation_id: String,
+    #[arg(long)]
+    yes: bool,
     #[command(flatten)]
     output_args: OutputArgs,
 }
@@ -2346,6 +2392,15 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         Command::Host {
             command:
                 HostCommand::Storage {
+                    command:
+                        HostStorageCommand::Source {
+                            command: HostStorageSourceCommand::Cleanup(command),
+                        },
+                },
+        } if command.dry_run => return None,
+        Command::Host {
+            command:
+                HostCommand::Storage {
                     command: HostStorageCommand::Restore(command),
                 },
         } if command.dry_run => return None,
@@ -2379,6 +2434,9 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         Command::Host {
             command: HostCommand::OfflineStorageBackupCleanupPlan(_),
         } => return None,
+        Command::Host {
+            command: HostCommand::OfflineStorageMigration { .. },
+        } => return None,
         Command::Host { command } => HistoryTarget {
             family: "host",
             selects_host: match command {
@@ -2407,6 +2465,15 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                     command: HostStorageCommand::Migrate(command),
                 } => command.host.as_deref(),
                 HostCommand::Storage {
+                    command: HostStorageCommand::Complete(command),
+                } => Some(command.host.as_str()),
+                HostCommand::Storage {
+                    command:
+                        HostStorageCommand::Source {
+                            command: HostStorageSourceCommand::Cleanup(command),
+                        },
+                } => Some(command.host.as_str()),
+                HostCommand::Storage {
                     command: HostStorageCommand::Restore(command),
                 } => command.host.as_deref(),
                 HostCommand::Storage {
@@ -2422,6 +2489,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
                 HostCommand::OfflineStorageMaintenance(_) => None,
                 HostCommand::OfflineStorageRestorePreview(_) => None,
                 HostCommand::OfflineStorageBackupCleanupPlan(_) => None,
+                HostCommand::OfflineStorageMigration { .. } => None,
             },
             session_id: None,
         },
@@ -8391,6 +8459,7 @@ fn run_host(
     match command {
         HostCommand::Start(command) => start_host_daemon(*command, config, format),
         HostCommand::ReleaseState => release_ssh_state_owner(),
+        HostCommand::OfflineStorageMigration { command } => storage_migration::run_offline(command),
         HostCommand::Trust(command) => trust_host(command, config, format),
         HostCommand::Status(command) => {
             let status = read::host_status(command.host.as_deref(), config)?;
@@ -12185,12 +12254,28 @@ fn run_host_storage(
     format: OutputFormat,
 ) -> Result<(), CliFailure> {
     match command {
-        HostStorageCommand::Migrate(command) => {
-            Err(failure(SatelleError::not_implemented(format!(
-                "host storage migration is not implemented yet for host {}",
-                command.host.as_deref().unwrap_or(LOCAL_DEMO_HOST)
-            ))))
+        HostStorageCommand::Migrate(command) => storage_migration::run(command, config, format),
+        HostStorageCommand::Complete(command) => {
+            if !command.yes {
+                return Err(failure(SatelleError::invalid_usage(
+                    "storage completion requires --yes",
+                )));
+            }
+            let host = config.resolve_host(Some(&command.host))?;
+            transport::storage_migration::complete(&host, &command.operation_id)
+                .map_err(failure)?;
+            print_storage_result(
+                &host.alias,
+                "complete",
+                json!({"operation_id": command.operation_id}),
+                true,
+                &["migrate-host-storage"],
+                format,
+            )
         }
+        HostStorageCommand::Source {
+            command: HostStorageSourceCommand::Cleanup(command),
+        } => storage_migration::cleanup(command, config, format),
         HostStorageCommand::Restore(command) => {
             let host = config.resolve_host(command.host.as_deref())?;
             let local_state_root = (host.config.transport == TransportKind::Local)
