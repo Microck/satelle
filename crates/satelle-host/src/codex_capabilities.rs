@@ -1792,6 +1792,7 @@ fn probe_codex_version(mut command: Command, timeout: Duration) -> CodexVersionE
     probe_codex_version_command(command, timeout)
 }
 
+#[cfg(not(windows))]
 pub(crate) fn probe_codex_version_command(
     mut command: Command,
     timeout: Duration,
@@ -1853,6 +1854,78 @@ pub(crate) fn probe_codex_version_command(
     parse_codex_version_output(&output)
 }
 
+#[cfg(windows)]
+pub(crate) fn probe_codex_version_command(
+    mut command: Command,
+    timeout: Duration,
+) -> CodexVersionEvidence {
+    let deadline = Instant::now() + timeout;
+    let mut child = match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // The official Windows Codex CLI does not emit synchronous command
+        // output when started in Satelle's nested Job object. Version is a
+        // bounded, read-only command from the verified managed runtime, so
+        // run it as a plain child and kill/reap it on timeout.
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            tracing::debug!("Codex runtime version probe found no executable");
+            return CodexVersionEvidence::Missing;
+        }
+        Err(_) => {
+            tracing::debug!("Codex runtime version probe could not start");
+            return CodexVersionEvidence::Unavailable;
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return CodexVersionEvidence::Unavailable;
+    };
+
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let output = read_version_output(stdout, deadline);
+        let _ = sender.send(output);
+    });
+
+    let status = wait_for_plain_leader(&mut child, deadline);
+    let process_stopped = match &status {
+        GroupWaitOutcome::Exited(_) => true,
+        GroupWaitOutcome::Deadline | GroupWaitOutcome::Error => {
+            let _ = child.kill();
+            child.wait().is_ok()
+        }
+    };
+    let output = receiver.recv_timeout(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(10)),
+    );
+    let reader_stopped = reader.join().is_ok();
+    let Ok(Ok(output)) = output else {
+        return CodexVersionEvidence::Unavailable;
+    };
+    if !process_stopped || !reader_stopped {
+        return CodexVersionEvidence::Unavailable;
+    }
+
+    let evidence = parse_codex_version_output(&output);
+    match status {
+        GroupWaitOutcome::Exited(status) if status.success() => evidence,
+        // A complete canonical line is sufficient after the timed-out plain
+        // child has been killed and reaped. This also covers a slow first
+        // launch without admitting arbitrary or incomplete output.
+        GroupWaitOutcome::Deadline if matches!(evidence, CodexVersionEvidence::Detected { .. }) => {
+            evidence
+        }
+        _ => CodexVersionEvidence::Unavailable,
+    }
+}
+
 #[cfg(unix)]
 fn read_version_output(
     stdout: std::process::ChildStdout,
@@ -1882,7 +1955,67 @@ fn read_version_output(
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read_version_output(
+    mut stdout: std::process::ChildStdout,
+    deadline: Instant,
+) -> std::io::Result<Vec<u8>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let mut output = Vec::with_capacity(VERSION_OUTPUT_LIMIT as usize);
+    loop {
+        let mut available = 0_u32;
+        // A descendant can inherit this pipe after the version command exits.
+        // Peek before reading so a complete canonical line can finish the
+        // probe without waiting for that unrelated handle to close.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                stdout.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if peeked == 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == ErrorKind::BrokenPipe {
+                Ok(output)
+            } else {
+                Err(error)
+            };
+        }
+        if available > 0 {
+            let remaining = VERSION_OUTPUT_LIMIT
+                .saturating_sub(output.len() as u64)
+                .min(u64::from(available));
+            if remaining == 0 {
+                return Ok(output);
+            }
+            let start = output.len();
+            output.resize(start + remaining as usize, 0);
+            stdout.read_exact(&mut output[start..])?;
+            if matches!(
+                parse_codex_version_output(&output),
+                CodexVersionEvidence::Detected { .. }
+            ) {
+                return Ok(output);
+            }
+            continue;
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "version pipe read deadline expired",
+            ));
+        }
+        thread::sleep(VERSION_PROBE_POLL_INTERVAL);
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn read_version_output(
     stdout: std::process::ChildStdout,
     _deadline: Instant,
@@ -1913,6 +2046,18 @@ enum GroupWaitOutcome {
 fn wait_for_leader(child: &mut GroupChild, deadline: Instant) -> GroupWaitOutcome {
     loop {
         match child.inner().try_wait() {
+            Ok(Some(status)) => return GroupWaitOutcome::Exited(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(VERSION_PROBE_POLL_INTERVAL),
+            Ok(None) => return GroupWaitOutcome::Deadline,
+            Err(_) => return GroupWaitOutcome::Error,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_plain_leader(child: &mut std::process::Child, deadline: Instant) -> GroupWaitOutcome {
+    loop {
+        match child.try_wait() {
             Ok(Some(status)) => return GroupWaitOutcome::Exited(status),
             Ok(None) if Instant::now() < deadline => thread::sleep(VERSION_PROBE_POLL_INTERVAL),
             Ok(None) => return GroupWaitOutcome::Deadline,

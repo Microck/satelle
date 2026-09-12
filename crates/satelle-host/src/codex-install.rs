@@ -28,6 +28,10 @@ const BASELINE_CODEX_VERSION: &str = "0.144.0";
 const BASELINE_CODEX_RELEASE_TAG: &str = "rust-v0.144.0";
 const BASELINE_CHECKSUMS_SHA256: &str =
     "b651a02c474412bfc47707d3b12597f67ebaaf40665d81fe26a77488410302c1";
+// The first launch of a freshly extracted Codex binary can include Windows
+// Defender inspection. Keep the install probe bounded while allowing that
+// cold start to complete on a slower guest.
+const MANAGED_INSTALL_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CHECKSUMS_BYTES: u64 = 64 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
@@ -728,7 +732,7 @@ fn verify_installed_version(binary_path: &Path, codex_home: &Path) -> Result<(),
         .expect("the pinned baseline Codex version is valid");
     let evidence = crate::codex_capabilities::probe_codex_version_command(
         command,
-        crate::codex_capabilities::VERSION_PROBE_TIMEOUT,
+        MANAGED_INSTALL_VERSION_PROBE_TIMEOUT,
     );
     if !matches!(
         evidence,

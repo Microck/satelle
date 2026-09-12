@@ -408,7 +408,11 @@ impl DaemonClient {
         let path = provider_binding_path(provider_alias, model_alias)?;
         let (request, request_id) =
             self.mutation_request_with_method(Method::PUT, &path, idempotency_key)?;
-        self.send_authenticated(request.json(authorization), request_id, StatusCode::OK)
+        self.send_authenticated(
+            self.admission_request(request.json(authorization)),
+            request_id,
+            StatusCode::OK,
+        )
     }
 
     pub fn delete_provider_binding(
@@ -580,7 +584,10 @@ impl DaemonClient {
         );
         let idempotency_key = format!("{operation_id}:{action_id}:apply-managed-setup");
         let (request, request_id) = self.mutation_request(&path, &idempotency_key)?;
-        self.send_authenticated(request, request_id, StatusCode::OK)
+        // Managed setup can download and verify the pinned runtime. Use the
+        // admission deadline so a slow but bounded install returns its typed
+        // result instead of being flattened into host-unreachable.
+        self.send_authenticated(self.admission_request(request), request_id, StatusCode::OK)
     }
 
     pub fn begin_bootstrap_maintenance(
@@ -592,7 +599,7 @@ impl DaemonClient {
             "/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/on_demand_handoff/begin"
         );
         let (request, request_id) = self.mutation_request(&path, operation_id)?;
-        self.send_authenticated(request, request_id, StatusCode::OK)
+        self.send_authenticated(self.admission_request(request), request_id, StatusCode::OK)
     }
 
     pub fn begin_on_demand_setup_maintenance(
@@ -608,7 +615,7 @@ impl DaemonClient {
         let path =
             format!("/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/{plan_kind}/begin");
         let (request, request_id) = self.mutation_request(&path, operation_id)?;
-        self.send_authenticated(request, request_id, StatusCode::OK)
+        self.send_authenticated(self.admission_request(request), request_id, StatusCode::OK)
     }
 
     pub fn begin_persistent_service_maintenance(
@@ -625,7 +632,7 @@ impl DaemonClient {
         let path =
             format!("/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/{plan_kind}/begin");
         let (request, request_id) = self.mutation_request(&path, operation_id)?;
-        self.send_authenticated(request, request_id, StatusCode::OK)
+        self.send_authenticated(self.admission_request(request), request_id, StatusCode::OK)
     }
 
     pub fn begin_persistent_host_stop_maintenance(
@@ -1236,7 +1243,8 @@ fn validate_response_context(
 mod tests {
     use super::*;
     use satelle_core::{
-        ApiTokenSource, DirectHostBindingError, HostConfig, SatelleConfig, TransportKind,
+        ApiTokenSource, DirectHostBindingError, HostConfig, ProviderBindingAuthorization,
+        ProviderBindingSource, ResolvedProviderBinding, SatelleConfig, TransportKind,
     };
     use satelle_host::LogCursor;
     use std::io::{Read, Write};
@@ -1983,6 +1991,172 @@ mod tests {
             .build()
             .expect("build provider validation request");
         assert_eq!(validation_request.timeout(), Some(&admission_timeout));
+    }
+
+    #[test]
+    fn managed_setup_uses_the_admission_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind managed setup fixture");
+        let address = listener
+            .local_addr()
+            .expect("read managed setup fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept managed setup request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("read managed setup request");
+                assert_ne!(read, 0, "managed setup request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8(request).expect("request headers should be UTF-8");
+            assert!(request.starts_with(
+                "POST /v1/maintenance/bootstrap/operation/action/managed-codex/apply-managed-setup HTTP/1.1\r\n"
+            ));
+            let request_id = header_value(&request, "satelle-request-id")
+                .expect("managed setup request must carry a request ID");
+            std::thread::sleep(Duration::from_millis(150));
+            let body = format!(
+                "{{\"schema_version\":\"satelle.bootstrap-maintenance.v1\",\"request_id\":\"{request_id}\",\"host_identity\":\"host-managed-setup\",\"operation_id\":\"operation\",\"reconciled\":true,\"changed\":false}}"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write managed setup response");
+            stream.flush().expect("flush managed setup response");
+        });
+
+        let client = DaemonClient::loopback_with_timeout(
+            address,
+            ApiBearerToken::generate().expect("generate managed setup token"),
+            "host-managed-setup",
+            Duration::from_millis(50),
+        )
+        .expect("construct managed setup client")
+        .with_admission_timeout(Duration::from_secs(1));
+        let response = client
+            .apply_bootstrap_managed_setup_action("operation", "managed-codex")
+            .expect("managed setup should use the admission deadline");
+        assert_eq!(response.operation_id(), "operation");
+        assert!(!response.changed());
+        server.join().expect("join managed setup fixture");
+    }
+
+    #[test]
+    fn provider_binding_authorization_uses_the_admission_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+        let address = listener
+            .local_addr()
+            .expect("read provider fixture address");
+        let authorization =
+            ProviderBindingAuthorization::new("review", "openai", "gpt-5.6", "openai");
+        let public_binding = satelle_core::PublicResolvedProviderBinding::from(
+            &ResolvedProviderBinding::from_authorization(
+                authorization.clone(),
+                ProviderBindingSource::UserConfig,
+            ),
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("read provider request");
+                assert_ne!(read, 0, "provider request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8(request).expect("request headers should be UTF-8");
+            assert!(
+                request.starts_with("PUT /v1/setup/provider-bindings/openai/review HTTP/1.1\r\n")
+            );
+            let request_id = header_value(&request, "satelle-request-id")
+                .expect("provider request must carry a request ID");
+            std::thread::sleep(Duration::from_millis(150));
+            let body = serde_json::json!({
+                "schema_version": "satelle.provider-binding-authorization-response.v2",
+                "request_id": request_id,
+                "host_identity": "host-provider-setup",
+                "binding": public_binding,
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write provider response");
+            stream.flush().expect("flush provider response");
+        });
+
+        let client = DaemonClient::loopback_with_timeout(
+            address,
+            ApiBearerToken::generate().expect("generate provider setup token"),
+            "host-provider-setup",
+            Duration::from_millis(50),
+        )
+        .expect("construct provider setup client")
+        .with_admission_timeout(Duration::from_secs(1));
+        let response = client
+            .authorize_provider_binding(
+                "openai",
+                "review",
+                &ProviderBindingAuthorizationRequest::new(authorization),
+                "provider-authorization-test",
+            )
+            .expect("provider authorization should use the admission deadline");
+        assert_eq!(response.binding().model(), "gpt-5.6");
+        server.join().expect("join provider fixture");
+    }
+
+    #[test]
+    fn bootstrap_maintenance_begin_uses_the_admission_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind maintenance fixture");
+        let address = listener
+            .local_addr()
+            .expect("read maintenance fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept maintenance request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("read maintenance request");
+                assert_ne!(read, 0, "maintenance request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8(request).expect("request headers should be UTF-8");
+            assert!(request.starts_with(
+                "POST /v1/maintenance/bootstrap/operation/initial_setup/on_demand_handoff/begin HTTP/1.1\r\n"
+            ));
+            let request_id = header_value(&request, "satelle-request-id")
+                .expect("maintenance request must carry a request ID");
+            std::thread::sleep(Duration::from_millis(150));
+            let body = format!(
+                "{{\"schema_version\":\"satelle.bootstrap-maintenance.v1\",\"request_id\":\"{request_id}\",\"host_identity\":\"host-maintenance\",\"operation_id\":\"operation\",\"reconciled\":true}}"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write maintenance response");
+            stream.flush().expect("flush maintenance response");
+        });
+
+        let client = DaemonClient::loopback_with_timeout(
+            address,
+            ApiBearerToken::generate().expect("generate maintenance token"),
+            "host-maintenance",
+            Duration::from_millis(50),
+        )
+        .expect("construct maintenance client")
+        .with_admission_timeout(Duration::from_secs(1));
+        let response = client
+            .begin_bootstrap_maintenance("operation", "initial_setup")
+            .expect("maintenance begin should use the admission deadline");
+        assert_eq!(response.operation_id(), "operation");
+        assert!(response.reconciled());
+        server.join().expect("join maintenance fixture");
     }
 
     #[test]
