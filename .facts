@@ -2332,7 +2332,7 @@
 - satelle bundled setup skill guides AI agents through safe noninteractive setup planning, secret-source descriptor handling, consent boundaries, and readiness verification @spec @mvp @implemented
 - satelle bundled use skill guides AI agents through run, steer, status, logs, stop, event modes, output formats, and session continuation rules @spec @mvp @implemented
 - satelle bundled recover skill guides AI agents through doctor, config check, logs, setup repair, and host update without guessing at remote state @spec @mvp @implemented
-- satelle later extends the bundled recover skill with support bundle escalation when the matching CLI release supports diagnostic bundles @spec @later
+- satelle bundled recover skill escalates unresolved failures with a local support bundle when the matching CLI release supports diagnostic bundles @spec @phase4 @implemented
 - satelle bundled router skill names the setup, use, and recover skills and routes agents to the smallest skill that covers the current Satelle task @spec @mvp @implemented
 - satelle bundled skills are versioned with the Satelle CLI release and document the CLI behavior for that same release instead of floating independently from the binary @spec @mvp @implemented
 - satelle skills list and satelle skills get report the Agent Skill Bundle release version @spec @mvp @implemented
