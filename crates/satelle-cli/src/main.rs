@@ -63,9 +63,10 @@ use satelle_core::{
     MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField, ProviderSecretSource,
     RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
     SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
-    SetupSchemaVersion, SetupVerification, TransportKind, load_config, load_config_for_profile,
-    load_config_without_profile, load_user_api_rate_limits, open_new_owner_only_file,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
+    SetupSchemaVersion, SetupVerification, TransportKind, TurnId, load_config,
+    load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
+    open_new_owner_only_file, open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    open_owner_only_directory, persist_new_owner_only_diagnostic_file,
     publish_new_owner_only_directory, read_owner_controlled_config_file,
     read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set,
     sync_owner_only_directory, utc_now,
@@ -1189,6 +1190,8 @@ struct RunCommand {
     )]
     timeout: Option<String>,
     #[command(flatten)]
+    raw_protocol_args: RawProtocolArgs,
+    #[command(flatten)]
     output_args: OutputArgs,
     #[arg(
         value_name = "PROMPT_OR_DASH",
@@ -1267,12 +1270,36 @@ struct SteerCommand {
     )]
     timeout: Option<String>,
     #[command(flatten)]
+    raw_protocol_args: RawProtocolArgs,
+    #[command(flatten)]
     output_args: OutputArgs,
     #[arg(
         value_name = "PROMPT_OR_DASH",
         help = "Prompt text or '-' for stdin. Prompt arguments may be retained by shell history or visible in local process metadata; use stdin or --prompt-file for sensitive input"
     )]
     prompt: Option<String>,
+}
+
+#[derive(Args, Clone, Debug)]
+struct RawProtocolArgs {
+    #[arg(
+        long,
+        help = "Capture this prospective Turn's redacted Codex app-server JSON protocol"
+    )]
+    raw_protocol: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the raw diagnostic artifact to this local path"
+    )]
+    output: Option<PathBuf>,
+    #[arg(long, help = "Disable raw diagnostic consent input")]
+    no_input: bool,
+    #[arg(
+        long,
+        help = "Confirm this invocation's raw diagnostic warning in noninteractive mode"
+    )]
+    yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -13881,12 +13908,13 @@ fn turn_request_construction_carries_provider_aliases_refresh_and_one_shot_opt_i
         &selection,
         true,
         satelle_core::DEFAULT_TURN_EXECUTION_TIMEOUT_MS,
+        None,
     );
 
     assert_eq!(
         serde_json::to_value(request).expect("TurnRequest should serialize"),
         json!({
-            "schema_version": "satelle.api.v8",
+            "schema_version": "satelle.api.v9",
             "prompt": "inspect the desktop",
             "execution_mode": "standard",
             "model": "vision",
@@ -13918,6 +13946,239 @@ fn print_experimental_provider_warning(
     }
 }
 
+fn prepare_raw_protocol_capture(
+    raw: &RawProtocolArgs,
+    detach: bool,
+) -> Result<Option<PathBuf>, CliFailure> {
+    if !raw.raw_protocol {
+        if raw.output.is_some() || raw.no_input || raw.yes {
+            return Err(failure(SatelleError::invalid_usage(
+                "--output, --no-input, and --yes require --raw-protocol for run and steer",
+            )));
+        }
+        return Ok(None);
+    }
+    if detach {
+        return Err(failure(SatelleError::invalid_usage(
+            "--raw-protocol cannot be combined with --detach because this invocation must write and acknowledge the artifact",
+        )));
+    }
+    let requested = raw
+        .output
+        .as_deref()
+        .ok_or_else(|| failure(SatelleError::raw_diagnostics_output_required()))?;
+    let file_name = requested.file_name().ok_or_else(|| {
+        failure(SatelleError::raw_diagnostics_failure(
+            satelle_core::sensitive_diagnostics::RawDiagnosticFailure::StagingFailed,
+            "--output must name a new raw diagnostic file",
+        ))
+    })?;
+    let parent = task_artifact_output_parent(requested)
+        .canonicalize()
+        .map_err(|error| {
+            failure(SatelleError::raw_diagnostics_failure(
+                satelle_core::sensitive_diagnostics::RawDiagnosticFailure::StagingFailed,
+                format!("raw diagnostic output parent is unavailable: {error}"),
+            ))
+        })?;
+    let output = parent.join(file_name);
+    if output.try_exists().map_err(|error| {
+        failure(SatelleError::raw_diagnostics_failure(
+            satelle_core::sensitive_diagnostics::RawDiagnosticFailure::StagingFailed,
+            format!("could not inspect raw diagnostic output path: {error}"),
+        ))
+    })? {
+        return Err(failure(SatelleError::raw_diagnostics_failure(
+            satelle_core::sensitive_diagnostics::RawDiagnosticFailure::StagingFailed,
+            format!("raw diagnostic output already exists: {}", output.display()),
+        )));
+    }
+
+    eprintln!(
+        "Warning: this raw protocol export may contain secrets, prompts, transcripts, provider payloads, visible desktop content, file paths, user names, host names, internal addresses, and other sensitive diagnostic data even after redaction."
+    );
+    eprintln!("Output: {}", output.display());
+    eprintln!("Satelle will not upload this artifact automatically.");
+    eprintln!("Normal Satelle diagnostics are unchanged.");
+    eprintln!("Inspect the artifact before sharing it.");
+
+    let interactive = io::stdin().is_terminal() && !raw.no_input;
+    let consented = if interactive {
+        cliclack::confirm("Create this raw protocol export?")
+            .initial_value(false)
+            .interact()
+            .map_err(|error| {
+                failure(SatelleError::config_error(
+                    "could not read raw diagnostic consent",
+                    Some(error.to_string()),
+                ))
+            })?
+    } else {
+        raw.no_input && raw.yes
+    };
+    if !consented {
+        return Err(failure(SatelleError::raw_diagnostics_consent_required(
+            &output,
+        )));
+    }
+    Ok(Some(output))
+}
+
+fn export_raw_protocol(
+    transport: &dyn transport::TransportClient,
+    turn_id: &TurnId,
+    output: &Path,
+) -> Result<(), CliFailure> {
+    let artifact = transport.raw_protocol_export(turn_id).map_err(failure)?;
+    let bytes = serde_json::to_vec(&artifact).map_err(|_| {
+        failure(SatelleError::raw_diagnostics_failure(
+            satelle_core::sensitive_diagnostics::RawDiagnosticFailure::RedactionFailed,
+            "the redacted raw protocol artifact could not be serialized",
+        ))
+    })?;
+    let staging = output.with_file_name(format!(
+        ".satelle-raw-diagnostics-{}.tmp",
+        Uuid::now_v7().simple()
+    ));
+    if let Err(error) = persist_new_owner_only_diagnostic_file(output, &staging, &bytes) {
+        let _ = transport.acknowledge_raw_protocol_export(
+            turn_id,
+            satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome::Failed,
+        );
+        let raw_material_may_remain = staging.try_exists().unwrap_or(true);
+        let mut failure_error = SatelleError::raw_diagnostics_failure(
+            satelle_core::sensitive_diagnostics::RawDiagnosticFailure::StagingFailed,
+            format!("could not publish raw protocol artifact: {error}"),
+        );
+        failure_error.details.insert(
+            "staging_path".to_string(),
+            Value::String(staging.display().to_string()),
+        );
+        failure_error.details.insert(
+            "cleanup_command".to_string(),
+            Value::String(raw_diagnostic_cleanup_command(&staging)),
+        );
+        failure_error.details.insert(
+            "raw_material_may_remain".to_string(),
+            Value::Bool(raw_material_may_remain),
+        );
+        return Err(failure(failure_error));
+    }
+    transport
+        .acknowledge_raw_protocol_export(
+            turn_id,
+            satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome::Exported,
+        )
+        .map_err(|mut error| {
+            error.details.insert(
+                "output_path".to_string(),
+                Value::String(output.display().to_string()),
+            );
+            failure(error)
+        })?;
+    eprintln!("Raw protocol artifact: {}", output.display());
+    Ok(())
+}
+
+fn attach_raw_protocol_export_failure(
+    transport: &dyn transport::TransportClient,
+    output: Option<&Path>,
+    turn_id: Option<&TurnId>,
+    turn_error: &mut SatelleError,
+) {
+    let (Some(output), Some(turn_id)) = (output, turn_id) else {
+        return;
+    };
+    let Err(raw_failure) = export_raw_protocol(transport, turn_id, output) else {
+        return;
+    };
+    turn_error.details.insert(
+        "raw_protocol_export_error".to_string(),
+        json!({
+            "code": raw_failure.error.code.as_str(),
+            "message": raw_failure.error.message,
+            "recovery_command": raw_failure.error.recovery_command,
+            "details": raw_failure.error.details,
+        }),
+    );
+}
+
+fn raw_diagnostic_cleanup_command(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            "Remove-Item -LiteralPath '{}'",
+            path.to_string_lossy().replace('\'', "''")
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!(
+            "rm -- '{}'",
+            path.to_string_lossy().replace('\'', "'\"'\"'")
+        )
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn raw_protocol_consent_requires_one_exact_noninteractive_invocation() {
+    let state = satelle_host::test_support::TestStateDir::new().unwrap();
+    let output = state.path().join("raw.json");
+    let raw = RawProtocolArgs {
+        raw_protocol: true,
+        output: Some(output.clone()),
+        no_input: true,
+        yes: true,
+    };
+    let prepared = match prepare_raw_protocol_capture(&raw, false) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => panic!("raw capture consent must return the output path"),
+        Err(_) => panic!("explicit noninteractive consent must succeed"),
+    };
+    let expected_output = state.path().canonicalize().unwrap().join("raw.json");
+    assert_eq!(prepared, expected_output);
+    assert!(!prepared.exists());
+
+    let detached = prepare_raw_protocol_capture(&raw, true).unwrap_err();
+    assert_eq!(detached.error.code, ErrorCode::InvalidUsage);
+    let unconfirmed = prepare_raw_protocol_capture(
+        &RawProtocolArgs {
+            yes: false,
+            ..raw.clone()
+        },
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        unconfirmed.error.code,
+        ErrorCode::RawDiagnosticsConsentRequired
+    );
+    let missing_output = prepare_raw_protocol_capture(
+        &RawProtocolArgs {
+            output: None,
+            ..raw
+        },
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        missing_output.error.code,
+        ErrorCode::RawDiagnosticsOutputRequired
+    );
+    let unrelated = prepare_raw_protocol_capture(
+        &RawProtocolArgs {
+            raw_protocol: false,
+            output: Some(output),
+            no_input: false,
+            yes: false,
+        },
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(unrelated.error.code, ErrorCode::InvalidUsage);
+}
+
 fn run_prompt(
     command: RunCommand,
     config_context: ConfigContext<'_>,
@@ -13926,6 +14187,7 @@ fn run_prompt(
     let machine_output = format.is_structured();
     validate_interrupt_mode(command.detach, command.detach_on_interrupt)?;
     validate_event_mode(command.detach, command.events)?;
+    let raw_output = prepare_raw_protocol_capture(&command.raw_protocol_args, command.detach)?;
     let effective_mode = effective_event_mode(
         command.events,
         command.detach,
@@ -14096,6 +14358,7 @@ fn run_prompt(
         &provider_selection,
         command.refresh_provider_smoke_test,
         turn_execution_timeout_ms,
+        raw_output.as_ref().map(|_| host.alias.as_str()),
     )
     .with_attachments(attachments);
     if command.detach {
@@ -14132,20 +14395,32 @@ fn run_prompt(
     }) {
         Ok(outcome) => outcome,
         Err(attached_failure) => {
-            for event in attached_failure.events() {
-                event_output
-                    .emit(&host.alias, event.clone())
-                    .map_err(failure)?;
-            }
-            let history_session_id = attached_failure
+            let phase = attached_failure.phase();
+            let durable_handles = attached_failure
                 .durable_handles()
+                .map(|(session_id, turn_id)| (session_id.clone(), turn_id.clone()));
+            let events = attached_failure.events().to_vec();
+            let mut turn_error = attached_failure.into_error();
+            attach_raw_protocol_export_failure(
+                transport.as_ref(),
+                raw_output.as_deref(),
+                durable_handles.as_ref().map(|(_, turn_id)| turn_id),
+                &mut turn_error,
+            );
+            for event in events {
+                event_output.emit(&host.alias, event).map_err(failure)?;
+            }
+            let history_session_id = durable_handles
+                .as_ref()
                 .map(|(session_id, _)| Box::new(session_id.clone()));
             event_output
                 .emit_admission_failure(
                     &host.alias,
-                    attached_failure.error(),
-                    attached_failure.phase(),
-                    attached_failure.durable_handles(),
+                    &turn_error,
+                    phase,
+                    durable_handles
+                        .as_ref()
+                        .map(|(session_id, turn_id)| (session_id, turn_id)),
                 )
                 .map_err(|error| CliFailure {
                     error,
@@ -14154,13 +14429,16 @@ fn run_prompt(
                     exit_code_override: None,
                 })?;
             return Err(CliFailure {
-                error: attached_failure.into_error(),
+                error: turn_error,
                 history_session_id,
                 error_reported: false,
                 exit_code_override: None,
             });
         }
     };
+    if let Some(output) = raw_output.as_deref() {
+        export_raw_protocol(transport.as_ref(), &outcome.turn_id, output)?;
+    }
     print_turn_session(
         outcome,
         TurnOutputOptions {
@@ -14185,6 +14463,7 @@ fn steer_prompt(
     let machine_output = format.is_structured();
     validate_interrupt_mode(command.detach, command.detach_on_interrupt)?;
     validate_event_mode(command.detach, command.events)?;
+    let raw_output = prepare_raw_protocol_capture(&command.raw_protocol_args, command.detach)?;
     let effective_mode = effective_event_mode(
         command.events,
         command.detach,
@@ -14353,6 +14632,7 @@ fn steer_prompt(
         &provider_selection,
         command.refresh_provider_smoke_test,
         turn_execution_timeout_ms,
+        raw_output.as_ref().map(|_| host.alias.as_str()),
     )
     .with_attachments(attachments);
     if command.detach {
@@ -14394,20 +14674,32 @@ fn steer_prompt(
     ) {
         Ok(outcome) => outcome,
         Err(attached_failure) => {
-            for event in attached_failure.events() {
-                event_output
-                    .emit(&host.alias, event.clone())
-                    .map_err(failure)?;
-            }
-            let history_session_id = attached_failure
+            let phase = attached_failure.phase();
+            let durable_handles = attached_failure
                 .durable_handles()
+                .map(|(session_id, turn_id)| (session_id.clone(), turn_id.clone()));
+            let events = attached_failure.events().to_vec();
+            let mut turn_error = attached_failure.into_error();
+            attach_raw_protocol_export_failure(
+                transport.as_ref(),
+                raw_output.as_deref(),
+                durable_handles.as_ref().map(|(_, turn_id)| turn_id),
+                &mut turn_error,
+            );
+            for event in events {
+                event_output.emit(&host.alias, event).map_err(failure)?;
+            }
+            let history_session_id = durable_handles
+                .as_ref()
                 .map(|(session_id, _)| Box::new(session_id.clone()));
             event_output
                 .emit_admission_failure(
                     &host.alias,
-                    attached_failure.error(),
-                    attached_failure.phase(),
-                    attached_failure.durable_handles(),
+                    &turn_error,
+                    phase,
+                    durable_handles
+                        .as_ref()
+                        .map(|(session_id, turn_id)| (session_id, turn_id)),
                 )
                 .map_err(|error| CliFailure {
                     error,
@@ -14416,13 +14708,16 @@ fn steer_prompt(
                     exit_code_override: None,
                 })?;
             return Err(CliFailure {
-                error: attached_failure.into_error(),
+                error: turn_error,
                 history_session_id,
                 error_reported: false,
                 exit_code_override: None,
             });
         }
     };
+    if let Some(output) = raw_output.as_deref() {
+        export_raw_protocol(transport.as_ref(), &outcome.turn_id, output)?;
+    }
     print_turn_session(
         outcome,
         TurnOutputOptions {
@@ -14445,8 +14740,9 @@ fn build_turn_request(
     provider_selection: &ProviderSelection,
     refresh_provider_smoke_test: bool,
     turn_execution_timeout_ms: u64,
+    raw_protocol_source_host: Option<&str>,
 ) -> TurnRequest {
-    TurnRequest::new(prompt)
+    let request = TurnRequest::new(prompt)
         .with_execution_mode(execution_mode)
         .with_provider_intent(
             provider_selection.requested_model_alias.clone(),
@@ -14458,7 +14754,11 @@ fn build_turn_request(
         .with_experimental_provider_computer_use(
             provider_selection.experimental_provider_computer_use,
         )
-        .with_turn_execution_timeout_ms(turn_execution_timeout_ms)
+        .with_turn_execution_timeout_ms(turn_execution_timeout_ms);
+    match raw_protocol_source_host {
+        Some(source_host) => request.with_raw_protocol_capture(source_host),
+        None => request,
+    }
 }
 
 fn show_status(

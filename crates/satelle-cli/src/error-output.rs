@@ -342,6 +342,22 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The migration could not verify its storage paths.",
             default_recovery: "inspect the reported paths and migration state before retrying",
         },
+        ErrorCode::RawDiagnosticsOutputRequired | ErrorCode::RawDiagnosticsConsentRequired => {
+            ErrorContract {
+                category: ErrorCategory::InvalidRequest,
+                retryable: false,
+                outcome: "Raw diagnostic capture did not start.",
+                default_recovery: "choose an output path and confirm the warning for this invocation",
+            }
+        }
+        ErrorCode::RawDiagnosticsRedactionFailed
+        | ErrorCode::RawDiagnosticsStagingFailed
+        | ErrorCode::RawDiagnosticsExportFailed => ErrorContract {
+            category: ErrorCategory::Storage,
+            retryable: false,
+            outcome: "The raw diagnostic export did not complete.",
+            default_recovery: "inspect the reported cleanup state before requesting a new capture",
+        },
         ErrorCode::StorageMigrationRollbackFailed => ErrorContract {
             category: ErrorCategory::Storage,
             retryable: false,

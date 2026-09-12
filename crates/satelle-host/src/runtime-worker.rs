@@ -263,6 +263,7 @@ pub(super) struct ExecutionPlan {
     pub(super) resolved_provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
     pub(super) attachments: crate::attachment::StagedAttachments,
     pub(super) live_events: super::request::LocalLiveEventBuffer,
+    pub(super) raw_protocol_capture: Option<crate::raw_diagnostics::RawProtocolCapture>,
 }
 
 #[derive(Default)]
@@ -401,7 +402,7 @@ impl RuntimeEngine {
             .ok_or_else(|| model::integrity_failure("the executing Turn is missing"))?
             .execution_policy();
         let resolved_provider_secret = plan.resolved_provider_secret.take();
-        let result = match self.adapter.execute(
+        let adapter_result = self.adapter.execute(
             ExecuteRequest::new(
                 &plan.host,
                 &plan.prompt,
@@ -422,8 +423,17 @@ impl RuntimeEngine {
             )
             .with_admitted_app_approval(&plan.admitted_app_approval)
             .with_resolved_provider_binding(plan.resolved_provider_binding.as_ref())
-            .with_resolved_provider_secret(resolved_provider_secret),
-        ) {
+            .with_resolved_provider_secret(resolved_provider_secret)
+            .with_raw_protocol_capture(plan.raw_protocol_capture.clone()),
+        );
+        if plan.raw_protocol_capture.is_some() {
+            self.raw_diagnostics.complete(
+                Arc::clone(&self.storage),
+                &turn_id,
+                OffsetDateTime::now_utc(),
+            );
+        }
+        let result = match adapter_result {
             Ok(result) => result,
             Err(error) => {
                 return runtime_failure_with_events(

@@ -99,6 +99,23 @@ JSON results include `provider_smoke` with `status`, `source`, `observed_at`,
 `--refresh-provider-smoke-test` forces `refresh` before prompt execution.
 Provider fingerprints, prompts, transcripts, and desktop content are excluded.
 
+## Raw protocol exports
+
+Use `satelle run --raw-protocol --output <path>` or
+`satelle steer <session_id> --raw-protocol --output <path>` to capture the
+selected Turn's Codex app-server JSON messages. Satelle shows the full
+sensitivity warning before capture starts. Interactive use requires
+confirmation. Noninteractive use requires both `--no-input` and `--yes`.
+Raw capture cannot run with `--detach`.
+
+The invoking CLI writes one private `satelle.raw-diagnostics.v1` JSON file,
+then acknowledges that write to the Host. Satelle does not upload or cache the
+file. The Host redacts known credentials before transfer, caps one capture at
+8 MiB, keeps at most eight pending exports, and discards unacknowledged data
+ten minutes after the Turn finishes or when the Host restarts. Inspect the
+artifact before sharing it because unknown secrets and visible session content
+can remain after redaction.
+
 ## Doctor options
 
 `doctor` accepts `--host`, `--scope`, `--refresh`, `--timeout`,

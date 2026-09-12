@@ -79,7 +79,7 @@ async fn storage_migration_completion_checks_admin_paths_and_durable_staging_bef
             &source_server.host_identity,
         )
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "15")
+        .header("Satelle-Protocol-Version", "16")
         .header("Idempotency-Key", &begin_key)
         .json(&StorageMigrationPathsRequest::new(source_paths.clone()))
         .send()
@@ -138,7 +138,7 @@ async fn storage_migration_completion_checks_admin_paths_and_durable_staging_bef
         .bearer_auth(read_token.expose().as_str())
         .header("Satelle-Expected-Host-Identity", &server.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "15")
+        .header("Satelle-Protocol-Version", "16")
         .header("Idempotency-Key", "read-only-completion")
         .json(&request)
         .send()
@@ -216,7 +216,7 @@ async fn storage_migration_completion_checks_admin_paths_and_durable_staging_bef
     std::fs::write(&copied_log, b"original log\n").unwrap();
     let preview = server.request(&cleanup_endpoint).send().await.unwrap();
     assert_eq!(preview.status(), StatusCode::OK);
-    assert_eq!(preview.headers()["Satelle-Protocol-Version"], "15");
+    assert_eq!(preview.headers()["Satelle-Protocol-Version"], "16");
     assert!(std::path::Path::new(&source_paths.sqlite_store).exists());
     let cleaned = server
         .mutation(&cleanup_endpoint, "cleanup-source")

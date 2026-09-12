@@ -1,5 +1,6 @@
 use super::{CodexSessionError, CodexSessionFailure};
 use command_group::{CommandGroup, GroupChild};
+use satelle_core::sensitive_diagnostics::ProtocolDirection;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::Path;
@@ -99,6 +100,10 @@ pub(super) trait CodexExchange {
     fn turn_dispatch_attempted(&self) -> bool {
         false
     }
+
+    fn raw_protocol_capture(&self) -> Option<crate::raw_diagnostics::RawProtocolCapture> {
+        None
+    }
 }
 
 pub(super) fn run_exchange<E: CodexExchange>(
@@ -107,6 +112,7 @@ pub(super) fn run_exchange<E: CodexExchange>(
     deadline: Instant,
     exchange: &mut E,
 ) -> Result<E::Output, CodexSessionFailure> {
+    let raw_protocol_capture = exchange.raw_protocol_capture();
     #[cfg(windows)]
     if !cleanup_pending(
         &mut PENDING_CLEANUP
@@ -175,6 +181,7 @@ pub(super) fn run_exchange<E: CodexExchange>(
     let writer = ProtocolWriter {
         sender: write_sender,
         deadline,
+        raw_protocol_capture,
     };
     let writer_thread = match thread::Builder::new()
         .name("satelle-codex-writer".to_string())
@@ -249,6 +256,7 @@ pub(super) fn run_exchange<E: CodexExchange>(
 pub(super) struct ProtocolWriter {
     sender: mpsc::Sender<WriteCommand>,
     deadline: Instant,
+    raw_protocol_capture: Option<crate::raw_diagnostics::RawProtocolCapture>,
 }
 
 struct WriteCommand {
@@ -263,6 +271,7 @@ impl ProtocolWriter {
         Self {
             sender,
             deadline: Instant::now(),
+            raw_protocol_capture: None,
         }
     }
 
@@ -280,6 +289,9 @@ impl ProtocolWriter {
         }
         let mut bytes = serde_json::to_vec(value).map_err(|_| CodexSessionError::Write)?;
         bytes.push(b'\n');
+        if let Some(capture) = &self.raw_protocol_capture {
+            capture.record_message(ProtocolDirection::ToCodex, value.clone(), bytes.len());
+        }
         if Instant::now() >= self.deadline {
             return Err(CodexSessionError::Timeout);
         }

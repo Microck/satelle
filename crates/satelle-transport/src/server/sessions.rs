@@ -1,8 +1,12 @@
 use super::api_json::ApiJson;
 use super::auth::AuthorizedRequest;
-use super::{ApiFailure, DaemonState, api_error_response, authenticated_json_response, host_error};
+use super::{
+    ApiFailure, DaemonState, api_error_response, authenticated_json_bytes_response,
+    authenticated_json_response, host_error,
+};
 use crate::contract::{
-    AdmissionCancellationResponse, ApiErrorCategory, ApiErrorCode, RequestId, SessionResponse,
+    AdmissionCancellationResponse, ApiErrorCategory, ApiErrorCode, RawProtocolAcknowledgeRequest,
+    RawProtocolAcknowledgeResponse, RawProtocolDownloadResponse, RequestId, SessionResponse,
     StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest, TurnRequestParts,
 };
 use axum::extract::{Extension, FromRequestParts, Path, State};
@@ -10,7 +14,9 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use satelle_core::{SatelleError, SessionId, TurnId};
-use satelle_host::{AdmissionCancellationResult, MutationAuthority, TurnIntent, TurnIntentError};
+use satelle_host::{
+    AdmissionCancellationResult, ApiScopes, MutationAuthority, TurnIntent, TurnIntentError,
+};
 use std::sync::Arc;
 
 pub(super) async fn create_session(
@@ -20,6 +26,9 @@ pub(super) async fn create_session(
     headers: HeaderMap,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
+    if let Some(response) = raw_protocol_scope_failure(&state, &authorized, &request) {
+        return response;
+    }
     let intent = match turn_intent(request, state.capabilities.image_attachments()) {
         Ok(intent) => intent,
         Err(error) => return invalid_turn_request(&state, &authorized, error),
@@ -70,6 +79,9 @@ pub(super) async fn create_turn(
     SessionPath(session_id): SessionPath,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
+    if let Some(response) = raw_protocol_scope_failure(&state, &authorized, &request) {
+        return response;
+    }
     let intent = match turn_intent(request, state.capabilities.image_attachments()) {
         Ok(intent) => intent,
         Err(error) => return invalid_turn_request(&state, &authorized, error),
@@ -110,6 +122,27 @@ pub(super) async fn create_turn(
         authorized.request_id(),
         &state.host_identity,
     )
+}
+
+fn raw_protocol_scope_failure(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+    request: &TurnRequest,
+) -> Option<Response> {
+    if request.raw_protocol_capture().is_some()
+        && !authorized
+            .principal()
+            .scopes()
+            .allows(ApiScopes::DIAGNOSTICS_SENSITIVE)
+    {
+        Some(super::auth::insufficient_scope(
+            state,
+            authorized,
+            "diagnostics:sensitive",
+        ))
+    } else {
+        None
+    }
 }
 
 const ADMISSION_ACTION_HEADER: &str = "satelle-admission-action";
@@ -220,6 +253,70 @@ pub(super) async fn get_task_artifacts(
     )
 }
 
+pub(super) async fn get_raw_protocol_export(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    TurnPath(turn_id): TurnPath,
+) -> Response {
+    let principal_ref = authorized.principal().principal_ref().to_string();
+    let request_id = authorized.request_id().clone();
+    let host_identity = state.host_identity.clone();
+    let service = Arc::clone(&state.service);
+    let body = match host_call(&state, &authorized, move || {
+        let artifact = service.raw_protocol_export(&principal_ref, &turn_id)?;
+        serde_json::to_vec(&RawProtocolDownloadResponse::new(
+            request_id,
+            host_identity,
+            artifact,
+        ))
+        .map_err(|_| {
+            SatelleError::raw_diagnostics_failure(
+                satelle_core::sensitive_diagnostics::RawDiagnosticFailure::ExportFailed,
+                "the Host Daemon could not encode the raw protocol export",
+            )
+        })
+    })
+    .await
+    {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    authenticated_json_bytes_response(
+        StatusCode::OK,
+        body,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn acknowledge_raw_protocol_export(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    TurnPath(turn_id): TurnPath,
+    ApiJson(request): ApiJson<RawProtocolAcknowledgeRequest>,
+) -> Response {
+    let principal_ref = authorized.principal().principal_ref().to_string();
+    let outcome = request.outcome();
+    let service = Arc::clone(&state.service);
+    if let Err(response) = host_call(&state, &authorized, move || {
+        service.acknowledge_raw_protocol_export(&principal_ref, &turn_id, outcome)
+    })
+    .await
+    {
+        return response;
+    }
+    authenticated_json_response(
+        StatusCode::OK,
+        &RawProtocolAcknowledgeResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            outcome,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
 pub(super) async fn stop_session(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
@@ -276,6 +373,7 @@ fn expected_turn_id(headers: &HeaderMap) -> Result<Option<TurnId>, ()> {
 }
 
 pub(super) struct SessionPath(SessionId);
+pub(super) struct TurnPath(TurnId);
 
 impl FromRequestParts<Arc<DaemonState>> for SessionPath {
     type Rejection = Response;
@@ -295,6 +393,27 @@ impl FromRequestParts<Arc<DaemonState>> for SessionPath {
         SessionId::parse(&raw_session_id)
             .map(Self)
             .map_err(|_| invalid_session_id(state, &authorized))
+    }
+}
+
+impl FromRequestParts<Arc<DaemonState>> for TurnPath {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<DaemonState>,
+    ) -> Result<Self, Self::Rejection> {
+        let authorized = parts
+            .extensions
+            .get::<AuthorizedRequest>()
+            .cloned()
+            .ok_or_else(missing_authorization_context)?;
+        let Path(raw_turn_id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| invalid_turn_id(state, &authorized))?;
+        TurnId::parse(&raw_turn_id)
+            .map(Self)
+            .map_err(|_| invalid_turn_id(state, &authorized))
     }
 }
 
@@ -340,6 +459,7 @@ fn turn_intent(
         experimental_provider_computer_use,
         attachments,
         turn_execution_timeout_ms,
+        raw_protocol,
     } = request.into_parts();
     let attachments = attachments
         .into_iter()
@@ -368,6 +488,9 @@ fn turn_intent(
         })
         .and_then(|intent| intent.with_turn_execution_timeout_ms(turn_execution_timeout_ms))
         .and_then(|intent| intent.with_attachments(attachments))
+        .and_then(|intent| {
+            intent.with_raw_protocol_capture(raw_protocol.map(|capture| capture.into_source_host()))
+        })
 }
 
 fn invalid_turn_request(
@@ -383,6 +506,9 @@ fn invalid_turn_request(
             "Turn execution timeout must be a whole number of seconds from 1s through 24h"
         }
         TurnIntentError::InvalidAttachments => "image attachments failed integrity validation",
+        TurnIntentError::InvalidRawProtocolSourceHost => {
+            "raw protocol source Host alias is invalid"
+        }
     };
     request_error(state, authorized, message)
 }
@@ -392,6 +518,14 @@ fn invalid_session_id(state: &DaemonState, authorized: &AuthorizedRequest) -> Re
         state,
         authorized,
         "the path must contain one canonical Satelle Session ID",
+    )
+}
+
+fn invalid_turn_id(state: &DaemonState, authorized: &AuthorizedRequest) -> Response {
+    request_error(
+        state,
+        authorized,
+        "the path must contain one canonical Satelle Turn ID",
     )
 }
 

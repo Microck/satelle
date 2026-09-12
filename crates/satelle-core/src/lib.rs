@@ -35,6 +35,8 @@ mod project_config;
 mod secret_file_path;
 #[path = "secure-file.rs"]
 mod secure_file;
+#[path = "sensitive-diagnostics.rs"]
+pub mod sensitive_diagnostics;
 pub mod session;
 
 pub use authority::{
@@ -78,12 +80,12 @@ pub use secure_file::{
     open_or_create_owner_only_directory, open_or_create_owner_only_file,
     open_or_create_user_or_administrator_controlled_directory, open_owner_only_directory,
     open_user_or_administrator_controlled_directory, owner_only_secret_destination_exists,
-    persist_new_owner_only_config_file, persist_new_owner_only_secret_file,
-    publish_new_owner_only_directory, publish_owner_only_secret_file,
-    read_bounded_regular_file_no_follow, read_optional_owner_only_secret_config_file,
-    read_owner_controlled_config_file, read_owner_only_secret_config_file,
-    read_owner_only_secret_file, read_trusted_ca_bundle_file, rollback_owner_only_secret_file,
-    stage_owner_only_secret_file, sync_owner_only_directory,
+    persist_new_owner_only_config_file, persist_new_owner_only_diagnostic_file,
+    persist_new_owner_only_secret_file, publish_new_owner_only_directory,
+    publish_owner_only_secret_file, read_bounded_regular_file_no_follow,
+    read_optional_owner_only_secret_config_file, read_owner_controlled_config_file,
+    read_owner_only_secret_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
+    rollback_owner_only_secret_file, stage_owner_only_secret_file, sync_owner_only_directory,
 };
 
 pub const PRODUCT_NAME: &str = "Satelle";
@@ -1082,6 +1084,50 @@ impl From<&ResolvedProviderBinding> for PublicResolvedProviderBinding {
 }
 
 impl SatelleError {
+    pub fn raw_diagnostics_failure(
+        failure: sensitive_diagnostics::RawDiagnosticFailure,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: failure.code(),
+            message: message.into(),
+            recovery_command: Some(
+                "request a new raw protocol capture after correcting the reported problem"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn raw_diagnostics_output_required() -> Self {
+        Self {
+            code: ErrorCode::RawDiagnosticsOutputRequired,
+            message: "--raw-protocol requires one --output path".to_string(),
+            recovery_command: Some(
+                "repeat the command with --raw-protocol --output <path>".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn raw_diagnostics_consent_required(output: &Path) -> Self {
+        Self {
+            code: ErrorCode::RawDiagnosticsConsentRequired,
+            message: "raw protocol capture requires consent for this invocation".to_string(),
+            recovery_command: Some(format!(
+                "repeat the command with --raw-protocol --output {} --no-input --yes",
+                shell_argument(&output.to_string_lossy())
+            )),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "output_path".to_string(),
+                Value::String(output.display().to_string()),
+            )]),
+        }
+    }
+
     pub fn project_provider_selection_not_allowed(
         host_alias: &str,
         provider_alias: &str,
@@ -4682,6 +4728,11 @@ pub enum ErrorCode {
     StorageMigrationPathsOverlap,
     StorageMigrationDestinationNotEmpty,
     StorageMigrationRollbackFailed,
+    RawDiagnosticsOutputRequired,
+    RawDiagnosticsConsentRequired,
+    RawDiagnosticsRedactionFailed,
+    RawDiagnosticsStagingFailed,
+    RawDiagnosticsExportFailed,
     IncompatibleControlPlane,
     ComputerUseNotReady,
     NativeReadinessTimeout,
@@ -4841,6 +4892,11 @@ impl ErrorCode {
             Self::StorageMigrationPathsOverlap => "storage-migration-paths-overlap",
             Self::StorageMigrationDestinationNotEmpty => "storage-migration-destination-not-empty",
             Self::StorageMigrationRollbackFailed => "storage-migration-rollback-failed",
+            Self::RawDiagnosticsOutputRequired => "raw-diagnostics-output-required",
+            Self::RawDiagnosticsConsentRequired => "raw-diagnostics-consent-required",
+            Self::RawDiagnosticsRedactionFailed => "raw-diagnostics-redaction-failed",
+            Self::RawDiagnosticsStagingFailed => "raw-diagnostics-staging-failed",
+            Self::RawDiagnosticsExportFailed => "raw-diagnostics-export-failed",
             Self::IncompatibleControlPlane => "incompatible-control-plane",
             Self::ComputerUseNotReady => "computer-use-not-ready",
             Self::NativeReadinessTimeout => "native-readiness-timeout",
@@ -4934,6 +4990,8 @@ impl ErrorCode {
             | Self::SetupLedgerUnavailable
             | Self::DoctorFixConsentRequired
             | Self::ConfigRepairConsentRequired
+            | Self::RawDiagnosticsOutputRequired
+            | Self::RawDiagnosticsConsentRequired
             | Self::InputRequired
             | Self::DesktopBindingRequired
             | Self::DoctorRefreshScopeRequired
@@ -5017,6 +5075,9 @@ impl ErrorCode {
             | Self::StorageBusy
             | Self::StorageIntegrityFailed
             | Self::StorageMigrationRollbackFailed
+            | Self::RawDiagnosticsRedactionFailed
+            | Self::RawDiagnosticsStagingFailed
+            | Self::RawDiagnosticsExportFailed
             | Self::CredentialHelperTimeout
             | Self::ProviderSecretResolutionFailed
             | Self::SelfUpdateRollbackFailed

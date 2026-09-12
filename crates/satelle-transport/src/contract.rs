@@ -33,8 +33,9 @@ pub(crate) use session::TurnRequestParts;
 pub use session::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ImageAttachment,
     MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL, MAX_IMAGE_ATTACHMENT_COUNT,
-    SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse,
-    TurnRequest,
+    RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse, RawProtocolCaptureRequest,
+    RawProtocolDownloadResponse, SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse, StopRequest,
+    StopResponse, TaskArtifactsResponse, TurnRequest,
 };
 pub use setup::{
     BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
@@ -559,8 +560,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v15_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "15");
+    fn protocol_version_is_the_v16_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "16");
     }
 
     #[test]

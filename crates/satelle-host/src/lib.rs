@@ -23,6 +23,8 @@ mod process_identity;
 pub(crate) mod provider_auth;
 #[path = "provider-probe.rs"]
 mod provider_probe;
+#[path = "raw-diagnostics.rs"]
+mod raw_diagnostics;
 mod runtime;
 mod storage;
 #[cfg(any(test, feature = "test-support"))]
@@ -4479,7 +4481,8 @@ impl HostService {
             .with_execution_mode(intent.execution_mode())
             .with_provider_intent(intent.provider_intent().clone())
             .with_turn_execution_timeout(Some(self.effective_turn_execution_timeout(intent)))
-            .with_attachments(attachment::resolve_images(intent.attachments())?))
+            .with_attachments(attachment::resolve_images(intent.attachments())?)
+            .with_raw_protocol_capture(intent.raw_protocol_source_host()))
     }
 
     fn steer_command<'a>(
@@ -4491,7 +4494,8 @@ impl HostService {
             .with_execution_mode(intent.execution_mode())
             .with_provider_intent(intent.provider_intent().clone())
             .with_turn_execution_timeout(Some(self.effective_turn_execution_timeout(intent)))
-            .with_attachments(attachment::resolve_images(intent.attachments())?))
+            .with_attachments(attachment::resolve_images(intent.attachments())?)
+            .with_raw_protocol_capture(intent.raw_protocol_source_host()))
     }
 
     pub fn run(
@@ -4627,6 +4631,24 @@ impl HostService {
 
     pub fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifactSet, SatelleError> {
         self.runtime.task_artifacts(session_id.clone())
+    }
+
+    pub fn raw_protocol_export(
+        &self,
+        principal_ref: &str,
+        turn_id: &TurnId,
+    ) -> Result<satelle_core::sensitive_diagnostics::RawProtocolArtifact, SatelleError> {
+        self.runtime.raw_protocol_export(principal_ref, turn_id)
+    }
+
+    pub fn acknowledge_raw_protocol_export(
+        &self,
+        principal_ref: &str,
+        turn_id: &TurnId,
+        outcome: satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.runtime
+            .acknowledge_raw_protocol_export(principal_ref, turn_id, outcome)
     }
 
     pub fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {

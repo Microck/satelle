@@ -12,7 +12,8 @@ use crate::contract::{
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, RequestId, SessionResponse, SetupRepairPlanRequest,
+    ProviderSecretUploadEnvelope, RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse,
+    RawProtocolDownloadResponse, RequestId, SessionResponse, SetupRepairPlanRequest,
     SetupRepairPlanResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
     StopResponse, TaskArtifactsResponse, TurnRequest, provider_secret_upload_aad,
 };
@@ -921,6 +922,36 @@ impl DaemonClient {
         // Bind the authenticated response body to the requested Session before
         // any exported content can cross the transport boundary.
         if response.session_id() != session_id {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        Ok(response)
+    }
+
+    pub fn download_raw_protocol_export(
+        &self,
+        turn_id: &satelle_core::TurnId,
+    ) -> Result<RawProtocolDownloadResponse, DaemonClientError> {
+        let path = format!("/v1/diagnostics/raw-protocol/{turn_id}");
+        let (request, request_id) = self.protected_request(Method::GET, &path)?;
+        let response: RawProtocolDownloadResponse =
+            self.send_authenticated(request, request_id, StatusCode::OK)?;
+        if response.artifact().manifest.turn_id != *turn_id {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        Ok(response)
+    }
+
+    pub fn acknowledge_raw_protocol_export(
+        &self,
+        turn_id: &satelle_core::TurnId,
+        request: &RawProtocolAcknowledgeRequest,
+        idempotency_key: &str,
+    ) -> Result<RawProtocolAcknowledgeResponse, DaemonClientError> {
+        let path = format!("/v1/diagnostics/raw-protocol/{turn_id}/acknowledge");
+        let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
+        let response: RawProtocolAcknowledgeResponse =
+            self.send_authenticated(request_builder.json(request), request_id, StatusCode::OK)?;
+        if response.outcome() != request.outcome() {
             return Err(DaemonClientError::ResponseContractViolation);
         }
         Ok(response)

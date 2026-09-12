@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::sensitive_diagnostics::MAX_RAW_PROTOCOL_BYTES;
+
 const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
 const SSH_IDENTITY_COMMIT_SCHEMA: &str = "satelle.ssh-host-identity-commit.v2";
@@ -316,6 +318,47 @@ pub fn persist_new_owner_only_config_file(
                 .ok_or(SecureFileError::UnsafeOrUnavailable)
         },
     )
+}
+
+/// Publishes one bounded raw diagnostic artifact from a caller-named sibling
+/// staging path. Naming the staging path lets the CLI report exact cleanup
+/// state if the filesystem cannot remove a failed write.
+pub fn persist_new_owner_only_diagnostic_file(
+    path: &Path,
+    staging_path: &Path,
+    contents: &[u8],
+) -> Result<(), SecureFileError> {
+    if contents.len() > MAX_RAW_PROTOCOL_BYTES
+        || path.parent().is_none()
+        || path.parent() != staging_path.parent()
+        || path == staging_path
+    {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+    let parent = path.parent().expect("validated diagnostic parent");
+    let directory = open_or_create_owner_only_directory(parent)?;
+    let mut published = false;
+    let persisted = (|| {
+        let mut staging = open_new_owner_only_file(staging_path)?;
+        staging
+            .write_all(contents)
+            .and_then(|()| staging.sync_all())
+            .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+        drop(staging);
+        publish_new_file_without_replace(staging_path, path, &directory)?;
+        published = true;
+        sync_owner_only_directory(parent, &directory)?;
+        secure_file_matches(path, SecurityPolicy::OwnerOnly, contents)?
+            .then_some(())
+            .ok_or(SecureFileError::UnsafeOrUnavailable)
+    })();
+    match persisted {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            cleanup_failed_new_file(staging_path, path, published)?;
+            Err(error)
+        }
+    }
 }
 
 fn persist_new_owner_only_file_with_verification(
@@ -1901,6 +1944,31 @@ fn read_secure_file_contents(
         return Err(SecureFileError::TooLarge);
     }
     Ok(bytes)
+}
+
+fn secure_file_matches(
+    path: &Path,
+    policy: SecurityPolicy,
+    expected: &[u8],
+) -> Result<bool, SecureFileError> {
+    let mut file = open_secure_file(path, policy)?;
+    let mut offset = 0;
+    let mut chunk = Zeroizing::new([0_u8; 64 * 1024]);
+    loop {
+        let read = file
+            .read(&mut *chunk)
+            .map_err(|_| SecureFileError::UnsafeOrUnavailable)?;
+        if read == 0 {
+            return Ok(offset == expected.len());
+        }
+        let Some(end) = offset.checked_add(read) else {
+            return Ok(false);
+        };
+        if expected.get(offset..end) != Some(&chunk[..read]) {
+            return Ok(false);
+        }
+        offset = end;
+    }
 }
 
 fn open_secure_file(path: &Path, policy: SecurityPolicy) -> Result<File, SecureFileError> {

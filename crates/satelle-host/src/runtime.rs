@@ -60,6 +60,9 @@ use recovery::RecoveryQueue;
 pub(crate) use recovery::VerifiedSetupPostconditions;
 #[cfg(test)]
 pub(crate) use recovery::verify_setup_postconditions;
+use satelle_core::sensitive_diagnostics::{
+    RawDiagnosticCommand, RawDiagnosticExportOutcome, RawProtocolArtifact,
+};
 use satelle_core::session::{DesktopBindingRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, ProviderBindingAuthorization,
@@ -217,6 +220,13 @@ struct AdmissionExecution<'a> {
     resolved_provider_secret: Option<crate::provider_auth::ResolvedProviderSecret>,
     attachments: crate::attachment::StagedAttachments,
     live_events: request::LocalLiveEventBuffer,
+    raw_protocol: Option<RawCaptureAdmission>,
+}
+
+struct RawCaptureAdmission {
+    principal_ref: String,
+    source_host: String,
+    command: RawDiagnosticCommand,
 }
 
 /// The Host's closed resolution result for one exact model/provider pair.
@@ -659,6 +669,7 @@ pub(crate) struct RuntimeEngine {
     live_events: LiveEventHub,
     process_identity: ProcessIdentity,
     attachment_store: crate::attachment::AttachmentStore,
+    raw_diagnostics: crate::raw_diagnostics::RawDiagnosticExports,
     session_metadata_retention: time::Duration,
     setup_ledger_retention: time::Duration,
 }
@@ -774,6 +785,9 @@ impl RuntimeEngine {
             ProcessIdentity::current().map_err(model::process_identity_failure)?;
         let mut storage =
             Storage::open_without_restart_recovery(state_root).map_err(model::storage_failure)?;
+        storage
+            .recover_raw_diagnostic_exports(time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)?;
         storage.set_log_retention(storage_policy.sqlite_log_retention);
         if let Some(fingerprinter) = provider_smoke_fingerprinter {
             let key = storage
@@ -802,6 +816,7 @@ impl RuntimeEngine {
             live_events: LiveEventHub::new(),
             process_identity,
             attachment_store,
+            raw_diagnostics: crate::raw_diagnostics::RawDiagnosticExports::default(),
             session_metadata_retention: storage_policy.session_metadata_retention,
             setup_ledger_retention: storage_policy.setup_ledger_retention,
         });
@@ -1225,6 +1240,14 @@ impl RuntimeEngine {
                     }
                     Ok((outcome, provider_smoke_event))
                 })?;
+        let raw_protocol =
+            command
+                .raw_protocol_source_host
+                .map(|source_host| RawCaptureAdmission {
+                    principal_ref: command.identity.principal_ref().to_string(),
+                    source_host,
+                    command: RawDiagnosticCommand::Run,
+                });
         self.finish_admission(
             AdmissionExecution {
                 host: command.host,
@@ -1237,6 +1260,7 @@ impl RuntimeEngine {
                 resolved_provider_secret: readiness.take_resolved_provider_secret(),
                 attachments,
                 live_events: command.cancellation.live_event_buffer(),
+                raw_protocol,
             },
             outcome,
             context.lease_owner().clone(),
@@ -1297,6 +1321,14 @@ impl RuntimeEngine {
                 Ok((outcome, provider_smoke_event))
             },
         )?;
+        let raw_protocol =
+            command
+                .raw_protocol_source_host
+                .map(|source_host| RawCaptureAdmission {
+                    principal_ref: command.identity.principal_ref().to_string(),
+                    source_host,
+                    command: RawDiagnosticCommand::Steer,
+                });
         self.finish_admission(
             AdmissionExecution {
                 host: LOCAL_DEMO_HOST,
@@ -1309,6 +1341,7 @@ impl RuntimeEngine {
                 resolved_provider_secret: readiness.take_resolved_provider_secret(),
                 attachments,
                 live_events: command.cancellation.live_event_buffer(),
+                raw_protocol,
             },
             outcome,
             context.lease_owner().clone(),
@@ -2231,6 +2264,22 @@ impl RuntimeEngine {
                     _heartbeat: heartbeat,
                 };
                 let admitted = model::turn_outcome(&work.session, Vec::new());
+                let raw_protocol_capture = execution.raw_protocol.and_then(|raw| {
+                    let storage = self.lock_storage().ok()?;
+                    let manifest = satelle_core::sensitive_diagnostics::RawDiagnosticManifest::new(
+                        &raw.source_host,
+                        work.subject.host_identity().as_str(),
+                        raw.command,
+                        work.subject.session_id().clone(),
+                        work.subject.turn_id().clone(),
+                    );
+                    Some(self.raw_diagnostics.begin(
+                        &storage,
+                        &raw.principal_ref,
+                        manifest,
+                        time::OffsetDateTime::now_utc(),
+                    ))
+                });
                 let plan = ExecutionPlan {
                     host: execution.host.to_string(),
                     prompt: execution.prompt.to_string(),
@@ -2242,6 +2291,7 @@ impl RuntimeEngine {
                     resolved_provider_secret: execution.resolved_provider_secret,
                     attachments: execution.attachments,
                     live_events: execution.live_events,
+                    raw_protocol_capture,
                 };
                 match execution.dispatch_preference {
                     request::DispatchPreference::Inline => self.execute(plan),
@@ -2955,6 +3005,38 @@ impl RuntimeHandle {
             .lock_storage()?
             .setup_history()
             .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn raw_protocol_export(
+        &self,
+        principal_ref: &str,
+        turn_id: &TurnId,
+    ) -> Result<RawProtocolArtifact, SatelleError> {
+        let engine = self.engine()?;
+        let storage = engine.lock_storage()?;
+        engine.raw_diagnostics.download(
+            &storage,
+            principal_ref,
+            turn_id,
+            time::OffsetDateTime::now_utc(),
+        )
+    }
+
+    pub(crate) fn acknowledge_raw_protocol_export(
+        &self,
+        principal_ref: &str,
+        turn_id: &TurnId,
+        outcome: RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        let storage = engine.lock_storage()?;
+        engine.raw_diagnostics.acknowledge(
+            &storage,
+            principal_ref,
+            turn_id,
+            outcome,
+            time::OffsetDateTime::now_utc(),
+        )
     }
 
     pub(crate) fn load_setup_run(

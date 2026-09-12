@@ -493,6 +493,15 @@ pub(crate) trait TransportClient: Send {
     ) -> Result<PublicSession, SatelleError>;
     fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError>;
     fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifacts, SatelleError>;
+    fn raw_protocol_export(
+        &self,
+        turn_id: &TurnId,
+    ) -> Result<satelle_core::sensitive_diagnostics::RawProtocolArtifact, SatelleError>;
+    fn acknowledge_raw_protocol_export(
+        &self,
+        turn_id: &TurnId,
+        outcome: satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError>;
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError>;
     fn logs(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError>;
     fn setup_history(&self) -> Result<satelle_host::SetupHistory, SatelleError>;
@@ -1158,6 +1167,23 @@ impl TransportClient for LocalTransport {
             .map(TaskArtifacts::from_host)
     }
 
+    fn raw_protocol_export(
+        &self,
+        turn_id: &TurnId,
+    ) -> Result<satelle_core::sensitive_diagnostics::RawProtocolArtifact, SatelleError> {
+        self.service
+            .raw_protocol_export("local-principal-v1", turn_id)
+    }
+
+    fn acknowledge_raw_protocol_export(
+        &self,
+        turn_id: &TurnId,
+        outcome: satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.service
+            .acknowledge_raw_protocol_export("local-principal-v1", turn_id, outcome)
+    }
+
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {
         self.service.stop(session_id)
     }
@@ -1408,6 +1434,13 @@ fn local_turn_intent(request: &TurnRequest) -> Result<satelle_host::TurnIntent, 
             intent.with_turn_execution_timeout_ms(request.turn_execution_timeout_ms())
         })
         .and_then(|intent| intent.with_attachments(attachments))
+        .and_then(|intent| {
+            intent.with_raw_protocol_capture(
+                request
+                    .raw_protocol_capture()
+                    .map(|capture| capture.source_host().to_string()),
+            )
+        })
         .map_err(|error| SatelleError::invalid_usage(error.to_string()))
 }
 
@@ -7662,6 +7695,21 @@ impl TransportClient for SshSetupTransport {
         Err(self.unsupported("task artifact export"))
     }
 
+    fn raw_protocol_export(
+        &self,
+        _turn_id: &TurnId,
+    ) -> Result<satelle_core::sensitive_diagnostics::RawProtocolArtifact, SatelleError> {
+        Err(self.unsupported("raw protocol export"))
+    }
+
+    fn acknowledge_raw_protocol_export(
+        &self,
+        _turn_id: &TurnId,
+        _outcome: satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        Err(self.unsupported("raw protocol export acknowledgement"))
+    }
+
     fn stop(&self, _session_id: &SessionId) -> Result<StopResult, SatelleError> {
         Err(self.unsupported("session stop"))
     }
@@ -7963,6 +8011,31 @@ impl TransportClient for DirectTransport {
             .read_task_artifacts(session_id)
             .map(TaskArtifacts::from_response)
             .map_err(|error| direct_session_resource_error(&self.alias, session_id, error))
+    }
+
+    fn raw_protocol_export(
+        &self,
+        turn_id: &TurnId,
+    ) -> Result<satelle_core::sensitive_diagnostics::RawProtocolArtifact, SatelleError> {
+        self.client
+            .download_raw_protocol_export(turn_id)
+            .map(satelle_transport::RawProtocolDownloadResponse::into_artifact)
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn acknowledge_raw_protocol_export(
+        &self,
+        turn_id: &TurnId,
+        outcome: satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.client
+            .acknowledge_raw_protocol_export(
+                turn_id,
+                &satelle_transport::RawProtocolAcknowledgeRequest::new(outcome),
+                &Self::idempotency_key(),
+            )
+            .map(|_| ())
+            .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {

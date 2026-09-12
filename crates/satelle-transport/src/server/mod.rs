@@ -1008,10 +1008,24 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_query_read,
         ));
+    let raw_diagnostic_read_route = Router::new()
+        .route(
+            "/v1/diagnostics/raw-protocol/{turn_id}",
+            get(sessions::get_raw_protocol_export),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_diagnostics_sensitive,
+        ));
     let read_routes = bodyless_read_routes
         .merge(capabilities_route)
         .merge(maintenance_read_route)
         .merge(logs_route)
+        .merge(raw_diagnostic_read_route)
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_read,
@@ -1198,6 +1212,19 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_control,
         ));
+    let raw_diagnostic_acknowledgement_route = Router::new()
+        .route(
+            "/v1/diagnostics/raw-protocol/{turn_id}/acknowledge",
+            post(sessions::acknowledge_raw_protocol_export),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_diagnostics_sensitive,
+        ));
     let api_token_routes = Router::new()
         .route("/v1/api-tokens", post(api_tokens::issue))
         .route("/v1/api-tokens/{token_id}/rotate", post(api_tokens::rotate))
@@ -1240,6 +1267,7 @@ fn router(state: Arc<DaemonState>) -> Router {
         .merge(local_doctor_operation_route)
         .merge(local_daemon_relaunch_route)
         .merge(control_routes)
+        .merge(raw_diagnostic_acknowledgement_route)
         .method_not_allowed_fallback(protected_method_not_allowed)
         .fallback(protected_not_found)
         .layer(middleware::from_fn_with_state(
@@ -1626,6 +1654,20 @@ pub(super) fn authenticated_json_response(
     )
 }
 
+pub(super) fn authenticated_json_bytes_response(
+    status: StatusCode,
+    body: Vec<u8>,
+    request_id: &RequestId,
+    host_identity: &str,
+) -> Response {
+    json_bytes_response_with_context(
+        status,
+        body,
+        request_id.clone(),
+        Some(host_identity.to_string()),
+    )
+}
+
 fn json_response_with_context(
     status: StatusCode,
     value: &impl Serialize,
@@ -1650,6 +1692,15 @@ fn json_response_with_context(
             (StatusCode::INTERNAL_SERVER_ERROR, body)
         }
     };
+    json_bytes_response_with_context(status, body, request_id, response_host_identity)
+}
+
+fn json_bytes_response_with_context(
+    status: StatusCode,
+    body: Vec<u8>,
+    request_id: RequestId,
+    host_identity: Option<String>,
+) -> Response {
     let mut response = (status, body).into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
@@ -1658,7 +1709,7 @@ fn json_response_with_context(
     security_headers(with_response_context(
         response,
         &request_id,
-        response_host_identity.as_deref(),
+        host_identity.as_deref(),
     ))
 }
 

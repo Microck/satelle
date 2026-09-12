@@ -572,6 +572,24 @@ pub(super) async fn require_read(
     next.run(request).await
 }
 
+pub(super) async fn require_diagnostics_sensitive(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>() else {
+        return missing_authorization_context();
+    };
+    if !authorized
+        .principal()
+        .scopes()
+        .allows(ApiScopes::DIAGNOSTICS_SENSITIVE)
+    {
+        return insufficient_scope(&state, authorized, "diagnostics:sensitive");
+    }
+    next.run(request).await
+}
+
 pub(super) async fn require_admin_read(
     State(state): State<Arc<DaemonState>>,
     request: Request,
@@ -993,7 +1011,7 @@ fn invalid_idempotency_key(state: &DaemonState, authorized: &AuthorizedRequest) 
     )
 }
 
-fn insufficient_scope(
+pub(super) fn insufficient_scope(
     state: &DaemonState,
     authorized: &AuthorizedRequest,
     scope: &'static str,
@@ -1016,6 +1034,7 @@ fn insufficient_scope_message(scope: &'static str) -> &'static str {
     match scope {
         "control" => "the API Principal does not have control scope",
         "admin" => "the API Principal does not have admin scope",
+        "diagnostics:sensitive" => "the API Principal does not have diagnostics:sensitive scope",
         "bootstrap admin" => {
             "durable setup credentials require an admin-scoped SSH bootstrap principal"
         }

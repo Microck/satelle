@@ -103,6 +103,7 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) goal_set_supported: bool,
     pub(crate) image_input_mode: crate::codex_capabilities::CodexImageInputMode,
     pub(crate) attachments: &'a [crate::attachment::StagedImage],
+    pub(crate) raw_protocol_capture: Option<crate::raw_diagnostics::RawProtocolCapture>,
 }
 
 impl CodexSessionRequest<'_> {
@@ -680,7 +681,26 @@ impl<'a> SessionExchange<'a> {
         };
         match receiver.recv_timeout(wait) {
             Ok(ReadEvent::Line(line)) => {
-                if let Some(response) = self.consume_line(&line)? {
+                let message: Value = match serde_json::from_slice(&line) {
+                    Ok(message) => message,
+                    Err(_) => {
+                        if let Some(capture) = &self.request.raw_protocol_capture {
+                            capture.record(
+                                satelle_core::sensitive_diagnostics::ProtocolDirection::FromCodex,
+                                &line,
+                            );
+                        }
+                        return Err(CodexSessionError::MalformedMessage);
+                    }
+                };
+                if let Some(capture) = &self.request.raw_protocol_capture {
+                    capture.record_message(
+                        satelle_core::sensitive_diagnostics::ProtocolDirection::FromCodex,
+                        message.clone(),
+                        line.len(),
+                    );
+                }
+                if let Some(response) = self.consume_message(message)? {
                     writer.write(&response.body)?;
                     if response.observe_native_approval
                         && let Some(observer) = self.request.observe_native_approval.as_mut()
@@ -767,9 +787,10 @@ impl<'a> SessionExchange<'a> {
         Ok(CodexSessionTerminal::StoppedByControl)
     }
 
-    fn consume_line(&mut self, line: &[u8]) -> Result<Option<ServerResponse>, CodexSessionError> {
-        let message: Value =
-            serde_json::from_slice(line).map_err(|_| CodexSessionError::MalformedMessage)?;
+    fn consume_message(
+        &mut self,
+        message: Value,
+    ) -> Result<Option<ServerResponse>, CodexSessionError> {
         let object = message
             .as_object()
             .ok_or(CodexSessionError::MalformedMessage)?;
@@ -1365,6 +1386,10 @@ impl CodexExchange for SessionExchange<'_> {
 
     fn turn_dispatch_attempted(&self) -> bool {
         self.turn_dispatch_attempted
+    }
+
+    fn raw_protocol_capture(&self) -> Option<crate::raw_diagnostics::RawProtocolCapture> {
+        self.request.raw_protocol_capture.clone()
     }
 }
 
