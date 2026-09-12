@@ -11,18 +11,20 @@ mod setup;
 
 use crate::contract::{
     ApiError, ApiErrorCategory, ApiErrorCode, CapabilitiesResponse, EffectiveLimits,
-    HostDesktopSessionsResponse, HostPathsResponse, HostStatusResponse, LiveResponse,
-    LocalDaemonRelaunchResponse, LocalDoctorOperationRequest, LocalDoctorOperationResponse,
-    LocalSetupOperationRequest, LocalSetupOperationResponse, MaintenanceUpdateEvidenceResponse,
-    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, RequestId, effective_limits,
+    HostDesktopSessionsResponse, HostPathsResponse, HostStatusResponse,
+    HostTelemetryStatusResponse, LiveResponse, LocalDaemonRelaunchResponse,
+    LocalDoctorOperationRequest, LocalDoctorOperationResponse, LocalSetupOperationRequest,
+    LocalSetupOperationResponse, MaintenanceUpdateEvidenceResponse, PROTOCOL_VERSION,
+    PROTOCOL_VERSION_HEADER, RequestId, effective_limits,
 };
 use api_json::ApiJson;
 use auth::{AuthorizedRequest, REQUEST_ID_HEADER};
 use axum::Router;
+use axum::extract::Request;
 use axum::extract::{Extension, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::middleware;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use listener::{ConnectionActivity, ConnectionContext, LimitedTcpListener};
@@ -989,6 +991,7 @@ fn router(state: Arc<DaemonState>) -> Router {
     let bodyless_read_routes = Router::new()
         .route("/v1/setup/api-token/current", get(setup::confirm_api_token))
         .route("/v1/host/status", get(host_status))
+        .route("/v1/host/telemetry", get(host_telemetry_status))
         .route("/v1/host/paths", get(host_paths))
         .route("/v1/diagnostics/setup-history", get(setup_history))
         .route("/v1/host/desktop-sessions", get(host_desktop_sessions))
@@ -1294,14 +1297,49 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::authorize,
         ));
+    let telemetry_state = Arc::clone(&state);
     Router::new()
         .merge(live_route)
         .merge(protected)
         .with_state(state)
         .layer(middleware::from_fn_with_state(
+            telemetry_state,
+            record_telemetry,
+        ))
+        .layer(middleware::from_fn_with_state(
             capacity_state,
             listener::enforce_capacity,
         ))
+}
+
+async fn record_telemetry(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let started = Instant::now();
+    let response = next.run(request).await;
+    if !state.service.telemetry_enabled() {
+        return response;
+    }
+    let status = response.status();
+    let outcome = if status.is_success() {
+        satelle_core::telemetry::TelemetryOutcome::Success
+    } else {
+        satelle_core::telemetry::TelemetryOutcome::Failure
+    };
+    let error_code = match status {
+        StatusCode::UNAUTHORIZED => Some(satelle_core::ErrorCode::AuthenticationFailed),
+        StatusCode::FORBIDDEN => Some(satelle_core::ErrorCode::AuthorizationInsufficientScope),
+        StatusCode::TOO_MANY_REQUESTS => Some(satelle_core::ErrorCode::HostBusy),
+        status if status.is_client_error() => Some(satelle_core::ErrorCode::InvalidUsage),
+        status if status.is_server_error() => Some(satelle_core::ErrorCode::RemoteExecution),
+        _ => None,
+    };
+    let service = Arc::clone(&state.service);
+    let duration = started.elapsed();
+    tokio::task::spawn_blocking(move || service.record_telemetry(duration, outcome, error_code));
+    response
 }
 
 async fn live(headers: HeaderMap) -> Response {
@@ -1514,6 +1552,28 @@ async fn host_status(
     authenticated_json_response(
         StatusCode::OK,
         &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn host_telemetry_status(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let status = match tokio::task::spawn_blocking(move || service.telemetry_status()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    authenticated_json_response(
+        StatusCode::OK,
+        &HostTelemetryStatusResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            status,
+        ),
         authorized.request_id(),
         &state.host_identity,
     )

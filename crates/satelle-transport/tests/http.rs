@@ -44,7 +44,8 @@ use satelle_transport::{
     DaemonClientError, DaemonEventClient, DaemonServer, DaemonServerConfig, DaemonTlsConfig,
     DaemonTlsConfigError, DaemonTlsReloadError, DurableTokenActivationResponse,
     DurableTokenIssuanceResponse, EventSubscription, HostDesktopSessionsResponse,
-    HostStatusResponse, LiveResponse, LogsPageResponse, RequestId, TrustedProxy,
+    HostStatusResponse, HostTelemetryStatusResponse, LiveResponse, LogsPageResponse, RequestId,
+    TrustedProxy,
 };
 use serde_json::Value;
 use std::cell::RefCell;
@@ -63,11 +64,12 @@ use tracing::metadata::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
-const EXPECTED_OPERATIONS: [&str; 25] = [
+const EXPECTED_OPERATIONS: [&str; 26] = [
     "live",
     "capabilities",
     "maintenance_update_evidence",
     "host_status",
+    "host_telemetry_status",
     "host_paths",
     "host_desktop_sessions",
     "session_create",
@@ -164,13 +166,13 @@ impl RunningServer {
 
     fn request(&self, path: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::GET, path)
-            .header("Satelle-Protocol-Version", "18")
+            .header("Satelle-Protocol-Version", "19")
     }
 
     fn mutation(&self, path: &str, idempotency_key: &str) -> reqwest::RequestBuilder {
         self.protected_request(reqwest::Method::POST, path)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "18")
+            .header("Satelle-Protocol-Version", "19")
     }
 
     fn mutation_with_request_id(
@@ -181,7 +183,7 @@ impl RunningServer {
     ) -> reqwest::RequestBuilder {
         self.protected_request_with_request_id(reqwest::Method::POST, path, request_id)
             .header("Idempotency-Key", idempotency_key)
-            .header("Satelle-Protocol-Version", "18")
+            .header("Satelle-Protocol-Version", "19")
     }
 
     fn protected_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -387,7 +389,7 @@ fn setup_mutation_request(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string())
         .header("Idempotency-Key", idempotency_key)
-        .header("Satelle-Protocol-Version", "18")
+        .header("Satelle-Protocol-Version", "19")
 }
 
 fn replacement_token(token_id: &str) -> ApiBearerToken {
@@ -967,6 +969,33 @@ async fn protected_reads_authenticate_before_host_pinning() {
     let status: HostStatusResponse = accepted.json().await.expect("decode status");
     assert_eq!(status.host_identity(), running.host_identity);
     assert_eq!(status.session_count(), 0);
+}
+
+#[tokio::test]
+async fn host_telemetry_status_is_an_authenticated_typed_read() {
+    let running = RunningServer::start(ApiScopes::READ).await;
+    let response = running
+        .request("/v1/host/telemetry")
+        .send()
+        .await
+        .expect("request Host telemetry status");
+    assert_eq!(response.status(), StatusCode::OK);
+    let status: HostTelemetryStatusResponse =
+        response.json().await.expect("decode Host telemetry status");
+    assert_eq!(status.host_identity(), running.host_identity);
+    let telemetry = status.into_status();
+    assert_eq!(
+        telemetry.component,
+        satelle_core::telemetry::TelemetryComponent::Host
+    );
+    assert!(!telemetry.enabled);
+    assert_eq!(
+        telemetry.excluded_data_categories,
+        satelle_core::telemetry::TELEMETRY_EXCLUSIONS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -1824,7 +1853,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("18"),
+            Some("19"),
             None,
             false,
             false,
@@ -1833,7 +1862,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("18"),
+            Some("19"),
             Some("query-key"),
             true,
             false,
@@ -1842,7 +1871,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("18"),
+            Some("19"),
             Some("cookie-key"),
             false,
             true,
@@ -1955,7 +1984,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("18"),
+            Some("19"),
             None,
             false,
             false,
@@ -1964,7 +1993,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("18"),
+            Some("19"),
             Some("complete-query-key"),
             true,
             false,
@@ -1973,7 +2002,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("18"),
+            Some("19"),
             Some("complete-cookie-key"),
             false,
             true,

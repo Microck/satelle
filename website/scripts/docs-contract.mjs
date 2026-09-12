@@ -14,6 +14,7 @@ const binary = process.env.SATELLE_DOCS_BINARY
 const publicSchemaSources = [
   'crates/satelle-core/src/lib.rs',
   'crates/satelle-core/src/events.rs',
+  'crates/satelle-core/src/telemetry.rs',
   'crates/satelle-cli/src/output.rs',
   'crates/satelle-cli/src/error-output.rs',
   'crates/satelle-cli/src/support.rs',

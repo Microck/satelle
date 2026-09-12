@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 // Release packaging reads these constants for the signed compatibility asset.
 // Protocol handling and storage migrations enforce the same values below their
 // own boundaries, so a release cannot advertise a separate compatibility state.
-pub const HOST_PROTOCOL_VERSION: &str = "18";
+pub const HOST_PROTOCOL_VERSION: &str = "19";
 pub const HOST_STORAGE_SCHEMA_VERSION: i64 = 21;
 pub const HOST_MINIMUM_CLI_VERSION: &str = "0.1.10";
 

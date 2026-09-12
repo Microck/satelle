@@ -2499,6 +2499,7 @@ version = "0.1.10"
 dependencies = [
  "directories",
  "libc",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",

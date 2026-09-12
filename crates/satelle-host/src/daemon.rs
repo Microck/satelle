@@ -585,6 +585,47 @@ impl HostService {
         self.runtime.snapshot().map(daemon_status)
     }
 
+    /// Reports only the bounded, redacted state of the Host-owned telemetry
+    /// queue. Reading status never resolves the authorization Secret Source.
+    pub fn telemetry_status(
+        &self,
+    ) -> Result<satelle_core::telemetry::TelemetryStatus, SatelleError> {
+        match &self.mode {
+            HostMode::Production { telemetry, .. } => telemetry.status(),
+            #[cfg(any(test, feature = "test-support"))]
+            HostMode::TestFake { .. } => Ok(satelle_core::telemetry::TelemetryStatus::disabled(
+                satelle_core::telemetry::TelemetryComponent::Host,
+            )),
+        }
+    }
+
+    /// Lets the transport skip task scheduling entirely when telemetry is off.
+    /// This keeps the disabled path inert, including for busy event streams.
+    pub fn telemetry_enabled(&self) -> bool {
+        match &self.mode {
+            HostMode::Production { telemetry, .. } => telemetry.enabled(),
+            #[cfg(any(test, feature = "test-support"))]
+            HostMode::TestFake { .. } => false,
+        }
+    }
+
+    /// Captures one request outcome without retaining route parameters,
+    /// identities, bodies, or other request data.
+    pub fn record_telemetry(
+        &self,
+        duration: std::time::Duration,
+        outcome: satelle_core::telemetry::TelemetryOutcome,
+        error_code: Option<satelle_core::ErrorCode>,
+    ) {
+        match &self.mode {
+            HostMode::Production { telemetry, .. } => {
+                telemetry.record(duration, outcome, error_code);
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            HostMode::TestFake { .. } => {}
+        }
+    }
+
     pub fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {
         self.runtime.daemon_workers_idle()
     }

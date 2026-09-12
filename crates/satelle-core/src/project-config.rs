@@ -856,4 +856,21 @@ websocket_inbound_messages_per_minute = 1
             Some(&serde_json::json!("api_rate_limits"))
         );
     }
+
+    #[test]
+    fn project_config_cannot_enable_controller_or_host_telemetry() {
+        let root = tempfile::tempdir().expect("create project config root");
+        let path = root.path().join("config.toml");
+        for source in [
+            "[telemetry]\nenabled = true\notlp_endpoint = \"https://collector.example\"\n",
+            "[hosts.office.telemetry]\nenabled = true\notlp_endpoint = \"https://collector.example\"\n",
+        ] {
+            fs::write(&path, source).expect("write project telemetry attempt");
+            let error = match read(&path) {
+                Err(error) => error,
+                Ok(_) => panic!("project configuration cannot own telemetry policy"),
+            };
+            assert_eq!(error.code, ErrorCode::UnknownConfigKey);
+        }
+    }
 }

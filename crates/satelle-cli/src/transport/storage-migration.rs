@@ -400,8 +400,11 @@ impl RemoteMigration {
                 transport.binding.destination(),
                 &service_path,
                 host_id,
-                &overrides,
-                resolved_persistent_storage_policy(&host.config),
+                ssh_bootstrap::ManagedServiceExpectation::new(
+                    &overrides,
+                    resolved_persistent_storage_policy(&host.config),
+                    host.config.telemetry.as_ref(),
+                ),
             )
             .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?
             .ok_or_else(SatelleError::state_conflict)?;

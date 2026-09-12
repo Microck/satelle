@@ -38,6 +38,7 @@ mod secure_file;
 #[path = "sensitive-diagnostics.rs"]
 pub mod sensitive_diagnostics;
 pub mod session;
+pub mod telemetry;
 
 pub use authority::{
     ApiPermissionScope, ApiPrincipalModel, ArtifactExportPolicy, AuthoritativeStateSubject,
@@ -112,6 +113,8 @@ pub struct SatelleConfig {
     pub experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
     pub command_history: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<telemetry::TelemetryConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_rate_limits: Option<ApiRateLimits>,
     #[serde(default)]
     pub hosts: BTreeMap<String, HostConfig>,
@@ -140,6 +143,7 @@ impl SatelleConfig {
                 sqlite_log_retention: None,
                 operator_log_retained_files: None,
                 platform_log_sink: false,
+                telemetry: None,
                 desktop_user: None,
                 desktop_session_preference: None,
                 desktop_session_native_selector: None,
@@ -171,6 +175,7 @@ impl SatelleConfig {
             experimental_provider_computer_use: None,
             experimental_provider_computer_use_by_provider: BTreeMap::new(),
             command_history: None,
+            telemetry: None,
             api_rate_limits: None,
             hosts,
             trusted_profiles: BTreeMap::new(),
@@ -202,6 +207,9 @@ impl SatelleConfig {
         }
         if higher.command_history.is_some() {
             self.command_history = higher.command_history;
+        }
+        if higher.telemetry.is_some() {
+            self.telemetry = higher.telemetry;
         }
         if higher.api_rate_limits.is_some() {
             self.api_rate_limits = higher.api_rate_limits;
@@ -353,6 +361,8 @@ pub struct HostConfig {
     pub operator_log_retained_files: Option<usize>,
     #[serde(default)]
     pub platform_log_sink: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<telemetry::TelemetryConfig>,
     pub desktop_user: Option<String>,
     pub desktop_session_preference: Option<DesktopSessionPreference>,
     pub desktop_session_native_selector: Option<DesktopSessionNativeSelector>,
@@ -3433,6 +3443,7 @@ fn parse_user_config_value(
     reject_timeout_config_errors(path, &value)?;
     reject_desktop_session_selector_conflicts(path, &value)?;
     reject_provider_secret_source_errors(path, &value)?;
+    reject_telemetry_config_errors(path, &value)?;
     reject_provider_binding_errors(path, &value)?;
     reject_unknown_user_config_keys(path, &value)?;
     reject_trusted_profile_errors(path, &value)?;
@@ -3624,6 +3635,7 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
         table.get("provider_alias"),
         &mut interpolations,
     );
+    collect_telemetry_interpolation("telemetry", table.get("telemetry"), &mut interpolations);
 
     let Some(hosts) = table.get("hosts").and_then(toml::Value::as_table) else {
         return finish_interpolation_check(path, interpolations);
@@ -3774,9 +3786,41 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
                 );
             }
         }
+        collect_telemetry_interpolation(
+            &format!("{host_path}.telemetry"),
+            host_table.get("telemetry"),
+            &mut interpolations,
+        );
     }
 
     finish_interpolation_check(path, interpolations)
+}
+
+fn collect_telemetry_interpolation(
+    telemetry_path: &str,
+    value: Option<&toml::Value>,
+    interpolations: &mut Vec<ConfigInterpolation>,
+) {
+    let Some(table) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for key in ["otlp_endpoint", "deployment_label"] {
+        collect_interpolation_for_value(
+            &format!("{telemetry_path}.{key}"),
+            table.get(key),
+            interpolations,
+        );
+    }
+    let Some(authorization) = table.get("authorization").and_then(toml::Value::as_table) else {
+        return;
+    };
+    for key in ["kind", "variable", "path"] {
+        collect_interpolation_for_value(
+            &format!("{telemetry_path}.authorization.{key}"),
+            authorization.get(key),
+            interpolations,
+        );
+    }
 }
 
 fn collect_interpolation_for_value(
@@ -4176,6 +4220,35 @@ fn reject_provider_secret_source_errors(
     Ok(())
 }
 
+fn reject_telemetry_config_errors(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
+    let validate = |toml_path: &str, value: &toml::Value| {
+        let config = value
+            .clone()
+            .try_into::<telemetry::TelemetryConfig>()
+            .map_err(|_| {
+                SatelleError::config_error(
+                    format!(
+                        "invalid telemetry configuration at {toml_path} in {}",
+                        path.display()
+                    ),
+                    None,
+                )
+            })?;
+        config.endpoint().map(|_| ())
+    };
+    if let Some(config) = value.get("telemetry") {
+        validate("telemetry", config)?;
+    }
+    if let Some(hosts) = value.get("hosts").and_then(toml::Value::as_table) {
+        for (alias, host) in hosts {
+            if let Some(config) = host.get("telemetry") {
+                validate(&format!("hosts.{alias}.telemetry"), config)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reject_provider_binding_errors(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
     let Some(hosts) = value.get("hosts").and_then(toml::Value::as_table) else {
         return Ok(());
@@ -4302,6 +4375,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             "experimental_provider_computer_use",
             "experimental_provider_computer_use_by_provider",
             "command_history",
+            "telemetry",
             "api_rate_limits",
             "profile",
             "profiles",
@@ -4323,6 +4397,31 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             ],
             &mut unknown_keys,
         );
+    }
+
+    if let Some(telemetry) = table.get("telemetry").and_then(toml::Value::as_table) {
+        collect_unknown_keys_for_table(
+            "telemetry",
+            telemetry,
+            &[
+                "enabled",
+                "otlp_endpoint",
+                "authorization",
+                "deployment_label",
+            ],
+            &mut unknown_keys,
+        );
+        if let Some(authorization) = telemetry
+            .get("authorization")
+            .and_then(toml::Value::as_table)
+        {
+            collect_unknown_keys_for_table(
+                "telemetry.authorization",
+                authorization,
+                &["kind", "variable", "path"],
+                &mut unknown_keys,
+            );
+        }
     }
 
     if let Some(profiles) = table
@@ -4368,6 +4467,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "sqlite_log_retention",
                     "operator_log_retained_files",
                     "platform_log_sink",
+                    "telemetry",
                     "desktop_user",
                     "desktop_session_preference",
                     "desktop_session_native_selector",
@@ -4390,6 +4490,31 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                 ],
                 &mut unknown_keys,
             );
+
+            if let Some(telemetry) = host_table.get("telemetry").and_then(toml::Value::as_table) {
+                collect_unknown_keys_for_table(
+                    &format!("{host_path}.telemetry"),
+                    telemetry,
+                    &[
+                        "enabled",
+                        "otlp_endpoint",
+                        "authorization",
+                        "deployment_label",
+                    ],
+                    &mut unknown_keys,
+                );
+                if let Some(authorization) = telemetry
+                    .get("authorization")
+                    .and_then(toml::Value::as_table)
+                {
+                    collect_unknown_keys_for_table(
+                        &format!("{host_path}.telemetry.authorization"),
+                        authorization,
+                        &["kind", "variable", "path"],
+                        &mut unknown_keys,
+                    );
+                }
+            }
 
             if let Some(certificate) = host_table
                 .get("client_certificate")
@@ -4630,6 +4755,71 @@ mod session_metadata_retention_tests {
             );
             parse_user_config(Path::new("/test/config.toml"), &raw)
                 .expect_err("reject an invalid destructive retention policy");
+        }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_config_tests {
+    use super::*;
+
+    #[test]
+    fn user_config_owns_independent_controller_and_host_telemetry_policies() {
+        let parsed = parse_user_config(
+            Path::new("/test/config.toml"),
+            r#"
+[telemetry]
+enabled = true
+otlp_endpoint = "https://controller-collector.example"
+deployment_label = "control-plane"
+
+[hosts.office]
+transport = "ssh"
+address = "operator@example.test"
+adapter = "codex"
+
+[hosts.office.telemetry]
+enabled = true
+otlp_endpoint = "https://host-collector.example"
+deployment_label = "office-host"
+"#,
+        )
+        .expect("parse independent telemetry policies");
+
+        assert_eq!(
+            parsed
+                .config
+                .telemetry
+                .unwrap()
+                .endpoint()
+                .unwrap()
+                .unwrap()
+                .origin(),
+            "https://controller-collector.example"
+        );
+        assert_eq!(
+            parsed.config.hosts["office"]
+                .telemetry
+                .as_ref()
+                .unwrap()
+                .endpoint()
+                .unwrap()
+                .unwrap()
+                .origin(),
+            "https://host-collector.example"
+        );
+    }
+
+    #[test]
+    fn enabled_telemetry_requires_a_secure_endpoint_and_rejects_interpolation() {
+        for source in [
+            "[telemetry]\nenabled = true\n",
+            "[telemetry]\nenabled = true\notlp_endpoint = \"http://collector.example\"\n",
+            "[telemetry]\nenabled = true\notlp_endpoint = \"https://${COLLECTOR}\"\n",
+            "[telemetry]\nenabled = true\notlp_endpoint = \"https://collector.example\"\n[telemetry.authorization]\nkind = \"inline\"\nvalue = \"secret\"\n",
+        ] {
+            parse_user_config(Path::new("/test/config.toml"), source)
+                .expect_err("reject invalid telemetry configuration");
         }
     }
 }

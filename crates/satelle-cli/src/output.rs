@@ -187,6 +187,12 @@ impl Command {
             Self::Desktop {
                 command: DesktopCommand::Snapshot(command),
             } => (command.output_args, EventOutput::None),
+            Self::Telemetry { command } => match command {
+                super::TelemetryCommand::Status(command) => {
+                    (command.output_args, EventOutput::None)
+                }
+                super::TelemetryCommand::Deliver(_) => (OutputArgs::default(), EventOutput::None),
+            },
             Self::SelfCtl { command } => command.output_request(),
             Self::Run(command) => (
                 command.output_args,

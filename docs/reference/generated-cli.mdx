@@ -25,6 +25,7 @@ public Satelle result and event schema sources. CI rejects hand-edited or stale 
 | `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.steer.v2` |
 | `StopSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.stop.v1` |
 | `SUPPORT_BUNDLE_SCHEMA_VERSION` | `crates/satelle-cli/src/support.rs` | `satelle.support.bundle.v1` |
+| `TELEMETRY_STATUS_SCHEMA_VERSION` | `crates/satelle-core/src/telemetry.rs` | `satelle.telemetry.status.v1` |
 
 ## `satelle`
 
@@ -42,6 +43,7 @@ Commands:
   paths
   host
   desktop
+  telemetry    Inspect opt-in Controller or Host telemetry state
   self
   run
   steer
@@ -313,6 +315,25 @@ Usage: satelle desktop [OPTIONS] <COMMAND>
 Commands:
   snapshot
   help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle telemetry`
+
+```text
+Inspect opt-in Controller or Host telemetry state
+
+Usage: satelle telemetry [OPTIONS] <COMMAND>
+
+Commands:
+  status  Report policy, endpoint origin, queue use, delivery outcome, and exclusions
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
       --no-color               Disable colored human output
@@ -862,6 +883,24 @@ Options:
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle telemetry status`
+
+```text
+Report policy, endpoint origin, queue use, delivery outcome, and exclusions
+
+Usage: satelle telemetry status [OPTIONS]
+
+Options:
+      --host <HOST>            Inspect one Host instead of the local Controller
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --json                   Alias for --format json
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
   -h, --help                   Print help
 ```
 

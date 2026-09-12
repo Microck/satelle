@@ -30,6 +30,7 @@ Global options include `--no-color`, `--profile <name>`, and
 | `satelle stop` | Stop the active Turn | Implemented |
 | `satelle logs` | Read normalized retained Host logs | Implemented |
 | `satelle desktop snapshot` | Export the current visible desktop after explicit consent | Implemented |
+| `satelle telemetry status` | Inspect Controller or Host telemetry policy and queue state | Implemented |
 | `satelle mcp serve` | Serve the MCP interface over stdio | Implemented |
 | `satelle mcp install` | Configure a supported AI client to call Satelle MCP | Implemented |
 | `satelle skills list` / `get` / `path` | Discover and materialize the release-matched Agent Skill Bundle | Implemented |
@@ -134,6 +135,27 @@ bounded audit metadata. It does not store pixels, thumbnails, OCR text, prompts,
 transcripts, or output artifact contents. The PNG can still contain visible app
 content, notifications, credentials, and personal data, so inspect it before
 sharing it.
+
+## Telemetry
+
+Use `satelle telemetry status` for the local Controller. Add `--host <alias>`
+to read an authenticated Host status. The result reports enabled state,
+endpoint origin, buffered count and bytes, oldest record age, last delivery
+outcome, and the excluded data categories. It never resolves or prints the
+authorization Secret Source.
+
+Opt-in telemetry contains bounded operation duration, outcome class, typed
+error code, retry count, queue depth, and optional CPU and peak-memory values.
+Resource attributes are limited to Satelle version, component kind, platform
+class, and the configured deployment label. It excludes Host and Principal
+identities, Session and Turn identifiers, arguments, prompts, transcripts,
+desktop content, paths, addresses, secrets, artifacts, and provider payloads.
+
+Failed delivery uses an owner-private local queue capped at 10 MiB and 24
+hours. The oldest records are removed first. Collection and delivery do not
+hold command or Host request completion open. Setting `enabled = false` stops
+new capture, deletes that component's unsent queue, and makes no collector
+request.
 
 ## Doctor options
 

@@ -976,6 +976,7 @@ mod tests {
             sqlite_log_retention: None,
             operator_log_retained_files: None,
             platform_log_sink: false,
+            telemetry: None,
             desktop_user: None,
             desktop_session_preference: None,
             desktop_session_native_selector: None,

@@ -44,7 +44,7 @@ use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 #[cfg(any(windows, test))]
-use satelle_core::daemon_service::WindowsServiceConfigV5;
+use satelle_core::daemon_service::WindowsServiceConfigV6;
 use satelle_core::daemon_service::{
     DaemonServicePlatform, PersistentHostStoragePolicy, PersistentServiceDecision,
     SetupModeSelection, SetupModeSource,
@@ -53,6 +53,10 @@ use satelle_core::doctor::{DoctorScope, DoctorScopeSelection, DoctorScopeSelecti
 use satelle_core::session::{
     EffectiveModelRef, HostIdentityRef, ProviderBindingRef, PublicSession, PublicTurn,
     TurnAdmissionPhase, TurnExecutionMode, TurnState,
+};
+use satelle_core::telemetry::{
+    TelemetryComponent, TelemetryOutcome, TelemetryQueue, TelemetryRecord, TelemetryResourceUsage,
+    TelemetryStatus,
 };
 use satelle_core::{
     BEACON_CORAL, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
@@ -362,6 +366,11 @@ enum Command {
         #[command(subcommand)]
         command: DesktopCommand,
     },
+    /// Inspect opt-in Controller or Host telemetry state.
+    Telemetry {
+        #[command(subcommand)]
+        command: TelemetryCommand,
+    },
     #[command(name = "self")]
     SelfCtl {
         #[command(subcommand)]
@@ -388,6 +397,43 @@ enum Command {
         #[command(subcommand)]
         command: SupportCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum TelemetryCommand {
+    /// Report policy, endpoint origin, queue use, delivery outcome, and exclusions.
+    Status(TelemetryStatusCommand),
+    #[command(name = "__deliver", hide = true)]
+    Deliver(TelemetryDeliverCommand),
+}
+
+#[derive(Args, Debug)]
+struct TelemetryStatusCommand {
+    /// Inspect one Host instead of the local Controller.
+    #[arg(long)]
+    host: Option<String>,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TelemetryOutcomeArg {
+    Success,
+    Failure,
+}
+
+#[derive(Args, Debug)]
+struct TelemetryDeliverCommand {
+    #[arg(long)]
+    duration_ms: u64,
+    #[arg(long, value_enum)]
+    outcome: TelemetryOutcomeArg,
+    #[arg(long)]
+    error_code: Option<String>,
+    #[arg(long)]
+    cpu_ms: Option<u64>,
+    #[arg(long)]
+    peak_memory_bytes: Option<u64>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -793,6 +839,9 @@ struct HostStartCommand {
     /// Internal resolved platform-native log mirror opt-in for managed Host launches.
     #[arg(long, hide = true)]
     platform_log_sink: bool,
+    /// Internal Host telemetry policy serialized into a managed Host launch.
+    #[arg(long, hide = true, value_name = "JSON")]
+    telemetry_config_json: Option<String>,
     /// Internal owner-only configuration used by the per-user Windows task.
     #[arg(
         long,
@@ -1861,6 +1910,77 @@ fn parser_error_format(args: &[std::ffi::OsString]) -> ErrorFormat {
     ErrorFormat::resolve(configured, machine_selector)
 }
 
+struct ControllerTelemetryCapture {
+    started: Instant,
+}
+
+impl ControllerTelemetryCapture {
+    fn start(command: &Command, config: &ConfigContext<'_>) -> Option<Self> {
+        if matches!(command, Command::Telemetry { .. }) {
+            return None;
+        }
+        let resolved = config.load().ok()?;
+        let telemetry = resolved
+            .config
+            .telemetry
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let state_root = resolve_path_set(&cwd).ok()?.state_root;
+        let queue = TelemetryQueue::new(&state_root, TelemetryComponent::Controller);
+        if !telemetry.enabled {
+            let _ = queue.clear();
+            return None;
+        }
+        telemetry.endpoint().ok().flatten()?;
+        Some(Self {
+            started: Instant::now(),
+        })
+    }
+
+    fn finish(self, outcome: &Result<Option<SessionId>, CliFailure>) {
+        let executable = match std::env::current_exe() {
+            Ok(executable) => executable,
+            Err(_) => return,
+        };
+        let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut child = ProcessCommand::new(executable);
+        child
+            .arg("telemetry")
+            .arg("__deliver")
+            .arg("--duration-ms")
+            .arg(duration_ms.to_string())
+            .arg("--outcome")
+            .arg(if outcome.is_ok() {
+                "success"
+            } else {
+                "failure"
+            })
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(error_code) = outcome.as_ref().err().map(|failure| failure.error.code) {
+            let encoded = serde_json::to_value(error_code)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string));
+            if let Some(encoded) = encoded {
+                child.arg("--error-code").arg(encoded);
+            }
+        }
+        let resource_usage = TelemetryResourceUsage::current();
+        if let Some(cpu_ms) = resource_usage.cpu_ms {
+            child.arg("--cpu-ms").arg(cpu_ms.to_string());
+        }
+        if let Some(peak_memory_bytes) = resource_usage.peak_memory_bytes {
+            child
+                .arg("--peak-memory-bytes")
+                .arg(peak_memory_bytes.to_string());
+        }
+        let _ = child.spawn();
+    }
+}
+
 fn try_main(cli: Cli, error_format: &mut ErrorFormat) -> Result<(), CliFailure> {
     let error_format_configured = cli.error_format.is_some();
     let Cli {
@@ -1873,6 +1993,7 @@ fn try_main(cli: Cli, error_format: &mut ErrorFormat) -> Result<(), CliFailure> 
     let config = ConfigContext::new(profile.as_deref());
     let setup_exact_state_requires_identity_discovery =
         preflight_setup_before_history(&command, &config)?;
+    let telemetry = ControllerTelemetryCapture::start(&command, &config);
     let history = start_command_history(&command, &config);
     let command = PreflightedCommand {
         command,
@@ -1901,6 +2022,10 @@ fn try_main(cli: Cli, error_format: &mut ErrorFormat) -> Result<(), CliFailure> 
             // outcome, but operators still need to know when a row was lost.
             eprintln!("warning: command history was not recorded: {error}");
         }
+    }
+
+    if let Some(telemetry) = telemetry {
+        telemetry.finish(&outcome);
     }
 
     outcome.map(|_| ())
@@ -2152,6 +2277,9 @@ fn execute_command(
         Command::Config { .. }
             | Command::Paths(_)
             | Command::Status(_)
+            | Command::Telemetry {
+                command: TelemetryCommand::Status(_),
+            }
             | Command::Logs(_)
             | Command::Host {
                 command: HostCommand::Status(_) | HostCommand::Sessions(_),
@@ -2216,6 +2344,12 @@ fn execute_command(
         Command::Desktop {
             command: DesktopCommand::Snapshot(command),
         } => run_desktop_snapshot(command, config, output).map(|_| None),
+        Command::Telemetry {
+            command: TelemetryCommand::Status(command),
+        } => run_telemetry_status(command, config, output).map(|_| None),
+        Command::Telemetry {
+            command: TelemetryCommand::Deliver(command),
+        } => deliver_controller_telemetry(command, config).map(|_| None),
         Command::SelfCtl { command } => {
             run_self(command, config, output, no_color, *error_format).map(|_| None)
         }
@@ -2236,6 +2370,127 @@ fn execute_command(
         } => run_mcp_install(command, profile, &config, output).map(|_| None),
         Command::Support { command } => support::run_support(command, config, output).map(|_| None),
     }
+}
+
+fn run_telemetry_status(
+    command: TelemetryStatusCommand,
+    config: ConfigContext<'_>,
+    output: OutputFormat,
+) -> Result<(), CliFailure> {
+    let status = if let Some(host) = command.host.as_deref() {
+        let selected = config.resolve_host(Some(host))?;
+        transport::transport_for(&selected)?
+            .telemetry_status()
+            .map_err(failure)?
+    } else {
+        let resolved = config.load()?;
+        let telemetry = resolved.config.telemetry.clone().unwrap_or_default();
+        let endpoint_origin = telemetry
+            .endpoint()
+            .map_err(failure)?
+            .map(|endpoint| endpoint.origin());
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let state_root = resolve_path_set(&cwd).map_err(failure)?.state_root;
+        TelemetryQueue::new(&state_root, TelemetryComponent::Controller)
+            .status(
+                TelemetryComponent::Controller,
+                telemetry.enabled,
+                endpoint_origin,
+            )
+            .map_err(|error| {
+                failure(SatelleError::config_error(
+                    "the private Controller telemetry queue is unavailable",
+                    Some(error.to_string()),
+                ))
+            })?
+    };
+    print_telemetry_status(&status, output).map_err(failure)
+}
+
+fn print_telemetry_status(
+    status: &TelemetryStatus,
+    output: OutputFormat,
+) -> Result<(), SatelleError> {
+    if output.is_structured() {
+        return output.print(status);
+    }
+    println!("Component: {}", status.component.as_str());
+    println!("Enabled: {}", status.enabled);
+    println!(
+        "Endpoint: {}",
+        status
+            .endpoint_origin
+            .as_deref()
+            .unwrap_or("not configured")
+    );
+    println!("Buffered records: {}", status.buffered_record_count);
+    println!("Buffered bytes: {}", status.buffered_bytes);
+    println!(
+        "Oldest buffered record: {}",
+        status
+            .oldest_record_age_ms
+            .map(|age| format!("{age}ms"))
+            .unwrap_or_else(|| "none".to_string())
+    );
+    if let Some(delivery) = status.last_delivery.as_ref() {
+        println!(
+            "Last delivery: {:?} at {}",
+            delivery.outcome, delivery.delivered_at
+        );
+    } else {
+        println!("Last delivery: none");
+    }
+    println!("Excluded: {}", status.excluded_data_categories.join(", "));
+    Ok(())
+}
+
+fn deliver_controller_telemetry(
+    command: TelemetryDeliverCommand,
+    config: ConfigContext<'_>,
+) -> Result<(), CliFailure> {
+    let resolved = config.load()?;
+    let telemetry = resolved.config.telemetry.clone().unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let state_root = resolve_path_set(&cwd).map_err(failure)?.state_root;
+    let queue = TelemetryQueue::new(&state_root, TelemetryComponent::Controller);
+    if !telemetry.enabled {
+        return queue.clear().map_err(telemetry_queue_failure);
+    }
+    telemetry.endpoint().map_err(failure)?;
+    let error_code = command
+        .error_code
+        .map(|code| serde_json::from_value::<ErrorCode>(json!(code)))
+        .transpose()
+        .map_err(|_| {
+            failure(SatelleError::invalid_usage(
+                "invalid internal telemetry error code",
+            ))
+        })?;
+    queue
+        .enqueue(TelemetryRecord::new(
+            Duration::from_millis(command.duration_ms),
+            match command.outcome {
+                TelemetryOutcomeArg::Success => TelemetryOutcome::Success,
+                TelemetryOutcomeArg::Failure => TelemetryOutcome::Failure,
+            },
+            error_code,
+            0,
+            TelemetryResourceUsage {
+                cpu_ms: command.cpu_ms,
+                peak_memory_bytes: command.peak_memory_bytes,
+            },
+        ))
+        .map_err(telemetry_queue_failure)?;
+    queue
+        .deliver(&telemetry, TelemetryComponent::Controller)
+        .map_err(telemetry_queue_failure)
+}
+
+fn telemetry_queue_failure(error: satelle_core::telemetry::TelemetryQueueError) -> CliFailure {
+    failure(SatelleError::config_error(
+        "the private Controller telemetry queue is unavailable",
+        Some(error.to_string()),
+    ))
 }
 
 fn run_desktop_snapshot(
@@ -2784,11 +3039,48 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         },
         Command::Completions(_)
         | Command::Paths(_)
+        | Command::Telemetry { .. }
         | Command::Skills { .. }
         | Command::SelfCtl { .. }
         | Command::Support { .. } => return None,
     };
     Some(target)
+}
+
+#[cfg(test)]
+mod telemetry_cli_tests {
+    use super::*;
+
+    #[test]
+    fn status_selects_controller_by_default_or_one_explicit_host() {
+        for (arguments, expected_host) in [
+            (vec!["satelle", "telemetry", "status", "--json"], None),
+            (
+                vec![
+                    "satelle",
+                    "telemetry",
+                    "status",
+                    "--host",
+                    "office",
+                    "--json",
+                ],
+                Some("office"),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("parse telemetry status");
+            let Command::Telemetry {
+                command: TelemetryCommand::Status(command),
+            } = cli.command
+            else {
+                panic!("expected telemetry status command");
+            };
+            assert_eq!(command.host.as_deref(), expected_host);
+            assert_eq!(
+                command.output_args.resolve(EventOutput::None).unwrap(),
+                OutputFormat::Json
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3116,6 +3408,7 @@ mod history_target_tests {
                 sqlite_log_retention_hours: None,
                 operator_log_retained_files: None,
                 platform_log_sink: false,
+                telemetry_config_json: None,
                 service_config: None,
                 output_args: OutputArgs::default(),
             })),
@@ -9444,7 +9737,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.session_metadata_retention_hours.is_some()
             || command.sqlite_log_retention_hours.is_some()
             || command.operator_log_retained_files.is_some()
-            || command.platform_log_sink)
+            || command.platform_log_sink
+            || command.telemetry_config_json.is_some())
     {
         return Err(SatelleError::invalid_usage(
             "--service-config is an internal Windows service input and cannot be combined with ordinary Host start options",
@@ -9464,7 +9758,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.initial_identity_record.is_some()
             || command.tls_cert.is_some()
             || command.tls_key.is_some()
-            || command.platform_log_sink)
+            || command.platform_log_sink
+            || command.telemetry_config_json.is_some())
     {
         return Err(SatelleError::invalid_usage(
             "the managed local daemon launch descriptor cannot be combined with foreground, SSH bootstrap, identity bootstrap, or TLS inputs",
@@ -9634,7 +9929,20 @@ fn start_host_daemon_with(
             ))
         })?;
     }
-    let (service_path_overrides, service_storage_policy) =
+    let forwarded_telemetry = command
+        .telemetry_config_json
+        .as_deref()
+        .map(serde_json::from_str::<satelle_core::telemetry::TelemetryConfig>)
+        .transpose()
+        .map_err(|_| {
+            failure(SatelleError::invalid_usage(
+                "the managed Host telemetry configuration is invalid",
+            ))
+        })?;
+    if let Some(config) = forwarded_telemetry.as_ref() {
+        config.endpoint().map_err(failure)?;
+    }
+    let (service_path_overrides, service_storage_policy, service_telemetry) =
         if let Some(_service_config_path) = command.service_config.as_deref() {
             #[cfg(not(windows))]
             return Err(failure(SatelleError::invalid_usage(
@@ -9648,7 +9956,11 @@ fn start_host_daemon_with(
                 apply_windows_service_environment(&service_config);
                 command.bind = service_config.bind().to_string();
                 command.foreground = true;
-                (Some(path_overrides), Some(service_config.storage_policy()))
+                (
+                    Some(path_overrides),
+                    Some(service_config.storage_policy()),
+                    service_config.telemetry().cloned(),
+                )
             }
         } else if command.launchd_service {
             (
@@ -9671,9 +9983,10 @@ fn start_host_daemon_with(
                     .map(|policy| policy.with_platform_log_sink(command.platform_log_sink))
                     .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?,
                 ),
+                forwarded_telemetry.clone(),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
     let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
         (true, Some(scope)) => Some(scope.api_scopes()),
@@ -9811,6 +10124,7 @@ fn start_host_daemon_with(
                 .as_ref()
                 .expect("persistent service path overrides were checked"),
             service_storage_policy.expect("persistent service storage policy was checked"),
+            service_telemetry,
         )
         .map_err(failure)?,
         (None, _, Some(token)) => {
@@ -9820,6 +10134,7 @@ fn start_host_daemon_with(
                 .expect("the built-in local Host config exists");
             host_config.timeouts = forwarded_readiness_timeouts;
             host_config.platform_log_sink = command.platform_log_sink;
+            host_config.telemetry = forwarded_telemetry.clone();
             if let Some(record) = initial_identity.as_ref() {
                 let committed =
                     HostService::commit_fresh_ssh_host_identity(&state_release_root, record)
@@ -9837,7 +10152,9 @@ fn start_host_daemon_with(
         }
         (None, Some(host), None) => HostService::production_for_host(&host.config),
         (None, None, None)
-            if forwarded_readiness_timeouts.is_some() || command.platform_log_sink =>
+            if forwarded_readiness_timeouts.is_some()
+                || command.platform_log_sink
+                || forwarded_telemetry.is_some() =>
         {
             let mut host_config = satelle_core::SatelleConfig::defaults()
                 .hosts
@@ -9845,6 +10162,7 @@ fn start_host_daemon_with(
                 .expect("the built-in local Host config exists");
             host_config.timeouts = forwarded_readiness_timeouts;
             host_config.platform_log_sink = command.platform_log_sink;
+            host_config.telemetry = forwarded_telemetry;
             HostService::production_for_host(&host_config)
         }
         (None, None, None) => HostService::production(),
@@ -9973,7 +10291,7 @@ mod daemon_process_notice_tests {
 }
 
 #[cfg(any(windows, test))]
-fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV5, CliFailure> {
+fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV6, CliFailure> {
     if !path.is_absolute() {
         return Err(failure(SatelleError::invalid_usage(
             "Windows Host service config path must be absolute",
@@ -10027,7 +10345,7 @@ mod windows_service_config_tests {
         };
         let storage_policy = PersistentHostStoragePolicy::new(3_600_000, 30 * 24, 45 * 24, 12)
             .expect("build storage policy");
-        let expected = WindowsServiceConfigV5::new("127.0.0.1:3001", &overrides, storage_policy)
+        let expected = WindowsServiceConfigV6::new("127.0.0.1:3001", &overrides, storage_policy)
             .expect("build service config");
         write_owner_only_config(
             &path,
@@ -10079,7 +10397,7 @@ mod windows_service_config_tests {
 }
 
 #[cfg(windows)]
-fn apply_windows_service_environment(config: &WindowsServiceConfigV5) {
+fn apply_windows_service_environment(config: &WindowsServiceConfigV6) {
     const PATH_OVERRIDES: [&str; 5] = [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -10682,6 +11000,7 @@ mod daemon_tls_watcher_tests {
             sqlite_log_retention_hours: None,
             operator_log_retained_files: None,
             platform_log_sink: false,
+            telemetry_config_json: None,
             service_config: None,
             output_args: OutputArgs::default(),
         }
@@ -11265,6 +11584,7 @@ mod bootstrap_startup_tests {
             sqlite_log_retention_hours: None,
             operator_log_retained_files: None,
             platform_log_sink: false,
+            telemetry_config_json: None,
             service_config: None,
             output_args: OutputArgs::default(),
         };

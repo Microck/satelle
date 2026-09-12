@@ -72,6 +72,21 @@ Support bundle export is not implemented. The absence of that command is not
 permission to archive the Host state directory. Suspected vulnerabilities use
 the private reporting process in the repository security policy.
 
+## Telemetry is operator-owned and opt-in
+
+Controller and Host telemetry have separate user-owned settings and are off by
+default. Satelle sends OTLP/HTTP metrics and traces only to the configured
+Operator endpoint. Satelle does not run a collection service or choose a
+fallback endpoint.
+
+Telemetry records operation timing, outcome class, typed errors, retries,
+queue depth, and optional process resource use. They exclude command arguments,
+Host and Principal identities, Session and Turn identifiers, network addresses,
+paths, prompts, transcripts, desktop content, recordings, secrets, artifacts,
+and provider requests or responses. The private failed-delivery queue keeps at
+most 10 MiB for 24 hours. Disabling one component deletes its unsent queue and
+does not contact its endpoint.
+
 ## Retention has a defined ownership boundary
 
 Satelle retention deletes only Satelle-owned metadata and files. It does not

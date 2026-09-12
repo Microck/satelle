@@ -47,6 +47,10 @@ impl ProviderSecretUploadCapability {
     }
 }
 define_schema_token!(HostStatusSchema, "satelle.host.status.v1");
+define_schema_token!(
+    HostTelemetryStatusSchema,
+    "satelle.host.telemetry-status.v1"
+);
 define_schema_token!(HostPathsSchema, "satelle.host.paths.v1");
 define_schema_token!(SetupHistorySchema, "satelle.setup-history.v1");
 define_schema_token!(
@@ -81,6 +85,7 @@ enum Operation {
     Capabilities,
     MaintenanceUpdateEvidence,
     HostStatus,
+    HostTelemetryStatus,
     HostPaths,
     SetupHistory,
     HostDesktopSessions,
@@ -111,6 +116,7 @@ impl Operation {
             Self::Capabilities => "capabilities",
             Self::MaintenanceUpdateEvidence => "maintenance_update_evidence",
             Self::HostStatus => "host_status",
+            Self::HostTelemetryStatus => "host_telemetry_status",
             Self::HostPaths => "host_paths",
             Self::SetupHistory => "setup_history",
             Self::HostDesktopSessions => "host_desktop_sessions",
@@ -324,6 +330,7 @@ impl CapabilitiesResponse {
                 Operation::Capabilities,
                 Operation::MaintenanceUpdateEvidence,
                 Operation::HostStatus,
+                Operation::HostTelemetryStatus,
                 Operation::HostPaths,
                 Operation::HostDesktopSessions,
                 Operation::SessionCreate,
@@ -510,6 +517,52 @@ pub struct HostStatusResponse {
     session_count: usize,
     active_turn_count: usize,
     recovery_pending_turn_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostTelemetryStatusResponse {
+    schema_version: HostTelemetryStatusSchema,
+    request_id: RequestId,
+    host_identity: String,
+    status: satelle_core::telemetry::TelemetryStatus,
+}
+
+impl HostTelemetryStatusResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        status: satelle_core::telemetry::TelemetryStatus,
+    ) -> Self {
+        Self {
+            schema_version: HostTelemetryStatusSchema,
+            request_id,
+            host_identity,
+            status,
+        }
+    }
+
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+
+    pub fn into_status(self) -> satelle_core::telemetry::TelemetryStatus {
+        self.status
+    }
+}
+
+impl AuthenticatedResponseContract for HostTelemetryStatusResponse {
+    fn request_id(&self) -> &RequestId {
+        self.request_id()
+    }
+
+    fn host_identity(&self) -> &str {
+        self.host_identity()
+    }
 }
 
 impl HostStatusResponse {

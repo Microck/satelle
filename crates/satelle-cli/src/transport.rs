@@ -3,7 +3,7 @@ use crate::{CliFailure, SelectedHost, bootstrap_lock, failure, on_demand_idle_ti
 use satelle_core::AdapterKind;
 use satelle_core::daemon_service::{
     DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentHostStoragePolicy,
-    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV5, WindowsTaskDefinition,
+    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV6, WindowsTaskDefinition,
 };
 use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
@@ -468,6 +468,7 @@ pub(crate) trait TransportClient: Send {
         experimental_provider_computer_use: bool,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError>;
     fn host_status(&self) -> Result<HostStatus, SatelleError>;
+    fn telemetry_status(&self) -> Result<satelle_core::telemetry::TelemetryStatus, SatelleError>;
     fn host_paths(
         &self,
     ) -> Result<satelle_core::daemon_service::DaemonResolvedPathSet, SatelleError>;
@@ -1111,6 +1112,10 @@ impl TransportClient for LocalTransport {
 
     fn host_status(&self) -> Result<HostStatus, SatelleError> {
         self.service.host_status()
+    }
+
+    fn telemetry_status(&self) -> Result<satelle_core::telemetry::TelemetryStatus, SatelleError> {
+        self.service.telemetry_status()
     }
 
     fn host_paths(
@@ -1860,7 +1865,7 @@ fn coordinate_setup(
 enum PreparedPersistentService {
     Windows {
         task: Box<WindowsTaskDefinition>,
-        config: Box<WindowsServiceConfigV5>,
+        config: Box<WindowsServiceConfigV6>,
     },
     Launchd(ssh_bootstrap::LaunchdServiceDefinition),
 }
@@ -2850,10 +2855,11 @@ impl SshSetupTransport {
                         artifact,
                     )
                     .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
-                let config = WindowsServiceConfigV5::new(
+                let config = WindowsServiceConfigV6::new_with_telemetry(
                     "127.0.0.1:3001",
                     daemon_path_overrides,
                     storage_policy,
+                    self.host_config.telemetry.clone(),
                 )
                 .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
                 Ok(PreparedPersistentService::Windows {
@@ -2862,7 +2868,12 @@ impl SshSetupTransport {
                 })
             }
             DaemonServicePlatform::Macos => remote
-                .launchd_definition(artifact, daemon_path_overrides, storage_policy)
+                .launchd_definition(
+                    artifact,
+                    daemon_path_overrides,
+                    storage_policy,
+                    self.host_config.telemetry.as_ref(),
+                )
                 .map(PreparedPersistentService::Launchd)
                 .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error)),
             DaemonServicePlatform::Linux => Err(SatelleError::persistent_service_unsupported(
@@ -3928,8 +3939,11 @@ pub(crate) fn preview_ssh_storage_restore(
             transport.binding.destination(),
             &service_asset_path,
             host_id,
-            &path_overrides,
-            resolved_persistent_storage_policy(&host.config),
+            ssh_bootstrap::ManagedServiceExpectation::new(
+                &path_overrides,
+                resolved_persistent_storage_policy(&host.config),
+                host.config.telemetry.as_ref(),
+            ),
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
         .ok_or_else(SatelleError::state_conflict)?;
@@ -3988,8 +4002,11 @@ pub(crate) fn plan_ssh_storage_backup_cleanup(
             transport.binding.destination(),
             &service_asset_path,
             host_id,
-            &path_overrides,
-            resolved_persistent_storage_policy(&host.config),
+            ssh_bootstrap::ManagedServiceExpectation::new(
+                &path_overrides,
+                resolved_persistent_storage_policy(&host.config),
+                host.config.telemetry.as_ref(),
+            ),
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
         .ok_or_else(SatelleError::state_conflict)?;
@@ -4624,8 +4641,11 @@ fn inspect_host_maintenance(
                                 transport.binding.destination(),
                                 &destination,
                                 host_id,
-                                &expected_path_overrides,
-                                resolved_persistent_storage_policy(&host.config),
+                                ssh_bootstrap::ManagedServiceExpectation::new(
+                                    &expected_path_overrides,
+                                    resolved_persistent_storage_policy(&host.config),
+                                    host.config.telemetry.as_ref(),
+                                ),
                             )
                             .map_err(|error| {
                                 map_ssh_daemon_bootstrap_error(&transport.alias, error)
@@ -7708,6 +7728,10 @@ impl TransportClient for SshSetupTransport {
         Err(self.unsupported("host status"))
     }
 
+    fn telemetry_status(&self) -> Result<satelle_core::telemetry::TelemetryStatus, SatelleError> {
+        Err(self.unsupported("telemetry status"))
+    }
+
     fn host_paths(
         &self,
     ) -> Result<satelle_core::daemon_service::DaemonResolvedPathSet, SatelleError> {
@@ -8007,6 +8031,13 @@ impl TransportClient for DirectTransport {
             mode: self.mode.to_string(),
             sessions: response.session_count(),
         })
+    }
+
+    fn telemetry_status(&self) -> Result<satelle_core::telemetry::TelemetryStatus, SatelleError> {
+        self.client
+            .host_telemetry_status()
+            .map(satelle_transport::HostTelemetryStatusResponse::into_status)
+            .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
     fn host_paths(
