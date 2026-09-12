@@ -1,5 +1,7 @@
 use super::{AuthenticatedResponseContract, RequestId, define_schema_token};
-use satelle_core::sensitive_diagnostics::{RawDiagnosticExportOutcome, RawProtocolArtifact};
+use satelle_core::sensitive_diagnostics::{
+    RawDiagnosticExportOutcome, RawProtocolArtifact, RawSubprocessCommand, RawSubprocessManifest,
+};
 use satelle_core::session::{
     PublicSession, SessionStateRevision, TurnExecutionMode, TurnState, TurnStateRevision,
 };
@@ -21,6 +23,14 @@ define_schema_token!(
 define_schema_token!(
     RawProtocolAcknowledgeSchema,
     "satelle.raw-diagnostics.acknowledge.v1"
+);
+define_schema_token!(
+    RawSubprocessBeginSchema,
+    "satelle.raw-subprocess-diagnostics.begin.v1"
+);
+define_schema_token!(
+    RawSubprocessPrepareSchema,
+    "satelle.raw-subprocess-diagnostics.prepare.v1"
 );
 
 pub const MAX_IMAGE_ATTACHMENT_COUNT: usize = 2;
@@ -728,6 +738,150 @@ impl AuthenticatedResponseContract for RawProtocolAcknowledgeResponse {
 
     fn host_identity(&self) -> &str {
         self.host_identity()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSubprocessBeginRequest {
+    schema_version: RawSubprocessBeginSchema,
+    source_host: String,
+    command: RawSubprocessCommand,
+    invocation_id: String,
+}
+
+impl RawSubprocessBeginRequest {
+    pub fn new(
+        source_host: impl Into<String>,
+        command: RawSubprocessCommand,
+        invocation_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: RawSubprocessBeginSchema,
+            source_host: source_host.into(),
+            command,
+            invocation_id: invocation_id.into(),
+        }
+    }
+
+    pub fn source_host(&self) -> &str {
+        &self.source_host
+    }
+
+    pub const fn command(&self) -> RawSubprocessCommand {
+        self.command
+    }
+
+    pub fn invocation_id(&self) -> &str {
+        &self.invocation_id
+    }
+}
+
+impl ApiRequestContract for RawSubprocessBeginRequest {
+    const SCHEMA_VERSION: &'static str = RawSubprocessBeginSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSubprocessBeginResponse {
+    schema_version: RawSubprocessBeginSchema,
+    request_id: RequestId,
+    host_identity: String,
+    manifest: RawSubprocessManifest,
+}
+
+impl RawSubprocessBeginResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        manifest: RawSubprocessManifest,
+    ) -> Self {
+        Self {
+            schema_version: RawSubprocessBeginSchema,
+            request_id,
+            host_identity,
+            manifest,
+        }
+    }
+
+    pub const fn manifest(&self) -> &RawSubprocessManifest {
+        &self.manifest
+    }
+
+    pub fn into_manifest(self) -> RawSubprocessManifest {
+        self.manifest
+    }
+}
+
+impl AuthenticatedResponseContract for RawSubprocessBeginResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSubprocessPrepareRequest {
+    schema_version: RawSubprocessPrepareSchema,
+    artifact_byte_size: usize,
+}
+
+impl RawSubprocessPrepareRequest {
+    pub fn new(artifact_byte_size: usize) -> Self {
+        Self {
+            schema_version: RawSubprocessPrepareSchema,
+            artifact_byte_size,
+        }
+    }
+
+    pub const fn artifact_byte_size(&self) -> usize {
+        self.artifact_byte_size
+    }
+}
+
+impl ApiRequestContract for RawSubprocessPrepareRequest {
+    const SCHEMA_VERSION: &'static str = RawSubprocessPrepareSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSubprocessPrepareResponse {
+    schema_version: RawSubprocessPrepareSchema,
+    request_id: RequestId,
+    host_identity: String,
+    artifact_byte_size: usize,
+}
+
+impl RawSubprocessPrepareResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        artifact_byte_size: usize,
+    ) -> Self {
+        Self {
+            schema_version: RawSubprocessPrepareSchema,
+            request_id,
+            host_identity,
+            artifact_byte_size,
+        }
+    }
+
+    pub const fn artifact_byte_size(&self) -> usize {
+        self.artifact_byte_size
+    }
+}
+
+impl AuthenticatedResponseContract for RawSubprocessPrepareResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
     }
 }
 

@@ -5,6 +5,7 @@ use satelle_core::{DaemonPathOverrides, HostConfig, SshIdentityCommitRecord};
 use satelle_host::{ApiBearerToken, readiness_probe_timeouts};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 #[cfg(all(test, unix))]
@@ -22,6 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use super::SshBootstrapScope;
 use super::bootstrap_lock;
@@ -43,6 +45,126 @@ const BOOTSTRAP_LOCK_EXIT_POLL: Duration = Duration::from_millis(10);
 const WINDOWS_MUTATION_RESULT_POLL: Duration = Duration::from_millis(250);
 const CACHE_CLEANUP_PROTOCOL: &str = "satelle-cache-cleanup-v1";
 const STAGED_DIGEST_MISMATCH_EXIT_CODE: i32 = 65;
+
+struct CapturedSubprocess {
+    command_id: &'static str,
+    started_at: String,
+    completed_at: String,
+    exit_status: Option<i32>,
+    stdout: Zeroizing<Vec<u8>>,
+}
+
+struct RawSubprocessCaptureBuffer {
+    records: Vec<CapturedSubprocess>,
+    captured_bytes: usize,
+    overflowed: bool,
+}
+
+thread_local! {
+    static RAW_SUBPROCESS_CAPTURE: RefCell<Option<RawSubprocessCaptureBuffer>> = const {
+        RefCell::new(None)
+    };
+}
+
+pub(crate) struct RawSubprocessCapture {
+    manifest: satelle_core::sensitive_diagnostics::RawSubprocessManifest,
+    active: bool,
+}
+
+impl RawSubprocessCapture {
+    pub(crate) fn begin(
+        manifest: satelle_core::sensitive_diagnostics::RawSubprocessManifest,
+    ) -> Result<Self, satelle_core::sensitive_diagnostics::DiagnosticRedactionError> {
+        let installed = RAW_SUBPROCESS_CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            if capture.is_some() {
+                return false;
+            }
+            *capture = Some(RawSubprocessCaptureBuffer {
+                records: Vec::new(),
+                captured_bytes: 0,
+                overflowed: false,
+            });
+            true
+        });
+        if !installed {
+            return Err(satelle_core::sensitive_diagnostics::DiagnosticRedactionError);
+        }
+        Ok(Self {
+            manifest,
+            active: true,
+        })
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        redactor: &satelle_core::sensitive_diagnostics::DiagnosticRedactor,
+    ) -> Result<
+        satelle_core::sensitive_diagnostics::RawSubprocessArtifact,
+        satelle_core::sensitive_diagnostics::DiagnosticRedactionError,
+    > {
+        let capture = RAW_SUBPROCESS_CAPTURE.with(|capture| capture.borrow_mut().take());
+        self.active = false;
+        let capture = capture
+            .filter(|capture| !capture.overflowed)
+            .ok_or(satelle_core::sensitive_diagnostics::DiagnosticRedactionError)?;
+        let records = capture
+            .records
+            .into_iter()
+            .map(|record| {
+                Ok(satelle_core::sensitive_diagnostics::RawSubprocessRecord {
+                    command_id: record.command_id.to_string(),
+                    started_at: record.started_at,
+                    completed_at: record.completed_at,
+                    exit_status: record.exit_status,
+                    stdout: redactor.redact_text(&record.stdout)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(satelle_core::sensitive_diagnostics::RawSubprocessArtifact {
+            schema_version:
+                satelle_core::sensitive_diagnostics::RAW_SUBPROCESS_DIAGNOSTICS_SCHEMA_VERSION
+                    .to_string(),
+            manifest: self.manifest.clone(),
+            records,
+        })
+    }
+}
+
+impl Drop for RawSubprocessCapture {
+    fn drop(&mut self) {
+        if self.active {
+            RAW_SUBPROCESS_CAPTURE.with(|capture| {
+                capture.borrow_mut().take();
+            });
+        }
+    }
+}
+
+fn capture_subprocess_stdout(command_id: &'static str, started_at: String, output: &CommandOutput) {
+    RAW_SUBPROCESS_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        let Some(capture) = capture.as_mut() else {
+            return;
+        };
+        let Some(captured_bytes) = capture.captured_bytes.checked_add(output.stdout.len()) else {
+            capture.overflowed = true;
+            return;
+        };
+        if captured_bytes > satelle_core::sensitive_diagnostics::MAX_RAW_PROTOCOL_BYTES {
+            capture.overflowed = true;
+            return;
+        }
+        capture.captured_bytes = captured_bytes;
+        capture.records.push(CapturedSubprocess {
+            command_id,
+            started_at,
+            completed_at: satelle_core::utc_now(),
+            exit_status: output.status.code(),
+            stdout: Zeroizing::new(output.stdout.clone()),
+        });
+    });
+}
 const POSIX_CACHE_DIRECTORY_GUARD: &str = r#"safe_cache_directory() {
   expected_root=$1
   expected_directory=$2
@@ -6609,7 +6731,8 @@ fn run_ssh_command_with_program(
     destination: &str,
     remote_command: &str,
 ) -> Result<CommandOutput, SshBootstrapError> {
-    run_program_with_output_limit(
+    let started_at = satelle_core::utc_now();
+    let output = run_program_with_output_limit(
         ssh_program,
         [
             OsStr::new("-T"),
@@ -6620,7 +6743,9 @@ fn run_ssh_command_with_program(
             OsStr::new(remote_command),
         ],
         PROBE_OUTPUT_LIMIT,
-    )
+    )?;
+    capture_subprocess_stdout("ssh-read-only", started_at, &output);
+    Ok(output)
 }
 
 fn run_ssh_command_with_output_limit(
@@ -6628,7 +6753,8 @@ fn run_ssh_command_with_output_limit(
     remote_command: &str,
     output_limit: usize,
 ) -> Result<CommandOutput, SshBootstrapError> {
-    run_program_with_output_limit(
+    let started_at = satelle_core::utc_now();
+    let output = run_program_with_output_limit(
         "ssh",
         [
             OsStr::new("-T"),
@@ -6637,7 +6763,9 @@ fn run_ssh_command_with_output_limit(
             OsStr::new(remote_command),
         ],
         output_limit,
-    )
+    )?;
+    capture_subprocess_stdout("ssh-read-only", started_at, &output);
+    Ok(output)
 }
 
 fn run_fenced_ssh_command(
@@ -6662,6 +6790,10 @@ fn run_fenced_ssh_command_with_output_limit(
     mut input: Option<FencedMutationInput<'_>>,
     output_limit: usize,
 ) -> Result<CommandOutput, SshBootstrapError> {
+    // Inputs can contain bearer tokens, service definitions, or staged files.
+    // Capture only commands whose stdin is structurally empty.
+    let capture_allowed = input.is_none();
+    let started_at = satelle_core::utc_now();
     let FencedMutationCommand {
         remote_command,
         windows_input_paths,
@@ -6799,6 +6931,9 @@ fn run_fenced_ssh_command_with_output_limit(
             .map_or(true, |output| !output.status.success())
     {
         cleanup_windows_fenced_mutation_input(destination, input_paths);
+    }
+    if capture_allowed && let Ok(output) = &result {
+        capture_subprocess_stdout("ssh-fenced-mutation", started_at, output);
     }
     result
 }
@@ -11377,5 +11512,35 @@ mod tests {
         assert!(!script.contains("--bootstrap-operation-kind"));
         assert!(script.contains("RedirectStandardInput = $true"));
         assert!(script.contains("StandardInput.WriteLine($token)"));
+    }
+
+    #[test]
+    fn explicit_subprocess_capture_redacts_selected_bounded_stdout() {
+        let manifest = satelle_core::sensitive_diagnostics::RawSubprocessManifest::new(
+            "remote",
+            "host-test",
+            satelle_core::sensitive_diagnostics::RawSubprocessCommand::Setup,
+            Uuid::now_v7().to_string(),
+        );
+        let capture = RawSubprocessCapture::begin(manifest).unwrap();
+        capture_subprocess_stdout(
+            "ssh-read-only",
+            satelle_core::utc_now(),
+            &CommandOutput {
+                status: RemoteExitStatus::from_code(17),
+                stdout: b"OPENAI_API_KEY=CANARY\nsafe line\n".to_vec(),
+                stderr: SshStderrClassification::default(),
+            },
+        );
+
+        let artifact = capture.finish(&Default::default()).unwrap();
+
+        assert_eq!(artifact.records.len(), 1);
+        assert_eq!(artifact.records[0].command_id, "ssh-read-only");
+        assert_eq!(artifact.records[0].exit_status, Some(17));
+        assert_eq!(
+            artifact.records[0].stdout,
+            "OPENAI_API_KEY=[REDACTED]\nsafe line\n"
+        );
     }
 }

@@ -7,7 +7,9 @@ use satelle_test_contract::assert_privacy_canaries_absent;
 use satelle_transport::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ImageAttachment,
     MAX_IMAGE_ATTACHMENT_BYTES, RawProtocolAcknowledgeRequest, RawProtocolDownloadResponse,
-    SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
+    RawSubprocessBeginRequest, RawSubprocessBeginResponse, RawSubprocessPrepareRequest,
+    RawSubprocessPrepareResponse, SessionResponse, StopRequest, StopResponse,
+    TaskArtifactsResponse, TurnRequest,
 };
 use sha2::Digest as _;
 
@@ -74,6 +76,82 @@ async fn raw_protocol_capture_requires_sensitive_scope_and_supports_download_the
     assert_eq!(acknowledged.status(), StatusCode::OK);
     let unavailable = running.request(&path).send().await.unwrap();
     assert_eq!(unavailable.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    running.server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn raw_subprocess_audit_requires_sensitive_scope_and_tracks_local_publication() {
+    let invocation_id = uuid::Uuid::now_v7().to_string();
+    let request = RawSubprocessBeginRequest::new(
+        "remote-demo",
+        satelle_core::sensitive_diagnostics::RawSubprocessCommand::Repair,
+        &invocation_id,
+    );
+    let control_only = RunningServer::start(ApiScopes::CONTROL).await;
+    let rejected = control_only
+        .mutation(
+            "/v1/diagnostics/raw-subprocess",
+            "raw-subprocess-without-sensitive",
+        )
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    control_only.server.shutdown().await.unwrap();
+
+    let running = RunningServer::start(ApiScopes::CONTROL | ApiScopes::DIAGNOSTICS_SENSITIVE).await;
+    let begun: RawSubprocessBeginResponse = running
+        .mutation("/v1/diagnostics/raw-subprocess", "raw-subprocess-begin")
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(begun.manifest().invocation_id, invocation_id);
+    assert_eq!(begun.manifest().included, ["selected_subprocess_stdout"]);
+
+    let oversized = running
+        .mutation(
+            &format!("/v1/diagnostics/raw-subprocess/{invocation_id}/prepare"),
+            "raw-subprocess-prepare-oversized",
+        )
+        .json(&RawSubprocessPrepareRequest::new(
+            satelle_core::sensitive_diagnostics::MAX_RAW_PROTOCOL_BYTES + 1,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+
+    let prepared: RawSubprocessPrepareResponse = running
+        .mutation(
+            &format!("/v1/diagnostics/raw-subprocess/{invocation_id}/prepare"),
+            "raw-subprocess-prepare",
+        )
+        .json(&RawSubprocessPrepareRequest::new(321))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prepared.artifact_byte_size(), 321);
+
+    let acknowledged = running
+        .mutation(
+            &format!("/v1/diagnostics/raw-subprocess/{invocation_id}/acknowledge"),
+            "raw-subprocess-acknowledge",
+        )
+        .json(&RawProtocolAcknowledgeRequest::new(
+            satelle_core::sensitive_diagnostics::RawDiagnosticExportOutcome::Exported,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(acknowledged.status(), StatusCode::OK);
     running.server.shutdown().await.unwrap();
 }
 
@@ -1450,7 +1528,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "16")
+        .header("Satelle-Protocol-Version", "17")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -2109,7 +2187,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "16")
+        request.header("Satelle-Protocol-Version", "17")
     } else {
         request
     }

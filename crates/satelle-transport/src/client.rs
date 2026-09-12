@@ -13,9 +13,11 @@ use crate::contract::{
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
     ProviderSecretUploadEnvelope, RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse,
-    RawProtocolDownloadResponse, RequestId, SessionResponse, SetupRepairPlanRequest,
-    SetupRepairPlanResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
-    StopResponse, TaskArtifactsResponse, TurnRequest, provider_secret_upload_aad,
+    RawProtocolDownloadResponse, RawSubprocessBeginRequest, RawSubprocessBeginResponse,
+    RawSubprocessPrepareRequest, RawSubprocessPrepareResponse, RequestId, SessionResponse,
+    SetupRepairPlanRequest, SetupRepairPlanResponse, SetupVerificationRequest,
+    SetupVerificationResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
+    provider_secret_upload_aad,
 };
 use crate::transport_tls::{
     ClientCertificate, ReqwestTrustError, TlsFailureKind, classify_tls_error,
@@ -948,6 +950,56 @@ impl DaemonClient {
         idempotency_key: &str,
     ) -> Result<RawProtocolAcknowledgeResponse, DaemonClientError> {
         let path = format!("/v1/diagnostics/raw-protocol/{turn_id}/acknowledge");
+        let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
+        let response: RawProtocolAcknowledgeResponse =
+            self.send_authenticated(request_builder.json(request), request_id, StatusCode::OK)?;
+        if response.outcome() != request.outcome() {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        Ok(response)
+    }
+
+    pub fn begin_raw_subprocess_export(
+        &self,
+        request: &RawSubprocessBeginRequest,
+        idempotency_key: &str,
+    ) -> Result<RawSubprocessBeginResponse, DaemonClientError> {
+        let path = "/v1/diagnostics/raw-subprocess";
+        let (request_builder, request_id) = self.mutation_request(path, idempotency_key)?;
+        let response: RawSubprocessBeginResponse =
+            self.send_authenticated(request_builder.json(request), request_id, StatusCode::OK)?;
+        if response.manifest().invocation_id != request.invocation_id()
+            || response.manifest().command != request.command()
+            || response.manifest().source_host != request.source_host()
+        {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        Ok(response)
+    }
+
+    pub fn prepare_raw_subprocess_export(
+        &self,
+        invocation_id: &str,
+        request: &RawSubprocessPrepareRequest,
+        idempotency_key: &str,
+    ) -> Result<RawSubprocessPrepareResponse, DaemonClientError> {
+        let path = format!("/v1/diagnostics/raw-subprocess/{invocation_id}/prepare");
+        let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
+        let response: RawSubprocessPrepareResponse =
+            self.send_authenticated(request_builder.json(request), request_id, StatusCode::OK)?;
+        if response.artifact_byte_size() != request.artifact_byte_size() {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        Ok(response)
+    }
+
+    pub fn acknowledge_raw_subprocess_export(
+        &self,
+        invocation_id: &str,
+        request: &RawProtocolAcknowledgeRequest,
+        idempotency_key: &str,
+    ) -> Result<RawProtocolAcknowledgeResponse, DaemonClientError> {
+        let path = format!("/v1/diagnostics/raw-subprocess/{invocation_id}/acknowledge");
         let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
         let response: RawProtocolAcknowledgeResponse =
             self.send_authenticated(request_builder.json(request), request_id, StatusCode::OK)?;

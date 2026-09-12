@@ -26,9 +26,10 @@ those pull requests merge, the integration branch gets a final pull request to
 | Native package repair | Launcher repair through the detected installation owner | Merged in PR #225 |
 | Output formats | Lossless final results and fixed-column CSV | Merged in PR #226 |
 | Support bundle history | Bounded, redacted Host setup-ledger summaries | Merged in PR #238 |
-| Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit | Ready for review |
-| Platform-native log sinks | Optional redacted mirrors with typed Doctor health | Ready for review |
-| Capture and observability | Raw protocol/subprocess exports, desktop snapshot, recording, native log sinks, telemetry | Pending |
+| Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit | Merged in PR #239 |
+| Platform-native log sinks | Optional redacted mirrors with typed Doctor health | Merged in PR #241 |
+| Setup and repair subprocess exports | Selected bounded SSH output for one consented invocation | Ready for review |
+| Capture and observability | Desktop snapshot, recording, telemetry | Pending |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Pending |
 | Automation | Batch, watch, webhook notifications, REPL, command history | Pending |
@@ -255,7 +256,7 @@ plus documentation and release installation checks on all six targets.
 - Paths use absolute native Host syntax. The Controller neither interprets nor
   opens them. The Host applies bounded regular-file reads before admission.
 - Uploads and Host paths share a tagged attachment list in `satelle.api.v9` and
-  protocol version 16. No older request shape is accepted.
+  protocol version 17. No older request shape is accepted.
 - The keyed operation identity includes the path reference. A replay or
   cancellation resolves from durable admission state without reopening files.
 - Remote files share the upload limits and private staging lifecycle. Cleanup
@@ -352,3 +353,20 @@ remains.
   and bundle versions on every row and retains every skill name and description.
 - All structured formats share JSON's consent, event, error, and exit policy.
   Command-specific parsers reject unsupported formats before loading config.
+
+## Setup and repair raw subprocess diagnostics
+
+`setup` and `repair` accept `--raw-subprocess-output --output <path>` for one
+invocation. Noninteractive use also requires `--no-input --yes`. The warning
+and consent happen before Satelle installs the capture guard.
+
+The export contains bounded stdout from selected input-free SSH probes and
+fenced mutations, stable command identifiers, timestamps, exit status, and
+redaction metadata. Satelle excludes token-bearing subprocesses, provider
+traffic, prompts, transcripts, screenshots, and recordings. Invalid UTF-8 or
+an artifact over 8 MiB fails closed without publishing a partial file.
+
+The Host records actor, command scope, categories, size, and outcome in the
+shared raw diagnostic audit table. Raw bytes stay in invocation memory and a
+private local staging file. Normal logs, setup history, status, Doctor,
+Operator Log Files, caches, and support bundles never receive them.

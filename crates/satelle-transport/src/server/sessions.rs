@@ -6,8 +6,10 @@ use super::{
 };
 use crate::contract::{
     AdmissionCancellationResponse, ApiErrorCategory, ApiErrorCode, RawProtocolAcknowledgeRequest,
-    RawProtocolAcknowledgeResponse, RawProtocolDownloadResponse, RequestId, SessionResponse,
-    StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest, TurnRequestParts,
+    RawProtocolAcknowledgeResponse, RawProtocolDownloadResponse, RawSubprocessBeginRequest,
+    RawSubprocessBeginResponse, RawSubprocessPrepareRequest, RawSubprocessPrepareResponse,
+    RequestId, SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
+    TurnRequestParts,
 };
 use axum::extract::{Extension, FromRequestParts, Path, State};
 use axum::http::request::Parts;
@@ -284,6 +286,122 @@ pub(super) async fn get_raw_protocol_export(
     authenticated_json_bytes_response(
         StatusCode::OK,
         body,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn begin_raw_subprocess_export(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    ApiJson(request): ApiJson<RawSubprocessBeginRequest>,
+) -> Response {
+    if uuid::Uuid::parse_str(request.invocation_id()).is_err() || request.source_host().is_empty() {
+        return request_error(
+            &state,
+            &authorized,
+            "raw subprocess export identity is invalid",
+        );
+    }
+    let manifest = satelle_core::sensitive_diagnostics::RawSubprocessManifest::new(
+        request.source_host(),
+        state.host_identity.clone(),
+        request.command(),
+        request.invocation_id(),
+    );
+    let principal_ref = authorized.principal().principal_ref().to_string();
+    let service = Arc::clone(&state.service);
+    let stored_manifest = manifest.clone();
+    if let Err(response) = host_call(&state, &authorized, move || {
+        service.begin_raw_subprocess_export(&principal_ref, &stored_manifest)
+    })
+    .await
+    {
+        return response;
+    }
+    authenticated_json_response(
+        StatusCode::OK,
+        &RawSubprocessBeginResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            manifest,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn prepare_raw_subprocess_export(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(invocation_id): Path<String>,
+    ApiJson(request): ApiJson<RawSubprocessPrepareRequest>,
+) -> Response {
+    if uuid::Uuid::parse_str(&invocation_id).is_err() {
+        return request_error(
+            &state,
+            &authorized,
+            "raw subprocess export identity is invalid",
+        );
+    }
+    let artifact_byte_size = request.artifact_byte_size();
+    if artifact_byte_size > satelle_core::sensitive_diagnostics::MAX_RAW_PROTOCOL_BYTES {
+        return request_error(
+            &state,
+            &authorized,
+            "raw subprocess export exceeds the maximum artifact size",
+        );
+    }
+    let service = Arc::clone(&state.service);
+    if let Err(response) = host_call(&state, &authorized, move || {
+        service.prepare_raw_subprocess_export(&invocation_id, artifact_byte_size)
+    })
+    .await
+    {
+        return response;
+    }
+    authenticated_json_response(
+        StatusCode::OK,
+        &RawSubprocessPrepareResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            artifact_byte_size,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn acknowledge_raw_subprocess_export(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(invocation_id): Path<String>,
+    ApiJson(request): ApiJson<RawProtocolAcknowledgeRequest>,
+) -> Response {
+    if uuid::Uuid::parse_str(&invocation_id).is_err() {
+        return request_error(
+            &state,
+            &authorized,
+            "raw subprocess export identity is invalid",
+        );
+    }
+    let principal_ref = authorized.principal().principal_ref().to_string();
+    let outcome = request.outcome();
+    let service = Arc::clone(&state.service);
+    if let Err(response) = host_call(&state, &authorized, move || {
+        service.acknowledge_raw_subprocess_export(&principal_ref, &invocation_id, outcome)
+    })
+    .await
+    {
+        return response;
+    }
+    authenticated_json_response(
+        StatusCode::OK,
+        &RawProtocolAcknowledgeResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            outcome,
+        ),
         authorized.request_id(),
         &state.host_identity,
     )

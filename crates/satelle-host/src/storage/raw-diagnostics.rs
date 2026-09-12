@@ -2,8 +2,7 @@ use super::codec::unix_timestamp_nanos;
 use super::open::sqlite_error;
 use super::{Storage, StorageError, StorageErrorKind};
 use rusqlite::{OptionalExtension, params};
-use satelle_core::TurnId;
-use satelle_core::sensitive_diagnostics::{RawDiagnosticExportOutcome, RawDiagnosticManifest};
+use satelle_core::sensitive_diagnostics::{RawDiagnosticAuditMetadata, RawDiagnosticExportOutcome};
 use time::OffsetDateTime;
 
 impl Storage {
@@ -12,24 +11,26 @@ impl Storage {
     pub(crate) fn begin_raw_diagnostic_export(
         &self,
         principal_ref: &str,
-        manifest: &RawDiagnosticManifest,
+        metadata: &RawDiagnosticAuditMetadata,
         created_at: OffsetDateTime,
     ) -> Result<(), StorageError> {
-        let categories = serde_json::to_string(&manifest.included)
+        let categories = serde_json::to_string(&metadata.included)
             .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
         self.connection
             .execute(
-                "INSERT INTO raw_diagnostic_audit (turn_id, session_id, principal_ref, host_alias,
-             command, data_categories, redaction_policy_version, created_at_unix_nanos, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'capturing')",
+                "INSERT INTO raw_diagnostic_audit (export_id, principal_ref, host_alias, command,
+             scope_kind, scope_ref, data_categories, redaction_policy_version,
+             created_at_unix_nanos, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'capturing')",
                 params![
-                    manifest.turn_id.as_str(),
-                    manifest.session_id.as_str(),
+                    metadata.export_id,
                     principal_ref,
-                    manifest.source_host,
-                    manifest.command.as_str(),
+                    metadata.source_host,
+                    metadata.command.as_str(),
+                    metadata.scope_kind.as_str(),
+                    metadata.scope_ref,
                     categories,
-                    manifest.redaction_policy_version,
+                    metadata.redaction_policy_version,
                     unix_timestamp_nanos(created_at)?
                 ],
             )
@@ -39,15 +40,15 @@ impl Storage {
 
     pub(crate) fn prepare_raw_diagnostic_export(
         &self,
-        turn_id: &TurnId,
+        export_id: &str,
         artifact_byte_size: usize,
     ) -> Result<(), StorageError> {
         let changed = self
             .connection
             .execute(
                 "UPDATE raw_diagnostic_audit SET status = 'prepared', artifact_byte_size = ?2
-             WHERE turn_id = ?1 AND status = 'capturing'",
-                params![turn_id.as_str(), artifact_byte_size as i64],
+             WHERE export_id = ?1 AND status = 'capturing'",
+                params![export_id, artifact_byte_size as i64],
             )
             .map_err(|error| sqlite_error(StorageErrorKind::OperationFailed, error))?;
         if changed != 1 {
@@ -61,7 +62,7 @@ impl Storage {
     pub(crate) fn finish_raw_diagnostic_export(
         &self,
         principal_ref: &str,
-        turn_id: &TurnId,
+        export_id: &str,
         outcome: RawDiagnosticExportOutcome,
         finished_at: OffsetDateTime,
     ) -> Result<(), StorageError> {
@@ -69,10 +70,10 @@ impl Storage {
             .connection
             .execute(
                 "UPDATE raw_diagnostic_audit SET status = ?3, completed_at_unix_nanos = ?4
-             WHERE turn_id = ?1 AND principal_ref = ?2
+             WHERE export_id = ?1 AND principal_ref = ?2
                AND (status = 'prepared' OR (status = 'capturing' AND ?3 = 'failed'))",
                 params![
-                    turn_id.as_str(),
+                    export_id,
                     principal_ref,
                     outcome.as_str(),
                     unix_timestamp_nanos(finished_at)?
@@ -85,8 +86,8 @@ impl Storage {
         let status: Option<String> = self
             .connection
             .query_row(
-                "SELECT status FROM raw_diagnostic_audit WHERE turn_id = ?1 AND principal_ref = ?2",
-                params![turn_id.as_str(), principal_ref],
+                "SELECT status FROM raw_diagnostic_audit WHERE export_id = ?1 AND principal_ref = ?2",
+                params![export_id, principal_ref],
                 |row| row.get(0),
             )
             .optional()
@@ -118,7 +119,10 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use satelle_core::sensitive_diagnostics::RawDiagnosticCommand;
+    use satelle_core::TurnId;
+    use satelle_core::sensitive_diagnostics::{
+        RawDiagnosticCommand, RawDiagnosticManifest, RawSubprocessCommand, RawSubprocessManifest,
+    };
 
     #[test]
     fn raw_diagnostic_audit_distinguishes_preparation_acknowledgement_and_restart_loss() {
@@ -133,26 +137,26 @@ mod tests {
             TurnId::new(),
         );
         storage
-            .begin_raw_diagnostic_export("controller", &manifest, now)
+            .begin_raw_diagnostic_export("controller", &(&manifest).into(), now)
             .unwrap();
         assert!(
             storage
                 .finish_raw_diagnostic_export(
                     "controller",
-                    &manifest.turn_id,
+                    manifest.turn_id.as_str(),
                     RawDiagnosticExportOutcome::Exported,
                     now
                 )
                 .is_err()
         );
         storage
-            .prepare_raw_diagnostic_export(&manifest.turn_id, 123)
+            .prepare_raw_diagnostic_export(manifest.turn_id.as_str(), 123)
             .unwrap();
         assert!(
             storage
                 .finish_raw_diagnostic_export(
                     "another-controller",
-                    &manifest.turn_id,
+                    manifest.turn_id.as_str(),
                     RawDiagnosticExportOutcome::Exported,
                     now
                 )
@@ -162,7 +166,7 @@ mod tests {
             storage
                 .finish_raw_diagnostic_export(
                     "controller",
-                    &manifest.turn_id,
+                    manifest.turn_id.as_str(),
                     RawDiagnosticExportOutcome::Exported,
                     now,
                 )
@@ -173,10 +177,10 @@ mod tests {
             ..manifest.clone()
         };
         storage
-            .begin_raw_diagnostic_export("controller", &pending, now)
+            .begin_raw_diagnostic_export("controller", &(&pending).into(), now)
             .unwrap();
         storage
-            .prepare_raw_diagnostic_export(&pending.turn_id, 456)
+            .prepare_raw_diagnostic_export(pending.turn_id.as_str(), 456)
             .unwrap();
         drop(storage);
         let (storage, _) = Storage::open(state.path()).unwrap();
@@ -185,7 +189,7 @@ mod tests {
             storage
                 .finish_raw_diagnostic_export(
                     "controller",
-                    &pending.turn_id,
+                    pending.turn_id.as_str(),
                     RawDiagnosticExportOutcome::Exported,
                     now
                 )
@@ -193,7 +197,7 @@ mod tests {
         );
         let statuses: Vec<String> = storage
             .connection
-            .prepare("SELECT status FROM raw_diagnostic_audit ORDER BY turn_id")
+            .prepare("SELECT status FROM raw_diagnostic_audit ORDER BY export_id")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
@@ -203,10 +207,48 @@ mod tests {
         storage
             .finish_raw_diagnostic_export(
                 "controller",
-                &manifest.turn_id,
+                manifest.turn_id.as_str(),
                 RawDiagnosticExportOutcome::Exported,
                 now,
             )
             .unwrap();
+
+        let subprocess = RawSubprocessManifest::new(
+            "local-demo",
+            "host-test",
+            RawSubprocessCommand::Setup,
+            uuid::Uuid::now_v7().to_string(),
+        );
+        storage
+            .begin_raw_diagnostic_export("controller", &(&subprocess).into(), now)
+            .unwrap();
+        storage
+            .prepare_raw_diagnostic_export(&subprocess.invocation_id, 321)
+            .unwrap();
+        storage
+            .finish_raw_diagnostic_export(
+                "controller",
+                &subprocess.invocation_id,
+                RawDiagnosticExportOutcome::Exported,
+                now,
+            )
+            .unwrap();
+        let subprocess_scope: (String, String, String) = storage
+            .connection
+            .query_row(
+                "SELECT command, scope_kind, scope_ref FROM raw_diagnostic_audit
+                 WHERE export_id = ?1",
+                [&subprocess.invocation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            subprocess_scope,
+            (
+                "setup".to_string(),
+                "command_invocation".to_string(),
+                subprocess.invocation_id,
+            )
+        );
     }
 }

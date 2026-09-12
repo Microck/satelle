@@ -1,9 +1,10 @@
 CREATE TABLE raw_diagnostic_audit (
-    turn_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
+    export_id TEXT PRIMARY KEY,
     principal_ref TEXT NOT NULL,
     host_alias TEXT NOT NULL,
-    command TEXT NOT NULL CHECK (command IN ('run', 'steer')),
+    command TEXT NOT NULL CHECK (command IN ('run', 'steer', 'setup', 'repair')),
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('turn', 'command_invocation')),
+    scope_ref TEXT NOT NULL,
     data_categories TEXT NOT NULL,
     redaction_policy_version TEXT NOT NULL,
     created_at_unix_nanos INTEGER NOT NULL,

@@ -34,8 +34,9 @@ pub use session::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ImageAttachment,
     MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL, MAX_IMAGE_ATTACHMENT_COUNT,
     RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse, RawProtocolCaptureRequest,
-    RawProtocolDownloadResponse, SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse, StopRequest,
-    StopResponse, TaskArtifactsResponse, TurnRequest,
+    RawProtocolDownloadResponse, RawSubprocessBeginRequest, RawSubprocessBeginResponse,
+    RawSubprocessPrepareRequest, RawSubprocessPrepareResponse, SUPPORTED_IMAGE_MEDIA_TYPES,
+    SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
 };
 pub use setup::{
     BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
@@ -57,7 +58,7 @@ pub(crate) use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v15 distinguishes Controller uploads from explicit Host image paths.
+// Protocol v17 adds audited raw setup and repair subprocess exports.
 // Older peers cannot interpret the tagged attachment request, so every protected
 // operation requires the current protocol before decoding its payload.
 pub(crate) const PROTOCOL_VERSION: &str = satelle_core::host_update::HOST_PROTOCOL_VERSION;
@@ -560,8 +561,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v16_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "16");
+    fn protocol_version_is_the_v17_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "17");
     }
 
     #[test]
