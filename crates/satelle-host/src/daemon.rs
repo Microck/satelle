@@ -41,6 +41,7 @@ pub struct DaemonRuntimeStatus {
     active_turn_count: usize,
     recovery_pending_turn_count: usize,
     operator_log_health: crate::OperatorLogSinkHealth,
+    platform_log_sink_health: crate::PlatformLogSinkHealth,
 }
 
 /// Authoritative Host state used when a Client reconnects after losing its
@@ -87,6 +88,10 @@ impl DaemonRuntimeStatus {
 
     pub const fn operator_log_health(&self) -> crate::OperatorLogSinkHealth {
         self.operator_log_health
+    }
+
+    pub const fn platform_log_sink_health(&self) -> crate::PlatformLogSinkHealth {
+        self.platform_log_sink_health
     }
 }
 
@@ -2088,6 +2093,7 @@ fn daemon_status(snapshot: crate::runtime::RuntimeSnapshot) -> DaemonRuntimeStat
         active_turn_count: snapshot.active_turn_count(),
         recovery_pending_turn_count: snapshot.recovery_pending_turn_count(),
         operator_log_health: snapshot.operator_log_health(),
+        platform_log_sink_health: snapshot.platform_log_sink_health(),
     }
 }
 

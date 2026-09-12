@@ -9,6 +9,8 @@ mod operational;
 mod operator_log;
 #[path = "storage/path-migration.rs"]
 mod path_migration;
+#[path = "storage/platform-log.rs"]
+mod platform_log;
 #[path = "storage/provider-secret-journal.rs"]
 mod provider_secret_journal;
 #[path = "storage/raw-diagnostics.rs"]
@@ -40,8 +42,8 @@ use self::open::DATABASE_FILE_NAME;
 #[cfg(all(test, unix))]
 use self::open::LOCK_FILE_NAME;
 use self::open::sqlite_error;
+pub(crate) use self::operator_log::{CommittedLogMirrors, OperatorLogPolicy};
 pub use self::operator_log::{OperatorLogFailureKind, OperatorLogSinkHealth};
-pub(crate) use self::operator_log::{OperatorLogMirror, OperatorLogPolicy};
 #[cfg(test)]
 pub(crate) use self::operator_log::{OperatorLogSink, OperatorLogWriteOutcome};
 pub use self::path_migration::{
@@ -52,6 +54,8 @@ pub(crate) use self::path_migration::{
     migration_requires_rollback, plan as plan_path_migration,
     plan_for_operation as plan_owned_path_migration, stage as stage_path_migration,
 };
+pub(crate) use self::platform_log::PlatformLogSink;
+pub use self::platform_log::{PlatformLogFailureKind, PlatformLogSinkHealth};
 pub(crate) use self::provider_secret_journal::{
     BeginProviderSecretProvisioning, PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
     PROVIDER_SECRET_PRIOR_HMAC_DOMAIN, ProviderSecretProvisioningJournal,

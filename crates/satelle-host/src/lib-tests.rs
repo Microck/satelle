@@ -2681,6 +2681,41 @@ fn production_doctor_filters_requested_scopes_without_relabeling_blockers() {
 }
 
 #[test]
+fn platform_log_failure_adds_one_informational_config_finding() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    );
+    let mut report = production_doctor_report(LOCAL_DEMO_HOST, Some("config"), &snapshot);
+
+    apply_platform_log_sink_finding(&mut report, PlatformLogFailureKind::SinkUnavailable);
+
+    assert!(report.ready);
+    assert_eq!(report.summary.informational_findings, 1);
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(
+        report.findings[0].finding_id,
+        "config.platform_log_sink.degraded"
+    );
+    assert_eq!(
+        report.findings[0].fixability,
+        DoctorFixability::Informational
+    );
+    assert_eq!(report.findings[0].readiness_impact, "ready");
+    assert_eq!(report.findings[0].evidence, ["failure=sink_unavailable"]);
+    assert_eq!(
+        report.probe_results[0].finding_ids,
+        ["config.platform_log_sink.degraded"]
+    );
+}
+
+#[test]
 fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
     let state = crate::TestStateDir::new().expect("temporary state directory");
     let config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();

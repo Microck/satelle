@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v4";
+pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v5";
 pub const DEFAULT_SETUP_LEDGER_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -456,6 +456,11 @@ pub fn render_launchd_user_plist(
     storage_policy
         .validate()
         .map_err(|_| WindowsServiceDefinitionError::InvalidServiceConfig)?;
+    let platform_log_argument = if storage_policy.platform_log_sink {
+        "<string>--platform-log-sink</string>"
+    } else {
+        ""
+    };
     let mut environment = String::new();
     for entry in overrides.entries() {
         if !is_absolute_posix_path(&entry.value) {
@@ -484,6 +489,7 @@ pub fn render_launchd_user_plist(
             "<string>--session-metadata-retention-hours</string><string>{}</string>",
             "<string>--sqlite-log-retention-hours</string><string>{}</string>",
             "<string>--operator-log-retained-files</string><string>{}</string>",
+            "{}",
             "</array><key>EnvironmentVariables</key><dict>{}</dict>",
             "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
             "</dict></plist>"
@@ -494,6 +500,7 @@ pub fn render_launchd_user_plist(
         storage_policy.session_metadata_retention_hours,
         storage_policy.sqlite_log_retention_hours,
         storage_policy.operator_log_retained_files,
+        platform_log_argument,
         environment
     ))
 }
@@ -536,6 +543,7 @@ pub struct PersistentHostStoragePolicy {
     session_metadata_retention_hours: u64,
     sqlite_log_retention_hours: u64,
     operator_log_retained_files: usize,
+    platform_log_sink: bool,
 }
 
 impl PersistentHostStoragePolicy {
@@ -558,6 +566,7 @@ impl PersistentHostStoragePolicy {
             operator_log_retained_files: config
                 .operator_log_retained_files
                 .unwrap_or(crate::DEFAULT_OPERATOR_LOG_RETAINED_FILES),
+            platform_log_sink: config.platform_log_sink,
         }
     }
 
@@ -572,6 +581,7 @@ impl PersistentHostStoragePolicy {
             session_metadata_retention_hours,
             sqlite_log_retention_hours,
             operator_log_retained_files,
+            platform_log_sink: false,
         };
         policy
             .validate()
@@ -593,6 +603,15 @@ impl PersistentHostStoragePolicy {
 
     pub const fn sqlite_log_retention_hours(self) -> u64 {
         self.sqlite_log_retention_hours
+    }
+
+    pub const fn platform_log_sink(self) -> bool {
+        self.platform_log_sink
+    }
+
+    pub const fn with_platform_log_sink(mut self, enabled: bool) -> Self {
+        self.platform_log_sink = enabled;
+        self
     }
 
     fn validate(self) -> Result<(), &'static str> {
@@ -618,14 +637,14 @@ impl PersistentHostStoragePolicy {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct WindowsServiceConfigV4 {
+pub struct WindowsServiceConfigV5 {
     schema: String,
     daemon_arguments: Vec<String>,
     environment: BTreeMap<String, String>,
     storage_policy: PersistentHostStoragePolicy,
 }
 
-impl WindowsServiceConfigV4 {
+impl WindowsServiceConfigV5 {
     pub fn new(
         bind: &str,
         overrides: &DaemonPathOverrides,
@@ -741,7 +760,7 @@ impl WindowsServiceConfigV4 {
     }
 }
 
-impl<'de> Deserialize<'de> for WindowsServiceConfigV4 {
+impl<'de> Deserialize<'de> for WindowsServiceConfigV5 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -1057,7 +1076,8 @@ mod tests {
             log_dir: Some(PathBuf::from(r"C:\Satelle\logs")),
             ..DaemonPathOverrides::default()
         };
-        let config = WindowsServiceConfigV4::new("127.0.0.1:3001", &overrides, storage_policy())
+        let enabled_policy = storage_policy().with_platform_log_sink(true);
+        let config = WindowsServiceConfigV5::new("127.0.0.1:3001", &overrides, enabled_policy)
             .expect("valid service config");
         assert_eq!(config.schema(), WINDOWS_SERVICE_CONFIG_SCHEMA);
         assert_eq!(
@@ -1065,7 +1085,8 @@ mod tests {
             ["host", "start", "--foreground", "--bind", "127.0.0.1:3001"]
         );
         assert_eq!(config.environment().len(), 5);
-        assert_eq!(config.storage_policy(), storage_policy());
+        assert_eq!(config.storage_policy(), enabled_policy);
+        assert!(config.storage_policy().platform_log_sink());
         assert_eq!(
             config.environment().keys().cloned().collect::<Vec<_>>(),
             [
@@ -1102,7 +1123,7 @@ mod tests {
             "environment": {},
             "storage_policy": storage_policy()
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV4>(invalid_arguments).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV5>(invalid_arguments).is_err());
 
         let invalid_environment = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1110,7 +1131,7 @@ mod tests {
             "environment": {"PATH": "C:\\attacker"},
             "storage_policy": storage_policy()
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV4>(invalid_environment).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV5>(invalid_environment).is_err());
 
         let invalid_retention = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1123,7 +1144,23 @@ mod tests {
                 "operator_log_retained_files": 12
             }
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV4>(invalid_retention).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV5>(invalid_retention).is_err());
+
+        let missing_platform_log_policy = serde_json::json!({
+            "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
+            "daemon_arguments": ["host", "start", "--foreground", "--bind", "127.0.0.1:3001"],
+            "environment": {},
+            "storage_policy": {
+                "setup_ledger_retention_ms": 3_600_000,
+                "session_metadata_retention_hours": 720,
+                "sqlite_log_retention_hours": 1080,
+                "operator_log_retained_files": 12
+            }
+        });
+        assert!(
+            serde_json::from_value::<WindowsServiceConfigV5>(missing_platform_log_policy).is_err(),
+            "persistent service policy must use the current complete schema"
+        );
     }
 
     #[test]
@@ -1358,7 +1395,7 @@ mod tests {
                 home: Some(PathBuf::from("/Users/operator/Satelle & Host")),
                 ..DaemonPathOverrides::default()
             },
-            storage_policy(),
+            storage_policy().with_platform_log_sink(true),
         )
         .expect("valid launchd definition");
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
@@ -1369,9 +1406,19 @@ mod tests {
         assert!(plist.contains("<string>--setup-ledger-retention-ms</string>"));
         assert!(plist.contains("<string>--session-metadata-retention-hours</string>"));
         assert!(plist.contains("<string>--operator-log-retained-files</string>"));
+        assert!(plist.contains("<string>--platform-log-sink</string>"));
         assert!(plist.contains("<string>3600000</string>"));
         assert!(!plist.contains("0.0.0.0"));
         assert!(!plist.contains("UserName"));
+
+        let disabled_plist = render_launchd_user_plist(
+            Path::new("/Users/operator/Library/Caches/Satelle/host/v0.1.0/satelle"),
+            "127.0.0.1:3001",
+            &DaemonPathOverrides::default(),
+            storage_policy(),
+        )
+        .expect("valid launchd definition without platform logging");
+        assert!(!disabled_plist.contains("<string>--platform-log-sink</string>"));
     }
 
     #[test]
@@ -1381,7 +1428,7 @@ mod tests {
             state_dir: Some(PathBuf::from(r"C:\Users\operator\Satelle\state")),
             ..DaemonPathOverrides::default()
         };
-        let config = WindowsServiceConfigV4::new("127.0.0.1:3001", &overrides, storage_policy())
+        let config = WindowsServiceConfigV5::new("127.0.0.1:3001", &overrides, storage_policy())
             .expect("valid Windows service config");
 
         assert_eq!(config.path_overrides(), overrides);

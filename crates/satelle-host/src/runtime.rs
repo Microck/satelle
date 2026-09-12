@@ -43,9 +43,9 @@ use daemon_activity::{DaemonActivity, DaemonActivityGuard};
 use crate::live_events::LiveEventHub;
 use crate::process_identity::ProcessIdentity;
 use crate::storage::{
-    AdmissionOutcome, ApiTokenRegistration, BeginProviderSecretProvisioning, IdempotentOperation,
-    LeaseOwner, LogPageStorageError, NativeReadinessInvalidationReplay,
-    NativeReadinessInvalidationTarget, ObservedUpstreamRef, OperatorLogMirror, OperatorLogPolicy,
+    AdmissionOutcome, ApiTokenRegistration, BeginProviderSecretProvisioning, CommittedLogMirrors,
+    IdempotentOperation, LeaseOwner, LogPageStorageError, NativeReadinessInvalidationReplay,
+    NativeReadinessInvalidationTarget, ObservedUpstreamRef, OperatorLogPolicy,
     ProviderBindingAuthorizationReplay, ProviderBindingDeletionReplay,
     ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
     ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay, ReadinessProbeKind,
@@ -657,9 +657,10 @@ pub(crate) enum RuntimeStartupState {
 
 pub(crate) struct RuntimeEngine {
     // This is the sole SQLite owner for the runtime. The mutex protects short
-    // admission/read/commit sections only and is never held across adapter I/O.
+    // admission/read/commit sections only and is never held across adapter or
+    // log-sink I/O.
     storage: Arc<Mutex<Storage>>,
-    operator_log: Mutex<OperatorLogMirror>,
+    log_mirrors: Mutex<CommittedLogMirrors>,
     adapter: Arc<dyn ComputerUseAdapter>,
     provider_policy: RuntimeProviderPolicy,
     readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
@@ -680,6 +681,7 @@ pub(crate) struct RuntimeStoragePolicy {
     sqlite_log_retention: time::Duration,
     setup_ledger_retention: time::Duration,
     operator_log_retained_files: usize,
+    platform_log_sink: bool,
 }
 
 impl RuntimeStoragePolicy {
@@ -704,6 +706,7 @@ impl RuntimeStoragePolicy {
             operator_log_retained_files: config
                 .operator_log_retained_files
                 .unwrap_or(satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES),
+            platform_log_sink: config.platform_log_sink,
         }
     }
 }
@@ -715,6 +718,7 @@ impl Default for RuntimeStoragePolicy {
             sqlite_log_retention: crate::storage::DEFAULT_LOG_RETENTION,
             setup_ledger_retention: crate::storage::DEFAULT_SETUP_LEDGER_RETENTION,
             operator_log_retained_files: satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
+            platform_log_sink: false,
         }
     }
 }
@@ -745,6 +749,7 @@ pub(crate) struct RuntimeSnapshot {
     host_identity: satelle_core::session::HostIdentityRef,
     storage: StorageSnapshot,
     operator_log_health: crate::storage::OperatorLogSinkHealth,
+    platform_log_sink_health: crate::storage::PlatformLogSinkHealth,
 }
 
 impl RuntimeSnapshot {
@@ -766,6 +771,10 @@ impl RuntimeSnapshot {
 
     pub(crate) const fn operator_log_health(&self) -> crate::storage::OperatorLogSinkHealth {
         self.operator_log_health
+    }
+
+    pub(crate) const fn platform_log_sink_health(&self) -> crate::storage::PlatformLogSinkHealth {
+        self.platform_log_sink_health
     }
 }
 
@@ -802,10 +811,11 @@ impl RuntimeEngine {
             .map_err(model::storage_failure)?;
         let engine = Arc::new(Self {
             storage: Arc::new(Mutex::new(storage)),
-            operator_log: Mutex::new(OperatorLogMirror::new(
+            log_mirrors: Mutex::new(CommittedLogMirrors::new(
                 OperatorLogPolicy::new(operator_log_root)
                     .with_retained_files(storage_policy.operator_log_retained_files),
                 mirrored_cursor,
+                storage_policy.platform_log_sink,
             )),
             adapter,
             provider_policy,
@@ -2563,17 +2573,34 @@ impl RuntimeEngine {
 
     fn snapshot(&self) -> Result<RuntimeSnapshot, SatelleError> {
         self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
-        let storage = self.lock_storage()?;
-        let operator_log_health = self
-            .operator_log
-            .lock()
-            .map_err(|_| model::integrity_failure("the operator log mirror lock was poisoned"))?
-            .health();
+        let (host_identity, storage_snapshot) = {
+            let storage = self.lock_storage()?;
+            (
+                storage.host_identity().map_err(model::storage_failure)?,
+                storage.snapshot().map_err(model::storage_failure)?,
+            )
+        };
+        let (operator_log_health, platform_log_sink_health) = {
+            let mirrors = self.log_mirrors.lock().map_err(|_| {
+                model::integrity_failure("the committed log mirror lock was poisoned")
+            })?;
+            (mirrors.health(), mirrors.platform_health())
+        };
         Ok(RuntimeSnapshot {
-            host_identity: storage.host_identity().map_err(model::storage_failure)?,
-            storage: storage.snapshot().map_err(model::storage_failure)?,
+            host_identity,
+            storage: storage_snapshot,
             operator_log_health,
+            platform_log_sink_health,
         })
+    }
+
+    fn platform_log_sink_health(
+        &self,
+    ) -> Result<crate::storage::PlatformLogSinkHealth, SatelleError> {
+        self.log_mirrors
+            .lock()
+            .map(|mirrors| mirrors.platform_health())
+            .map_err(|_| model::integrity_failure("the committed log mirror lock was poisoned"))
     }
 
     fn reap_finished_workers(&self) -> Result<bool, SatelleError> {
@@ -2605,8 +2632,9 @@ impl RuntimeEngine {
         self.storage
             .lock()
             .map(|storage| RuntimeStorageGuard {
-                storage,
-                operator_log: &self.operator_log,
+                storage: Some(storage),
+                storage_owner: self.storage.as_ref(),
+                log_mirrors: &self.log_mirrors,
             })
             .map_err(|_| {
                 model::integrity_failure(
@@ -2617,29 +2645,45 @@ impl RuntimeEngine {
 }
 
 struct RuntimeStorageGuard<'a> {
-    storage: MutexGuard<'a, Storage>,
-    operator_log: &'a Mutex<OperatorLogMirror>,
+    storage: Option<MutexGuard<'a, Storage>>,
+    storage_owner: &'a Mutex<Storage>,
+    log_mirrors: &'a Mutex<CommittedLogMirrors>,
 }
 
 impl Deref for RuntimeStorageGuard<'_> {
     type Target = Storage;
 
     fn deref(&self) -> &Self::Target {
-        &self.storage
+        self.storage
+            .as_deref()
+            .expect("the storage guard remains present until drop")
     }
 }
 
 impl DerefMut for RuntimeStorageGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.storage
+        self.storage
+            .as_deref_mut()
+            .expect("the storage guard remains present until drop")
     }
 }
 
 impl Drop for RuntimeStorageGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut operator_log) = self.operator_log.lock() {
-            operator_log.flush_committed(&self.storage);
-        }
+        // Never wait for or write to an external sink while holding SQLite.
+        // The mirror lock preserves cursor order while SQLite is reacquired only
+        // long enough to load and format the next batch of committed records.
+        drop(self.storage.take());
+        let Ok(mut log_mirrors) = self.log_mirrors.lock() else {
+            return;
+        };
+        let prepared = {
+            let Ok(storage) = self.storage_owner.lock() else {
+                return;
+            };
+            log_mirrors.prepare_committed(&storage)
+        };
+        log_mirrors.write_prepared(prepared);
     }
 }
 
@@ -2678,6 +2722,23 @@ impl RuntimeHandle {
             ),
             |driver| driver.readiness_probe_timeouts(),
         )
+    }
+
+    pub(crate) fn platform_log_sink_health(
+        &self,
+    ) -> Result<crate::storage::PlatformLogSinkHealth, SatelleError> {
+        let (engine, enabled) = {
+            let lazy = self
+                .lazy
+                .lock()
+                .map_err(|_| integrity_error("the lazy runtime lock was poisoned"))?;
+            (lazy.engine.clone(), lazy.storage_policy.platform_log_sink)
+        };
+        match engine {
+            Some(engine) => engine.platform_log_sink_health(),
+            None if enabled => Ok(crate::storage::PlatformLogSinkHealth::Healthy),
+            None => Ok(crate::storage::PlatformLogSinkHealth::Disabled),
+        }
     }
 
     pub(crate) fn provider_secret_provisioning_hmac(

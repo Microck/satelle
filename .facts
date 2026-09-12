@@ -57,7 +57,7 @@
 - a Satelle Config Include is an explicit reference from one Satelle TOML configuration file to another Satelle TOML configuration file loaded as part of the same user-level or project-level configuration source @spec @phase4 @implemented
 - a Satelle Executable Credential Helper is a Host-Resolved Secret Source that runs a user-configured executable on the machine resolving provider authentication and returns secret material through the Satelle credential-helper protocol @spec @phase4 @implemented
 - a Satelle Queued Turn Request is a Host Daemon-owned pending run or steer request waiting to start because the selected Control Lease is occupied @spec @later
-- a Satelle Platform-Native Log Sink is an OS-owned logging destination such as journald, Windows Event Log, or macOS unified logging that receives mirrored redacted Satelle Log Entries without becoming a Satelle-owned store @spec @later
+- a Satelle Platform-Native Log Sink is an OS-owned logging destination such as journald, Windows Event Log, or macOS unified logging that receives mirrored redacted Satelle Log Entries without becoming a Satelle-owned store @spec @phase4 @implemented
 - a Satelle Path Set is the runtime-resolved collection of config, cache, local state, operator log, SQLite store, and recording artifact paths for one OS user on one machine @spec @mvp @implemented
 - label: a Satelle Desktop Binding is one configured remote OS user account whose compatible visible desktop sessions a Host Daemon is authorized to observe and control
   command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
@@ -1755,11 +1755,11 @@
 - satelle Host Daemon continues running when Satelle Operator Log File writes fail while SQLite remains writable, and records the degraded log-file sink as a typed diagnostic finding @spec @mvp @implemented
 - satelle Host Daemon writes startup, shutdown, and fatal-error notices to stdout or stderr so service managers and containers can capture minimal process diagnostics @spec @mvp @implemented
 - satelle MVP does not require direct journald, Windows Event Log, or macOS unified logging API integration as a separate log sink @spec @mvp @implemented
-- satelle later adds Platform-Native Log Sinks only as optional mirrors of redacted Satelle Log Entries @spec @later
-- satelle Satelle Platform-Native Log Sinks never replace the Host Daemon SQLite store, Satelle Operator Log Files, or the Host Daemon API as the authoritative source for satelle logs, status, recovery, retention, or support bundle collection @spec @later
-- satelle Satelle Platform-Native Log Sinks emit the same redacted summaries and default exclusions as Satelle Operator Log Files instead of raw protocol payloads, provider bodies, prompts, screenshots, transcripts, recordings, or raw setup and repair subprocess streams @spec @later
-- satelle Host Daemon continues running when a Satelle Platform-Native Log Sink fails while SQLite remains writable, and records the degraded platform-native log sink as a typed diagnostic finding @spec @later
-- satelle Satelle Platform-Native Log Sink retention and query behavior are treated as operating-system-managed mirror behavior and do not change SQLite Satelle Log Entry retention, Satelle Operator Log File retention, or satelle logs output semantics @spec @later
+- satelle later adds Platform-Native Log Sinks only as optional mirrors of redacted Satelle Log Entries @spec @phase4 @implemented
+- satelle Satelle Platform-Native Log Sinks never replace the Host Daemon SQLite store, Satelle Operator Log Files, or the Host Daemon API as the authoritative source for satelle logs, status, recovery, retention, or support bundle collection @spec @phase4 @implemented
+- satelle Satelle Platform-Native Log Sinks emit the same redacted summaries and default exclusions as Satelle Operator Log Files instead of raw protocol payloads, provider bodies, prompts, screenshots, transcripts, recordings, or raw setup and repair subprocess streams @spec @phase4 @implemented
+- satelle Host Daemon continues running when a Satelle Platform-Native Log Sink fails while SQLite remains writable, and records the degraded platform-native log sink as a typed diagnostic finding @spec @phase4 @implemented
+- satelle Satelle Platform-Native Log Sink retention and query behavior are treated as operating-system-managed mirror behavior and do not change SQLite Satelle Log Entry retention, Satelle Operator Log File retention, or satelle logs output semantics @spec @phase4 @implemented
 - satelle SQLite Satelle Log Entries are retained for 7 days by default @spec @mvp @implemented
 - satelle SQLite Satelle Log Entry retention can be configured per host or profile @spec @mvp @implemented
 - each persisted Satelle Log Entry receives a monotonic Log Cursor in its Host Daemon store @spec @mvp @implemented

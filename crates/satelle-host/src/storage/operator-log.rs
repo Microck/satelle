@@ -1,5 +1,6 @@
 use super::Storage;
-use crate::{DaemonLogEntry, LogSubject};
+use crate::storage::{PlatformLogSink, PlatformLogSinkHealth};
+use crate::{DaemonLogEntry, LogSeverity, LogSubject};
 use satelle_core::{
     OwnerOnlyDirectory, open_or_create_owner_only_directory, open_or_create_owner_only_file,
 };
@@ -16,53 +17,102 @@ const MIRROR_PAGE_SIZE: usize = 100;
 ///
 /// The cursor starts at the SQLite tail on each process start, so an existing
 /// local mirror is never replayed or treated as authoritative recovery state.
-pub(crate) struct OperatorLogMirror {
-    sink: OperatorLogSink,
+pub(crate) struct CommittedLogMirrors {
+    operator_sink: OperatorLogSink,
+    platform_sink: PlatformLogSink,
     mirrored_cursor: u64,
 }
 
-impl OperatorLogMirror {
-    pub(crate) fn new(policy: OperatorLogPolicy, mirrored_cursor: u64) -> Self {
-        let mut sink = OperatorLogSink::new(policy);
+pub(crate) struct PreparedLogEntry {
+    cursor: u64,
+    line: Result<String, OperatorLogFailureKind>,
+    severity: LogSeverity,
+}
+
+impl CommittedLogMirrors {
+    pub(crate) fn new(
+        policy: OperatorLogPolicy,
+        mirrored_cursor: u64,
+        platform_log_enabled: bool,
+    ) -> Self {
+        let mut operator_sink = OperatorLogSink::new(policy);
         // Reconcile the file cap at process start. A read-only daemon may not
         // commit another log entry, so write-time reconciliation alone can
         // leave generations above a newly reduced cap indefinitely.
-        sink.reconcile_retention();
+        operator_sink.reconcile_retention();
         Self {
-            sink,
+            operator_sink,
+            platform_sink: PlatformLogSink::new(platform_log_enabled),
             mirrored_cursor,
         }
     }
 
-    pub(crate) fn flush_committed(&mut self, storage: &Storage) {
+    /// Loads and formats every record committed since the previous flush.
+    /// The caller holds the storage lock here, but releases it before emitting
+    /// the prepared lines to either external sink.
+    pub(crate) fn prepare_committed(&self, storage: &Storage) -> Vec<PreparedLogEntry> {
+        let mut prepared = Vec::new();
+        let mut query_cursor = self.mirrored_cursor;
         loop {
-            let Ok(entries) =
-                storage.committed_log_entries_after(self.mirrored_cursor, MIRROR_PAGE_SIZE)
+            let Ok(entries) = storage.committed_log_entries_after(query_cursor, MIRROR_PAGE_SIZE)
             else {
-                return;
+                return prepared;
             };
             let entry_count = entries.len();
             for (cursor, entry) in entries {
-                // Mirroring is deliberately best effort. Advance even when a
-                // file write fails so recovery and public log pagination can
-                // never depend on retrying a local inspection artifact.
-                match self.sink.write_committed(&entry) {
-                    OperatorLogWriteOutcome::Failure(kind) => {
-                        debug_assert_eq!(self.sink.health(), OperatorLogSinkHealth::Degraded(kind));
-                    }
-                    OperatorLogWriteOutcome::Written
-                    | OperatorLogWriteOutcome::FailureCoalesced => {}
-                }
-                self.mirrored_cursor = cursor;
+                let severity = entry.severity();
+                prepared.push(PreparedLogEntry {
+                    cursor,
+                    line: format_entry(&entry),
+                    severity,
+                });
+                query_cursor = cursor;
             }
             if entry_count < MIRROR_PAGE_SIZE {
-                return;
+                return prepared;
             }
         }
     }
 
+    pub(crate) fn write_prepared(&mut self, entries: Vec<PreparedLogEntry>) {
+        for PreparedLogEntry {
+            cursor,
+            line,
+            severity,
+        } in entries
+        {
+            match line {
+                Ok(line) => {
+                    // Both mirrors receive the exact committed, redacted
+                    // summary. Neither mirror can affect SQLite or retry
+                    // the same authoritative record after a sink failure.
+                    match self.operator_sink.write_formatted(&line) {
+                        OperatorLogWriteOutcome::Failure(kind) => {
+                            debug_assert_eq!(
+                                self.operator_sink.health(),
+                                OperatorLogSinkHealth::Degraded(kind)
+                            );
+                        }
+                        OperatorLogWriteOutcome::Written
+                        | OperatorLogWriteOutcome::FailureCoalesced => {}
+                    }
+                    self.platform_sink.write_formatted(&line, severity);
+                }
+                Err(kind) => {
+                    self.operator_sink.record_failure(kind);
+                    self.platform_sink.record_format_failure();
+                }
+            }
+            self.mirrored_cursor = cursor;
+        }
+    }
+
     pub(crate) const fn health(&self) -> OperatorLogSinkHealth {
-        self.sink.health()
+        self.operator_sink.health()
+    }
+
+    pub(crate) const fn platform_health(&self) -> PlatformLogSinkHealth {
+        self.platform_sink.health()
     }
 }
 
@@ -175,24 +225,34 @@ impl OperatorLogSink {
     /// Mirrors the authoritative entry loaded after its SQLite commit.
     /// A sink failure is returned as data and must never become a recursive log
     /// entry or change the authoritative commit result.
+    #[cfg(test)]
     pub(crate) fn write_committed(&mut self, entry: &DaemonLogEntry) -> OperatorLogWriteOutcome {
-        match self.try_write_committed(entry) {
+        match format_entry(entry) {
+            Ok(line) => self.write_formatted(&line),
+            Err(kind) => self.record_failure(kind),
+        }
+    }
+
+    fn write_formatted(&mut self, line: &str) -> OperatorLogWriteOutcome {
+        let outcome = self.try_write_formatted(line);
+        match outcome {
             Ok(()) => {
                 self.active_failure = None;
                 OperatorLogWriteOutcome::Written
             }
-            Err(kind) => {
-                // Reopen from the pinned owner-only boundary on the next
-                // record. Only the first failure in one uninterrupted outage
-                // changes the typed health observed by the Doctor owner.
-                self.file = None;
-                if self.active_failure.is_some() {
-                    OperatorLogWriteOutcome::FailureCoalesced
-                } else {
-                    self.active_failure = Some(kind);
-                    OperatorLogWriteOutcome::Failure(kind)
-                }
-            }
+            Err(kind) => self.record_failure(kind),
+        }
+    }
+
+    fn record_failure(&mut self, kind: OperatorLogFailureKind) -> OperatorLogWriteOutcome {
+        // Reopen from the pinned owner-only boundary on the next record. Only
+        // the first failure in one outage changes the health observed by Doctor.
+        self.file = None;
+        if self.active_failure.is_some() {
+            OperatorLogWriteOutcome::FailureCoalesced
+        } else {
+            self.active_failure = Some(kind);
+            OperatorLogWriteOutcome::Failure(kind)
         }
     }
 
@@ -203,11 +263,7 @@ impl OperatorLogSink {
         }
     }
 
-    fn try_write_committed(
-        &mut self,
-        entry: &DaemonLogEntry,
-    ) -> Result<(), OperatorLogFailureKind> {
-        let line = format_entry(entry)?;
+    fn try_write_formatted(&mut self, line: &str) -> Result<(), OperatorLogFailureKind> {
         self.ensure_open()?;
 
         let current_bytes = self
