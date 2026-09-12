@@ -797,6 +797,9 @@ impl RuntimeEngine {
         storage
             .recover_raw_diagnostic_exports(time::OffsetDateTime::now_utc())
             .map_err(model::storage_failure)?;
+        storage
+            .recover_desktop_snapshots(time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)?;
         storage.set_log_retention(storage_policy.sqlite_log_retention);
         if let Some(fingerprinter) = provider_smoke_fingerprinter {
             let key = storage
@@ -3137,6 +3140,99 @@ impl RuntimeHandle {
             .finish_raw_diagnostic_export(
                 principal_ref,
                 invocation_id,
+                outcome,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn capture_desktop_snapshot(
+        &self,
+        principal_ref: &str,
+        source_host: &str,
+        desktop_binding: &DesktopBindingRef,
+        desktop_session_identity: &str,
+    ) -> Result<satelle_core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
+        let engine = self.engine()?;
+        let host_identity = engine.host_identity()?;
+        let snapshot_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        let acquired_at = time::OffsetDateTime::now_utc();
+        let owner = LeaseOwner::new(
+            snapshot_id.clone(),
+            engine.process_identity.process_id(),
+            engine.process_identity.process_start_ref(),
+            engine.process_identity.boot_identity_ref(),
+            acquired_at,
+        )
+        .map_err(model::storage_failure)?;
+        if let Err(error) = engine.lock_storage()?.begin_desktop_snapshot(
+            principal_ref,
+            source_host,
+            &host_identity,
+            desktop_binding,
+            Some(desktop_session_identity),
+            &owner,
+        ) {
+            return if error.kind() == crate::storage::StorageErrorKind::LeaseConflict {
+                Err(SatelleError::host_busy_without_owner(source_host))
+            } else {
+                Err(model::storage_failure(error))
+            };
+        }
+        let heartbeat = match LeaseHeartbeatGuard::start(Arc::clone(&engine.storage), &owner) {
+            Ok(heartbeat) => heartbeat,
+            Err(_) => {
+                engine
+                    .lock_storage()?
+                    .fail_desktop_snapshot(&snapshot_id, time::OffsetDateTime::now_utc())
+                    .map_err(model::storage_failure)?;
+                return Err(SatelleError::desktop_snapshot_host_export_failed(
+                    "lease_heartbeat_unavailable",
+                ));
+            }
+        };
+        let png = match crate::desktop_snapshot::capture_current_desktop_png() {
+            Ok(png) => png,
+            Err(error) => {
+                drop(heartbeat);
+                engine
+                    .lock_storage()?
+                    .fail_desktop_snapshot(&snapshot_id, time::OffsetDateTime::now_utc())
+                    .map_err(model::storage_failure)?;
+                return Err(error);
+            }
+        };
+        let manifest = satelle_core::sensitive_diagnostics::DesktopSnapshotManifest::new(
+            snapshot_id.clone(),
+            source_host,
+            host_identity.as_str(),
+            desktop_binding.as_str(),
+            Some(desktop_session_identity.to_string()),
+            png.len(),
+        );
+        if let Err(error) = engine.lock_storage()?.prepare_desktop_snapshot(&manifest) {
+            drop(heartbeat);
+            engine
+                .lock_storage()?
+                .fail_desktop_snapshot(&snapshot_id, time::OffsetDateTime::now_utc())
+                .map_err(model::storage_failure)?;
+            return Err(model::storage_failure(error));
+        }
+        drop(heartbeat);
+        Ok(satelle_core::sensitive_diagnostics::DesktopSnapshotArtifact { manifest, png })
+    }
+
+    pub(crate) fn acknowledge_desktop_snapshot(
+        &self,
+        principal_ref: &str,
+        snapshot_id: &str,
+        outcome: satelle_core::sensitive_diagnostics::DesktopSnapshotExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .finish_desktop_snapshot(
+                principal_ref,
+                snapshot_id,
                 outcome,
                 time::OffsetDateTime::now_utc(),
             )

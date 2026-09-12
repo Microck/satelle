@@ -28,8 +28,9 @@ those pull requests merge, the integration branch gets a final pull request to
 | Support bundle history | Bounded, redacted Host setup-ledger summaries | Merged in PR #238 |
 | Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit | Merged in PR #239 |
 | Platform-native log sinks | Optional redacted mirrors with typed Doctor health | Merged in PR #241 |
-| Setup and repair subprocess exports | Selected bounded SSH output for one consented invocation | Ready for review |
-| Capture and observability | Desktop snapshot, recording, telemetry | Pending |
+| Setup and repair subprocess exports | Selected bounded SSH output for one consented invocation | Merged in PR #242 |
+| Desktop snapshot export | Current native desktop capture with consent, redaction, and audit metadata | Ready for review |
+| Recording and telemetry | Per-Turn recording modes and opt-in telemetry | Pending |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Pending |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Pending |
 | Automation | Batch, watch, webhook notifications, REPL, command history | Pending |
@@ -58,6 +59,32 @@ or approval is a blocker, never proof of implementation.
 - The Controller writes one new owner-only local file without replacement,
   verifies its exact bytes, then acknowledges success. Failure reports the
   staging path, cleanup command, and whether raw material may remain.
+
+## Desktop snapshot decisions
+
+Box passed workspace format, check, and Clippy; the complete Rust suites;
+all 115 npm checks; and 64 documentation examples. The Rust verification
+included 600 CLI unit tests, 175 CLI integration tests, 777 Host tests, 233
+core tests, 120 transport library tests, and 155 HTTP transport tests.
+
+- `desktop snapshot --host <alias> --output <path>` resolves one trusted Host,
+  Desktop Binding, and current native desktop session before it requests
+  consent. Ambiguous and unavailable targets use closed typed errors.
+- Consent is always interactive and applies to one invocation. The warning
+  names the output path, PNG format, storage effect, metadata redaction policy,
+  and visual content that can remain. `--yes` cannot imply this consent.
+- The Host checks native capture readiness, takes the Desktop Binding's Control
+  Lease, captures the current visible desktop, validates PNG structure and CRCs,
+  and removes ancillary metadata before transfer.
+- The Windows Host captures in memory. The macOS Host uses a private temporary
+  directory and deletes it after preparation or failure. The Controller writes
+  through a private sibling staging file and never replaces an existing path.
+- The manifest binds the artifact to its Host Identity, Desktop Binding,
+  desktop session, redaction policy, risk categories, creation time, format,
+  and byte count. The direct client verifies the pinned Host Identity again.
+- SQLite stores only bounded lifecycle and manifest metadata. Pixels,
+  thumbnails, OCR text, prompts, transcripts, and artifact bytes never enter
+  SQLite, logs, status, events, support bundles, readiness caches, or ledgers.
 
 ## Platform-native log sink decisions
 

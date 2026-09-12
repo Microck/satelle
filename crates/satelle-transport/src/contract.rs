@@ -31,7 +31,9 @@ pub use satelle_core::{
 pub(crate) use session::ApiRequestContract;
 pub(crate) use session::TurnRequestParts;
 pub use session::{
-    AdmissionCancellationOutcome, AdmissionCancellationResponse, ImageAttachment,
+    AdmissionCancellationOutcome, AdmissionCancellationResponse, DesktopSnapshotAcknowledgeRequest,
+    DesktopSnapshotAcknowledgeResponse, DesktopSnapshotCaptureRequest,
+    DesktopSnapshotCaptureResponse, DesktopSnapshotContractError, ImageAttachment,
     MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL, MAX_IMAGE_ATTACHMENT_COUNT,
     RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse, RawProtocolCaptureRequest,
     RawProtocolDownloadResponse, RawSubprocessBeginRequest, RawSubprocessBeginResponse,
@@ -58,8 +60,8 @@ pub(crate) use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v17 adds audited raw setup and repair subprocess exports.
-// Older peers cannot interpret the tagged attachment request, so every protected
+// Protocol v18 adds audited desktop snapshot capture and acknowledgement.
+// Older peers cannot interpret the image-bearing response, so every protected
 // operation requires the current protocol before decoding its payload.
 pub(crate) const PROTOCOL_VERSION: &str = satelle_core::host_update::HOST_PROTOCOL_VERSION;
 
@@ -561,8 +563,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v17_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "17");
+    fn protocol_version_is_the_v18_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "18");
     }
 
     #[test]

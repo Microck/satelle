@@ -15,7 +15,9 @@ pub use client::{
 pub use contract::{
     AdmissionCancellationOutcome, AdmissionCancellationResponse, ApiError, ApiErrorCode,
     ApiTokenIssueRequest, ApiTokenResponse, ApiTokenRevokeRequest, ApiTokenRotateRequest,
-    CapabilitiesResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
+    CapabilitiesResponse, DURABLE_SETUP_PENDING_TTL, DesktopSnapshotAcknowledgeRequest,
+    DesktopSnapshotAcknowledgeResponse, DesktopSnapshotCaptureRequest,
+    DesktopSnapshotCaptureResponse, DesktopSnapshotContractError, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, EventSubscription,
     HostDesktopSessionsResponse, HostStatusResponse, HostUpdateMaintenanceRequest, ImageAttachment,
     LiveResponse, LogsPageResponse, MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL,

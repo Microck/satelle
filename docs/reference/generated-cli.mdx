@@ -41,6 +41,7 @@ Commands:
   config
   paths
   host
+  desktop
   self
   run
   steer
@@ -294,6 +295,23 @@ Commands:
   sessions
   storage
   store
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle desktop`
+
+```text
+Usage: satelle desktop [OPTIONS] <COMMAND>
+
+Commands:
+  snapshot
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -826,6 +844,24 @@ Options:
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle desktop snapshot`
+
+```text
+Usage: satelle desktop snapshot [OPTIONS] --host <HOST> --output <PATH>
+
+Options:
+      --host <HOST>
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --output <PATH>
+      --no-input
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
+      --json                   Alias for --format json
   -h, --help                   Print help
 ```
 

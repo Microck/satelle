@@ -5,7 +5,9 @@ use super::{
     authenticated_json_response, host_error,
 };
 use crate::contract::{
-    AdmissionCancellationResponse, ApiErrorCategory, ApiErrorCode, RawProtocolAcknowledgeRequest,
+    AdmissionCancellationResponse, ApiErrorCategory, ApiErrorCode,
+    DesktopSnapshotAcknowledgeRequest, DesktopSnapshotAcknowledgeResponse,
+    DesktopSnapshotCaptureRequest, DesktopSnapshotCaptureResponse, RawProtocolAcknowledgeRequest,
     RawProtocolAcknowledgeResponse, RawProtocolDownloadResponse, RawSubprocessBeginRequest,
     RawSubprocessBeginResponse, RawSubprocessPrepareRequest, RawSubprocessPrepareResponse,
     RequestId, SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
@@ -325,6 +327,78 @@ pub(super) async fn begin_raw_subprocess_export(
             authorized.request_id().clone(),
             state.host_identity.clone(),
             manifest,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn capture_desktop_snapshot(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    ApiJson(request): ApiJson<DesktopSnapshotCaptureRequest>,
+) -> Response {
+    if request.source_host().is_empty()
+        || request.desktop_binding().is_empty()
+        || request.desktop_session_identity().is_empty()
+    {
+        return request_error(&state, &authorized, "desktop snapshot target is invalid");
+    }
+    let principal_ref = authorized.principal().principal_ref().to_string();
+    let source_host = request.source_host().to_string();
+    let desktop_binding = request.desktop_binding().to_string();
+    let desktop_session_identity = request.desktop_session_identity().to_string();
+    let service = Arc::clone(&state.service);
+    let artifact = match host_call(&state, &authorized, move || {
+        service.capture_desktop_snapshot(
+            &principal_ref,
+            &source_host,
+            &desktop_binding,
+            &desktop_session_identity,
+        )
+    })
+    .await
+    {
+        Ok(artifact) => artifact,
+        Err(response) => return response,
+    };
+    authenticated_json_response(
+        StatusCode::OK,
+        &DesktopSnapshotCaptureResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            artifact,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn acknowledge_desktop_snapshot(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(snapshot_id): Path<String>,
+    ApiJson(request): ApiJson<DesktopSnapshotAcknowledgeRequest>,
+) -> Response {
+    if uuid::Uuid::parse_str(&snapshot_id).is_err() {
+        return request_error(&state, &authorized, "desktop snapshot identity is invalid");
+    }
+    let principal_ref = authorized.principal().principal_ref().to_string();
+    let outcome = request.outcome();
+    let service = Arc::clone(&state.service);
+    if let Err(response) = host_call(&state, &authorized, move || {
+        service.acknowledge_desktop_snapshot(&principal_ref, &snapshot_id, outcome)
+    })
+    .await
+    {
+        return response;
+    }
+    authenticated_json_response(
+        StatusCode::OK,
+        &DesktopSnapshotAcknowledgeResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            outcome,
         ),
         authorized.request_id(),
         &state.host_identity,

@@ -202,6 +202,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "client_certificate_audit",
             "control_leases",
             "daemon_identity",
+            "desktop_snapshot_audit",
             "idempotency_hmac_keys",
             "idempotency_records",
             "log_retention_state",
@@ -258,6 +259,30 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "redaction_policy_version",
             "created_at_unix_nanos",
             "completed_at_unix_nanos",
+            "artifact_byte_size",
+            "status",
+        ],
+    );
+
+    // Snapshot bytes stay outside SQLite. The audit stores only ownership,
+    // declared risk categories, dimensions, timing, and export outcome.
+    assert_table_columns(
+        &storage,
+        "desktop_snapshot_audit",
+        &[
+            "snapshot_id",
+            "principal_ref",
+            "host_alias",
+            "host_identity_ref",
+            "desktop_binding_ref",
+            "desktop_session_ref",
+            "data_categories",
+            "redaction_policy_version",
+            "redaction_categories",
+            "unredacted_risk_categories",
+            "created_at_unix_nanos",
+            "completed_at_unix_nanos",
+            "artifact_format",
             "artifact_byte_size",
             "status",
         ],

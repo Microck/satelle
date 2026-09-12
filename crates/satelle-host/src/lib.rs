@@ -11,6 +11,7 @@ mod credential_helper;
 mod daemon;
 #[path = "desktop-sessions.rs"]
 mod desktop_sessions;
+mod desktop_snapshot;
 #[path = "live-events.rs"]
 mod live_events;
 #[path = "log-page.rs"]
@@ -4687,6 +4688,49 @@ impl HostService {
     ) -> Result<(), SatelleError> {
         self.runtime
             .acknowledge_raw_subprocess_export(principal_ref, invocation_id, outcome)
+    }
+
+    pub fn capture_desktop_snapshot(
+        &self,
+        principal_ref: &str,
+        source_host: &str,
+        desktop_binding: &str,
+        desktop_session_identity: &str,
+    ) -> Result<satelle_core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
+        let desktop_binding = satelle_core::session::DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_snapshot_target_required(source_host))?;
+        let matching = self
+            .daemon_desktop_sessions()?
+            .into_iter()
+            .filter(|session| {
+                session.session_id == desktop_session_identity
+                    && session.desktop_user == desktop_binding.as_str()
+                    && session.state == "active"
+                    && session.session_kind == "visible_desktop"
+                    && session.is_console != session.is_remote
+            })
+            .count();
+        if matching != 1 {
+            return Err(SatelleError::desktop_snapshot_permission_required(
+                "selected_desktop_session_unavailable",
+            ));
+        }
+        self.runtime.capture_desktop_snapshot(
+            principal_ref,
+            source_host,
+            &desktop_binding,
+            desktop_session_identity,
+        )
+    }
+
+    pub fn acknowledge_desktop_snapshot(
+        &self,
+        principal_ref: &str,
+        snapshot_id: &str,
+        outcome: satelle_core::sensitive_diagnostics::DesktopSnapshotExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.runtime
+            .acknowledge_desktop_snapshot(principal_ref, snapshot_id, outcome)
     }
 
     pub fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {

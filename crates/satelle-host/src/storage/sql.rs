@@ -446,7 +446,10 @@ pub(super) fn ensure_control_lease_available(
     if let Some((owner_kind, session_id, heartbeat_at)) = control {
         let _freshness =
             super::operational::classify_lease_freshness(&heartbeat_at, OffsetDateTime::now_utc())?;
-        if matches!(owner_kind.as_str(), "provider_probe" | "native_probe") && session_id.is_none()
+        if matches!(
+            owner_kind.as_str(),
+            "provider_probe" | "native_probe" | "desktop_snapshot"
+        ) && session_id.is_none()
         {
             return Err(StorageError::new(StorageErrorKind::LeaseConflict));
         }

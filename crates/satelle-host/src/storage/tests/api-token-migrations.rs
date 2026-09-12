@@ -44,11 +44,16 @@ fn version_sixteen_store_with_pending_journal(state: &TempDir) {
         .unwrap();
     connection.execute_batch(predecessor).unwrap();
     connection
-        .execute_batch("DROP TABLE raw_diagnostic_audit; DROP TABLE client_certificate_audit;")
+        .execute_batch(
+            "DROP INDEX control_lease_desktop_snapshot_owner;
+             DROP TABLE desktop_snapshot_audit;
+             DROP TABLE raw_diagnostic_audit;
+             DROP TABLE client_certificate_audit;",
+        )
         .unwrap();
     connection
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (17, 18, 19, 20)",
+            "DELETE FROM schema_migrations WHERE version IN (17, 18, 19, 20, 21)",
             [],
         )
         .unwrap();

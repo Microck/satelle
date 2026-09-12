@@ -47,6 +47,28 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the requested raw diagnostic export is unavailable; no raw staging files remain",
             details: None,
         },
+        ErrorCode::DesktopSnapshotPermissionRequired => ApiFailure {
+            status: StatusCode::FORBIDDEN,
+            code: ApiErrorCode::DesktopSnapshotPermissionRequired,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Host cannot capture the current visible desktop",
+            details: validated_string_details(error, &["reason"]),
+        },
+        ErrorCode::DesktopSnapshotRedactionFailed | ErrorCode::DesktopSnapshotExportFailed => {
+            ApiFailure {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: if error.code == ErrorCode::DesktopSnapshotRedactionFailed {
+                    ApiErrorCode::DesktopSnapshotRedactionFailed
+                } else {
+                    ApiErrorCode::DesktopSnapshotExportFailed
+                },
+                category: ApiErrorCategory::Storage,
+                retryable: false,
+                message: "the desktop snapshot could not be prepared for export",
+                details: None,
+            }
+        }
         ErrorCode::InvalidUsage
         | ErrorCode::ScopeSelectionConflict
         | ErrorCode::PromptSourceConflict
@@ -96,6 +118,9 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
         | ErrorCode::RawDiagnosticsOutputRequired
         | ErrorCode::RawDiagnosticsConsentRequired
+        | ErrorCode::DesktopSnapshotTargetRequired
+        | ErrorCode::DesktopSnapshotAmbiguous
+        | ErrorCode::DesktopSnapshotConsentRequired
         | ErrorCode::InputRequired => ApiFailure {
             status: StatusCode::BAD_REQUEST,
             code: ApiErrorCode::InvalidRequest,
@@ -217,14 +242,22 @@ fn failure(error: &SatelleError) -> ApiFailure {
             category: ApiErrorCategory::Conflict,
             retryable: true,
             message: "the Host is already controlling its authorized desktop",
-            details: Some(serde_json::json!({
-                "host": error.details.get("host").cloned().unwrap_or(serde_json::Value::Null),
-                "active_session_id": error
-                    .details
-                    .get("active_session_id")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            })),
+            details: Some(match (
+                error.details.get("active_session_id"),
+                error.details.get("active_operation_id"),
+            ) {
+                (Some(active_session_id), _) => serde_json::json!({
+                    "host": error.details.get("host").cloned().unwrap_or(serde_json::Value::Null),
+                    "active_session_id": active_session_id,
+                }),
+                (_, Some(active_operation_id)) => serde_json::json!({
+                    "host": error.details.get("host").cloned().unwrap_or(serde_json::Value::Null),
+                    "active_operation_id": active_operation_id,
+                }),
+                _ => serde_json::json!({
+                    "host": error.details.get("host").cloned().unwrap_or(serde_json::Value::Null),
+                }),
+            }),
         },
         ErrorCode::StoreInUse => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1098,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn host_busy_preserves_only_the_public_active_session_details() {
+    fn host_busy_preserves_only_public_owner_details() {
         let session_id = SessionId::new();
         let mut error = SatelleError::host_busy("local-demo", &session_id);
         error
@@ -1116,6 +1149,11 @@ mod tests {
                 "active_session_id": session_id,
             }))
         );
+
+        let operation = failure(&SatelleError::host_busy_without_owner("local-demo"));
+        assert_eq!(operation.status, StatusCode::CONFLICT);
+        assert_eq!(operation.code, ApiErrorCode::HostBusy);
+        assert_eq!(operation.details, Some(json!({"host": "local-demo"})));
     }
 
     #[test]

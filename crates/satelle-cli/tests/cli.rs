@@ -4813,6 +4813,15 @@ fn setup_apply_and_yes_outside_consent_commands_are_rejected_by_the_parser() {
         &["run", "--yes", "Inspect"][..],
         &["doctor", "--yes"][..],
         &["paths", "--yes"][..],
+        &[
+            "desktop",
+            "snapshot",
+            "--host",
+            "local-demo",
+            "--output",
+            "snapshot.png",
+            "--yes",
+        ][..],
     ] {
         satelle()
             .args(args)
@@ -4820,6 +4829,25 @@ fn setup_apply_and_yes_outside_consent_commands_are_rejected_by_the_parser() {
             .failure()
             .stderr(predicate::str::contains("--yes"));
     }
+}
+
+#[test]
+fn desktop_snapshot_no_input_requires_consent_before_creating_the_artifact() {
+    let state = state_dir();
+    let output = state.path().join("current-desktop.png");
+
+    satelle()
+        .env("SATELLE_HOME", state.path())
+        .args(["desktop", "snapshot", "--host", "local-demo", "--output"])
+        .arg(&output)
+        .args(["--no-input", "--json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            r#""code": "desktop-snapshot-consent-required""#,
+        ));
+
+    assert!(!output.exists());
 }
 
 #[cfg(target_os = "linux")]

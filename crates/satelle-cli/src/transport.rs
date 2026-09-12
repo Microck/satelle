@@ -528,6 +528,23 @@ pub(crate) trait TransportClient: Send {
             "this transport cannot acknowledge raw subprocess exports",
         ))
     }
+    fn capture_desktop_snapshot(
+        &self,
+        _request: &satelle_transport::DesktopSnapshotCaptureRequest,
+    ) -> Result<satelle_core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
+        Err(SatelleError::not_implemented(
+            "this transport cannot capture desktop snapshots",
+        ))
+    }
+    fn acknowledge_desktop_snapshot(
+        &self,
+        _snapshot_id: &str,
+        _outcome: satelle_core::sensitive_diagnostics::DesktopSnapshotExportOutcome,
+    ) -> Result<(), SatelleError> {
+        Err(SatelleError::not_implemented(
+            "this transport cannot acknowledge desktop snapshots",
+        ))
+    }
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError>;
     fn logs(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError>;
     fn setup_history(&self) -> Result<satelle_host::SetupHistory, SatelleError>;
@@ -1208,6 +1225,27 @@ impl TransportClient for LocalTransport {
     ) -> Result<(), SatelleError> {
         self.service
             .acknowledge_raw_protocol_export("local-principal-v1", turn_id, outcome)
+    }
+
+    fn capture_desktop_snapshot(
+        &self,
+        request: &satelle_transport::DesktopSnapshotCaptureRequest,
+    ) -> Result<satelle_core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
+        self.service.capture_desktop_snapshot(
+            "local-principal-v1",
+            request.source_host(),
+            request.desktop_binding(),
+            request.desktop_session_identity(),
+        )
+    }
+
+    fn acknowledge_desktop_snapshot(
+        &self,
+        snapshot_id: &str,
+        outcome: satelle_core::sensitive_diagnostics::DesktopSnapshotExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.service
+            .acknowledge_desktop_snapshot("local-principal-v1", snapshot_id, outcome)
     }
 
     fn stop(&self, session_id: &SessionId) -> Result<StopResult, SatelleError> {
@@ -7819,6 +7857,32 @@ impl TransportClient for DirectTransport {
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 
+    fn capture_desktop_snapshot(
+        &self,
+        request: &satelle_transport::DesktopSnapshotCaptureRequest,
+    ) -> Result<satelle_core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
+        self.client
+            .capture_desktop_snapshot(request, &Self::idempotency_key())
+            .map_err(|error| direct_transport_error(&self.alias, error))?
+            .into_artifact()
+            .map_err(|_| SatelleError::remote_api_error(&self.alias, "invalid-daemon-response"))
+    }
+
+    fn acknowledge_desktop_snapshot(
+        &self,
+        snapshot_id: &str,
+        outcome: satelle_core::sensitive_diagnostics::DesktopSnapshotExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.client
+            .acknowledge_desktop_snapshot(
+                snapshot_id,
+                &satelle_transport::DesktopSnapshotAcknowledgeRequest::new(outcome),
+                &Self::idempotency_key(),
+            )
+            .map(|_| ())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
     fn plan_setup_repair(
         &self,
         run_id: Option<&str>,
@@ -9102,6 +9166,19 @@ fn response_connection_lost(error: &reqwest::Error) -> bool {
 // Typed API failures can carry path, cleanup, cursor, or contention evidence.
 // Validate each closed detail shape here before exposing it to the Controller.
 fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
+    if error.code() == ApiErrorCode::DesktopSnapshotPermissionRequired {
+        let Some(reason) = error
+            .details()
+            .and_then(serde_json::Value::as_object)
+            .filter(|details| details.len() == 1)
+            .and_then(|details| details.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| !reason.is_empty())
+        else {
+            return SatelleError::remote_api_error(host, "invalid-daemon-response");
+        };
+        return SatelleError::desktop_snapshot_permission_required(reason);
+    }
     let storage_code = match error.code() {
         ApiErrorCode::StorageMigrationSourceInvalid => Some((
             ErrorCode::StorageMigrationSourceInvalid,
@@ -9249,13 +9326,25 @@ fn map_host_busy_api_error(host: &str, error: &ApiError) -> SatelleError {
     let Some(details) = error.details().and_then(serde_json::Value::as_object) else {
         return SatelleError::remote_api_error(host, "invalid-daemon-response");
     };
-    if details.len() != 2
-        || details
-            .get("host")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(str::is_empty)
+    if details
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
     {
         return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    }
+    if details.len() == 1 {
+        return SatelleError::host_busy_without_owner(host);
+    }
+    if details.len() != 2 {
+        return SatelleError::remote_api_error(host, "invalid-daemon-response");
+    }
+    if let Some(active_operation_id) = details
+        .get("active_operation_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        return SatelleError::host_busy_operation(host, active_operation_id);
     }
     let Some(active_session_id) = details
         .get("active_session_id")
@@ -9669,6 +9758,12 @@ fn api_code_error(host: &str, code: ApiErrorCode) -> SatelleError {
             ErrorCode::ExperimentalProviderNotValidated,
             "the selected provider did not pass live validation",
         ),
+        ApiErrorCode::DesktopSnapshotRedactionFailed => {
+            SatelleError::desktop_snapshot_redaction_failed()
+        }
+        ApiErrorCode::DesktopSnapshotExportFailed => {
+            SatelleError::desktop_snapshot_host_export_failed("host_preparation_failed")
+        }
         code => SatelleError::remote_api_error(host, code.as_str()),
     }
 }

@@ -328,14 +328,41 @@ pub fn persist_new_owner_only_diagnostic_file(
     staging_path: &Path,
     contents: &[u8],
 ) -> Result<(), SecureFileError> {
-    if contents.len() > MAX_RAW_PROTOCOL_BYTES
+    persist_new_owner_only_staged_file(path, staging_path, contents, MAX_RAW_PROTOCOL_BYTES)
+}
+
+/// Publishes one metadata-redacted PNG without replacing an existing path.
+/// The caller supplies a sibling staging name so failed cleanup remains exact.
+pub fn persist_new_owner_only_desktop_snapshot(
+    path: &Path,
+    staging_path: &Path,
+    contents: &[u8],
+) -> Result<(), SecureFileError> {
+    if !contents.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(SecureFileError::UnsafeOrUnavailable);
+    }
+    persist_new_owner_only_staged_file(
+        path,
+        staging_path,
+        contents,
+        crate::sensitive_diagnostics::MAX_DESKTOP_SNAPSHOT_BYTES,
+    )
+}
+
+fn persist_new_owner_only_staged_file(
+    path: &Path,
+    staging_path: &Path,
+    contents: &[u8],
+    max_bytes: usize,
+) -> Result<(), SecureFileError> {
+    if contents.len() > max_bytes
         || path.parent().is_none()
         || path.parent() != staging_path.parent()
         || path == staging_path
     {
         return Err(SecureFileError::UnsafeOrUnavailable);
     }
-    let parent = path.parent().expect("validated diagnostic parent");
+    let parent = path.parent().expect("validated artifact parent");
     let directory = open_or_create_owner_only_directory(parent)?;
     let mut published = false;
     let persisted = (|| {

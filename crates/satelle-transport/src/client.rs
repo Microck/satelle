@@ -1,6 +1,8 @@
 use crate::contract::{
     AdmissionCancellationResponse, ApiError, ApiErrorCode, AuthenticatedResponseContract,
-    BootstrapMaintenanceResponse, CapabilitiesResponse, DurableTokenActivationResponse,
+    BootstrapMaintenanceResponse, CapabilitiesResponse, DesktopSnapshotAcknowledgeRequest,
+    DesktopSnapshotAcknowledgeResponse, DesktopSnapshotCaptureRequest,
+    DesktopSnapshotCaptureResponse, DurableTokenActivationResponse,
     DurableTokenConfirmationResponse, DurableTokenIssuanceResponse, HostDesktopSessionsResponse,
     HostPathsResponse, HostStatusResponse, LiveResponse, LocalDaemonRelaunchResponse,
     LocalDoctorOperationRequest, LocalDoctorOperationResponse, LocalSetupOperationRequest,
@@ -1002,6 +1004,42 @@ impl DaemonClient {
         let path = format!("/v1/diagnostics/raw-subprocess/{invocation_id}/acknowledge");
         let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
         let response: RawProtocolAcknowledgeResponse =
+            self.send_authenticated(request_builder.json(request), request_id, StatusCode::OK)?;
+        if response.outcome() != request.outcome() {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        Ok(response)
+    }
+
+    pub fn capture_desktop_snapshot(
+        &self,
+        request: &DesktopSnapshotCaptureRequest,
+        idempotency_key: &str,
+    ) -> Result<DesktopSnapshotCaptureResponse, DaemonClientError> {
+        let path = "/v1/diagnostics/desktop-snapshot";
+        let (request_builder, request_id) = self.mutation_request(path, idempotency_key)?;
+        let response: DesktopSnapshotCaptureResponse =
+            self.send_authenticated(request_builder.json(request), request_id, StatusCode::OK)?;
+        if response.manifest().source_host != request.source_host()
+            || response.manifest().host_identity != self.expected_host_identity
+            || response.manifest().desktop_binding != request.desktop_binding()
+            || response.manifest().desktop_session_identity.as_deref()
+                != Some(request.desktop_session_identity())
+        {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        Ok(response)
+    }
+
+    pub fn acknowledge_desktop_snapshot(
+        &self,
+        snapshot_id: &str,
+        request: &DesktopSnapshotAcknowledgeRequest,
+        idempotency_key: &str,
+    ) -> Result<DesktopSnapshotAcknowledgeResponse, DaemonClientError> {
+        let path = format!("/v1/diagnostics/desktop-snapshot/{snapshot_id}/acknowledge");
+        let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
+        let response: DesktopSnapshotAcknowledgeResponse =
             self.send_authenticated(request_builder.json(request), request_id, StatusCode::OK)?;
         if response.outcome() != request.outcome() {
             return Err(DaemonClientError::ResponseContractViolation);

@@ -29,6 +29,7 @@ Global options include `--no-color`, `--profile <name>`, and
 | `satelle status` | Read authoritative Session state | Implemented |
 | `satelle stop` | Stop the active Turn | Implemented |
 | `satelle logs` | Read normalized retained Host logs | Implemented |
+| `satelle desktop snapshot` | Export the current visible desktop after explicit consent | Implemented |
 | `satelle mcp serve` | Serve the MCP interface over stdio | Implemented |
 | `satelle mcp install` | Configure a supported AI client to call Satelle MCP | Implemented |
 | `satelle skills list` / `get` / `path` | Discover and materialize the release-matched Agent Skill Bundle | Implemented |
@@ -115,6 +116,24 @@ file. The Host redacts known credentials before transfer, caps one capture at
 ten minutes after the Turn finishes or when the Host restarts. Inspect the
 artifact before sharing it because unknown secrets and visible session content
 can remain after redaction.
+
+## Desktop snapshots
+
+Use `satelle desktop snapshot --host <alias> --output <path>` to capture the
+current visible desktop from one trusted Host and Desktop Binding. The command
+shows the exact local output path, PNG format, redaction policy, storage effect,
+and visual risks before asking for confirmation. It requires an interactive
+terminal and one confirmation for that invocation. `--no-input`, redirected
+stdin, or declined consent fails before capture.
+
+The Host checks native capture permission, holds the Desktop Binding's Control
+Lease during capture, removes PNG metadata, and transfers the artifact only to
+the invoking Controller. The Controller writes a new owner-only file without
+replacing an existing path, then acknowledges publication. The Host stores only
+bounded audit metadata. It does not store pixels, thumbnails, OCR text, prompts,
+transcripts, or output artifact contents. The PNG can still contain visible app
+content, notifications, credentials, and personal data, so inspect it before
+sharing it.
 
 ## Doctor options
 
