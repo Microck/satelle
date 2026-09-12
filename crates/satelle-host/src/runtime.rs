@@ -2190,7 +2190,9 @@ impl RuntimeEngine {
             Err(error)
                 if matches!(
                     error.code,
-                    ErrorCode::ComputerUseNotReady | ErrorCode::IncompatibleControlPlane
+                    ErrorCode::ComputerUseNotReady
+                        | ErrorCode::IncompatibleControlPlane
+                        | ErrorCode::ExperimentalProviderOptInRequired
                 ) =>
             {
                 return Ok(false);

@@ -736,6 +736,28 @@ fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
 }
 
 #[test]
+fn host_default_cache_lookup_treats_provider_opt_in_as_unavailable() {
+    let state = crate::TestStateDir::new().expect("temporary state directory should exist");
+    let error = SatelleError {
+        code: ErrorCode::ExperimentalProviderOptInRequired,
+        message: "provider opt-in is required".to_string(),
+        recovery_command: None,
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
+    };
+    let runtime = RuntimeHandle::new(
+        Ok(state.path().to_path_buf()),
+        BlockedComputerUseAdapter::new(error),
+    );
+
+    assert!(
+        !runtime
+            .has_reusable_readiness(LOCAL_DEMO_HOST)
+            .expect("provider opt-in must be a cache miss, not a startup failure")
+    );
+}
+
+#[test]
 fn native_readiness_precedes_turn_admission_and_provider_smoke() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter);
