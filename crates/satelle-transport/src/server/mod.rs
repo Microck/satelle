@@ -564,6 +564,7 @@ impl DaemonServer {
         let initialized = service
             .initialize_daemon()
             .map_err(DaemonServerError::HostInitializationFailed)?;
+        service.prepare_queue_worker_for_daemon();
         let capabilities = service
             .daemon_runtime_capabilities()
             .map_err(DaemonServerError::HostInitializationFailed)?;
@@ -617,6 +618,7 @@ impl DaemonServer {
         };
         let connection_activity = listener.activity();
         let idle_service = Arc::clone(&state.service);
+        let queue_shutdown_service = Arc::clone(&state.service);
         let idle_timeout = config.idle_timeout;
         let task = tokio::spawn(async move {
             axum::serve(
@@ -633,6 +635,7 @@ impl DaemonServer {
                         config.local_relaunch,
                     ) => {}
                 }
+                queue_shutdown_service.request_queue_worker_shutdown();
             })
             .await
         });

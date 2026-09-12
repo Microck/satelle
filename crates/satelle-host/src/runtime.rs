@@ -2871,6 +2871,7 @@ pub(crate) struct RuntimeHandle {
     activity: Arc<DaemonActivity>,
     lazy: Arc<Mutex<LazyRuntime>>,
     queue_worker_running: Arc<AtomicBool>,
+    queue_worker_shutdown: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -2897,6 +2898,9 @@ impl RuntimeHandle {
     }
 
     pub(crate) fn try_start_queue_worker(&self) -> bool {
+        if self.queue_worker_shutdown.load(Ordering::Acquire) {
+            return false;
+        }
         self.queue_worker_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -2904,6 +2908,18 @@ impl RuntimeHandle {
 
     pub(crate) fn finish_queue_worker(&self) {
         self.queue_worker_running.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn prepare_queue_worker_for_daemon(&self) {
+        self.queue_worker_shutdown.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn request_queue_worker_shutdown(&self) {
+        self.queue_worker_shutdown.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn queue_worker_shutdown_requested(&self) -> bool {
+        self.queue_worker_shutdown.load(Ordering::Acquire)
     }
 
     pub(crate) fn recording_preflight(
@@ -3603,6 +3619,7 @@ impl RuntimeHandle {
                 provider_smoke_fingerprinter: None,
             })),
             queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3631,6 +3648,7 @@ impl RuntimeHandle {
                 ),
             })),
             queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3664,6 +3682,7 @@ impl RuntimeHandle {
                 ),
             })),
             queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3691,6 +3710,7 @@ impl RuntimeHandle {
                 provider_smoke_fingerprinter: Some(provider_smoke_fingerprinter),
             })),
             queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3741,6 +3761,7 @@ impl RuntimeHandle {
                 ),
             })),
             queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -4365,7 +4386,8 @@ impl RuntimeHandle {
     }
 
     pub(crate) fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {
-        self.engine()?.reap_finished_workers()
+        Ok(self.engine()?.reap_finished_workers()?
+            && !self.queue_worker_running.load(Ordering::Acquire))
     }
 
     pub(crate) fn daemon_activity_snapshot(&self) -> Result<(bool, u64), SatelleError> {

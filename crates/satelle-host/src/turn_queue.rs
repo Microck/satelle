@@ -495,12 +495,13 @@ impl HostService {
                 service.runtime.finish_queue_worker();
                 // Close the insertion/exit race: an enqueue that observed the
                 // old worker as running is visible before this recheck.
-                if service
-                    .runtime
-                    .queue_desktop_binding()
-                    .and_then(|binding| service.runtime.queue_lease_key(&binding))
-                    .and_then(|lease| service.runtime.next_queued_turn(&lease))
-                    .is_ok_and(|next| next.is_some())
+                if !service.runtime.queue_worker_shutdown_requested()
+                    && service
+                        .runtime
+                        .queue_desktop_binding()
+                        .and_then(|binding| service.runtime.queue_lease_key(&binding))
+                        .and_then(|lease| service.runtime.next_queued_turn(&lease))
+                        .is_ok_and(|next| next.is_some())
                 {
                     service.start_queue_worker();
                 }
@@ -513,6 +514,9 @@ impl HostService {
 
     fn drain_turn_queue(&self) {
         loop {
+            if self.runtime.queue_worker_shutdown_requested() {
+                return;
+            }
             let now = OffsetDateTime::now_utc();
             if self.runtime.expire_turn_queue(now).is_err() {
                 return;
@@ -600,6 +604,9 @@ impl HostService {
                     continue;
                 }
             };
+            if self.runtime.queue_worker_shutdown_requested() {
+                return;
+            }
             let admitted = match operation {
                 QueuedOperation::Run => self.admit_run(&intent, &authority),
                 QueuedOperation::Steer => match session_id {

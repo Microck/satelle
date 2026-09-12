@@ -32,7 +32,7 @@ those pull requests merge, the integration branch gets a final pull request to
 | Desktop snapshot export | Current native desktop capture with consent, redaction, and audit metadata | Merged in PR #243 |
 | Opt-in telemetry | Independent Controller and Host OTLP/HTTP export with private bounded queues | Merged in PR #244 |
 | Recording | Per-Turn recording modes and export policy | Merged in PR #245 |
-| Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Implemented; review pending |
+| Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | In PR #247 |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Pending |
 | Automation | Batch, watch, webhook notifications, REPL, command history | Pending |
 | Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Pending |

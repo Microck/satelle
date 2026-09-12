@@ -47,6 +47,7 @@ Commands:
   self
   run
   steer
+  queue
   status
   stop
   session
@@ -385,6 +386,8 @@ Options:
 
       --error-format <FORMAT>
           Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --queue
+          Persist this Turn until the Host can admit it
       --detach-on-interrupt
           Leave an admitted Turn running when the attached command is interrupted
       --quiet
@@ -455,6 +458,8 @@ Options:
 
       --error-format <FORMAT>
           Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --queue
+          Persist this Turn until the Host can admit it
       --detach-on-interrupt
           Leave an admitted Turn running when the attached command is interrupted
       --quiet
@@ -497,6 +502,24 @@ Options:
           Alias for --format json
   -h, --help
           Print help
+```
+
+## `satelle queue`
+
+```text
+Usage: satelle queue [OPTIONS] <COMMAND>
+
+Commands:
+  status  Read the durable state of one queued Turn
+  cancel  Cancel one queued Turn before admission
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
 ```
 
 ## `satelle status`
@@ -935,6 +958,48 @@ Options:
       --format <FORMAT>            [possible values: human, json, compact-json, toon, markdown]
       --json                       Alias for --format json
   -h, --help                       Print help
+```
+
+## `satelle queue status`
+
+```text
+Read the durable state of one queued Turn
+
+Usage: satelle queue status [OPTIONS] <QUEUE_REQUEST_ID>
+
+Arguments:
+  <QUEUE_REQUEST_ID>
+
+Options:
+      --host <HOST>
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --json                   Alias for --format json
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle queue cancel`
+
+```text
+Cancel one queued Turn before admission
+
+Usage: satelle queue cancel [OPTIONS] <QUEUE_REQUEST_ID>
+
+Arguments:
+  <QUEUE_REQUEST_ID>
+
+Options:
+      --host <HOST>
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --json                   Alias for --format json
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
 ```
 
 ## `satelle session export`
