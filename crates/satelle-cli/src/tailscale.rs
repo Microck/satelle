@@ -819,6 +819,7 @@ mod tests {
             platform_log_sink: false,
             telemetry: None,
             recording: None,
+            queue: satelle_core::queue::QueueConfig::default(),
             desktop_user: None,
             desktop_session_preference: None,
             desktop_session_native_selector: None,

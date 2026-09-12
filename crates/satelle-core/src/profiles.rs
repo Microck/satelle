@@ -30,6 +30,7 @@ const PROFILE_KEYS: &[&str] = &[
     "sqlite_log_retention",
     "operator_log_retained_files",
     "recording",
+    "queue",
 ];
 const TIMEOUT_KEYS: &[&str] = &["native_readiness", "provider_smoke_test", "turn_execution"];
 
@@ -94,6 +95,7 @@ pub(super) struct ProfileConfig {
     sqlite_log_retention: Option<RetentionDuration>,
     operator_log_retained_files: Option<usize>,
     recording: Option<crate::recording::RecordingPolicy>,
+    queue: Option<crate::queue::QueueConfig>,
 }
 
 impl ProfileConfig {
@@ -195,6 +197,9 @@ impl ProfileConfig {
             }
             if let (Some(base), Some(profile)) = (&mut host.recording, &self.recording) {
                 base.narrow(profile);
+            }
+            if let Some(queue) = &self.queue {
+                host.queue.apply_overlay(queue);
             }
         }
         if source.allows_user_policy()
@@ -363,6 +368,14 @@ fn validate_profile(path: &Path, name: &str, value: &toml::Value) -> Result<(), 
             &mut unknown_keys,
         );
     }
+    if let Some(queue) = table.get("queue").and_then(toml::Value::as_table) {
+        collect_unknown_keys_for_table(
+            &format!("{profile_path}.queue"),
+            queue,
+            &["enabled", "max_depth", "ttl"],
+            &mut unknown_keys,
+        );
+    }
 
     if !unknown_keys.is_empty() {
         return Err(SatelleError::unknown_config_keys(path, unknown_keys));
@@ -424,6 +437,29 @@ fn validate_profile(path: &Path, name: &str, value: &toml::Value) -> Result<(), 
             SatelleError::config_error(
                 format!(
                     "config file {} has invalid {profile_path}.recording: {message}",
+                    path.display()
+                ),
+                None,
+            )
+        })?;
+    }
+    if let Some(queue) = table.get("queue") {
+        let policy = queue
+            .clone()
+            .try_into::<crate::queue::QueueConfig>()
+            .map_err(|_| {
+                SatelleError::config_error(
+                    format!(
+                        "config file {} has invalid {profile_path}.queue",
+                        path.display()
+                    ),
+                    None,
+                )
+            })?;
+        policy.validate().map_err(|message| {
+            SatelleError::config_error(
+                format!(
+                    "config file {} has invalid {profile_path}.queue: {message}",
                     path.display()
                 ),
                 None,
@@ -862,6 +898,35 @@ mod timeout_profile_tests {
             assert!(host.session_metadata_retention.is_none());
             assert!(host.sqlite_log_retention.is_none());
             assert!(host.operator_log_retained_files.is_none());
+        }
+    }
+
+    #[test]
+    fn only_user_selected_profiles_enable_turn_queueing() {
+        let profile: ProfileConfig =
+            toml::from_str("[queue]\nenabled = true\nmax_depth = 32\nttl = \"120m\"\n")
+                .expect("parse profile queue policy");
+
+        for source in [
+            ProfileSelectionSource::UserConfig,
+            ProfileSelectionSource::CliFlag,
+        ] {
+            let mut host = base_host();
+            profile.apply_to_host(super::super::LOCAL_DEMO_HOST, &mut host, source);
+            assert!(host.queue.enabled());
+            assert_eq!(host.queue.max_depth(), 32);
+            assert_eq!(host.queue.ttl_ms(), 2 * 60 * 60 * 1_000);
+        }
+
+        for source in [
+            ProfileSelectionSource::ProjectConfig,
+            ProfileSelectionSource::Environment,
+        ] {
+            let mut host = base_host();
+            profile.apply_to_host(super::super::LOCAL_DEMO_HOST, &mut host, source);
+            assert!(!host.queue.enabled());
+            assert_eq!(host.queue.max_depth(), 16);
+            assert_eq!(host.queue.ttl_ms(), 60 * 60 * 1_000);
         }
     }
 }

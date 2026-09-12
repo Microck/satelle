@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v7";
+pub const WINDOWS_SERVICE_CONFIG_SCHEMA: &str = "satelle.host-service.v8";
 pub const DEFAULT_SETUP_LEDGER_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -444,7 +444,15 @@ pub fn render_launchd_user_plist(
     overrides: &DaemonPathOverrides,
     storage_policy: PersistentHostStoragePolicy,
 ) -> Result<String, WindowsServiceDefinitionError> {
-    render_launchd_user_plist_with_policies(binary, bind, overrides, storage_policy, None, None)
+    render_launchd_user_plist_with_policies(
+        binary,
+        bind,
+        overrides,
+        storage_policy,
+        None,
+        None,
+        &crate::queue::QueueConfig::default(),
+    )
 }
 
 pub fn render_launchd_user_plist_with_policies(
@@ -454,6 +462,7 @@ pub fn render_launchd_user_plist_with_policies(
     storage_policy: PersistentHostStoragePolicy,
     telemetry: Option<&TelemetryConfig>,
     recording: Option<&crate::recording::RecordingPolicy>,
+    queue: &crate::queue::QueueConfig,
 ) -> Result<String, WindowsServiceDefinitionError> {
     let binary = binary
         .to_str()
@@ -499,6 +508,16 @@ pub fn render_launchd_user_plist_with_policies(
     } else {
         String::new()
     };
+    queue
+        .validate()
+        .map_err(|_| WindowsServiceDefinitionError::InvalidServiceConfig)?;
+    let queue_argument = format!(
+        "<string>--queue-config-json</string><string>{}</string>",
+        xml_escape(
+            &serde_json::to_string(queue)
+                .map_err(|_| WindowsServiceDefinitionError::InvalidServiceConfig)?
+        )
+    );
     let mut environment = String::new();
     for entry in overrides.entries() {
         if !is_absolute_posix_path(&entry.value) {
@@ -530,6 +549,7 @@ pub fn render_launchd_user_plist_with_policies(
             "{}",
             "{}",
             "{}",
+            "{}",
             "</array><key>EnvironmentVariables</key><dict>{}</dict>",
             "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
             "</dict></plist>"
@@ -543,6 +563,7 @@ pub fn render_launchd_user_plist_with_policies(
         platform_log_argument,
         telemetry_argument,
         recording_argument,
+        queue_argument,
         environment
     ))
 }
@@ -679,7 +700,7 @@ impl PersistentHostStoragePolicy {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct WindowsServiceConfigV7 {
+pub struct WindowsServiceConfigV8 {
     schema: String,
     daemon_arguments: Vec<String>,
     environment: BTreeMap<String, String>,
@@ -687,9 +708,10 @@ pub struct WindowsServiceConfigV7 {
     #[serde(skip_serializing_if = "Option::is_none")]
     telemetry: Option<TelemetryConfig>,
     recording: Option<crate::recording::RecordingPolicy>,
+    queue: crate::queue::QueueConfig,
 }
 
-impl WindowsServiceConfigV7 {
+impl WindowsServiceConfigV8 {
     pub fn new(
         bind: &str,
         overrides: &DaemonPathOverrides,
@@ -731,6 +753,7 @@ impl WindowsServiceConfigV7 {
             storage_policy,
             telemetry: None,
             recording: None,
+            queue: crate::queue::QueueConfig::default(),
         };
         config
             .validate()
@@ -744,10 +767,12 @@ impl WindowsServiceConfigV7 {
         storage_policy: PersistentHostStoragePolicy,
         telemetry: Option<TelemetryConfig>,
         recording: Option<crate::recording::RecordingPolicy>,
+        queue: crate::queue::QueueConfig,
     ) -> Result<Self, WindowsServiceDefinitionError> {
         let mut config = Self::new(bind, overrides, storage_policy)?;
         config.telemetry = telemetry;
         config.recording = recording;
+        config.queue = queue;
         config
             .validate()
             .map_err(|_| WindowsServiceDefinitionError::InvalidServiceConfig)?;
@@ -782,6 +807,10 @@ impl WindowsServiceConfigV7 {
 
     pub fn recording(&self) -> Option<&crate::recording::RecordingPolicy> {
         self.recording.as_ref()
+    }
+
+    pub const fn queue(&self) -> &crate::queue::QueueConfig {
+        &self.queue
     }
 
     pub fn path_overrides(&self) -> DaemonPathOverrides {
@@ -841,11 +870,12 @@ impl WindowsServiceConfigV7 {
         {
             return Err("invalid recording policy");
         }
+        self.queue.validate()?;
         Ok(())
     }
 }
 
-impl<'de> Deserialize<'de> for WindowsServiceConfigV7 {
+impl<'de> Deserialize<'de> for WindowsServiceConfigV8 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -859,6 +889,7 @@ impl<'de> Deserialize<'de> for WindowsServiceConfigV7 {
             storage_policy: PersistentHostStoragePolicy,
             telemetry: Option<TelemetryConfig>,
             recording: Option<crate::recording::RecordingPolicy>,
+            queue: crate::queue::QueueConfig,
         }
 
         let wire = WireConfig::deserialize(deserializer)?;
@@ -869,6 +900,7 @@ impl<'de> Deserialize<'de> for WindowsServiceConfigV7 {
             storage_policy: wire.storage_policy,
             telemetry: wire.telemetry,
             recording: wire.recording,
+            queue: wire.queue,
         };
         config.validate().map_err(D::Error::custom)?;
         Ok(config)
@@ -1166,7 +1198,7 @@ mod tests {
             ..DaemonPathOverrides::default()
         };
         let enabled_policy = storage_policy().with_platform_log_sink(true);
-        let config = WindowsServiceConfigV7::new("127.0.0.1:3001", &overrides, enabled_policy)
+        let config = WindowsServiceConfigV8::new("127.0.0.1:3001", &overrides, enabled_policy)
             .expect("valid service config");
         assert_eq!(config.schema(), WINDOWS_SERVICE_CONFIG_SCHEMA);
         assert_eq!(
@@ -1198,6 +1230,7 @@ mod tests {
             [
                 "daemon_arguments",
                 "environment",
+                "queue",
                 "recording",
                 "schema",
                 "storage_policy",
@@ -1213,25 +1246,26 @@ mod tests {
             authorization: None,
             deployment_label: Some("windows-host".to_string()),
         };
-        let config = WindowsServiceConfigV7::new_with_policies(
+        let config = WindowsServiceConfigV8::new_with_policies(
             "127.0.0.1:3001",
             &DaemonPathOverrides::default(),
             storage_policy(),
             Some(telemetry.clone()),
             None,
+            crate::queue::QueueConfig::default(),
         )
         .expect("build service config with telemetry");
         let encoded = serde_json::to_value(&config).expect("serialize service config");
         assert_eq!(config.telemetry(), Some(&telemetry));
         assert_eq!(
-            serde_json::from_value::<WindowsServiceConfigV7>(encoded.clone())
+            serde_json::from_value::<WindowsServiceConfigV8>(encoded.clone())
                 .expect("decode current service config"),
             config
         );
 
         let mut legacy = encoded;
         legacy["schema"] = serde_json::json!("satelle.host-service.v5");
-        assert!(serde_json::from_value::<WindowsServiceConfigV7>(legacy).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV8>(legacy).is_err());
     }
 
     #[test]
@@ -1242,7 +1276,7 @@ mod tests {
             "environment": {},
             "storage_policy": storage_policy()
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV7>(invalid_arguments).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV8>(invalid_arguments).is_err());
 
         let invalid_environment = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1250,7 +1284,7 @@ mod tests {
             "environment": {"PATH": "C:\\attacker"},
             "storage_policy": storage_policy()
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV7>(invalid_environment).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV8>(invalid_environment).is_err());
 
         let invalid_retention = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1263,7 +1297,7 @@ mod tests {
                 "operator_log_retained_files": 12
             }
         });
-        assert!(serde_json::from_value::<WindowsServiceConfigV7>(invalid_retention).is_err());
+        assert!(serde_json::from_value::<WindowsServiceConfigV8>(invalid_retention).is_err());
 
         let missing_platform_log_policy = serde_json::json!({
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
@@ -1277,7 +1311,7 @@ mod tests {
             }
         });
         assert!(
-            serde_json::from_value::<WindowsServiceConfigV7>(missing_platform_log_policy).is_err(),
+            serde_json::from_value::<WindowsServiceConfigV8>(missing_platform_log_policy).is_err(),
             "persistent service policy must use the current complete schema"
         );
     }
@@ -1552,6 +1586,7 @@ mod tests {
             storage_policy(),
             Some(&telemetry),
             None,
+            &crate::queue::QueueConfig::default(),
         )
         .expect("valid launchd definition with telemetry");
         assert!(telemetry_plist.contains("<string>--telemetry-config-json</string>"));
@@ -1566,7 +1601,7 @@ mod tests {
             state_dir: Some(PathBuf::from(r"C:\Users\operator\Satelle\state")),
             ..DaemonPathOverrides::default()
         };
-        let config = WindowsServiceConfigV7::new("127.0.0.1:3001", &overrides, storage_policy())
+        let config = WindowsServiceConfigV8::new("127.0.0.1:3001", &overrides, storage_policy())
             .expect("valid Windows service config");
 
         assert_eq!(config.path_overrides(), overrides);

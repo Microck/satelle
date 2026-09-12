@@ -7,18 +7,18 @@ use super::{
 use crate::contract::{
     AdmissionCancellationResponse, ApiErrorCategory, ApiErrorCode,
     DesktopSnapshotAcknowledgeRequest, DesktopSnapshotAcknowledgeResponse,
-    DesktopSnapshotCaptureRequest, DesktopSnapshotCaptureResponse, RawProtocolAcknowledgeRequest,
-    RawProtocolAcknowledgeResponse, RawProtocolDownloadResponse, RawSubprocessBeginRequest,
-    RawSubprocessBeginResponse, RawSubprocessPrepareRequest, RawSubprocessPrepareResponse,
-    RecordingManifestResponse, RecordingPreflightRequest, RecordingPreflightResponse, RequestId,
-    SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
-    TurnRequestParts,
+    DesktopSnapshotCaptureRequest, DesktopSnapshotCaptureResponse, QueueCancelResponse,
+    QueueStatusResponse, RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse,
+    RawProtocolDownloadResponse, RawSubprocessBeginRequest, RawSubprocessBeginResponse,
+    RawSubprocessPrepareRequest, RawSubprocessPrepareResponse, RecordingManifestResponse,
+    RecordingPreflightRequest, RecordingPreflightResponse, RequestId, SessionResponse, StopRequest,
+    StopResponse, TaskArtifactsResponse, TurnRequest, TurnRequestParts,
 };
 use axum::extract::{Extension, FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use satelle_core::{SatelleError, SessionId, TurnId};
+use satelle_core::{QueueRequestId, SatelleError, SessionId, TurnId};
 use satelle_host::{
     AdmissionCancellationResult, ApiScopes, MutationAuthority, TurnIntent, TurnIntentError,
 };
@@ -31,6 +31,7 @@ pub(super) async fn create_session(
     headers: HeaderMap,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
+    let queue = request.queue();
     if let Some(response) = sensitive_diagnostics_scope_failure(&state, &authorized, &request) {
         return response;
     }
@@ -44,6 +45,13 @@ pub(super) async fn create_session(
     };
     let service = Arc::clone(&state.service);
     if action == AdmissionAction::Cancel {
+        if queue {
+            return request_error(
+                &state,
+                &authorized,
+                "queued admission cannot use the admission cancellation header",
+            );
+        }
         let cancellation = match host_call(&state, &authorized, move || {
             service.cancel_run_admission(&intent, &authority)
         })
@@ -53,6 +61,26 @@ pub(super) async fn create_session(
             Err(response) => return response,
         };
         return cancellation_response(&state, &authorized, cancellation);
+    }
+    if queue {
+        let status = match host_call(&state, &authorized, move || {
+            service.enqueue_run(&intent, &authority, true)
+        })
+        .await
+        {
+            Ok(status) => status,
+            Err(response) => return response,
+        };
+        return authenticated_json_response(
+            StatusCode::ACCEPTED,
+            &QueueStatusResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                status,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        );
     }
     let session = match host_call(&state, &authorized, move || {
         service
@@ -146,6 +174,7 @@ pub(super) async fn create_turn(
     SessionPath(session_id): SessionPath,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
+    let queue = request.queue();
     if let Some(response) = sensitive_diagnostics_scope_failure(&state, &authorized, &request) {
         return response;
     }
@@ -159,6 +188,13 @@ pub(super) async fn create_turn(
     };
     let service = Arc::clone(&state.service);
     if action == AdmissionAction::Cancel {
+        if queue {
+            return request_error(
+                &state,
+                &authorized,
+                "queued admission cannot use the admission cancellation header",
+            );
+        }
         let cancellation = match host_call(&state, &authorized, move || {
             service.cancel_steer_admission(&session_id, &intent, &authority)
         })
@@ -168,6 +204,26 @@ pub(super) async fn create_turn(
             Err(response) => return response,
         };
         return cancellation_response(&state, &authorized, cancellation);
+    }
+    if queue {
+        let status = match host_call(&state, &authorized, move || {
+            service.enqueue_steer(&session_id, &intent, &authority, true)
+        })
+        .await
+        {
+            Ok(status) => status,
+            Err(response) => return response,
+        };
+        return authenticated_json_response(
+            StatusCode::ACCEPTED,
+            &QueueStatusResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                status,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        );
     }
     let session = match host_call(&state, &authorized, move || {
         service
@@ -629,6 +685,7 @@ fn expected_turn_id(headers: &HeaderMap) -> Result<Option<TurnId>, ()> {
 
 pub(super) struct SessionPath(SessionId);
 pub(super) struct TurnPath(TurnId);
+pub(super) struct QueuePath(QueueRequestId);
 
 impl FromRequestParts<Arc<DaemonState>> for SessionPath {
     type Rejection = Response;
@@ -670,6 +727,81 @@ impl FromRequestParts<Arc<DaemonState>> for TurnPath {
             .map(Self)
             .map_err(|_| invalid_turn_id(state, &authorized))
     }
+}
+
+impl FromRequestParts<Arc<DaemonState>> for QueuePath {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<DaemonState>,
+    ) -> Result<Self, Self::Rejection> {
+        let authorized = parts
+            .extensions
+            .get::<AuthorizedRequest>()
+            .cloned()
+            .ok_or_else(missing_authorization_context)?;
+        let Path(raw_queue_request_id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| invalid_queue_request_id(state, &authorized))?;
+        QueueRequestId::parse(&raw_queue_request_id)
+            .map(Self)
+            .map_err(|_| invalid_queue_request_id(state, &authorized))
+    }
+}
+
+pub(super) async fn get_queue_request(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    QueuePath(queue_request_id): QueuePath,
+) -> Response {
+    let principal_ref = authorized.principal().principal_ref().to_string();
+    let service = Arc::clone(&state.service);
+    let status = match host_call(&state, &authorized, move || {
+        service.queued_turn_status(&principal_ref, &queue_request_id)
+    })
+    .await
+    {
+        Ok(status) => status,
+        Err(response) => return response,
+    };
+    authenticated_json_response(
+        StatusCode::OK,
+        &QueueStatusResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            status,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn cancel_queue_request(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    QueuePath(queue_request_id): QueuePath,
+) -> Response {
+    let principal_ref = authorized.principal().principal_ref().to_string();
+    let service = Arc::clone(&state.service);
+    let result = match host_call(&state, &authorized, move || {
+        service.cancel_queued_turn(&principal_ref, &queue_request_id)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    authenticated_json_response(
+        StatusCode::OK,
+        &QueueCancelResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            result,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
 }
 
 async fn host_call<T, F>(
@@ -784,6 +916,14 @@ fn invalid_turn_id(state: &DaemonState, authorized: &AuthorizedRequest) -> Respo
         state,
         authorized,
         "the path must contain one canonical Satelle Turn ID",
+    )
+}
+
+fn invalid_queue_request_id(state: &DaemonState, authorized: &AuthorizedRequest) -> Response {
+    request_error(
+        state,
+        authorized,
+        "the path must contain one canonical Satelle queue request ID",
     )
 }
 

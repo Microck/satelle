@@ -405,7 +405,8 @@ impl RemoteMigration {
                     resolved_persistent_storage_policy(&host.config),
                     host.config.telemetry.as_ref(),
                     None,
-                ),
+                )
+                .with_queue(&host.config.queue),
             )
             .map_err(|error| map_ssh_daemon_bootstrap_error(&host.alias, error))?
             .ok_or_else(SatelleError::state_conflict)?;

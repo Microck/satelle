@@ -3,7 +3,7 @@ use super::transport::{TransportClient, transport_for};
 use super::{CliFailure, ConfigContext, failure, parse_duration_ms, shell_argument};
 use clap::Args;
 use satelle_core::{ErrorCode, SatelleError, SessionId};
-use satelle_host::{DaemonLogEntry, LogCursor, LogPageQuery, LogSeverity, LogSource};
+use satelle_host::{DaemonLogEntry, LogCursor, LogPageQuery, LogSeverity, LogSource, LogSubject};
 use std::io::{self, Write};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -1076,9 +1076,26 @@ fn write_entries_to(
                 .map_err(|error| SatelleError::invalid_usage(error.to_string()))?;
             writeln!(stdout).map_err(log_output_error)?;
         } else {
+            let queue_details = match entry.subject() {
+                LogSubject::Queue { queue_status } => format!(
+                    " request={} status={} position={} enqueued_at={} expires_at={} failure={}",
+                    queue_status.queue_request_id,
+                    queue_status.status.as_str(),
+                    queue_status
+                        .position
+                        .map_or_else(|| "none".to_string(), |position| position.to_string()),
+                    queue_status.enqueued_at,
+                    queue_status.expires_at,
+                    queue_status
+                        .failure
+                        .as_ref()
+                        .map_or("none", |failure| failure.code.as_str()),
+                ),
+                LogSubject::Host | LogSubject::Turn { .. } => String::new(),
+            };
             writeln!(
                 stdout,
-                "{} [{}] source={} event={} cursor={} {}",
+                "{} [{}] source={} event={} cursor={} {}{}",
                 entry
                     .timestamp()
                     .format(&Rfc3339)
@@ -1088,6 +1105,7 @@ fn write_entries_to(
                 entry.event().as_str(),
                 entry.cursor(),
                 entry.event().message(),
+                queue_details,
             )
             .map_err(log_output_error)?;
         }

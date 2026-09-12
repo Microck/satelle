@@ -332,6 +332,12 @@ impl TurnIntent {
         &self.attachments
     }
 
+    pub(crate) const fn turn_execution_timeout(
+        &self,
+    ) -> Option<satelle_core::session::TimeoutPolicy> {
+        self.turn_execution_timeout
+    }
+
     pub(crate) fn raw_protocol_source_host(&self) -> Option<&str> {
         self.raw_protocol_source_host.as_deref()
     }

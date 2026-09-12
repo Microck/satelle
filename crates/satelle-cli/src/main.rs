@@ -44,7 +44,7 @@ use logs::{LogsCommand, show_logs};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use output::{EventOutput, OutputArgs, OutputFormat, SessionResultSchemaVersion, StatusReport};
 #[cfg(any(windows, test))]
-use satelle_core::daemon_service::WindowsServiceConfigV7;
+use satelle_core::daemon_service::WindowsServiceConfigV8;
 use satelle_core::daemon_service::{
     DaemonServicePlatform, PersistentHostStoragePolicy, PersistentServiceDecision,
     SetupModeSelection, SetupModeSource,
@@ -65,9 +65,9 @@ use satelle_core::{
     DoctorFixRequest, DoctorFixability, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode,
     EventSource, EventType, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, LogVerbosity,
     MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField, ProviderSecretSource,
-    RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
-    SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
-    SetupSchemaVersion, SetupVerification, TransportKind, TurnId, load_config,
+    QueueRequestId, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent,
+    SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport,
+    SetupRequiredInput, SetupSchemaVersion, SetupVerification, TransportKind, TurnId, load_config,
     load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
     open_new_owner_only_file, open_or_create_owner_only_directory, open_or_create_owner_only_file,
     open_owner_only_directory, persist_new_owner_only_diagnostic_file,
@@ -378,6 +378,10 @@ enum Command {
     },
     Run(RunCommand),
     Steer(SteerCommand),
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
     Status(StatusCommand),
     Stop(StopCommand),
     Session {
@@ -845,6 +849,9 @@ struct HostStartCommand {
     /// Internal Host recording policy serialized into a managed Host launch.
     #[arg(long, hide = true, value_name = "JSON")]
     recording_config_json: Option<String>,
+    /// Internal Host queue policy serialized into a managed Host launch.
+    #[arg(long, hide = true, value_name = "JSON")]
+    queue_config_json: Option<String>,
     /// Internal owner-only configuration used by the per-user Windows task.
     #[arg(
         long,
@@ -1237,6 +1244,9 @@ struct RunCommand {
     provider: Option<String>,
     #[arg(long)]
     detach: bool,
+    /// Persist this Turn until the Host can admit it
+    #[arg(long, conflicts_with_all = ["detach", "detach_on_interrupt"])]
+    queue: bool,
     /// Leave an admitted Turn running when the attached command is interrupted
     #[arg(long)]
     detach_on_interrupt: bool,
@@ -1319,6 +1329,9 @@ struct SteerCommand {
     provider: Option<String>,
     #[arg(long)]
     detach: bool,
+    /// Persist this Turn until the Host can admit it
+    #[arg(long, conflicts_with_all = ["detach", "detach_on_interrupt"])]
+    queue: bool,
     /// Leave an admitted Turn running when the attached command is interrupted
     #[arg(long)]
     detach_on_interrupt: bool,
@@ -1457,6 +1470,94 @@ struct StopCommand {
     host: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum QueueCommand {
+    /// Read the durable state of one queued Turn
+    Status(QueueStatusCommand),
+    /// Cancel one queued Turn before admission
+    Cancel(QueueCancelCommand),
+}
+
+#[derive(Args, Debug)]
+struct QueueStatusCommand {
+    queue_request_id: String,
+    #[arg(long)]
+    host: Option<String>,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[derive(Args, Debug)]
+struct QueueCancelCommand {
+    queue_request_id: String,
+    #[arg(long)]
+    host: Option<String>,
+    #[command(flatten)]
+    output_args: OutputArgs,
+}
+
+#[cfg(test)]
+mod queue_cli_tests {
+    use super::*;
+
+    const QUEUE_REQUEST_ID: &str = "rq_01890a5d-ac96-7b7c-8f89-37c3d0a66f10";
+
+    #[test]
+    fn run_and_steer_parse_explicit_queue_opt_in() {
+        let run = Cli::try_parse_from(["satelle", "run", "--queue", "queued work"])
+            .expect("parse queued run");
+        let Command::Run(run) = run.command else {
+            panic!("expected run command");
+        };
+        assert!(run.queue);
+
+        let steer = Cli::try_parse_from([
+            "satelle",
+            "steer",
+            "s_01890a5d-ac96-7b7c-8f89-37c3d0a66f11",
+            "--queue",
+            "queued follow-up",
+        ])
+        .expect("parse queued steer");
+        let Command::Steer(steer) = steer.command else {
+            panic!("expected steer command");
+        };
+        assert!(steer.queue);
+    }
+
+    #[test]
+    fn queue_commands_parse_the_request_identity_and_reject_detach() {
+        for action in ["status", "cancel"] {
+            let cli = Cli::try_parse_from(["satelle", "queue", action, QUEUE_REQUEST_ID])
+                .expect("parse queue command");
+            match cli.command {
+                Command::Queue {
+                    command: QueueCommand::Status(command),
+                } => assert_eq!(command.queue_request_id, QUEUE_REQUEST_ID),
+                Command::Queue {
+                    command: QueueCommand::Cancel(command),
+                } => assert_eq!(command.queue_request_id, QUEUE_REQUEST_ID),
+                _ => panic!("expected queue command"),
+            }
+        }
+
+        assert!(
+            Cli::try_parse_from(["satelle", "run", "--queue", "--detach", "queued work"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "satelle",
+                "steer",
+                "s_01890a5d-ac96-7b7c-8f89-37c3d0a66f11",
+                "--queue",
+                "--detach",
+                "queued follow-up",
+            ])
+            .is_err()
+        );
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -2321,6 +2422,7 @@ fn execute_command(
         Command::Config { .. }
             | Command::Paths(_)
             | Command::Status(_)
+            | Command::Queue { .. }
             | Command::Telemetry {
                 command: TelemetryCommand::Status(_),
             }
@@ -2397,8 +2499,14 @@ fn execute_command(
         Command::SelfCtl { command } => {
             run_self(command, config, output, no_color, *error_format).map(|_| None)
         }
-        Command::Run(command) => run_prompt(command, config, output).map(Some),
-        Command::Steer(command) => steer_prompt(command, config, output).map(Some),
+        Command::Run(command) => run_prompt(command, config, output),
+        Command::Steer(command) => steer_prompt(command, config, output),
+        Command::Queue {
+            command: QueueCommand::Status(command),
+        } => show_queue_status(command, config, output).map(|_| None),
+        Command::Queue {
+            command: QueueCommand::Cancel(command),
+        } => cancel_queue_request(command, config, output).map(|_| None),
         Command::Status(command) => show_status(command, config, output).map(|_| None),
         Command::Stop(command) => stop_session(command, config, output).map(|_| None),
         Command::Session {
@@ -3044,6 +3152,18 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             explicit_host: command.host.as_deref(),
             session_id: canonical_history_session_id(&command.session_id),
         },
+        Command::Queue { command } => HistoryTarget {
+            family: match command {
+                QueueCommand::Status(_) => "queue-status",
+                QueueCommand::Cancel(_) => "queue-cancel",
+            },
+            selects_host: true,
+            explicit_host: match command {
+                QueueCommand::Status(command) => command.host.as_deref(),
+                QueueCommand::Cancel(command) => command.host.as_deref(),
+            },
+            session_id: None,
+        },
         Command::Status(command) => HistoryTarget {
             family: "status",
             selects_host: true,
@@ -3454,6 +3574,7 @@ mod history_target_tests {
                 platform_log_sink: false,
                 telemetry_config_json: None,
                 recording_config_json: None,
+                queue_config_json: None,
                 service_config: None,
                 output_args: OutputArgs::default(),
             })),
@@ -3605,6 +3726,8 @@ mod history_target_tests {
             "1080",
             "--operator-log-retained-files",
             "12",
+            "--queue-config-json",
+            "{}",
         ])
         .expect("parse internal launchd service start command");
         assert!(
@@ -3623,6 +3746,7 @@ mod history_target_tests {
         assert_eq!(command.session_metadata_retention_hours, Some(720));
         assert_eq!(command.sqlite_log_retention_hours, Some(1080));
         assert_eq!(command.operator_log_retained_files, Some(12));
+        assert_eq!(command.queue_config_json.as_deref(), Some("{}"));
         validate_host_start_mode(&command).expect("launchd service is a valid closed start mode");
     }
 
@@ -9761,7 +9885,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.setup_ledger_retention_ms.is_none()
             || command.session_metadata_retention_hours.is_none()
             || command.sqlite_log_retention_hours.is_none()
-            || command.operator_log_retained_files.is_none())
+            || command.operator_log_retained_files.is_none()
+            || command.queue_config_json.is_none())
     {
         return Err(SatelleError::invalid_usage(
             "--launchd-service is an internal launchd input and cannot be combined with other internal or TLS Host start options",
@@ -9784,7 +9909,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.operator_log_retained_files.is_some()
             || command.platform_log_sink
             || command.telemetry_config_json.is_some()
-            || command.recording_config_json.is_some())
+            || command.recording_config_json.is_some()
+            || command.queue_config_json.is_some())
     {
         return Err(SatelleError::invalid_usage(
             "--service-config is an internal Windows service input and cannot be combined with ordinary Host start options",
@@ -9806,7 +9932,8 @@ fn validate_host_start_mode(command: &HostStartCommand) -> Result<(), SatelleErr
             || command.tls_key.is_some()
             || command.platform_log_sink
             || command.telemetry_config_json.is_some()
-            || command.recording_config_json.is_some())
+            || command.recording_config_json.is_some()
+            || command.queue_config_json.is_some())
     {
         return Err(SatelleError::invalid_usage(
             "the managed local daemon launch descriptor cannot be combined with foreground, SSH bootstrap, identity bootstrap, or TLS inputs",
@@ -10004,54 +10131,76 @@ fn start_host_daemon_with(
             .validate()
             .map_err(|error| failure(SatelleError::invalid_usage(error)))?;
     }
-    let (service_path_overrides, service_storage_policy, service_telemetry, service_recording) =
-        if let Some(_service_config_path) = command.service_config.as_deref() {
-            #[cfg(not(windows))]
-            return Err(failure(SatelleError::invalid_usage(
-                "--service-config is supported only for the per-user Windows Host service",
-            )));
+    let forwarded_queue = command
+        .queue_config_json
+        .as_deref()
+        .map(serde_json::from_str::<satelle_core::queue::QueueConfig>)
+        .transpose()
+        .map_err(|_| {
+            failure(SatelleError::invalid_usage(
+                "the managed Host queue policy is invalid",
+            ))
+        })?;
+    if let Some(policy) = forwarded_queue.as_ref() {
+        policy
+            .validate()
+            .map_err(|error| failure(SatelleError::invalid_usage(error)))?;
+    }
+    let (
+        service_path_overrides,
+        service_storage_policy,
+        service_telemetry,
+        service_recording,
+        service_queue,
+    ) = if let Some(_service_config_path) = command.service_config.as_deref() {
+        #[cfg(not(windows))]
+        return Err(failure(SatelleError::invalid_usage(
+            "--service-config is supported only for the per-user Windows Host service",
+        )));
 
-            #[cfg(windows)]
-            {
-                let service_config = read_windows_service_config(_service_config_path)?;
-                let path_overrides = service_config.path_overrides();
-                apply_windows_service_environment(&service_config);
-                command.bind = service_config.bind().to_string();
-                command.foreground = true;
-                (
-                    Some(path_overrides),
-                    Some(service_config.storage_policy()),
-                    service_config.telemetry().cloned(),
-                    service_config.recording().cloned(),
-                )
-            }
-        } else if command.launchd_service {
+        #[cfg(windows)]
+        {
+            let service_config = read_windows_service_config(_service_config_path)?;
+            let path_overrides = service_config.path_overrides();
+            apply_windows_service_environment(&service_config);
+            command.bind = service_config.bind().to_string();
+            command.foreground = true;
             (
-                Some(daemon_path_overrides_from_process_environment()),
-                Some(
-                    PersistentHostStoragePolicy::new(
-                        command
-                            .setup_ledger_retention_ms
-                            .expect("launchd setup-ledger retention was validated"),
-                        command
-                            .session_metadata_retention_hours
-                            .expect("launchd Session retention was validated"),
-                        command
-                            .sqlite_log_retention_hours
-                            .expect("launchd SQLite Log retention was validated"),
-                        command
-                            .operator_log_retained_files
-                            .expect("launchd Operator Log retention was validated"),
-                    )
-                    .map(|policy| policy.with_platform_log_sink(command.platform_log_sink))
-                    .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?,
-                ),
-                forwarded_telemetry.clone(),
-                forwarded_recording.clone(),
+                Some(path_overrides),
+                Some(service_config.storage_policy()),
+                service_config.telemetry().cloned(),
+                service_config.recording().cloned(),
+                Some(service_config.queue().clone()),
             )
-        } else {
-            (None, None, None, None)
-        };
+        }
+    } else if command.launchd_service {
+        (
+            Some(daemon_path_overrides_from_process_environment()),
+            Some(
+                PersistentHostStoragePolicy::new(
+                    command
+                        .setup_ledger_retention_ms
+                        .expect("launchd setup-ledger retention was validated"),
+                    command
+                        .session_metadata_retention_hours
+                        .expect("launchd Session retention was validated"),
+                    command
+                        .sqlite_log_retention_hours
+                        .expect("launchd SQLite Log retention was validated"),
+                    command
+                        .operator_log_retained_files
+                        .expect("launchd Operator Log retention was validated"),
+                )
+                .map(|policy| policy.with_platform_log_sink(command.platform_log_sink))
+                .map_err(|error| failure(SatelleError::invalid_usage(error.to_string())))?,
+            ),
+            forwarded_telemetry.clone(),
+            forwarded_recording.clone(),
+            forwarded_queue.clone(),
+        )
+    } else {
+        (None, None, None, None, None)
+    };
     let bootstrap_scopes = match (command.bootstrap_token_stdin, command.bootstrap_scope) {
         (true, Some(scope)) => Some(scope.api_scopes()),
         (true, None) => {
@@ -10190,6 +10339,7 @@ fn start_host_daemon_with(
             service_storage_policy.expect("persistent service storage policy was checked"),
             service_telemetry,
             service_recording,
+            service_queue.unwrap_or_default(),
         )
         .map_err(failure)?,
         (None, _, Some(token)) => {
@@ -10201,6 +10351,7 @@ fn start_host_daemon_with(
             host_config.platform_log_sink = command.platform_log_sink;
             host_config.telemetry = forwarded_telemetry.clone();
             host_config.recording = forwarded_recording.clone();
+            host_config.queue = forwarded_queue.clone().unwrap_or_default();
             if let Some(record) = initial_identity.as_ref() {
                 let committed =
                     HostService::commit_fresh_ssh_host_identity(&state_release_root, record)
@@ -10221,7 +10372,8 @@ fn start_host_daemon_with(
             if forwarded_readiness_timeouts.is_some()
                 || command.platform_log_sink
                 || forwarded_telemetry.is_some()
-                || forwarded_recording.is_some() =>
+                || forwarded_recording.is_some()
+                || forwarded_queue.is_some() =>
         {
             let mut host_config = satelle_core::SatelleConfig::defaults()
                 .hosts
@@ -10231,6 +10383,7 @@ fn start_host_daemon_with(
             host_config.platform_log_sink = command.platform_log_sink;
             host_config.telemetry = forwarded_telemetry;
             host_config.recording = forwarded_recording;
+            host_config.queue = forwarded_queue.unwrap_or_default();
             HostService::production_for_host(&host_config)
         }
         (None, None, None) => HostService::production(),
@@ -10359,7 +10512,7 @@ mod daemon_process_notice_tests {
 }
 
 #[cfg(any(windows, test))]
-fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV7, CliFailure> {
+fn read_windows_service_config(path: &Path) -> Result<WindowsServiceConfigV8, CliFailure> {
     if !path.is_absolute() {
         return Err(failure(SatelleError::invalid_usage(
             "Windows Host service config path must be absolute",
@@ -10413,7 +10566,7 @@ mod windows_service_config_tests {
         };
         let storage_policy = PersistentHostStoragePolicy::new(3_600_000, 30 * 24, 45 * 24, 12)
             .expect("build storage policy");
-        let expected = WindowsServiceConfigV7::new("127.0.0.1:3001", &overrides, storage_policy)
+        let expected = WindowsServiceConfigV8::new("127.0.0.1:3001", &overrides, storage_policy)
             .expect("build service config");
         write_owner_only_config(
             &path,
@@ -10465,7 +10618,7 @@ mod windows_service_config_tests {
 }
 
 #[cfg(windows)]
-fn apply_windows_service_environment(config: &WindowsServiceConfigV7) {
+fn apply_windows_service_environment(config: &WindowsServiceConfigV8) {
     const PATH_OVERRIDES: [&str; 5] = [
         "SATELLE_HOME",
         "SATELLE_CONFIG_FILE",
@@ -11070,6 +11223,7 @@ mod daemon_tls_watcher_tests {
             platform_log_sink: false,
             telemetry_config_json: None,
             recording_config_json: None,
+            queue_config_json: None,
             service_config: None,
             output_args: OutputArgs::default(),
         }
@@ -11655,6 +11809,7 @@ mod bootstrap_startup_tests {
             platform_log_sink: false,
             telemetry_config_json: None,
             recording_config_json: None,
+            queue_config_json: None,
             service_config: None,
             output_args: OutputArgs::default(),
         };
@@ -14798,7 +14953,7 @@ fn turn_request_construction_carries_provider_aliases_refresh_and_one_shot_opt_i
     assert_eq!(
         serde_json::to_value(request).expect("TurnRequest should serialize"),
         json!({
-            "schema_version": "satelle.api.v10",
+            "schema_version": "satelle.api.v11",
             "prompt": "inspect the desktop",
             "execution_mode": "standard",
             "model": "vision",
@@ -15293,7 +15448,7 @@ fn run_prompt(
     command: RunCommand,
     config_context: ConfigContext<'_>,
     format: OutputFormat,
-) -> Result<SessionId, CliFailure> {
+) -> Result<Option<SessionId>, CliFailure> {
     let machine_output = format.is_structured();
     validate_interrupt_mode(command.detach, command.detach_on_interrupt)?;
     validate_event_mode(command.detach, command.events)?;
@@ -15323,6 +15478,14 @@ fn run_prompt(
             .resolve_host_with_project_source(explicit_host_alias)
             .map(SelectedHost::from)
             .map_err(failure),
+    )?;
+    let queue = command.queue || host.config.queue.enabled();
+    validate_queue_mode(
+        queue,
+        command.detach,
+        command.detach_on_interrupt,
+        command.events,
+        raw_output.is_some(),
     )?;
     report_not_admitted(
         &mut event_output,
@@ -15484,6 +15647,14 @@ fn run_prompt(
     if let Some(recording) = recording {
         request = request.with_recording(recording);
     }
+    if queue {
+        warn_queue_retention(command.quiet, machine_output);
+        let status = transport
+            .enqueue_run(&request.with_queue(true))
+            .map_err(failure)?;
+        print_queue_status(&status, &host.alias, format)?;
+        return Ok(None);
+    }
     if command.detach {
         let session = transport.run_detached(&request).map_err(failure)?;
         return print_detached_session(
@@ -15497,7 +15668,8 @@ fn run_prompt(
                 schema_version: SessionResultSchemaVersion::RunV2,
                 format,
             },
-        );
+        )
+        .map(Some);
     }
 
     event_output
@@ -15576,13 +15748,14 @@ fn run_prompt(
             format,
         },
     )
+    .map(Some)
 }
 
 fn steer_prompt(
     command: SteerCommand,
     config_context: ConfigContext<'_>,
     format: OutputFormat,
-) -> Result<SessionId, CliFailure> {
+) -> Result<Option<SessionId>, CliFailure> {
     let machine_output = format.is_structured();
     validate_interrupt_mode(command.detach, command.detach_on_interrupt)?;
     validate_event_mode(command.detach, command.events)?;
@@ -15609,6 +15782,14 @@ fn steer_prompt(
         &mut event_output,
         explicit_host_alias,
         config_context.resolve_session_host(explicit_host_alias, &session_id),
+    )?;
+    let queue = command.queue || host.config.queue.enabled();
+    validate_queue_mode(
+        queue,
+        command.detach,
+        command.detach_on_interrupt,
+        command.events,
+        raw_output.is_some(),
     )?;
     let config = report_not_admitted(&mut event_output, Some(&host.alias), config_context.load())?;
     report_not_admitted(
@@ -15771,6 +15952,14 @@ fn steer_prompt(
     if let Some(recording) = recording {
         request = request.with_recording(recording);
     }
+    if queue {
+        warn_queue_retention(command.quiet, machine_output);
+        let status = transport
+            .enqueue_steer(&session_id, &request.with_queue(true))
+            .map_err(failure)?;
+        print_queue_status(&status, &host.alias, format)?;
+        return Ok(None);
+    }
     if command.detach {
         let session = transport
             .steer_detached(&session_id, &request)
@@ -15786,7 +15975,8 @@ fn steer_prompt(
                 schema_version: SessionResultSchemaVersion::SteerV2,
                 format,
             },
-        );
+        )
+        .map(Some);
     }
 
     event_output
@@ -15868,6 +16058,7 @@ fn steer_prompt(
             format,
         },
     )
+    .map(Some)
 }
 
 fn build_turn_request(
@@ -15895,6 +16086,109 @@ fn build_turn_request(
         Some(source_host) => request.with_raw_protocol_capture(source_host),
         None => request,
     }
+}
+
+fn validate_queue_mode(
+    queue: bool,
+    detach: bool,
+    detach_on_interrupt: bool,
+    events: EventMode,
+    raw_protocol_export: bool,
+) -> Result<(), CliFailure> {
+    if !queue {
+        return Ok(());
+    }
+    if detach || detach_on_interrupt {
+        return Err(failure(SatelleError::invalid_usage(
+            "queued Turns cannot use --detach or --detach-on-interrupt",
+        )));
+    }
+    if events != EventMode::Auto {
+        return Err(failure(SatelleError::invalid_usage(
+            "queued Turns do not stream lifecycle events; omit --events",
+        )));
+    }
+    if raw_protocol_export {
+        return Err(failure(SatelleError::invalid_usage(
+            "queued Turns cannot export a raw protocol artifact from the enqueue command",
+        )));
+    }
+    Ok(())
+}
+
+fn warn_queue_retention(quiet: bool, machine_output: bool) {
+    if !quiet && !machine_output {
+        eprintln!(
+            "Queued prompts and staged attachments remain in the Host's private state until admission, cancellation, or expiry."
+        );
+    }
+}
+
+fn show_queue_status(
+    command: QueueStatusCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    let queue_request_id =
+        QueueRequestId::parse(&command.queue_request_id).map_err(|error| failure(error.into()))?;
+    let host = config.resolve_host(command.host.as_deref())?;
+    let status = transport_for(&host)?
+        .queue_status(&queue_request_id)
+        .map_err(failure)?;
+    print_queue_status(&status, &host.alias, format)
+}
+
+fn cancel_queue_request(
+    command: QueueCancelCommand,
+    config: ConfigContext<'_>,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    let queue_request_id =
+        QueueRequestId::parse(&command.queue_request_id).map_err(|error| failure(error.into()))?;
+    let host = config.resolve_host(command.host.as_deref())?;
+    let result = transport_for(&host)?
+        .cancel_queue_request(&queue_request_id)
+        .map_err(failure)?;
+    if format.is_structured() {
+        return format.print(&result).map_err(failure);
+    }
+    println!("Queue request: {}", result.queue_request_id);
+    println!("Outcome: {}", result.outcome.as_str());
+    println!("Changed: {}", result.changed);
+    if let Some(session_id) = result.session_id.as_ref() {
+        println!("Session: {session_id}");
+    }
+    if let Some(turn_id) = result.turn_id.as_ref() {
+        println!("Turn: {turn_id}");
+    }
+    Ok(())
+}
+
+fn print_queue_status(
+    status: &satelle_core::queue::QueueStatus,
+    host_alias: &str,
+    format: OutputFormat,
+) -> Result<(), CliFailure> {
+    if format.is_structured() {
+        return format.print(status).map_err(failure);
+    }
+    println!("Host: {host_alias}");
+    println!("Queue request: {}", status.queue_request_id);
+    println!("Status: {}", status.status.as_str());
+    if let Some(position) = status.position {
+        println!("Position: {position}");
+    }
+    println!("Expires at: {}", status.expires_at);
+    if let Some(session_id) = status.session_id.as_ref() {
+        println!("Session: {session_id}");
+    }
+    if let Some(turn_id) = status.turn_id.as_ref() {
+        println!("Turn: {turn_id}");
+    }
+    if let Some(queue_failure) = status.failure.as_ref() {
+        println!("Failure: {}: {}", queue_failure.code, queue_failure.message);
+    }
+    Ok(())
 }
 
 fn show_status(

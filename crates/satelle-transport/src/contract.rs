@@ -36,11 +36,12 @@ pub use session::{
     DesktopSnapshotAcknowledgeResponse, DesktopSnapshotCaptureRequest,
     DesktopSnapshotCaptureResponse, DesktopSnapshotContractError, ImageAttachment,
     MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL, MAX_IMAGE_ATTACHMENT_COUNT,
-    RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse, RawProtocolCaptureRequest,
-    RawProtocolDownloadResponse, RawSubprocessBeginRequest, RawSubprocessBeginResponse,
-    RawSubprocessPrepareRequest, RawSubprocessPrepareResponse, RecordingManifestResponse,
-    RecordingPreflightRequest, RecordingPreflightResponse, SUPPORTED_IMAGE_MEDIA_TYPES,
-    SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
+    QueueCancelResponse, QueueStatusResponse, RawProtocolAcknowledgeRequest,
+    RawProtocolAcknowledgeResponse, RawProtocolCaptureRequest, RawProtocolDownloadResponse,
+    RawSubprocessBeginRequest, RawSubprocessBeginResponse, RawSubprocessPrepareRequest,
+    RawSubprocessPrepareResponse, RecordingManifestResponse, RecordingPreflightRequest,
+    RecordingPreflightResponse, SUPPORTED_IMAGE_MEDIA_TYPES, SessionResponse, StopRequest,
+    StopResponse, TaskArtifactsResponse, TurnRequest,
 };
 pub use setup::{
     BootstrapMaintenanceResponse, DURABLE_SETUP_PENDING_TTL, DurableTokenActivationResponse,
@@ -62,8 +63,8 @@ pub(crate) use setup::{
 };
 
 pub(crate) const PROTOCOL_VERSION_HEADER: &str = "satelle-protocol-version";
-// Protocol v20 adds consented Turn recording preflight and manifest retrieval.
-// Older peers cannot interpret recording-bearing Turn requests, so every
+// Protocol v21 adds durable queued Turn admission and owner-scoped queue control.
+// Older peers cannot interpret queue-bearing Turn requests, so every
 // protected operation requires the current protocol before decoding its payload.
 pub(crate) const PROTOCOL_VERSION: &str = satelle_core::host_update::HOST_PROTOCOL_VERSION;
 
@@ -566,7 +567,7 @@ mod tests {
 
     #[test]
     fn protocol_version_is_the_v20_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "20");
+        assert_eq!(PROTOCOL_VERSION, "21");
     }
 
     #[test]

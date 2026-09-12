@@ -1,10 +1,53 @@
 use super::{AdapterReadiness, RuntimeEngine};
+use satelle_core::queue::QueueStatus;
 use satelle_core::session::{Session, TurnState};
 use satelle_core::{EventSource, EventSubject, EventType, SatelleEventBody, TurnId};
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 
 impl RuntimeEngine {
+    pub(super) fn publish_queue_event(
+        &self,
+        event_type: EventType,
+        status: &QueueStatus,
+        message: &'static str,
+    ) -> Result<(), satelle_core::SatelleError> {
+        let host_identity = self.host_identity()?;
+        let subject = match (&status.session_id, &status.turn_id) {
+            (Some(session_id), Some(turn_id)) => Some(EventSubject::TurnIdentity {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+            }),
+            (Some(session_id), None) => Some(EventSubject::SessionIdentity {
+                session_id: session_id.clone(),
+            }),
+            (None, Some(_)) => unreachable!("a queue Turn cannot exist without its Session"),
+            (None, None) => None,
+        };
+        let event = SatelleEventBody::new(
+            event_type,
+            EventSource::HostDaemon,
+            time::OffsetDateTime::now_utc(),
+            host_identity.as_str(),
+            subject,
+            message,
+            json!({
+                "queue_request_id": status.queue_request_id,
+                "status": status.status,
+                "position": status.position,
+                "enqueued_at": status.enqueued_at,
+                "expires_at": status.expires_at,
+                "session_id": status.session_id,
+                "turn_id": status.turn_id,
+                "failure": status.failure,
+                "state_revision": status.state_revision,
+            }),
+        )
+        .expect("a typed queue status produces a valid safe lifecycle event");
+        self.live_events.publish(event);
+        Ok(())
+    }
+
     /// Publishes the successful native preflight before the admitted Turn so
     /// attached clients can distinguish native readiness from provider
     /// readiness without inferring either result from later execution events.

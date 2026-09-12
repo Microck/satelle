@@ -376,6 +376,20 @@ fn format_entry(entry: &DaemonLogEntry) -> Result<String, OperatorLogFailureKind
             session_state_revision,
             turn_state_revision,
         ),
+        LogSubject::Queue { queue_status } => format!(
+            "subject=queue request={} status={} position={} enqueued_at={} expires_at={} failure={}",
+            queue_status.queue_request_id.as_str(),
+            queue_status.status.as_str(),
+            queue_status
+                .position
+                .map_or_else(|| "none".to_string(), |position| position.to_string()),
+            queue_status.enqueued_at,
+            queue_status.expires_at,
+            queue_status
+                .failure
+                .as_ref()
+                .map_or("none", |failure| failure.code.as_str()),
+        ),
     };
     Ok(format!(
         "{timestamp} level={} host={} source={} event={} {subject} cursor={} redacted=true message=\"{}\"\n",

@@ -259,6 +259,48 @@ fn failure(error: &SatelleError) -> ApiFailure {
                 }),
             }),
         },
+        ErrorCode::QueueDisabled => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::QueueDisabled,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the durable Turn queue is not enabled for this request",
+            details: None,
+        },
+        ErrorCode::QueueFull => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::QueueFull,
+            category: ApiErrorCategory::Conflict,
+            retryable: true,
+            message: "the durable Turn queue is full",
+            details: None,
+        },
+        ErrorCode::QueueRequestNotFound => ApiFailure {
+            status: StatusCode::NOT_FOUND,
+            code: ApiErrorCode::QueueRequestNotFound,
+            category: ApiErrorCategory::NotFound,
+            retryable: false,
+            message: "the queue request does not exist for this API Principal",
+            details: None,
+        },
+        ErrorCode::QueueAlreadyAdmitted => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::QueueAlreadyAdmitted,
+            category: ApiErrorCategory::Conflict,
+            retryable: false,
+            message: "the queued Turn has already been admitted",
+            details: error.recovery_command.as_ref().map(|command| {
+                serde_json::json!({"stop_command": command})
+            }),
+        },
+        ErrorCode::QueuedPrincipalNoLongerAuthorized => ApiFailure {
+            status: StatusCode::FORBIDDEN,
+            code: ApiErrorCode::QueuedPrincipalNoLongerAuthorized,
+            category: ApiErrorCategory::Authentication,
+            retryable: false,
+            message: "the queued API Principal is no longer authorized",
+            details: None,
+        },
         ErrorCode::StoreInUse => ApiFailure {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: ApiErrorCode::StoreInUse,

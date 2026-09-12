@@ -95,6 +95,7 @@ fn production_service_reports_the_frozen_service_config_path_set() {
         .expect("valid persistent storage policy"),
         None,
         None,
+        satelle_core::queue::QueueConfig::default(),
     )
     .expect("valid persistent service configuration");
     let paths = service

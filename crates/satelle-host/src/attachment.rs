@@ -1,4 +1,5 @@
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fmt;
 use std::fs;
@@ -12,7 +13,8 @@ const MAX_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const MAX_STALE_FILES_PER_START: usize = 1024;
 const FILE_PREFIX: &str = "satelle-image-";
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AttachmentInput {
     Upload {
         media_type: String,
@@ -70,6 +72,20 @@ impl fmt::Debug for AttachmentInput {
 pub(crate) enum AcceptedImageAttachment {
     Upload(VerifiedImageAttachment),
     HostFile(String),
+}
+
+impl AcceptedImageAttachment {
+    pub(crate) fn durable_input(&self) -> AttachmentInput {
+        match self {
+            Self::Upload(image) => AttachmentInput::upload(
+                image.media_type(),
+                u64::try_from(image.bytes.len()).expect("bounded attachment size fits u64"),
+                image.sha256_hex(),
+                base64::engine::general_purpose::STANDARD.encode(&image.bytes),
+            ),
+            Self::HostFile(path) => AttachmentInput::host_file(path.clone()),
+        }
+    }
 }
 
 #[derive(Clone)]

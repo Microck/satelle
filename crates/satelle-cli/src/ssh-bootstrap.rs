@@ -375,6 +375,7 @@ struct DaemonLaunchPolicy<'a> {
     platform_log_sink: bool,
     telemetry: Option<&'a satelle_core::telemetry::TelemetryConfig>,
     recording: Option<&'a satelle_core::recording::RecordingPolicy>,
+    queue: Option<&'a satelle_core::queue::QueueConfig>,
 }
 
 impl<'a> From<&'a HostConfig> for DaemonLaunchPolicy<'a> {
@@ -383,6 +384,7 @@ impl<'a> From<&'a HostConfig> for DaemonLaunchPolicy<'a> {
             platform_log_sink: host.platform_log_sink,
             telemetry: host.telemetry.as_ref(),
             recording: host.recording.as_ref(),
+            queue: Some(&host.queue),
         }
     }
 }
@@ -455,6 +457,7 @@ struct BootstrapStartContext<'a> {
     platform_log_sink: bool,
     telemetry: Option<&'a satelle_core::telemetry::TelemetryConfig>,
     recording: Option<&'a satelle_core::recording::RecordingPolicy>,
+    queue: Option<&'a satelle_core::queue::QueueConfig>,
     initial_identity: Option<InitialHostIdentityCommit<'a>>,
 }
 
@@ -991,6 +994,7 @@ impl SshBootstrapProcess {
                 platform_log_sink: host_config.platform_log_sink,
                 telemetry: host_config.telemetry.as_ref(),
                 recording: host_config.recording.as_ref(),
+                queue: Some(&host_config.queue),
                 initial_identity: launch_mode.initial_identity(),
             },
         );
@@ -2731,6 +2735,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
                 platform_log_sink: false,
                 telemetry: None,
                 recording: None,
+                queue: None,
                 initial_identity: None,
             },
         )
@@ -2749,6 +2754,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             platform_log_sink,
             telemetry,
             recording,
+            queue,
             initial_identity,
         } = context;
         let timeout_args = format!(
@@ -2782,6 +2788,12 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         let posix_recording_argument = recording_json.as_ref().map_or_else(String::new, |policy| {
             format!(" --recording-config-json {}", posix_quote(policy))
         });
+        let queue_json = queue.map(|policy| {
+            serde_json::to_string(policy).expect("validated queue policy serializes")
+        });
+        let posix_queue_argument = queue_json.as_ref().map_or_else(String::new, |policy| {
+            format!(" --queue-config-json {}", posix_quote(policy))
+        });
         if self.is_windows() {
             let mut arguments = vec![
                 "host".to_string(),
@@ -2805,6 +2817,9 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             }
             if let Some(policy) = recording_json.as_ref() {
                 arguments.extend(["--recording-config-json".to_string(), policy.clone()]);
+            }
+            if let Some(policy) = queue_json.as_ref() {
+                arguments.extend(["--queue-config-json".to_string(), policy.clone()]);
             }
             if let Some(initial) = initial_identity {
                 arguments.extend([
@@ -2873,13 +2888,13 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             // outer login shell cannot reinterpret either identity value.
             let script = format!("{}exec \"$@\"", posix_environment(environment));
             let arguments = format!(
-                "{} host start --bootstrap-token-stdin {timeout_args}{platform_log_argument}{posix_telemetry_argument}{posix_recording_argument}{posix_identity_args} --json",
+                "{} host start --bootstrap-token-stdin {timeout_args}{platform_log_argument}{posix_telemetry_argument}{posix_recording_argument}{posix_queue_argument}{posix_identity_args} --json",
                 posix_quote(remote_binary),
             );
             format!("sh -c {} sh {arguments}", posix_quote(&script))
         } else {
             let script = format!(
-                "{}exec {remote_binary} host start --bootstrap-token-stdin {timeout_args}{platform_log_argument}{posix_telemetry_argument}{posix_recording_argument} --json",
+                "{}exec {remote_binary} host start --bootstrap-token-stdin {timeout_args}{platform_log_argument}{posix_telemetry_argument}{posix_recording_argument}{posix_queue_argument} --json",
                 posix_environment(environment),
             );
             format!("sh -c {}", posix_quote(&script))
@@ -2973,6 +2988,7 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             platform_log_sink,
             telemetry,
             recording,
+            queue,
         } = policy;
         let mut timeout_args = format!(
             "--bootstrap-token-stdin --bootstrap-scope {} --on-demand-idle-timeout-ms {} --bootstrap-native-readiness-timeout-ms {} --bootstrap-provider-smoke-timeout-ms {}",
@@ -3003,6 +3019,16 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
                 timeout_args.push_str(&windows_command_line_argument(&encoded));
             } else {
                 timeout_args.push_str(" --recording-config-json ");
+                timeout_args.push_str(&posix_quote(&encoded));
+            }
+        }
+        if let Some(policy) = queue {
+            let encoded = serde_json::to_string(policy).expect("validated queue policy serializes");
+            if self.is_windows() {
+                timeout_args.push_str(" --queue-config-json ");
+                timeout_args.push_str(&windows_command_line_argument(&encoded));
+            } else {
+                timeout_args.push_str(" --queue-config-json ");
                 timeout_args.push_str(&posix_quote(&encoded));
             }
         }
@@ -3492,7 +3518,7 @@ impl<'a> PersistentServiceRemote<'a> {
     pub(super) fn publish_windows_service_config(
         &mut self,
         task: &satelle_core::daemon_service::WindowsTaskDefinition,
-        config: &satelle_core::daemon_service::WindowsServiceConfigV7,
+        config: &satelle_core::daemon_service::WindowsServiceConfigV8,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Windows)?;
         let contents = serde_json::to_vec_pretty(config)
@@ -3567,6 +3593,7 @@ impl<'a> PersistentServiceRemote<'a> {
         storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
         telemetry: Option<&satelle_core::telemetry::TelemetryConfig>,
         recording: Option<&satelle_core::recording::RecordingPolicy>,
+        queue: &satelle_core::queue::QueueConfig,
     ) -> Result<LaunchdServiceDefinition, SshBootstrapError> {
         self.require_platform(satelle_core::daemon_service::DaemonServicePlatform::Macos)?;
         let binary = self.absolute_artifact_path(artifact);
@@ -3577,6 +3604,7 @@ impl<'a> PersistentServiceRemote<'a> {
             storage_policy,
             telemetry,
             recording,
+            queue,
         )
         .map_err(|_| SshBootstrapError::InvalidPersistentServiceDefinition)?;
         Ok(LaunchdServiceDefinition {
@@ -4909,7 +4937,7 @@ fn parse_service_path_overrides(
     output: &[u8],
 ) -> Result<DaemonPathOverrides, SshBootstrapError> {
     if target.is_windows() {
-        let config: satelle_core::daemon_service::WindowsServiceConfigV7 =
+        let config: satelle_core::daemon_service::WindowsServiceConfigV8 =
             serde_json::from_slice(output)
                 .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
         if config.bind() != "127.0.0.1:3001" {
@@ -4952,6 +4980,7 @@ struct ObservedLaunchdServiceDefinition {
     storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
     telemetry: Option<satelle_core::telemetry::TelemetryConfig>,
     recording: Option<satelle_core::recording::RecordingPolicy>,
+    queue: satelle_core::queue::QueueConfig,
 }
 
 fn parse_launchd_service_definition(
@@ -4980,6 +5009,7 @@ fn parse_launchd_service_definition(
     const PLATFORM_LOG_ARGUMENT: &str = "<string>--platform-log-sink</string>";
     const TELEMETRY_PREFIX: &str = "<string>--telemetry-config-json</string><string>";
     const RECORDING_PREFIX: &str = "<string>--recording-config-json</string><string>";
+    const QUEUE_PREFIX: &str = "<string>--queue-config-json</string><string>";
     const ENVIRONMENT_PREFIX: &str = "</array><key>EnvironmentVariables</key><dict>";
     const SUFFIX: &str = concat!(
         "</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
@@ -5022,20 +5052,6 @@ fn parse_launchd_service_definition(
         Some(body) => (true, body),
         None => (false, body),
     };
-    let (recording, body) = if let Some(encoded) = body.strip_prefix(RECORDING_PREFIX) {
-        let (encoded, body) = encoded
-            .split_once("</string>")
-            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
-        let encoded = decode_plist_text(encoded)?;
-        let recording = serde_json::from_str::<satelle_core::recording::RecordingPolicy>(&encoded)
-            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
-        recording
-            .validate()
-            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
-        (Some(recording), body)
-    } else {
-        (None, body)
-    };
     let (telemetry, body) = if let Some(encoded) = body.strip_prefix(TELEMETRY_PREFIX) {
         let (encoded, body) = encoded
             .split_once("</string>")
@@ -5050,6 +5066,32 @@ fn parse_launchd_service_definition(
     } else {
         (None, body)
     };
+    let (recording, body) = if let Some(encoded) = body.strip_prefix(RECORDING_PREFIX) {
+        let (encoded, body) = encoded
+            .split_once("</string>")
+            .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+        let encoded = decode_plist_text(encoded)?;
+        let recording = serde_json::from_str::<satelle_core::recording::RecordingPolicy>(&encoded)
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+        recording
+            .validate()
+            .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+        (Some(recording), body)
+    } else {
+        (None, body)
+    };
+    let encoded = body
+        .strip_prefix(QUEUE_PREFIX)
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let (encoded, body) = encoded
+        .split_once("</string>")
+        .ok_or(SshBootstrapError::InvalidServiceObservation)?;
+    let encoded = decode_plist_text(encoded)?;
+    let queue = serde_json::from_str::<satelle_core::queue::QueueConfig>(&encoded)
+        .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
+    queue
+        .validate()
+        .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
     let body = body
         .strip_prefix(ENVIRONMENT_PREFIX)
         .ok_or(SshBootstrapError::InvalidServiceObservation)?;
@@ -5097,6 +5139,7 @@ fn parse_launchd_service_definition(
         storage_policy,
         telemetry,
         recording,
+        queue,
         path_overrides: daemon_path_overrides_from_environment(
             RemoteTarget::DarwinArm64,
             &entries,
@@ -5270,6 +5313,7 @@ pub(super) struct ManagedServiceExpectation<'a> {
     storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
     telemetry: Option<&'a satelle_core::telemetry::TelemetryConfig>,
     recording: Option<&'a satelle_core::recording::RecordingPolicy>,
+    queue: Option<&'a satelle_core::queue::QueueConfig>,
 }
 
 impl<'a> ManagedServiceExpectation<'a> {
@@ -5284,7 +5328,13 @@ impl<'a> ManagedServiceExpectation<'a> {
             storage_policy,
             telemetry,
             recording,
+            queue: None,
         }
+    }
+
+    pub(super) const fn with_queue(mut self, queue: &'a satelle_core::queue::QueueConfig) -> Self {
+        self.queue = Some(queue);
+        self
     }
 }
 
@@ -5550,7 +5600,7 @@ impl RemoteUserDirectories {
                     "$config=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json; ",
                     "$task=Get-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name} ",
                     "-ErrorAction SilentlyContinue; ",
-                    "if ($config.schema -cne 'satelle.host-service.v7' -or $null -eq $task) {{ ",
+                    "if ($config.schema -cne 'satelle.host-service.v8' -or $null -eq $task) {{ ",
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "[xml]$xml=Export-ScheduledTask -TaskPath '\\Satelle\\' -TaskName {task_name}; ",
                     "$root=$xml.Task; ",
@@ -5640,16 +5690,17 @@ impl RemoteUserDirectories {
                 .ok_or(SshBootstrapError::InvalidServiceObservation)?;
             let config = config.strip_suffix('\r').unwrap_or(config);
             let Ok(config) = serde_json::from_str::<
-                satelle_core::daemon_service::WindowsServiceConfigV7,
+                satelle_core::daemon_service::WindowsServiceConfigV8,
             >(config) else {
                 return Ok(None);
             };
-            let expected = satelle_core::daemon_service::WindowsServiceConfigV7::new_with_policies(
+            let expected = satelle_core::daemon_service::WindowsServiceConfigV8::new_with_policies(
                 "127.0.0.1:3001",
                 expected.path_overrides,
                 expected.storage_policy,
                 expected.telemetry.cloned(),
                 expected.recording.cloned(),
+                expected.queue.cloned().unwrap_or_default(),
             )
             .map_err(|_| SshBootstrapError::InvalidServiceObservation)?;
             if config != expected {
@@ -5671,6 +5722,7 @@ impl RemoteUserDirectories {
             || definition.storage_policy != expected.storage_policy
             || definition.telemetry.as_ref() != expected.telemetry
             || definition.recording.as_ref() != expected.recording
+            || definition.queue != expected.queue.cloned().unwrap_or_default()
         {
             return Ok(None);
         }
@@ -8061,6 +8113,7 @@ mod tests {
             persistent_storage_policy(),
             Some(&telemetry),
             None,
+            &satelle_core::queue::QueueConfig::default(),
         )
         .expect("render canonical macOS service definition");
         fs::write(
@@ -8208,14 +8261,14 @@ mod tests {
                     "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
                     "printf 'managed\\r\\n",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                    "{{\"schema\":\"satelle.host-service.v7\",",
+                    "{{\"schema\":\"satelle.host-service.v8\",",
                     "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                     "\"127.0.0.1:3001\"],\"environment\":{{}},",
                     "\"storage_policy\":{{\"setup_ledger_retention_ms\":2592000000,",
                     "\"session_metadata_retention_hours\":168,",
                     "\"sqlite_log_retention_hours\":168,",
                     "\"operator_log_retained_files\":5,",
-                    "\"platform_log_sink\":false}}}}\\r\\n",
+                    "\"platform_log_sink\":false}},\"queue\":{{}}}}\\r\\n",
                     "C:\\\\Users\\\\operator\\\\AppData\\\\Local\\\\Satelle\\\\host\\\\v0.1.0\\\\",
                     "win32-x64-msvc\\\\",
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\\satelle.exe'\n"
@@ -8326,7 +8379,7 @@ mod tests {
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                "{\"schema\":\"satelle.host-service.v7\",",
+                "{\"schema\":\"satelle.host-service.v8\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                 "\"127.0.0.1:3002\"],\"environment\":{},",
                 "\"storage_policy\":{\"setup_ledger_retention_ms\":2592000000,",
@@ -8363,7 +8416,7 @@ mod tests {
             concat!(
                 "#!/bin/sh\nprintf 'managed\\r\\n",
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\r\\n",
-                "{\"schema\":\"satelle.host-service.v7\",",
+                "{\"schema\":\"satelle.host-service.v8\",",
                 "\"daemon_arguments\":[\"host\",\"start\",\"--foreground\",\"--bind\",",
                 "\"127.0.0.1:3001\"],",
                 "\"environment\":{\"SATELLE_HOME\":\"C:\\\\\\\\Drifted\"},",
@@ -8859,7 +8912,7 @@ mod tests {
     #[test]
     fn persistent_service_path_override_parsers_are_closed() {
         let windows = br#"{
-          "schema":"satelle.host-service.v7",
+          "schema":"satelle.host-service.v8",
           "daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],
           "environment":{"SATELLE_STATE_DIR":"C:\\Users\\operator\\AppData\\Local\\Satelle\\state"},
           "storage_policy":{
@@ -8868,7 +8921,8 @@ mod tests {
             "sqlite_log_retention_hours":168,
             "operator_log_retained_files":5,
             "platform_log_sink":true
-          }
+          },
+          "queue":{}
         }"#;
         let parsed = parse_service_path_overrides(RemoteTarget::WindowsX64Msvc, windows)
             .expect("valid Windows service config");
@@ -8879,7 +8933,7 @@ mod tests {
         assert!(
             parse_service_path_overrides(
                 RemoteTarget::WindowsX64Msvc,
-                br#"{"schema":"satelle.host-service.v7","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"},"storage_policy":{"setup_ledger_retention_ms":3600000,"session_metadata_retention_hours":168,"sqlite_log_retention_hours":168,"operator_log_retained_files":5,"platform_log_sink":false}}"#,
+                br#"{"schema":"satelle.host-service.v8","daemon_arguments":["host","start","--foreground","--bind","127.0.0.1:3001"],"environment":{"OTHER":"C:\\safe"},"storage_policy":{"setup_ledger_retention_ms":3600000,"session_metadata_retention_hours":168,"sqlite_log_retention_hours":168,"operator_log_retained_files":5,"platform_log_sink":false}}"#,
             )
             .is_err()
         );
@@ -10024,6 +10078,7 @@ mod tests {
                 platform_log_sink: false,
                 telemetry: None,
                 recording: None,
+                queue: None,
                 initial_identity: Some(initial),
             },
         );
@@ -10047,6 +10102,7 @@ mod tests {
                 platform_log_sink: false,
                 telemetry: None,
                 recording: None,
+                queue: None,
                 initial_identity: Some(initial),
             },
         );
@@ -10089,6 +10145,7 @@ mod tests {
                     platform_log_sink: false,
                     telemetry: Some(&telemetry),
                     recording: None,
+                    queue: None,
                     initial_identity: None,
                 },
             );
@@ -10372,6 +10429,7 @@ mod tests {
             platform_log_sink: false,
             telemetry: None,
             recording: None,
+            queue: satelle_core::queue::QueueConfig::default(),
             daemon_idle_timeout: None,
             desktop_user: None,
             desktop_session_preference: None,
@@ -10408,6 +10466,7 @@ mod tests {
                 platform_log_sink: false,
                 telemetry: None,
                 recording: None,
+                queue: None,
                 initial_identity: None,
             },
         );
@@ -10432,6 +10491,7 @@ mod tests {
                 platform_log_sink: host.platform_log_sink,
                 telemetry: None,
                 recording: None,
+                queue: None,
                 initial_identity: None,
             },
         );
@@ -10461,6 +10521,7 @@ mod tests {
                 platform_log_sink: false,
                 telemetry: None,
                 recording: None,
+                queue: None,
                 initial_identity: None,
             },
         );
@@ -10493,6 +10554,7 @@ mod tests {
                 platform_log_sink: false,
                 telemetry: None,
                 recording: None,
+                queue: None,
                 initial_identity: None,
             },
         );
@@ -10512,6 +10574,7 @@ mod tests {
                 platform_log_sink: false,
                 telemetry: None,
                 recording: None,
+                queue: None,
                 initial_identity: None,
             },
         );
@@ -10536,6 +10599,7 @@ mod tests {
                 platform_log_sink: false,
                 telemetry: None,
                 recording: None,
+                queue: None,
                 initial_identity: None,
             },
         );
@@ -10557,6 +10621,7 @@ mod tests {
                 platform_log_sink: false,
                 telemetry: None,
                 recording: None,
+                queue: None,
                 initial_identity: None,
             },
         );

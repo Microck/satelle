@@ -600,6 +600,7 @@ impl DaemonServer {
             shutdown: shutdown.clone(),
             local_relaunch: config.local_relaunch,
         });
+        state.service.start_queue_worker();
         let router = router(Arc::clone(&state));
         let (listener, tls_reloader) = match tls {
             Some(tls) => {
@@ -997,6 +998,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         .route("/v1/host/desktop-sessions", get(host_desktop_sessions))
         .route("/v1/sessions/{session_id}", get(sessions::get_session))
         .route(
+            "/v1/queue/{queue_request_id}",
+            get(sessions::get_queue_request),
+        )
+        .route(
             "/v1/sessions/{session_id}/task-artifacts",
             get(sessions::get_task_artifacts),
         )
@@ -1214,6 +1219,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         .route(
             "/v1/sessions/{session_id}/stop",
             post(sessions::stop_session),
+        )
+        .route(
+            "/v1/queue/{queue_request_id}",
+            axum::routing::delete(sessions::cancel_queue_request),
         )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),

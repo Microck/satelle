@@ -14,13 +14,13 @@ use crate::contract::{
     ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
     ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
     ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse,
-    RawProtocolDownloadResponse, RawSubprocessBeginRequest, RawSubprocessBeginResponse,
-    RawSubprocessPrepareRequest, RawSubprocessPrepareResponse, RecordingManifestResponse,
-    RecordingPreflightRequest, RecordingPreflightResponse, RequestId, SessionResponse,
-    SetupRepairPlanRequest, SetupRepairPlanResponse, SetupVerificationRequest,
-    SetupVerificationResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
-    provider_secret_upload_aad,
+    ProviderSecretUploadEnvelope, QueueCancelResponse, QueueStatusResponse,
+    RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse, RawProtocolDownloadResponse,
+    RawSubprocessBeginRequest, RawSubprocessBeginResponse, RawSubprocessPrepareRequest,
+    RawSubprocessPrepareResponse, RecordingManifestResponse, RecordingPreflightRequest,
+    RecordingPreflightResponse, RequestId, SessionResponse, SetupRepairPlanRequest,
+    SetupRepairPlanResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
+    StopResponse, TaskArtifactsResponse, TurnRequest, provider_secret_upload_aad,
 };
 use crate::transport_tls::{
     ClientCertificate, ReqwestTrustError, TlsFailureKind, classify_tls_error,
@@ -32,7 +32,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode};
 use satelle_core::session::{EffectiveModelRef, ProviderBindingRef};
-use satelle_core::{DirectHostBinding, SessionId, TurnId};
+use satelle_core::{DirectHostBinding, QueueRequestId, SessionId, TurnId};
 use satelle_host::{ApiBearerToken, LogPageMode, LogPageQuery};
 use serde::de::DeserializeOwned;
 use std::fmt;
@@ -859,6 +859,17 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::ACCEPTED)
     }
 
+    pub fn enqueue_session(
+        &self,
+        request: &TurnRequest,
+        idempotency_key: &str,
+    ) -> Result<QueueStatusResponse, DaemonClientError> {
+        let (request_builder, request_id) =
+            self.mutation_request("/v1/sessions", idempotency_key)?;
+        let request = self.admission_request(request_builder.json(request));
+        self.send_authenticated(request, request_id, StatusCode::ACCEPTED)
+    }
+
     pub fn cancel_session_admission(
         &self,
         request: &TurnRequest,
@@ -892,6 +903,37 @@ impl DaemonClient {
         let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
         let request = self.admission_request(request_builder.json(request));
         self.send_authenticated(request, request_id, StatusCode::ACCEPTED)
+    }
+
+    pub fn enqueue_turn(
+        &self,
+        session_id: &SessionId,
+        request: &TurnRequest,
+        idempotency_key: &str,
+    ) -> Result<QueueStatusResponse, DaemonClientError> {
+        let path = format!("/v1/sessions/{session_id}/turns");
+        let (request_builder, request_id) = self.mutation_request(&path, idempotency_key)?;
+        let request = self.admission_request(request_builder.json(request));
+        self.send_authenticated(request, request_id, StatusCode::ACCEPTED)
+    }
+
+    pub fn queue_status(
+        &self,
+        queue_request_id: &QueueRequestId,
+    ) -> Result<QueueStatusResponse, DaemonClientError> {
+        let path = format!("/v1/queue/{queue_request_id}");
+        let (request, request_id) = self.protected_request(Method::GET, &path)?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn cancel_queue_request(
+        &self,
+        queue_request_id: &QueueRequestId,
+    ) -> Result<QueueCancelResponse, DaemonClientError> {
+        let path = format!("/v1/queue/{queue_request_id}");
+        let (request, request_id) =
+            self.mutation_request_with_method(Method::DELETE, &path, queue_request_id.as_str())?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
     pub fn cancel_turn_admission(

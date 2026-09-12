@@ -31,6 +31,7 @@ pub mod ids;
 mod profiles;
 #[path = "project-config.rs"]
 mod project_config;
+pub mod queue;
 pub mod recording;
 #[path = "secret-file-path.rs"]
 mod secret_file_path;
@@ -69,7 +70,9 @@ pub use events::{
     EVENT_SCHEMA_VERSION, EventSource, EventStateSubject, EventSubject, EventType, SatelleEvent,
     SatelleEventBody, SatelleEventError,
 };
-pub use ids::{IdParseError, SESSION_ID_PATTERN, SessionId, TurnId};
+pub use ids::{
+    IdParseError, QUEUE_REQUEST_ID_PATTERN, QueueRequestId, SESSION_ID_PATTERN, SessionId, TurnId,
+};
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secret_file_path::{
     SecretFilePathError, expand_secret_file_path, resolver_account_home, secret_file_error_details,
@@ -146,6 +149,7 @@ impl SatelleConfig {
                 platform_log_sink: false,
                 telemetry: None,
                 recording: None,
+                queue: queue::QueueConfig::default(),
                 desktop_user: None,
                 desktop_session_preference: None,
                 desktop_session_native_selector: None,
@@ -367,6 +371,10 @@ pub struct HostConfig {
     pub telemetry: Option<telemetry::TelemetryConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording: Option<recording::RecordingPolicy>,
+    /// User-owned durable admission policy. Project configuration and remote
+    /// transport overlays cannot enable this Host-side mutation queue.
+    #[serde(default, skip_serializing_if = "queue::QueueConfig::is_default")]
+    pub queue: queue::QueueConfig,
     pub desktop_user: Option<String>,
     pub desktop_session_preference: Option<DesktopSessionPreference>,
     pub desktop_session_native_selector: Option<DesktopSessionNativeSelector>,
@@ -3449,6 +3457,7 @@ fn parse_user_config_value(
     reject_provider_secret_source_errors(path, &value)?;
     reject_telemetry_config_errors(path, &value)?;
     reject_recording_config_errors(path, &value)?;
+    reject_queue_config_errors(path, &value)?;
     reject_provider_binding_errors(path, &value)?;
     reject_unknown_user_config_keys(path, &value)?;
     reject_trusted_profile_errors(path, &value)?;
@@ -4285,6 +4294,37 @@ fn reject_recording_config_errors(path: &Path, value: &toml::Value) -> Result<()
     Ok(())
 }
 
+fn reject_queue_config_errors(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
+    let validate = |toml_path: &str, value: &toml::Value| {
+        let policy = value
+            .clone()
+            .try_into::<queue::QueueConfig>()
+            .map_err(|_| {
+                SatelleError::config_error(
+                    format!(
+                        "invalid queue configuration at {toml_path} in {}",
+                        path.display()
+                    ),
+                    None,
+                )
+            })?;
+        policy.validate().map_err(|message| {
+            SatelleError::config_error(
+                format!("invalid queue configuration at {toml_path}: {message}"),
+                None,
+            )
+        })
+    };
+    if let Some(hosts) = value.get("hosts").and_then(toml::Value::as_table) {
+        for (alias, host) in hosts {
+            if let Some(policy) = host.get("queue") {
+                validate(&format!("hosts.{alias}.queue"), policy)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reject_provider_binding_errors(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
     let Some(hosts) = value.get("hosts").and_then(toml::Value::as_table) else {
         return Ok(());
@@ -4505,6 +4545,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "platform_log_sink",
                     "telemetry",
                     "recording",
+                    "queue",
                     "desktop_user",
                     "desktop_session_preference",
                     "desktop_session_native_selector",
@@ -4558,6 +4599,14 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     &format!("{host_path}.recording"),
                     recording,
                     &["allowed_modes", "default_retention", "max_retention"],
+                    &mut unknown_keys,
+                );
+            }
+            if let Some(queue) = host_table.get("queue").and_then(toml::Value::as_table) {
+                collect_unknown_keys_for_table(
+                    &format!("{host_path}.queue"),
+                    queue,
+                    &["enabled", "max_depth", "ttl"],
                     &mut unknown_keys,
                 );
             }
@@ -5107,6 +5156,11 @@ pub enum ErrorCode {
     AuthorizationInsufficientScope,
     HostIdentityMismatch,
     HostBusy,
+    QueueDisabled,
+    QueueFull,
+    QueueRequestNotFound,
+    QueueAlreadyAdmitted,
+    QueuedPrincipalNoLongerAuthorized,
     StoreInUse,
     StateConflict,
     StopNotConfirmed,
@@ -5277,6 +5331,11 @@ impl ErrorCode {
             Self::AuthorizationInsufficientScope => "authorization-insufficient-scope",
             Self::HostIdentityMismatch => "host-identity-mismatch",
             Self::HostBusy => "host-busy",
+            Self::QueueDisabled => "queue-disabled",
+            Self::QueueFull => "queue-full",
+            Self::QueueRequestNotFound => "queue-request-not-found",
+            Self::QueueAlreadyAdmitted => "queue-already-admitted",
+            Self::QueuedPrincipalNoLongerAuthorized => "queued-principal-no-longer-authorized",
             Self::StoreInUse => "store-in-use",
             Self::StateConflict => "state-conflict",
             Self::StopNotConfirmed => "stop-not-confirmed",
@@ -5398,6 +5457,7 @@ impl ErrorCode {
             | Self::DesktopSnapshotTargetRequired
             | Self::DesktopSnapshotAmbiguous
             | Self::DesktopSnapshotConsentRequired
+            | Self::QueueDisabled
             | Self::InputRequired
             | Self::DesktopBindingRequired
             | Self::DoctorRefreshScopeRequired
@@ -5444,6 +5504,7 @@ impl ErrorCode {
             | Self::DaemonPathOverrideNotAbsolute
             | Self::ModelProviderBindingMissing
             | Self::HostNotFound
+            | Self::QueueRequestNotFound
             | Self::SessionNotFound
             | Self::LogsCursorExpired
             | Self::SelfUpdateInstallOwnerUnknown
@@ -5489,6 +5550,7 @@ impl ErrorCode {
             | Self::DesktopSnapshotExportFailed
             | Self::CredentialHelperTimeout
             | Self::ProviderSecretResolutionFailed
+            | Self::QueuedPrincipalNoLongerAuthorized
             | Self::SelfUpdateRollbackFailed
             | Self::SelfUpdateVerificationFailed
             | Self::SelfUpdateFailed => 74,
@@ -5498,6 +5560,8 @@ impl ErrorCode {
             Self::BootstrapBusy
             | Self::CapacityExceeded
             | Self::HostBusy
+            | Self::QueueFull
+            | Self::QueueAlreadyAdmitted
             | Self::IncompatibleControlPlane
             | Self::ComputerUseNotReady
             | Self::NativeReadinessTimeout

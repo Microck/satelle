@@ -3,20 +3,20 @@ use crate::{CliFailure, SelectedHost, bootstrap_lock, failure, on_demand_idle_ti
 use satelle_core::AdapterKind;
 use satelle_core::daemon_service::{
     DaemonArtifactPlan, DaemonServicePlan, DaemonServicePlatform, PersistentHostStoragePolicy,
-    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV7, WindowsTaskDefinition,
+    PersistentServiceDecision, SetupModeSelection, WindowsServiceConfigV8, WindowsTaskDefinition,
 };
 use satelle_core::doctor::DoctorScopeSelection;
 use satelle_core::session::{HostIdentityRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ApiRateLimits, ApiTokenSource, DaemonPathOverrides, DirectHostBinding, DoctorOptions,
     DoctorReport, ErrorCode, HostConfig, HostSessionsReport, HostSessionsSchemaVersion,
-    LOCAL_DEMO_HOST, SatelleError, SatelleEvent, SecureFileError, SessionId, SetupReadinessSummary,
-    SetupReport, SetupRequiredInput, SetupSchemaVersion, SshHostBinding, StopResult, TransportKind,
-    TurnId, load_user_api_rate_limits, open_or_create_owner_only_directory,
-    open_or_create_owner_only_file, persist_new_owner_only_config_file,
-    persist_new_owner_only_secret_file, read_owner_controlled_config_file,
-    read_owner_only_secret_config_file, read_owner_only_secret_file, read_trusted_ca_bundle_file,
-    resolve_path_set,
+    LOCAL_DEMO_HOST, QueueRequestId, SatelleError, SatelleEvent, SecureFileError, SessionId,
+    SetupReadinessSummary, SetupReport, SetupRequiredInput, SetupSchemaVersion, SshHostBinding,
+    StopResult, TransportKind, TurnId, load_user_api_rate_limits,
+    open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    persist_new_owner_only_config_file, persist_new_owner_only_secret_file,
+    read_owner_controlled_config_file, read_owner_only_secret_config_file,
+    read_owner_only_secret_file, read_trusted_ca_bundle_file, resolve_path_set,
 };
 use satelle_host::{
     AdmissionCancellation, ApiBearerToken, ApiScopes, ControllerTransportProbe, DaemonLogPage,
@@ -499,6 +499,39 @@ pub(crate) trait TransportClient: Send {
         session_id: &SessionId,
         request: &TurnRequest,
     ) -> Result<PublicSession, SatelleError>;
+    fn enqueue_run(
+        &self,
+        _request: &TurnRequest,
+    ) -> Result<satelle_core::queue::QueueStatus, SatelleError> {
+        Err(SatelleError::not_implemented(
+            "this transport cannot enqueue a Turn",
+        ))
+    }
+    fn enqueue_steer(
+        &self,
+        _session_id: &SessionId,
+        _request: &TurnRequest,
+    ) -> Result<satelle_core::queue::QueueStatus, SatelleError> {
+        Err(SatelleError::not_implemented(
+            "this transport cannot enqueue a Turn",
+        ))
+    }
+    fn queue_status(
+        &self,
+        _queue_request_id: &QueueRequestId,
+    ) -> Result<satelle_core::queue::QueueStatus, SatelleError> {
+        Err(SatelleError::not_implemented(
+            "this transport cannot inspect the Turn queue",
+        ))
+    }
+    fn cancel_queue_request(
+        &self,
+        _queue_request_id: &QueueRequestId,
+    ) -> Result<satelle_core::queue::QueueCancelResult, SatelleError> {
+        Err(SatelleError::not_implemented(
+            "this transport cannot cancel a queued Turn",
+        ))
+    }
     fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError>;
     fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifacts, SatelleError>;
     fn raw_protocol_export(
@@ -1885,7 +1918,7 @@ fn coordinate_setup(
 enum PreparedPersistentService {
     Windows {
         task: Box<WindowsTaskDefinition>,
-        config: Box<WindowsServiceConfigV7>,
+        config: Box<WindowsServiceConfigV8>,
     },
     Launchd(ssh_bootstrap::LaunchdServiceDefinition),
 }
@@ -2875,12 +2908,13 @@ impl SshSetupTransport {
                         artifact,
                     )
                     .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error))?;
-                let config = WindowsServiceConfigV7::new_with_policies(
+                let config = WindowsServiceConfigV8::new_with_policies(
                     "127.0.0.1:3001",
                     daemon_path_overrides,
                     storage_policy,
                     self.host_config.telemetry.clone(),
                     self.host_config.recording.clone(),
+                    self.host_config.queue.clone(),
                 )
                 .map_err(|error| SatelleError::config_error(error.to_string(), None))?;
                 Ok(PreparedPersistentService::Windows {
@@ -2895,6 +2929,7 @@ impl SshSetupTransport {
                     storage_policy,
                     self.host_config.telemetry.as_ref(),
                     self.host_config.recording.as_ref(),
+                    &self.host_config.queue,
                 )
                 .map(PreparedPersistentService::Launchd)
                 .map_err(|error| map_ssh_daemon_bootstrap_error(&self.alias, error)),
@@ -3966,7 +4001,8 @@ pub(crate) fn preview_ssh_storage_restore(
                 resolved_persistent_storage_policy(&host.config),
                 host.config.telemetry.as_ref(),
                 host.config.recording.as_ref(),
-            ),
+            )
+            .with_queue(&host.config.queue),
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
         .ok_or_else(SatelleError::state_conflict)?;
@@ -4030,7 +4066,8 @@ pub(crate) fn plan_ssh_storage_backup_cleanup(
                 resolved_persistent_storage_policy(&host.config),
                 host.config.telemetry.as_ref(),
                 host.config.recording.as_ref(),
-            ),
+            )
+            .with_queue(&host.config.queue),
         )
         .map_err(|error| map_ssh_daemon_bootstrap_error(&transport.alias, error))?
         .ok_or_else(SatelleError::state_conflict)?;
@@ -4670,7 +4707,8 @@ fn inspect_host_maintenance(
                                     resolved_persistent_storage_policy(&host.config),
                                     host.config.telemetry.as_ref(),
                                     host.config.recording.as_ref(),
-                                ),
+                                )
+                                .with_queue(&host.config.queue),
                             )
                             .map_err(|error| {
                                 map_ssh_daemon_bootstrap_error(&transport.alias, error)
@@ -7912,6 +7950,47 @@ impl TransportClient for DirectTransport {
         self.client
             .verify_setup(request, &format!("setup-verification-{}", Uuid::now_v7()))
             .map(|response| response.verification().clone())
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn enqueue_run(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<satelle_core::queue::QueueStatus, SatelleError> {
+        self.client
+            .enqueue_session(request, &Self::idempotency_key())
+            .map(satelle_transport::QueueStatusResponse::into_status)
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn enqueue_steer(
+        &self,
+        session_id: &SessionId,
+        request: &TurnRequest,
+    ) -> Result<satelle_core::queue::QueueStatus, SatelleError> {
+        self.client
+            .enqueue_turn(session_id, request, &Self::idempotency_key())
+            .map(satelle_transport::QueueStatusResponse::into_status)
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn queue_status(
+        &self,
+        queue_request_id: &QueueRequestId,
+    ) -> Result<satelle_core::queue::QueueStatus, SatelleError> {
+        self.client
+            .queue_status(queue_request_id)
+            .map(satelle_transport::QueueStatusResponse::into_status)
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+
+    fn cancel_queue_request(
+        &self,
+        queue_request_id: &QueueRequestId,
+    ) -> Result<satelle_core::queue::QueueCancelResult, SatelleError> {
+        self.client
+            .cancel_queue_request(queue_request_id)
+            .map(satelle_transport::QueueCancelResponse::into_result)
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
 

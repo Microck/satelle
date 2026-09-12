@@ -45,13 +45,15 @@ use crate::process_identity::ProcessIdentity;
 use crate::storage::{
     AdmissionOutcome, ApiTokenRegistration, BeginProviderSecretProvisioning, CommittedLogMirrors,
     IdempotentOperation, LeaseOwner, LogPageStorageError, NativeReadinessInvalidationReplay,
-    NativeReadinessInvalidationTarget, ObservedUpstreamRef, OperatorLogPolicy,
+    NativeReadinessInvalidationTarget, NewQueueRecord, ObservedUpstreamRef, OperatorLogPolicy,
     ProviderBindingAuthorizationReplay, ProviderBindingDeletionReplay,
     ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
-    ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay, ReadinessProbeKind,
-    ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason, SetupRepairPlan,
-    SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage, StorageSnapshot,
+    ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay, QueueEnqueueOutcome,
+    ReadinessProbeKind, ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason,
+    SetupRepairPlan, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage,
+    StorageSnapshot, StoredQueueRecord, TurnQueueOperation,
 };
+use crate::turn_queue::{QueuePayloadStore, QueuedTurnPayload};
 use crate::{
     ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery, LogSubject,
     TaskArtifactSet,
@@ -66,14 +68,15 @@ use satelle_core::sensitive_diagnostics::{
 use satelle_core::session::{DesktopBindingRef, PublicSession, TurnAdmissionFailure};
 use satelle_core::{
     ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, ProviderBindingAuthorization,
-    ProviderBindingSource, PublicResolvedProviderBinding, ResolvedProviderBinding, SatelleError,
-    SatelleEvent, SessionId, TurnId,
+    ProviderBindingSource, PublicResolvedProviderBinding, QueueRequestId, ResolvedProviderBinding,
+    SatelleError, SatelleEvent, SessionId, TurnId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use zeroize::Zeroizing;
 
@@ -695,6 +698,7 @@ pub(crate) struct RuntimeEngine {
     raw_diagnostics: crate::raw_diagnostics::RawDiagnosticExports,
     recording_root: PathBuf,
     recording_policy: satelle_core::recording::RecordingPolicy,
+    queue_payloads: QueuePayloadStore,
     session_metadata_retention: time::Duration,
     setup_ledger_retention: time::Duration,
 }
@@ -707,6 +711,8 @@ pub(crate) struct RuntimeStoragePolicy {
     operator_log_retained_files: usize,
     platform_log_sink: bool,
     recording_policy: satelle_core::recording::RecordingPolicy,
+    queue_config: satelle_core::queue::QueueConfig,
+    queue_desktop_binding: String,
 }
 
 impl RuntimeStoragePolicy {
@@ -733,6 +739,11 @@ impl RuntimeStoragePolicy {
                 .unwrap_or(satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES),
             platform_log_sink: config.platform_log_sink,
             recording_policy: config.recording.clone().unwrap_or_default(),
+            queue_config: config.queue.clone(),
+            queue_desktop_binding: config
+                .desktop_user
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
         }
     }
 }
@@ -746,6 +757,8 @@ impl Default for RuntimeStoragePolicy {
             operator_log_retained_files: satelle_core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
             platform_log_sink: false,
             recording_policy: satelle_core::recording::RecordingPolicy::default(),
+            queue_config: satelle_core::queue::QueueConfig::default(),
+            queue_desktop_binding: "default".to_string(),
         }
     }
 }
@@ -846,6 +859,20 @@ impl RuntimeEngine {
         storage
             .mark_recordings_expired(observed_at)
             .map_err(model::storage_failure)?;
+        let queue_payloads = QueuePayloadStore::open(state_root.join("turn-queue"))?;
+        for (record, _) in storage
+            .expire_queue_requests(observed_at)
+            .map_err(model::storage_failure)?
+        {
+            queue_payloads.delete(&record.payload_file)?;
+        }
+        let retained_queue_payloads = storage
+            .queued_payload_files()
+            .map_err(model::storage_failure)?
+            .into_iter()
+            .map(|(file_name, _)| file_name)
+            .collect();
+        queue_payloads.retain_only(&retained_queue_payloads)?;
         storage.set_log_retention(storage_policy.sqlite_log_retention);
         if let Some(fingerprinter) = provider_smoke_fingerprinter {
             let key = storage
@@ -878,6 +905,7 @@ impl RuntimeEngine {
             raw_diagnostics: crate::raw_diagnostics::RawDiagnosticExports::default(),
             recording_root: state_root.join("recordings"),
             recording_policy: storage_policy.recording_policy.clone(),
+            queue_payloads,
             session_metadata_retention: storage_policy.session_metadata_retention,
             setup_ledger_retention: storage_policy.setup_ledger_retention,
         });
@@ -2623,6 +2651,7 @@ impl RuntimeEngine {
                 let turn_id = match entry.subject() {
                     LogSubject::Turn { turn_id, .. } => turn_id.as_str(),
                     LogSubject::Host => "host",
+                    LogSubject::Queue { queue_status } => queue_status.queue_request_id.as_str(),
                 };
                 writeln!(
                     worklog,
@@ -2841,6 +2870,7 @@ pub(crate) struct RuntimeHandle {
     readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
     activity: Arc<DaemonActivity>,
     lazy: Arc<Mutex<LazyRuntime>>,
+    queue_worker_running: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -2852,6 +2882,30 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    pub(crate) fn queue_config(&self) -> Result<satelle_core::queue::QueueConfig, SatelleError> {
+        self.lazy
+            .lock()
+            .map(|lazy| lazy.storage_policy.queue_config.clone())
+            .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))
+    }
+
+    pub(crate) fn queue_desktop_binding(&self) -> Result<String, SatelleError> {
+        self.lazy
+            .lock()
+            .map(|lazy| lazy.storage_policy.queue_desktop_binding.clone())
+            .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))
+    }
+
+    pub(crate) fn try_start_queue_worker(&self) -> bool {
+        self.queue_worker_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn finish_queue_worker(&self) {
+        self.queue_worker_running.store(false, Ordering::Release);
+    }
+
     pub(crate) fn recording_preflight(
         &self,
         mode: satelle_core::recording::RecordingMode,
@@ -3548,6 +3602,7 @@ impl RuntimeHandle {
                 storage_policy: RuntimeStoragePolicy::default(),
                 provider_smoke_fingerprinter: None,
             })),
+            queue_worker_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3575,6 +3630,7 @@ impl RuntimeHandle {
                     crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
                 ),
             })),
+            queue_worker_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3607,6 +3663,7 @@ impl RuntimeHandle {
                     crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
                 ),
             })),
+            queue_worker_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3633,6 +3690,7 @@ impl RuntimeHandle {
                 storage_policy,
                 provider_smoke_fingerprinter: Some(provider_smoke_fingerprinter),
             })),
+            queue_worker_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -3682,6 +3740,7 @@ impl RuntimeHandle {
                     crate::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
                 ),
             })),
+            queue_worker_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -4381,6 +4440,241 @@ impl RuntimeHandle {
             .map_err(model::storage_failure)
     }
 
+    pub(crate) fn queue_lease_key(&self, desktop_binding: &str) -> Result<String, SatelleError> {
+        let host_identity = self
+            .engine()?
+            .lock_storage()?
+            .host_identity()
+            .map_err(model::storage_failure)?;
+        Ok(format!("{}:{}", host_identity.as_str(), desktop_binding))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_turn_queue(
+        &self,
+        queue_request_id: &QueueRequestId,
+        lease_key: &str,
+        token_id: &str,
+        credential_revision: u64,
+        principal_ref: &str,
+        operation: TurnQueueOperation,
+        idempotency_key: &str,
+        session_id: Option<&SessionId>,
+        payload: &[u8],
+        enqueued_at: time::OffsetDateTime,
+        expires_at: time::OffsetDateTime,
+        max_depth: u16,
+    ) -> Result<Option<StoredQueueRecord>, SatelleError> {
+        let engine = self.engine()?;
+        let (payload_file, payload_sha256) =
+            engine.queue_payloads.write(queue_request_id, payload)?;
+        let record = NewQueueRecord {
+            queue_request_id,
+            lease_key,
+            token_id,
+            credential_revision,
+            principal_ref,
+            operation,
+            idempotency_key,
+            request_digest: &payload_sha256,
+            payload_file: &payload_file,
+            payload_sha256: &payload_sha256,
+            enqueued_at,
+            expires_at,
+            session_id,
+        };
+        let outcome = engine
+            .lock_storage()?
+            .enqueue_queue_request(&record, max_depth)
+            .map_err(model::storage_failure);
+        match outcome {
+            Ok(QueueEnqueueOutcome::Inserted(record)) => {
+                engine.publish_queue_event(
+                    satelle_core::EventType::TurnQueued,
+                    &record.status,
+                    "queued Turn request",
+                )?;
+                Ok(Some(record))
+            }
+            Ok(QueueEnqueueOutcome::Replayed(record)) => {
+                engine.queue_payloads.delete(&payload_file)?;
+                Ok(Some(record))
+            }
+            Ok(QueueEnqueueOutcome::Full) => {
+                engine.queue_payloads.delete(&payload_file)?;
+                Ok(None)
+            }
+            Err(error) => {
+                let _ = engine.queue_payloads.delete(&payload_file);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn expire_turn_queue(
+        &self,
+        observed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        let expired = engine
+            .lock_storage()?
+            .expire_queue_requests(observed_at)
+            .map_err(model::storage_failure)?;
+        let mut changed_positions = BTreeMap::<String, u16>::new();
+        for (record, old_position) in expired {
+            engine.queue_payloads.delete(&record.payload_file)?;
+            engine.publish_queue_event(
+                satelle_core::EventType::TurnQueueExpired,
+                &record.status,
+                "queued Turn request expired",
+            )?;
+            changed_positions
+                .entry(record.lease_key)
+                .and_modify(|position| *position = (*position).min(old_position))
+                .or_insert(old_position);
+        }
+        for (lease_key, first_changed_position) in changed_positions {
+            self.publish_queue_position_changes(&lease_key, first_changed_position)?;
+        }
+        Ok(())
+    }
+
+    fn publish_queue_position_changes(
+        &self,
+        lease_key: &str,
+        first_changed_position: u16,
+    ) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        let records = engine
+            .lock_storage()?
+            .advance_queue_positions(lease_key, first_changed_position)
+            .map_err(model::storage_failure)?;
+        for record in records {
+            engine.publish_queue_event(
+                satelle_core::EventType::QueuePositionChanged,
+                &record.status,
+                "queued Turn position changed",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_queued_turn(
+        &self,
+        lease_key: &str,
+    ) -> Result<Option<StoredQueueRecord>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .first_queued_request(lease_key)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn queued_turn_status(
+        &self,
+        principal_ref: &str,
+        queue_request_id: &QueueRequestId,
+    ) -> Result<Option<StoredQueueRecord>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .queue_status(principal_ref, queue_request_id)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn cancel_queued_turn(
+        &self,
+        principal_ref: &str,
+        queue_request_id: &QueueRequestId,
+    ) -> Result<Option<StoredQueueRecord>, SatelleError> {
+        let engine = self.engine()?;
+        let before = engine
+            .lock_storage()?
+            .queue_status(principal_ref, queue_request_id)
+            .map_err(model::storage_failure)?;
+        let record = engine
+            .lock_storage()?
+            .cancel_queue_request(principal_ref, queue_request_id)
+            .map_err(model::storage_failure)?;
+        if let Some(record) = &record
+            && record.status.status == satelle_core::queue::QueueRequestStatus::Cancelled
+            && before.as_ref().is_some_and(|before| {
+                before.status.status == satelle_core::queue::QueueRequestStatus::Queued
+            })
+        {
+            engine.queue_payloads.delete(&record.payload_file)?;
+            engine.publish_queue_event(
+                satelle_core::EventType::TurnQueueCancelled,
+                &record.status,
+                "cancelled queued Turn request",
+            )?;
+            self.publish_queue_position_changes(
+                &record.lease_key,
+                before
+                    .as_ref()
+                    .and_then(|before| before.status.position)
+                    .unwrap_or(1),
+            )?;
+        }
+        Ok(record)
+    }
+
+    pub(crate) fn read_queued_turn(
+        &self,
+        record: &StoredQueueRecord,
+    ) -> Result<QueuedTurnPayload, SatelleError> {
+        self.engine()?
+            .queue_payloads
+            .read(&record.payload_file, &record.payload_sha256)
+    }
+
+    pub(crate) fn finish_queued_turn_admitted(
+        &self,
+        record: &StoredQueueRecord,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        engine
+            .lock_storage()?
+            .admit_queue_request(&record.status.queue_request_id, session_id, turn_id)
+            .map_err(model::storage_failure)?;
+        engine.queue_payloads.delete(&record.payload_file)?;
+        let admitted = engine
+            .lock_storage()?
+            .queue_status_unowned(&record.status.queue_request_id)
+            .map_err(model::storage_failure)?
+            .ok_or_else(SatelleError::state_conflict)?;
+        engine.publish_queue_event(
+            satelle_core::EventType::TurnDequeued,
+            &admitted.status,
+            "admitted queued Turn request",
+        )?;
+        self.publish_queue_position_changes(&record.lease_key, record.status.position.unwrap_or(1))
+    }
+
+    pub(crate) fn finish_queued_turn_failed(
+        &self,
+        record: &StoredQueueRecord,
+        failure: &satelle_core::queue::QueueFailure,
+    ) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        engine
+            .lock_storage()?
+            .fail_queue_request(&record.status.queue_request_id, failure)
+            .map_err(model::storage_failure)?;
+        engine.queue_payloads.delete(&record.payload_file)?;
+        let failed = engine
+            .lock_storage()?
+            .queue_status_unowned(&record.status.queue_request_id)
+            .map_err(model::storage_failure)?
+            .ok_or_else(SatelleError::state_conflict)?;
+        engine.publish_queue_event(
+            satelle_core::EventType::TurnQueueValidationFailed,
+            &failed.status,
+            "queued Turn failed pre-start validation",
+        )?;
+        self.publish_queue_position_changes(&record.lease_key, record.status.position.unwrap_or(1))
+    }
+
     pub(crate) fn rotate_api_token(
         &self,
         replacement: &ApiBearerToken,
@@ -4435,9 +4729,60 @@ impl RuntimeHandle {
                 bearer_token: None,
             });
         }
-        storage
+        let affected_credential = match mutation {
+            crate::ApiTokenMutation::Rotate {
+                token_id,
+                expected_credential_revision,
+            }
+            | crate::ApiTokenMutation::Revoke {
+                token_id,
+                expected_credential_revision,
+            } => Some((token_id.as_str(), *expected_credential_revision)),
+            crate::ApiTokenMutation::Issue { .. } => None,
+        };
+        let result = storage
             .mutate_api_token(input, mutation, at)
-            .map_err(model::storage_failure)
+            .map_err(model::storage_failure)?;
+        let queued = if matches!(
+            &result.outcome,
+            crate::ApiTokenMutationOutcome::Completed(_)
+        ) {
+            match affected_credential {
+                Some((token_id, credential_revision)) => storage
+                    .fail_queue_requests_for_credential(
+                        token_id,
+                        credential_revision,
+                        &satelle_core::queue::QueueFailure {
+                            code: ErrorCode::QueuedPrincipalNoLongerAuthorized
+                                .as_str()
+                                .to_string(),
+                            message: "the queued API Principal is no longer authorized".to_string(),
+                        },
+                    )
+                    .map_err(model::storage_failure)?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        drop(storage);
+        let mut affected_leases = BTreeMap::<String, u16>::new();
+        for (record, old_position) in queued {
+            engine.queue_payloads.delete(&record.payload_file)?;
+            engine.publish_queue_event(
+                satelle_core::EventType::TurnQueueValidationFailed,
+                &record.status,
+                "queued Turn credential is no longer authorized",
+            )?;
+            affected_leases
+                .entry(record.lease_key)
+                .and_modify(|position| *position = (*position).min(old_position))
+                .or_insert(old_position);
+        }
+        for (lease_key, first_changed_position) in affected_leases {
+            self.publish_queue_position_changes(&lease_key, first_changed_position)?;
+        }
+        Ok(result)
     }
 
     pub(crate) fn activate_api_token(

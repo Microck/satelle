@@ -6,6 +6,7 @@ use super::open::sqlite_error;
 use super::sql::insert_safe_log;
 use super::sql::{logs_need_pruning, prune_expired_logs};
 use super::{Storage, StorageError, StorageErrorKind};
+use crate::log_page::LogSubjectKind;
 use crate::{
     DaemonLogEntry, DaemonLogPage, LogCursor, LogEvent, LogPageMode, LogPageQuery, LogSeverity,
     LogSource, LogSubject,
@@ -32,8 +33,21 @@ impl SafeLogRecord {
         event: LogEvent,
         subject: LogSubject,
     ) -> Result<Self, StorageError> {
-        if event.has_turn_subject() != matches!(subject, LogSubject::Turn { .. }) {
+        let subject_kind = match subject {
+            LogSubject::Host => LogSubjectKind::Host,
+            LogSubject::Turn { .. } => LogSubjectKind::Turn,
+            LogSubject::Queue { .. } => LogSubjectKind::Queue,
+        };
+        if event.subject_kind() != subject_kind {
             return Err(StorageError::new(StorageErrorKind::InvalidInput));
+        }
+        if let LogSubject::Queue { queue_status } = &subject {
+            queue_status
+                .validate()
+                .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
+            if !event.matches_queue_status(queue_status.status) {
+                return Err(StorageError::new(StorageErrorKind::InvalidInput));
+            }
         }
         Ok(Self {
             recorded_at,
@@ -67,6 +81,23 @@ impl SafeLogRecord {
     pub(crate) const fn subject(&self) -> &LogSubject {
         &self.subject
     }
+}
+
+pub(super) fn queue_log(
+    event: LogEvent,
+    severity: LogSeverity,
+    status: satelle_core::queue::QueueStatus,
+    recorded_at: OffsetDateTime,
+) -> Result<SafeLogRecord, StorageError> {
+    SafeLogRecord::new(
+        recorded_at,
+        event.source(),
+        severity,
+        event,
+        LogSubject::Queue {
+            queue_status: status,
+        },
+    )
 }
 
 pub(super) fn canonical_log(
