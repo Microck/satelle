@@ -10,7 +10,8 @@ use crate::contract::{
     DesktopSnapshotCaptureRequest, DesktopSnapshotCaptureResponse, RawProtocolAcknowledgeRequest,
     RawProtocolAcknowledgeResponse, RawProtocolDownloadResponse, RawSubprocessBeginRequest,
     RawSubprocessBeginResponse, RawSubprocessPrepareRequest, RawSubprocessPrepareResponse,
-    RequestId, SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
+    RecordingManifestResponse, RecordingPreflightRequest, RecordingPreflightResponse, RequestId,
+    SessionResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
     TurnRequestParts,
 };
 use axum::extract::{Extension, FromRequestParts, Path, State};
@@ -30,7 +31,7 @@ pub(super) async fn create_session(
     headers: HeaderMap,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
-    if let Some(response) = raw_protocol_scope_failure(&state, &authorized, &request) {
+    if let Some(response) = sensitive_diagnostics_scope_failure(&state, &authorized, &request) {
         return response;
     }
     let intent = match turn_intent(request, state.capabilities.image_attachments()) {
@@ -75,6 +76,68 @@ pub(super) async fn create_session(
     )
 }
 
+pub(super) async fn recording_preflight(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    ApiJson(request): ApiJson<RecordingPreflightRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let preflight = match tokio::task::spawn_blocking(move || {
+        service.recording_preflight(
+            request.mode(),
+            request.retention_ms(),
+            request.source_host(),
+        )
+    })
+    .await
+    {
+        Ok(Ok(preflight)) => preflight,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    authenticated_json_response(
+        StatusCode::OK,
+        &RecordingPreflightResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            preflight,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+pub(super) async fn get_recording_manifest(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    TurnPath(turn_id): TurnPath,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let principal_ref = authorized.principal().principal_ref().to_string();
+    let manifest = match tokio::task::spawn_blocking(move || {
+        service.recording_manifest(&principal_ref, &turn_id)
+    })
+    .await
+    {
+        Ok(Ok(Some(manifest))) => manifest,
+        Ok(Ok(None)) => {
+            return host_error::response(&state, &authorized, &SatelleError::state_conflict());
+        }
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    authenticated_json_response(
+        StatusCode::OK,
+        &RecordingManifestResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            manifest,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
 pub(super) async fn create_turn(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
@@ -83,7 +146,7 @@ pub(super) async fn create_turn(
     SessionPath(session_id): SessionPath,
     ApiJson(request): ApiJson<TurnRequest>,
 ) -> Response {
-    if let Some(response) = raw_protocol_scope_failure(&state, &authorized, &request) {
+    if let Some(response) = sensitive_diagnostics_scope_failure(&state, &authorized, &request) {
         return response;
     }
     let intent = match turn_intent(request, state.capabilities.image_attachments()) {
@@ -128,12 +191,12 @@ pub(super) async fn create_turn(
     )
 }
 
-fn raw_protocol_scope_failure(
+fn sensitive_diagnostics_scope_failure(
     state: &DaemonState,
     authorized: &AuthorizedRequest,
     request: &TurnRequest,
 ) -> Option<Response> {
-    if request.raw_protocol_capture().is_some()
+    if (request.raw_protocol_capture().is_some() || request.recording().is_some())
         && !authorized
             .principal()
             .scopes()
@@ -652,6 +715,7 @@ fn turn_intent(
         attachments,
         turn_execution_timeout_ms,
         raw_protocol,
+        recording,
     } = request.into_parts();
     let attachments = attachments
         .into_iter()
@@ -683,6 +747,7 @@ fn turn_intent(
         .and_then(|intent| {
             intent.with_raw_protocol_capture(raw_protocol.map(|capture| capture.into_source_host()))
         })
+        .and_then(|intent| intent.with_recording(recording))
 }
 
 fn invalid_turn_request(
@@ -701,6 +766,7 @@ fn invalid_turn_request(
         TurnIntentError::InvalidRawProtocolSourceHost => {
             "raw protocol source Host alias is invalid"
         }
+        TurnIntentError::InvalidRecordingRequest => "recording request is invalid",
     };
     request_error(state, authorized, message)
 }

@@ -17,6 +17,8 @@ mod platform_log;
 mod provider_secret_journal;
 #[path = "storage/raw-diagnostics.rs"]
 mod raw_diagnostics;
+#[path = "storage/recording.rs"]
+mod recording;
 mod retention;
 mod setup_ledger;
 mod sql;
@@ -458,10 +460,11 @@ mod ssh_identity_commit_tests {
         (19, "fnv1a64:7f9ea3a158176b9c"),
         (20, "fnv1a64:349cb7810ef318f4"),
         (21, "fnv1a64:63131767685873a3"),
+        (22, "fnv1a64:691b625c8486aa5a"),
     ];
-    const EXPECTED_SCHEMA_ROW_COUNT: usize = 80;
+    const EXPECTED_SCHEMA_ROW_COUNT: usize = 86;
     const EXPECTED_SCHEMA_SHA256: &str =
-        "409ed1514f7d2da71f99ecc508862c45b1e35bc4022dd1bb71abae741ba95154";
+        "bd1041810dc2befc089df062dd58c9753c6b4479c73a15d6b46cd6c20885548f";
 
     fn identity() -> HostIdentityRef {
         HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")
@@ -610,7 +613,7 @@ mod ssh_identity_commit_tests {
         let user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema user version");
-        assert_eq!(user_version, 21);
+        assert_eq!(user_version, 22);
 
         let schema = connection
             .prepare(

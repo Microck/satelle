@@ -285,6 +285,7 @@ pub(crate) struct RunCommand<'a> {
     pub(super) turn_execution_timeout: Option<satelle_core::session::TimeoutPolicy>,
     pub(super) attachments: Vec<crate::attachment::VerifiedImageAttachment>,
     pub(super) raw_protocol_source_host: Option<String>,
+    pub(super) recording: Option<satelle_core::recording::RecordingRequest>,
 }
 
 #[derive(Clone, Copy)]
@@ -314,6 +315,7 @@ impl<'a> RunCommand<'a> {
             turn_execution_timeout: None,
             attachments: Vec::new(),
             raw_protocol_source_host: None,
+            recording: None,
         }
     }
 
@@ -337,6 +339,7 @@ impl<'a> RunCommand<'a> {
             turn_execution_timeout: None,
             attachments: Vec::new(),
             raw_protocol_source_host: None,
+            recording: None,
         }
     }
 
@@ -378,6 +381,14 @@ impl<'a> RunCommand<'a> {
         self.raw_protocol_source_host = source_host.map(str::to_string);
         self
     }
+
+    pub(crate) fn with_recording(
+        mut self,
+        recording: Option<&satelle_core::recording::RecordingRequest>,
+    ) -> Self {
+        self.recording = recording.cloned();
+        self
+    }
 }
 
 pub(crate) struct SteerCommand<'a> {
@@ -391,6 +402,7 @@ pub(crate) struct SteerCommand<'a> {
     pub(super) turn_execution_timeout: Option<satelle_core::session::TimeoutPolicy>,
     pub(super) attachments: Vec<crate::attachment::VerifiedImageAttachment>,
     pub(super) raw_protocol_source_host: Option<String>,
+    pub(super) recording: Option<satelle_core::recording::RecordingRequest>,
 }
 
 impl<'a> SteerCommand<'a> {
@@ -414,6 +426,7 @@ impl<'a> SteerCommand<'a> {
             turn_execution_timeout: None,
             attachments: Vec::new(),
             raw_protocol_source_host: None,
+            recording: None,
         }
     }
 
@@ -437,6 +450,7 @@ impl<'a> SteerCommand<'a> {
             turn_execution_timeout: None,
             attachments: Vec::new(),
             raw_protocol_source_host: None,
+            recording: None,
         }
     }
 
@@ -476,6 +490,14 @@ impl<'a> SteerCommand<'a> {
 
     pub(crate) fn with_raw_protocol_capture(mut self, source_host: Option<&str>) -> Self {
         self.raw_protocol_source_host = source_host.map(str::to_string);
+        self
+    }
+
+    pub(crate) fn with_recording(
+        mut self,
+        recording: Option<&satelle_core::recording::RecordingRequest>,
+    ) -> Self {
+        self.recording = recording.cloned();
         self
     }
 }

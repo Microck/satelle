@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt;
 
-define_schema_token!(TurnRequestSchema, "satelle.api.v9");
+define_schema_token!(TurnRequestSchema, "satelle.api.v10");
 define_schema_token!(StopRequestSchema, "satelle.api.v1");
 define_schema_token!(SessionSchema, "satelle.session.v1");
 define_schema_token!(TaskArtifactsSchema, "satelle.task_artifacts.v1");
@@ -41,6 +41,18 @@ define_schema_token!(
 define_schema_token!(
     DesktopSnapshotAcknowledgeSchema,
     "satelle.desktop-snapshot-acknowledge.v1"
+);
+define_schema_token!(
+    RecordingPreflightRequestSchema,
+    "satelle.recording-preflight-request.v1"
+);
+define_schema_token!(
+    RecordingPreflightResponseSchema,
+    "satelle.recording-preflight-response.v1"
+);
+define_schema_token!(
+    RecordingManifestResponseSchema,
+    "satelle.recording-manifest-response.v1"
 );
 
 pub const MAX_IMAGE_ATTACHMENT_COUNT: usize = 2;
@@ -87,6 +99,8 @@ pub struct TurnRequest {
     turn_execution_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     raw_protocol: Option<RawProtocolCaptureRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recording: Option<satelle_core::recording::RecordingRequest>,
 }
 
 pub(crate) struct TurnRequestParts {
@@ -101,6 +115,7 @@ pub(crate) struct TurnRequestParts {
     pub(crate) attachments: Vec<ImageAttachment>,
     pub(crate) turn_execution_timeout_ms: Option<u64>,
     pub(crate) raw_protocol: Option<RawProtocolCaptureRequest>,
+    pub(crate) recording: Option<satelle_core::recording::RecordingRequest>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -116,6 +131,123 @@ impl RawProtocolCaptureRequest {
 
     pub(crate) fn into_source_host(self) -> String {
         self.source_host
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingPreflightRequest {
+    schema_version: RecordingPreflightRequestSchema,
+    mode: satelle_core::recording::RecordingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention_ms: Option<u64>,
+    source_host: String,
+}
+
+impl RecordingPreflightRequest {
+    pub fn new(
+        mode: satelle_core::recording::RecordingMode,
+        retention_ms: Option<u64>,
+        source_host: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: RecordingPreflightRequestSchema,
+            mode,
+            retention_ms,
+            source_host: source_host.into(),
+        }
+    }
+
+    pub const fn mode(&self) -> satelle_core::recording::RecordingMode {
+        self.mode
+    }
+
+    pub const fn retention_ms(&self) -> Option<u64> {
+        self.retention_ms
+    }
+
+    pub fn source_host(&self) -> &str {
+        &self.source_host
+    }
+}
+
+impl ApiRequestContract for RecordingPreflightRequest {
+    const SCHEMA_VERSION: &'static str = RecordingPreflightRequestSchema::TOKEN;
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingPreflightResponse {
+    schema_version: RecordingPreflightResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    preflight: satelle_core::recording::RecordingPreflight,
+}
+
+impl RecordingPreflightResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        preflight: satelle_core::recording::RecordingPreflight,
+    ) -> Self {
+        Self {
+            schema_version: RecordingPreflightResponseSchema,
+            request_id,
+            host_identity,
+            preflight,
+        }
+    }
+
+    pub fn into_preflight(self) -> satelle_core::recording::RecordingPreflight {
+        self.preflight
+    }
+}
+
+impl AuthenticatedResponseContract for RecordingPreflightResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingManifestResponse {
+    schema_version: RecordingManifestResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    manifest: satelle_core::recording::RecordingManifest,
+}
+
+impl RecordingManifestResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        manifest: satelle_core::recording::RecordingManifest,
+    ) -> Self {
+        Self {
+            schema_version: RecordingManifestResponseSchema,
+            request_id,
+            host_identity,
+            manifest,
+        }
+    }
+
+    pub fn into_manifest(self) -> satelle_core::recording::RecordingManifest {
+        self.manifest
+    }
+}
+
+impl AuthenticatedResponseContract for RecordingManifestResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    fn host_identity(&self) -> &str {
+        &self.host_identity
     }
 }
 
@@ -192,6 +324,7 @@ impl TurnRequest {
             attachments: Vec::new(),
             turn_execution_timeout_ms: None,
             raw_protocol: None,
+            recording: None,
         }
     }
 
@@ -235,6 +368,11 @@ impl TurnRequest {
         self.raw_protocol = Some(RawProtocolCaptureRequest {
             source_host: source_host.into(),
         });
+        self
+    }
+
+    pub fn with_recording(mut self, recording: satelle_core::recording::RecordingRequest) -> Self {
+        self.recording = Some(recording);
         self
     }
 
@@ -282,6 +420,10 @@ impl TurnRequest {
         self.raw_protocol.as_ref()
     }
 
+    pub const fn recording(&self) -> Option<&satelle_core::recording::RecordingRequest> {
+        self.recording.as_ref()
+    }
+
     pub(crate) fn into_parts(self) -> TurnRequestParts {
         TurnRequestParts {
             prompt: self.prompt,
@@ -295,6 +437,7 @@ impl TurnRequest {
             attachments: self.attachments,
             turn_execution_timeout_ms: self.turn_execution_timeout_ms,
             raw_protocol: self.raw_protocol,
+            recording: self.recording,
         }
     }
 }
@@ -378,6 +521,10 @@ impl fmt::Debug for TurnRequest {
             .field("attachment_count", &self.attachments.len())
             .field("turn_execution_timeout_ms", &self.turn_execution_timeout_ms)
             .field("raw_protocol_capture", &self.raw_protocol.is_some())
+            .field(
+                "recording",
+                &self.recording.as_ref().map(|request| request.mode),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -419,7 +566,7 @@ mod provider_binding_boundary_tests {
     }
 
     #[test]
-    fn turn_request_v9_carries_independent_project_provenance_and_opt_ins() {
+    fn turn_request_v10_carries_independent_project_provenance_and_opt_ins() {
         let request = TurnRequest::new("inspect the repository")
             .with_provider_intent(
                 Some("vision".to_string()),
@@ -429,12 +576,18 @@ mod provider_binding_boundary_tests {
                 true,
             )
             .with_experimental_provider_computer_use(true)
-            .with_raw_protocol_capture("remote-demo");
+            .with_raw_protocol_capture("remote-demo")
+            .with_recording(satelle_core::recording::RecordingRequest::new(
+                satelle_core::recording::RecordingMode::Events,
+                86_400_000,
+                "private-recording-host",
+            ));
         assert!(!format!("{request:?}").contains("remote-demo"));
+        assert!(!format!("{request:?}").contains("private-recording-host"));
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             json!({
-                "schema_version": "satelle.api.v9",
+                "schema_version": "satelle.api.v10",
                 "model_from_project": true,
                 "provider_from_project": false,
                 "prompt": "inspect the repository",
@@ -444,20 +597,25 @@ mod provider_binding_boundary_tests {
                 "refresh_provider_smoke_test": true,
                 "experimental_provider_computer_use": true,
                 "raw_protocol": {"source_host": "remote-demo"}
+                ,"recording": {
+                    "mode": "events",
+                    "retention_ms": 86400000,
+                    "source_host": "private-recording-host"
+                }
             })
         );
     }
 
     #[test]
-    fn turn_request_rejects_missing_provenance_and_the_v8_shape() {
+    fn turn_request_rejects_missing_provenance_and_the_v9_shape() {
         for request in [
             serde_json::json!({
-                "schema_version": "satelle.api.v9",
+                "schema_version": "satelle.api.v10",
                 "prompt": "private",
                 "execution_mode": "standard"
             }),
             serde_json::json!({
-                "schema_version": "satelle.api.v8",
+                "schema_version": "satelle.api.v9",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private",
@@ -1390,7 +1548,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).expect("serialize request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v9",
+                "schema_version": "satelle.api.v10",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1403,7 +1561,7 @@ mod tests {
             )
             .expect("serialize YOLO request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v9",
+                "schema_version": "satelle.api.v10",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1420,7 +1578,7 @@ mod tests {
             ))
             .expect("serialize provider intent"),
             serde_json::json!({
-                "schema_version": "satelle.api.v9",
+                "schema_version": "satelle.api.v10",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1432,7 +1590,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v9",
+                "schema_version": "satelle.api.v10",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt"
@@ -1441,7 +1599,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v9",
+                "schema_version": "satelle.api.v10",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1460,7 +1618,7 @@ mod tests {
     fn controller_presentation_fields_are_absent_from_the_turn_request_contract() {
         for field in ["attach", "detach"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v9",
+                "schema_version": "satelle.api.v10",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1482,7 +1640,7 @@ mod tests {
     fn mvp_turn_requests_cannot_route_across_desktop_bindings() {
         for field in ["desktop_user", "desktop_binding", "desktop_session"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v9",
+                "schema_version": "satelle.api.v10",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",

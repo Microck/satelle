@@ -977,6 +977,7 @@ mod tests {
             operator_log_retained_files: None,
             platform_log_sink: false,
             telemetry: None,
+            recording: None,
             desktop_user: None,
             desktop_session_preference: None,
             desktop_session_native_selector: None,

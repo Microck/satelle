@@ -64,6 +64,7 @@ async fn protocol_version_gate_is_exact_sanitized_and_precedes_mutation_work() {
         "5",
         "10",
         "18",
+        "19",
         "65535",
         "65536",
         "99999999999999999999",
@@ -81,7 +82,7 @@ async fn protocol_version_gate_is_exact_sanitized_and_precedes_mutation_work() {
     // exposed. Send this case at the wire layer because reqwest deliberately
     // prevents callers from constructing padded header values.
     let whitespace_request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version:   19 \r\nIdempotency-Key:\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version:   20 \r\nIdempotency-Key:\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         bearer(&running.token),
         running.host_identity,
         RequestId::new(),
@@ -150,12 +151,12 @@ async fn capabilities_handshake_rejects_old_and_missing_clients() {
 
     let current = running
         .protected_request(Method::GET, "/v1/capabilities")
-        .header("Satelle-Protocol-Version", "19")
+        .header("Satelle-Protocol-Version", "20")
         .send()
         .await
         .expect("send capabilities request with current protocol version");
     assert_eq!(current.status(), StatusCode::OK);
-    assert_eq!(current.headers()["satelle-protocol-version"], "19");
+    assert_eq!(current.headers()["satelle-protocol-version"], "20");
 }
 
 #[tokio::test]
@@ -215,7 +216,7 @@ async fn assert_protocol_error(
             "details": {
                 "daemon_version": env!("CARGO_PKG_VERSION"),
                 "reason": reason,
-                "supported_versions": ["19"],
+                "supported_versions": ["20"],
                 "received_version": received_version,
             },
             "docs_url": null,

@@ -140,6 +140,26 @@ fn human_error(error: &SatelleError) -> String {
     if error.details.get("mutated") == Some(&Value::Bool(false)) {
         lines.push("state: No changes were applied.".to_string());
     }
+    if let Some(recording) = error.details.get("recording") {
+        if let Some(expires_at) = recording.get("expires_at").and_then(Value::as_str) {
+            lines.push(format!("recording expires: {expires_at}"));
+        }
+        if let Some(manifest_path) = recording.get("manifest_path").and_then(Value::as_str) {
+            lines.push(format!("recording manifest: {manifest_path}"));
+        }
+        if let Some(artifacts) = recording.get("artifacts").and_then(Value::as_array) {
+            for path in artifacts
+                .iter()
+                .filter_map(|artifact| artifact.get("path"))
+                .filter_map(Value::as_str)
+            {
+                lines.push(format!("recording artifact: {path}"));
+            }
+        }
+        if let Some(cleanup) = recording.get("cleanup_command").and_then(Value::as_str) {
+            lines.push(format!("recording cleanup: {cleanup}"));
+        }
+    }
     if matches!(
         error.code,
         ErrorCode::HostUpdatePartiallyApplied

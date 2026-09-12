@@ -1013,6 +1013,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         ));
     let raw_diagnostic_read_route = Router::new()
         .route(
+            "/v1/diagnostics/recording/{turn_id}",
+            get(sessions::get_recording_manifest),
+        )
+        .route(
             "/v1/diagnostics/raw-protocol/{turn_id}",
             get(sessions::get_raw_protocol_export),
         )
@@ -1216,6 +1220,10 @@ fn router(state: Arc<DaemonState>) -> Router {
             auth::require_control,
         ));
     let sensitive_diagnostic_routes = Router::new()
+        .route(
+            "/v1/diagnostics/recording/preflight",
+            post(sessions::recording_preflight),
+        )
         .route(
             "/v1/diagnostics/desktop-snapshot",
             post(sessions::capture_desktop_snapshot),

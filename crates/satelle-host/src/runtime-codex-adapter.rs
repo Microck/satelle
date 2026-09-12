@@ -597,6 +597,7 @@ impl ProductionComputerUseAdapter {
                 image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
                 attachments: &[],
                 raw_protocol_capture: None,
+                recording_capture: None,
             },
             native_action_evidence.clone(),
             READINESS_CANCELLATION_GRACE,
@@ -1082,6 +1083,7 @@ fn provider_smoke_session_request<'a>(
         image_input_mode: crate::codex_capabilities::CodexImageInputMode::Unsupported,
         attachments: &[],
         raw_protocol_capture: None,
+        recording_capture: None,
     }
 }
 
@@ -2264,6 +2266,11 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
         {
             secret.expose_to_provider(|value| capture.add_known_secret(value));
         }
+        if let (Some(capture), Some(secret)) =
+            (request.recording_capture(), provider_secret.as_ref())
+        {
+            secret.expose_to_provider(|value| capture.add_known_secret(value));
+        }
         let policy = request.execution_policy();
         let binding = request
             .resolved_provider_binding()
@@ -2384,6 +2391,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                         image_input_mode,
                         attachments: request.attachments(),
                         raw_protocol_capture: request.raw_protocol_capture().cloned(),
+                        recording_capture: request.recording_capture().cloned(),
                     },
                     READINESS_CANCELLATION_GRACE,
                     None,

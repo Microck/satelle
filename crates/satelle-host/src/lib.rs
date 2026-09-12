@@ -26,6 +26,7 @@ pub(crate) mod provider_auth;
 mod provider_probe;
 #[path = "raw-diagnostics.rs"]
 mod raw_diagnostics;
+mod recording;
 mod runtime;
 mod storage;
 mod telemetry;
@@ -3313,6 +3314,7 @@ impl HostService {
         overrides: &DaemonPathOverrides,
         storage_policy: satelle_core::daemon_service::PersistentHostStoragePolicy,
         telemetry: Option<satelle_core::telemetry::TelemetryConfig>,
+        recording: Option<satelle_core::recording::RecordingPolicy>,
     ) -> Result<Self, SatelleError> {
         let mut config = satelle_core::SatelleConfig::defaults()
             .hosts
@@ -3351,6 +3353,7 @@ impl HostService {
         config.operator_log_retained_files = Some(storage_policy.operator_log_retained_files());
         config.platform_log_sink = storage_policy.platform_log_sink();
         config.telemetry = telemetry;
+        config.recording = recording;
         Ok(Self::production_for_host(&config))
     }
 
@@ -4499,7 +4502,8 @@ impl HostService {
             .with_provider_intent(intent.provider_intent().clone())
             .with_turn_execution_timeout(Some(self.effective_turn_execution_timeout(intent)))
             .with_attachments(attachment::resolve_images(intent.attachments())?)
-            .with_raw_protocol_capture(intent.raw_protocol_source_host()))
+            .with_raw_protocol_capture(intent.raw_protocol_source_host())
+            .with_recording(intent.recording()))
     }
 
     fn steer_command<'a>(
@@ -4512,7 +4516,8 @@ impl HostService {
             .with_provider_intent(intent.provider_intent().clone())
             .with_turn_execution_timeout(Some(self.effective_turn_execution_timeout(intent)))
             .with_attachments(attachment::resolve_images(intent.attachments())?)
-            .with_raw_protocol_capture(intent.raw_protocol_source_host()))
+            .with_raw_protocol_capture(intent.raw_protocol_source_host())
+            .with_recording(intent.recording()))
     }
 
     pub fn run(
@@ -7702,6 +7707,8 @@ pub struct HostStatus {
 pub struct TurnOutcome {
     pub session: PublicSession,
     pub events: Vec<SatelleEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<satelle_core::recording::RecordingManifest>,
 }
 
 pub fn health_route() -> Value {
