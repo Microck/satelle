@@ -29,9 +29,10 @@ const HANDSHAKE_LINE_LIMIT: u64 = 64 * 1024;
 const HANDSHAKE_MESSAGE_LIMIT: usize = 64;
 const HANDSHAKE_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 // A cold probe verifies the managed runtime, generates the full app-server
-// schema, and completes a live handshake. Windows ARM64 has taken 14.5 seconds
-// for this path, so the blocking admission budget must cover the cold case.
-pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+// schema, and completes a live handshake. A Windows desktop reset can make
+// those three steps take more than a minute, so admission needs the same
+// bounded cold-start allowance as native isolation.
+pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(90);
 // Native isolation serializes desktop-app authentication, plugin and MCP
 // inventories, Computer Use helper authentication, and the final bridge check.
 // The current Windows ARM64 runtime can spend 30 seconds reopening the managed

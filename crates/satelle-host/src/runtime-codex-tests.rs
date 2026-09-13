@@ -782,7 +782,7 @@ fn native_isolation_budget_covers_inventories_and_macos_authentication() {
 #[test]
 fn default_control_plane_budget_covers_a_cold_managed_runtime() {
     assert!(
-        PROBE_TIMEOUT >= Duration::from_secs(60),
+        PROBE_TIMEOUT >= Duration::from_secs(90),
         "schema generation and the live handshake must fit after a cold runtime integrity check"
     );
 }
