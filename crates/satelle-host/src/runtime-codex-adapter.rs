@@ -1346,9 +1346,7 @@ fn javascript_single_quoted(value: &str) -> String {
 
 fn node_repl_exec_source(script: &str) -> String {
     let code = serde_json::to_string(script).expect("a Rust string always serializes as JSON");
-    format!(
-        "const nativeResult = await tools.mcp__node_repl__js({{code:{code}}}); text(JSON.stringify(nativeResult));"
-    )
+    format!("const r=await tools.mcp__node_repl__js({{code:{code}}});text(JSON.stringify(r))")
 }
 
 fn native_readiness_prompt(
@@ -1368,14 +1366,10 @@ fn native_readiness_prompt(
             if !allowed_app_ids.contains("satelle.exe") {
                 return Err("native_app_approval_unavailable");
             }
-            // Resolve the indexed button by its stable label and keep the fresh
-            // window binding returned after the click for the screenshot-bound
-            // drag. The private loopback target is the authority for both event
-            // acknowledgements, so duplicating those checks in this generated
-            // cell only lengthens a script that the model must reproduce exactly.
-            // Desktop reset can leave app discovery briefly incomplete, so only
-            // that external transition receives a bounded retry.
-            let script = "globalThis.sky ??= (await import('@oai/sky')).sky; var apps = null; var satelle = null; var listAppsError = null; for (var attempt = 0; attempt < 2 && !satelle; attempt++) { try { apps = await sky.list_apps(); listAppsError = null; satelle = apps.find(app => app.id.toLowerCase().endsWith('satelle.exe')); } catch (error) { apps = null; listAppsError = error; } if (!satelle && attempt < 1) await new Promise(resolve => setTimeout(resolve, 500)); } if (!apps) throw listAppsError; if (!satelle) throw new Error('Satelle is unavailable'); var probeWindow = satelle.windows.find(window => window.title === 'Satelle native readiness probe'); if (!probeWindow) throw new Error('Satelle native readiness probe window is unavailable'); var state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); probeWindow = state.window; var buttonLine = state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); var buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) }); await new Promise(resolve => setTimeout(resolve, 250)); state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); probeWindow = state.window; var screenshot = state.screenshots[0]; if (!screenshot) throw new Error('window screenshot missing after click'); await sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 578, to_y: 406, screenshotId: screenshot.id }); nodeRepl.write('Native click and drag actions dispatched');".to_string();
+            // The native probe has a fixed captured-window layout. Coordinate input keeps
+            // this generated cell short enough for the model to copy verbatim,
+            // while the private callback remains the authority for both events.
+            let script = "globalThis.sky??=(await import('@oai/sky')).sky;var a=(await sky.list_apps()).find(x=>x.id.toLowerCase().endsWith('satelle.exe')),w=a.windows.find(x=>x.title==='Satelle native readiness probe'),g=w=>sky.get_window_state({window:w,include_screenshot:true,include_text:true}),s=await g(w);await sky.click({window:s.window,x:190,y:173,screenshotId:s.screenshots[0].id});s=await g(s.window);await sky.drag({window:s.window,from_x:238,from_y:356,to_x:578,to_y:406,screenshotId:s.screenshots[0].id})".to_string();
             // The `exec` tool yields after roughly ten seconds and reports a
             // background cell instead of a result. On slow hosts the readiness
             // script outlives that window, and a model that obeys "no other
@@ -1387,7 +1381,7 @@ fn native_readiness_prompt(
             native_action_evidence.expect_script_for_app(&script, "satelle.exe");
             let exec_source = node_repl_exec_source(&script);
             Ok(format!(
-                "Use the installed official Computer Use plugin immediately. Call the top-level `exec` tool exactly once with this exact JavaScript source: `{exec_source}`. That source calls the nested `mcp__node_repl__js` tool exactly once with the complete readiness script as the exact `code` argument. The tools are already available; do not call `tool_search` or inspect the tool inventory. Make no other discovery or tool calls. The Satelle-owned window independently reports both native events to a private loopback capability, and the accessibility tree is formatted text. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list or inspect unrelated apps. Do not inspect Object.keys or probe API shapes. Do not read documentation. If the `exec` result reports that the script is still running with a cell ID instead of a terminal result, call the top-level `wait` tool with that `cell_id` and `yield_time_ms` of 10000, repeating only until the cell returns a terminal result. That `wait` call is the only other tool call permitted. Stop immediately after the `exec` tool call reaches a terminal result."
+                "Use the installed official Computer Use plugin immediately. Call the top-level `exec` tool exactly once with this exact JavaScript source: `{exec_source}`. Copy the source verbatim without expanding or replacing any operation. That source calls the nested `mcp__node_repl__js` tool exactly once with the complete readiness script as the exact `code` argument. The tools are already available; do not call `tool_search` or inspect the tool inventory. Make no other discovery or tool calls. The Satelle-owned window independently reports both native events to a private loopback capability. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list or inspect unrelated apps. Do not inspect Object.keys or probe API shapes. Do not read documentation. If the `exec` result reports that the script is still running with a cell ID instead of a terminal result, call the top-level `wait` tool with that `cell_id` and `yield_time_ms` of 10000, repeating only until the cell returns a terminal result. That `wait` call is the only other tool call permitted. Stop immediately after the `exec` tool call reaches a terminal result."
             ))
         }
         crate::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
@@ -4564,39 +4558,30 @@ mod tests {
         assert!(!prompt.contains("data:text"));
         assert!(!prompt.contains("http://127.0.0.1:12345/probe/private-capability"));
         assert!(prompt.contains("sky.list_apps()"));
-        assert!(prompt.contains("app.id.toLowerCase().endsWith('satelle.exe')"));
+        assert!(prompt.contains("x.id.toLowerCase().endsWith('satelle.exe')"));
         assert!(!prompt.contains("MSEdge"));
         assert!(prompt.contains("Satelle native readiness probe"));
-        // Keep the exact returned window. The rehydration and activation calls
-        // both require foreground activation, while input methods activate
-        // their selected target automatically.
+        // Keep each fresh window binding and its screenshot ID. Input methods
+        // activate the selected target automatically.
         assert!(!prompt.contains("sky.get_window({"));
         assert!(!prompt.contains("sky.activate_window"));
         assert!(!prompt.contains("sky.type_text"));
-        assert!(prompt.contains("sky.get_window_state({ window: probeWindow"));
-        assert!(prompt.contains("accessibility tree is formatted text"));
-        // Resolve the indexed native button by its stable label. Only the
-        // painted drag surface remains bound to the fixed window geometry.
-        assert!(prompt.contains("button Click to confirm"));
-        assert!(prompt.contains("buttonMatch"));
+        assert!(prompt.contains("sky.get_window_state({window:w"));
+        assert!(!prompt.contains("accessibility.tree"));
+        assert!(prompt.contains("sky.click({window:s.window,x:190,y:173"));
         assert!(
-            prompt.contains(
-                "sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) })"
-            )
+            prompt.contains("sky.drag({window:s.window,from_x:238,from_y:356,to_x:578,to_y:406")
         );
-        assert!(prompt.contains(
-            "sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 578, to_y: 406"
-        ));
-        assert!(prompt.contains("screenshotId: screenshot.id"));
+        assert!(prompt.contains("screenshotId:s.screenshots[0].id"));
         let click = prompt
-            .find("await sky.click({ window: probeWindow")
+            .find("await sky.click({window:s.window")
             .expect("the probe must click the fixed readiness control");
         let refreshed_state = prompt[click..]
-            .find("state = await sky.get_window_state({ window: probeWindow, include_screenshot: true")
+            .find("s=await g(s.window)")
             .map(|offset| click + offset)
             .expect("the probe must refresh screenshot state after the click");
         let drag = prompt
-            .find("await sky.drag({ window: probeWindow")
+            .find("await sky.drag({window:s.window")
             .expect("the probe must drag on the readiness surface");
         assert!(click < refreshed_state);
         assert!(refreshed_state < drag);
@@ -4604,16 +4589,19 @@ mod tests {
         assert!(prompt.contains("call the top-level `wait` tool with that `cell_id`"));
         assert!(prompt.contains("only other tool call permitted"));
         assert!(prompt.contains("complete readiness script as the exact `code` argument"));
+        assert!(prompt.contains("Copy the source verbatim"));
         assert!(!prompt.contains("functions.exec"));
+        assert!(!prompt.contains("captureScreenshot"));
         assert!(!prompt.contains("Click event observed"));
         assert!(!prompt.contains("Drag event observed"));
         assert!(prompt.contains(
             "Do not use shell, separate file tools, browser automation, or network tools"
         ));
-        let (_, authorized_app_id) = evidence
+        let (authorized_script, authorized_app_id) = evidence
             .expected_authorization()
             .expect("the exact script must retain its checked app authority");
         assert_eq!(authorized_app_id, "satelle.exe");
+        assert!(authorized_script.len() <= 512);
     }
 
     #[test]
@@ -4954,23 +4942,14 @@ mod tests {
         assert!(prompt.contains("click"));
         assert!(prompt.contains("drag"));
         assert!(!prompt.contains("readiness-nonce"));
-        assert!(prompt.contains(
-            "state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm'))"
-        ));
+        assert_eq!(prompt.matches("sky.list_apps()").count(), 1);
+        assert!(prompt.contains("sky.click({window:s.window,x:190,y:173"));
         assert!(
-            prompt.contains(
-                "sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) })"
-            )
+            prompt.contains("sky.drag({window:s.window,from_x:238,from_y:356,to_x:578,to_y:406")
         );
-        assert!(prompt.contains("attempt < 2 && !satelle"));
-        assert!(prompt.contains("listAppsError = null; satelle = apps.find"));
-        assert!(prompt.contains("catch (error) { apps = null; listAppsError = error; }"));
-        assert!(prompt.contains("if (!satelle && attempt < 1)"));
-        assert!(prompt.contains("if (!apps) throw listAppsError"));
-        assert!(prompt.contains("await new Promise(resolve => setTimeout(resolve, 250))"));
-        assert!(prompt.contains("include_screenshot: true, include_text: true"));
-        assert!(!prompt.contains("include_screenshot: false"));
-        assert!(!prompt.contains("attempt < 8"));
+        assert!(prompt.contains("screenshotId:s.screenshots[0].id"));
+        assert!(!prompt.contains("accessibility.tree"));
+        assert!(!prompt.contains("setTimeout"));
     }
 
     #[test]
