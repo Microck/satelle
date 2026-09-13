@@ -34,7 +34,7 @@ those pull requests merge, the integration branch gets a final pull request to
 | Recording | Per-Turn recording modes and export policy | Merged in PR #245 |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Merged in PR #247 |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Merged in PR #252 |
-| Automation | Batch, watch, webhook notifications, REPL, command history | Batch in progress |
+| Automation | Batch, watch, webhook notifications, REPL, command history | Batch merged in PR #256; watch and notify in progress |
 | Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Pending |
 
 Package repository submissions, staged npm publishing, and native action relay
@@ -63,6 +63,29 @@ through 16. Results always follow input order and use
 line is one `satelle.batch.summary.v1` record. A partial failure returns process
 status 1 after writing every item result and the summary. Request objects and
 raw prompt arguments are never copied into output records.
+
+## Watch and webhook notification contract
+
+`satelle watch <sessions|logs|doctor|host>` polls one selected context and
+emits `satelle.watch.change.v1` NDJSON. The first successful snapshot is a
+change. Later polls emit only when the structured state differs. `--interval`
+accepts 250ms through 60s. `--reconnect-attempts` accepts 1 through 100 and
+counts consecutive failed polls, resetting after each success. `watch logs`
+also accepts an optional `--session` filter. Doctor comparison ignores probe
+start, finish, and duration fields so observation timing alone is not a change.
+
+`satelle notify --watch <sessions|logs|doctor|host> --webhook <alias>` uses the
+same change detector and posts each change in a `satelle.notify.webhook.v1`
+payload. Delivery makes at most three HTTPS attempts. A failed watch budget or
+webhook delivery returns a typed error. `--dry-run` writes the exact redacted
+payload as NDJSON and neither resolves authorization nor contacts the endpoint.
+
+Notifier aliases live only in user configuration. Each alias has an absolute
+HTTPS endpoint with no inline credentials, query, or fragment, plus optional
+bearer authorization from an environment or absolute owner-only file Secret
+Source. Project configuration cannot define or redirect aliases. Internal
+polls do not create their own command-history or telemetry entries; the outer
+watch or notify workflow remains the recorded operation.
 
 ## Opt-in telemetry decisions
 

@@ -175,12 +175,12 @@
 - satelle batch emits one satelle.batch.result.v1 JSON record per input item followed by one satelle.batch.summary.v1 record, preserving input order for result records even when execution completes out of order @spec @contract @phase4 @implemented
 - satelle batch defaults to 4 concurrent items, accepts --concurrency values from 1 through 16, and never exceeds the selected Host's admission and API rate limits @spec @phase4 @implemented
 - satelle batch automation never bypasses host-busy, setup consent, YOLO, Trusted Profile, provider auth, or native Computer Use readiness rules that would apply to each individual command @spec @phase4 @implemented
-- satelle later exposes watch automation for polling or streaming session, log, doctor, or host state changes and emitting changed records only when requested @spec @later
-- satelle watch <sessions|logs|doctor|host> is the exact watch command and emits versioned NDJSON change records until interrupted or its reconnect budget is exhausted @spec @contract @later
-- satelle later exposes notify automation for sending selected Satelle state changes to a configured webhook with change-only delivery, bounded retries, and redacted payloads @spec @later
-- satelle notify --watch <sessions|logs|doctor|host> --webhook <notifier-alias> is the exact notify command @spec @later
-- webhook notifier aliases are defined only in user-level configuration, resolve an HTTPS endpoint plus optional Secret Source authentication on the Controller, and cannot be defined or redirected by project configuration @spec @later
-- satelle notify --dry-run emits the redacted versioned webhook payloads without making network requests @spec @later
+- satelle later exposes watch automation for polling or streaming session, log, doctor, or host state changes and emitting changed records only when requested @spec @phase4 @implemented
+- satelle watch <sessions|logs|doctor|host> is the exact watch command and emits versioned NDJSON change records until interrupted or its reconnect budget is exhausted @spec @contract @phase4 @implemented
+- satelle later exposes notify automation for sending selected Satelle state changes to a configured webhook with change-only delivery, bounded retries, and redacted payloads @spec @phase4 @implemented
+- satelle notify --watch <sessions|logs|doctor|host> --webhook <notifier-alias> is the exact notify command @spec @phase4 @implemented
+- webhook notifier aliases are defined only in user-level configuration, resolve an HTTPS endpoint plus optional Secret Source authentication on the Controller, and cannot be defined or redirected by project configuration @spec @phase4 @implemented
+- satelle notify --dry-run emits the redacted versioned webhook payloads without making network requests @spec @phase4 @implemented
 
 ## distribution
 - satelle is distributed as one satelle executable per target, and builds for native Computer Use Host targets contain both Controller commands and Host Daemon mode @spec @mvp @implemented

@@ -41,6 +41,8 @@ mod secure_file;
 pub mod sensitive_diagnostics;
 pub mod session;
 pub mod telemetry;
+#[path = "webhook-notifier.rs"]
+mod webhook_notifier;
 
 pub use authority::{
     ApiPermissionScope, ApiPrincipalModel, ArtifactExportPolicy, AuthoritativeStateSubject,
@@ -93,6 +95,7 @@ pub use secure_file::{
     read_owner_only_secret_file, read_trusted_ca_bundle_file, rollback_owner_only_secret_file,
     stage_owner_only_secret_file, sync_owner_only_directory,
 };
+pub use webhook_notifier::{WebhookNotifierConfig, WebhookSecretSource};
 
 pub const PRODUCT_NAME: &str = "Satelle";
 pub const CLI_NAME: &str = "satelle";
@@ -116,6 +119,8 @@ pub struct SatelleConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
     pub command_history: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub notifiers: BTreeMap<String, WebhookNotifierConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<telemetry::TelemetryConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +182,7 @@ impl SatelleConfig {
             experimental_provider_computer_use: None,
             experimental_provider_computer_use_by_provider: BTreeMap::new(),
             command_history: None,
+            notifiers: BTreeMap::new(),
             telemetry: None,
             api_rate_limits: None,
             hosts,
@@ -209,6 +215,9 @@ impl SatelleConfig {
         }
         if higher.command_history.is_some() {
             self.command_history = higher.command_history;
+        }
+        for (alias, notifier) in higher.notifiers {
+            self.notifiers.insert(alias, notifier);
         }
         if higher.telemetry.is_some() {
             self.telemetry = higher.telemetry;
@@ -2975,6 +2984,60 @@ mod presentation_output_config_tests {
 }
 
 #[cfg(test)]
+mod webhook_notifier_config_tests {
+    use super::*;
+
+    #[test]
+    fn user_config_owns_webhook_notifiers_and_higher_includes_replace_aliases() {
+        let base = parse_user_config(
+            Path::new("/test/base.toml"),
+            r#"
+[notifiers.ops]
+endpoint = "https://old.example.test/events"
+
+[notifiers.ops.authorization]
+kind = "environment"
+variable = "SATELLE_OLD_WEBHOOK_TOKEN"
+"#,
+        )
+        .expect("parse a user-owned webhook notifier")
+        .config;
+        let higher = parse_user_config(
+            Path::new("/test/higher.toml"),
+            r#"
+[notifiers.ops]
+endpoint = "https://new.example.test/events"
+"#,
+        )
+        .expect("parse a replacement webhook notifier")
+        .config;
+
+        let merged = base.merge(higher);
+        assert_eq!(
+            merged.notifiers["ops"].endpoint,
+            "https://new.example.test/events"
+        );
+        assert!(merged.notifiers["ops"].authorization.is_none());
+    }
+
+    #[test]
+    fn project_config_cannot_define_webhook_notifiers() {
+        let root = tempfile::tempdir().expect("create project config root");
+        let path = root.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[notifiers.ops]\nendpoint = \"https://hooks.example.test/events\"\n",
+        )
+        .expect("write project configuration");
+
+        assert!(
+            project_config::read(&path).is_err(),
+            "webhook credentials and endpoints belong to user configuration"
+        );
+    }
+}
+
+#[cfg(test)]
 mod api_rate_limit_config_tests {
     use super::*;
 
@@ -3495,6 +3558,7 @@ fn parse_user_config_value(
     reject_desktop_session_selector_conflicts(path, &value)?;
     reject_provider_secret_source_errors(path, &value)?;
     reject_telemetry_config_errors(path, &value)?;
+    reject_webhook_notifier_errors(path, &value)?;
     reject_recording_config_errors(path, &value)?;
     reject_queue_config_errors(path, &value)?;
     reject_provider_binding_errors(path, &value)?;
@@ -3689,6 +3753,7 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
         &mut interpolations,
     );
     collect_telemetry_interpolation("telemetry", table.get("telemetry"), &mut interpolations);
+    collect_notifier_interpolation(table.get("notifiers"), &mut interpolations);
 
     let Some(hosts) = table.get("hosts").and_then(toml::Value::as_table) else {
         return finish_interpolation_check(path, interpolations);
@@ -3844,6 +3909,39 @@ fn collect_telemetry_interpolation(
             authorization.get(key),
             interpolations,
         );
+    }
+}
+
+fn collect_notifier_interpolation(
+    value: Option<&toml::Value>,
+    interpolations: &mut Vec<ConfigInterpolation>,
+) {
+    let Some(notifiers) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for (alias, value) in notifiers {
+        let path = format!("notifiers.{alias}");
+        let Some(notifier) = value.as_table() else {
+            continue;
+        };
+        collect_interpolation_for_value(
+            &format!("{path}.endpoint"),
+            notifier.get("endpoint"),
+            interpolations,
+        );
+        let Some(authorization) = notifier
+            .get("authorization")
+            .and_then(toml::Value::as_table)
+        else {
+            continue;
+        };
+        for key in ["kind", "variable", "path"] {
+            collect_interpolation_for_value(
+                &format!("{path}.authorization.{key}"),
+                authorization.get(key),
+                interpolations,
+            );
+        }
     }
 }
 
@@ -4352,6 +4450,28 @@ fn reject_telemetry_config_errors(path: &Path, value: &toml::Value) -> Result<()
     Ok(())
 }
 
+fn reject_webhook_notifier_errors(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
+    let Some(notifiers) = value.get("notifiers").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    for (alias, value) in notifiers {
+        let config = value
+            .clone()
+            .try_into::<WebhookNotifierConfig>()
+            .map_err(|_| {
+                SatelleError::config_error(
+                    format!(
+                        "invalid webhook notifier configuration at notifiers.{alias} in {}",
+                        path.display()
+                    ),
+                    None,
+                )
+            })?;
+        config.validate(alias)?;
+    }
+    Ok(())
+}
+
 fn reject_recording_config_errors(path: &Path, value: &toml::Value) -> Result<(), SatelleError> {
     let validate = |toml_path: &str, value: &toml::Value| {
         let policy = value
@@ -4569,6 +4689,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
             "experimental_provider_computer_use",
             "experimental_provider_computer_use_by_provider",
             "command_history",
+            "notifiers",
             "telemetry",
             "api_rate_limits",
             "profile",
@@ -4615,6 +4736,32 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                 &["kind", "variable", "path"],
                 &mut unknown_keys,
             );
+        }
+    }
+
+    if let Some(notifiers) = table.get("notifiers").and_then(toml::Value::as_table) {
+        for (alias, notifier) in notifiers {
+            let Some(notifier) = notifier.as_table() else {
+                continue;
+            };
+            let path = format!("notifiers.{alias}");
+            collect_unknown_keys_for_table(
+                &path,
+                notifier,
+                &["endpoint", "authorization"],
+                &mut unknown_keys,
+            );
+            if let Some(authorization) = notifier
+                .get("authorization")
+                .and_then(toml::Value::as_table)
+            {
+                collect_unknown_keys_for_table(
+                    &format!("{path}.authorization"),
+                    authorization,
+                    &["kind", "variable", "path"],
+                    &mut unknown_keys,
+                );
+            }
         }
     }
 
@@ -5367,6 +5514,8 @@ pub enum ErrorCode {
     LogsFollowIdentityChanged,
     LogsFollowReconnectExhausted,
     BatchPartialFailure,
+    WatchReconnectExhausted,
+    NotifyDeliveryFailed,
     CapacityExceeded,
     ConcurrencyLimitExceeded,
     ConcurrencyWithoutRemoteUpdate,
@@ -5549,6 +5698,8 @@ impl ErrorCode {
             Self::LogsFollowIdentityChanged => "logs-follow-identity-changed",
             Self::LogsFollowReconnectExhausted => "logs-follow-reconnect-exhausted",
             Self::BatchPartialFailure => "batch-partial-failure",
+            Self::WatchReconnectExhausted => "watch-reconnect-exhausted",
+            Self::NotifyDeliveryFailed => "notify-delivery-failed",
             Self::CapacityExceeded => "capacity-exceeded",
             Self::ConcurrencyLimitExceeded => "concurrency-limit-exceeded",
             Self::ConcurrencyWithoutRemoteUpdate => "concurrency-without-remote-update",
@@ -5685,7 +5836,8 @@ impl ErrorCode {
             | Self::DirectDaemonUnreachable
             | Self::SshBootstrapUnavailable
             | Self::ReleaseVerifierUnavailable
-            | Self::LogsFollowReconnectExhausted => 69,
+            | Self::LogsFollowReconnectExhausted
+            | Self::WatchReconnectExhausted => 69,
             Self::CertificateUntrusted
             | Self::CertificateHostnameMismatch
             | Self::CertificateExpired
@@ -5718,6 +5870,7 @@ impl ErrorCode {
             | Self::ProviderSecretResolutionFailed
             | Self::QueuedPrincipalNoLongerAuthorized
             | Self::BatchPartialFailure
+            | Self::NotifyDeliveryFailed
             | Self::SelfUpdateRollbackFailed
             | Self::SelfUpdateVerificationFailed
             | Self::SelfUpdateFailed => 74,
@@ -7289,6 +7442,37 @@ impl SatelleError {
             ),
             source_detail: None,
             details,
+        }
+    }
+
+    pub fn watch_reconnect_exhausted(target: &str, attempts: usize) -> Self {
+        Self {
+            code: ErrorCode::WatchReconnectExhausted,
+            message: format!("watch reconnect budget was exhausted for {target}"),
+            recovery_command: Some(format!("satelle watch {target}")),
+            source_detail: None,
+            details: BTreeMap::from([
+                ("target".to_string(), Value::String(target.to_string())),
+                ("attempts".to_string(), Value::from(attempts)),
+            ]),
+        }
+    }
+
+    pub fn notify_delivery_failed(notifier_alias: &str, attempts: usize) -> Self {
+        Self {
+            code: ErrorCode::NotifyDeliveryFailed,
+            message: format!("webhook notifier '{notifier_alias}' did not accept the change"),
+            recovery_command: Some(format!(
+                "check notifiers.{notifier_alias} and retry satelle notify"
+            )),
+            source_detail: None,
+            details: BTreeMap::from([
+                (
+                    "notifier".to_string(),
+                    Value::String(notifier_alias.to_string()),
+                ),
+                ("attempts".to_string(), Value::from(attempts)),
+            ]),
         }
     }
 

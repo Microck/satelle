@@ -174,6 +174,7 @@ impl Command {
     pub(super) fn output_request(&self) -> (OutputArgs, EventOutput) {
         match self {
             Self::Batch(_) => (OutputArgs::default(), EventOutput::None),
+            Self::Watch(_) | Self::Notify(_) => (OutputArgs::default(), EventOutput::None),
             Self::Completions(_) => (OutputArgs::default(), EventOutput::None),
             Self::Setup(command) => (command.output_args, EventOutput::None),
             Self::Repair(command) => (command.output_args, EventOutput::None),
@@ -234,7 +235,7 @@ impl Command {
     }
 
     pub(super) fn requests_machine_errors(&self) -> bool {
-        if matches!(self, Self::Batch(_)) {
+        if matches!(self, Self::Batch(_) | Self::Watch(_) | Self::Notify(_)) {
             return true;
         }
         let (output, events) = self.output_request();

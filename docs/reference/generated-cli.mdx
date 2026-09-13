@@ -22,6 +22,7 @@ public Satelle result and event schema sources. CI rejects hand-edited or stale 
 | `HostSessionsSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.host.sessions.v1` |
 | `HOST_UPDATE_PLAIN_SCHEMA_VERSION` | `crates/satelle-cli/src/output.rs` | `satelle.host.update.plain.v1` |
 | `LogEntrySchema` | `crates/satelle-host/src/log-page.rs` | `satelle.logs.entry.v2` |
+| `NOTIFY_WEBHOOK_SCHEMA_VERSION` | `crates/satelle-cli/src/automation.rs` | `satelle.notify.webhook.v1` |
 | `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.run.v2` |
 | `SetupSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.setup.v2` |
 | `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.status.v2` |
@@ -29,6 +30,7 @@ public Satelle result and event schema sources. CI rejects hand-edited or stale 
 | `StopSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.stop.v1` |
 | `SUPPORT_BUNDLE_SCHEMA_VERSION` | `crates/satelle-cli/src/support.rs` | `satelle.support.bundle.v1` |
 | `TELEMETRY_STATUS_SCHEMA_VERSION` | `crates/satelle-core/src/telemetry.rs` | `satelle.telemetry.status.v1` |
+| `WATCH_CHANGE_SCHEMA_VERSION` | `crates/satelle-cli/src/automation.rs` | `satelle.watch.change.v1` |
 
 ## `satelle`
 
@@ -39,6 +41,8 @@ Usage: satelle [OPTIONS] <COMMAND>
 
 Commands:
   batch        Execute versioned NDJSON command requests with bounded concurrency
+  watch        Emit versioned NDJSON records when selected Satelle state changes
+  notify       Deliver selected Satelle state changes to a user-owned webhook
   completions
   setup
   repair
@@ -114,6 +118,71 @@ Options:
       --profile <NAME>             Apply a named user-level configuration profile
       --error-format <FORMAT>      Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
   -h, --help                       Print help
+```
+
+## `satelle watch`
+
+```text
+Emit versioned NDJSON records when selected Satelle state changes
+
+Usage: satelle watch [OPTIONS] <TARGET>
+
+Arguments:
+  <TARGET>  [possible values: sessions, logs, doctor, host]
+
+Options:
+      --host <HOST>
+          Read state from this configured Host
+      --no-color
+          Disable colored human output
+      --log-verbosity <LEVEL>
+          Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --session <SESSION>
+          Include only log entries for this Session
+      --interval <INTERVAL>
+          Delay between successful polls, such as 500ms or 2s [default: 2s]
+      --profile <NAME>
+          Apply a named user-level configuration profile
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --reconnect-attempts <RECONNECT_ATTEMPTS>
+          Consecutive failed polls allowed before the watch stops [default: 8]
+  -h, --help
+          Print help
+```
+
+## `satelle notify`
+
+```text
+Deliver selected Satelle state changes to a user-owned webhook
+
+Usage: satelle notify [OPTIONS] --watch <WATCH> --webhook <WEBHOOK>
+
+Options:
+      --no-color
+          Disable colored human output
+      --watch <WATCH>
+          Satelle state category to watch [possible values: sessions, logs, doctor, host]
+      --log-verbosity <LEVEL>
+          Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --webhook <WEBHOOK>
+          User-level webhook notifier alias
+      --host <HOST>
+          Read state from this configured Host
+      --profile <NAME>
+          Apply a named user-level configuration profile
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --session <SESSION>
+          Include only log entries for this Session
+      --interval <INTERVAL>
+          Delay between successful polls, such as 500ms or 2s [default: 2s]
+      --reconnect-attempts <RECONNECT_ATTEMPTS>
+          Consecutive failed polls allowed before the notification watch stops [default: 8]
+      --dry-run
+          Print webhook payloads without making network requests
+  -h, --help
+          Print help
 ```
 
 ## `satelle completions`

@@ -62,7 +62,7 @@ impl ConfigSources {
         // User-owned bindings and profiles replace complete objects. Drop their
         // previous field origins together with the values they used to describe.
         if file.source == ConfigSourceKind::UserConfig {
-            for namespace in ["hosts", "profiles", "trusted_profiles"] {
+            for namespace in ["hosts", "notifiers", "profiles", "trusted_profiles"] {
                 if let Some(entries) = value.get(namespace).and_then(toml::Value::as_table) {
                     for name in entries.keys() {
                         let prefix = format!("{namespace}.{}.", config_toml_key(name));

@@ -412,7 +412,8 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         ErrorCode::HostUnreachable
         | ErrorCode::HostDaemonUnreachable
         | ErrorCode::DirectDaemonUnreachable
-        | ErrorCode::LogsFollowReconnectExhausted => ErrorContract {
+        | ErrorCode::LogsFollowReconnectExhausted
+        | ErrorCode::WatchReconnectExhausted => ErrorContract {
             category: ErrorCategory::RemoteExecution,
             retryable: true,
             outcome: "The Host could not be reached.",
@@ -423,6 +424,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             retryable: false,
             outcome: "One or more batch items failed.",
             default_recovery: "inspect the item results and retry only the failed requests",
+        },
+        ErrorCode::NotifyDeliveryFailed => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: true,
+            outcome: "The webhook did not accept the notification.",
+            default_recovery: "check the user-level notifier configuration and retry the command",
         },
         ErrorCode::RemoteExecution => ErrorContract {
             category: ErrorCategory::RemoteExecution,
