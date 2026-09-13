@@ -1781,9 +1781,21 @@ fn native_smoke_failure(reason: &'static str) -> NativeSmokeFailure {
 
 fn native_smoke_session_failure(failure: CodexSessionFailure) -> NativeSmokeFailure {
     let reason = match failure.error() {
+        CodexSessionError::Spawn => "native_readiness_spawn_failed",
+        CodexSessionError::Write => "native_readiness_write_failed",
+        CodexSessionError::MalformedMessage => "native_readiness_malformed_message",
+        CodexSessionError::OversizedMessage => "native_readiness_oversized_message",
+        CodexSessionError::UnexpectedResponse => "native_readiness_unexpected_response",
+        CodexSessionError::DuplicateResponse => "native_readiness_duplicate_response",
+        CodexSessionError::ResponseError => "native_readiness_response_error",
+        CodexSessionError::YoloNotSupported => "native_readiness_yolo_not_supported",
+        CodexSessionError::ConflictingIdentity => "native_readiness_conflicting_identity",
+        CodexSessionError::PrematureExit => "native_readiness_premature_exit",
         CodexSessionError::Timeout => "native_readiness_timed_out",
         CodexSessionError::Persistence => "native_readiness_persistence_failed",
-        _ => "native_readiness_session_failed",
+        CodexSessionError::Containment => "native_readiness_containment_failed",
+        CodexSessionError::Control => "native_readiness_control_failed",
+        CodexSessionError::NativeActionUnavailable => "native_readiness_native_action_unavailable",
     };
     NativeSmokeFailure {
         reason,
@@ -3340,7 +3352,11 @@ mod tests {
         let failure = classify_native_probe_failure_before_action_wait(&run)
             .expect("a terminal session failure cannot produce native readiness");
 
-        assert_eq!(failure.reason, "native_readiness_session_failed");
+        assert_eq!(failure.reason, "native_readiness_response_error");
+        assert_eq!(
+            failure.error.details["reason"],
+            "native_readiness_response_error"
+        );
         assert!(failure.dispatch_possible);
     }
 
@@ -4369,6 +4385,68 @@ mod tests {
             false,
         );
         assert!(!probe_dispatch_possible(&terminal_provider));
+    }
+
+    #[test]
+    fn native_readiness_preserves_closed_codex_failure_reasons() {
+        for (error, expected_reason) in [
+            (CodexSessionError::Spawn, "native_readiness_spawn_failed"),
+            (CodexSessionError::Write, "native_readiness_write_failed"),
+            (
+                CodexSessionError::MalformedMessage,
+                "native_readiness_malformed_message",
+            ),
+            (
+                CodexSessionError::OversizedMessage,
+                "native_readiness_oversized_message",
+            ),
+            (
+                CodexSessionError::UnexpectedResponse,
+                "native_readiness_unexpected_response",
+            ),
+            (
+                CodexSessionError::DuplicateResponse,
+                "native_readiness_duplicate_response",
+            ),
+            (
+                CodexSessionError::ResponseError,
+                "native_readiness_response_error",
+            ),
+            (
+                CodexSessionError::YoloNotSupported,
+                "native_readiness_yolo_not_supported",
+            ),
+            (
+                CodexSessionError::ConflictingIdentity,
+                "native_readiness_conflicting_identity",
+            ),
+            (
+                CodexSessionError::PrematureExit,
+                "native_readiness_premature_exit",
+            ),
+            (CodexSessionError::Timeout, "native_readiness_timed_out"),
+            (
+                CodexSessionError::Persistence,
+                "native_readiness_persistence_failed",
+            ),
+            (
+                CodexSessionError::Containment,
+                "native_readiness_containment_failed",
+            ),
+            (
+                CodexSessionError::Control,
+                "native_readiness_control_failed",
+            ),
+            (
+                CodexSessionError::NativeActionUnavailable,
+                "native_readiness_native_action_unavailable",
+            ),
+        ] {
+            let failure =
+                native_smoke_session_failure(CodexSessionFailure::after_exchange(error, true));
+            assert_eq!(failure.reason, expected_reason);
+            assert_eq!(failure.error.details["reason"], expected_reason);
+        }
     }
 
     #[test]
