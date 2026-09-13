@@ -170,11 +170,11 @@
 - satelle later exposes an interactive REPL for repeated run, steer, status, logs, doctor, and config inspection against one selected context @spec @later
 - satelle repl is the exact Automation Workflow command and requires an interactive terminal @spec @later
 - satelle later REPL export writes a redacted local transcript of commands, structured outputs, and stable session identifiers without including raw prompts unless the user explicitly requests prompt inclusion @spec @later
-- satelle later exposes batch automation for running multiple Satelle operations with bounded concurrency, rate limits, per-item outcomes, and a final aggregate summary @spec @later
-- satelle batch --input <path|-> is the exact batch command and reads one satelle.batch.request.v1 JSON object per input line from a file or standard input @spec @contract @later
-- satelle batch emits one satelle.batch.result.v1 JSON record per input item followed by one satelle.batch.summary.v1 record, preserving input order for result records even when execution completes out of order @spec @contract @later
-- satelle batch defaults to 4 concurrent items, accepts --concurrency values from 1 through 16, and never exceeds the selected Host's admission and API rate limits @spec @later
-- satelle batch automation never bypasses host-busy, setup consent, YOLO, Trusted Profile, provider auth, or native Computer Use readiness rules that would apply to each individual command @spec @later
+- satelle exposes batch automation for running multiple Satelle operations with bounded concurrency, rate limits, per-item outcomes, and a final aggregate summary @spec @phase4 @implemented
+- satelle batch --input <path|-> is the exact batch command and reads one satelle.batch.request.v1 JSON object per input line from a file or standard input @spec @contract @phase4 @implemented
+- satelle batch emits one satelle.batch.result.v1 JSON record per input item followed by one satelle.batch.summary.v1 record, preserving input order for result records even when execution completes out of order @spec @contract @phase4 @implemented
+- satelle batch defaults to 4 concurrent items, accepts --concurrency values from 1 through 16, and never exceeds the selected Host's admission and API rate limits @spec @phase4 @implemented
+- satelle batch automation never bypasses host-busy, setup consent, YOLO, Trusted Profile, provider auth, or native Computer Use readiness rules that would apply to each individual command @spec @phase4 @implemented
 - satelle later exposes watch automation for polling or streaming session, log, doctor, or host state changes and emitting changed records only when requested @spec @later
 - satelle watch <sessions|logs|doctor|host> is the exact watch command and emits versioned NDJSON change records until interrupted or its reconnect budget is exhausted @spec @contract @later
 - satelle later exposes notify automation for sending selected Satelle state changes to a configured webhook with change-only delivery, bounded retries, and redacted payloads @spec @later

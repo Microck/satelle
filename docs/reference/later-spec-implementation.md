@@ -33,13 +33,36 @@ those pull requests merge, the integration branch gets a final pull request to
 | Opt-in telemetry | Independent Controller and Host OTLP/HTTP export with private bounded queues | Merged in PR #244 |
 | Recording | Per-Turn recording modes and export policy | Merged in PR #245 |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Merged in PR #247 |
-| Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | PR #252 |
-| Automation | Batch, watch, webhook notifications, REPL, command history | Pending |
+| Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Merged in PR #252 |
+| Automation | Batch, watch, webhook notifications, REPL, command history | Batch in progress |
 | Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Pending |
 
 Package repository submissions, staged npm publishing, and native action relay
 retain the prerequisites declared in `.facts`. A missing external capability
 or approval is a blocker, never proof of implementation.
+
+## Batch automation contract
+
+`satelle batch --input <path|->` reads one JSON object per line. Each object has
+this closed shape:
+
+```json
+{"schema_version":"satelle.batch.request.v1","request_id":"check-office","arguments":["doctor","--host","office"]}
+```
+
+`arguments` starts with a normal Satelle command. Batch supplies compact JSON
+output and JSON errors. A request cannot override those output selectors or
+start another batch, watch, notify, or REPL workflow. Each command runs in a
+separate Satelle process with standard input closed. Existing config, profile,
+Trusted Profile, consent, provider, Host admission, API rate, YOLO, and native
+readiness checks still apply.
+
+The command runs four items at a time by default. `--concurrency` accepts 1
+through 16. Results always follow input order and use
+`satelle.batch.result.v1`, even when workers finish in another order. The last
+line is one `satelle.batch.summary.v1` record. A partial failure returns process
+status 1 after writing every item result and the summary. Request objects and
+raw prompt arguments are never copied into output records.
 
 ## Opt-in telemetry decisions
 

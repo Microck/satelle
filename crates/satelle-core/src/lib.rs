@@ -5366,6 +5366,7 @@ pub enum ErrorCode {
     LogsTargetRequired,
     LogsFollowIdentityChanged,
     LogsFollowReconnectExhausted,
+    BatchPartialFailure,
     CapacityExceeded,
     ConcurrencyLimitExceeded,
     ConcurrencyWithoutRemoteUpdate,
@@ -5547,6 +5548,7 @@ impl ErrorCode {
             Self::LogsTargetRequired => "logs-target-required",
             Self::LogsFollowIdentityChanged => "logs-follow-identity-changed",
             Self::LogsFollowReconnectExhausted => "logs-follow-reconnect-exhausted",
+            Self::BatchPartialFailure => "batch-partial-failure",
             Self::CapacityExceeded => "capacity-exceeded",
             Self::ConcurrencyLimitExceeded => "concurrency-limit-exceeded",
             Self::ConcurrencyWithoutRemoteUpdate => "concurrency-without-remote-update",
@@ -5715,6 +5717,7 @@ impl ErrorCode {
             | Self::CredentialHelperTimeout
             | Self::ProviderSecretResolutionFailed
             | Self::QueuedPrincipalNoLongerAuthorized
+            | Self::BatchPartialFailure
             | Self::SelfUpdateRollbackFailed
             | Self::SelfUpdateVerificationFailed
             | Self::SelfUpdateFailed => 74,
@@ -7270,6 +7273,20 @@ impl SatelleError {
             code: ErrorCode::LogsFollowReconnectExhausted,
             message: "log follow reconnect budget was exhausted".to_string(),
             recovery_command: Some(rerun_command.to_string()),
+            source_detail: None,
+            details,
+        }
+    }
+
+    pub fn batch_partial_failure(failed: usize) -> Self {
+        let mut details = BTreeMap::new();
+        details.insert("failed".to_string(), Value::from(failed));
+        Self {
+            code: ErrorCode::BatchPartialFailure,
+            message: format!("{failed} batch item(s) failed"),
+            recovery_command: Some(
+                "inspect the item results and retry only the failed requests".to_string(),
+            ),
             source_detail: None,
             details,
         }

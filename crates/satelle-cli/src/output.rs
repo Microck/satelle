@@ -1,4 +1,5 @@
 use clap::builder::{PossibleValuesParser, TypedValueParser};
+use clap::parser::ValueSource;
 use clap::{ArgMatches, Args, ValueEnum};
 use satelle_core::session::{PublicSession, PublicTurn, TurnState};
 use satelle_core::{ErrorCode, SatelleError, SessionId};
@@ -172,6 +173,7 @@ impl Command {
     // that a descendant does not support.
     pub(super) fn output_request(&self) -> (OutputArgs, EventOutput) {
         match self {
+            Self::Batch(_) => (OutputArgs::default(), EventOutput::None),
             Self::Completions(_) => (OutputArgs::default(), EventOutput::None),
             Self::Setup(command) => (command.output_args, EventOutput::None),
             Self::Repair(command) => (command.output_args, EventOutput::None),
@@ -232,6 +234,9 @@ impl Command {
     }
 
     pub(super) fn requests_machine_errors(&self) -> bool {
+        if matches!(self, Self::Batch(_)) {
+            return true;
+        }
         let (output, events) = self.output_request();
         output.requests_machine() || events.requests_json_errors()
     }
@@ -248,6 +253,7 @@ pub(crate) fn partial_requests_machine_errors(matches: &ArgMatches) -> bool {
     }
 
     match matches.subcommand() {
+        Some(("batch", _)) => true,
         Some(("run" | "steer", command)) => {
             parsed_output_selector(command)
                 || command
@@ -268,6 +274,20 @@ pub(crate) fn partial_requests_machine_errors(matches: &ArgMatches) -> bool {
         Some((_, command)) => partial_requests_machine_errors(command),
         None => false,
     }
+}
+
+/// Detects only selectors supplied as options, preserving Clap's handling of
+/// global options, defaults, environment values, and the `--` delimiter.
+pub(crate) fn has_explicit_output_selector(matches: &ArgMatches) -> bool {
+    ["json", "format", "error_format", "events"]
+        .iter()
+        .any(|id| {
+            matches.try_get_raw(id).ok().flatten().is_some()
+                && matches.value_source(id) == Some(ValueSource::CommandLine)
+        })
+        || matches
+            .subcommand()
+            .is_some_and(|(_, command)| has_explicit_output_selector(command))
 }
 
 fn parsed_output_selector(matches: &ArgMatches) -> bool {

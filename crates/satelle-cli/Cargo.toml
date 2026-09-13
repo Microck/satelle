@@ -92,6 +92,11 @@ path = "tests/command-history.rs"
 required-features = ["test-support"]
 
 [[test]]
+name = "automation"
+path = "tests/automation.rs"
+required-features = ["test-support"]
+
+[[test]]
 name = "mcp"
 path = "tests/mcp.rs"
 required-features = ["test-support"]

@@ -418,6 +418,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The Host could not be reached.",
             default_recovery: "run satelle doctor --scope transport and retry the command",
         },
+        ErrorCode::BatchPartialFailure => ErrorContract {
+            category: ErrorCategory::RemoteExecution,
+            retryable: false,
+            outcome: "One or more batch items failed.",
+            default_recovery: "inspect the item results and retry only the failed requests",
+        },
         ErrorCode::RemoteExecution => ErrorContract {
             category: ErrorCategory::RemoteExecution,
             retryable: true,
