@@ -102,6 +102,17 @@ impl OutputFormat {
         !matches!(self, Self::Human)
     }
 
+    pub(crate) const fn cli_name(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Json => "json",
+            Self::CompactJson => "compact-json",
+            Self::Toon => "toon",
+            Self::Markdown => "markdown",
+            Self::Csv => "csv",
+        }
+    }
+
     pub(crate) fn print(self, value: &impl Serialize) -> Result<(), SatelleError> {
         self.write(&mut std::io::stdout().lock(), value)
     }
@@ -173,7 +184,7 @@ impl Command {
     // that a descendant does not support.
     pub(super) fn output_request(&self) -> (OutputArgs, EventOutput) {
         match self {
-            Self::Batch(_) => (OutputArgs::default(), EventOutput::None),
+            Self::Batch(_) | Self::Repl(_) => (OutputArgs::default(), EventOutput::None),
             Self::Watch(_) | Self::Notify(_) => (OutputArgs::default(), EventOutput::None),
             Self::Completions(_) => (OutputArgs::default(), EventOutput::None),
             Self::Setup(command) => (command.output_args, EventOutput::None),

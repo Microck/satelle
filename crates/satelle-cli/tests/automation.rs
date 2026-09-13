@@ -200,3 +200,29 @@ fn notify_requires_a_user_owned_webhook_alias_before_watching() {
     assert_eq!(error["code"], "configuration-error");
     assert!(!error.to_string().contains("authorization"));
 }
+
+#[test]
+fn repl_requires_all_three_interactive_terminal_streams() {
+    let state = TestStateDir::new().expect("secure state directory");
+    let transcript = state.path().join("transcript.ndjson");
+    let output = satelle()
+        .env("SATELLE_HOME", state.path().join("home"))
+        .args(["repl", "--export"])
+        .arg(&transcript)
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("requires interactive standard input, output, and error terminals")
+    );
+    assert!(!transcript.exists());
+
+    satelle()
+        .args(["repl", "--include-prompts"])
+        .assert()
+        .code(64);
+}

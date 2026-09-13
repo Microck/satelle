@@ -34,7 +34,7 @@ those pull requests merge, the integration branch gets a final pull request to
 | Recording | Per-Turn recording modes and export policy | Merged in PR #245 |
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Merged in PR #247 |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Merged in PR #252 |
-| Automation | Batch, watch, webhook notifications, REPL, command history | Batch merged in PR #256; watch and notify in progress |
+| Automation | Batch, watch, webhook notifications, REPL, command history | Batch merged in PR #256; watch and notify merged in PR #257; REPL in progress |
 | Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Pending |
 
 Package repository submissions, staged npm publishing, and native action relay
@@ -63,6 +63,28 @@ through 16. Results always follow input order and use
 line is one `satelle.batch.summary.v1` record. A partial failure returns process
 status 1 after writing every item result and the summary. Request objects and
 raw prompt arguments are never copied into output records.
+
+## Interactive REPL contract
+
+`satelle repl --host <alias>` opens one terminal-only Automation Workflow for
+repeated `run`, `steer`, `status`, `logs`, `doctor`, `config check`, and
+`config explain` commands. Lines use shell-style quoting and omit the `satelle`
+executable name. `help` lists the accepted commands; `exit`, `quit`, or end of
+input closes the REPL. Each command inherits the REPL's resolved Host, global
+profile, color choice, and normal authority, consent, admission, and safety
+checks. Per-line Host, profile, output, repair, all-Host, and nested automation
+overrides are rejected. Ctrl-C interrupts an active child command and returns
+to the REPL prompt.
+
+`--export <path>` creates a new owner-only NDJSON transcript and never replaces
+an existing path. Each `satelle.repl.transcript.v1` record contains the redacted
+command, selected Host, process status, duration, structured output and errors,
+and deduplicated stable Session identifiers. Inline run and steer prompts and
+path-bearing prompt, image, remote-image, and diagnostic arguments are redacted.
+`--include-prompts` preserves inline prompts and is accepted only with
+`--export`. Terminal output stays live. A stream larger than the 8 MiB capture
+limit produces a typed transcript error for that command, then the REPL
+continues.
 
 ## Watch and webhook notification contract
 

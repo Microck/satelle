@@ -1,14 +1,17 @@
 use crate::error_output::error_envelope;
-use crate::output::has_explicit_output_selector;
+use crate::output::{OutputFormat, has_explicit_output_selector};
 use crate::transport::process_interrupt_signal;
-use crate::{Cli, Command as SatelleCommand};
+use crate::{Cli, Command as SatelleCommand, ConfigCommand};
 use clap::{Args, CommandFactory, FromArgMatches, ValueEnum};
 use command_group::CommandGroup as _;
-use satelle_core::{ExplicitDuration, SatelleError, WebhookNotifierConfig, utc_now};
+use satelle_core::{
+    ExplicitDuration, SatelleError, WebhookNotifierConfig, open_new_owner_only_file, utc_now,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
@@ -18,6 +21,7 @@ use std::time::{Duration, Instant};
 const BATCH_REQUEST_SCHEMA_VERSION: &str = "satelle.batch.request.v1";
 const BATCH_RESULT_SCHEMA_VERSION: &str = "satelle.batch.result.v1";
 const BATCH_SUMMARY_SCHEMA_VERSION: &str = "satelle.batch.summary.v1";
+pub(crate) const REPL_TRANSCRIPT_SCHEMA_VERSION: &str = "satelle.repl.transcript.v1";
 pub(crate) const WATCH_CHANGE_SCHEMA_VERSION: &str = "satelle.watch.change.v1";
 pub(crate) const NOTIFY_WEBHOOK_SCHEMA_VERSION: &str = "satelle.notify.webhook.v1";
 const DEFAULT_WATCH_INTERVAL: &str = "2s";
@@ -26,6 +30,7 @@ const MAX_RECONNECT_ATTEMPTS: usize = 100;
 const MAX_WEBHOOK_ATTEMPTS: usize = 3;
 const WATCH_POLL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const WATCH_POLL_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+const REPL_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
 pub(crate) const AUTOMATION_POLL_ENV: &str = "SATELLE_AUTOMATION_POLL";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
@@ -147,6 +152,25 @@ pub(crate) struct BatchCommand {
     concurrency: usize,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct ReplCommand {
+    /// Select the Host used by every command in this REPL.
+    #[arg(long)]
+    host: Option<String>,
+    /// Write one redacted versioned NDJSON record per executed command.
+    #[arg(long, value_name = "PATH")]
+    export: Option<PathBuf>,
+    /// Preserve inline run and steer prompts in the exported transcript.
+    #[arg(long, requires = "export")]
+    include_prompts: bool,
+}
+
+impl ReplCommand {
+    pub(crate) fn host(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+}
+
 fn parse_batch_concurrency(raw: &str) -> Result<usize, String> {
     let value = raw
         .parse::<usize>()
@@ -205,12 +229,6 @@ impl AutomationContext {
         command.args(self.machine_arguments());
         command
     }
-
-    fn finish_machine_command(&self, command: &mut ProcessCommand) {
-        command
-            .args(["--format", "compact-json"])
-            .stdin(Stdio::null());
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,7 +256,7 @@ enum RequestState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum BatchResultStatus {
+enum AutomationResultStatus {
     Success,
     Failure,
 }
@@ -248,7 +266,7 @@ struct BatchResult {
     schema_version: &'static str,
     index: usize,
     request_id: Option<String>,
-    status: BatchResultStatus,
+    status: AutomationResultStatus,
     exit_code: Option<i32>,
     duration_ms: u64,
     output: Vec<Value>,
@@ -293,6 +311,521 @@ struct WebhookPayload<'a> {
     schema_version: &'static str,
     notifier: &'a str,
     change: &'a WatchChange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplCommandKind {
+    Run,
+    Steer,
+    Status,
+    Logs,
+    Doctor,
+    ConfigCheck,
+    ConfigExplain,
+}
+
+impl ReplCommandKind {
+    const fn host_argument_index(self) -> usize {
+        match self {
+            Self::ConfigCheck | Self::ConfigExplain => 2,
+            Self::Run | Self::Steer | Self::Status | Self::Logs | Self::Doctor => 1,
+        }
+    }
+
+    const fn output_format(self) -> OutputFormat {
+        if matches!(self, Self::Logs) {
+            OutputFormat::Json
+        } else {
+            OutputFormat::CompactJson
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ParsedReplCommand {
+    arguments: Vec<String>,
+    kind: ReplCommandKind,
+    prompt_index: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReplTranscriptRecord {
+    schema_version: &'static str,
+    sequence: u64,
+    host: String,
+    command: Vec<String>,
+    status: AutomationResultStatus,
+    exit_code: Option<i32>,
+    started_at: String,
+    duration_ms: u64,
+    output: Vec<Value>,
+    errors: Vec<Value>,
+    session_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ReplStreamCapture {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+#[cfg(unix)]
+struct ReplChildInterruptGuard {
+    previous: libc::sigaction,
+}
+
+#[cfg(unix)]
+impl ReplChildInterruptGuard {
+    fn install() -> Result<Self, SatelleError> {
+        unsafe extern "C" fn retain_parent(_: libc::c_int) {}
+
+        // A caught disposition resets to the default across exec, so the child
+        // still receives Ctrl-C while this REPL parent remains alive.
+        let mut handler = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        handler.sa_sigaction = retain_parent as *const () as usize;
+        handler.sa_flags = libc::SA_RESTART;
+        if unsafe { libc::sigemptyset(&mut handler.sa_mask) } != 0 {
+            return Err(repl_io_error(io::Error::last_os_error()));
+        }
+        let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        if unsafe { libc::sigaction(libc::SIGINT, &handler, &mut previous) } != 0 {
+            return Err(repl_io_error(io::Error::last_os_error()));
+        }
+        Ok(Self { previous })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReplChildInterruptGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ReplChildInterruptGuard;
+
+#[cfg(windows)]
+impl ReplChildInterruptGuard {
+    fn install() -> Result<Self, SatelleError> {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+        if unsafe { SetConsoleCtrlHandler(Some(retain_repl_parent), 1) } == 0 {
+            return Err(repl_io_error(io::Error::last_os_error()));
+        }
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ReplChildInterruptGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+        unsafe {
+            SetConsoleCtrlHandler(Some(retain_repl_parent), 0);
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn retain_repl_parent(control: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+
+    i32::from(matches!(control, CTRL_C_EVENT | CTRL_BREAK_EVENT))
+}
+
+pub(crate) fn run_repl(
+    command: ReplCommand,
+    context: AutomationContext,
+    selected_host: String,
+) -> Result<(), SatelleError> {
+    let mut transcript = command
+        .export
+        .as_deref()
+        .map(|path| {
+            open_new_owner_only_file(path).map_err(|error| {
+                SatelleError::invalid_usage(format!(
+                    "could not create owner-only REPL transcript '{}': {error}",
+                    path.display()
+                ))
+            })
+        })
+        .transpose()?;
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    // Do not retain stderr's lock while a child is active. The live child
+    // reader tees its structured error stream to the same terminal.
+    let mut prompt_writer = io::stderr();
+    let mut line = String::new();
+    let mut sequence = 0_u64;
+    let mut parser = Cli::command();
+
+    writeln!(
+        prompt_writer,
+        "Satelle REPL for Host {selected_host}. Type help for commands or exit to leave."
+    )
+    .map_err(repl_io_error)?;
+    loop {
+        write!(prompt_writer, "satelle[{selected_host}]> ").map_err(repl_io_error)?;
+        prompt_writer.flush().map_err(repl_io_error)?;
+        line.clear();
+        if input.read_line(&mut line).map_err(repl_io_error)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if matches!(trimmed, "exit" | "quit") {
+            break;
+        }
+        if trimmed == "help" {
+            writeln!(
+                prompt_writer,
+                "commands: run, steer, status, logs, doctor, config check, config explain, help, exit, quit"
+            )
+            .map_err(repl_io_error)?;
+            continue;
+        }
+
+        let parsed = match parse_repl_command_with(&mut parser, trimmed, transcript.is_some()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                writeln!(prompt_writer, "error: {}", error.message).map_err(repl_io_error)?;
+                continue;
+            }
+        };
+        sequence = sequence.saturating_add(1);
+        let record = execute_repl_command(
+            parsed,
+            &context,
+            &selected_host,
+            command.include_prompts,
+            transcript.is_some(),
+            sequence,
+        )?;
+        if let (Some(file), Some(record)) = (transcript.as_mut(), record.as_ref()) {
+            write_record(file, record)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_repl_terminal() -> Result<(), SatelleError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
+        return Err(SatelleError::invalid_usage(
+            "satelle repl requires interactive standard input, output, and error terminals",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn parse_repl_command(line: &str, exporting: bool) -> Result<ParsedReplCommand, SatelleError> {
+    parse_repl_command_with(&mut Cli::command(), line, exporting)
+}
+
+fn parse_repl_command_with(
+    parser: &mut clap::Command,
+    line: &str,
+    exporting: bool,
+) -> Result<ParsedReplCommand, SatelleError> {
+    let arguments = shlex::split(line)
+        .ok_or_else(|| SatelleError::invalid_usage("REPL command contains an unclosed quote"))?;
+    let Some(family) = arguments.first().map(String::as_str) else {
+        return Err(SatelleError::invalid_usage("REPL command is empty"));
+    };
+    if !matches!(
+        family,
+        "run" | "steer" | "status" | "logs" | "doctor" | "config"
+    ) {
+        return Err(SatelleError::invalid_usage(
+            "REPL accepts only run, steer, status, logs, doctor, config check, and config explain",
+        ));
+    }
+
+    let matches = parser
+        .try_get_matches_from_mut(
+            std::iter::once("satelle").chain(arguments.iter().map(String::as_str)),
+        )
+        .map_err(|_| {
+            SatelleError::invalid_usage("REPL command contains invalid Satelle arguments")
+        })?;
+    if has_explicit_output_selector(&matches) {
+        return Err(SatelleError::invalid_usage(
+            "REPL commands cannot override machine output selectors",
+        ));
+    }
+    // Clap's positional index identifies the prompt even when an option value
+    // contains the same text. Clap does not count `--`, so map its index back
+    // to the entered token list before transcript redaction.
+    let prompt_index = if matches!(family, "run" | "steer") {
+        let parsed_index = matches
+            .subcommand()
+            .and_then(|(_, command)| command.indices_of("prompt"))
+            .and_then(|mut indices| indices.next_back());
+        parsed_index.map(|index| {
+            if arguments
+                .iter()
+                .position(|argument| argument == "--")
+                .is_some_and(|delimiter| delimiter <= index)
+            {
+                index + 1
+            } else {
+                index
+            }
+        })
+    } else {
+        None
+    };
+    let parsed = Cli::from_arg_matches(&matches).map_err(|_| {
+        SatelleError::invalid_usage("REPL command contains invalid Satelle arguments")
+    })?;
+    if parsed.profile.is_some() || parsed.no_color || parsed.log_verbosity.is_some() {
+        return Err(SatelleError::invalid_usage(
+            "REPL commands cannot override the selected profile or global display settings",
+        ));
+    }
+
+    let kind = match parsed.command {
+        SatelleCommand::Run(command) if command.host.is_none() => ReplCommandKind::Run,
+        SatelleCommand::Steer(command) if command.host.is_none() => ReplCommandKind::Steer,
+        SatelleCommand::Status(command) if command.host.is_none() => ReplCommandKind::Status,
+        SatelleCommand::Logs(command) if command.history_host().is_none() => ReplCommandKind::Logs,
+        SatelleCommand::Doctor(command) if command.host.is_none() && !command.fix => {
+            ReplCommandKind::Doctor
+        }
+        SatelleCommand::Config {
+            command: ConfigCommand::Check(command),
+        } if command.host.is_none() && !command.all => ReplCommandKind::ConfigCheck,
+        SatelleCommand::Config {
+            command: ConfigCommand::Explain(command),
+        } if command.host.is_none() && !(exporting && command.show_secret_references) => {
+            ReplCommandKind::ConfigExplain
+        }
+        _ => {
+            return Err(SatelleError::invalid_usage(
+                "REPL commands must use the selected Host and cannot start repair, all-Host, or nested automation work",
+            ));
+        }
+    };
+    Ok(ParsedReplCommand {
+        arguments,
+        kind,
+        prompt_index,
+    })
+}
+
+fn execute_repl_command(
+    parsed: ParsedReplCommand,
+    context: &AutomationContext,
+    selected_host: &str,
+    include_prompts: bool,
+    capture_transcript: bool,
+    sequence: u64,
+) -> Result<Option<ReplTranscriptRecord>, SatelleError> {
+    let transcript_metadata = capture_transcript.then(|| {
+        (
+            Instant::now(),
+            utc_now(),
+            redact_repl_command(&parsed, include_prompts),
+        )
+    });
+    let mut arguments = parsed.arguments;
+    arguments.splice(
+        parsed.kind.host_argument_index()..parsed.kind.host_argument_index(),
+        ["--host".to_string(), selected_host.to_string()],
+    );
+    let mut child = context.machine_command();
+    append_machine_command_arguments(&mut child, &arguments, parsed.kind.output_format());
+    let _interrupt_guard = ReplChildInterruptGuard::install()?;
+    if !capture_transcript {
+        child
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        child.status().map_err(|error| {
+            SatelleError::invalid_usage(format!("could not execute REPL command: {error}"))
+        })?;
+        return Ok(None);
+    }
+    child
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child.spawn().map_err(|error| {
+        SatelleError::invalid_usage(format!("could not execute REPL command: {error}"))
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .expect("REPL child standard output is piped");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("REPL child standard error is piped");
+    let (status, stdout, stderr) = std::thread::scope(|scope| {
+        let stdout = scope.spawn(move || read_and_tee_repl_stream(stdout, false));
+        let stderr = scope.spawn(move || read_and_tee_repl_stream(stderr, true));
+        let status = child.wait();
+        if status.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let stdout = stdout
+            .join()
+            .map_err(|_| SatelleError::invalid_usage("REPL output reader panicked"))??;
+        let stderr = stderr
+            .join()
+            .map_err(|_| SatelleError::invalid_usage("REPL error reader panicked"))??;
+        let status = status.map_err(repl_io_error)?;
+        Ok::<_, SatelleError>((status, stdout, stderr))
+    })?;
+    let Some((started, started_at, transcript_command)) = transcript_metadata else {
+        return Ok(None);
+    };
+    let (output, mut errors) = machine_stream_values(&stdout.bytes, &stderr.bytes, "REPL command");
+    for (stream, capture) in [("standard output", stdout), ("standard error", stderr)] {
+        if capture.exceeded_limit {
+            errors.push(error_envelope(&SatelleError::invalid_usage(format!(
+                "REPL command {stream} exceeded the {REPL_CAPTURE_LIMIT}-byte transcript limit"
+            ))));
+        }
+    }
+    let mut session_ids = BTreeSet::new();
+    for value in output.iter().chain(&errors) {
+        collect_session_ids(value, &mut session_ids);
+    }
+    let failed = !status.success() || !errors.is_empty();
+    Ok(Some(ReplTranscriptRecord {
+        schema_version: REPL_TRANSCRIPT_SCHEMA_VERSION,
+        sequence,
+        host: selected_host.to_string(),
+        command: transcript_command,
+        status: if failed {
+            AutomationResultStatus::Failure
+        } else {
+            AutomationResultStatus::Success
+        },
+        exit_code: status.code(),
+        started_at,
+        duration_ms: elapsed_millis(started),
+        output,
+        errors,
+        session_ids: session_ids.into_iter().collect(),
+    }))
+}
+
+fn read_and_tee_repl_stream(
+    reader: impl Read,
+    to_stderr: bool,
+) -> Result<ReplStreamCapture, SatelleError> {
+    if to_stderr {
+        read_and_tee_repl_stream_to(reader, io::stderr().lock())
+    } else {
+        read_and_tee_repl_stream_to(reader, io::stdout().lock())
+    }
+}
+
+fn read_and_tee_repl_stream_to(
+    mut reader: impl Read,
+    mut writer: impl Write,
+) -> Result<ReplStreamCapture, SatelleError> {
+    let mut captured = Vec::new();
+    let mut exceeded_limit = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).map_err(repl_io_error)?;
+        if read == 0 {
+            break;
+        }
+        if !exceeded_limit && captured.len().saturating_add(read) <= REPL_CAPTURE_LIMIT {
+            captured.extend_from_slice(&buffer[..read]);
+        } else {
+            exceeded_limit = true;
+            captured = Vec::new();
+        }
+        writer.write_all(&buffer[..read]).map_err(repl_io_error)?;
+        writer.flush().map_err(repl_io_error)?;
+    }
+    Ok(ReplStreamCapture {
+        bytes: captured,
+        exceeded_limit,
+    })
+}
+
+fn redact_repl_command(parsed: &ParsedReplCommand, include_prompts: bool) -> Vec<String> {
+    let mut arguments = parsed.arguments.clone();
+    let option_end = arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(arguments.len());
+    for index in 0..option_end {
+        let flag = arguments[index].as_str();
+        if matches!(
+            flag,
+            "--prompt-file" | "--image" | "--remote-image" | "--output"
+        ) {
+            if let Some(value) = arguments.get_mut(index + 1) {
+                *value = "<redacted>".to_string();
+            }
+        } else if ["--prompt-file=", "--image=", "--remote-image=", "--output="]
+            .iter()
+            .any(|prefix| flag.starts_with(prefix))
+        {
+            let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+            arguments[index] = format!("{name}=<redacted>");
+        }
+    }
+    if !include_prompts
+        && let Some(index) = parsed.prompt_index
+        && arguments.get(index).is_some_and(|prompt| prompt != "-")
+    {
+        arguments[index] = "<redacted>".to_string();
+    }
+    arguments
+}
+
+fn append_machine_command_arguments(
+    command: &mut ProcessCommand,
+    arguments: &[String],
+    format: OutputFormat,
+) {
+    let delimiter = arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(arguments.len());
+    command
+        .args(&arguments[..delimiter])
+        .args(["--format", format.cli_name()])
+        .args(&arguments[delimiter..]);
+}
+
+fn collect_session_ids(value: &Value, session_ids: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(fields) => {
+            if let Some(Value::String(session_id)) = fields.get("session_id") {
+                session_ids.insert(session_id.clone());
+            }
+            for value in fields.values() {
+                collect_session_ids(value, session_ids);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_session_ids(value, session_ids);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn repl_io_error(error: io::Error) -> SatelleError {
+    SatelleError::invalid_usage(format!("REPL input or output failed: {error}"))
 }
 
 pub(crate) fn run_watch(
@@ -613,7 +1146,7 @@ fn poll_watch_state(
     if !status.success() {
         return Err(WatchPollError::Failed);
     }
-    json_values(&stdout, "standard output").map_err(|_| WatchPollError::Failed)
+    json_values(&stdout, "standard output", "watch poll").map_err(|_| WatchPollError::Failed)
 }
 
 fn capture_bounded(mut reader: impl Read) -> io::Result<Option<Vec<u8>>> {
@@ -657,7 +1190,14 @@ fn watch_arguments(command: &WatchCommand, context: &AutomationContext) -> Vec<S
     if let Some(host) = &command.host {
         arguments.extend(["--host".to_string(), host.clone()]);
     }
-    arguments.extend(["--format".to_string(), "compact-json".to_string()]);
+    arguments.extend([
+        "--format".to_string(),
+        if command.target == WatchTarget::Logs {
+            OutputFormat::Json.cli_name().to_string()
+        } else {
+            OutputFormat::CompactJson.cli_name().to_string()
+        },
+    ]);
     arguments
 }
 
@@ -761,7 +1301,7 @@ pub(crate) fn run_batch(
     }
     for result in ordered_results {
         let result = result.expect("every batch request must produce one result");
-        if result.status == BatchResultStatus::Success {
+        if result.status == AutomationResultStatus::Success {
             succeeded += 1;
         } else {
             failed += 1;
@@ -868,7 +1408,10 @@ fn validate_request(index: usize, request: BatchRequest) -> Result<BatchRequest,
     })?;
     if matches!(
         parsed.command,
-        SatelleCommand::Batch(_) | SatelleCommand::Watch(_) | SatelleCommand::Notify(_)
+        SatelleCommand::Batch(_)
+            | SatelleCommand::Repl(_)
+            | SatelleCommand::Watch(_)
+            | SatelleCommand::Notify(_)
     ) {
         return Err(invalid(format!(
             "batch input line {} cannot start another automation workflow",
@@ -887,7 +1430,7 @@ fn execute_request(indexed: &IndexedRequest, context: &AutomationContext) -> Bat
                 schema_version: BATCH_RESULT_SCHEMA_VERSION,
                 index: indexed.index,
                 request_id: request_id.clone(),
-                status: BatchResultStatus::Failure,
+                status: AutomationResultStatus::Failure,
                 exit_code: Some(64),
                 duration_ms: elapsed_millis(started),
                 output: Vec::new(),
@@ -897,31 +1440,21 @@ fn execute_request(indexed: &IndexedRequest, context: &AutomationContext) -> Bat
     };
 
     let mut child = context.machine_command();
-    child.args(&request.arguments);
-    context.finish_machine_command(&mut child);
+    append_machine_command_arguments(&mut child, &request.arguments, OutputFormat::CompactJson);
+    child.stdin(Stdio::null());
     match child.output() {
         Ok(output) => {
-            let (output_values, output_error) = match json_values(&output.stdout, "standard output")
-            {
-                Ok(values) => (values, None),
-                Err(error) => (Vec::new(), Some(error)),
-            };
-            let mut error_values = match json_values(&output.stderr, "standard error") {
-                Ok(values) => values,
-                Err(error) => vec![error],
-            };
-            if let Some(error) = output_error {
-                error_values.push(error);
-            }
+            let (output_values, error_values) =
+                machine_stream_values(&output.stdout, &output.stderr, "batch item");
             let contract_failed = !output.status.success() || !error_values.is_empty();
             BatchResult {
                 schema_version: BATCH_RESULT_SCHEMA_VERSION,
                 index: indexed.index,
                 request_id: Some(request.request_id.clone()),
                 status: if !contract_failed {
-                    BatchResultStatus::Success
+                    AutomationResultStatus::Success
                 } else {
-                    BatchResultStatus::Failure
+                    AutomationResultStatus::Failure
                 },
                 exit_code: output.status.code(),
                 duration_ms: elapsed_millis(started),
@@ -933,7 +1466,7 @@ fn execute_request(indexed: &IndexedRequest, context: &AutomationContext) -> Bat
             schema_version: BATCH_RESULT_SCHEMA_VERSION,
             index: indexed.index,
             request_id: Some(request.request_id.clone()),
-            status: BatchResultStatus::Failure,
+            status: AutomationResultStatus::Failure,
             exit_code: None,
             duration_ms: elapsed_millis(started),
             output: Vec::new(),
@@ -944,13 +1477,32 @@ fn execute_request(indexed: &IndexedRequest, context: &AutomationContext) -> Bat
     }
 }
 
-fn json_values(bytes: &[u8], stream_name: &str) -> Result<Vec<Value>, Value> {
+fn machine_stream_values(
+    stdout: &[u8],
+    stderr: &[u8],
+    operation: &str,
+) -> (Vec<Value>, Vec<Value>) {
+    let (output, output_error) = match json_values(stdout, "standard output", operation) {
+        Ok(values) => (values, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    let mut errors = match json_values(stderr, "standard error", operation) {
+        Ok(values) => values,
+        Err(error) => vec![error],
+    };
+    if let Some(error) = output_error {
+        errors.push(error);
+    }
+    (output, errors)
+}
+
+fn json_values(bytes: &[u8], stream_name: &str, operation: &str) -> Result<Vec<Value>, Value> {
     serde_json::Deserializer::from_slice(bytes)
         .into_iter::<Value>()
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
             error_envelope(&SatelleError::invalid_usage(format!(
-                "batch item produced invalid JSON on {stream_name}: {error}"
+                "{operation} produced invalid JSON on {stream_name}: {error}"
             )))
         })
 }
@@ -978,6 +1530,7 @@ mod tests {
     fn rejects_recursive_workflows_and_output_overrides() {
         for arguments in [
             vec!["batch", "--input", "work.ndjson"],
+            vec!["repl"],
             vec!["--no-color", "batch", "--input", "work.ndjson"],
             vec!["status", "rs_example", "--json"],
         ] {
@@ -992,6 +1545,163 @@ mod tests {
                 RequestState::Rejected { .. }
             ));
         }
+    }
+
+    #[test]
+    fn repl_accepts_only_selected_context_commands() {
+        let parsed = parse_repl_command(r#"run "inspect the queue""#, false)
+            .expect("parse quoted run command");
+        assert_eq!(parsed.kind, ReplCommandKind::Run);
+        assert_eq!(parsed.prompt_index, Some(1));
+
+        for line in [
+            "satelle status rs_01890a5d-ac96-7b7c-8f89-37c3d0a66ee11",
+            "batch --input work.ndjson",
+            "repl",
+            "run --host office inspect",
+            "status rs_01890a5d-ac96-7b7c-8f89-37c3d0a66ee11 --json",
+            "doctor --fix --yes",
+            "config check --all",
+            "config repair",
+        ] {
+            assert!(parse_repl_command(line, false).is_err(), "accepted {line}");
+        }
+        assert!(parse_repl_command("config explain --show-secret-references", true).is_err());
+    }
+
+    #[test]
+    fn repl_transcript_redacts_prompts_and_local_paths() {
+        let parsed = parse_repl_command(
+            r#"run --prompt-file "/private/prompt.txt" --image "/private/screen.png""#,
+            true,
+        )
+        .expect("parse file-backed run");
+        assert_eq!(
+            redact_repl_command(&parsed, false),
+            [
+                "run",
+                "--prompt-file",
+                "<redacted>",
+                "--image",
+                "<redacted>",
+            ]
+        );
+
+        let parsed = parse_repl_command(
+            r#"steer rs_01890a5d-ac96-7b7c-8f89-37c3d0a66ee11 "private prompt""#,
+            false,
+        )
+        .expect("parse steer command");
+        assert_eq!(
+            redact_repl_command(&parsed, false)
+                .last()
+                .map(String::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            redact_repl_command(&parsed, true)
+                .last()
+                .map(String::as_str),
+            Some("private prompt")
+        );
+
+        let parsed = parse_repl_command(r#"run "same value" --model "same value""#, false)
+            .expect("parse prompt followed by an equal option value");
+        assert_eq!(
+            redact_repl_command(&parsed, false),
+            ["run", "<redacted>", "--model", "same value"]
+        );
+
+        let parsed = parse_repl_command(r#"run -- "--image=/not-an-option""#, false)
+            .expect("parse delimiter-protected prompt");
+        assert_eq!(
+            redact_repl_command(&parsed, true),
+            ["run", "--", "--image=/not-an-option"]
+        );
+        assert_eq!(
+            redact_repl_command(&parsed, false),
+            ["run", "--", "<redacted>"]
+        );
+    }
+
+    #[test]
+    fn machine_output_selector_precedes_the_argument_delimiter() {
+        let arguments = vec!["run".to_string(), "--".to_string(), "--format".to_string()];
+        let mut command = ProcessCommand::new("satelle");
+        append_machine_command_arguments(&mut command, &arguments, OutputFormat::CompactJson);
+
+        assert_eq!(
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["run", "--format", "compact-json", "--", "--format"]
+        );
+    }
+
+    #[test]
+    fn repl_stream_capture_reports_overflow_without_retaining_bytes() {
+        let input = vec![b'x'; REPL_CAPTURE_LIMIT + 1];
+        let mut terminal = Vec::new();
+        let capture = read_and_tee_repl_stream_to(input.as_slice(), &mut terminal)
+            .expect("tee over-limit stream");
+
+        assert!(capture.exceeded_limit);
+        assert!(capture.bytes.is_empty());
+        assert_eq!(terminal, input);
+    }
+
+    #[test]
+    fn repl_transcript_collects_stable_session_ids_once() {
+        let mut session_ids = BTreeSet::new();
+        collect_session_ids(
+            &serde_json::json!({
+                "session_id": "rs_first",
+                "turns": [
+                    {"session_id": "rs_second"},
+                    {"nested": {"session_id": "rs_first"}}
+                ]
+            }),
+            &mut session_ids,
+        );
+        assert_eq!(
+            session_ids.into_iter().collect::<Vec<_>>(),
+            ["rs_first", "rs_second"]
+        );
+    }
+
+    #[test]
+    fn repl_transcript_record_has_one_closed_versioned_shape() {
+        let record = ReplTranscriptRecord {
+            schema_version: REPL_TRANSCRIPT_SCHEMA_VERSION,
+            sequence: 1,
+            host: "office".to_string(),
+            command: vec!["config".to_string(), "check".to_string()],
+            status: AutomationResultStatus::Success,
+            exit_code: Some(0),
+            started_at: "2026-09-13T23:14:52Z".to_string(),
+            duration_ms: 11,
+            output: vec![serde_json::json!({"schema_version": "satelle.config.check.v1"})],
+            errors: Vec::new(),
+            session_ids: vec!["rs_example".to_string()],
+        };
+
+        assert_eq!(
+            serde_json::to_value(record).expect("serialize REPL transcript"),
+            serde_json::json!({
+                "schema_version": "satelle.repl.transcript.v1",
+                "sequence": 1,
+                "host": "office",
+                "command": ["config", "check"],
+                "status": "success",
+                "exit_code": 0,
+                "started_at": "2026-09-13T23:14:52Z",
+                "duration_ms": 11,
+                "output": [{"schema_version": "satelle.config.check.v1"}],
+                "errors": [],
+                "session_ids": ["rs_example"],
+            })
+        );
     }
 
     #[test]
@@ -1026,7 +1736,7 @@ mod tests {
     #[test]
     fn invalid_child_output_becomes_a_typed_error_without_copying_raw_bytes() {
         let canary = "PRIVATE_CHILD_OUTPUT_CANARY";
-        let error = json_values(canary.as_bytes(), "standard output")
+        let error = json_values(canary.as_bytes(), "standard output", "batch item")
             .expect_err("plain text must not satisfy the child output contract");
         assert_eq!(error["code"], "invalid-usage");
         assert!(!error.to_string().contains(canary));
@@ -1063,7 +1773,7 @@ mod tests {
                 "--host",
                 "office",
                 "--format",
-                "compact-json",
+                "json",
             ]
         );
     }

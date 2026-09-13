@@ -33,8 +33,8 @@ mod transport;
 mod windows_interactive_bootstrap;
 
 use automation::{
-    AUTOMATION_POLL_ENV, AutomationContext, BatchCommand, NotifyCommand, WatchCommand, run_batch,
-    run_notify, run_watch,
+    AUTOMATION_POLL_ENV, AutomationContext, BatchCommand, NotifyCommand, ReplCommand, WatchCommand,
+    ensure_repl_terminal, run_batch, run_notify, run_repl, run_watch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use cliclack::{Theme, ThemeState};
@@ -356,6 +356,8 @@ impl<'a> ConfigContext<'a> {
 enum Command {
     /// Execute versioned NDJSON command requests with bounded concurrency.
     Batch(BatchCommand),
+    /// Run repeated Satelle commands against one selected Host.
+    Repl(ReplCommand),
     /// Emit versioned NDJSON records when selected Satelle state changes.
     Watch(WatchCommand),
     /// Deliver selected Satelle state changes to a user-owned webhook.
@@ -2507,6 +2509,14 @@ fn execute_command(
                 })
             }
         }
+        Command::Repl(command) => {
+            ensure_repl_terminal().map_err(failure)?;
+            let selected_host = config.resolve_host(command.host())?.alias;
+            let context = AutomationContext::current(profile, no_color).map_err(failure)?;
+            run_repl(command, context, selected_host)
+                .map_err(failure)
+                .map(|_| None)
+        }
         Command::Watch(command) => {
             let context = AutomationContext::current(profile, no_color).map_err(failure)?;
             run_watch(command, context).map_err(failure).map(|_| None)
@@ -3266,6 +3276,12 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             explicit_host: None,
             session_id: None,
         },
+        Command::Repl(command) => HistoryTarget {
+            family: "repl",
+            selects_host: true,
+            explicit_host: command.host(),
+            session_id: None,
+        },
         Command::Watch(command) => HistoryTarget {
             family: "watch",
             selects_host: true,
@@ -3710,6 +3726,17 @@ mod history_target_tests {
                 Some(SESSION_ID)
             );
         }
+    }
+
+    #[test]
+    fn repl_history_uses_the_selected_context() {
+        let cli = Cli::try_parse_from(["satelle", "repl", "--host", "office"])
+            .expect("parse REPL command");
+        let target = history_target(&cli.command).expect("REPL history target");
+        assert_eq!(target.family, "repl");
+        assert!(target.selects_host);
+        assert_eq!(target.explicit_host, Some("office"));
+        assert_eq!(target.session_id, None);
     }
 
     #[test]
