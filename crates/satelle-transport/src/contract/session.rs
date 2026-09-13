@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::fmt;
 
-define_schema_token!(TurnRequestSchema, "satelle.api.v11");
+define_schema_token!(TurnRequestSchema, "satelle.api.v12");
 define_schema_token!(
     QueueStatusResponseSchema,
     "satelle.queue.status-response.v1"
@@ -23,7 +23,7 @@ define_schema_token!(
     "satelle.queue.cancel-response.v1"
 );
 define_schema_token!(StopRequestSchema, "satelle.api.v1");
-define_schema_token!(SessionSchema, "satelle.session.v1");
+define_schema_token!(SessionSchema, "satelle.session.v2");
 define_schema_token!(TaskArtifactsSchema, "satelle.task_artifacts.v1");
 define_schema_token!(SessionStopSchema, "satelle.session.stop.v1");
 define_schema_token!(AdmissionCancellationSchema, "satelle.admission.cancel.v1");
@@ -112,6 +112,8 @@ pub struct TurnRequest {
     recording: Option<satelle_core::recording::RecordingRequest>,
     #[serde(default, skip_serializing_if = "is_false")]
     queue: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    desktop_binding: Option<String>,
 }
 
 pub(crate) struct TurnRequestParts {
@@ -127,6 +129,7 @@ pub(crate) struct TurnRequestParts {
     pub(crate) turn_execution_timeout_ms: Option<u64>,
     pub(crate) raw_protocol: Option<RawProtocolCaptureRequest>,
     pub(crate) recording: Option<satelle_core::recording::RecordingRequest>,
+    pub(crate) desktop_binding: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -337,6 +340,7 @@ impl TurnRequest {
             raw_protocol: None,
             recording: None,
             queue: false,
+            desktop_binding: None,
         }
     }
 
@@ -393,6 +397,11 @@ impl TurnRequest {
         self
     }
 
+    pub fn with_desktop_binding(mut self, desktop_binding: impl Into<String>) -> Self {
+        self.desktop_binding = Some(desktop_binding.into());
+        self
+    }
+
     pub fn prompt(&self) -> &str {
         &self.prompt
     }
@@ -445,6 +454,10 @@ impl TurnRequest {
         self.queue
     }
 
+    pub fn desktop_binding(&self) -> Option<&str> {
+        self.desktop_binding.as_deref()
+    }
+
     pub(crate) fn into_parts(self) -> TurnRequestParts {
         TurnRequestParts {
             prompt: self.prompt,
@@ -459,6 +472,7 @@ impl TurnRequest {
             turn_execution_timeout_ms: self.turn_execution_timeout_ms,
             raw_protocol: self.raw_protocol,
             recording: self.recording,
+            desktop_binding: self.desktop_binding,
         }
     }
 }
@@ -660,7 +674,7 @@ mod provider_binding_boundary_tests {
     }
 
     #[test]
-    fn turn_request_v10_carries_independent_project_provenance_and_opt_ins() {
+    fn turn_request_v12_carries_independent_project_provenance_and_opt_ins() {
         let request = TurnRequest::new("inspect the repository")
             .with_provider_intent(
                 Some("vision".to_string()),
@@ -681,7 +695,7 @@ mod provider_binding_boundary_tests {
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             json!({
-                "schema_version": "satelle.api.v11",
+                "schema_version": "satelle.api.v12",
                 "model_from_project": true,
                 "provider_from_project": false,
                 "prompt": "inspect the repository",
@@ -704,7 +718,7 @@ mod provider_binding_boundary_tests {
     fn turn_request_rejects_missing_provenance_and_the_v9_shape() {
         for request in [
             serde_json::json!({
-                "schema_version": "satelle.api.v11",
+                "schema_version": "satelle.api.v12",
                 "prompt": "private",
                 "execution_mode": "standard"
             }),
@@ -1593,10 +1607,11 @@ mod tests {
 
     fn starting_session_response() -> serde_json::Value {
         serde_json::json!({
-            "schema_version": "satelle.session.v1",
+            "schema_version": "satelle.session.v2",
             "request_id": "01890a5d-ac96-7b7c-8f89-37c3d0a66e01",
             "host_identity": "host-test",
             "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+            "desktop_binding": "local-demo-desktop-v1",
             "display_name": null,
             "session_state_revision": 1,
             "created_at": "2024-01-01T00:00:00Z",
@@ -1642,7 +1657,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(request).expect("serialize request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v11",
+                "schema_version": "satelle.api.v12",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1655,7 +1670,7 @@ mod tests {
             )
             .expect("serialize YOLO request"),
             serde_json::json!({
-                "schema_version": "satelle.api.v11",
+                "schema_version": "satelle.api.v12",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1672,7 +1687,7 @@ mod tests {
             ))
             .expect("serialize provider intent"),
             serde_json::json!({
-                "schema_version": "satelle.api.v11",
+                "schema_version": "satelle.api.v12",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1684,7 +1699,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v11",
+                "schema_version": "satelle.api.v12",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt"
@@ -1693,7 +1708,7 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<TurnRequest>(serde_json::json!({
-                "schema_version": "satelle.api.v11",
+                "schema_version": "satelle.api.v12",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1712,7 +1727,7 @@ mod tests {
     fn controller_presentation_fields_are_absent_from_the_turn_request_contract() {
         for field in ["attach", "detach"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v11",
+                "schema_version": "satelle.api.v12",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1731,10 +1746,14 @@ mod tests {
     }
 
     #[test]
-    fn mvp_turn_requests_cannot_route_across_desktop_bindings() {
-        for field in ["desktop_user", "desktop_binding", "desktop_session"] {
+    fn turn_requests_accept_a_binding_but_not_desktop_identity_fields() {
+        let request =
+            TurnRequest::new("private prompt").with_desktop_binding("local-demo-desktop-v1");
+        assert_eq!(request.desktop_binding(), Some("local-demo-desktop-v1"));
+
+        for field in ["desktop_user", "desktop_session"] {
             let mut request = serde_json::json!({
-                "schema_version": "satelle.api.v11",
+                "schema_version": "satelle.api.v12",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "private prompt",
@@ -1747,7 +1766,7 @@ mod tests {
 
             assert!(
                 serde_json::from_value::<TurnRequest>(request).is_err(),
-                "MVP Turn requests must not select {field}"
+                "Turn requests must not carry the implicit desktop identity field {field}"
             );
         }
     }
@@ -1798,11 +1817,12 @@ mod tests {
         assert!(serde_json::from_value::<SessionResponse>(unknown).is_err());
 
         let duplicate = r#"{
-            "schema_version":"satelle.session.v1",
+            "schema_version":"satelle.session.v2",
             "request_id":"01890a5d-ac96-7b7c-8f89-37c3d0a66e01",
             "host_identity":"host-test",
             "host_identity":"host-other",
             "session_id":"rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
+            "desktop_binding":"local-demo-desktop-v1",
             "display_name":null,
             "session_state_revision":1,
             "created_at":"2024-01-01T00:00:00Z",

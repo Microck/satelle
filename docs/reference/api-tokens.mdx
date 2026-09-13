@@ -14,7 +14,7 @@ Send these headers with each mutation:
 | --- | --- |
 | `Authorization` | `Bearer <admin-token>` |
 | `Satelle-Expected-Host-Identity` | The pinned Host identity |
-| `Satelle-Protocol-Version` | `15` |
+| `Satelle-Protocol-Version` | `22` |
 | `Idempotency-Key` | One unique key for the intended operation |
 | `Content-Type` | `application/json` |
 
@@ -27,8 +27,9 @@ Send `POST /v1/api-tokens`:
 
 ```json
 {
-  "schema_version": "satelle.api-token.issue.v1",
+  "schema_version": "satelle.api-token.issue.v2",
   "scopes": ["control"],
+  "desktop_bindings": ["operator"],
   "expires_at": "2030-01-01T00:00:00Z"
 }
 ```
@@ -37,6 +38,10 @@ Send `POST /v1/api-tokens`:
 `diagnostics_sensitive`. Control includes read, and admin includes control.
 Sensitive diagnostics require their separate scope. Duplicate scopes and their
 order do not change the request's meaning.
+
+`desktop_bindings` grants the token access to exact configured Desktop Binding
+aliases. A token with `control` or `admin` scope needs at least one grant. An
+admin cannot grant a Desktop Binding that its own token cannot access.
 
 Omit `expires_at`, or set it to `null`, for no expiry. An explicit expiry must
 be a future RFC 3339 time in UTC.
@@ -52,6 +57,7 @@ The first successful request returns HTTP 201 with a flat response:
   "principal_ref": "<principal-reference>",
   "credential_revision": 1,
   "scopes": ["control"],
+  "desktop_bindings": ["operator"],
   "expires_at": "2030-01-01T00:00:00Z",
   "revoked_at": null,
   "bearer_token": "<one-time-token>"

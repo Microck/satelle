@@ -185,6 +185,40 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "a Desktop Binding is required before native Computer Use can start",
             details: validated_candidate_desktop_users_details(error),
         },
+        ErrorCode::DesktopBindingAmbiguous => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::DesktopBindingAmbiguous,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the Turn must select one configured Desktop Binding",
+            details: error.details.get("desktop_bindings").cloned().map(|bindings| {
+                serde_json::json!({ "desktop_bindings": bindings })
+            }),
+        },
+        ErrorCode::DesktopBindingNotFound => ApiFailure {
+            status: StatusCode::NOT_FOUND,
+            code: ApiErrorCode::DesktopBindingNotFound,
+            category: ApiErrorCategory::NotFound,
+            retryable: false,
+            message: "the selected Desktop Binding is not configured on this Host",
+            details: validated_string_details(error, &["desktop_binding"]),
+        },
+        ErrorCode::DesktopBindingUnauthorized => ApiFailure {
+            status: StatusCode::FORBIDDEN,
+            code: ApiErrorCode::DesktopBindingUnauthorized,
+            category: ApiErrorCategory::Authorization,
+            retryable: false,
+            message: "the API Principal cannot use the selected Desktop Binding",
+            details: validated_string_details(error, &["desktop_binding"]),
+        },
+        ErrorCode::DesktopBindingSecureHandoffUnsupported => ApiFailure {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: ApiErrorCode::DesktopBindingSecureHandoffUnsupported,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Host cannot securely enter the selected OS user's desktop session",
+            details: validated_string_details(error, &["desktop_binding", "desktop_user"]),
+        },
         ErrorCode::IdempotencyKeyConflict => ApiFailure {
             status: StatusCode::CONFLICT,
             code: ApiErrorCode::IdempotencyKeyConflict,

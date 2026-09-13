@@ -2,6 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::BitOr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -264,6 +265,7 @@ impl ApiScope {
 pub enum ApiTokenMutation {
     Issue {
         scopes: ApiScopes,
+        desktop_bindings: BTreeSet<String>,
         #[serde(with = "time::serde::rfc3339::option")]
         expires_at: Option<OffsetDateTime>,
     },
@@ -284,6 +286,7 @@ pub struct ApiTokenMetadata {
     pub principal_ref: String,
     pub credential_revision: u64,
     pub scopes: Vec<ApiScope>,
+    pub desktop_bindings: Vec<String>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -325,6 +328,7 @@ pub struct ApiPrincipal {
     pub(crate) principal_ref: String,
     pub(crate) credential_revision: u64,
     pub(crate) scopes: ApiScopes,
+    pub(crate) desktop_bindings: BTreeSet<String>,
     pub(crate) expires_at: Option<OffsetDateTime>,
     pub(crate) process_local_ssh_bootstrap: bool,
     pub(crate) durable_setup_pending: bool,
@@ -345,6 +349,7 @@ impl EphemeralApiAuthenticator {
         token: &ApiBearerToken,
         scopes: ApiScopes,
         expires_at: OffsetDateTime,
+        desktop_bindings: BTreeSet<String>,
     ) -> Self {
         Self {
             verifier: token.verifier(),
@@ -353,6 +358,7 @@ impl EphemeralApiAuthenticator {
                 principal_ref: "ssh-bootstrap".to_string(),
                 credential_revision: 1,
                 scopes,
+                desktop_bindings,
                 expires_at: Some(expires_at),
                 process_local_ssh_bootstrap: true,
                 durable_setup_pending: false,
@@ -425,6 +431,14 @@ impl ApiPrincipal {
 
     pub const fn scopes(&self) -> ApiScopes {
         self.scopes
+    }
+
+    pub fn allows_desktop_binding(&self, desktop_binding: &str) -> bool {
+        self.desktop_bindings.contains(desktop_binding)
+    }
+
+    pub fn desktop_bindings(&self) -> &BTreeSet<String> {
+        &self.desktop_bindings
     }
 
     pub const fn expires_at(&self) -> Option<OffsetDateTime> {
@@ -502,7 +516,12 @@ mod tests {
     fn ephemeral_bootstrap_authentication_expires_without_durable_state() {
         let token = ApiBearerToken::generate().expect("generate bootstrap token");
         let expires_at = OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15);
-        let authenticator = EphemeralApiAuthenticator::new(&token, ApiScopes::CONTROL, expires_at);
+        let authenticator = EphemeralApiAuthenticator::new(
+            &token,
+            ApiScopes::CONTROL,
+            expires_at,
+            BTreeSet::from(["local-demo-desktop-v1".to_string()]),
+        );
 
         let principal = authenticator
             .authenticate(&token, OffsetDateTime::UNIX_EPOCH)
@@ -522,6 +541,7 @@ mod tests {
             principal_ref: "ssh-bootstrap".to_string(),
             credential_revision: 1,
             scopes: ApiScopes::ADMIN,
+            desktop_bindings: BTreeSet::from(["local-demo-desktop-v1".to_string()]),
             expires_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15)),
             process_local_ssh_bootstrap: false,
             durable_setup_pending: false,
@@ -538,6 +558,7 @@ mod tests {
             &token,
             ApiScopes::READ,
             OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(15),
+            BTreeSet::from(["local-demo-desktop-v1".to_string()]),
         );
 
         let principal = authenticator

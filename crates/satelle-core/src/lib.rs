@@ -150,9 +150,7 @@ impl SatelleConfig {
                 telemetry: None,
                 recording: None,
                 queue: queue::QueueConfig::default(),
-                desktop_user: None,
-                desktop_session_preference: None,
-                desktop_session_native_selector: None,
+                desktop_bindings: BTreeMap::new(),
                 daemon_home: None,
                 daemon_config_file: None,
                 daemon_state_dir: None,
@@ -167,8 +165,6 @@ impl SatelleConfig {
                 api_token: None,
                 ca_bundle: None,
                 client_certificate: None,
-                provider_auth: BTreeMap::new(),
-                provider_bindings: BTreeMap::new(),
             },
         );
 
@@ -375,9 +371,8 @@ pub struct HostConfig {
     /// transport overlays cannot enable this Host-side mutation queue.
     #[serde(default, skip_serializing_if = "queue::QueueConfig::is_default")]
     pub queue: queue::QueueConfig,
-    pub desktop_user: Option<String>,
-    pub desktop_session_preference: Option<DesktopSessionPreference>,
-    pub desktop_session_native_selector: Option<DesktopSessionNativeSelector>,
+    #[serde(default)]
+    pub desktop_bindings: BTreeMap<String, DesktopBindingConfig>,
     pub daemon_home: Option<PathBuf>,
     pub daemon_config_file: Option<PathBuf>,
     pub daemon_state_dir: Option<PathBuf>,
@@ -398,20 +393,33 @@ pub struct HostConfig {
     pub ca_bundle: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_certificate: Option<ClientCertificateSource>,
-    #[serde(default)]
-    pub provider_auth: BTreeMap<String, ProviderSecretSource>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub provider_bindings: BTreeMap<String, BTreeMap<String, ProviderBindingConfig>>,
 }
 
 impl HostConfig {
     pub fn provider_binding(
         &self,
+        desktop_binding: &str,
         provider_alias: &str,
         model_alias: &str,
     ) -> Option<&ProviderBindingConfig> {
-        self.provider_bindings.get(provider_alias)?.get(model_alias)
+        self.desktop_bindings
+            .get(desktop_binding)?
+            .provider_bindings
+            .get(provider_alias)?
+            .get(model_alias)
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopBindingConfig {
+    pub desktop_user: String,
+    pub desktop_session_preference: Option<DesktopSessionPreference>,
+    pub desktop_session_native_selector: Option<DesktopSessionNativeSelector>,
+    #[serde(default)]
+    pub provider_auth: BTreeMap<String, ProviderSecretSource>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_bindings: BTreeMap<String, BTreeMap<String, ProviderBindingConfig>>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -492,9 +500,9 @@ pub struct DesktopSelectionPolicy {
 }
 
 impl DesktopSelectionPolicy {
-    pub fn from_host_config(config: &HostConfig) -> Self {
+    pub fn from_binding_config(config: &DesktopBindingConfig) -> Self {
         Self {
-            desktop_user: config.desktop_user.clone(),
+            desktop_user: Some(config.desktop_user.clone()),
             preference: config.desktop_session_preference.clone(),
             native_selector: config.desktop_session_native_selector.clone(),
         }
@@ -1252,11 +1260,16 @@ impl SatelleError {
 
     pub fn project_provider_selection_not_allowed(
         host_alias: &str,
+        desktop_binding: &str,
         provider_alias: &str,
         model_alias: &str,
     ) -> Self {
         let mut details = BTreeMap::new();
         details.insert("host".to_string(), Value::String(host_alias.to_string()));
+        details.insert(
+            "desktop_binding".to_string(),
+            Value::String(desktop_binding.to_string()),
+        );
         details.insert(
             "provider_alias".to_string(),
             Value::String(provider_alias.to_string()),
@@ -1272,7 +1285,7 @@ impl SatelleError {
             ),
             details,
             recovery_command: Some(format!(
-                "Set `allow_project_selection = true` in `[hosts.{host_alias}.provider_bindings.{provider_alias}.{model_alias}]` in owner-controlled Host config, or pass an explicit override for each project-selected alias."
+                "Set `allow_project_selection = true` in `[hosts.{host_alias}.desktop_bindings.{desktop_binding}.provider_bindings.{provider_alias}.{model_alias}]` in owner-controlled Host config, or pass an explicit override for each project-selected alias."
             )),
             source_detail: None,
         }
@@ -1545,18 +1558,21 @@ provider_alias = "open_ai"
 transport = "local"
 adapter = "codex"
 
-[hosts.workstation.provider_bindings.open_ai.vision_pro]
+[hosts.workstation.desktop_bindings.operator]
+desktop_user = "operator"
+
+[hosts.workstation.desktop_bindings.operator.provider_bindings.open_ai.vision_pro]
 model = "gpt-5.6"
 model_provider = "openai"
 endpoint = "https://provider.example/v1"
 auth_source = "primary"
 allow_project_selection = true
 
-[hosts.workstation.provider_bindings.open_ai.default]
+[hosts.workstation.desktop_bindings.operator.provider_bindings.open_ai.default]
 model = "gpt-5.6-mini"
 model_provider = "openai"
 
-[hosts.workstation.provider_bindings.anthropic.vision_pro]
+[hosts.workstation.desktop_bindings.operator.provider_bindings.anthropic.vision_pro]
 model = "claude-vision"
 model_provider = "anthropic"
 "#;
@@ -1572,7 +1588,7 @@ model_provider = "anthropic"
             .expect("retain configured Host");
 
         let binding = host
-            .provider_binding("open_ai", "vision_pro")
+            .provider_binding("operator", "open_ai", "vision_pro")
             .expect("resolve the exact provider and model aliases");
         assert_eq!(binding.model, "gpt-5.6");
         assert_eq!(binding.model_provider, "openai");
@@ -1584,14 +1600,20 @@ model_provider = "anthropic"
         assert!(binding.allow_project_selection);
 
         let binding_without_optional_fields = host
-            .provider_binding("open_ai", "default")
+            .provider_binding("operator", "open_ai", "default")
             .expect("parse a binding without optional fields");
         assert_eq!(binding_without_optional_fields.endpoint, None);
         assert_eq!(binding_without_optional_fields.auth_source, None);
         assert!(!binding_without_optional_fields.allow_project_selection);
 
-        assert!(host.provider_binding("open_ai", "missing").is_none());
-        assert!(host.provider_binding("missing", "vision_pro").is_none());
+        assert!(
+            host.provider_binding("operator", "open_ai", "missing")
+                .is_none()
+        );
+        assert!(
+            host.provider_binding("operator", "missing", "vision_pro")
+                .is_none()
+        );
 
         let encoded = toml::to_string(&parsed.config).expect("serialize provider bindings");
         assert!(encoded.contains("provider_bindings"));
@@ -1636,21 +1658,30 @@ model_provider = "anthropic"
 [hosts.workstation]
 transport = "local"
 adapter = "codex"
-[hosts.workstation.provider_bindings.open_ai.vision]
+[hosts.workstation.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+
+[hosts.workstation.desktop_bindings.operator.provider_bindings.open_ai.vision]
 model = "gpt-5.6"
 "#,
             r#"
 [hosts.workstation]
 transport = "local"
 adapter = "codex"
-[hosts.workstation.provider_bindings.open_ai.vision]
+[hosts.workstation.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+
+[hosts.workstation.desktop_bindings.operator.provider_bindings.open_ai.vision]
 model_provider = "openai"
 "#,
             r#"
 [hosts.workstation]
 transport = "local"
 adapter = "codex"
-[hosts.workstation.provider_bindings.open_ai.vision]
+[hosts.workstation.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+
+[hosts.workstation.desktop_bindings.operator.provider_bindings.open_ai.vision]
 model = ""
 model_provider = "openai"
 "#,
@@ -1658,7 +1689,10 @@ model_provider = "openai"
 [hosts.workstation]
 transport = "local"
 adapter = "codex"
-[hosts.workstation.provider_bindings.open_ai.vision]
+[hosts.workstation.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+
+[hosts.workstation.desktop_bindings.operator.provider_bindings.open_ai.vision]
 model = "gpt-5.6"
 model_provider = ""
 "#,
@@ -1674,7 +1708,10 @@ model_provider = ""
 [hosts.workstation]
 transport = "local"
 adapter = "codex"
-[hosts.workstation.provider_bindings.open_ai.vision]
+[hosts.workstation.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+
+[hosts.workstation.desktop_bindings.operator.provider_bindings.open_ai.vision]
 model = "gpt-5.6"
 model_provider = "openai"
 {raw_secret_key} = "must-not-enter-config"
@@ -1704,6 +1741,7 @@ model_provider = "openai"
         assert_eq!(
             model_selected.hosts["workstation"]
                 .provider_binding(
+                    "operator",
                     model_selected
                         .provider_alias
                         .as_deref()
@@ -1733,6 +1771,7 @@ model_provider = "openai"
         assert_eq!(
             provider_selected.hosts["workstation"]
                 .provider_binding(
+                    "operator",
                     provider_selected
                         .provider_alias
                         .as_deref()
@@ -3667,8 +3706,6 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
             "address",
             "expected_host_id",
             "ca_bundle",
-            "desktop_user",
-            "desktop_session_preference",
             "daemon_home",
             "daemon_config_file",
             "daemon_state_dir",
@@ -3723,71 +3760,44 @@ fn reject_interpolation(path: &Path, value: &toml::Value) -> Result<(), SatelleE
             }
         }
 
-        if let Some(selector_table) = host_table
-            .get("desktop_session_native_selector")
+        if let Some(desktop_bindings) = host_table
+            .get("desktop_bindings")
             .and_then(toml::Value::as_table)
         {
-            for key in ["platform", "kind", "value"] {
-                collect_interpolation_for_value(
-                    &format!("{host_path}.desktop_session_native_selector.{key}"),
-                    selector_table.get(key),
-                    &mut interpolations,
-                );
-            }
-        }
-
-        if let Some(provider_auth_table) = host_table
-            .get("provider_auth")
-            .and_then(toml::Value::as_table)
-        {
-            for (provider_alias, source_value) in provider_auth_table {
-                let source_path = format!("{host_path}.provider_auth.{provider_alias}");
-                let Some(source_table) = source_value.as_table() else {
+            for (binding_alias, binding_value) in desktop_bindings {
+                let binding_path = format!("{host_path}.desktop_bindings.{binding_alias}");
+                let Some(binding) = binding_value.as_table() else {
                     continue;
                 };
-
-                for key in ["kind", "variable", "path", "service", "account", "name"] {
-                    // Home shorthand has its own typed grammar diagnostic.
-                    if key == "path"
-                        && source_table.get("kind").and_then(toml::Value::as_str) == Some("file")
-                        && source_table
-                            .get(key)
-                            .and_then(toml::Value::as_str)
-                            .is_some_and(|path| path.contains('~'))
-                    {
-                        continue;
-                    }
+                for key in ["desktop_user", "desktop_session_preference"] {
                     collect_interpolation_for_value(
-                        &format!("{source_path}.{key}"),
-                        source_table.get(key),
+                        &format!("{binding_path}.{key}"),
+                        binding.get(key),
                         &mut interpolations,
                     );
                 }
-            }
-        }
-
-        if let Some(provider_bindings) = host_table
-            .get("provider_bindings")
-            .and_then(toml::Value::as_table)
-        {
-            for (provider_alias, model_bindings) in provider_bindings {
-                let Some(model_bindings) = model_bindings.as_table() else {
-                    continue;
-                };
-                for (model_alias, binding) in model_bindings {
-                    let Some(binding) = binding.as_table() else {
-                        continue;
-                    };
-                    for key in ["model", "model_provider", "endpoint", "auth_source"] {
+                if let Some(selector) = binding
+                    .get("desktop_session_native_selector")
+                    .and_then(toml::Value::as_table)
+                {
+                    for key in ["platform", "kind", "value"] {
                         collect_interpolation_for_value(
-                            &format!(
-                                "{host_path}.provider_bindings.{provider_alias}.{model_alias}.{key}"
-                            ),
-                            binding.get(key),
+                            &format!("{binding_path}.desktop_session_native_selector.{key}"),
+                            selector.get(key),
                             &mut interpolations,
                         );
                     }
                 }
+                collect_provider_auth_interpolation(
+                    &format!("{binding_path}.provider_auth"),
+                    binding.get("provider_auth"),
+                    &mut interpolations,
+                );
+                collect_provider_binding_interpolation(
+                    &format!("{binding_path}.provider_bindings"),
+                    binding.get("provider_bindings"),
+                    &mut interpolations,
+                );
             }
         }
 
@@ -3834,6 +3844,66 @@ fn collect_telemetry_interpolation(
             authorization.get(key),
             interpolations,
         );
+    }
+}
+
+fn collect_provider_auth_interpolation(
+    auth_path: &str,
+    value: Option<&toml::Value>,
+    interpolations: &mut Vec<ConfigInterpolation>,
+) {
+    let Some(provider_auth) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for (provider_alias, source_value) in provider_auth {
+        let source_path = format!("{auth_path}.{provider_alias}");
+        let Some(source) = source_value.as_table() else {
+            continue;
+        };
+        for key in ["kind", "variable", "path", "service", "account", "name"] {
+            // Home shorthand has its own typed grammar diagnostic.
+            if key == "path"
+                && source.get("kind").and_then(toml::Value::as_str) == Some("file")
+                && source
+                    .get(key)
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|path| path.contains('~'))
+            {
+                continue;
+            }
+            collect_interpolation_for_value(
+                &format!("{source_path}.{key}"),
+                source.get(key),
+                interpolations,
+            );
+        }
+    }
+}
+
+fn collect_provider_binding_interpolation(
+    bindings_path: &str,
+    value: Option<&toml::Value>,
+    interpolations: &mut Vec<ConfigInterpolation>,
+) {
+    let Some(provider_bindings) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for (provider_alias, model_bindings) in provider_bindings {
+        let Some(model_bindings) = model_bindings.as_table() else {
+            continue;
+        };
+        for (model_alias, binding) in model_bindings {
+            let Some(binding) = binding.as_table() else {
+                continue;
+            };
+            for key in ["model", "model_provider", "endpoint", "auth_source"] {
+                collect_interpolation_for_value(
+                    &format!("{bindings_path}.{provider_alias}.{model_alias}.{key}"),
+                    binding.get(key),
+                    interpolations,
+                );
+            }
+        }
     }
 }
 
@@ -4136,45 +4206,67 @@ fn reject_provider_secret_source_errors(
                 }
             }
         }
-        let Some(provider_auth) = host_table
-            .get("provider_auth")
+        let local = host_table.get("transport").and_then(toml::Value::as_str) == Some("local");
+        let Some(desktop_bindings) = host_table
+            .get("desktop_bindings")
             .and_then(toml::Value::as_table)
         else {
             continue;
         };
-
-        for (provider_alias, source_value) in provider_auth {
-            let source_path = format!("{host_path}.provider_auth.{provider_alias}");
-            let Some(source_table) = source_value.as_table() else {
+        for (binding_alias, binding_value) in desktop_bindings {
+            let Some(provider_auth) = binding_value
+                .get("provider_auth")
+                .and_then(toml::Value::as_table)
+            else {
                 continue;
             };
-            let Some(kind) = source_table.get("kind").and_then(toml::Value::as_str) else {
-                continue;
-            };
+            let auth_path = format!("{host_path}.desktop_bindings.{binding_alias}.provider_auth");
+            validate_provider_secret_sources(path, alias, local, &auth_path, provider_auth)?;
+        }
+    }
 
-            if !SUPPORTED_SECRET_SOURCE_KINDS.contains(&kind) {
-                return Err(SatelleError::unsupported_secret_source_kind(
-                    path,
-                    &format!("{source_path}.kind"),
-                    kind,
-                ));
-            }
+    Ok(())
+}
 
-            if kind == "executable-helper" {
-                let argv = source_table
-                    .get("argv")
-                    .and_then(toml::Value::as_array)
-                    .and_then(|items| {
-                        items
-                            .iter()
-                            .map(|item| item.as_str().map(str::to_owned))
-                            .collect::<Option<Vec<_>>>()
-                    });
-                if argv
-                    .as_ref()
-                    .is_none_or(|argv| !credential_helper::valid_argv(argv))
-                {
-                    return Err(SatelleError {
+fn validate_provider_secret_sources(
+    path: &Path,
+    host_alias: &str,
+    local: bool,
+    auth_path: &str,
+    provider_auth: &toml::Table,
+) -> Result<(), SatelleError> {
+    for (provider_alias, source_value) in provider_auth {
+        let source_path = format!("{auth_path}.{provider_alias}");
+        let Some(source_table) = source_value.as_table() else {
+            continue;
+        };
+        let Some(kind) = source_table.get("kind").and_then(toml::Value::as_str) else {
+            continue;
+        };
+
+        if !SUPPORTED_SECRET_SOURCE_KINDS.contains(&kind) {
+            return Err(SatelleError::unsupported_secret_source_kind(
+                path,
+                &format!("{source_path}.kind"),
+                kind,
+            ));
+        }
+
+        if kind == "executable-helper" {
+            let argv = source_table
+                .get("argv")
+                .and_then(toml::Value::as_array)
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .map(|item| item.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                });
+            if argv
+                .as_ref()
+                .is_none_or(|argv| !credential_helper::valid_argv(argv))
+            {
+                return Err(SatelleError {
                         code: ErrorCode::CredentialHelperArgvInvalid,
                         message: "credential helper argv requires an absolute executable and literal arguments".to_string(),
                         recovery_command: Some("configure an absolute Host helper executable with literal arguments".to_string()),
@@ -4184,50 +4276,47 @@ fn reject_provider_secret_source_errors(
                             ("toml_path".to_string(), Value::String(format!("{source_path}.argv"))),
                         ]),
                     });
-                }
-                if let Some(timeout) = source_table.get("timeout")
-                    && timeout.as_str().and_then(ExplicitDuration::parse).is_none()
-                {
-                    return Err(SatelleError::duration_unit_required(
-                        path,
-                        &format!("{source_path}.timeout"),
-                    ));
-                }
-                // Serde errors can quote a malformed value. Keep helper argv
-                // and environment values outside diagnostic output even when
-                // the descriptor itself cannot be decoded.
-                if source_value
-                    .clone()
-                    .try_into::<ProviderSecretSource>()
-                    .is_err()
-                {
-                    return Err(SatelleError::config_error(
-                        format!(
-                            "invalid credential helper descriptor at {source_path} in {}",
-                            path.display()
-                        ),
-                        None,
-                    ));
-                }
             }
-
-            if kind == "file"
-                && let Some(file_path) = source_table.get("path").and_then(toml::Value::as_str)
+            if let Some(timeout) = source_table.get("timeout")
+                && timeout.as_str().and_then(ExplicitDuration::parse).is_none()
             {
-                // Local Hosts use this platform. A remote Host's grammar is
-                // unknown here; accept either syntax without resolving home.
-                let local =
-                    host_table.get("transport").and_then(toml::Value::as_str) == Some("local");
-                validate_secret_file_path(Path::new(file_path), local.then_some(cfg!(windows)))
-                    .map_err(|error| {
-                        error.diagnostic(
-                            Some(path),
-                            Some(&format!("{source_path}.path")),
-                            Some(alias),
-                            local.then_some(std::env::consts::OS),
-                        )
-                    })?;
+                return Err(SatelleError::duration_unit_required(
+                    path,
+                    &format!("{source_path}.timeout"),
+                ));
             }
+            // Serde errors can quote a malformed value. Keep helper argv
+            // and environment values outside diagnostic output even when
+            // the descriptor itself cannot be decoded.
+            if source_value
+                .clone()
+                .try_into::<ProviderSecretSource>()
+                .is_err()
+            {
+                return Err(SatelleError::config_error(
+                    format!(
+                        "invalid credential helper descriptor at {source_path} in {}",
+                        path.display()
+                    ),
+                    None,
+                ));
+            }
+        }
+
+        if kind == "file"
+            && let Some(file_path) = source_table.get("path").and_then(toml::Value::as_str)
+        {
+            // Local Hosts use this platform. A remote Host's grammar is
+            // unknown here; accept either syntax without resolving home.
+            validate_secret_file_path(Path::new(file_path), local.then_some(cfg!(windows)))
+                .map_err(|error| {
+                    error.diagnostic(
+                        Some(path),
+                        Some(&format!("{source_path}.path")),
+                        Some(host_alias),
+                        local.then_some(std::env::consts::OS),
+                    )
+                })?;
         }
     }
 
@@ -4331,15 +4420,33 @@ fn reject_provider_binding_errors(path: &Path, value: &toml::Value) -> Result<()
     };
 
     for (host_alias, host_value) in hosts {
-        let Some(provider_bindings) = host_value
-            .get("provider_bindings")
+        let Some(desktop_bindings) = host_value
+            .get("desktop_bindings")
             .and_then(toml::Value::as_table)
         else {
             continue;
         };
-        for (provider_alias, model_bindings) in provider_bindings {
-            let provider_path = format!("hosts.{host_alias}.provider_bindings.{provider_alias}");
-            crate::session::ProviderBindingRef::new(provider_alias.clone()).map_err(|_| {
+        for (desktop_alias, desktop_value) in desktop_bindings {
+            crate::session::DesktopBindingRef::new(desktop_alias.clone()).map_err(|_| {
+                SatelleError::config_error(
+                    format!(
+                        "config file {} has an invalid Desktop Binding alias at hosts.{host_alias}.desktop_bindings.{desktop_alias}",
+                        path.display()
+                    ),
+                    None,
+                )
+            })?;
+            let Some(provider_bindings) = desktop_value
+                .get("provider_bindings")
+                .and_then(toml::Value::as_table)
+            else {
+                continue;
+            };
+            for (provider_alias, model_bindings) in provider_bindings {
+                let provider_path = format!(
+                    "hosts.{host_alias}.desktop_bindings.{desktop_alias}.provider_bindings.{provider_alias}"
+                );
+                crate::session::ProviderBindingRef::new(provider_alias.clone()).map_err(|_| {
                 SatelleError::config_error(
                     format!(
                         "config file {} has an invalid provider binding alias at {provider_path}",
@@ -4348,37 +4455,38 @@ fn reject_provider_binding_errors(path: &Path, value: &toml::Value) -> Result<()
                     None,
                 )
             })?;
-            let Some(model_bindings) = model_bindings.as_table() else {
-                continue;
-            };
-            for (model_alias, binding) in model_bindings {
-                let model_path = format!("{provider_path}.{model_alias}");
-                crate::session::EffectiveModelRef::new(model_alias.clone()).map_err(|_| {
-                    SatelleError::config_error(
-                        format!(
-                            "config file {} has an invalid model binding alias at {model_path}",
-                            path.display()
-                        ),
-                        None,
-                    )
-                })?;
-                let Some(binding) = binding.as_table() else {
+                let Some(model_bindings) = model_bindings.as_table() else {
                     continue;
                 };
-                for field in ["model", "model_provider"] {
-                    let field_path = format!("{model_path}.{field}");
-                    if binding
-                        .get(field)
-                        .and_then(toml::Value::as_str)
-                        .is_none_or(str::is_empty)
-                    {
-                        return Err(SatelleError::config_error(
+                for (model_alias, binding) in model_bindings {
+                    let model_path = format!("{provider_path}.{model_alias}");
+                    crate::session::EffectiveModelRef::new(model_alias.clone()).map_err(|_| {
+                        SatelleError::config_error(
                             format!(
-                                "config file {} requires a non-empty string at {field_path}",
+                                "config file {} has an invalid model binding alias at {model_path}",
                                 path.display()
                             ),
                             None,
-                        ));
+                        )
+                    })?;
+                    let Some(binding) = binding.as_table() else {
+                        continue;
+                    };
+                    for field in ["model", "model_provider"] {
+                        let field_path = format!("{model_path}.{field}");
+                        if binding
+                            .get(field)
+                            .and_then(toml::Value::as_str)
+                            .is_none_or(str::is_empty)
+                        {
+                            return Err(SatelleError::config_error(
+                                format!(
+                                    "config file {} requires a non-empty string at {field_path}",
+                                    path.display()
+                                ),
+                                None,
+                            ));
+                        }
                     }
                 }
             }
@@ -4407,18 +4515,28 @@ fn reject_desktop_session_selector_conflicts(
         return Ok(());
     };
 
-    for (alias, host_value) in hosts {
+    for (host_alias, host_value) in hosts {
         let Some(host_table) = host_value.as_table() else {
             continue;
         };
-
-        if host_table.contains_key("desktop_session_preference")
-            && host_table.contains_key("desktop_session_native_selector")
-        {
-            return Err(SatelleError::desktop_session_selector_conflict(
-                path,
-                &format!("hosts.{alias}"),
-            ));
+        let Some(desktop_bindings) = host_table
+            .get("desktop_bindings")
+            .and_then(toml::Value::as_table)
+        else {
+            continue;
+        };
+        for (binding_alias, binding_value) in desktop_bindings {
+            let Some(binding) = binding_value.as_table() else {
+                continue;
+            };
+            if binding.contains_key("desktop_session_preference")
+                && binding.contains_key("desktop_session_native_selector")
+            {
+                return Err(SatelleError::desktop_session_selector_conflict(
+                    path,
+                    &format!("hosts.{host_alias}.desktop_bindings.{binding_alias}"),
+                ));
+            }
         }
     }
 
@@ -4546,9 +4664,7 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "telemetry",
                     "recording",
                     "queue",
-                    "desktop_user",
-                    "desktop_session_preference",
-                    "desktop_session_native_selector",
+                    "desktop_bindings",
                     "daemon_home",
                     "daemon_config_file",
                     "daemon_state_dir",
@@ -4563,8 +4679,6 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                     "api_token",
                     "ca_bundle",
                     "client_certificate",
-                    "provider_auth",
-                    "provider_bindings",
                 ],
                 &mut unknown_keys,
             );
@@ -4644,68 +4758,48 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
                 );
             }
 
-            if let Some(selector_table) = host_table
-                .get("desktop_session_native_selector")
+            if let Some(desktop_bindings) = host_table
+                .get("desktop_bindings")
                 .and_then(toml::Value::as_table)
             {
-                collect_unknown_keys_for_table(
-                    &format!("{host_path}.desktop_session_native_selector"),
-                    selector_table,
-                    &["platform", "kind", "value"],
-                    &mut unknown_keys,
-                );
-            }
-
-            if let Some(provider_auth_table) = host_table
-                .get("provider_auth")
-                .and_then(toml::Value::as_table)
-            {
-                for (provider_alias, source_value) in provider_auth_table {
-                    let Some(source_table) = source_value.as_table() else {
+                for (binding_alias, binding_value) in desktop_bindings {
+                    let binding_path = format!("{host_path}.desktop_bindings.{binding_alias}");
+                    let Some(binding) = binding_value.as_table() else {
                         continue;
                     };
                     collect_unknown_keys_for_table(
-                        &format!("{host_path}.provider_auth.{provider_alias}"),
-                        source_table,
-                        if source_table.get("kind").and_then(toml::Value::as_str)
-                            == Some("executable-helper")
-                        {
-                            &["kind", "argv", "timeout", "environment"]
-                        } else {
-                            &["kind", "variable", "path", "service", "account", "name"]
-                        },
+                        &binding_path,
+                        binding,
+                        &[
+                            "desktop_user",
+                            "desktop_session_preference",
+                            "desktop_session_native_selector",
+                            "provider_auth",
+                            "provider_bindings",
+                        ],
                         &mut unknown_keys,
                     );
-                }
-            }
-
-            if let Some(provider_bindings) = host_table
-                .get("provider_bindings")
-                .and_then(toml::Value::as_table)
-            {
-                for (provider_alias, model_bindings) in provider_bindings {
-                    let Some(model_bindings) = model_bindings.as_table() else {
-                        continue;
-                    };
-                    for (model_alias, binding) in model_bindings {
-                        let Some(binding) = binding.as_table() else {
-                            continue;
-                        };
+                    if let Some(selector) = binding
+                        .get("desktop_session_native_selector")
+                        .and_then(toml::Value::as_table)
+                    {
                         collect_unknown_keys_for_table(
-                            &format!(
-                                "{host_path}.provider_bindings.{provider_alias}.{model_alias}"
-                            ),
-                            binding,
-                            &[
-                                "model",
-                                "model_provider",
-                                "endpoint",
-                                "auth_source",
-                                "allow_project_selection",
-                            ],
+                            &format!("{binding_path}.desktop_session_native_selector"),
+                            selector,
+                            &["platform", "kind", "value"],
                             &mut unknown_keys,
                         );
                     }
+                    collect_provider_auth_unknown_keys(
+                        &format!("{binding_path}.provider_auth"),
+                        binding.get("provider_auth"),
+                        &mut unknown_keys,
+                    );
+                    collect_provider_binding_unknown_keys(
+                        &format!("{binding_path}.provider_bindings"),
+                        binding.get("provider_bindings"),
+                        &mut unknown_keys,
+                    );
                 }
             }
 
@@ -4726,6 +4820,63 @@ fn reject_unknown_user_config_keys(path: &Path, value: &toml::Value) -> Result<(
         Ok(())
     } else {
         Err(SatelleError::unknown_config_keys(path, unknown_keys))
+    }
+}
+
+fn collect_provider_auth_unknown_keys(
+    auth_path: &str,
+    value: Option<&toml::Value>,
+    unknown_keys: &mut Vec<UnknownConfigKey>,
+) {
+    let Some(provider_auth) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for (provider_alias, source_value) in provider_auth {
+        let Some(source) = source_value.as_table() else {
+            continue;
+        };
+        collect_unknown_keys_for_table(
+            &format!("{auth_path}.{provider_alias}"),
+            source,
+            if source.get("kind").and_then(toml::Value::as_str) == Some("executable-helper") {
+                &["kind", "argv", "timeout", "environment"]
+            } else {
+                &["kind", "variable", "path", "service", "account", "name"]
+            },
+            unknown_keys,
+        );
+    }
+}
+
+fn collect_provider_binding_unknown_keys(
+    bindings_path: &str,
+    value: Option<&toml::Value>,
+    unknown_keys: &mut Vec<UnknownConfigKey>,
+) {
+    let Some(provider_bindings) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for (provider_alias, model_bindings) in provider_bindings {
+        let Some(model_bindings) = model_bindings.as_table() else {
+            continue;
+        };
+        for (model_alias, binding) in model_bindings {
+            let Some(binding) = binding.as_table() else {
+                continue;
+            };
+            collect_unknown_keys_for_table(
+                &format!("{bindings_path}.{provider_alias}.{model_alias}"),
+                binding,
+                &[
+                    "model",
+                    "model_provider",
+                    "endpoint",
+                    "auth_source",
+                    "allow_project_selection",
+                ],
+                unknown_keys,
+            );
+        }
     }
 }
 
@@ -5131,6 +5282,10 @@ pub enum ErrorCode {
     SecretFileHomeUnavailable,
     DesktopSessionSelectorConflict,
     DesktopBindingRequired,
+    DesktopBindingAmbiguous,
+    DesktopBindingNotFound,
+    DesktopBindingUnauthorized,
+    DesktopBindingSecureHandoffUnsupported,
     DesktopSessionUnavailable,
     DesktopSessionAmbiguous,
     DesktopSessionPreferenceUnmatched,
@@ -5302,6 +5457,12 @@ impl ErrorCode {
             Self::SecretFileHomeUnavailable => "secret-file-home-unavailable",
             Self::DesktopSessionSelectorConflict => "desktop-session-selector-conflict",
             Self::DesktopBindingRequired => "desktop-binding-required",
+            Self::DesktopBindingAmbiguous => "desktop-binding-ambiguous",
+            Self::DesktopBindingNotFound => "desktop-binding-not-found",
+            Self::DesktopBindingUnauthorized => "desktop-binding-unauthorized",
+            Self::DesktopBindingSecureHandoffUnsupported => {
+                "desktop-binding-secure-handoff-unsupported"
+            }
             Self::DesktopSessionUnavailable => "desktop-session-unavailable",
             Self::DesktopSessionAmbiguous => "desktop-session-ambiguous",
             Self::DesktopSessionPreferenceUnmatched => "desktop-session-preference-unmatched",
@@ -5460,6 +5621,7 @@ impl ErrorCode {
             | Self::QueueDisabled
             | Self::InputRequired
             | Self::DesktopBindingRequired
+            | Self::DesktopBindingAmbiguous
             | Self::DoctorRefreshScopeRequired
             | Self::DoctorRefreshTimeoutWithoutRefresh => 64,
             Self::Interrupted => 130,
@@ -5503,6 +5665,7 @@ impl ErrorCode {
             | Self::PathOverrideNotAbsolute
             | Self::DaemonPathOverrideNotAbsolute
             | Self::ModelProviderBindingMissing
+            | Self::DesktopBindingNotFound
             | Self::HostNotFound
             | Self::QueueRequestNotFound
             | Self::SessionNotFound
@@ -5529,6 +5692,7 @@ impl ErrorCode {
             | Self::SshHostKeyVerificationRequired
             | Self::AuthenticationFailed
             | Self::AuthorizationInsufficientScope
+            | Self::DesktopBindingUnauthorized
             | Self::HostIdentityMismatch
             | Self::LogsFollowIdentityChanged
             | Self::StoreInUse
@@ -5571,6 +5735,7 @@ impl ErrorCode {
             | Self::UnsupportedProviderComputerUse
             | Self::ExperimentalProviderNotValidated
             | Self::DesktopSessionUnavailable
+            | Self::DesktopBindingSecureHandoffUnsupported
             | Self::DesktopSessionAmbiguous
             | Self::DesktopSessionPreferenceUnmatched
             | Self::DesktopSessionConsoleUnavailable
@@ -6227,7 +6392,8 @@ impl SatelleError {
                 "multiple compatible desktop users are visible and no Desktop Binding is configured"
                     .to_string(),
             recovery_command: Some(
-                "set hosts.<alias>.desktop_user in user-level configuration".to_string(),
+                "set hosts.<alias>.desktop_bindings.<binding-alias>.desktop_user in user-level configuration"
+                    .to_string(),
             ),
             source_detail: None,
             details: BTreeMap::from([(
@@ -6239,6 +6405,69 @@ impl SatelleError {
                         .collect(),
                 ),
             )]),
+        }
+    }
+
+    pub fn desktop_binding_ambiguous(bindings: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            code: ErrorCode::DesktopBindingAmbiguous,
+            message: "the Host owns multiple Desktop Bindings and the Turn did not select one"
+                .to_string(),
+            recovery_command: Some("pass --desktop-binding <alias>".to_string()),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "desktop_bindings".to_string(),
+                Value::Array(bindings.into_iter().map(Value::String).collect()),
+            )]),
+        }
+    }
+
+    pub fn desktop_binding_not_found(binding: &str) -> Self {
+        Self {
+            code: ErrorCode::DesktopBindingNotFound,
+            message: format!("Desktop Binding '{binding}' is not configured on this Host"),
+            recovery_command: Some(
+                "select a binding reported by satelle host sessions".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "desktop_binding".to_string(),
+                Value::String(binding.to_string()),
+            )]),
+        }
+    }
+
+    pub fn desktop_binding_unauthorized(binding: &str) -> Self {
+        Self {
+            code: ErrorCode::DesktopBindingUnauthorized,
+            message: format!("the API Principal is not authorized for Desktop Binding '{binding}'"),
+            recovery_command: Some(
+                "ask the Host Operator to issue a credential with this Desktop Binding grant"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([(
+                "desktop_binding".to_string(),
+                Value::String(binding.to_string()),
+            )]),
+        }
+    }
+
+    pub fn desktop_binding_secure_handoff_unsupported(binding: &str, desktop_user: &str) -> Self {
+        Self {
+            code: ErrorCode::DesktopBindingSecureHandoffUnsupported,
+            message: format!(
+                "Desktop Binding '{binding}' targets OS user '{desktop_user}', but this Host runtime cannot perform a secure cross-user handoff"
+            ),
+            recovery_command: Some(
+                "run a per-user Host Daemon for that OS account or use a Host runtime with secure user handoff"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::from([
+                ("desktop_binding".to_string(), Value::String(binding.to_string())),
+                ("desktop_user".to_string(), Value::String(desktop_user.to_string())),
+            ]),
         }
     }
 

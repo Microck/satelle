@@ -11,6 +11,11 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+fn test_desktop_binding() -> satelle_core::session::DesktopBindingRef {
+    satelle_core::session::DesktopBindingRef::new("desktop-test")
+        .expect("valid test Desktop Binding")
+}
+
 fn rebuild_logs_as_v15_fixture(connection: &Connection) {
     // Migration metadata is not a historical fixture. Restore the exact
     // predecessor table so migration 16 proves its real ALTER/COPY boundary.
@@ -424,6 +429,9 @@ fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
 
             DROP TABLE turn_admission_readiness;
             DROP TABLE authorized_provider_bindings;
+            DROP INDEX logs_by_desktop_binding_cursor;
+            ALTER TABLE logs DROP COLUMN desktop_binding_ref;
+            ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
             DROP TABLE provider_smoke_hmac_key;
             ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
             ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
@@ -435,7 +443,7 @@ fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
             DROP TABLE raw_diagnostic_audit;
             DROP TABLE client_certificate_audit;
              DROP TABLE turn_admission_queue;
-            DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
+            DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
             PRAGMA user_version = 11;",
         )
         .expect("restore the exact version eleven storage schema");
@@ -447,7 +455,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_current_version() {
     let (storage, _) = Storage::open(state.path()).expect("open storage");
     let connection = storage.connection_for_test();
 
-    assert_eq!(23_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(24_i64, pragma_integer(connection, "user_version"));
     let versions = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -459,6 +467,7 @@ fn operational_evidence_schema_is_migrated_atomically_to_current_version() {
         vec![
             1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64, 11_i64, 12_i64,
             13_i64, 14_i64, 15_i64, 16_i64, 17_i64, 18_i64, 19_i64, 20_i64, 21_i64, 22_i64, 23_i64,
+            24_i64,
         ],
         versions
     );
@@ -551,7 +560,9 @@ fn version_fifteen_logs_upgrade_preserves_rows_and_normalizes_lifecycle_sources(
         .expect("load the version fifteen Log cursor high-water mark");
     connection
         .execute_batch(
-            "DROP TABLE recording_artifacts;
+            "ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP TABLE authorized_provider_bindings;
+             DROP TABLE recording_artifacts;
              DROP INDEX recording_audit_retention;
              DROP TABLE recording_audit;
              DROP INDEX control_lease_desktop_snapshot_owner;
@@ -561,6 +572,7 @@ fn version_fifteen_logs_upgrade_preserves_rows_and_normalizes_lifecycle_sources(
              DROP TABLE turn_admission_queue;",
         )
         .expect("remove later audit tables from the version fifteen fixture");
+    restore_authorized_provider_bindings_v12(connection);
     connection
         .execute("DELETE FROM schema_migrations WHERE version >= 16", [])
         .expect("remove history after version fifteen");
@@ -576,7 +588,7 @@ fn version_fifteen_logs_upgrade_preserves_rows_and_normalizes_lifecycle_sources(
         "the destructive log-table rewrite must retain a rollback backup",
     );
     let connection = upgraded.connection_for_test();
-    assert_eq!(23_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(24_i64, pragma_integer(connection, "user_version"));
     assert_eq!(
         (lifecycle_cursor, "codex_adapter".to_string()),
         connection
@@ -675,7 +687,7 @@ fn version_eleven_provider_smoke_rows_upgrade_to_credential_scoped_cache() {
     let mut upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade the version eleven store");
     assert_eq!(
-        23_i64,
+        24_i64,
         pragma_integer(upgraded.connection_for_test(), "user_version")
     );
     let credential_columns: i64 = upgraded
@@ -770,6 +782,9 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
         .execute_batch(
             "DROP TABLE turn_admission_readiness;
              DROP TABLE authorized_provider_bindings;
+             DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
              DROP TABLE provider_smoke_hmac_key;
              ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
              ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;",
@@ -791,7 +806,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     storage
         .connection_for_test()
         .execute(
-            "DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23)",
+            "DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)",
             [],
         )
         .expect("remove version eleven and twelve history");
@@ -804,7 +819,7 @@ fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() 
     let upgraded = Storage::open_without_restart_recovery(state.path())
         .expect("upgrade populated version ten storage");
     let connection = upgraded.connection_for_test();
-    assert_eq!(23_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(24_i64, pragma_integer(connection, "user_version"));
     assert_eq!(
         ("run".to_string(), "in_progress".to_string()),
         connection
@@ -1029,6 +1044,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
                 "existing-principal",
                 1,
                 crate::ApiScopes::CONTROL,
+                std::collections::BTreeSet::from(["desktop-test".to_string()]),
                 None,
                 at(1),
             )
@@ -1045,6 +1061,9 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
              ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
@@ -1057,7 +1076,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;
              DROP TABLE turn_admission_queue;
-             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
+             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
              PRAGMA user_version = 7;",
         )
         .expect("recreate the version seven token schema");
@@ -1065,7 +1084,7 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
 
     let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
     assert_eq!(
-        23_i64,
+        24_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
     let token_state: String = storage
@@ -1077,12 +1096,12 @@ fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
         )
         .expect("read migrated token state");
     assert_eq!("active", token_state);
-    assert!(
-        storage
-            .authenticate_api_token(&existing_token, at(2))
-            .expect("authenticate migrated token")
-            .is_some()
-    );
+    let principal = storage
+        .authenticate_api_token(&existing_token, at(2))
+        .expect("authenticate migrated token")
+        .expect("the migrated token remains active");
+    assert!(principal.desktop_bindings().is_empty());
+    assert!(!principal.allows_desktop_binding("desktop-test"));
 }
 
 #[test]
@@ -2322,6 +2341,9 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
              DROP TABLE authorized_provider_bindings;
              DROP TABLE provider_smoke_hmac_key;
              DROP TABLE recording_artifacts;
@@ -2332,7 +2354,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;
              DROP TABLE turn_admission_queue;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -2341,7 +2363,7 @@ fn version_one_store_upgrades_without_replacing_existing_state() {
     let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
     assert_eq!(expected_host, storage.host_identity().unwrap());
     assert_eq!(
-        23_i64,
+        24_i64,
         pragma_integer(storage.connection_for_test(), "user_version")
     );
 
@@ -2436,6 +2458,9 @@ fn assert_version_one_corruption_rejected_before_migration(
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
              DROP TABLE provider_secret_provisioning_journal;
              DROP INDEX idempotency_operation_identity;
              DROP TABLE authorized_provider_bindings;
@@ -2448,7 +2473,7 @@ fn assert_version_one_corruption_rejected_before_migration(
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;
              DROP TABLE turn_admission_queue;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
              PRAGMA user_version = 1;",
         )
         .expect("create a logically corrupt version one store");
@@ -2512,6 +2537,9 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              ALTER TABLE sessions DROP COLUMN display_name;
              ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
              ALTER TABLE api_tokens DROP COLUMN token_state;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
              DROP TABLE provider_secret_provisioning_journal;
              DROP INDEX idempotency_operation_identity;
              DROP TABLE authorized_provider_bindings;
@@ -2524,7 +2552,7 @@ fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
              DROP TABLE raw_diagnostic_audit;
              DROP TABLE client_certificate_audit;
              DROP TABLE turn_admission_queue;
-             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
              PRAGMA user_version = 1;
              CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
              INSERT INTO migration_sentinel (value) VALUES ('preserve-me');
@@ -3130,11 +3158,15 @@ fn authorized_provider_binding_round_trips_replaces_restarts_and_deletes() {
     );
 
     storage
-        .authorize_provider_binding(&initial, at(1))
+        .authorize_provider_binding(&test_desktop_binding(), &initial, at(1))
         .expect("authorize initial provider binding");
 
     let loaded_initial = storage
-        .load_authorized_provider_binding("review-model", "review-provider")
+        .load_authorized_provider_binding(
+            &test_desktop_binding(),
+            "review-model",
+            "review-provider",
+        )
         .expect("load initial provider binding")
         .expect("initial provider binding exists");
     assert_eq!(loaded_initial.requested_model_alias(), "review-model");
@@ -3177,11 +3209,15 @@ fn authorized_provider_binding_round_trips_replaces_restarts_and_deletes() {
     assert_ne!(replacement_digest, initial_digest);
 
     storage
-        .authorize_provider_binding(&replacement, at(2))
+        .authorize_provider_binding(&test_desktop_binding(), &replacement, at(2))
         .expect("replace authorized provider binding");
 
     let loaded_replacement = storage
-        .load_authorized_provider_binding("review-model", "review-provider")
+        .load_authorized_provider_binding(
+            &test_desktop_binding(),
+            "review-model",
+            "review-provider",
+        )
         .expect("load replacement provider binding")
         .expect("replacement provider binding exists");
     assert_eq!(loaded_replacement.requested_model_alias(), "review-model");
@@ -3214,37 +3250,61 @@ fn authorized_provider_binding_round_trips_replaces_restarts_and_deletes() {
     let (mut storage, _) = Storage::open(state.path()).expect("reopen storage");
 
     let loaded_after_restart = storage
-        .load_authorized_provider_binding("review-model", "review-provider")
+        .load_authorized_provider_binding(
+            &test_desktop_binding(),
+            "review-model",
+            "review-provider",
+        )
         .expect("load provider binding after restart")
         .expect("provider binding survives restart");
     assert_eq!(loaded_after_restart, loaded_replacement);
     assert_eq!(loaded_after_restart.binding_digest(), replacement_digest);
     assert_eq!(
         storage
-            .load_authorized_provider_binding("other-model", "review-provider")
+            .load_authorized_provider_binding(
+                &test_desktop_binding(),
+                "other-model",
+                "review-provider"
+            )
             .expect("look up another model alias"),
         None
     );
     assert_eq!(
         storage
-            .load_authorized_provider_binding("review-model", "other-provider")
+            .load_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "other-provider"
+            )
             .expect("look up another provider alias"),
         None
     );
 
     assert!(
         storage
-            .delete_authorized_provider_binding("review-model", "review-provider")
+            .delete_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "review-provider"
+            )
             .expect("delete provider binding")
     );
     assert!(
         !storage
-            .delete_authorized_provider_binding("review-model", "review-provider")
+            .delete_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "review-provider"
+            )
             .expect("delete absent provider binding")
     );
     assert_eq!(
         storage
-            .load_authorized_provider_binding("review-model", "review-provider")
+            .load_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "review-provider"
+            )
             .expect("load deleted provider binding"),
         None
     );
@@ -3253,9 +3313,63 @@ fn authorized_provider_binding_round_trips_replaces_restarts_and_deletes() {
     let (storage, _) = Storage::open(state.path()).expect("reopen storage after deletion");
     assert_eq!(
         storage
-            .load_authorized_provider_binding("review-model", "review-provider")
+            .load_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "review-provider"
+            )
             .expect("load deleted provider binding after restart"),
         None
+    );
+}
+
+#[test]
+fn authorized_provider_bindings_are_namespaced_by_desktop_binding() {
+    let state = TempDir::new().expect("create state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let alice = satelle_core::session::DesktopBindingRef::new("alice").unwrap();
+    let bob = satelle_core::session::DesktopBindingRef::new("bob").unwrap();
+    let alice_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-alice",
+            "openai",
+        ),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+    let bob_binding = satelle_core::ResolvedProviderBinding::from_authorization(
+        satelle_core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-bob",
+            "openai",
+        ),
+        satelle_core::ProviderBindingSource::UserConfig,
+    );
+
+    storage
+        .authorize_provider_binding(&alice, &alice_binding, at(1))
+        .expect("authorize Alice's provider binding");
+    storage
+        .authorize_provider_binding(&bob, &bob_binding, at(2))
+        .expect("authorize Bob's provider binding");
+
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding(&alice, "review-model", "review-provider")
+            .unwrap()
+            .unwrap()
+            .model(),
+        "gpt-alice"
+    );
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding(&bob, "review-model", "review-provider")
+            .unwrap()
+            .unwrap()
+            .model(),
+        "gpt-bob"
     );
 }
 
@@ -3277,7 +3391,7 @@ fn authorized_provider_binding_tampered_digest_fails_closed() {
     );
 
     storage
-        .authorize_provider_binding(&binding, at(1))
+        .authorize_provider_binding(&test_desktop_binding(), &binding, at(1))
         .expect("authorize provider binding");
     storage
         .connection_for_test()
@@ -3290,7 +3404,11 @@ fn authorized_provider_binding_tampered_digest_fails_closed() {
         .expect("tamper with the stored binding digest");
 
     let error = storage
-        .load_authorized_provider_binding("review-model", "review-provider")
+        .load_authorized_provider_binding(
+            &test_desktop_binding(),
+            "review-model",
+            "review-provider",
+        )
         .expect_err("a mismatched stored digest must fail closed");
     assert_eq!(error.kind(), StorageErrorKind::InvalidStoredState);
 }
@@ -3309,7 +3427,7 @@ fn provider_binding_compare_and_swap_preserves_a_concurrent_replacement() {
         satelle_core::ProviderBindingSource::UserConfig,
     );
     storage
-        .authorize_provider_binding(&initial, at(1))
+        .authorize_provider_binding(&test_desktop_binding(), &initial, at(1))
         .expect("authorize initial provider binding");
     let concurrent = satelle_core::ResolvedProviderBinding::from_authorization(
         satelle_core::ProviderBindingAuthorization::new(
@@ -3321,7 +3439,7 @@ fn provider_binding_compare_and_swap_preserves_a_concurrent_replacement() {
         satelle_core::ProviderBindingSource::UserConfig,
     );
     storage
-        .authorize_provider_binding(&concurrent, at(2))
+        .authorize_provider_binding(&test_desktop_binding(), &concurrent, at(2))
         .expect("commit concurrent provider replacement");
     let stale = satelle_core::ResolvedProviderBinding::from_authorization(
         satelle_core::ProviderBindingAuthorization::new(
@@ -3334,12 +3452,21 @@ fn provider_binding_compare_and_swap_preserves_a_concurrent_replacement() {
     );
 
     let error = storage
-        .authorize_provider_binding_if_unchanged(&stale, Some(initial.binding_digest()), at(3))
+        .authorize_provider_binding_if_unchanged(
+            &test_desktop_binding(),
+            &stale,
+            Some(initial.binding_digest()),
+            at(3),
+        )
         .expect_err("a stale replacement must not overwrite the current binding");
     assert_eq!(error.kind(), StorageErrorKind::StateConflict);
     assert_eq!(
         storage
-            .load_authorized_provider_binding("review-model", "review-provider")
+            .load_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "review-provider"
+            )
             .expect("load current provider binding")
             .expect("current provider binding exists"),
         concurrent

@@ -149,13 +149,13 @@ fn supported_execution_version(
 pub(crate) struct ProductionComputerUseAdapter {
     snapshot: Arc<RwLock<crate::ProductionCapabilitySnapshot>>,
     working_directory: Result<PathBuf, SatelleError>,
-    active_execution: Arc<Mutex<Option<ActiveCodexExecution>>>,
+    active_executions: Arc<Mutex<BTreeMap<String, ActiveCodexExecution>>>,
     native_readiness_timeout: Duration,
     native_readiness_ttl: time::Duration,
     provider_smoke_timeout: Duration,
     provider_smoke_success_ttl: time::Duration,
     provider_smoke_failure_ttl: time::Duration,
-    desktop_selection: DesktopSelectionPolicy,
+    desktop_bindings: BTreeMap<String, DesktopSelectionPolicy>,
     provider_smoke_fingerprinter: ProviderSmokeCredentialFingerprinter,
 }
 
@@ -165,7 +165,7 @@ pub(crate) struct ProductionAdapterPolicy {
     pub(crate) provider_smoke_timeout: Duration,
     pub(crate) provider_smoke_success_ttl: time::Duration,
     pub(crate) provider_smoke_failure_ttl: time::Duration,
-    pub(crate) desktop_selection: DesktopSelectionPolicy,
+    pub(crate) desktop_bindings: BTreeMap<String, DesktopSelectionPolicy>,
 }
 
 #[derive(Clone)]
@@ -176,7 +176,8 @@ struct ActiveCodexExecution {
 }
 
 struct ActiveExecutionGuard {
-    registry: Arc<Mutex<Option<ActiveCodexExecution>>>,
+    registry: Arc<Mutex<BTreeMap<String, ActiveCodexExecution>>>,
+    desktop_binding: String,
     session_id: satelle_core::SessionId,
     turn_id: satelle_core::TurnId,
 }
@@ -186,10 +187,10 @@ impl Drop for ActiveExecutionGuard {
         let Ok(mut active) = self.registry.lock() else {
             return;
         };
-        if active.as_ref().is_some_and(|execution| {
+        if active.get(&self.desktop_binding).is_some_and(|execution| {
             execution.session_id == self.session_id && execution.turn_id == self.turn_id
         }) {
-            *active = None;
+            active.remove(&self.desktop_binding);
         }
     }
 }
@@ -203,17 +204,20 @@ impl ProductionComputerUseAdapter {
         Self {
             snapshot,
             working_directory,
-            active_execution: Arc::new(Mutex::new(None)),
+            active_executions: Arc::new(Mutex::new(BTreeMap::new())),
             native_readiness_timeout: crate::DEFAULT_NATIVE_READINESS_TIMEOUT,
             native_readiness_ttl: crate::DEFAULT_NATIVE_READINESS_TTL,
             provider_smoke_timeout: Duration::from_secs(120),
             provider_smoke_success_ttl: crate::DEFAULT_PROVIDER_SMOKE_SUCCESS_TTL,
             provider_smoke_failure_ttl: crate::DEFAULT_PROVIDER_SMOKE_FAILURE_TTL,
-            desktop_selection: DesktopSelectionPolicy {
-                desktop_user: None,
-                preference: None,
-                native_selector: None,
-            },
+            desktop_bindings: BTreeMap::from([(
+                "local-demo-desktop-v1".to_string(),
+                DesktopSelectionPolicy {
+                    desktop_user: None,
+                    preference: None,
+                    native_selector: None,
+                },
+            )]),
             provider_smoke_fingerprinter: ProviderSmokeCredentialFingerprinter::for_test(
                 [0x5a; 32],
             ),
@@ -228,13 +232,13 @@ impl ProductionComputerUseAdapter {
         Self {
             snapshot,
             working_directory,
-            active_execution: Arc::new(Mutex::new(None)),
+            active_executions: Arc::new(Mutex::new(BTreeMap::new())),
             native_readiness_timeout: policy.native_readiness_timeout,
             native_readiness_ttl: policy.native_readiness_ttl,
             provider_smoke_timeout: policy.provider_smoke_timeout,
             provider_smoke_success_ttl: policy.provider_smoke_success_ttl,
             provider_smoke_failure_ttl: policy.provider_smoke_failure_ttl,
-            desktop_selection: policy.desktop_selection,
+            desktop_bindings: policy.desktop_bindings,
             provider_smoke_fingerprinter: ProviderSmokeCredentialFingerprinter::default(),
         }
     }
@@ -336,9 +340,12 @@ impl ProductionComputerUseAdapter {
         let plugin_version = verified_app_server.plugin_version().to_string();
         let native_runtime_version = verified_app_server.native_runtime_version().to_string();
 
+        let (desktop_binding, desktop_selection) =
+            self.selected_desktop_binding(provider_intent)?;
         let desktops = crate::desktop_sessions::discover()?;
         let platform = crate::codex_capabilities::HostPlatform::current().as_str();
-        let desktop = resolve_desktop_session_for(platform, &desktops, &self.desktop_selection)?;
+        self.require_secure_desktop_handoff(&desktop_binding, desktop_selection)?;
+        let desktop = resolve_desktop_session_for(platform, &desktops, desktop_selection)?;
         let allowed_app_ids = crate::codex_capabilities::configured_computer_use_allowed_app_ids();
         let observations = native_prerequisite_observations(
             platform,
@@ -346,8 +353,6 @@ impl ProductionComputerUseAdapter {
             app_policy_surface,
             &allowed_app_ids,
         );
-        let desktop_binding = DesktopBindingRef::new(desktop.desktop_user.clone())
-            .map_err(|_| adapter_failure("desktop_binding_invalid"))?;
         let resolved_binding = self.resolve_provider_binding(provider_intent)?;
         let effective_model = EffectiveModelRef::new(resolved_binding.model())
             .map_err(|_| adapter_failure("model_binding_invalid"))?;
@@ -534,13 +539,16 @@ impl ProductionComputerUseAdapter {
                 Some,
             )
             .ok_or_else(|| native_smoke_failure("native_readiness_timeout_invalid"))?;
-        let working_directory = self
+        let runtime_paths = self
             .working_directory
             .as_ref()
             .map_err(|_| native_smoke_failure("working_directory_unavailable"))
             .and_then(|path| {
-                prepare_working_directory(path)
-                    .map_err(|_| native_smoke_failure("working_directory_unavailable"))
+                prepare_binding_runtime_paths(
+                    path,
+                    key.execution_policy().desktop_target().binding(),
+                )
+                .map_err(|_| native_smoke_failure("working_directory_unavailable"))
             })?;
         let verified_app_server = crate::codex_capabilities::installed_computer_use_app_server()
             .map_err(|error| NativeSmokeFailure {
@@ -573,9 +581,12 @@ impl ProductionComputerUseAdapter {
         .map_err(native_smoke_failure)?;
         let expected_mcp_server_name = verified_app_server.native_mcp_server_name.clone();
         let run = run_codex_session_with_native_action_completion(
-            verified_app_server.into_command(),
+            command_for_binding(
+                verified_app_server.into_command(),
+                &runtime_paths.codex_home,
+            ),
             CodexSessionRequest {
-                working_directory: &working_directory,
+                working_directory: &runtime_paths.working_directory,
                 prompt: &prompt,
                 existing_thread_ref: None,
                 model: None,
@@ -793,11 +804,16 @@ impl ProductionComputerUseAdapter {
                     false,
                 )
             })?;
-        let working_directory = self
+        let runtime_paths = self
             .working_directory
             .as_ref()
             .map_err(Clone::clone)
-            .and_then(|path| prepare_working_directory(path))
+            .and_then(|path| {
+                prepare_binding_runtime_paths(
+                    path,
+                    key.execution_policy().desktop_target().binding(),
+                )
+            })
             .map_err(|error| mark_probe_dispatch_possible(error, false))?;
         let verified_app_server =
             app_server_command().map_err(|error| mark_probe_dispatch_possible(error, false))?;
@@ -830,11 +846,14 @@ impl ProductionComputerUseAdapter {
         .map_err(|reason| mark_probe_dispatch_possible(adapter_failure(reason), false))?;
         let expected_mcp_server_name = verified_app_server.native_mcp_server_name.clone();
         let run = run_codex_session_with_timeout_cancellation(
-            verified_app_server.into_command(),
+            command_for_binding(
+                verified_app_server.into_command(),
+                &runtime_paths.codex_home,
+            ),
             provider_smoke_session_request(
                 binding,
                 provider_secret,
-                &working_directory,
+                &runtime_paths.working_directory,
                 &prompt,
                 deadline,
                 &expected_mcp_server_name,
@@ -888,14 +907,65 @@ impl ProductionComputerUseAdapter {
         .map_err(|_| adapter_failure("provider_smoke_evidence_invalid"))
     }
 
-    fn resolve_configured_desktop_target(&self) -> Result<DesktopTarget, SatelleError> {
+    fn selected_desktop_binding(
+        &self,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<(DesktopBindingRef, &DesktopSelectionPolicy), SatelleError> {
+        let alias = match provider_intent.desktop_binding() {
+            Some(binding) => binding.clone(),
+            None if self.desktop_bindings.len() == 1 => DesktopBindingRef::new(
+                self.desktop_bindings
+                    .first_key_value()
+                    .expect("one Desktop Binding policy exists")
+                    .0
+                    .clone(),
+            )
+            .map_err(|_| adapter_failure("desktop_binding_invalid"))?,
+            None => {
+                return Err(SatelleError::desktop_binding_ambiguous(
+                    self.desktop_bindings.keys().cloned(),
+                ));
+            }
+        };
+        let policy = self
+            .desktop_bindings
+            .get(alias.as_str())
+            .ok_or_else(|| SatelleError::desktop_binding_not_found(alias.as_str()))?;
+        Ok((alias, policy))
+    }
+
+    fn require_secure_desktop_handoff(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        policy: &DesktopSelectionPolicy,
+    ) -> Result<(), SatelleError> {
+        let Some(desktop_user) = policy.desktop_user.as_deref() else {
+            return Ok(());
+        };
+        let daemon_user = crate::desktop_sessions::current_process_user()?;
+        if daemon_user != desktop_user {
+            return Err(SatelleError::desktop_binding_secure_handoff_unsupported(
+                desktop_binding.as_str(),
+                desktop_user,
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_configured_desktop_target(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+    ) -> Result<DesktopTarget, SatelleError> {
+        let desktop_selection = self
+            .desktop_bindings
+            .get(desktop_binding.as_str())
+            .ok_or_else(|| SatelleError::desktop_binding_not_found(desktop_binding.as_str()))?;
         let desktops = crate::desktop_sessions::discover()?;
         let platform = crate::codex_capabilities::HostPlatform::current().as_str();
-        let desktop = resolve_desktop_session_for(platform, &desktops, &self.desktop_selection)?;
-        let desktop_binding = DesktopBindingRef::new(desktop.desktop_user.clone())
-            .map_err(|_| adapter_failure("desktop_binding_invalid"))?;
+        self.require_secure_desktop_handoff(desktop_binding, desktop_selection)?;
+        let desktop = resolve_desktop_session_for(platform, &desktops, desktop_selection)?;
         Ok(DesktopTarget::new(
-            desktop_binding,
+            desktop_binding.clone(),
             desktop.session_id.clone(),
         ))
     }
@@ -906,10 +976,11 @@ impl ProductionComputerUseAdapter {
         control: CodexSessionControl,
     ) -> Result<ActiveExecutionGuard, SatelleError> {
         let mut active = self
-            .active_execution
+            .active_executions
             .lock()
             .map_err(|_| adapter_failure("control_registry_unavailable"))?;
-        if active.is_some() {
+        let desktop_binding = subject.desktop_binding().as_str().to_string();
+        if active.contains_key(&desktop_binding) {
             return Err(adapter_failure("desktop_owner_conflict"));
         }
         let execution = ActiveCodexExecution {
@@ -918,11 +989,12 @@ impl ProductionComputerUseAdapter {
             control,
         };
         let guard = ActiveExecutionGuard {
-            registry: Arc::clone(&self.active_execution),
+            registry: Arc::clone(&self.active_executions),
+            desktop_binding: desktop_binding.clone(),
             session_id: execution.session_id.clone(),
             turn_id: execution.turn_id.clone(),
         };
-        *active = Some(execution);
+        active.insert(desktop_binding, execution);
         Ok(guard)
     }
 
@@ -931,11 +1003,11 @@ impl ProductionComputerUseAdapter {
         subject: AdapterSubject<'_>,
     ) -> Result<Option<CodexSessionControl>, SatelleError> {
         let active = self
-            .active_execution
+            .active_executions
             .lock()
             .map_err(|_| adapter_failure("control_registry_unavailable"))?;
         Ok(active
-            .as_ref()
+            .get(subject.desktop_binding().as_str())
             .filter(|execution| {
                 execution.session_id == *subject.session_id()
                     && execution.turn_id == *subject.turn_id()
@@ -951,18 +1023,18 @@ impl ProductionComputerUseAdapter {
         else {
             return None;
         };
-        let working_directory = self
-            .working_directory
-            .as_ref()
-            .ok()
-            .and_then(|path| prepare_working_directory(path).ok())?;
+        let runtime_paths =
+            self.working_directory.as_ref().ok().and_then(|path| {
+                prepare_binding_runtime_paths(path, subject.desktop_binding()).ok()
+            })?;
         let deadline = Instant::now().checked_add(PERSISTED_TURN_READ_TIMEOUT)?;
-        let app_server =
+        let mut app_server =
             crate::codex_capabilities::installed_read_only_app_server_command(deadline).ok()?;
+        app_server.env("CODEX_HOME", &runtime_paths.codex_home);
         read_codex_turn(
             app_server,
             CodexTurnReadRequest {
-                working_directory: &working_directory,
+                working_directory: &runtime_paths.working_directory,
                 thread_ref,
                 turn_ref,
                 deadline,
@@ -980,18 +1052,18 @@ impl ProductionComputerUseAdapter {
         else {
             return None;
         };
-        let working_directory = self
-            .working_directory
-            .as_ref()
-            .ok()
-            .and_then(|path| prepare_working_directory(path).ok())?;
+        let runtime_paths =
+            self.working_directory.as_ref().ok().and_then(|path| {
+                prepare_binding_runtime_paths(path, subject.desktop_binding()).ok()
+            })?;
         let deadline = Instant::now().checked_add(PERSISTED_TURN_READ_TIMEOUT)?;
-        let app_server =
+        let mut app_server =
             crate::codex_capabilities::installed_read_only_app_server_command(deadline).ok()?;
+        app_server.env("CODEX_HOME", &runtime_paths.codex_home);
         read_codex_turn(
             app_server,
             CodexTurnReadRequest {
-                working_directory: &working_directory,
+                working_directory: &runtime_paths.working_directory,
                 thread_ref,
                 turn_ref,
                 deadline,
@@ -2277,7 +2349,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
             .ok_or_else(codex_effective_defaults_unavailable)?;
         dispatch_with_configured_desktop_target(
             policy,
-            || self.resolve_configured_desktop_target(),
+            || self.resolve_configured_desktop_target(policy.desktop_target().binding()),
             || {
                 let approval_policy = codex_approval_policy(policy.approval_policy())?;
                 let sandbox_policy = codex_sandbox_policy(policy.sandbox_policy());
@@ -2288,11 +2360,13 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 let cancellation_deadline = deadline
                     .checked_add(READINESS_CANCELLATION_GRACE)
                     .unwrap_or(deadline);
-                let working_directory = self
+                let runtime_paths = self
                     .working_directory
                     .as_ref()
                     .map_err(Clone::clone)
-                    .and_then(|path| prepare_working_directory(path))?;
+                    .and_then(|path| {
+                        prepare_binding_runtime_paths(path, policy.desktop_target().binding())
+                    })?;
                 let control = CodexSessionControl::new(cancellation_deadline);
                 let _active_execution =
                     self.register_execution(request.subject(), control.clone())?;
@@ -2367,9 +2441,12 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                     &verified_app_server.native_action_path,
                 );
                 let run = run_codex_session_with_timeout_cancellation(
-                    verified_app_server.into_command(),
+                    command_for_binding(
+                        verified_app_server.into_command(),
+                        &runtime_paths.codex_home,
+                    ),
                     CodexSessionRequest {
-                        working_directory: &working_directory,
+                        working_directory: &runtime_paths.working_directory,
                         prompt: &prompt,
                         existing_thread_ref: request.upstream_thread_ref(),
                         model: model_override(policy.effective_model().as_str()),
@@ -2419,14 +2496,20 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
         Ok(recovery_observation(self.read_persisted_turn(subject)))
     }
 
-    fn stop_committed(&self, session_id: &satelle_core::SessionId, turn_id: &satelle_core::TurnId) {
-        let control = self.active_execution.lock().ok().and_then(|mut active| {
-            let matching = active.as_ref().is_some_and(|execution| {
-                execution.session_id == *session_id && execution.turn_id == *turn_id
-            });
-            matching
-                .then(|| active.take().map(|execution| execution.control))
-                .flatten()
+    fn stop_committed(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        session_id: &satelle_core::SessionId,
+        turn_id: &satelle_core::TurnId,
+    ) {
+        let control = self.active_executions.lock().ok().and_then(|mut active| {
+            let execution = active.get(desktop_binding.as_str())?;
+            if execution.session_id != *session_id || execution.turn_id != *turn_id {
+                return None;
+            }
+            active
+                .remove(desktop_binding.as_str())
+                .map(|execution| execution.control)
         });
         if let Some(control) = control {
             control.stop_committed();
@@ -2592,6 +2675,31 @@ fn recovery_observation(status: Option<CodexTurnStatus>) -> RecoveryObservation 
         Some(CodexTurnStatus::Interrupted | CodexTurnStatus::Failed) => RecoveryObservation::Failed,
         None => RecoveryObservation::Unknown,
     }
+}
+
+struct BindingRuntimePaths {
+    working_directory: PathBuf,
+    codex_home: PathBuf,
+}
+
+fn prepare_binding_runtime_paths(
+    root: &Path,
+    desktop_binding: &DesktopBindingRef,
+) -> Result<BindingRuntimePaths, SatelleError> {
+    let root = prepare_working_directory(root)?;
+    let binding_root = prepare_working_directory(&root.join(desktop_binding.as_str()))?;
+    Ok(BindingRuntimePaths {
+        working_directory: prepare_working_directory(&binding_root.join("work"))?,
+        codex_home: prepare_working_directory(&binding_root.join("codex-home"))?,
+    })
+}
+
+fn command_for_binding(
+    mut command: crate::codex_session::CodexCommand,
+    codex_home: &Path,
+) -> crate::codex_session::CodexCommand {
+    command.command.env("CODEX_HOME", codex_home);
+    command
 }
 
 fn prepare_working_directory(path: &Path) -> Result<PathBuf, SatelleError> {
@@ -2838,6 +2946,46 @@ mod tests {
             PERSISTED_TURN_READ_TIMEOUT >= Duration::from_secs(120),
             "recovery must outlive cold app-server startup before retaining ownership as unknown"
         );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn native_adapter_rejects_cross_user_control_without_a_secure_handoff() {
+        let snapshot = Arc::new(RwLock::new(crate::ProductionCapabilitySnapshot::collect(
+            None,
+        )));
+        let adapter = ProductionComputerUseAdapter::new(snapshot, Ok(PathBuf::from(".")));
+        let current_user = crate::desktop_sessions::current_process_user()
+            .expect("the test host resolves its process user");
+        let policy = DesktopSelectionPolicy {
+            desktop_user: Some(format!("{current_user}-other")),
+            preference: None,
+            native_selector: None,
+        };
+        let binding = DesktopBindingRef::new("other-user").unwrap();
+
+        assert_eq!(
+            adapter
+                .require_secure_desktop_handoff(&binding, &policy)
+                .expect_err("the native adapter exposes no cross-user handoff")
+                .code,
+            ErrorCode::DesktopBindingSecureHandoffUnsupported
+        );
+    }
+
+    #[test]
+    fn desktop_bindings_receive_separate_work_and_codex_home_paths() {
+        let state = crate::TestStateDir::new().expect("temporary state directory");
+        let root = std::fs::canonicalize(state.path()).expect("canonical state directory");
+        let alice = prepare_binding_runtime_paths(&root, &DesktopBindingRef::new("alice").unwrap())
+            .expect("prepare Alice's runtime paths");
+        let bob = prepare_binding_runtime_paths(&root, &DesktopBindingRef::new("bob").unwrap())
+            .expect("prepare Bob's runtime paths");
+
+        assert_ne!(alice.working_directory, bob.working_directory);
+        assert_ne!(alice.codex_home, bob.codex_home);
+        assert!(alice.working_directory.starts_with(root.join("alice")));
+        assert!(bob.codex_home.starts_with(root.join("bob")));
     }
 
     #[test]
@@ -4347,16 +4495,20 @@ mod tests {
         );
         let session_id = satelle_core::SessionId::new();
         let turn_id = satelle_core::TurnId::new();
+        let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1").unwrap();
         let control = CodexSessionControl::new(Instant::now() + Duration::from_secs(1));
-        *adapter.active_execution.lock().unwrap() = Some(ActiveCodexExecution {
-            session_id: session_id.clone(),
-            turn_id: turn_id.clone(),
-            control,
-        });
+        adapter.active_executions.lock().unwrap().insert(
+            "local-demo-desktop-v1".to_string(),
+            ActiveCodexExecution {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                control,
+            },
+        );
 
-        adapter.stop_committed(&session_id, &turn_id);
+        adapter.stop_committed(&desktop_binding, &session_id, &turn_id);
 
-        assert!(adapter.active_execution.lock().unwrap().is_none());
+        assert!(adapter.active_executions.lock().unwrap().is_empty());
     }
 
     #[test]

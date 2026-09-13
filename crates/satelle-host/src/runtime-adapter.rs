@@ -23,6 +23,7 @@ pub struct ProviderComputerUseIntent {
     experimental_provider_computer_use: bool,
     refresh: bool,
     provider_smoke_timeout: Option<std::time::Duration>,
+    desktop_binding: Option<DesktopBindingRef>,
 }
 
 impl ProviderComputerUseIntent {
@@ -40,6 +41,7 @@ impl ProviderComputerUseIntent {
             experimental_provider_computer_use: false,
             refresh,
             provider_smoke_timeout: None,
+            desktop_binding: None,
         }
     }
 
@@ -71,6 +73,15 @@ impl ProviderComputerUseIntent {
     pub fn with_provider_smoke_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.provider_smoke_timeout = Some(timeout);
         self
+    }
+
+    pub fn with_desktop_binding(mut self, desktop_binding: DesktopBindingRef) -> Self {
+        self.desktop_binding = Some(desktop_binding);
+        self
+    }
+
+    pub fn desktop_binding(&self) -> Option<&DesktopBindingRef> {
+        self.desktop_binding.as_ref()
     }
 
     pub fn host_default() -> Self {
@@ -1480,6 +1491,10 @@ impl<'a> AdapterSubject<'a> {
         self.subject.turn_id()
     }
 
+    pub fn desktop_binding(self) -> &'a DesktopBindingRef {
+        self.subject.desktop_binding()
+    }
+
     pub(crate) fn turn_state(self) -> satelle_core::session::TurnState {
         self.subject.turn_state()
     }
@@ -1869,7 +1884,13 @@ pub trait ComputerUseAdapter: Send + Sync + 'static {
 
     /// Releases an execution exchange that was deliberately held open until
     /// its confirmed stopped state became durable.
-    fn stop_committed(&self, _session_id: &SessionId, _turn_id: &TurnId) {}
+    fn stop_committed(
+        &self,
+        _desktop_binding: &DesktopBindingRef,
+        _session_id: &SessionId,
+        _turn_id: &TurnId,
+    ) {
+    }
 }
 
 #[cfg(test)]

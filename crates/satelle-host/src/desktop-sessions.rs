@@ -4,6 +4,10 @@ pub(super) fn discover() -> Result<Vec<DesktopSessionRecord>, satelle_core::Sate
     platform::observe().map(|observation| observation.and_then(record).into_iter().collect())
 }
 
+pub(super) fn current_process_user() -> Result<String, satelle_core::SatelleError> {
+    platform::current_process_user()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DesktopObservation {
     platform_name: &'static str,
@@ -81,6 +85,17 @@ mod platform {
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
     pub(super) fn observe() -> Result<Option<DesktopObservation>, SatelleError> {
+        let session_id = current_process_session_id()?;
+        // SAFETY: this function takes no pointers and returns an identifier.
+        let console_session = unsafe { WTSGetActiveConsoleSessionId() };
+        observe_session(session_id, console_session).map(Some)
+    }
+
+    pub(super) fn current_process_user() -> Result<String, SatelleError> {
+        query_string(current_process_session_id()?, WTSUserName)
+    }
+
+    fn current_process_session_id() -> Result<u32, SatelleError> {
         let mut session_id = 0_u32;
         // SAFETY: `session_id` is a valid writable u32 and the current process
         // identifier remains valid for the duration of this call.
@@ -90,13 +105,7 @@ mod platform {
                 Some(io::Error::last_os_error().to_string()),
             ));
         }
-        // SAFETY: this function takes no pointers and returns an identifier.
-        let console_session = unsafe { WTSGetActiveConsoleSessionId() };
-        // Native Computer Use runs inside this Host process and the probe
-        // rejects any WTS selector owned by another process session. An SSH or
-        // background Host therefore cannot advertise a separate live console;
-        // setup must launch the Host in that interactive session first.
-        observe_session(session_id, console_session).map(Some)
+        Ok(session_id)
     }
 
     fn observe_session(
@@ -223,6 +232,17 @@ mod platform {
 
     pub(super) fn observe() -> Result<Option<DesktopObservation>, SatelleError> {
         let effective_user = rustix::process::geteuid().as_raw();
+        let desktop_user = current_process_user()?;
+        let (console_user, console_uid) = live_console_user()?;
+        Ok(Some(super::macos_console_observation(
+            effective_user,
+            &desktop_user,
+            console_uid,
+            &console_user,
+        )))
+    }
+
+    pub(super) fn current_process_user() -> Result<String, SatelleError> {
         let output = Command::new("/usr/bin/id")
             .arg("-un")
             .output()
@@ -233,17 +253,10 @@ mod platform {
                 std::io::Error::other(format!("/usr/bin/id exited with {}", output.status)),
             ));
         }
-        let desktop_user = String::from_utf8(output.stdout)
+        Ok(String::from_utf8(output.stdout)
             .map_err(|error| discovery_error("macOS returned a non-UTF-8 daemon user", error))?
             .trim()
-            .to_string();
-        let (console_user, console_uid) = live_console_user()?;
-        Ok(Some(super::macos_console_observation(
-            effective_user,
-            &desktop_user,
-            console_uid,
-            &console_user,
-        )))
+            .to_string())
     }
 
     pub(super) fn live_console_user() -> Result<(String, u32), SatelleError> {
@@ -294,6 +307,10 @@ mod platform {
 
     pub(super) fn observe() -> Result<Option<DesktopObservation>, satelle_core::SatelleError> {
         Ok(None)
+    }
+
+    pub(super) fn current_process_user() -> Result<String, satelle_core::SatelleError> {
+        Err(satelle_core::SatelleError::computer_use_not_ready())
     }
 }
 

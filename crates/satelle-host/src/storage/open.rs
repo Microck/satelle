@@ -48,7 +48,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const RESTORE_ACTIVATION_JOURNAL: &str = ".satelle-restore-activation-v1";
 const RESTORE_ACTIVATION_JOURNAL_LIMIT: usize = 64 * 1024;
-const MIGRATIONS: [Migration; 23] = [
+const MIGRATIONS: [Migration; 24] = [
     Migration {
         version: 1,
         sql: include_str!("0001_initial.sql"),
@@ -186,6 +186,12 @@ const MIGRATIONS: [Migration; 23] = [
         sql: include_str!("0023-turn-admission-queue.sql"),
         seeds_sensitive_state: false,
         irreversible: false,
+    },
+    Migration {
+        version: 24,
+        sql: include_str!("0024-desktop-binding-grants.sql"),
+        seeds_sensitive_state: false,
+        irreversible: true,
     },
 ];
 
@@ -1092,6 +1098,8 @@ fn apply_migrations(
             super::auth::validate_sensitive_state_before_token_state_migration(connection)?;
         } else if expected_user_version < 12 {
             super::auth::validate_sensitive_state_before_provider_smoke_key_migration(connection)?;
+        } else if expected_user_version < 24 {
+            super::auth::validate_sensitive_state_before_desktop_binding_grants(connection)?;
         } else {
             super::auth::validate_sensitive_state(connection)?;
         }

@@ -4,7 +4,7 @@ use serde_json::json;
 #[tokio::test]
 async fn concurrent_token_retries_expose_one_secret_and_keys_are_scoped_to_principals() {
     let running = RunningServer::start(ApiScopes::ADMIN).await;
-    let body = json!({ "schema_version": "satelle.api-token.issue.v1", "scopes": ["read"] });
+    let body = json!({ "schema_version": "satelle.api-token.issue.v2", "scopes": ["read"], "desktop_bindings": ["local-demo-desktop-v1"] });
     let first = running
         .mutation("/v1/api-tokens", "shared-key")
         .json(&body)
@@ -69,7 +69,7 @@ async fn admin_token_lifecycle_returns_secrets_once_and_invalidates_old_credenti
             .header("Authorization", format!("Bearer {secret}"))
             .header("Satelle-Expected-Host-Identity", &running.host_identity)
     };
-    let issue_body = json!({ "schema_version": "satelle.api-token.issue.v1", "scopes": ["read"] });
+    let issue_body = json!({ "schema_version": "satelle.api-token.issue.v2", "scopes": ["read"], "desktop_bindings": ["local-demo-desktop-v1"] });
     let response = running
         .mutation("/v1/api-tokens", "issue")
         .json(&issue_body)
@@ -181,7 +181,7 @@ async fn token_management_requires_admin_scope_and_validates_expiry() {
         let response = running
             .mutation("/v1/api-tokens", "denied")
             .json(&json!({
-                "schema_version": "satelle.api-token.issue.v1", "scopes": ["admin"]
+                "schema_version": "satelle.api-token.issue.v2", "scopes": ["admin"], "desktop_bindings": ["local-demo-desktop-v1"]
             }))
             .send()
             .await
@@ -205,7 +205,7 @@ async fn token_management_requires_admin_scope_and_validates_expiry() {
         ),
     ] {
         let response = running.mutation("/v1/api-tokens", key).json(&json!({
-            "schema_version": "satelle.api-token.issue.v1", "scopes": scopes, "expires_at": expiry
+            "schema_version": "satelle.api-token.issue.v2", "scopes": scopes, "desktop_bindings": ["local-demo-desktop-v1"], "expires_at": expiry
         })).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }

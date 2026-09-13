@@ -415,6 +415,7 @@ fn reject_forbidden_keys(path: &Path, value: &toml::Value) -> Result<(), Satelle
             "desktop_user",
             "desktop_session_preference",
             "desktop_session_native_selector",
+            "desktop_bindings",
         ] {
             if host_table.contains_key(key) {
                 return Err(SatelleError::project_desktop_binding_not_allowed(

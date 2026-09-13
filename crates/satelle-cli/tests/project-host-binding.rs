@@ -42,10 +42,11 @@ address = "https://attacker.example.test"
 
 #[test]
 fn project_config_rejects_concrete_host_access_fields_independently() {
-    for (key, expected_code, project_config) in [
+    for (case, expected_code, rejected_key, project_config) in [
         (
             "address",
             "project-host-binding-not-allowed",
+            "address",
             r#"
 [hosts.attacker]
 address = "https://attacker.example.test"
@@ -54,6 +55,7 @@ address = "https://attacker.example.test"
         (
             "adapter",
             "project-host-binding-not-allowed",
+            "adapter",
             r#"
 [hosts.attacker]
 adapter = "codex"
@@ -62,6 +64,7 @@ adapter = "codex"
         (
             "network",
             "project-host-binding-not-allowed",
+            "network",
             r#"
 [hosts.attacker.network]
 provider = "tailscale"
@@ -71,6 +74,7 @@ hostname = "attacker"
         (
             "expected_host_id",
             "project-secret-source-not-allowed",
+            "expected_host_id",
             r#"
 [hosts.attacker]
 expected_host_id = "host-attacker"
@@ -79,6 +83,7 @@ expected_host_id = "host-attacker"
         (
             "api_token",
             "project-secret-source-not-allowed",
+            "api_token",
             r#"
 [hosts.attacker]
 api_token = { kind = "file", path = "/tmp/attacker.token" }
@@ -87,6 +92,7 @@ api_token = { kind = "file", path = "/tmp/attacker.token" }
         (
             "ca_bundle",
             "project-secret-source-not-allowed",
+            "ca_bundle",
             r#"
 [hosts.attacker]
 ca_bundle = "/tmp/attacker-ca.pem"
@@ -94,9 +100,12 @@ ca_bundle = "/tmp/attacker-ca.pem"
         ),
         (
             "provider_auth",
-            "project-secret-source-not-allowed",
+            "project-desktop-binding-not-allowed",
+            "desktop_bindings",
             r#"
-[hosts.attacker.provider_auth.openai]
+[hosts.attacker.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.attacker.desktop_bindings.operator.provider_auth.openai]
 kind = "environment"
 variable = "ATTACKER_API_KEY"
 "#,
@@ -113,14 +122,17 @@ variable = "ATTACKER_API_KEY"
         let error = parse_json(&output.stderr);
         assert_eq!(
             error["code"], expected_code,
-            "unexpected error code for {key}"
+            "unexpected error code for {case}"
         );
         assert_eq!(
             error["details"]["path"],
-            format!("hosts.attacker.{key}"),
-            "unexpected path for {key}"
+            format!("hosts.attacker.{rejected_key}"),
+            "unexpected path for {case}"
         );
-        assert_eq!(error["details"]["key"], key, "unexpected key for {key}");
+        assert_eq!(
+            error["details"]["key"], rejected_key,
+            "unexpected key for {case}"
+        );
     }
 }
 

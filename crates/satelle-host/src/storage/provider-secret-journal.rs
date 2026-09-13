@@ -318,6 +318,7 @@ impl Storage {
         )?;
         let expected_previous_binding_digest = Self::provider_binding_digest_in_connection(
             &transaction,
+            &plan.desktop_binding,
             plan.binding.requested_model_alias(),
             plan.binding.requested_provider_alias(),
         )?;
@@ -455,13 +456,19 @@ impl Storage {
         }
         let current_digest = Self::provider_binding_digest_in_connection(
             &transaction,
+            &journal.desktop_binding,
             binding.requested_model_alias(),
             binding.requested_provider_alias(),
         )?;
         if current_digest.as_deref() != journal.expected_previous_binding_digest.as_deref() {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
-        Self::authorize_provider_binding_in_connection(&transaction, binding, committed_at)?;
+        Self::authorize_provider_binding_in_connection(
+            &transaction,
+            &journal.desktop_binding,
+            binding,
+            committed_at,
+        )?;
         super::operational::insert_provider_provisioning_success(
             &transaction,
             journal.host_identity.as_str(),

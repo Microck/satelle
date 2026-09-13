@@ -1,9 +1,10 @@
 use super::{ApiRequestContract, RequestId, define_schema_token};
 use satelle_host::{ApiScope, ApiScopes, ApiTokenMetadata, ApiTokenMutation};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use time::{OffsetDateTime, UtcOffset};
 
-define_schema_token!(ApiTokenIssueSchema, "satelle.api-token.issue.v1");
+define_schema_token!(ApiTokenIssueSchema, "satelle.api-token.issue.v2");
 define_schema_token!(ApiTokenRotateSchema, "satelle.api-token.rotate.v1");
 define_schema_token!(ApiTokenRevokeSchema, "satelle.api-token.revoke.v1");
 define_schema_token!(ApiTokenSchema, "satelle.api-token.v1");
@@ -13,6 +14,7 @@ define_schema_token!(ApiTokenSchema, "satelle.api-token.v1");
 pub struct ApiTokenIssueRequest {
     schema_version: ApiTokenIssueSchema,
     scopes: Vec<ApiScope>,
+    desktop_bindings: Vec<String>,
     #[serde(default, with = "time::serde::rfc3339::option")]
     expires_at: Option<OffsetDateTime>,
 }
@@ -25,8 +27,18 @@ impl ApiTokenIssueRequest {
         {
             return None;
         }
+        let scopes = ApiScopes::from_scopes(&self.scopes)?;
+        let desktop_bindings = self.desktop_bindings.into_iter().collect::<BTreeSet<_>>();
+        if (scopes.allows(ApiScopes::CONTROL) && desktop_bindings.is_empty())
+            || desktop_bindings
+                .iter()
+                .any(|binding| satelle_core::session::DesktopBindingRef::new(binding).is_err())
+        {
+            return None;
+        }
         Some(ApiTokenMutation::Issue {
-            scopes: ApiScopes::from_scopes(&self.scopes)?,
+            scopes,
+            desktop_bindings,
             expires_at: self.expires_at,
         })
     }
@@ -96,7 +108,9 @@ mod tests {
     fn token_issue_requires_known_nonempty_scopes_and_utc_expiry() {
         for scopes in [json!([]), json!(["root"])] {
             let decoded = serde_json::from_value::<ApiTokenIssueRequest>(json!({
-                "schema_version": "satelle.api-token.issue.v1", "scopes": scopes
+                "schema_version": "satelle.api-token.issue.v2",
+                "scopes": scopes,
+                "desktop_bindings": ["operator"]
             }));
             assert!(
                 decoded
@@ -106,22 +120,28 @@ mod tests {
             );
         }
         let request = serde_json::from_value::<ApiTokenIssueRequest>(json!({
-            "schema_version": "satelle.api-token.issue.v1", "scopes": ["read", "control", "read"],
+            "schema_version": "satelle.api-token.issue.v2",
+            "scopes": ["read", "control", "read"],
+            "desktop_bindings": ["operator"],
             "expires_at": "2030-01-01T01:00:00+01:00"
         }))
         .unwrap();
         assert!(request.into_mutation().is_none());
         let request = serde_json::from_value::<ApiTokenIssueRequest>(json!({
-            "schema_version": "satelle.api-token.issue.v1", "scopes": ["control", "read", "read"]
+            "schema_version": "satelle.api-token.issue.v2",
+            "scopes": ["control", "read", "read"],
+            "desktop_bindings": ["operator", "operator"]
         }))
         .unwrap();
         let Some(ApiTokenMutation::Issue {
             scopes,
+            desktop_bindings,
             expires_at: None,
         }) = request.into_mutation()
         else {
             panic!("canonical scope request should decode");
         };
         assert_eq!(scopes.scopes(), [ApiScope::Read, ApiScope::Control]);
+        assert_eq!(desktop_bindings, BTreeSet::from(["operator".to_string()]));
     }
 }

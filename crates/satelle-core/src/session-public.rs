@@ -1,6 +1,6 @@
 use super::{
-    PublicSession, PublicSnapshotError, PublicTurn, SafeSummary, SessionActivity,
-    SessionStateRevision, TurnState, TurnStateRevision, terminal_summary_matches,
+    DesktopBindingRef, PublicSession, PublicSnapshotError, PublicTurn, SafeSummary,
+    SessionActivity, SessionStateRevision, TurnState, TurnStateRevision, terminal_summary_matches,
 };
 use crate::{SessionId, TurnId};
 use serde::{Deserialize, Deserializer};
@@ -69,6 +69,7 @@ fn validate_turn(turn: &PublicTurn) -> Result<(), &'static str> {
 #[serde(deny_unknown_fields)]
 struct PublicSessionWire {
     session_id: SessionId,
+    desktop_binding: String,
     #[serde(default, deserialize_with = "Option::deserialize")]
     display_name: Option<String>,
     session_state_revision: SessionStateRevision,
@@ -86,37 +87,21 @@ impl<'de> Deserialize<'de> for PublicSession {
         D: Deserializer<'de>,
     {
         let wire = PublicSessionWire::deserialize(deserializer)?;
-        Self::try_from_parts(
-            wire.session_id,
-            wire.display_name,
-            wire.session_state_revision,
-            wire.created_at,
-            wire.updated_at,
-            wire.activity,
-            wire.turns,
-        )
-        .map_err(serde::de::Error::custom)
+        Self::try_from_wire(wire).map_err(serde::de::Error::custom)
     }
 }
 
 impl PublicSession {
-    pub(crate) fn try_from_parts(
-        session_id: SessionId,
-        display_name: Option<String>,
-        session_state_revision: SessionStateRevision,
-        created_at: OffsetDateTime,
-        updated_at: OffsetDateTime,
-        activity: SessionActivity,
-        turns: Vec<PublicTurn>,
-    ) -> Result<Self, PublicSnapshotError> {
+    fn try_from_wire(wire: PublicSessionWire) -> Result<Self, PublicSnapshotError> {
         let session = Self {
-            session_id,
-            display_name,
-            session_state_revision,
-            created_at,
-            updated_at,
-            activity,
-            turns,
+            session_id: wire.session_id,
+            desktop_binding: wire.desktop_binding,
+            display_name: wire.display_name,
+            session_state_revision: wire.session_state_revision,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+            activity: wire.activity,
+            turns: wire.turns,
         };
         validate_session(&session).map_err(|_| PublicSnapshotError)?;
         Ok(session)
@@ -124,6 +109,9 @@ impl PublicSession {
 }
 
 fn validate_session(session: &PublicSession) -> Result<(), &'static str> {
+    if DesktopBindingRef::new(session.desktop_binding.clone()).is_err() {
+        return Err("a public Session has an invalid Desktop Binding");
+    }
     if session.turns.is_empty() {
         return Err("a public Session requires Turn history");
     }
@@ -209,6 +197,7 @@ mod tests {
     fn starting_session() -> Value {
         json!({
             "session_id": SESSION_ID,
+            "desktop_binding": "local-demo-desktop-v1",
             "display_name": null,
             "session_state_revision": 1,
             "created_at": "2024-01-01T00:00:00Z",

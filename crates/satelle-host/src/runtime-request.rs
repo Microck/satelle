@@ -286,6 +286,7 @@ pub(crate) struct RunCommand<'a> {
     pub(super) attachments: Vec<crate::attachment::VerifiedImageAttachment>,
     pub(super) raw_protocol_source_host: Option<String>,
     pub(super) recording: Option<satelle_core::recording::RecordingRequest>,
+    pub(super) desktop_binding: satelle_core::session::DesktopBindingRef,
 }
 
 #[derive(Clone, Copy)]
@@ -316,6 +317,8 @@ impl<'a> RunCommand<'a> {
             attachments: Vec::new(),
             raw_protocol_source_host: None,
             recording: None,
+            desktop_binding: satelle_core::session::DesktopBindingRef::new("local-demo-desktop-v1")
+                .expect("the built-in fake Desktop Binding is valid"),
         }
     }
 
@@ -340,6 +343,8 @@ impl<'a> RunCommand<'a> {
             attachments: Vec::new(),
             raw_protocol_source_host: None,
             recording: None,
+            desktop_binding: satelle_core::session::DesktopBindingRef::new("local-demo-desktop-v1")
+                .expect("the built-in fake Desktop Binding is valid"),
         }
     }
 
@@ -389,6 +394,14 @@ impl<'a> RunCommand<'a> {
         self.recording = recording.cloned();
         self
     }
+
+    pub(crate) fn with_desktop_binding(
+        mut self,
+        desktop_binding: satelle_core::session::DesktopBindingRef,
+    ) -> Self {
+        self.desktop_binding = desktop_binding;
+        self
+    }
 }
 
 pub(crate) struct SteerCommand<'a> {
@@ -403,6 +416,7 @@ pub(crate) struct SteerCommand<'a> {
     pub(super) attachments: Vec<crate::attachment::VerifiedImageAttachment>,
     pub(super) raw_protocol_source_host: Option<String>,
     pub(super) recording: Option<satelle_core::recording::RecordingRequest>,
+    pub(super) desktop_binding: satelle_core::session::DesktopBindingRef,
 }
 
 impl<'a> SteerCommand<'a> {
@@ -427,6 +441,8 @@ impl<'a> SteerCommand<'a> {
             attachments: Vec::new(),
             raw_protocol_source_host: None,
             recording: None,
+            desktop_binding: satelle_core::session::DesktopBindingRef::new("local-demo-desktop-v1")
+                .expect("the built-in fake Desktop Binding is valid"),
         }
     }
 
@@ -451,6 +467,8 @@ impl<'a> SteerCommand<'a> {
             attachments: Vec::new(),
             raw_protocol_source_host: None,
             recording: None,
+            desktop_binding: satelle_core::session::DesktopBindingRef::new("local-demo-desktop-v1")
+                .expect("the built-in fake Desktop Binding is valid"),
         }
     }
 
@@ -498,6 +516,14 @@ impl<'a> SteerCommand<'a> {
         recording: Option<&satelle_core::recording::RecordingRequest>,
     ) -> Self {
         self.recording = recording.cloned();
+        self
+    }
+
+    pub(crate) fn with_desktop_binding(
+        mut self,
+        desktop_binding: satelle_core::session::DesktopBindingRef,
+    ) -> Self {
+        self.desktop_binding = desktop_binding;
         self
     }
 }

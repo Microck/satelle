@@ -466,10 +466,11 @@ mod ssh_identity_commit_tests {
         (21, "fnv1a64:63131767685873a3"),
         (22, "fnv1a64:691b625c8486aa5a"),
         (23, "fnv1a64:fe4ec60e156190f1"),
+        (24, "fnv1a64:3a49db72dc2c82ec"),
     ];
-    const EXPECTED_SCHEMA_ROW_COUNT: usize = 92;
+    const EXPECTED_SCHEMA_ROW_COUNT: usize = 93;
     const EXPECTED_SCHEMA_SHA256: &str =
-        "8e34ad5eeb9cdf3d2a2e2e28c0eaea094873882cf023b3936894f0ec6f932bc9";
+        "f7bba3d8e6c372853d014420e4a1651c1f7ab3b824d97f5f264df07daaa576be";
 
     fn identity() -> HostIdentityRef {
         HostIdentityRef::new(HOST_IDENTITY.to_string()).expect("valid Host Identity fixture")
@@ -618,7 +619,7 @@ mod ssh_identity_commit_tests {
         let user_version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read schema user version");
-        assert_eq!(user_version, 23);
+        assert_eq!(user_version, 24);
 
         let schema = connection
             .prepare(
@@ -1158,6 +1159,10 @@ impl IdempotencyInput {
             expires_at,
         })
     }
+
+    const fn created_at(&self) -> OffsetDateTime {
+        self.created_at
+    }
 }
 
 #[derive(Clone)]
@@ -1328,6 +1333,10 @@ pub(crate) struct ProbeRecoverySubject {
 }
 
 impl ProbeRecoverySubject {
+    pub(crate) fn desktop_binding(&self) -> &DesktopBindingRef {
+        &self.desktop_binding
+    }
+
     pub(crate) const fn probe_kind(&self) -> ReadinessProbeKind {
         self.probe_kind
     }
@@ -1380,6 +1389,7 @@ impl ObservedUpstreamRef {
 #[derive(Clone)]
 pub(crate) struct RecoverySubject {
     session_id: SessionId,
+    desktop_binding: DesktopBindingRef,
     turn_id: TurnId,
     turn_state: TurnState,
     expected_revisions: ExpectedRevisions,
@@ -1398,6 +1408,10 @@ impl RecoverySubject {
 
     pub(crate) fn turn_id(&self) -> &TurnId {
         &self.turn_id
+    }
+
+    pub(crate) fn desktop_binding(&self) -> &DesktopBindingRef {
+        &self.desktop_binding
     }
 
     pub(crate) fn turn_state(&self) -> TurnState {
@@ -2505,6 +2519,7 @@ impl Storage {
     pub(crate) fn authorize_provider_binding_idempotent<V, M>(
         &mut self,
         idempotency: &IdempotencyInput,
+        desktop_binding: &DesktopBindingRef,
         expected_previous_digest: Option<&str>,
         completed_at: OffsetDateTime,
         validate: V,
@@ -2552,6 +2567,7 @@ impl Storage {
                     .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
                 let current_digest = Self::provider_binding_digest_in_connection(
                     &savepoint,
+                    desktop_binding,
                     binding.requested_model_alias(),
                     binding.requested_provider_alias(),
                 )?;
@@ -2560,6 +2576,7 @@ impl Storage {
                 } else {
                     Self::authorize_provider_binding_in_connection(
                         &savepoint,
+                        desktop_binding,
                         &binding,
                         completed_at,
                     )
@@ -2604,9 +2621,9 @@ impl Storage {
     pub(crate) fn delete_provider_binding_idempotent<V, M>(
         &mut self,
         idempotency: &IdempotencyInput,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
-        completed_at: OffsetDateTime,
         validate: V,
         map_failure: M,
     ) -> Result<ProviderBindingDeletionReplay, StorageError>
@@ -2615,6 +2632,7 @@ impl Storage {
         M: FnOnce(&StorageError) -> SatelleError,
     {
         require_operation(idempotency, IdempotentOperation::ProviderBindingDeletion)?;
+        let completed_at = idempotency.created_at();
         let mut transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2648,6 +2666,7 @@ impl Storage {
                     .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
                 match Self::delete_provider_binding_in_connection(
                     &savepoint,
+                    desktop_binding,
                     model_alias,
                     provider_alias,
                 ) {
@@ -2690,6 +2709,7 @@ impl Storage {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn authorize_provider_binding(
         &mut self,
+        desktop_binding: &DesktopBindingRef,
         binding: &ResolvedProviderBinding,
         updated_at: OffsetDateTime,
     ) -> Result<(), StorageError> {
@@ -2697,7 +2717,12 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        Self::authorize_provider_binding_in_connection(&transaction, binding, updated_at)?;
+        Self::authorize_provider_binding_in_connection(
+            &transaction,
+            desktop_binding,
+            binding,
+            updated_at,
+        )?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
@@ -2705,6 +2730,7 @@ impl Storage {
 
     fn authorize_provider_binding_in_connection(
         connection: &Connection,
+        desktop_binding: &DesktopBindingRef,
         binding: &ResolvedProviderBinding,
         updated_at: OffsetDateTime,
     ) -> Result<(), StorageError> {
@@ -2724,8 +2750,9 @@ impl Storage {
             .query_row(
                 "SELECT binding_digest
                  FROM authorized_provider_bindings
-                 WHERE provider_alias = ?1 AND model_alias = ?2",
+                 WHERE desktop_binding_ref = ?1 AND provider_alias = ?2 AND model_alias = ?3",
                 rusqlite::params![
+                    desktop_binding.as_str(),
                     binding.requested_provider_alias(),
                     binding.requested_model_alias()
                 ],
@@ -2736,6 +2763,7 @@ impl Storage {
         connection
             .execute(
                 "INSERT INTO authorized_provider_bindings (
+                    desktop_binding_ref,
                     provider_alias,
                     model_alias,
                     model,
@@ -2747,8 +2775,8 @@ impl Storage {
                     allow_project_selection,
                     binding_digest,
                     updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'user_config', ?7, ?8, ?9, ?10)
-                 ON CONFLICT(provider_alias, model_alias) DO UPDATE SET
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'user_config', ?8, ?9, ?10, ?11)
+                 ON CONFLICT(desktop_binding_ref, provider_alias, model_alias) DO UPDATE SET
                     model = excluded.model,
                     model_provider = excluded.model_provider,
                     endpoint = excluded.endpoint,
@@ -2760,6 +2788,7 @@ impl Storage {
                     binding_digest = excluded.binding_digest,
                     updated_at = excluded.updated_at",
                 rusqlite::params![
+                    desktop_binding.as_str(),
                     binding.requested_provider_alias(),
                     binding.requested_model_alias(),
                     binding.model(),
@@ -2792,6 +2821,7 @@ impl Storage {
 
     pub(crate) fn authorize_provider_binding_if_unchanged(
         &mut self,
+        desktop_binding: &DesktopBindingRef,
         binding: &ResolvedProviderBinding,
         expected_previous_digest: Option<&str>,
         updated_at: OffsetDateTime,
@@ -2802,13 +2832,19 @@ impl Storage {
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         let current_digest = Self::provider_binding_digest_in_connection(
             &transaction,
+            desktop_binding,
             binding.requested_model_alias(),
             binding.requested_provider_alias(),
         )?;
         if current_digest.as_deref() != expected_previous_digest {
             return Err(StorageError::new(StorageErrorKind::StateConflict));
         }
-        Self::authorize_provider_binding_in_connection(&transaction, binding, updated_at)?;
+        Self::authorize_provider_binding_in_connection(
+            &transaction,
+            desktop_binding,
+            binding,
+            updated_at,
+        )?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
@@ -2816,6 +2852,7 @@ impl Storage {
 
     fn provider_binding_digest_in_connection(
         connection: &Connection,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
     ) -> Result<Option<String>, StorageError> {
@@ -2823,8 +2860,8 @@ impl Storage {
             .query_row(
                 "SELECT binding_digest
                  FROM authorized_provider_bindings
-                 WHERE provider_alias = ?1 AND model_alias = ?2",
-                rusqlite::params![provider_alias, model_alias],
+                 WHERE desktop_binding_ref = ?1 AND provider_alias = ?2 AND model_alias = ?3",
+                rusqlite::params![desktop_binding.as_str(), provider_alias, model_alias],
                 |row| row.get(0),
             )
             .optional()
@@ -2833,6 +2870,7 @@ impl Storage {
 
     pub(crate) fn delete_authorized_provider_binding(
         &mut self,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
     ) -> Result<bool, StorageError> {
@@ -2840,8 +2878,12 @@ impl Storage {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        let deleted =
-            Self::delete_provider_binding_in_connection(&transaction, model_alias, provider_alias)?;
+        let deleted = Self::delete_provider_binding_in_connection(
+            &transaction,
+            desktop_binding,
+            model_alias,
+            provider_alias,
+        )?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -2850,6 +2892,7 @@ impl Storage {
 
     fn delete_provider_binding_in_connection(
         connection: &Connection,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
     ) -> Result<bool, StorageError> {
@@ -2857,8 +2900,8 @@ impl Storage {
             .query_row(
                 "SELECT binding_digest
                  FROM authorized_provider_bindings
-                 WHERE provider_alias = ?1 AND model_alias = ?2",
-                rusqlite::params![provider_alias, model_alias],
+                 WHERE desktop_binding_ref = ?1 AND provider_alias = ?2 AND model_alias = ?3",
+                rusqlite::params![desktop_binding.as_str(), provider_alias, model_alias],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -2866,8 +2909,8 @@ impl Storage {
         let deleted = connection
             .execute(
                 "DELETE FROM authorized_provider_bindings
-                 WHERE provider_alias = ?1 AND model_alias = ?2",
-                rusqlite::params![provider_alias, model_alias],
+                 WHERE desktop_binding_ref = ?1 AND provider_alias = ?2 AND model_alias = ?3",
+                rusqlite::params![desktop_binding.as_str(), provider_alias, model_alias],
             )
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
         if deleted == 1 && previous_digest.is_some() {
@@ -2883,6 +2926,7 @@ impl Storage {
 
     pub(crate) fn load_authorized_provider_binding(
         &self,
+        desktop_binding: &DesktopBindingRef,
         model_alias: &str,
         provider_alias: &str,
     ) -> Result<Option<ResolvedProviderBinding>, StorageError> {
@@ -2898,8 +2942,8 @@ impl Storage {
                         allow_project_selection,
                         binding_digest
                  FROM authorized_provider_bindings
-                 WHERE provider_alias = ?1 AND model_alias = ?2",
-                rusqlite::params![provider_alias, model_alias],
+                 WHERE desktop_binding_ref = ?1 AND provider_alias = ?2 AND model_alias = ?3",
+                rusqlite::params![desktop_binding.as_str(), provider_alias, model_alias],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,

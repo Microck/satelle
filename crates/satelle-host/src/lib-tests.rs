@@ -12,6 +12,11 @@ use std::path::PathBuf;
 use std::sync::Condvar;
 use std::time::Duration;
 
+fn local_desktop_binding() -> satelle_core::session::DesktopBindingRef {
+    satelle_core::session::DesktopBindingRef::new("local-demo-desktop-v1")
+        .expect("valid built-in Desktop Binding")
+}
+
 fn turn_intent(prompt: &str) -> TurnIntent {
     TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("valid test Turn intent")
 }
@@ -738,7 +743,21 @@ fn provider_intent_with_missing_descriptor() -> ProviderComputerUseIntent {
 
 fn provider_descriptor_config(auth_source: Option<String>) -> satelle_core::HostConfig {
     let mut config = satelle_core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
-    config.provider_bindings.insert(
+    config.desktop_bindings.insert(
+        "local-demo-desktop-v1".to_string(),
+        satelle_core::DesktopBindingConfig {
+            desktop_user: "local-demo-user".to_string(),
+            desktop_session_preference: None,
+            desktop_session_native_selector: None,
+            provider_auth: Default::default(),
+            provider_bindings: Default::default(),
+        },
+    );
+    let desktop = config
+        .desktop_bindings
+        .get_mut("local-demo-desktop-v1")
+        .expect("built-in Desktop Binding");
+    desktop.provider_bindings.insert(
         "openai".to_string(),
         std::collections::BTreeMap::from([(
             "review".to_string(),
@@ -779,7 +798,12 @@ fn secret_file_home_is_canonical_in_user_and_host_owned_bindings() {
     assert!(prepared.has_valid_binding_digest());
 
     let mut config = provider_descriptor_config(Some("home-file".to_string()));
-    config.provider_auth.insert("home-file".to_string(), input);
+    config
+        .desktop_bindings
+        .get_mut("local-demo-desktop-v1")
+        .expect("built-in Desktop Binding")
+        .provider_auth
+        .insert("home-file".to_string(), input);
     let host_config_state = TestStateDir::new().expect("separate Host-owned config state");
     let runtime = RuntimeHandle::new_with_provider_policy(
         Ok(host_config_state.path().to_path_buf()),
@@ -929,6 +953,7 @@ fn ordinary_post_t0_destination_failure_terminalizes_for_same_daemon_replay() {
     let first = service
         .provision_provider_secret(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             authorization.clone(),
             Zeroizing::new("candidate-provider-secret".to_string()),
             false,
@@ -938,6 +963,7 @@ fn ordinary_post_t0_destination_failure_terminalizes_for_same_daemon_replay() {
     let replay = service
         .provision_provider_secret(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             authorization,
             Zeroizing::new("candidate-provider-secret".to_string()),
             false,
@@ -975,6 +1001,7 @@ fn existing_provider_secret_requires_typed_overwrite_and_preserves_prior_value()
     let error = service
         .provision_provider_secret(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             provider_file_authorization(destination.clone()),
             Zeroizing::new("replacement-provider-secret".to_string()),
             false,
@@ -1021,6 +1048,7 @@ fn newline_terminated_provider_secrets_can_be_replaced_atomically() {
         let result = service
             .provision_provider_secret(
                 LOCAL_DEMO_HOST,
+                "local-demo-desktop-v1",
                 provider_file_authorization(destination.clone()),
                 Zeroizing::new("replacement-provider-secret".to_string()),
                 true,
@@ -1081,6 +1109,7 @@ fn provider_secret_publication_preserves_candidate_terminal_line_endings() {
         let result = service
             .provision_provider_secret(
                 LOCAL_DEMO_HOST,
+                "local-demo-desktop-v1",
                 provider_file_authorization(destination.clone()),
                 Zeroizing::new(candidate.to_string()),
                 false,
@@ -1139,6 +1168,7 @@ fn typed_unknown_provider_outcomes_retain_recovery_ownership() {
         let failure = service
             .provision_provider_secret(
                 LOCAL_DEMO_HOST,
+                "local-demo-desktop-v1",
                 provider_file_authorization(destination),
                 Zeroizing::new("candidate-provider-secret".to_string()),
                 false,
@@ -1184,6 +1214,7 @@ fn typed_unknown_provider_outcomes_retain_recovery_ownership() {
     service
         .provision_provider_secret(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             provider_file_authorization(destination),
             Zeroizing::new("candidate-provider-secret".to_string()),
             false,
@@ -1235,6 +1266,7 @@ fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
     let failure = service
         .provision_provider_secret(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             authorization.clone(),
             Zeroizing::new("candidate-provider-secret".to_string()),
             false,
@@ -1274,6 +1306,7 @@ fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
     let retry = service
         .provision_provider_secret(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             authorization,
             Zeroizing::new("candidate-provider-secret".to_string()),
             false,
@@ -2743,19 +2776,22 @@ fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
     };
     service
         .runtime
-        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
-            satelle_core::ProviderBindingAuthorization::new(
-                "provider-doctor-model",
-                "provider-doctor-binding",
-                "provider-doctor-model",
-                "provider-doctor-binding",
-            )
-            .with_auth_source(satelle_core::ProviderSecretSource::Environment {
-                variable: "SATELLE_PROVIDER_DOCTOR_TOKEN".to_string(),
-            })
-            .with_experimental_provider_computer_use(true),
-            satelle_core::ProviderBindingSource::UserConfig,
-        ))
+        .authorize_provider_binding(
+            &local_desktop_binding(),
+            &satelle_core::ResolvedProviderBinding::from_authorization(
+                satelle_core::ProviderBindingAuthorization::new(
+                    "provider-doctor-model",
+                    "provider-doctor-binding",
+                    "provider-doctor-model",
+                    "provider-doctor-binding",
+                )
+                .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+                    variable: "SATELLE_PROVIDER_DOCTOR_TOKEN".to_string(),
+                })
+                .with_experimental_provider_computer_use(true),
+                satelle_core::ProviderBindingSource::UserConfig,
+            ),
+        )
         .expect("authorize the persisted UserConfig provider binding");
     let intent = ProviderComputerUseIntent::new(
         Some(
@@ -3090,11 +3126,14 @@ fn production_adapter_accepts_host_authorized_binding_without_resolving_auth() {
             provider_smoke_timeout: std::time::Duration::from_secs(1),
             provider_smoke_success_ttl: time::Duration::hours(24),
             provider_smoke_failure_ttl: time::Duration::minutes(10),
-            desktop_selection: satelle_core::DesktopSelectionPolicy {
-                desktop_user: None,
-                preference: None,
-                native_selector: None,
-            },
+            desktop_bindings: std::collections::BTreeMap::from([(
+                "local-demo-desktop-v1".to_string(),
+                satelle_core::DesktopSelectionPolicy {
+                    desktop_user: None,
+                    preference: None,
+                    native_selector: None,
+                },
+            )]),
         },
     );
     let binding = satelle_core::ResolvedProviderBinding::from_authorization(
@@ -3197,25 +3236,29 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
     };
     service
         .runtime
-        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
-            satelle_core::ProviderBindingAuthorization::new(
-                "review",
-                "openai",
-                "host-model",
-                "openai",
-            )
-            .with_endpoint("http://127.0.0.1:9")
-            .with_auth_source(satelle_core::ProviderSecretSource::File {
-                path: secret_path.clone(),
-            })
-            .with_experimental_provider_computer_use(true),
-            satelle_core::ProviderBindingSource::UserConfig,
-        ))
+        .authorize_provider_binding(
+            &local_desktop_binding(),
+            &satelle_core::ResolvedProviderBinding::from_authorization(
+                satelle_core::ProviderBindingAuthorization::new(
+                    "review",
+                    "openai",
+                    "host-model",
+                    "openai",
+                )
+                .with_endpoint("http://127.0.0.1:9")
+                .with_auth_source(satelle_core::ProviderSecretSource::File {
+                    path: secret_path.clone(),
+                })
+                .with_experimental_provider_computer_use(true),
+                satelle_core::ProviderBindingSource::UserConfig,
+            ),
+        )
         .expect("seed the provider descriptor for validation");
 
     let cached = service
         .validate_provider_descriptor(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             crate::ProviderDescriptorValidationOptions::new(
@@ -3242,6 +3285,7 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
     let refreshed = service
         .validate_provider_descriptor(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             crate::ProviderDescriptorValidationOptions::new(
@@ -3268,6 +3312,7 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
     let cached_after_pass = service
         .validate_provider_descriptor(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             crate::ProviderDescriptorValidationOptions::new(
@@ -3291,6 +3336,7 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
     let unresolved = service
         .validate_provider_descriptor(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             crate::ProviderDescriptorValidationOptions::new(
@@ -3319,6 +3365,7 @@ fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
     let cached_after_failure = service
         .validate_provider_descriptor(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             crate::ProviderDescriptorValidationOptions::new(
@@ -3370,21 +3417,25 @@ fn failed_upstream_validation_returns_only_the_closed_smoke_failed_outcome() {
     };
     service
         .runtime
-        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
-            satelle_core::ProviderBindingAuthorization::new(
-                "review",
-                "openai",
-                "host-model",
-                "openai",
-            )
-            .with_auth_source(satelle_core::ProviderSecretSource::File { path: secret_path }),
-            satelle_core::ProviderBindingSource::UserConfig,
-        ))
+        .authorize_provider_binding(
+            &local_desktop_binding(),
+            &satelle_core::ResolvedProviderBinding::from_authorization(
+                satelle_core::ProviderBindingAuthorization::new(
+                    "review",
+                    "openai",
+                    "host-model",
+                    "openai",
+                )
+                .with_auth_source(satelle_core::ProviderSecretSource::File { path: secret_path }),
+                satelle_core::ProviderBindingSource::UserConfig,
+            ),
+        )
         .expect("seed provider binding before failed smoke");
 
     let validation = service
         .validate_provider_descriptor(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             crate::ProviderDescriptorValidationOptions::new(
@@ -3447,6 +3498,7 @@ fn provider_descriptor_refresh_replays_control_plane_errors_without_reclassifyin
     let first = service
         .validate_provider_descriptor_idempotent(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             options(),
@@ -3456,6 +3508,7 @@ fn provider_descriptor_refresh_replays_control_plane_errors_without_reclassifyin
     let replay = service
         .validate_provider_descriptor_idempotent(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             options(),
@@ -3486,19 +3539,22 @@ fn doctor_provider_and_default_scopes_report_closed_descriptor_status_without_se
     );
     service
         .runtime
-        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
-            satelle_core::ProviderBindingAuthorization::new(
-                "review",
-                "openai",
-                "provider-doctor-model",
-                "provider-doctor-binding",
-            )
-            .with_auth_source(satelle_core::ProviderSecretSource::Environment {
-                variable: variable.clone(),
-            })
-            .with_experimental_provider_computer_use(true),
-            satelle_core::ProviderBindingSource::UserConfig,
-        ))
+        .authorize_provider_binding(
+            &local_desktop_binding(),
+            &satelle_core::ResolvedProviderBinding::from_authorization(
+                satelle_core::ProviderBindingAuthorization::new(
+                    "review",
+                    "openai",
+                    "provider-doctor-model",
+                    "provider-doctor-binding",
+                )
+                .with_auth_source(satelle_core::ProviderSecretSource::Environment {
+                    variable: variable.clone(),
+                })
+                .with_experimental_provider_computer_use(true),
+                satelle_core::ProviderBindingSource::UserConfig,
+            ),
+        )
         .expect("authorize the persisted UserConfig provider binding");
     let intent = ProviderComputerUseIntent::new(
         Some(
@@ -3574,6 +3630,7 @@ fn named_missing_provider_descriptor_remains_observable_to_cached_validation() {
     let validation = service
         .validate_provider_descriptor(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             crate::ProviderDescriptorValidationOptions::new(
@@ -3603,6 +3660,7 @@ fn provider_binding_without_auth_source_is_resolved_by_cached_validation() {
     let validation = service
         .validate_provider_descriptor(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             crate::ProviderDescriptorValidationOptions::new(
@@ -3633,6 +3691,7 @@ fn provider_binding_without_auth_source_runs_live_refresh_validation() {
     let validation = service
         .validate_provider_descriptor(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "review",
             "openai",
             crate::ProviderDescriptorValidationOptions::new(
@@ -3748,6 +3807,7 @@ fn concurrent_provider_binding_authorization_retries_share_one_live_validation()
     let leader = std::thread::spawn(move || {
         leader_service.authorize_provider_binding_idempotent(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "vision",
             "open_ai",
             leader_authorization,
@@ -3766,6 +3826,7 @@ fn concurrent_provider_binding_authorization_retries_share_one_live_validation()
     let follower = std::thread::spawn(move || {
         follower_service.authorize_provider_binding_idempotent(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "vision",
             "open_ai",
             follower_authorization,
@@ -3779,6 +3840,7 @@ fn concurrent_provider_binding_authorization_retries_share_one_live_validation()
     let conflict = service
         .authorize_provider_binding_idempotent(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "vision",
             "open_ai",
             ProviderBindingAuthorization::new("vision", "open_ai", "gpt-conflict", "openai"),
@@ -3811,6 +3873,7 @@ fn concurrent_provider_binding_authorization_retries_share_one_live_validation()
     let replay = service
         .authorize_provider_binding_idempotent(
             LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
             "vision",
             "open_ai",
             authorization,
@@ -3827,7 +3890,7 @@ fn concurrent_provider_binding_authorization_retries_share_one_live_validation()
         Some(leader_binding.binding_digest()),
         service
             .runtime
-            .provider_binding_digest("vision", "open_ai")
+            .provider_binding_digest(&local_desktop_binding(), "vision", "open_ai")
             .expect("read persisted provider binding")
             .as_deref()
     );

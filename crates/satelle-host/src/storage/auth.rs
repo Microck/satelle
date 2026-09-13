@@ -11,6 +11,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use satelle_core::session::HostIdentityRef;
 use sha2::Sha256;
+use std::collections::BTreeSet;
 use std::fmt;
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
@@ -58,6 +59,7 @@ pub(crate) struct ApiTokenRegistration {
     credential_revision: u64,
     verifier: ApiTokenVerifier,
     scopes: ApiScopes,
+    desktop_bindings: BTreeSet<String>,
     expires_at: Option<OffsetDateTime>,
     created_at: OffsetDateTime,
     token_state: ApiTokenState,
@@ -69,51 +71,19 @@ impl ApiTokenRegistration {
         principal_ref: impl Into<String>,
         credential_revision: u64,
         scopes: ApiScopes,
+        desktop_bindings: BTreeSet<String>,
         expires_at: Option<OffsetDateTime>,
         created_at: OffsetDateTime,
-    ) -> Result<Self, StorageError> {
-        Self::new_with_state(
-            token,
-            principal_ref,
-            credential_revision,
-            scopes,
-            expires_at,
-            created_at,
-            ApiTokenState::Active,
-        )
-    }
-
-    pub(crate) fn new_setup_pending(
-        token: &ApiBearerToken,
-        principal_ref: impl Into<String>,
-        credential_revision: u64,
-        scopes: ApiScopes,
-        pending_until: OffsetDateTime,
-        created_at: OffsetDateTime,
-    ) -> Result<Self, StorageError> {
-        Self::new_with_state(
-            token,
-            principal_ref,
-            credential_revision,
-            scopes,
-            Some(pending_until),
-            created_at,
-            ApiTokenState::SetupPending,
-        )
-    }
-
-    fn new_with_state(
-        token: &ApiBearerToken,
-        principal_ref: impl Into<String>,
-        credential_revision: u64,
-        scopes: ApiScopes,
-        expires_at: Option<OffsetDateTime>,
-        created_at: OffsetDateTime,
-        token_state: ApiTokenState,
     ) -> Result<Self, StorageError> {
         let principal_ref = principal_ref.into();
         validate_safe_reference(&principal_ref)?;
         if credential_revision == 0 || expires_at.is_some_and(|expires_at| expires_at <= created_at)
+        {
+            return Err(StorageError::new(StorageErrorKind::InvalidInput));
+        }
+        if desktop_bindings
+            .iter()
+            .any(|binding| satelle_core::session::DesktopBindingRef::new(binding).is_err())
         {
             return Err(StorageError::new(StorageErrorKind::InvalidInput));
         }
@@ -123,10 +93,33 @@ impl ApiTokenRegistration {
             credential_revision,
             verifier: token.verifier(),
             scopes,
+            desktop_bindings,
             expires_at,
             created_at,
-            token_state,
+            token_state: ApiTokenState::Active,
         })
+    }
+
+    pub(crate) fn new_setup_pending(
+        token: &ApiBearerToken,
+        principal_ref: impl Into<String>,
+        credential_revision: u64,
+        scopes: ApiScopes,
+        desktop_bindings: BTreeSet<String>,
+        pending_until: OffsetDateTime,
+        created_at: OffsetDateTime,
+    ) -> Result<Self, StorageError> {
+        let mut registration = Self::new(
+            token,
+            principal_ref,
+            credential_revision,
+            scopes,
+            desktop_bindings,
+            Some(pending_until),
+            created_at,
+        )?;
+        registration.token_state = ApiTokenState::SetupPending;
+        Ok(registration)
     }
 
     pub(crate) fn principal(&self) -> ApiPrincipal {
@@ -135,6 +128,7 @@ impl ApiTokenRegistration {
             principal_ref: self.principal_ref.clone(),
             credential_revision: self.credential_revision,
             scopes: self.scopes,
+            desktop_bindings: self.desktop_bindings.clone(),
             expires_at: self.expires_at,
             process_local_ssh_bootstrap: false,
             durable_setup_pending: self.token_state == ApiTokenState::SetupPending,
@@ -179,6 +173,7 @@ struct StoredTokenRow {
     expires_at: Option<String>,
     revoked_at: Option<String>,
     token_state: String,
+    desktop_bindings_json: String,
 }
 
 impl StoredTokenRow {
@@ -194,6 +189,7 @@ impl StoredTokenRow {
             expires_at: row.get(7)?,
             revoked_at: row.get(8)?,
             token_state: row.get(9)?,
+            desktop_bindings_json: row.get(10)?,
         })
     }
 
@@ -230,11 +226,21 @@ impl StoredTokenRow {
             .map(parse_stored_time)
             .transpose()?;
         let token_state = ApiTokenState::parse(&self.token_state)?;
+        let desktop_binding_values: Vec<String> = serde_json::from_str(&self.desktop_bindings_json)
+            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+        let desktop_bindings = desktop_binding_values
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         if credential_updated_at < created_at
             || expires_at.is_some_and(|expires_at| expires_at <= created_at)
             || revoked_at.is_some_and(|revoked_at| revoked_at < created_at)
             || (token_state == ApiTokenState::SetupPending && expires_at.is_none())
             || (token_state == ApiTokenState::SetupActive && expires_at.is_some())
+            || desktop_bindings.len() != desktop_binding_values.len()
+            || desktop_bindings
+                .iter()
+                .any(|binding| satelle_core::session::DesktopBindingRef::new(binding).is_err())
         {
             return Err(StorageError::new(StorageErrorKind::InvalidStoredState));
         }
@@ -244,6 +250,7 @@ impl StoredTokenRow {
             credential_revision,
             verifier,
             scopes,
+            desktop_bindings,
             created_at,
             expires_at,
             revoked_at,
@@ -258,6 +265,7 @@ struct StoredToken {
     credential_revision: u64,
     verifier: ApiTokenVerifier,
     scopes: ApiScopes,
+    desktop_bindings: BTreeSet<String>,
     created_at: OffsetDateTime,
     expires_at: Option<OffsetDateTime>,
     revoked_at: Option<OffsetDateTime>,
@@ -271,6 +279,7 @@ impl StoredToken {
             principal_ref: self.principal_ref.clone(),
             credential_revision: self.credential_revision,
             scopes: self.scopes.scopes(),
+            desktop_bindings: self.desktop_bindings.iter().cloned().collect(),
             expires_at: self.expires_at,
             revoked_at: self.revoked_at,
         }
@@ -282,6 +291,7 @@ impl StoredToken {
             principal_ref: self.principal_ref.clone(),
             credential_revision: self.credential_revision,
             scopes: self.scopes,
+            desktop_bindings: self.desktop_bindings.clone(),
             expires_at: self.expires_at,
             process_local_ssh_bootstrap: false,
             durable_setup_pending: self.token_state == ApiTokenState::SetupPending,
@@ -410,7 +420,11 @@ fn apply_token_mutation(
     at: OffsetDateTime,
 ) -> Result<ApiTokenMutationResult, StorageError> {
     let (token_id, expected_revision, rotating) = match mutation {
-        ApiTokenMutation::Issue { scopes, expires_at } => {
+        ApiTokenMutation::Issue {
+            scopes,
+            desktop_bindings,
+            expires_at,
+        } => {
             if expires_at.is_some_and(|expiry| expiry <= at) {
                 return Ok(rejected_token_mutation(ApiTokenRejection::InvalidExpiry));
             }
@@ -418,8 +432,15 @@ fn apply_token_mutation(
                 StorageError::with_source(StorageErrorKind::OperationFailed, source)
             })?;
             let principal_ref = format!("api-{}", token.token_id());
-            let registration =
-                ApiTokenRegistration::new(&token, &principal_ref, 1, *scopes, *expires_at, at)?;
+            let registration = ApiTokenRegistration::new(
+                &token,
+                &principal_ref,
+                1,
+                *scopes,
+                desktop_bindings.clone(),
+                *expires_at,
+                at,
+            )?;
             register_api_token_in_connection(connection, registration)?;
             return Ok(ApiTokenMutationResult {
                 outcome: ApiTokenMutationOutcome::Completed(ApiTokenMetadata {
@@ -427,6 +448,7 @@ fn apply_token_mutation(
                     principal_ref,
                     credential_revision: 1,
                     scopes: scopes.scopes(),
+                    desktop_bindings: desktop_bindings.iter().cloned().collect(),
                     expires_at: *expires_at,
                     revoked_at: None,
                 }),
@@ -531,7 +553,7 @@ pub(super) fn seed_provider_smoke_hmac_key(
 }
 
 pub(super) fn validate_sensitive_state(connection: &Connection) -> Result<(), StorageError> {
-    validate_sensitive_state_with_schema(connection, true, true)
+    validate_sensitive_state_with_schema(connection, true, true, true)
 }
 
 /// Migration 8 makes the historical implicit `active` state explicit. This
@@ -540,19 +562,26 @@ pub(super) fn validate_sensitive_state(connection: &Connection) -> Result<(), St
 pub(super) fn validate_sensitive_state_before_token_state_migration(
     connection: &Connection,
 ) -> Result<(), StorageError> {
-    validate_sensitive_state_with_schema(connection, false, false)
+    validate_sensitive_state_with_schema(connection, false, false, false)
 }
 
 pub(super) fn validate_sensitive_state_before_provider_smoke_key_migration(
     connection: &Connection,
 ) -> Result<(), StorageError> {
-    validate_sensitive_state_with_schema(connection, true, false)
+    validate_sensitive_state_with_schema(connection, true, false, false)
+}
+
+pub(super) fn validate_sensitive_state_before_desktop_binding_grants(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    validate_sensitive_state_with_schema(connection, true, true, false)
 }
 
 fn validate_sensitive_state_with_schema(
     connection: &Connection,
     token_state_is_stored: bool,
     provider_smoke_key_is_stored: bool,
+    desktop_binding_grants_are_stored: bool,
 ) -> Result<(), StorageError> {
     let identity_count: i64 = connection
         .query_row("SELECT count(*) FROM daemon_identity", [], |row| row.get(0))
@@ -612,9 +641,14 @@ fn validate_sensitive_state_with_schema(
     } else {
         "'active' AS token_state"
     };
+    let desktop_bindings = if desktop_binding_grants_are_stored {
+        "desktop_bindings_json"
+    } else {
+        "'[]' AS desktop_bindings_json"
+    };
     let token_query = format!(
         "SELECT token_id, principal_ref, credential_revision, verifier, scopes, created_at, \
-         credential_updated_at, expires_at, revoked_at, {token_state} \
+         credential_updated_at, expires_at, revoked_at, {token_state}, {desktop_bindings} \
          FROM api_tokens ORDER BY token_id"
     );
     let mut token_statement = connection.prepare(&token_query).map_err(operation_failed)?;
@@ -797,6 +831,7 @@ fn register_api_token_in_connection(
                     .ct_eq(registration.verifier.as_bytes()),
             )
             && stored.scopes == registration.scopes
+            && stored.desktop_bindings == registration.desktop_bindings
             && stored.expires_at == registration.expires_at
             && stored.token_state == registration.token_state
             && stored.revoked_at.is_none();
@@ -809,7 +844,7 @@ fn register_api_token_in_connection(
     let created_at = format_time(registration.created_at)?;
     connection
         .execute(
-            "INSERT INTO api_tokens (token_id, principal_ref, credential_revision, verifier, scopes, created_at, credential_updated_at, expires_at, token_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO api_tokens (token_id, principal_ref, credential_revision, verifier, scopes, created_at, credential_updated_at, expires_at, token_state, desktop_bindings_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 registration.token_id,
                 registration.principal_ref,
@@ -821,6 +856,8 @@ fn register_api_token_in_connection(
                 format_time(registration.created_at)?,
                 registration.expires_at.map(format_time).transpose()?,
                 registration.token_state.as_str(),
+                serde_json::to_string(&registration.desktop_bindings)
+                    .map_err(|_| StorageError::new(StorageErrorKind::OperationFailed))?,
             ],
         )
         .map_err(operation_failed)?;
@@ -900,6 +937,7 @@ pub(super) fn api_principal_is_active(
             && stored.principal_ref == principal.principal_ref
             && stored.credential_revision == principal.credential_revision
             && stored.scopes == principal.scopes
+            && stored.desktop_bindings == principal.desktop_bindings
             && stored.expires_at == principal.expires_at
     }))
 }
@@ -1009,6 +1047,7 @@ pub(super) fn activate_api_token(
         principal_ref: stored.principal_ref,
         credential_revision: stored.credential_revision,
         scopes: stored.scopes,
+        desktop_bindings: stored.desktop_bindings,
         expires_at: None,
         process_local_ssh_bootstrap: false,
         durable_setup_pending: false,
@@ -1077,7 +1116,7 @@ fn load_token(
 ) -> Result<Option<StoredTokenRow>, StorageError> {
     connection
         .query_row(
-            "SELECT token_id, principal_ref, credential_revision, verifier, scopes, created_at, credential_updated_at, expires_at, revoked_at, token_state FROM api_tokens WHERE token_id = ?1",
+            "SELECT token_id, principal_ref, credential_revision, verifier, scopes, created_at, credential_updated_at, expires_at, revoked_at, token_state, desktop_bindings_json FROM api_tokens WHERE token_id = ?1",
             [token_id],
             StoredTokenRow::read,
         )

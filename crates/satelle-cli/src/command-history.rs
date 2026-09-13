@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 
 const DATABASE_FILE_NAME: &str = "command-history.sqlite3";
 const DATABASE_DIRECTORY_NAME: &str = "command-history";
-const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_HISTORY_RETENTION: time::Duration = time::Duration::days(7);
 
 const SCHEMA: &str = r#"

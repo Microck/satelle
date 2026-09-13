@@ -42,7 +42,9 @@ provider_alias = "schema-provider"
 transport = "local"
 adapter = "fake"
 
-[hosts.local-demo.provider_bindings.schema-provider.schema-model]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_bindings.schema-provider.schema-model]
 model = "fake-model-v1"
 model_provider = "openai"
 "#,
@@ -418,6 +420,7 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         &run,
         "satelle.run.v2",
         &[
+            "desktop_binding",
             "effective_timeouts",
             "experimental_provider_computer_use",
             "latest_turn",
@@ -448,6 +451,7 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         &steer,
         "satelle.steer.v2",
         &[
+            "desktop_binding",
             "effective_timeouts",
             "experimental_provider_computer_use",
             "latest_turn",
@@ -472,6 +476,7 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         "satelle.status.v2",
         &[
             "created_at",
+            "desktop_binding",
             "host",
             "schema_version",
             "session_id",
@@ -497,6 +502,7 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         "satelle.steer.v2",
         &[
             "created_at",
+            "desktop_binding",
             "effective_timeouts",
             "experimental_provider_computer_use",
             "host",
@@ -535,6 +541,7 @@ fn session_commands_use_command_specific_v2_schema_tokens() {
         "satelle.run.v2",
         &[
             "created_at",
+            "desktop_binding",
             "effective_timeouts",
             "experimental_provider_computer_use",
             "host",
@@ -616,7 +623,7 @@ fn logs_json_lines_use_the_exact_entry_v1_contract() {
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
         assert_eq!(actual_fields, expected_fields);
-        assert_eq!(entry["schema_version"], "satelle.logs.entry.v1");
+        assert_eq!(entry["schema_version"], "satelle.logs.entry.v2");
         assert!(
             entry["cursor"]
                 .as_str()

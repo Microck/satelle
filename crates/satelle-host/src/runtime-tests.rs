@@ -42,6 +42,10 @@ const PRIVATE_UPSTREAM_THREAD_REF: &str = "PRIVATE_UPSTREAM_THREAD_REFERENCE_CAN
 const PRIVATE_UPSTREAM_TURN_REF: &str = "PRIVATE_UPSTREAM_TURN_REFERENCE_CANARY";
 const PRIVATE_UPSTREAM_GOAL_REF: &str = "PRIVATE_UPSTREAM_GOAL_REFERENCE_CANARY";
 
+fn local_desktop_binding() -> DesktopBindingRef {
+    DesktopBindingRef::new("local-demo-desktop-v1").expect("valid built-in Desktop Binding")
+}
+
 fn latest_turn(session: &PublicSession) -> &PublicTurn {
     session
         .turns()
@@ -80,7 +84,21 @@ fn host_config_with_provider_binding(secret_variable: &str) -> satelle_core::Hos
         .hosts
         .remove(LOCAL_DEMO_HOST)
         .expect("the built-in local Host config exists");
-    config.provider_bindings = std::collections::BTreeMap::from([(
+    config.desktop_bindings.insert(
+        "local-demo-desktop-v1".to_string(),
+        satelle_core::DesktopBindingConfig {
+            desktop_user: "local-demo-user".to_string(),
+            desktop_session_preference: None,
+            desktop_session_native_selector: None,
+            provider_auth: Default::default(),
+            provider_bindings: Default::default(),
+        },
+    );
+    let desktop = config
+        .desktop_bindings
+        .get_mut("local-demo-desktop-v1")
+        .expect("built-in Desktop Binding");
+    desktop.provider_bindings = std::collections::BTreeMap::from([(
         "openai".to_string(),
         std::collections::BTreeMap::from([(
             "review".to_string(),
@@ -93,7 +111,7 @@ fn host_config_with_provider_binding(secret_variable: &str) -> satelle_core::Hos
             },
         )]),
     )]);
-    config.provider_auth = std::collections::BTreeMap::from([(
+    desktop.provider_auth = std::collections::BTreeMap::from([(
         "host-auth".to_string(),
         satelle_core::ProviderSecretSource::Environment {
             variable: secret_variable.to_string(),
@@ -909,7 +927,7 @@ fn host_config_binding_precedes_colliding_persisted_user_config_without_secret_r
         satelle_core::ProviderBindingSource::UserConfig,
     );
     runtime
-        .authorize_provider_binding(&persisted_user_binding)
+        .authorize_provider_binding(&local_desktop_binding(), &persisted_user_binding)
         .expect("persist the colliding UserConfig binding");
     let intent = ProviderComputerUseIntent::new(
         Some(EffectiveModelRef::new("review").expect("valid model alias")),
@@ -964,6 +982,9 @@ fn project_selection_requires_exact_host_owned_binding_consent() {
     drop(denied_runtime);
 
     config
+        .desktop_bindings
+        .get_mut("local-demo-desktop-v1")
+        .expect("built-in Desktop Binding")
         .provider_bindings
         .get_mut("openai")
         .and_then(|models| models.get_mut("review"))
@@ -1000,10 +1021,13 @@ fn project_selection_requires_exact_persisted_binding_consent() {
         ),
     });
     runtime
-        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
-            authorization.clone(),
-            satelle_core::ProviderBindingSource::UserConfig,
-        ))
+        .authorize_provider_binding(
+            &local_desktop_binding(),
+            &satelle_core::ResolvedProviderBinding::from_authorization(
+                authorization.clone(),
+                satelle_core::ProviderBindingSource::UserConfig,
+            ),
+        )
         .expect("persist the default-deny binding");
     let project_intent = ProviderComputerUseIntent::new(
         Some(EffectiveModelRef::new("review").expect("valid model alias")),
@@ -1021,10 +1045,13 @@ fn project_selection_requires_exact_persisted_binding_consent() {
     );
 
     runtime
-        .authorize_provider_binding(&satelle_core::ResolvedProviderBinding::from_authorization(
-            authorization.with_allow_project_selection(true),
-            satelle_core::ProviderBindingSource::UserConfig,
-        ))
+        .authorize_provider_binding(
+            &local_desktop_binding(),
+            &satelle_core::ResolvedProviderBinding::from_authorization(
+                authorization.with_allow_project_selection(true),
+                satelle_core::ProviderBindingSource::UserConfig,
+            ),
+        )
         .expect("replace the binding with exact project consent");
     let ProviderBindingResolution::Ready(binding) = runtime
         .resolve_provider_binding(LOCAL_DEMO_HOST, &project_intent)
@@ -1083,7 +1110,7 @@ fn replacing_or_deleting_persisted_binding_prevents_restored_digest_cache_reuse(
         satelle_core::ProviderBindingSource::UserConfig,
     );
     runtime
-        .authorize_provider_binding(&first_binding)
+        .authorize_provider_binding(&local_desktop_binding(), &first_binding)
         .expect("persist the first UserConfig binding");
     let first_key = ProviderProbeRecoveryAdapter::key().with_provider_binding(&first_binding);
     let observed_at = time::OffsetDateTime::now_utc();
@@ -1137,7 +1164,7 @@ fn replacing_or_deleting_persisted_binding_prevents_restored_digest_cache_reuse(
         satelle_core::ProviderBindingSource::UserConfig,
     );
     runtime
-        .authorize_provider_binding(&replacement)
+        .authorize_provider_binding(&local_desktop_binding(), &replacement)
         .expect("replace the persisted UserConfig binding");
 
     assert_ne!(first_binding.binding_digest(), replacement.binding_digest());
@@ -1150,7 +1177,7 @@ fn replacing_or_deleting_persisted_binding_prevents_restored_digest_cache_reuse(
     );
 
     runtime
-        .authorize_provider_binding(&first_binding)
+        .authorize_provider_binding(&local_desktop_binding(), &first_binding)
         .expect("restore the original binding after replacement");
     drop(runtime);
     let runtime = RuntimeHandle::new(
@@ -1203,11 +1230,11 @@ fn replacing_or_deleting_persisted_binding_prevents_restored_digest_cache_reuse(
 
     assert!(
         runtime
-            .delete_provider_binding("review", "openai")
+            .delete_provider_binding(&local_desktop_binding(), "review", "openai")
             .expect("delete the restored binding")
     );
     runtime
-        .authorize_provider_binding(&first_binding)
+        .authorize_provider_binding(&local_desktop_binding(), &first_binding)
         .expect("restore the identical binding after deletion");
     drop(runtime);
     let runtime = RuntimeHandle::new(
@@ -1614,6 +1641,9 @@ fn explicit_host_binding_is_attached_before_native_readiness_key_resolution() {
     let state = crate::TestStateDir::new().expect("temporary state directory should exist");
     let mut config = host_config_with_provider_binding("UNUSED_PROVIDER_SECRET");
     config
+        .desktop_bindings
+        .get_mut("local-demo-desktop-v1")
+        .expect("built-in Desktop Binding")
         .provider_bindings
         .get_mut("openai")
         .and_then(|models| models.get_mut("review"))

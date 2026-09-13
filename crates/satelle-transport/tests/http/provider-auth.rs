@@ -5,8 +5,9 @@ use satelle_core::{
 };
 use satelle_transport::{
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
-    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
+    ProviderBindingDeletionRequest, ProviderBindingDeletionResponse,
+    ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
+    ProviderSecretProvisioningMetadata,
 };
 use zeroize::Zeroizing;
 
@@ -19,6 +20,7 @@ const PROVIDER_SECRET_COMPLETED_OUTCOME: &str = "v1.provider_secret_provisioning
 
 fn provider_secret_metadata(overwrite_authorized: bool) -> ProviderSecretProvisioningMetadata {
     ProviderSecretProvisioningMetadata::new(
+        "local-demo-desktop-v1",
         ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai"),
         overwrite_authorized,
     )
@@ -26,6 +28,7 @@ fn provider_secret_metadata(overwrite_authorized: bool) -> ProviderSecretProvisi
 
 fn provider_secret_file_metadata(path: std::path::PathBuf) -> ProviderSecretProvisioningMetadata {
     ProviderSecretProvisioningMetadata::new(
+        "local-demo-desktop-v1",
         ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai")
             .with_auth_source(ProviderSecretSource::File { path }),
         false,
@@ -84,6 +87,7 @@ async fn provider_secret_preview_replays_without_consuming_upload_capacity() {
     }
 
     let conflicting = ProviderSecretProvisioningMetadata::new(
+        "local-demo-desktop-v1",
         metadata.authorization().clone(),
         !metadata.overwrite_authorized(),
     );
@@ -479,14 +483,18 @@ fn state_contains_provider_secret_sibling(path: &std::path::Path) -> bool {
 
 #[tokio::test]
 async fn provider_binding_validation_requires_setup_or_control_authority() {
-    let request =
-        ProviderDescriptorValidationRequest::new(ProviderAuthValidationMode::Cached, false, false);
+    let request = ProviderDescriptorValidationRequest::new(
+        "local-demo-desktop-v1",
+        ProviderAuthValidationMode::Cached,
+        false,
+        false,
+    );
 
     let control = RunningServer::start(ApiScopes::CONTROL).await;
     let unauthenticated = reqwest::Client::new()
         .post(control.url(VALIDATION_PATH))
         .header("Content-Type", "application/json")
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .header("Satelle-Expected-Host-Identity", &control.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
         .header("Idempotency-Key", "provider-auth-unauthenticated")
@@ -525,6 +533,7 @@ async fn bootstrap_admin_authorizes_and_control_validates_the_exact_path_aliases
     )
     .await;
     let authorization = ProviderBindingAuthorizationRequest::new(
+        "local-demo-desktop-v1",
         ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai"),
     );
 
@@ -533,7 +542,7 @@ async fn bootstrap_admin_authorizes_and_control_validates_the_exact_path_aliases
         .header("Authorization", bearer(&bootstrap_token))
         .header("Satelle-Expected-Host-Identity", &running.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .header("Idempotency-Key", "provider-authorization-admin")
         .json(&authorization)
         .send()
@@ -553,8 +562,12 @@ async fn bootstrap_admin_authorizes_and_control_validates_the_exact_path_aliases
         ProviderBindingSource::UserConfig
     );
 
-    let validation =
-        ProviderDescriptorValidationRequest::new(ProviderAuthValidationMode::Cached, false, false);
+    let validation = ProviderDescriptorValidationRequest::new(
+        "local-demo-desktop-v1",
+        ProviderAuthValidationMode::Cached,
+        false,
+        false,
+    );
     let validated = running
         .mutation(VALIDATION_PATH, "provider-validation-control")
         .json(&validation)
@@ -600,8 +613,12 @@ async fn ssh_bootstrap_read_cannot_validate_provider_bindings() {
         service,
     )
     .await;
-    let validation =
-        ProviderDescriptorValidationRequest::new(ProviderAuthValidationMode::Cached, false, false);
+    let validation = ProviderDescriptorValidationRequest::new(
+        "local-demo-desktop-v1",
+        ProviderAuthValidationMode::Cached,
+        false,
+        false,
+    );
     let forbidden = bootstrap_mutation(
         &running,
         &bootstrap_token,
@@ -624,7 +641,8 @@ async fn validation_rejects_descriptor_material_and_control_cannot_authorize() {
     let descriptor = control
         .mutation(VALIDATION_PATH, "provider-validation-descriptor")
         .json(&serde_json::json!({
-            "schema_version": "satelle.provider-binding-validation.v5",
+            "schema_version": "satelle.provider-binding-validation.v6",
+            "desktop_binding": "local-demo-desktop-v1",
             "model_from_project": false,
             "provider_from_project": false,
             "mode": "cached",
@@ -645,12 +663,13 @@ async fn validation_rejects_descriptor_material_and_control_cannot_authorize() {
     );
 
     let authorization = ProviderBindingAuthorizationRequest::new(
+        "local-demo-desktop-v1",
         ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai"),
     );
     let forbidden = control
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authorization-control")
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .json(&authorization)
         .send()
         .await
@@ -670,7 +689,7 @@ fn bootstrap_mutation(
         .header("Authorization", bearer(token))
         .header("Satelle-Expected-Host-Identity", &running.host_identity)
         .header("Satelle-Request-Id", RequestId::new().as_str())
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .header("Idempotency-Key", idempotency_key)
 }
 
@@ -712,14 +731,16 @@ fn ready_bootstrap_service(state: &TestStateDir, token: &ApiBearerToken) -> Host
 #[tokio::test]
 async fn provider_binding_mutations_require_admin() {
     let authorization = ProviderBindingAuthorizationRequest::new(
+        "local-demo-desktop-v1",
         ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai"),
     );
+    let deletion = ProviderBindingDeletionRequest::new("local-demo-desktop-v1");
 
     let control = RunningServer::start(ApiScopes::CONTROL).await;
     let forbidden_delete = control
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-control")
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .send()
         .await
         .expect("send deletion as control principal");
@@ -736,7 +757,7 @@ async fn provider_binding_mutations_require_admin() {
     let authorized = ordinary_admin
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authorization-ordinary-admin")
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .json(&authorization)
         .send()
         .await
@@ -746,7 +767,7 @@ async fn provider_binding_mutations_require_admin() {
     let rejected_body = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-body")
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .json(&serde_json::json!({"unexpected": true}))
         .send()
         .await
@@ -756,7 +777,8 @@ async fn provider_binding_mutations_require_admin() {
     let rejected_oversized_body = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-oversized-body")
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(vec![b'x'; 2 * 1024 * 1024])
         .send()
         .await
@@ -769,7 +791,8 @@ async fn provider_binding_mutations_require_admin() {
     let deleted = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-body")
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
+        .json(&deletion)
         .send()
         .await
         .expect("reuse the rejected body idempotency key");
@@ -778,7 +801,8 @@ async fn provider_binding_mutations_require_admin() {
     let absent = ordinary_admin
         .protected_request(reqwest::Method::DELETE, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-delete-oversized-body")
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
+        .json(&deletion)
         .send()
         .await
         .expect("reuse the rejected oversized-body idempotency key");
@@ -797,15 +821,15 @@ async fn provider_binding_mutation_replay_and_conflict_survive_restart() {
         service,
     )
     .await;
-    let initial = ProviderBindingAuthorizationRequest::new(ProviderBindingAuthorization::new(
-        "vision", "open_ai", "gpt-5.6", "openai",
-    ));
-    let replacement = ProviderBindingAuthorizationRequest::new(ProviderBindingAuthorization::new(
-        "vision",
-        "open_ai",
-        "gpt-5.6-mini",
-        "openai",
-    ));
+    let initial = ProviderBindingAuthorizationRequest::new(
+        "local-demo-desktop-v1",
+        ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai"),
+    );
+    let replacement = ProviderBindingAuthorizationRequest::new(
+        "local-demo-desktop-v1",
+        ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6-mini", "openai"),
+    );
+    let deletion = ProviderBindingDeletionRequest::new("local-demo-desktop-v1");
 
     let authorize = || {
         bootstrap_mutation(
@@ -866,14 +890,20 @@ async fn provider_binding_mutation_replay_and_conflict_survive_restart() {
         AUTHORIZATION_PATH,
         "provider-deletion-durable",
     )
+    .json(&deletion)
     .send()
     .await
     .expect("delete authorized binding");
-    assert_eq!(deleted.status(), StatusCode::OK);
+    let deleted_status = deleted.status();
+    let deleted_body = deleted.bytes().await.expect("read deletion response");
+    assert_eq!(
+        deleted_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&deleted_body)
+    );
     assert!(
-        deleted
-            .json::<ProviderBindingDeletionResponse>()
-            .await
+        serde_json::from_slice::<ProviderBindingDeletionResponse>(&deleted_body)
             .expect("decode deletion result")
             .deleted()
     );
@@ -884,6 +914,7 @@ async fn provider_binding_mutation_replay_and_conflict_survive_restart() {
         AUTHORIZATION_PATH,
         "provider-deletion-durable",
     )
+    .json(&deletion)
     .send()
     .await
     .expect("replay deletion");
@@ -923,6 +954,7 @@ async fn provider_binding_mutation_replay_and_conflict_survive_restart() {
         AUTHORIZATION_PATH,
         "provider-deletion-durable",
     )
+    .json(&deletion)
     .send()
     .await
     .expect("replay deletion after restart");
@@ -959,12 +991,10 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
         service,
     )
     .await;
-    let initial = ProviderBindingAuthorizationRequest::new(ProviderBindingAuthorization::new(
-        "vision",
-        "open_ai",
-        "gpt-forbidden",
-        "openai",
-    ));
+    let initial = ProviderBindingAuthorizationRequest::new(
+        "local-demo-desktop-v1",
+        ProviderBindingAuthorization::new("vision", "open_ai", "gpt-forbidden", "openai"),
+    );
     let rejected_before_protocol = running
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .body("{")
@@ -975,7 +1005,7 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
     let rejected_before_body = running
         .protected_request(reqwest::Method::PUT, AUTHORIZATION_PATH)
         .header("Idempotency-Key", "provider-authority-before-body")
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .body("{")
         .send()
         .await
@@ -1003,12 +1033,10 @@ async fn authorization_is_checked_before_the_durable_mutation_claim() {
         service,
     )
     .await;
-    let authorized = ProviderBindingAuthorizationRequest::new(ProviderBindingAuthorization::new(
-        "vision",
-        "open_ai",
-        "gpt-authorized",
-        "openai",
-    ));
+    let authorized = ProviderBindingAuthorizationRequest::new(
+        "local-demo-desktop-v1",
+        ProviderBindingAuthorization::new("vision", "open_ai", "gpt-authorized", "openai"),
+    );
     let response = bootstrap_mutation(
         &restarted,
         &token,
@@ -1065,11 +1093,13 @@ async fn binding_mutations_do_not_resolve_secret_or_contact_provider_endpoint() 
     )
     .await;
     let authorization = ProviderBindingAuthorizationRequest::new(
+        "local-demo-desktop-v1",
         ProviderBindingAuthorization::new("vision", "open_ai", "gpt-private", "openai")
             .with_endpoint(endpoint)
             .with_auth_source(ProviderSecretSource::File { path: secret_path })
             .with_experimental_provider_computer_use(true),
     );
+    let deletion = ProviderBindingDeletionRequest::new("local-demo-desktop-v1");
 
     let authorized = bootstrap_mutation(
         &running,
@@ -1096,11 +1126,18 @@ async fn binding_mutations_do_not_resolve_secret_or_contact_provider_endpoint() 
         AUTHORIZATION_PATH,
         "provider-private-deletion",
     )
+    .json(&deletion)
     .send()
     .await
     .expect("delete private provider binding");
-    assert_eq!(deleted.status(), StatusCode::OK);
+    let deleted_status = deleted.status();
     let deleted_bytes = deleted.bytes().await.expect("read deletion response");
+    assert_eq!(
+        deleted_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&deleted_bytes)
+    );
     assert!(!String::from_utf8_lossy(&deleted_bytes).contains(secret_canary));
 
     assert!(
@@ -1162,18 +1199,14 @@ async fn failed_provider_binding_authorization_replays_after_recovery_and_restar
              END;",
         )
         .expect("install deterministic provider mutation failure");
-    let initial = ProviderBindingAuthorizationRequest::new(ProviderBindingAuthorization::new(
-        "vision",
-        "open_ai",
-        "gpt-failed",
-        "openai",
-    ));
-    let replacement = ProviderBindingAuthorizationRequest::new(ProviderBindingAuthorization::new(
-        "vision",
-        "open_ai",
-        "gpt-changed",
-        "openai",
-    ));
+    let initial = ProviderBindingAuthorizationRequest::new(
+        "local-demo-desktop-v1",
+        ProviderBindingAuthorization::new("vision", "open_ai", "gpt-failed", "openai"),
+    );
+    let replacement = ProviderBindingAuthorizationRequest::new(
+        "local-demo-desktop-v1",
+        ProviderBindingAuthorization::new("vision", "open_ai", "gpt-changed", "openai"),
+    );
 
     let failed = bootstrap_mutation(
         &running,

@@ -35,38 +35,25 @@ pub(super) fn config_check_report(
     let checked_contexts = contexts
         .iter()
         .map(|context| -> Result<Value, CliFailure> {
-            let context_config = context.profile.as_deref().map_or_else(
-                ConfigContext::without_profile,
-                |profile| {
-                    context.profile_source.map_or_else(
-                        || ConfigContext::new(Some(profile)),
-                        |source| ConfigContext::for_profile(profile, source),
-                    )
-                },
-            );
+            let context_config =
+                context
+                    .profile
+                    .as_deref()
+                    .map_or_else(ConfigContext::without_profile, |profile| {
+                        context.profile_source.map_or_else(
+                            || ConfigContext::new(Some(profile)),
+                            |source| ConfigContext::for_profile(profile, source),
+                        )
+                    });
             let resolved = context_config.load()?;
-            resolved.check_trusted_profile_expiration(false, evaluated_at).map_err(failure)?;
+            resolved
+                .check_trusted_profile_expiration(false, evaluated_at)
+                .map_err(failure)?;
             let provider_host = resolved
                 .resolve_host(Some(&context.host))
                 .map(super::SelectedHost::from)
                 .map_err(failure)?;
-            let provider_selection = super::resolve_provider_selection(
-                resolved,
-                &provider_host,
-                None,
-                None,
-                false,
-                false,
-            )?;
-            if let Some(auth_source_name) = provider_selection.missing_auth_source_name() {
-                return Err(failure(SatelleError::config_error(
-                    format!(
-                        "Host Binding '{}' has provider authentication outcome missing_descriptor because provider_auth entry '{auth_source_name}' is absent",
-                        provider_host.alias
-                    ),
-                    None,
-                )));
-            }
+            super::validate_config_provider_selections(resolved, &provider_host)?;
             Ok(json!({
                 "host": context.host,
                 "profile": context.profile,

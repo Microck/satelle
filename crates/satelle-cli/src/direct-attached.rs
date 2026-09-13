@@ -204,6 +204,7 @@ impl DirectTransport {
                     turn_id: logged_turn_id,
                     session_state_revision,
                     turn_state_revision,
+                    ..
                 } if logged_session_id == session.session_id()
                     && logged_turn_id == turn_id
                     && *session_state_revision <= session.session_state_revision()

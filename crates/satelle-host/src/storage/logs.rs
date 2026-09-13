@@ -41,7 +41,13 @@ impl SafeLogRecord {
         if event.subject_kind() != subject_kind {
             return Err(StorageError::new(StorageErrorKind::InvalidInput));
         }
-        if let LogSubject::Queue { queue_status } = &subject {
+        if subject
+            .desktop_binding()
+            .is_some_and(|binding| satelle_core::session::DesktopBindingRef::new(binding).is_err())
+        {
+            return Err(StorageError::new(StorageErrorKind::InvalidInput));
+        }
+        if let LogSubject::Queue { queue_status, .. } = &subject {
             queue_status
                 .validate()
                 .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
@@ -86,6 +92,7 @@ impl SafeLogRecord {
 pub(super) fn queue_log(
     event: LogEvent,
     severity: LogSeverity,
+    desktop_binding: satelle_core::session::DesktopBindingRef,
     status: satelle_core::queue::QueueStatus,
     recorded_at: OffsetDateTime,
 ) -> Result<SafeLogRecord, StorageError> {
@@ -95,6 +102,7 @@ pub(super) fn queue_log(
         severity,
         event,
         LogSubject::Queue {
+            desktop_binding: desktop_binding.to_string(),
             queue_status: status,
         },
     )
@@ -119,6 +127,7 @@ pub(super) fn canonical_log(
         severity,
         event,
         LogSubject::Turn {
+            desktop_binding: session.desktop_binding().to_string(),
             session_id: session.id().clone(),
             turn_id: turn_id.clone(),
             session_state_revision: session.session_state_revision(),

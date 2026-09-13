@@ -25,7 +25,20 @@ const STALE_STOP_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f06";
 
 #[tokio::test]
 async fn queued_turns_preserve_fifo_through_cancellation_and_maintenance_release() {
-    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let state = TestStateDir::new().expect("temporary state directory");
+    let queue_config = serde_json::from_value(serde_json::json!({"enabled": true}))
+        .expect("construct enabled queue config");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service")
+        .with_queue_config_for_tests(queue_config)
+        .expect("enable the Host queue");
+    let running = RunningServer::start_with_service(
+        ApiScopes::CONTROL,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        state,
+        service,
+    )
+    .await;
     let now = time::OffsetDateTime::now_utc();
     let plan = SetupRunPlan::new(
         "queue-http-maintenance",
@@ -37,22 +50,36 @@ async fn queued_turns_preserve_fifo_through_cancellation_and_maintenance_release
     .unwrap();
     let mut maintenance = running.service.begin_setup_run(&plan).unwrap();
 
-    let first: QueueStatusResponse = running
+    let first_response = running
         .mutation("/v1/sessions", "queue-http-first")
-        .json(&TurnRequest::new("first queued Turn").with_queue(true))
+        .json(
+            &TurnRequest::new("first queued Turn")
+                .with_queue(true)
+                .with_desktop_binding("local-demo-desktop-v1"),
+        )
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
+    let first_status = first_response.status();
+    let first_body = first_response.bytes().await.unwrap();
+    assert_eq!(
+        first_status,
+        StatusCode::ACCEPTED,
+        "{}",
+        String::from_utf8_lossy(&first_body)
+    );
+    let first: QueueStatusResponse = serde_json::from_slice(&first_body).unwrap();
     let first = first.into_status();
     assert_eq!(first.status, QueueRequestStatus::Queued);
     assert_eq!(first.position, Some(1));
 
     let second: QueueStatusResponse = running
         .mutation("/v1/sessions", "queue-http-second")
-        .json(&TurnRequest::new("second queued Turn").with_queue(true))
+        .json(
+            &TurnRequest::new("second queued Turn")
+                .with_queue(true)
+                .with_desktop_binding("local-demo-desktop-v1"),
+        )
         .send()
         .await
         .unwrap()
@@ -66,7 +93,7 @@ async fn queued_turns_preserve_fifo_through_cancellation_and_maintenance_release
     let first_path = format!("/v1/queue/{}", first.queue_request_id);
     let cancelled = running
         .protected_request(Method::DELETE, &first_path)
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .header("Idempotency-Key", "queue-http-cancel-first")
         .send()
         .await
@@ -135,8 +162,11 @@ async fn queued_turns_preserve_fifo_through_cancellation_and_maintenance_release
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn desktop_snapshot_requires_sensitive_scope_and_reports_native_permission_readiness() {
-    let request =
-        DesktopSnapshotCaptureRequest::new("local-demo", "local-demo-user", "local-demo-console");
+    let request = DesktopSnapshotCaptureRequest::new(
+        "local-demo",
+        "local-demo-desktop-v1",
+        "local-demo-console",
+    );
     let control_only = RunningServer::start(ApiScopes::CONTROL).await;
     let rejected = control_only
         .mutation(
@@ -711,7 +741,7 @@ async fn admission_action_is_an_exact_optional_singleton_and_absence_preserves_a
     assert_eq!(admitted.status(), StatusCode::ACCEPTED);
     let body = admitted.bytes().await.expect("read admission response");
     let json: Value = serde_json::from_slice(&body).expect("parse admission response");
-    assert_eq!(json["schema_version"], "satelle.session.v1");
+    assert_eq!(json["schema_version"], "satelle.session.v2");
     assert!(json.get("display_name").is_none());
     assert!(json.get("outcome").is_none());
     serde_json::from_slice::<SessionResponse>(&body).expect("decode legacy admission response");
@@ -732,7 +762,7 @@ async fn session_routes_complete_the_durable_reconnect_journey() {
     assert_eq!(create.status(), StatusCode::ACCEPTED);
     let create_bytes = create.bytes().await.expect("read create response");
     let create_json: Value = serde_json::from_slice(&create_bytes).expect("parse create JSON");
-    assert_eq!(create_json["schema_version"], "satelle.session.v1");
+    assert_eq!(create_json["schema_version"], "satelle.session.v2");
     assert!(create_json.get("session").is_none());
     assert!(create_json.get("session_id").is_some());
     assert_privacy_canaries_absent(
@@ -740,9 +770,9 @@ async fn session_routes_complete_the_durable_reconnect_journey() {
         &create_bytes,
         &[prompt_canary, secret],
     );
-    assert!(!String::from_utf8_lossy(&create_bytes).contains("local-demo"));
     let created: SessionResponse =
         serde_json::from_slice(&create_bytes).expect("decode create contract");
+    assert_eq!(created.session().desktop_binding(), "local-demo-desktop-v1");
     assert_eq!(created.host_identity(), running.host_identity);
     assert_eq!(created.session().turns().len(), 1);
     let session_id = created.session().session_id().clone();
@@ -1681,7 +1711,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -1704,7 +1734,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
         .mutation("/v1/sessions", CREATE_KEY)
         .header("Content-Type", "text/plain")
         .body(
-            r#"{"schema_version":"satelle.api.v11","model_from_project":false,"provider_from_project":false,"prompt":"private","execution_mode":"standard"}"#,
+            r#"{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"private","execution_mode":"standard"}"#,
         )
         .send()
         .await
@@ -1719,7 +1749,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
     let duplicate_prompt = running
         .mutation("/v1/sessions", "duplicate-json-field-key")
         .header("Content-Type", "application/json")
-        .body(r#"{"schema_version":"satelle.api.v11","model_from_project":false,"provider_from_project":false,"prompt":"first","prompt":"second","execution_mode":"standard"}"#)
+        .body(r#"{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"first","prompt":"second","execution_mode":"standard"}"#)
         .send()
         .await
         .expect("send duplicate JSON field");
@@ -1817,7 +1847,8 @@ async fn fixed_size_attachments_precede_turn_request_deserialization() {
     let response = running
         .mutation("/v1/sessions", "attachment-limit-fixed-size")
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v11",
+            "schema_version": "satelle.api.v12",
+            "desktop_binding": "local-demo-desktop-v1",
             "model_from_project": false,
             "provider_from_project": false,
             "prompt": "PRIVATE_ATTACHMENT_LIMIT_CANARY",
@@ -1842,7 +1873,7 @@ async fn fixed_size_attachments_precede_turn_request_deserialization() {
 async fn attachment_limit_preserves_decoder_error_precedence() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let oversized = format!(
-        r#"{{"schema_version":"satelle.api.v11","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
+        r#"{{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_OVERSIZED_ATTACHMENT_CANARY","execution_mode":"standard","attachments":[{{"name":"private.txt"}}],"padding":"{}"}}"#,
         "x".repeat(1_048_576)
     );
     let cases = [
@@ -1853,7 +1884,7 @@ async fn attachment_limit_preserves_decoder_error_precedence() {
         ),
         (
             "duplicate-json-key",
-            r#"{"schema_version":"satelle.api.v11","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
+            r#"{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_DUPLICATE_ATTACHMENT_CANARY","prompt":"duplicate","execution_mode":"standard","attachments":[{"name":"private.txt"}]}"#.to_string(),
             INVALID_JSON_ERROR,
         ),
         ("oversized-body", oversized, ATTACHMENT_LIMIT_ERROR),
@@ -1939,7 +1970,8 @@ async fn empty_attachments_are_allowed_but_other_shapes_remain_contract_errors()
     let empty_response = running
         .mutation("/v1/sessions", "attachment-operation-contract-empty-array")
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v11",
+            "schema_version": "satelle.api.v12",
+            "desktop_binding": "local-demo-desktop-v1",
             "model_from_project": false,
             "provider_from_project": false,
             "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
@@ -1962,7 +1994,8 @@ async fn empty_attachments_are_allowed_but_other_shapes_remain_contract_errors()
                 &format!("attachment-operation-contract-{name}"),
             )
             .json(&serde_json::json!({
-                "schema_version": "satelle.api.v11",
+                "schema_version": "satelle.api.v12",
+            "desktop_binding": "local-demo-desktop-v1",
                 "model_from_project": false,
                 "provider_from_project": false,
                 "prompt": "PRIVATE_ATTACHMENT_SHAPE_CANARY",
@@ -2007,7 +2040,8 @@ async fn create_turn_attachments_precede_deserialization_without_admission() {
             "attachment-limit-create-turn",
         )
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v11",
+            "schema_version": "satelle.api.v12",
+            "desktop_binding": "local-demo-desktop-v1",
             "model_from_project": false,
             "provider_from_project": false,
             "prompt": "PRIVATE_REJECTED_ATTACHMENT_TURN_CANARY",
@@ -2187,7 +2221,8 @@ async fn request_material_log_privacy(trace_capture: TraceCapture) {
             &rejected_request_id,
         )
         .json(&serde_json::json!({
-            "schema_version": "satelle.api.v11",
+            "schema_version": "satelle.api.v12",
+            "desktop_binding": "local-demo-desktop-v1",
             "model_from_project": false,
             "provider_from_project": false,
             "prompt": rejected_prompt,
@@ -2340,7 +2375,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "21")
+        request.header("Satelle-Protocol-Version", "22")
     } else {
         request
     }
@@ -2375,7 +2410,8 @@ async fn assert_attachment_limit_error(response: reqwest::Response, host_identit
 
 fn turn_request_with_controller_field(field: &str, prompt: &str) -> Value {
     let mut request = serde_json::json!({
-        "schema_version": "satelle.api.v11",
+        "schema_version": "satelle.api.v12",
+            "desktop_binding": "local-demo-desktop-v1",
         "model_from_project": false,
         "provider_from_project": false,
         "prompt": prompt,

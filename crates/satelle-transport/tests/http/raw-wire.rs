@@ -1,15 +1,15 @@
 use super::*;
 use satelle_core::session::{
-    ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
-    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, SessionActivity,
-    StopObservation, TimeoutPolicy, TurnState, TurnTransition,
+    ApprovalPolicy, DesktopTarget, EffectiveModelRef, ExecutionPolicy, ExperimentalFeatureChoices,
+    FeatureChoice, ProviderBindingRef, SandboxPolicy, SessionActivity, StopObservation,
+    TimeoutPolicy, TurnState, TurnTransition,
 };
 use satelle_host::{
     AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
     ProviderComputerUseIntent, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
 };
 use satelle_test_contract::assert_privacy_canaries_absent;
-use satelle_transport::{SessionResponse, TurnRequest};
+use satelle_transport::{ProviderBindingDeletionRequest, SessionResponse, TurnRequest};
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +21,7 @@ async fn provider_secret_raw_wire_rejects_identity_content_type_and_duplicate_me
     let secret_canary = "PRIVATE_PROVIDER_SECRET_RAW_WIRE_CANARY";
     let metadata =
         serde_json::to_string(&satelle_transport::ProviderSecretProvisioningMetadata::new(
+            "local-demo-desktop-v1",
             satelle_core::ProviderBindingAuthorization::new(
                 "vision", "open_ai", "gpt-5.6", "openai",
             ),
@@ -54,7 +55,7 @@ async fn provider_secret_raw_wire_rejects_identity_content_type_and_duplicate_me
         ),
     ] {
         let mut request = format!(
-        "POST /v1/setup/provider-secret HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {expected_host}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 21\r\nIdempotency-Key: provider-secret-raw-wire\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{metadata_headers}Connection: close\r\n\r\n",
+        "POST /v1/setup/provider-secret HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {expected_host}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: provider-secret-raw-wire\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{metadata_headers}Connection: close\r\n\r\n",
             RequestId::new(),
             secret_canary.len(),
         )
@@ -71,12 +72,12 @@ async fn chunked_oversize_body_returns_typed_413_without_admission() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let authorization = bearer(&running.token);
     let body = format!(
-        r#"{{"schema_version":"satelle.api.v11","model_from_project":false,"provider_from_project":false,"prompt":"{}"}}"#,
+        r#"{{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"{}"}}"#,
         "x".repeat(1_048_576)
     );
     let payload_bytes = body.len();
     let head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 21\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
         running.host_identity,
         RequestId::new(),
     );
@@ -101,7 +102,7 @@ async fn chunked_oversize_body_returns_typed_413_without_admission() {
 async fn unauthenticated_attachment_sized_body_is_rejected_before_body_admission() {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let body = format!(
-        r#"{{"schema_version":"satelle.api.v11","model_from_project":false,"provider_from_project":false,"prompt":"{}"}}"#,
+        r#"{{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"{}"}}"#,
         "x".repeat(1_048_576)
     );
     let head = format!(
@@ -154,13 +155,13 @@ async fn chunked_attachment_limit_and_log_privacy(trace_capture: TraceCapture) {
     let attachment_name = "PRIVATE_CHUNKED_ATTACHMENT_NAME_CANARY";
     let attachment_bytes = "PRIVATE_CHUNKED_ATTACHMENT_BYTES_CANARY";
     let body = format!(
-        r#"{{"schema_version":"satelle.api.v11","model_from_project":false,"provider_from_project":false,"prompt":7,"execution_mode":"standard","body_canary":"{body_canary}","attachments":[{{"name":"{attachment_name}","content":"{attachment_bytes}"}}]}}"#
+        r#"{{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":7,"execution_mode":"standard","body_canary":"{body_canary}","attachments":[{{"name":"{attachment_name}","content":"{attachment_bytes}"}}]}}"#
     );
     let body = body.as_bytes();
     let split = body.len() / 2;
     let request_id = RequestId::new();
     let request_head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 21\r\nIdempotency-Key: attachment-limit-chunked\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{split:x}\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: attachment-limit-chunked\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{split:x}\r\n",
         running.host_identity, request_id,
     );
     let mut request = request_head.into_bytes();
@@ -235,9 +236,9 @@ async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
     assert_raw_api_error(&response, 400, "invalid-request");
 
     let body =
-        br#"{"schema_version":"satelle.api.v11","model_from_project":false,"provider_from_project":false,"prompt":"safe","execution_mode":"standard"}"#;
+        br#"{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"safe","execution_mode":"standard"}"#;
     let mutation_request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 21\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
         bearer(&running.token),
         running.host_identity,
         RequestId::new(),
@@ -257,11 +258,17 @@ async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
     );
 
     let admin = RunningServer::start(ApiScopes::ADMIN).await;
+    let deletion_body = serde_json::to_string(&ProviderBindingDeletionRequest::new(
+        "local-demo-desktop-v1",
+    ))
+    .expect("encode provider binding deletion request");
     let deletion_request = format!(
-        "DELETE /v1/setup/provider-bindings/openai/review HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 21\r\nIdempotency-Key: provider-delete-trailer\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        "DELETE /v1/setup/provider-bindings/openai/review HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: provider-delete-trailer\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
         bearer(&admin.token),
         admin.host_identity,
         RequestId::new(),
+        deletion_body.len(),
+        deletion_body,
         admin.token.expose().as_str(),
     );
     let response = raw_request(admin.server.local_addr(), deletion_request.as_bytes()).await;
@@ -272,8 +279,11 @@ async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
             reqwest::Method::DELETE,
             "/v1/setup/provider-bindings/openai/review",
         )
-        .header("Satelle-Protocol-Version", "21")
+        .header("Satelle-Protocol-Version", "22")
         .header("Idempotency-Key", "provider-delete-trailer")
+        .json(&ProviderBindingDeletionRequest::new(
+            "local-demo-desktop-v1",
+        ))
         .send()
         .await
         .expect("reuse the rejected trailer idempotency key");
@@ -302,7 +312,7 @@ async fn stalled_upload_cannot_hold_daemon_shutdown_open_forever() {
         .await
         .expect("open stalled request connection");
     let partial = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 21\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
         bearer(&token),
         initialized.host_identity(),
         RequestId::new(),
@@ -359,10 +369,11 @@ async fn dropped_admission_response_is_recovered_without_stopping_or_duplicate_t
         token,
         host_identity,
     };
-    let request = TurnRequest::new("PRIVATE_DROPPED_RESPONSE_CANARY");
+    let request = TurnRequest::new("PRIVATE_DROPPED_RESPONSE_CANARY")
+        .with_desktop_binding("local-demo-desktop-v1");
     let body = serde_json::to_vec(&request).expect("encode admission request");
     let head = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 21\r\nIdempotency-Key: {IDEMPOTENCY_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: {IDEMPOTENCY_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         bearer(&running.token),
         running.host_identity,
         RequestId::new(),
@@ -453,14 +464,24 @@ async fn dropped_admission_response_is_recovered_without_stopping_or_duplicate_t
         "disconnecting a pending admission response must not attempt a stop"
     );
 
-    let recovered: SessionResponse = running
+    let recovered_response = running
         .request(&format!("/v1/sessions/{session_id}"))
         .send()
         .await
-        .expect("read Session after reconnect")
-        .json()
+        .expect("read Session after reconnect");
+    let recovered_status = recovered_response.status();
+    let recovered_body = recovered_response
+        .bytes()
         .await
-        .expect("decode reconnected Session");
+        .expect("read reconnected Session body");
+    assert_eq!(
+        recovered_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&recovered_body)
+    );
+    let recovered: SessionResponse =
+        serde_json::from_slice(&recovered_body).expect("decode reconnected Session");
     assert_eq!(recovered.session(), &terminal);
     assert_eq!(
         running
@@ -542,11 +563,13 @@ impl ComputerUseAdapter for ControlledAdmissionAdapter {
     fn preflight(
         &self,
         _host: &str,
-        _provider_intent: &ProviderComputerUseIntent,
+        provider_intent: &ProviderComputerUseIntent,
     ) -> Result<AdapterReadiness, satelle_core::SatelleError> {
         self.admission.block_preflight();
-        let desktop_binding =
-            DesktopBindingRef::new("raw-wire-controlled-desktop").expect("valid desktop binding");
+        let desktop_binding = provider_intent
+            .desktop_binding()
+            .cloned()
+            .expect("broker admission always selects a Desktop Binding before preflight");
         let execution_policy = ExecutionPolicy::new(
             EffectiveModelRef::new("raw-wire-controlled-model").expect("valid model binding"),
             ProviderBindingRef::new("raw-wire-controlled-provider")
@@ -661,7 +684,7 @@ enum DuplicateHeader {
 async fn duplicate_header_case(header: DuplicateHeader, status: u16, code: &str) {
     let running = RunningServer::start(ApiScopes::CONTROL).await;
     let authorization = bearer(&running.token);
-    let body = br#"{"schema_version":"satelle.api.v11","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_RAW_HEADER_CANARY","execution_mode":"standard"}"#;
+    let body = br#"{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_RAW_HEADER_CANARY","execution_mode":"standard"}"#;
     let duplicated = match header {
         DuplicateHeader::Authorization => format!(
             "Authorization: {authorization}\r\nAuthorization: {authorization}\r\nIdempotency-Key: duplicate-auth\r\nContent-Type: application/json\r\n"
@@ -674,7 +697,7 @@ async fn duplicate_header_case(header: DuplicateHeader, status: u16, code: &str)
         ),
     };
     let mut request = format!(
-        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 21\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
         running.host_identity,
         RequestId::new(),
         body.len(),

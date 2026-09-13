@@ -1246,7 +1246,12 @@ fn provider_binding_deletion_shares_the_host_global_slot() {
     );
 
     let error = service
-        .delete_provider_binding_idempotent("review", "openai", &deletion_authority)
+        .delete_provider_binding_idempotent(
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            &deletion_authority,
+        )
         .expect_err("binding deletion must not race an active admission");
     assert_capacity_exceeded(&error);
 
@@ -1262,7 +1267,12 @@ fn provider_binding_deletion_shares_the_host_global_slot() {
 
     assert!(
         !service
-            .delete_provider_binding_idempotent("review", "openai", &deletion_authority)
+            .delete_provider_binding_idempotent(
+                "local-demo-desktop-v1",
+                "review",
+                "openai",
+                &deletion_authority,
+            )
             .expect("the deletion retry must run after admission releases capacity"),
         "the absent binding must report that no row was deleted"
     );

@@ -11,16 +11,17 @@ use crate::contract::{
     NativeReadinessInvalidationResponse, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
     PROVIDER_SECRET_UPLOAD_CONTENT_TYPE, PROVIDER_SECRET_UPLOAD_INFO,
     ProviderBindingAuthorizationRequest, ProviderBindingAuthorizationResponse,
-    ProviderBindingDeletionResponse, ProviderDescriptorValidationRequest,
-    ProviderDescriptorValidationResponse, ProviderSecretProvisioningMetadata,
-    ProviderSecretProvisioningPreviewResponse, ProviderSecretProvisioningResponse,
-    ProviderSecretUploadEnvelope, QueueCancelResponse, QueueStatusResponse,
-    RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse, RawProtocolDownloadResponse,
-    RawSubprocessBeginRequest, RawSubprocessBeginResponse, RawSubprocessPrepareRequest,
-    RawSubprocessPrepareResponse, RecordingManifestResponse, RecordingPreflightRequest,
-    RecordingPreflightResponse, RequestId, SessionResponse, SetupRepairPlanRequest,
-    SetupRepairPlanResponse, SetupVerificationRequest, SetupVerificationResponse, StopRequest,
-    StopResponse, TaskArtifactsResponse, TurnRequest, provider_secret_upload_aad,
+    ProviderBindingDeletionRequest, ProviderBindingDeletionResponse,
+    ProviderDescriptorValidationRequest, ProviderDescriptorValidationResponse,
+    ProviderSecretProvisioningMetadata, ProviderSecretProvisioningPreviewResponse,
+    ProviderSecretProvisioningResponse, ProviderSecretUploadEnvelope, QueueCancelResponse,
+    QueueStatusResponse, RawProtocolAcknowledgeRequest, RawProtocolAcknowledgeResponse,
+    RawProtocolDownloadResponse, RawSubprocessBeginRequest, RawSubprocessBeginResponse,
+    RawSubprocessPrepareRequest, RawSubprocessPrepareResponse, RecordingManifestResponse,
+    RecordingPreflightRequest, RecordingPreflightResponse, RequestId, SessionResponse,
+    SetupRepairPlanRequest, SetupRepairPlanResponse, SetupVerificationRequest,
+    SetupVerificationResponse, StopRequest, StopResponse, TaskArtifactsResponse, TurnRequest,
+    provider_secret_upload_aad,
 };
 use crate::transport_tls::{
     ClientCertificate, ReqwestTrustError, TlsFailureKind, classify_tls_error,
@@ -465,12 +466,13 @@ impl DaemonClient {
         &self,
         provider_alias: &str,
         model_alias: &str,
+        deletion: &ProviderBindingDeletionRequest,
         idempotency_key: &str,
     ) -> Result<ProviderBindingDeletionResponse, DaemonClientError> {
         let path = provider_binding_path(provider_alias, model_alias)?;
         let (request, request_id) =
             self.mutation_request_with_method(Method::DELETE, &path, idempotency_key)?;
-        self.send_authenticated(request, request_id, StatusCode::OK)
+        self.send_authenticated(request.json(deletion), request_id, StatusCode::OK)
     }
 
     pub fn validate_provider_descriptor(
@@ -1903,7 +1905,7 @@ mod tests {
             "request_id": request_id.as_str(),
             "host_identity": "host-expected",
             "entries": [{
-                "schema_version": "satelle.logs.entry.v1",
+                "schema_version": "satelle.logs.entry.v2",
                 "cursor": "slc1_0000000000000001",
                 "timestamp": "1970-01-01T00:00:00Z",
                 "host_identity": "host-other",
@@ -1933,7 +1935,7 @@ mod tests {
         let query =
             LogPageQuery::forward(Some(requested_cursor), 50).expect("construct forward Log query");
         let stale_entry = serde_json::json!({
-                "schema_version": "satelle.logs.entry.v1",
+                "schema_version": "satelle.logs.entry.v2",
                 "cursor": "slc1_0000000000000001",
                 "timestamp": "1970-01-01T00:00:00Z",
                 "host_identity": "host-expected",
@@ -1974,7 +1976,7 @@ mod tests {
         let query =
             LogPageQuery::forward(Some(requested_cursor), 50).expect("construct forward Log query");
         let entry = serde_json::json!({
-            "schema_version": "satelle.logs.entry.v1",
+            "schema_version": "satelle.logs.entry.v2",
             "cursor": "slc1_0000000000000003",
             "timestamp": "1970-01-01T00:00:00Z",
             "host_identity": "host-expected",
@@ -2020,7 +2022,7 @@ mod tests {
             "request_id": request_id.as_str(),
             "host_identity": "host-expected",
             "entries": [{
-                "schema_version": "satelle.logs.entry.v1",
+                "schema_version": "satelle.logs.entry.v2",
                 "cursor": "slc1_0000000000000001",
                 "timestamp": "1970-01-01T00:00:00Z",
                 "host_identity": "host-expected",
@@ -2029,6 +2031,7 @@ mod tests {
                 "event": "turn_state_committed",
                 "subject": {
                     "kind": "turn",
+                    "desktop_binding": "local-demo-desktop-v1",
                     "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e12",
                     "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
                     "session_state_revision": 1,
@@ -2061,7 +2064,7 @@ mod tests {
             "request_id": request_id.as_str(),
             "host_identity": "host-expected",
             "entries": [{
-                "schema_version": "satelle.logs.entry.v1",
+                "schema_version": "satelle.logs.entry.v2",
                 "cursor": "slc1_0000000000000003",
                 "timestamp": "1970-01-01T00:00:00Z",
                 "host_identity": "host-expected",
@@ -2070,6 +2073,7 @@ mod tests {
                 "event": "turn_state_committed",
                 "subject": {
                     "kind": "turn",
+                    "desktop_binding": "local-demo-desktop-v1",
                     "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
                     "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
                     "session_state_revision": 1,
@@ -2098,7 +2102,7 @@ mod tests {
             .with_minimum_severity(satelle_host::LogSeverity::Warning)
             .with_since(time::OffsetDateTime::UNIX_EPOCH);
         let valid_entry = serde_json::json!({
-            "schema_version": "satelle.logs.entry.v1",
+            "schema_version": "satelle.logs.entry.v2",
             "cursor": "slc1_0000000000000001",
             "timestamp": "1970-01-01T00:00:01Z",
             "host_identity": "host-expected",
@@ -2107,6 +2111,7 @@ mod tests {
             "event": "turn_state_committed",
             "subject": {
                 "kind": "turn",
+                "desktop_binding": "local-demo-desktop-v1",
                 "session_id": "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11",
                 "turn_id": "rt_01890a5d-ac96-7b7c-8f89-37c3d0a66e21",
                 "session_state_revision": 1,
@@ -2152,7 +2157,7 @@ mod tests {
         let query = LogPageQuery::tail(1).expect("construct bounded tail Log query");
         let entry = |cursor| {
             serde_json::json!({
-                "schema_version": "satelle.logs.entry.v1",
+                "schema_version": "satelle.logs.entry.v2",
                 "cursor": cursor,
                 "timestamp": "1970-01-01T00:00:00Z",
                 "host_identity": "host-expected",

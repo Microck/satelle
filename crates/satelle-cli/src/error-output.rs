@@ -288,6 +288,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The requested action was not authorized.",
             default_recovery: "use credentials with the required scope and retry the command",
         },
+        ErrorCode::DesktopBindingUnauthorized => ErrorContract {
+            category: ErrorCategory::Authorization,
+            retryable: false,
+            outcome: "The selected Desktop Binding was not authorized.",
+            default_recovery: "use a credential granted access to the selected Desktop Binding",
+        },
         ErrorCode::IdempotencyKeyConflict => ErrorContract {
             category: ErrorCategory::Conflict,
             retryable: false,
@@ -580,6 +586,8 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::SecretFileTildeFormUnsupported
         | ErrorCode::SecretFileHomeUnavailable
         | ErrorCode::DesktopSessionSelectorConflict
+        | ErrorCode::DesktopBindingAmbiguous
+        | ErrorCode::DesktopBindingNotFound
         | ErrorCode::PathOverrideNotAbsolute
         | ErrorCode::DaemonPathOverrideNotAbsolute
         | ErrorCode::SshBootstrapUnavailable => ErrorContract {
@@ -587,6 +595,12 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             retryable: false,
             outcome: "The Satelle configuration was not accepted.",
             default_recovery: "run satelle config check, correct the configuration, and retry",
+        },
+        ErrorCode::DesktopBindingSecureHandoffUnsupported => ErrorContract {
+            category: ErrorCategory::Readiness,
+            retryable: false,
+            outcome: "The Host cannot securely enter the selected user's desktop session.",
+            default_recovery: "run a Host Daemon as that OS user or configure a supported secure handoff",
         },
         ErrorCode::CompletionInstallFailed | ErrorCode::CompletionProfileUpdateFailed => {
             ErrorContract {

@@ -445,6 +445,7 @@ pub(crate) trait TransportClient: Send {
     ) -> Result<u64, SatelleError>;
     fn authorize_provider_binding(
         &self,
+        desktop_binding: &str,
         authorization: &satelle_core::ProviderBindingAuthorization,
     ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError>;
     fn preview_provider_secret_provisioning(
@@ -461,12 +462,10 @@ pub(crate) trait TransportClient: Send {
     ) -> Result<satelle_transport::ProviderSecretProvisioningResponse, SatelleError>;
     fn validate_provider_descriptor(
         &self,
+        desktop_binding: &str,
         model_alias: &str,
         provider_alias: &str,
-        model_alias_from_project: bool,
-        provider_alias_from_project: bool,
-        mode: satelle_core::ProviderAuthValidationMode,
-        experimental_provider_computer_use: bool,
+        options: satelle_host::ProviderDescriptorValidationOptions,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError>;
     fn host_status(&self) -> Result<HostStatus, SatelleError>;
     fn telemetry_status(&self) -> Result<satelle_core::telemetry::TelemetryStatus, SatelleError>;
@@ -1074,23 +1073,17 @@ impl TransportClient for LocalTransport {
 
     fn validate_provider_descriptor(
         &self,
+        desktop_binding: &str,
         model_alias: &str,
         provider_alias: &str,
-        model_alias_from_project: bool,
-        provider_alias_from_project: bool,
-        mode: satelle_core::ProviderAuthValidationMode,
-        experimental_provider_computer_use: bool,
+        options: satelle_host::ProviderDescriptorValidationOptions,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
         let validation = self.service.validate_provider_descriptor(
             &self.alias,
+            desktop_binding,
             model_alias,
             provider_alias,
-            satelle_host::ProviderDescriptorValidationOptions::new(
-                mode,
-                model_alias_from_project,
-                provider_alias_from_project,
-                experimental_provider_computer_use,
-            ),
+            options,
         )?;
         Ok(ProviderDescriptorValidationReport {
             resolved_binding: satelle_core::PublicResolvedProviderBinding::from(
@@ -1102,11 +1095,13 @@ impl TransportClient for LocalTransport {
 
     fn authorize_provider_binding(
         &self,
+        desktop_binding: &str,
         authorization: &satelle_core::ProviderBindingAuthorization,
     ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError> {
         self.service
             .authorize_provider_binding(
                 &self.alias,
+                desktop_binding,
                 authorization.requested_model_alias(),
                 authorization.requested_provider_alias(),
                 authorization.clone(),
@@ -7752,18 +7747,17 @@ impl TransportClient for SshSetupTransport {
 
     fn validate_provider_descriptor(
         &self,
+        _desktop_binding: &str,
         _model_alias: &str,
         _provider_alias: &str,
-        _model_alias_from_project: bool,
-        _provider_alias_from_project: bool,
-        _mode: satelle_core::ProviderAuthValidationMode,
-        _experimental_provider_computer_use: bool,
+        _options: satelle_host::ProviderDescriptorValidationOptions,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
         Err(self.unsupported("provider descriptor validation"))
     }
 
     fn authorize_provider_binding(
         &self,
+        _desktop_binding: &str,
         _authorization: &satelle_core::ProviderBindingAuthorization,
     ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError> {
         Err(self.unsupported("provider binding authorization"))
@@ -8070,12 +8064,10 @@ impl TransportClient for DirectTransport {
 
     fn validate_provider_descriptor(
         &self,
+        desktop_binding: &str,
         model_alias: &str,
         provider_alias: &str,
-        model_alias_from_project: bool,
-        provider_alias_from_project: bool,
-        mode: satelle_core::ProviderAuthValidationMode,
-        experimental_provider_computer_use: bool,
+        options: satelle_host::ProviderDescriptorValidationOptions,
     ) -> Result<ProviderDescriptorValidationReport, SatelleError> {
         let response = self
             .client
@@ -8083,11 +8075,14 @@ impl TransportClient for DirectTransport {
                 provider_alias,
                 model_alias,
                 &satelle_transport::ProviderDescriptorValidationRequest::new(
-                    mode,
-                    model_alias_from_project,
-                    provider_alias_from_project,
+                    desktop_binding,
+                    options.mode(),
+                    options.model_from_project(),
+                    options.provider_from_project(),
                 )
-                .with_experimental_provider_computer_use(experimental_provider_computer_use),
+                .with_experimental_provider_computer_use(
+                    options.experimental_provider_computer_use(),
+                ),
                 &format!("provider-validation-{}", Uuid::now_v7()),
             )
             .map_err(|error| direct_transport_error(&self.alias, error))?;
@@ -8099,13 +8094,17 @@ impl TransportClient for DirectTransport {
 
     fn authorize_provider_binding(
         &self,
+        desktop_binding: &str,
         authorization: &satelle_core::ProviderBindingAuthorization,
     ) -> Result<satelle_core::PublicResolvedProviderBinding, SatelleError> {
         self.client
             .authorize_provider_binding(
                 authorization.requested_provider_alias(),
                 authorization.requested_model_alias(),
-                &satelle_transport::ProviderBindingAuthorizationRequest::new(authorization.clone()),
+                &satelle_transport::ProviderBindingAuthorizationRequest::new(
+                    desktop_binding,
+                    authorization.clone(),
+                ),
                 &format!("provider-authorization-{}", Uuid::now_v7()),
             )
             .map(|response| response.binding().clone())
@@ -9421,6 +9420,10 @@ fn map_api_error(host: &str, error: &ApiError) -> SatelleError {
     if matches!(
         error.code(),
         ApiErrorCode::DesktopBindingRequired
+            | ApiErrorCode::DesktopBindingAmbiguous
+            | ApiErrorCode::DesktopBindingNotFound
+            | ApiErrorCode::DesktopBindingUnauthorized
+            | ApiErrorCode::DesktopBindingSecureHandoffUnsupported
             | ApiErrorCode::DesktopSessionUnavailable
             | ApiErrorCode::DesktopSessionAmbiguous
             | ApiErrorCode::DesktopSessionPreferenceUnmatched
@@ -9590,6 +9593,51 @@ fn map_desktop_selection_api_error(host: &str, error: &ApiError) -> SatelleError
     };
 
     match error.code() {
+        ApiErrorCode::DesktopBindingAmbiguous => {
+            if details.len() != 1 {
+                return invalid();
+            }
+            let Some(bindings) = details
+                .get("desktop_bindings")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return invalid();
+            };
+            bindings
+                .iter()
+                .map(|binding| binding.as_str().filter(|value| !value.is_empty()))
+                .collect::<Option<Vec<_>>>()
+                .map(|bindings| {
+                    SatelleError::desktop_binding_ambiguous(
+                        bindings.into_iter().map(str::to_string),
+                    )
+                })
+                .unwrap_or_else(invalid)
+        }
+        ApiErrorCode::DesktopBindingNotFound => exact_string("desktop_binding", 1)
+            .map(SatelleError::desktop_binding_not_found)
+            .unwrap_or_else(invalid),
+        ApiErrorCode::DesktopBindingUnauthorized => exact_string("desktop_binding", 1)
+            .map(SatelleError::desktop_binding_unauthorized)
+            .unwrap_or_else(invalid),
+        ApiErrorCode::DesktopBindingSecureHandoffUnsupported => {
+            if details.len() != 2 {
+                return invalid();
+            }
+            match (
+                details
+                    .get("desktop_binding")
+                    .and_then(serde_json::Value::as_str),
+                details
+                    .get("desktop_user")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                (Some(binding), Some(user)) if !binding.is_empty() && !user.is_empty() => {
+                    SatelleError::desktop_binding_secure_handoff_unsupported(binding, user)
+                }
+                _ => invalid(),
+            }
+        }
         ApiErrorCode::DesktopBindingRequired => {
             if details.len() != 1 {
                 return invalid();
@@ -9801,6 +9849,10 @@ fn api_error_is_definitively_not_admitted(code: ApiErrorCode) -> bool {
             | ApiErrorCode::YoloNotSupported
             | ApiErrorCode::YoloBlockedByNativeApproval
             | ApiErrorCode::DesktopBindingRequired
+            | ApiErrorCode::DesktopBindingAmbiguous
+            | ApiErrorCode::DesktopBindingNotFound
+            | ApiErrorCode::DesktopBindingUnauthorized
+            | ApiErrorCode::DesktopBindingSecureHandoffUnsupported
             | ApiErrorCode::DesktopSessionUnavailable
             | ApiErrorCode::DesktopSessionAmbiguous
             | ApiErrorCode::DesktopSessionPreferenceUnmatched
@@ -10047,24 +10099,33 @@ pub(super) fn local_host_service(
     host_config: &satelle_core::HostConfig,
 ) -> Result<HostService, CliFailure> {
     #[cfg(feature = "test-support")]
-    match selected_test_support_adapter()?.as_deref() {
-        Some("fake") => {
-            return HostService::local_demo_for_tests().map_err(failure);
+    if let Some(adapter) = selected_test_support_adapter()? {
+        let mut test_config = host_config.clone();
+        if test_config.desktop_bindings.is_empty() {
+            test_config.desktop_bindings.insert(
+                "local-demo-desktop-v1".to_string(),
+                satelle_core::DesktopBindingConfig {
+                    desktop_user: "local-demo-user".to_string(),
+                    desktop_session_preference: None,
+                    desktop_session_native_selector: None,
+                    provider_auth: Default::default(),
+                    provider_bindings: Default::default(),
+                },
+            );
         }
-        Some("pending") => {
-            return HostService::pending_local_demo_for_tests().map_err(failure);
-        }
-        Some("failing") => {
-            return HostService::failing_local_demo_for_tests().map_err(failure);
-        }
-        Some("readiness-failing") => {
-            return HostService::readiness_failing_local_demo_for_tests().map_err(failure);
-        }
-        Some("resolved-secret-canary") => {
-            return HostService::resolved_secret_canary_local_demo_for_tests().map_err(failure);
-        }
-        None => {}
-        Some(_) => unreachable!("test-support adapter selection is closed"),
+        return match adapter.as_str() {
+            "fake" => HostService::local_demo_for_tests(&test_config).map_err(failure),
+            "pending" => HostService::pending_local_demo_for_tests(&test_config).map_err(failure),
+            "failing" => HostService::failing_local_demo_for_tests(&test_config).map_err(failure),
+            "readiness-failing" => {
+                HostService::readiness_failing_local_demo_for_tests(&test_config).map_err(failure)
+            }
+            "resolved-secret-canary" => {
+                HostService::resolved_secret_canary_local_demo_for_tests(&test_config)
+                    .map_err(failure)
+            }
+            _ => unreachable!("test-support adapter selection is closed"),
+        };
     }
 
     Ok(HostService::production_for_host(host_config))
@@ -10298,8 +10359,9 @@ fn launch_local_daemon_process(
     // resolve them.
     #[cfg(windows)]
     let provider_environment = host_config
-        .provider_auth
+        .desktop_bindings
         .values()
+        .flat_map(|binding| binding.provider_auth.values())
         .filter_map(|source| match source {
             satelle_core::ProviderSecretSource::Environment { variable } => Some(variable.clone()),
             _ => None,
@@ -10419,6 +10481,7 @@ fn local_daemon_transport_with_config_policy(
     let expected_config_identity = require_config_match.then_some(&config_identity);
     let endpoint_path = state_root.join(LOCAL_DAEMON_ENDPOINT_FILE);
     let mut requested_relaunch = false;
+    let mut stale_endpoint = None;
     while let Some(endpoint) = optional_local_daemon_endpoint(&endpoint_path)? {
         let raw_token = local_daemon_token(&state_root)?;
         if let Some(transport) = probe_local_daemon(host, &host_config, &endpoint, &raw_token)? {
@@ -10440,7 +10503,10 @@ fn local_daemon_transport_with_config_policy(
             requested_relaunch = true;
             continue;
         }
-        remove_stale_local_daemon_endpoint(&endpoint_path, &endpoint)?;
+        // A failed probe can race the daemon's listener startup or shutdown.
+        // Keep its endpoint visible while the store is still held so the
+        // retry loop can adopt that same daemon if it becomes reachable.
+        stale_endpoint = Some(endpoint);
         break;
     }
 
@@ -10471,6 +10537,9 @@ fn local_daemon_transport_with_config_policy(
             Err(error) => return Err(error),
         }
     };
+    if let Some(stale_endpoint) = stale_endpoint.as_ref() {
+        remove_stale_local_daemon_endpoint(&endpoint_path, stale_endpoint)?;
+    }
     let launch = LocalDaemonLaunchConfig::new(
         host_config.clone(),
         api_rate_limits,

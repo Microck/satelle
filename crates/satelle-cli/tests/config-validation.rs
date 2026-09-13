@@ -71,7 +71,9 @@ default-host = "local"
 [hosts.local]
 transport = "local"
 adapter = "fake"
-[hosts.local.provider_auth.unused]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_auth.unused]
 kind = "environment"
 variable = "REFERENCE_SECRET_CANARY"
 "#;
@@ -352,7 +354,9 @@ default_host = "local"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings."invalid provider".model]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings."invalid provider".model]
 model = "provider-model"
 model_provider = "custom"
 "#,
@@ -367,11 +371,9 @@ model_provider = "custom"
         .clone();
     let invalid_provider = parse_json(&invalid_provider.stderr);
     assert_eq!(invalid_provider["code"], "configuration-error");
-    assert!(
-        invalid_provider["message"].as_str().is_some_and(
-            |message| message.contains("hosts.local.provider_bindings.invalid provider")
-        )
-    );
+    assert!(invalid_provider["message"].as_str().is_some_and(|message| {
+        message.contains("hosts.local.desktop_bindings.operator.provider_bindings.invalid provider")
+    }));
 
     fixture.write_user_config(
         r#"
@@ -381,7 +383,9 @@ default_host = "local"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.custom."invalid model"]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.custom."invalid model"]
 model = "provider-model"
 model_provider = "custom"
 "#,
@@ -396,7 +400,9 @@ model_provider = "custom"
     let invalid_model = parse_json(&invalid_model.stderr);
     assert_eq!(invalid_model["code"], "configuration-error");
     assert!(invalid_model["message"].as_str().is_some_and(|message| {
-        message.contains("hosts.local.provider_bindings.custom.invalid model")
+        message.contains(
+            "hosts.local.desktop_bindings.operator.provider_bindings.custom.invalid model",
+        )
     }));
 
     for config in [
@@ -407,7 +413,9 @@ default_host = "local"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.".".model]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.".".model]
 model = "provider-model"
 model_provider = "custom"
 "#,
@@ -418,7 +426,9 @@ default_host = "local"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.custom.".."]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.custom.".."]
 model = "provider-model"
 model_provider = "custom"
 "#,
@@ -895,20 +905,22 @@ default_host = "local-demo"
 transport = "local"
 adapter = "fake"
 
-[hosts.local-demo.provider_auth.file]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_auth.file]
 kind = "file"
 path = '{}'
 
-[hosts.local-demo.provider_auth.environment]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.environment]
 kind = "environment"
 variable = "SATELLE_TEST_SECRET_CANARY"
 
-[hosts.local-demo.provider_auth.credential]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.credential]
 kind = "credential-store"
 service = "satelle-test"
 account = "missing"
 
-[hosts.local-demo.provider_auth.host]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.host]
 kind = "host-store"
 name = "missing"
 "#,
@@ -954,7 +966,9 @@ name = "missing"
 transport = "local"
 adapter = "fake"
 
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "command"
 argv = [{}, "--exact", "secret_source_command_canary_child", "--nocapture"]
 "#,
@@ -972,7 +986,7 @@ argv = [{}, "--exact", "secret_source_command_canary_child", "--nocapture"]
     assert_eq!(rejected["code"], "unsupported-secret-source-kind");
     assert_eq!(
         rejected["details"]["path"],
-        "hosts.local-demo.provider_auth.openai.kind"
+        "hosts.local-demo.desktop_bindings.operator.provider_auth.openai.kind"
     );
     assert!(
         !command_canary.exists(),
@@ -1025,7 +1039,9 @@ fn credential_helpers_are_validated_and_redacted_without_execution() {
 transport = "local"
 adapter = "fake"
 
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "executable-helper"
 argv = [{executable}, "--exact", "secret_source_command_canary_child", "--nocapture"]
 environment = {{ PRIVATE_HELPER_ACCOUNT = "private-account" }}
@@ -1053,7 +1069,8 @@ environment = {{ PRIVATE_HELPER_ACCOUNT = "private-account" }}
             .get_output()
             .clone();
         let report = parse_json(&output.stdout);
-        let source = &report["effective"]["hosts"]["local-demo"]["provider_auth"]["openai"];
+        let source = &report["effective"]["hosts"]["local-demo"]["desktop_bindings"]["operator"]["provider_auth"]
+            ["openai"];
         assert_eq!(source["kind"], "executable-helper");
         assert_eq!(source["timeout"], "10s");
         assert_eq!(source["redacted"], true);
@@ -1093,7 +1110,7 @@ fn credential_helper_invalid_argv_timeout_and_placement_are_typed_errors() {
             "configuration-error",
         ),
     ] {
-        fixture.write_user_config(&format!("[hosts.local-demo]\ntransport = 'local'\nadapter = 'fake'\n[hosts.local-demo.provider_auth.openai]\nkind = 'executable-helper'\n{descriptor}\n"));
+        fixture.write_user_config(&format!("[hosts.local-demo]\ntransport = 'local'\nadapter = 'fake'\n[hosts.local-demo.desktop_bindings.operator]\ndesktop_user = 'local-demo-user'\n[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]\nkind = 'executable-helper'\n{descriptor}\n"));
         let output = fixture
             .command()
             .args(["config", "check", "--json"])
@@ -1159,7 +1176,9 @@ transport = "local"
 adapter = "fake"
 allow_project_selection = true
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 allow_project_selection = true
@@ -1216,7 +1235,9 @@ transport = "local"
 adapter = "fake"
 allow_project_selection = true
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 "#,
@@ -1251,14 +1272,16 @@ transport = "local"
 adapter = "fake"
 allow_project_selection = true
 
-[hosts.local.provider_bindings.anthropic.vision]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.anthropic.vision]
 model = "claude-computer-use"
 model_provider = "anthropic"
 endpoint = "https://anthropic.invalid/v1"
 auth_source = "anthropic"
 allow_project_selection = true
 
-[hosts.local.provider_auth.anthropic]
+[hosts.local.desktop_bindings.operator.provider_auth.anthropic]
 kind = "environment"
 variable = "SATELLE_TEST_ANTHROPIC_TOKEN"
 "#,
@@ -1300,14 +1323,16 @@ allow_project_selection = true
 [hosts.local.experimental_provider_computer_use_by_provider]
 anthropic = true
 
-[hosts.local.provider_bindings.anthropic.vision]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.anthropic.vision]
 model = "claude-computer-use"
 model_provider = "anthropic"
 endpoint = "https://anthropic.invalid/v1"
 auth_source = "anthropic"
 allow_project_selection = true
 
-[hosts.local.provider_auth.anthropic]
+[hosts.local.desktop_bindings.operator.provider_auth.anthropic]
 kind = "environment"
 variable = "SATELLE_TEST_ANTHROPIC_TOKEN"
 "#,
@@ -1349,11 +1374,13 @@ transport = "local"
 adapter = "fake"
 allow_project_selection = true
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "environment"
 variable = "OPENAI_API_KEY"
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
@@ -1382,12 +1409,14 @@ transport = "local"
 adapter = "fake"
 allow_project_selection = true
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "environment"
 variable = "OPENAI_API_KEY"
 value = "{raw_secret}"
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
@@ -1416,14 +1445,18 @@ default_host = "local"
 [hosts.local]
 transport = "local"
 adapter = "fake"
-[hosts.local.provider_auth.work]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_auth.work]
 kind = "file"
 path = "~/satelle-home-inspection-missing/token"
 [hosts.remote]
 transport = "ssh"
 adapter = "codex"
 address = "unused.invalid"
-[hosts.remote.provider_auth.work]
+[hosts.remote.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.remote.desktop_bindings.operator.provider_auth.work]
 kind = "file"
 path = "~/satelle-home-inspection-missing/token"
 "#,
@@ -1458,13 +1491,15 @@ path = "~/satelle-home-inspection-missing/token"
         .get_output()
         .clone();
     let report = parse_json(&shown.stdout);
-    let local = &report["effective"]["hosts"]["local"]["provider_auth"]["work"];
+    let local = &report["effective"]["hosts"]["local"]["desktop_bindings"]["operator"]["provider_auth"]
+        ["work"];
     assert_eq!(
         local["path"],
         serde_json::json!(home.join("satelle-home-inspection-missing").join("token"))
     );
     assert_eq!(local["normalization_status"], "expanded");
-    let remote = &report["effective"]["hosts"]["remote"]["provider_auth"]["work"];
+    let remote = &report["effective"]["hosts"]["remote"]["desktop_bindings"]["operator"]["provider_auth"]
+        ["work"];
     assert_eq!(remote["path"], serde_json::Value::Null);
     assert_eq!(remote["normalization_status"], "remote_home_not_checked");
 }
@@ -1482,7 +1517,7 @@ fn secret_file_home_syntax_errors_have_typed_redacted_source_details() {
         "~/$(private-command)",
         "~/`private-command`",
     ] {
-        let source = serde_json::json!({"hosts":{"local":{"transport":"local","adapter":"fake","provider_auth":{"work":{"kind":"file","path":path}}}}});
+        let source = serde_json::json!({"hosts":{"local":{"transport":"local","adapter":"fake","desktop_bindings":{"operator":{"desktop_user":"local-demo-user","provider_auth":{"work":{"kind":"file","path":path}}}}}}});
         fixture.write_user_config(&toml::to_string(&source).unwrap());
         let output = fixture
             .command()
@@ -1499,7 +1534,7 @@ fn secret_file_home_syntax_errors_have_typed_redacted_source_details() {
         assert_eq!(error["details"]["host"], "local");
         assert_eq!(
             error["details"]["toml_path"],
-            "hosts.local.provider_auth.work.path"
+            "hosts.local.desktop_bindings.operator.provider_auth.work.path"
         );
         assert_eq!(error["details"]["secret_source_kind"], "file");
         assert!(error["details"]["config_file"].is_string());

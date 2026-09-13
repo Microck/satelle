@@ -858,7 +858,7 @@ fn versioned_tool_results_conform_to_their_advertised_json_schemas() {
         .collect::<Vec<_>>();
     for record in &log_records {
         assert_eq!(
-            record["schema_version"], "satelle.logs.entry.v1",
+            record["schema_version"], "satelle.logs.entry.v2",
             "every retained log record must use the advertised schema version"
         );
     }

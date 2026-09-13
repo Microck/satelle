@@ -4,12 +4,13 @@ description: Configure Host-resolved Secret Sources without exposing provider se
 ---
 
 Provider authentication belongs to the Host. User configuration stores only a
-descriptor that tells the Host where to resolve secret material.
+descriptor that tells the selected Desktop Binding where to resolve secret
+material. These examples use the Desktop Binding alias `operator`.
 
 ## Environment
 
 ```toml
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "environment"
 variable = "OPENAI_API_KEY"
 ```
@@ -17,7 +18,7 @@ variable = "OPENAI_API_KEY"
 ## Owner-only file
 
 ```toml
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "file"
 path = "/absolute/path/to/openai-token"
 ```
@@ -35,7 +36,7 @@ remote references report `remote_home_not_checked`.
 ## Operating-system credential store
 
 ```toml
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "credential-store"
 service = "satelle"
 account = "openai"
@@ -44,7 +45,7 @@ account = "openai"
 ## Host-managed store
 
 ```toml
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "host-store"
 name = "openai-production"
 ```
@@ -52,7 +53,7 @@ name = "openai-production"
 ## Executable helper
 
 ```toml
-[hosts.local-demo.provider_auth.work]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.work]
 kind = "executable-helper"
 argv = ["/opt/credentials/provider-helper", "--account", "work"]
 timeout = "10s"

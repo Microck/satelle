@@ -5,7 +5,7 @@ use satelle_host::{ApiBearerToken, test_support::TestStateDir};
 #[cfg(target_os = "linux")]
 use satelle_host::{ApiScopes, HostService};
 use satelle_test_contract::{assert_directory_tree_unchanged, assert_privacy_canaries_absent};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 #[cfg(target_os = "linux")]
@@ -563,13 +563,15 @@ adapter = "fake"
 [hosts.local-demo.experimental_provider_computer_use_by_provider]
 fixture-provider = true
 
-[hosts.local-demo.provider_bindings.fixture-provider.fixture-model]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_bindings.fixture-provider.fixture-model]
 model = "fixture-model-v1"
 model_provider = "fixture-provider-v1"
 endpoint = "https://fixture-provider.invalid/v1"
 auth_source = "fixture-auth"
 
-[hosts.local-demo.provider_auth.fixture-auth]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.fixture-auth]
 kind = "environment"
 variable = "FIXTURE_PROVIDER_TOKEN"
 "#,
@@ -824,15 +826,14 @@ fn ordinary_production_run_is_blocked_without_fake_completion_or_state_mutation(
             "PRODUCTION_ADMISSION_PROMPT_CANARY",
         ])
         .assert()
-        .code(74)
+        .code(64)
         .get_output()
         .clone();
     let combined = command_output_text(&output);
 
-    // This production invocation closes before adapter execution. The daemon
-    // boundary preserves the public storage error without exposing its private
-    // platform reason.
-    assert!(combined.contains("storage-integrity-failed"));
+    // A fresh production Host cannot admit work until setup creates an exact
+    // Desktop Binding for its OS user and desktop session.
+    assert!(combined.contains("desktop-binding-ambiguous"));
     assert!(!combined.contains("fake"));
     assert!(!combined.contains("completed"));
     assert!(!combined.contains("PRODUCTION_ADMISSION_PROMPT_CANARY"));
@@ -934,7 +935,9 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "operator-auth"
@@ -942,7 +945,7 @@ auth_source = "operator-auth"
 "#,
             if include_source {
                 r#"
-[hosts.local.provider_auth.operator-auth]
+[hosts.local.desktop_bindings.operator.provider_auth.operator-auth]
 kind = "environment"
 variable = "SATELLE_TEST_OPENAI_TOKEN"
 "#
@@ -2245,6 +2248,9 @@ adapter = "codex"
 address = "https://{closed_address}"
 expected_host_id = "host-windows-11"
 api_token = {{ kind = "file", path = {token_path} }}
+
+[hosts.remote.desktop_bindings.operator]
+desktop_user = "operator"
 "#,
         ),
     )
@@ -2283,7 +2289,13 @@ api_token = {{ kind = "file", path = {token_path} }}
             .clone();
         let events = parse_json_lines(&output.stdout);
 
-        assert_eq!(events.len(), 2, "stdout must contain no result JSON");
+        assert_eq!(
+            events.len(),
+            2,
+            "stdout must contain only the two events: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
         assert_eq!(events[0]["type"], "preflight");
         let terminal = &events[1];
         assert_eq!(terminal["schema_version"], "satelle.events.v2");
@@ -3250,6 +3262,7 @@ fn logs_follow_waits_on_an_empty_page_and_ctrl_c_exits_130() {
         command.env_remove(name);
     }
     let mut child = command
+        .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_CACHE_DIR", &cache)
         .args([
@@ -3493,6 +3506,8 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "codex"
+
+[hosts.local-demo.desktop_bindings.operator]
 desktop_user = "missing-user"
 "#,
     )
@@ -3591,6 +3606,9 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "codex"
+
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "missing-user"
 "#,
     )
     .expect("production config should be written");
@@ -3650,7 +3668,9 @@ provider_alias = "openai"
 transport = "local"
 adapter = "codex"
 
-[hosts.local-demo.provider_bindings.openai.review]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 "#,
@@ -3721,6 +3741,9 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "codex"
+
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "missing-user"
 "#,
     )
     .expect("production Host-owned provider config should be written");
@@ -3846,6 +3869,9 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "codex"
+
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "missing-user"
 "#,
     )
     .expect("production config should be written");
@@ -3909,6 +3935,8 @@ default_host = "workstation"
 [hosts.workstation]
 transport = "local"
 adapter = "codex"
+
+[hosts.workstation.desktop_bindings.operator]
 desktop_user = "missing-user"
 "#,
     )
@@ -4632,13 +4660,15 @@ adapter = "fake"
 [hosts.local-demo.experimental_provider_computer_use_by_provider]
 fixture-provider = true
 
-[hosts.local-demo.provider_bindings.fixture-provider.fixture-model]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_bindings.fixture-provider.fixture-model]
 model = "fixture-model-v1"
 model_provider = "fixture-provider-v1"
 endpoint = "https://fixture-provider.invalid/v1"
 auth_source = "fixture-auth"
 
-[hosts.local-demo.provider_auth.fixture-auth]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.fixture-auth]
 kind = "environment"
 variable = "FIXTURE_PROVIDER_TOKEN"
 "#,
@@ -4694,7 +4724,9 @@ provider_alias = "fixture-provider"
 transport = "local"
 adapter = "fake"
 
-[hosts.local-demo.provider_bindings.fixture-provider.fixture-model]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local-demo.desktop_bindings.operator.provider_bindings.fixture-provider.fixture-model]
 model = "fixture-model-v1"
 model_provider = "fixture-provider-v1"
 "#,
@@ -7085,11 +7117,13 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
+
+[hosts.local-demo.desktop_bindings.operator]
 desktop_user = "alice"
 "#,
             "project-desktop-binding-not-allowed",
-            "hosts.local-demo.desktop_user",
-            "desktop_user",
+            "hosts.local-demo.desktop_bindings",
+            "desktop_bindings",
         ),
         (
             r#"
@@ -7191,13 +7225,15 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
-desktop_user = "alice"
-desktop_session_preference = "console"
 daemon_home = "/srv/satelle"
 daemon_config_file = "/srv/satelle/config/config.toml"
 daemon_state_dir = "/srv/satelle/state"
 daemon_cache_dir = "/srv/satelle/cache"
 daemon_log_dir = "/srv/satelle/logs"
+
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "alice"
+desktop_session_preference = "console"
 "#,
     )
     .expect("user config should be written");
@@ -7212,9 +7248,10 @@ daemon_log_dir = "/srv/satelle/logs"
         .clone();
     let report = parse_json_output(&output.stdout);
     let host = &report["effective"]["hosts"]["local-demo"];
+    let binding = &host["desktop_bindings"]["operator"];
 
-    assert_eq!(host["desktop_user"], "alice");
-    assert_eq!(host["desktop_session_preference"], "console");
+    assert_eq!(binding["desktop_user"], "alice");
+    assert_eq!(binding["desktop_session_preference"], "console");
     assert_eq!(host["daemon_home"], "/srv/satelle");
     assert_eq!(
         host["daemon_config_file"],
@@ -7244,9 +7281,10 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
-desktop_user = "alice"
 
-[hosts.local-demo.desktop_session_native_selector]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "alice"
+[hosts.local-demo.desktop_bindings.operator.desktop_session_native_selector]
 platform = "darwin"
 kind = "window-server-session-id"
 value = "42"
@@ -7263,7 +7301,7 @@ value = "42"
         .get_output()
         .clone();
     let report = parse_json_output(&output.stdout);
-    let selector = &report["effective"]["hosts"]["local-demo"]["desktop_session_native_selector"];
+    let selector = &report["effective"]["hosts"]["local-demo"]["desktop_bindings"]["operator"]["desktop_session_native_selector"];
 
     assert_eq!(selector["platform"], "darwin");
     assert_eq!(selector["kind"], "window-server-session-id");
@@ -7282,9 +7320,11 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
-desktop_session_preference = "only"
 
-[hosts.local-demo.desktop_session_native_selector]
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "alice"
+desktop_session_preference = "only"
+[hosts.local-demo.desktop_bindings.operator.desktop_session_native_selector]
 platform = "darwin"
 kind = "window-server-session-id"
 value = "42"
@@ -7304,7 +7344,10 @@ value = "42"
 
     assert_eq!(error["code"], "desktop-session-selector-conflict");
     assert_eq!(error["details"]["file"], serde_json::json!(user_config));
-    assert_eq!(error["details"]["path"], "hosts.local-demo");
+    assert_eq!(
+        error["details"]["path"],
+        "hosts.local-demo.desktop_bindings.operator"
+    );
     assert_eq!(
         error["details"]["conflicting_keys"],
         serde_json::json!([
@@ -7445,25 +7488,27 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.default]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.default]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "file"
 path = '{}'
 
-[hosts.local.provider_auth.anthropic]
+[hosts.local.desktop_bindings.operator.provider_auth.anthropic]
 kind = "environment"
 variable = "ANTHROPIC_API_KEY"
 
-[hosts.local.provider_auth.apple]
+[hosts.local.desktop_bindings.operator.provider_auth.apple]
 kind = "credential-store"
 service = "satelle"
 account = "apple"
 
-[hosts.local.provider_auth.local]
+[hosts.local.desktop_bindings.operator.provider_auth.local]
 kind = "host-store"
 name = "local-provider-token"
 "#,
@@ -7491,8 +7536,10 @@ name = "local-provider-token"
     assert!(!stdout.contains(secret_file.to_string_lossy().as_ref()));
     assert!(!stdout.contains("ANTHROPIC_API_KEY"));
     let report = parse_json_output(&output.stdout);
-    let openai = &report["effective"]["hosts"]["local"]["provider_auth"]["openai"];
-    let anthropic = &report["effective"]["hosts"]["local"]["provider_auth"]["anthropic"];
+    let openai = &report["effective"]["hosts"]["local"]["desktop_bindings"]["operator"]["provider_auth"]
+        ["openai"];
+    let anthropic = &report["effective"]["hosts"]["local"]["desktop_bindings"]["operator"]["provider_auth"]
+        ["anthropic"];
 
     assert_eq!(report["schema_version"], "satelle.config.explain.v2");
     assert_eq!(openai["kind"], "file");
@@ -7513,7 +7560,7 @@ name = "local-provider-token"
         .clone();
     let human_stdout = String::from_utf8_lossy(&human.stdout);
     assert!(human_stdout.contains(
-        "hosts.local.provider_auth.openai: <redacted> \
+        "hosts.local.desktop_bindings.operator.provider_auth.openai: <redacted> \
          (reason: secret_source_reference, source: user_config)"
     ));
     assert!(human_stdout.contains("hosts.local.transport: local"));
@@ -7529,7 +7576,8 @@ name = "local-provider-token"
         .get_output()
         .clone();
     let report = parse_json_output(&output.stdout);
-    let provider_auth = &report["effective"]["hosts"]["local"]["provider_auth"];
+    let provider_auth =
+        &report["effective"]["hosts"]["local"]["desktop_bindings"]["operator"]["provider_auth"];
 
     assert_eq!(
         provider_auth["openai"]["path"],
@@ -7558,12 +7606,14 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.default]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.default]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "command"
 argv = ["/usr/bin/op", "read", "secret"]
 "#,
@@ -7579,12 +7629,14 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.default]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.default]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "file"
 path = "relative-secret"
 "#,
@@ -7600,12 +7652,14 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.default]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.default]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "file"
 path = "~another-user/openai-key"
 "#,
@@ -7655,12 +7709,14 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.default]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.default]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "file"
 path = '{foreign_absolute_path}'
 "#
@@ -7703,7 +7759,9 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "operator-auth"
@@ -7711,22 +7769,28 @@ auth_source = "operator-auth"
     )
     .expect("dangling provider auth config should be written");
 
-    for arguments in [
-        vec![
-            "run".to_string(),
-            "--host".to_string(),
-            "local".to_string(),
-            "--json".to_string(),
-            "Do not admit dangling provider auth".to_string(),
-        ],
-        vec![
-            "steer".to_string(),
-            SessionId::new().to_string(),
-            "--host".to_string(),
-            "local".to_string(),
-            "--json".to_string(),
-            "Do not admit dangling provider auth".to_string(),
-        ],
+    for (arguments, expected_code) in [
+        (
+            vec![
+                "run".to_string(),
+                "--host".to_string(),
+                "local".to_string(),
+                "--json".to_string(),
+                "Do not admit dangling provider auth".to_string(),
+            ],
+            "model-provider-binding-missing",
+        ),
+        (
+            vec![
+                "steer".to_string(),
+                SessionId::new().to_string(),
+                "--host".to_string(),
+                "local".to_string(),
+                "--json".to_string(),
+                "Do not admit dangling provider auth".to_string(),
+            ],
+            "session-not-found",
+        ),
     ] {
         let output = satelle()
             .env("SATELLE_CONFIG_FILE", &user_config)
@@ -7737,7 +7801,7 @@ auth_source = "operator-auth"
             .get_output()
             .clone();
         let error = parse_json_output(&output.stderr);
-        assert_eq!(error["code"], "model-provider-binding-missing");
+        assert_eq!(error["code"], expected_code);
         assert!(error["details"].is_null());
     }
 }
@@ -8223,7 +8287,7 @@ adapter = "fake"
             .iter()
             .any(|action| action
                 .as_str()
-                .is_some_and(|action| action.contains("desktop_user")))
+                .is_some_and(|action| action.contains("Desktop Binding")))
     );
     assert!(
         report["applied_actions"]
@@ -8232,18 +8296,21 @@ adapter = "fake"
             .iter()
             .any(|action| action
                 .as_str()
-                .is_some_and(|action| action.contains("desktop_user")))
+                .is_some_and(|action| action.contains("Desktop Binding")))
     );
 
     let persisted = fs::read_to_string(&user_config).expect("read persisted user config");
     let persisted =
         toml::from_str::<toml::Value>(&persisted).expect("persisted user config should parse");
     assert_eq!(
-        persisted["hosts"]["local-demo"]["desktop_user"].as_str(),
+        persisted["hosts"]["local-demo"]["desktop_bindings"]["local-demo-user"]["desktop_user"]
+            .as_str(),
         Some("local-demo-user")
     );
     assert_eq!(
-        persisted["hosts"]["local-demo"]["desktop_session_preference"].as_str(),
+        persisted["hosts"]["local-demo"]["desktop_bindings"]["local-demo-user"]
+            ["desktop_session_preference"]
+            .as_str(),
         Some("only")
     );
 }
@@ -8260,6 +8327,8 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
+
+[hosts.local-demo.desktop_bindings.operator]
 desktop_user = "missing-user"
 "#,
     )
@@ -8293,6 +8362,65 @@ desktop_user = "missing-user"
 }
 
 #[test]
+fn run_requires_a_desktop_binding_when_the_host_configures_more_than_one() {
+    let state = state_dir();
+    let user_config = state.path().join("multi-binding-config.toml");
+    write_user_config(
+        &user_config,
+        r#"
+default_host = "local-demo"
+
+[hosts.local-demo]
+transport = "local"
+adapter = "fake"
+
+[hosts.local-demo.desktop_bindings.alice]
+desktop_user = "local-demo-user"
+
+[hosts.local-demo.desktop_bindings.bob]
+desktop_user = "another-user"
+"#,
+    )
+    .expect("write multi-binding config");
+
+    let ambiguous = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["run", "--detach", "--json", "Open the browser"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let error = parse_json_output(&ambiguous.stderr);
+    assert_eq!(error["code"], "desktop-binding-ambiguous");
+    assert_eq!(
+        error["details"]["desktop_bindings"],
+        json!(["alice", "bob"])
+    );
+
+    let selected = satelle()
+        .env("SATELLE_CONFIG_FILE", &user_config)
+        .env("SATELLE_STATE_DIR", state.path())
+        .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
+        .args([
+            "run",
+            "--desktop-binding",
+            "alice",
+            "--detach",
+            "--json",
+            "Open the browser",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(
+        parse_json_output(&selected.stdout)["desktop_binding"],
+        "alice"
+    );
+}
+
+#[test]
 fn host_sessions_marks_only_the_session_selected_by_effective_host_config() {
     let state = state_dir();
     let user_config = state.path().join("user-config.toml");
@@ -8318,7 +8446,7 @@ desktop_session_preference = "only"
             r#"
 desktop_user = "local-demo-user"
 
-[hosts.local-demo.desktop_session_native_selector]
+[hosts.local-demo.desktop_bindings.operator.desktop_session_native_selector]
 platform = "local-demo"
 kind = "console"
 value = "active"
@@ -8330,7 +8458,7 @@ value = "active"
             r#"
 desktop_user = "local-demo-user"
 
-[hosts.local-demo.desktop_session_native_selector]
+[hosts.local-demo.desktop_bindings.operator.desktop_session_native_selector]
 platform = "local-demo"
 kind = "console"
 value = "inactive"
@@ -8349,6 +8477,8 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
+
+[hosts.local-demo.desktop_bindings.operator]
 {selection}
 "#
             ),
@@ -8377,7 +8507,7 @@ fn run_and_steer_fail_before_admission_when_desktop_selection_is_invalid() {
         r#"
 desktop_user = "local-demo-user"
 
-[hosts.local-demo.desktop_session_native_selector]
+[hosts.local-demo.desktop_bindings.operator.desktop_session_native_selector]
 platform = "{}"
 kind = "console"
 value = "inactive"
@@ -8416,7 +8546,7 @@ desktop_session_preference = "console"
                 r#"
 desktop_user = "local-demo-user"
 
-[hosts.local-demo.desktop_session_native_selector]
+[hosts.local-demo.desktop_bindings.operator.desktop_session_native_selector]
 platform = "{}"
 kind = "{}"
 value = "7"
@@ -8450,6 +8580,8 @@ default_host = "local-demo"
 [hosts.local-demo]
 transport = "local"
 adapter = "fake"
+
+[hosts.local-demo.desktop_bindings.operator]
 {desktop_config}
 "#
             ),
@@ -8476,8 +8608,8 @@ adapter = "fake"
     write_user_config(
         &user_config,
         provider_config.replace(
-            "adapter = \"fake\"",
-            "adapter = \"fake\"\ndesktop_user = \"local-demo-user\"\ndesktop_session_preference = \"only\"",
+            "desktop_user = \"local-demo-user\"",
+            "desktop_user = \"local-demo-user\"\ndesktop_session_preference = \"only\"",
         ),
     )
     .expect("user config should be written");
@@ -8499,8 +8631,8 @@ adapter = "fake"
     write_user_config(
         &user_config,
         provider_config.replace(
-            "adapter = \"fake\"",
-            "adapter = \"fake\"\ndesktop_user = \"another-user\"",
+            "desktop_user = \"local-demo-user\"",
+            "desktop_user = \"another-user\"",
         ),
     )
     .expect("user config should be written");
@@ -8923,7 +9055,7 @@ address = "operator@current.example"
     }
     let output = command
         .env("SATELLE_CONFIG_FILE", &config_file)
-        .env(TEST_SUPPORT_ADAPTER_ENV, "fake")
+        .env(TEST_SUPPORT_ADAPTER_ENV, "pending")
         .args([
             "self",
             "update",
@@ -9008,7 +9140,9 @@ transport = "local"
 adapter = "fake"
 allow_project_selection = true
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 endpoint = "https://api.openai.example/v1"
@@ -9070,28 +9204,30 @@ adapter = "fake"
 [hosts.local.experimental_provider_computer_use_by_provider]
 anthropic = true
 
-[hosts.local.provider_bindings.openai.default]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.default]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
 
-[hosts.local.provider_bindings.openai.fast]
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.fast]
 model = "gpt-5.2-mini"
 model_provider = "openai"
 auth_source = "openai"
 allow_project_selection = true
 
-[hosts.local.provider_bindings.anthropic.default]
+[hosts.local.desktop_bindings.operator.provider_bindings.anthropic.default]
 model = "claude-computer-use"
 model_provider = "anthropic"
 endpoint = "https://anthropic.invalid/v1"
 auth_source = "anthropic"
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "environment"
 variable = "SATELLE_TEST_OPENAI_TOKEN"
 
-[hosts.local.provider_auth.anthropic]
+[hosts.local.desktop_bindings.operator.provider_auth.anthropic]
 kind = "environment"
 variable = "SATELLE_TEST_ANTHROPIC_TOKEN"
 "#
@@ -9231,7 +9367,9 @@ provider_alias = "anthropic"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.anthropic.vision]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.anthropic.vision]
 model = "claude-computer-use"
 model_provider = "anthropic"
 "#,
@@ -9273,7 +9411,9 @@ adapter = "fake"
 [hosts.local.experimental_provider_computer_use_by_provider]
 anthropic = true
 
-[hosts.local.provider_bindings.anthropic.vision]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.anthropic.vision]
 model = "claude-computer-use"
 model_provider = "anthropic"
 "#,
@@ -9414,12 +9554,14 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "environment"
 variable = "SATELLE_TEST_OPENAI_TOKEN"
 "#,
@@ -9504,7 +9646,9 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
@@ -9560,7 +9704,9 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "operator-auth"
@@ -9568,7 +9714,7 @@ auth_source = "operator-auth"
 "#,
             if include_descriptor {
                 r#"
-[hosts.local.provider_auth.operator-auth]
+[hosts.local.desktop_bindings.operator.provider_auth.operator-auth]
 kind = "environment"
 variable = "SATELLE_TEST_OPENAI_TOKEN"
 "#
@@ -9648,7 +9794,9 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "operator-auth"
@@ -9700,7 +9848,9 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.selected.provider_bindings.openai.review]
+[hosts.selected.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.selected.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "operator-auth"
@@ -9709,7 +9859,9 @@ auth_source = "operator-auth"
 transport = "local"
 adapter = "fake"
 
-[hosts.decoy.provider_auth.operator-auth]
+[hosts.decoy.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.decoy.desktop_bindings.operator.provider_auth.operator-auth]
 kind = "environment"
 variable = "DECOY_PROVIDER_TOKEN"
 "#,
@@ -9767,18 +9919,27 @@ variable = "DECOY_PROVIDER_TOKEN"
         assert!(!persisted_text.contains(&secret_canary));
         let persisted = toml::from_str::<toml::Value>(&persisted_text)
             .expect("persisted config should be TOML");
-        let selected_descriptor = &persisted["hosts"]["selected"]["provider_auth"]["operator-auth"];
+        let selected_descriptor = persisted
+            .get("hosts")
+            .and_then(|hosts| hosts.get("selected"))
+            .and_then(|host| host.get("desktop_bindings"))
+            .and_then(|bindings| bindings.get("operator"))
+            .and_then(|binding| binding.get("provider_auth"))
+            .and_then(|provider_auth| provider_auth.get("operator-auth"))
+            .unwrap_or_else(|| {
+                panic!("selected provider descriptor was not persisted:\n{persisted_text}")
+            });
         assert_eq!(selected_descriptor["kind"].as_str(), Some(source_kind));
         assert_eq!(
             selected_descriptor[expected_field].as_str(),
             Some(expected_value.as_str())
         );
         assert_eq!(
-            persisted["hosts"]["decoy"]["provider_auth"]["operator-auth"]["kind"].as_str(),
+            persisted["hosts"]["decoy"]["desktop_bindings"]["operator"]["provider_auth"]["operator-auth"]["kind"].as_str(),
             Some("environment")
         );
         assert_eq!(
-            persisted["hosts"]["decoy"]["provider_auth"]["operator-auth"]["variable"].as_str(),
+            persisted["hosts"]["decoy"]["desktop_bindings"]["operator"]["provider_auth"]["operator-auth"]["variable"].as_str(),
             Some("DECOY_PROVIDER_TOKEN")
         );
     }
@@ -10103,11 +10264,13 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.selected.provider_auth.operator-auth]
+[hosts.selected.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.selected.desktop_bindings.operator.provider_auth.operator-auth]
 kind = "file"
 path = '{}'
 
-[hosts.selected.provider_bindings.openai.review]
+[hosts.selected.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "operator-auth"
@@ -10116,7 +10279,9 @@ auth_source = "operator-auth"
 transport = "local"
 adapter = "fake"
 
-[hosts.decoy.provider_auth.operator-auth]
+[hosts.decoy.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.decoy.desktop_bindings.operator.provider_auth.operator-auth]
 kind = "file"
 path = '{}'
 
@@ -10263,7 +10428,9 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.selected.provider_bindings.openai.review]
+[hosts.selected.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.selected.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "operator-auth"
@@ -10302,7 +10469,8 @@ auth_source = "operator-auth"
     assert!(!persisted_text.contains(secret));
     let persisted =
         toml::from_str::<toml::Value>(&persisted_text).expect("reconstructed config is TOML");
-    let descriptor = &persisted["hosts"]["selected"]["provider_auth"]["operator-auth"];
+    let descriptor = &persisted["hosts"]["selected"]["desktop_bindings"]["operator"]["provider_auth"]
+        ["operator-auth"];
     assert_eq!(descriptor["kind"].as_str(), Some("file"));
     assert_eq!(
         descriptor["path"].as_str(),
@@ -10340,11 +10508,13 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.selected.provider_auth.operator-auth]
+[hosts.selected.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.selected.desktop_bindings.operator.provider_auth.operator-auth]
 kind = "file"
 path = '{}'
 
-[hosts.selected.provider_bindings.openai.review]
+[hosts.selected.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "operator-auth"
@@ -10404,11 +10574,13 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.selected.provider_auth.operator-auth]
+[hosts.selected.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.selected.desktop_bindings.operator.provider_auth.operator-auth]
 kind = "file"
 path = '{}'
 
-[hosts.selected.provider_bindings.openai.review]
+[hosts.selected.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "operator-auth"
@@ -10596,11 +10768,13 @@ expected_host_id = "host-intentionally-wrong"
 api_token = {{ kind = "file", path = "{}" }}
 ca_bundle = "{}"
 
-[hosts.selected.provider_auth.operator-auth]
+[hosts.selected.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.selected.desktop_bindings.operator.provider_auth.operator-auth]
 kind = "file"
 path = '{}'
 
-[hosts.selected.provider_bindings.openai.review]
+[hosts.selected.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "operator-auth"
@@ -10724,11 +10898,13 @@ adapter = "fake"
 [hosts.selected.experimental_provider_computer_use_by_provider]
 openai = true
 
-[hosts.selected.provider_auth.operator-auth]
+[hosts.selected.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.selected.desktop_bindings.operator.provider_auth.operator-auth]
 kind = "environment"
 variable = "PRIVATE_PROVIDER_TOKEN"
 
-[hosts.selected.provider_bindings.openai.review]
+[hosts.selected.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 endpoint = "http://127.0.0.1:9"
@@ -10904,10 +11080,12 @@ adapter = "fake"
 [hosts.selected.experimental_provider_computer_use_by_provider]
 openai = true
 
-[hosts.selected.provider_auth.operator-auth]
+[hosts.selected.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.selected.desktop_bindings.operator.provider_auth.operator-auth]
 {descriptor}
 
-[hosts.selected.provider_bindings.openai.review]
+[hosts.selected.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 endpoint = "http://127.0.0.1:9"
@@ -10978,11 +11156,13 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "environment"
 variable = "PROVIDER_SECRET_SETUP_TOKEN"
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
@@ -11023,11 +11203,13 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "file"
 path = '{}'
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"
@@ -11085,11 +11267,13 @@ provider_alias = "openai"
 transport = "local"
 adapter = "fake"
 
-[hosts.local.provider_auth.openai]
+[hosts.local.desktop_bindings.operator]
+desktop_user = "local-demo-user"
+[hosts.local.desktop_bindings.operator.provider_auth.openai]
 kind = "file"
 path = '{}'
 
-[hosts.local.provider_bindings.openai.review]
+[hosts.local.desktop_bindings.operator.provider_bindings.openai.review]
 model = "gpt-5.2"
 model_provider = "openai"
 auth_source = "openai"

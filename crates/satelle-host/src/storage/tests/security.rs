@@ -72,6 +72,7 @@ fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
                 LogSeverity::Info,
                 LogEvent::TurnStateCommitted,
                 LogSubject::Turn {
+                    desktop_binding: running.desktop_binding().to_string(),
                     session_id: running.id().clone(),
                     turn_id: turn_id(TURN_1),
                     session_state_revision: running.session_state_revision(),
@@ -95,6 +96,7 @@ fn private_upstream_refs_are_isolated_from_public_rows_and_logs() {
     assert_eq!(LogEvent::TurnStateCommitted, log.event());
     assert_eq!(
         &LogSubject::Turn {
+            desktop_binding: running.desktop_binding().to_string(),
             session_id: running.id().clone(),
             turn_id: turn_id(TURN_1),
             session_state_revision: running.session_state_revision(),
@@ -360,6 +362,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
         &storage,
         "authorized_provider_bindings",
         &[
+            "desktop_binding_ref",
             "provider_alias",
             "model_alias",
             "model",
@@ -432,6 +435,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "turn_state_revision",
             "queue_status_json",
             "redacted",
+            "desktop_binding_ref",
         ],
     );
     // Queue payloads remain in the owner-private staging directory. SQLite
@@ -459,6 +463,7 @@ fn lifecycle_schema_excludes_raw_content_and_replayable_event_history() {
             "failure_code",
             "failure_message",
             "state_revision",
+            "desktop_binding_ref",
         ],
     );
     assert_table_columns(
