@@ -30,6 +30,13 @@ deployment_label = "controller-production"
 kind = "environment"
 variable = "SATELLE_OTLP_TOKEN"
 
+[notifiers.ops]
+endpoint = "https://hooks.example.com/satelle/events"
+
+[notifiers.ops.authorization]
+kind = "environment"
+variable = "SATELLE_WEBHOOK_TOKEN"
+
 [hosts.local-demo]
 transport = "local"
 adapter = "codex"
@@ -82,6 +89,14 @@ absolute owner-only `file` Secret Source on the emitting machine. Satelle does
 not accept an inline authorization value. Project configuration, profiles,
 setup, bootstrap, package installation, `--yes`, and Trusted Profile consent
 cannot enable telemetry.
+
+Top-level `notifiers.<alias>` tables configure `satelle notify`. The endpoint
+must use HTTPS and cannot contain credentials, a query, or a fragment. Optional
+bearer authorization comes from an `environment` or absolute owner-only `file`
+Secret Source on the Controller. `notify --dry-run` does not resolve that
+source. Project configuration and profiles cannot define or redirect notifier
+aliases. When an included user file and its parent define the same alias, the
+higher-precedence file replaces the full alias definition.
 
 The duration parser requires explicit units such as `500ms`, `30s`, or `2m`.
 Configuration does not perform environment-variable interpolation.

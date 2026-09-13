@@ -37,6 +37,9 @@ Global options include `--no-color`, `--profile <name>`, and
 | `satelle support bundle` | Export a redacted support bundle | Implemented |
 | `satelle self update` | Update the executable and optional remotes | Verified local update and optional stable-release single-Host handoff implemented; prerelease and explicit multi-Host handoffs remain unavailable |
 | `satelle completions` | Generate shell completions | Implemented |
+| `satelle batch` | Run versioned NDJSON command requests with bounded concurrency | Implemented |
+| `satelle watch` | Emit versioned NDJSON records when selected state changes | Implemented |
+| `satelle notify` | Deliver selected state changes to a user-owned webhook alias | Implemented |
 
 `setup` application is transport-specific. Local setup is dry-run planning
 only. SSH setup can apply the on-demand transport token handoff only. Direct
@@ -51,6 +54,20 @@ Use `satelle <command> --help` as the exact option reference for the binary you
 are running. Pre-release commands may change before the first stable release.
 The [generated CLI and schema reference](/docs/reference/generated-cli) records
 the complete help tree and public schema identifiers for Satelle 0.1.10.
+
+## Automation
+
+`satelle batch --input <path|->` runs closed, versioned NDJSON requests with 1
+through 16 workers and emits results in input order. `satelle watch` accepts
+`sessions`, `logs`, `doctor`, or `host`; it emits the first successful state and
+later changes as `satelle.watch.change.v1` NDJSON. It stops on interrupt or
+after its bounded consecutive reconnect budget. Doctor probe timing does not
+count as a state change.
+
+`satelle notify --watch <target> --webhook <alias>` sends the same change-only
+records to a user-configured HTTPS endpoint with at most three delivery
+attempts. Add `--dry-run` to print `satelle.notify.webhook.v1` payloads without
+resolving authorization or making a request.
 
 ## Output formats
 

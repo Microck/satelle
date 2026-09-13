@@ -157,3 +157,46 @@ fn batch_results_do_not_repeat_prompt_arguments() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains(prompt));
     assert!(!String::from_utf8_lossy(&output.stderr).contains(prompt));
 }
+
+#[test]
+fn watch_rejects_session_filters_for_targets_other_than_logs() {
+    let state = TestStateDir::new().expect("secure state directory");
+    let output = satelle()
+        .env("SATELLE_HOME", state.path().join("home"))
+        .args(["watch", "host", "--session", "rs_example"])
+        .assert()
+        .code(64)
+        .get_output()
+        .clone();
+
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--session can be used only when watching logs")
+    );
+}
+
+#[test]
+fn notify_requires_a_user_owned_webhook_alias_before_watching() {
+    let state = TestStateDir::new().expect("secure state directory");
+    let output = satelle()
+        .env("SATELLE_HOME", state.path().join("home"))
+        .args([
+            "--error-format",
+            "json",
+            "notify",
+            "--watch",
+            "sessions",
+            "--webhook",
+            "missing",
+            "--dry-run",
+        ])
+        .assert()
+        .code(66)
+        .get_output()
+        .clone();
+
+    assert!(output.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("typed config error");
+    assert_eq!(error["code"], "configuration-error");
+    assert!(!error.to_string().contains("authorization"));
+}

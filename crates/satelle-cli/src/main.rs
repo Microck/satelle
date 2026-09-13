@@ -32,7 +32,10 @@ mod transport;
 #[path = "windows-interactive-bootstrap.rs"]
 mod windows_interactive_bootstrap;
 
-use automation::{BatchCommand, BatchContext, run_batch};
+use automation::{
+    AUTOMATION_POLL_ENV, AutomationContext, BatchCommand, NotifyCommand, WatchCommand, run_batch,
+    run_notify, run_watch,
+};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use cliclack::{Theme, ThemeState};
 use completions::{CompletionsCommand, run_completions};
@@ -353,6 +356,10 @@ impl<'a> ConfigContext<'a> {
 enum Command {
     /// Execute versioned NDJSON command requests with bounded concurrency.
     Batch(BatchCommand),
+    /// Emit versioned NDJSON records when selected Satelle state changes.
+    Watch(WatchCommand),
+    /// Deliver selected Satelle state changes to a user-owned webhook.
+    Notify(NotifyCommand),
     Completions(CompletionsCommand),
     Setup(SetupCommand),
     Repair(RepairCommand),
@@ -2071,7 +2078,9 @@ struct ControllerTelemetryCapture {
 
 impl ControllerTelemetryCapture {
     fn start(command: &Command, config: &ConfigContext<'_>) -> Option<Self> {
-        if matches!(command, Command::Telemetry { .. }) {
+        if matches!(command, Command::Telemetry { .. })
+            || std::env::var_os(AUTOMATION_POLL_ENV).is_some()
+        {
             return None;
         }
         let resolved = config.load().ok()?;
@@ -2485,7 +2494,7 @@ fn execute_command(
 
     match command {
         Command::Batch(command) => {
-            let context = BatchContext::current(profile, no_color).map_err(failure)?;
+            let context = AutomationContext::current(profile, no_color).map_err(failure)?;
             let status = run_batch(command, context).map_err(failure)?;
             if status.failed == 0 {
                 Ok(None)
@@ -2497,6 +2506,29 @@ fn execute_command(
                     exit_code_override: Some(1),
                 })
             }
+        }
+        Command::Watch(command) => {
+            let context = AutomationContext::current(profile, no_color).map_err(failure)?;
+            run_watch(command, context).map_err(failure).map(|_| None)
+        }
+        Command::Notify(command) => {
+            let notifier_alias = command.webhook().to_string();
+            let notifier = config
+                .load()?
+                .config
+                .notifiers
+                .get(&notifier_alias)
+                .cloned()
+                .ok_or_else(|| {
+                    failure(SatelleError::config_error(
+                        format!("webhook notifier '{notifier_alias}' is not defined in user configuration"),
+                        Some(format!("add [notifiers.{notifier_alias}] to the user config")),
+                    ))
+                })?;
+            let context = AutomationContext::current(profile, no_color).map_err(failure)?;
+            run_notify(command, context, notifier)
+                .map_err(failure)
+                .map(|_| None)
         }
         Command::Completions(command) => run_completions(command).map_err(failure).map(|_| None),
         Command::Setup(command) => run_setup(
@@ -3234,6 +3266,22 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             explicit_host: None,
             session_id: None,
         },
+        Command::Watch(command) => HistoryTarget {
+            family: "watch",
+            selects_host: true,
+            explicit_host: command.history_host(),
+            session_id: command
+                .history_session_id()
+                .and_then(canonical_history_session_id),
+        },
+        Command::Notify(command) => HistoryTarget {
+            family: "notify",
+            selects_host: true,
+            explicit_host: command.history_host(),
+            session_id: command
+                .history_session_id()
+                .and_then(canonical_history_session_id),
+        },
         Command::Completions(_)
         | Command::Paths(_)
         | Command::Telemetry { .. }
@@ -3635,6 +3683,33 @@ mod history_target_tests {
                 .expect("SSH bootstrap target")
                 .selects_host
         );
+    }
+
+    #[test]
+    fn log_automation_routes_history_to_the_watched_session() {
+        const SESSION_ID: &str = "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11";
+        for arguments in [
+            vec!["satelle", "watch", "logs", "--session", SESSION_ID],
+            vec![
+                "satelle",
+                "notify",
+                "--watch",
+                "logs",
+                "--webhook",
+                "ops",
+                "--session",
+                SESSION_ID,
+            ],
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("parse automation command");
+            assert_eq!(
+                history_target(&cli.command)
+                    .expect("automation history target")
+                    .session_id
+                    .as_deref(),
+                Some(SESSION_ID)
+            );
+        }
     }
 
     #[test]
