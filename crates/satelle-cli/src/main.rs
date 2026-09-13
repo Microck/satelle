@@ -60,9 +60,9 @@ use satelle_core::{
     RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent, SatelleEventBody,
     SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport, SetupRequiredInput,
     SetupSchemaVersion, SetupVerification, TransportKind, load_config, load_config_for_profile,
-    load_config_without_profile, load_user_api_rate_limits, open_new_owner_only_file,
-    open_or_create_owner_only_directory, open_or_create_owner_only_file, open_owner_only_directory,
-    publish_new_owner_only_directory, read_owner_controlled_config_file,
+    load_config_without_profile, load_user_api_rate_limits, load_user_host_config,
+    open_new_owner_only_file, open_or_create_owner_only_directory, open_or_create_owner_only_file,
+    open_owner_only_directory, publish_new_owner_only_directory, read_owner_controlled_config_file,
     read_owner_only_secret_config_file, resolve_desktop_session, resolve_path_set,
     sync_owner_only_directory, utc_now,
 };
@@ -9018,6 +9018,25 @@ fn start_host_daemon_with(
     } else {
         None
     };
+    // A manual foreground Host still owns the built-in local endpoint. Apply
+    // that endpoint's configured policy without letting a remote default_host
+    // redirect this local process. Managed launch modes carry their own exact
+    // configuration and remain separate.
+    let foreground_host = if local_daemon_launch.is_none()
+        && should_resolve_foreground_local_host(
+            command.foreground,
+            command.bootstrap_token_stdin,
+            command.launchd_service,
+            service_path_overrides.is_some(),
+        ) {
+        Some(load_user_host_config(&user_config_path, LOCAL_DEMO_HOST).map_err(failure)?)
+    } else {
+        None
+    };
+    let configured_host = on_demand_host
+        .as_ref()
+        .map(|host| &host.config)
+        .or(foreground_host.as_ref());
     let idle_timeout = if let Some(milliseconds) = command.on_demand_idle_timeout_ms {
         Some(Duration::from_millis(milliseconds))
     } else if command.bootstrap_token_stdin {
@@ -9036,9 +9055,8 @@ fn start_host_daemon_with(
         command.bootstrap_provider_smoke_timeout_ms,
     )
     .map_err(failure)?;
-    let state_release_root = on_demand_host
-        .as_ref()
-        .and_then(|host| host.config.daemon_state_dir.clone())
+    let state_release_root = configured_host
+        .and_then(|host| host.daemon_state_dir.clone())
         .or_else(|| {
             local_daemon_launch
                 .as_ref()
@@ -9056,7 +9074,7 @@ fn start_host_daemon_with(
     }
     let service = match (
         local_daemon_launch.as_ref(),
-        on_demand_host.as_ref(),
+        configured_host,
         bootstrap_token.as_ref(),
     ) {
         (Some(launch), _, None) => transport::local_host_service(launch.host_config())?,
@@ -9089,7 +9107,7 @@ fn start_host_daemon_with(
                 &host_config,
             )
         }
-        (None, Some(host), None) => HostService::production_for_host(&host.config),
+        (None, Some(host), None) => HostService::production_for_host(host),
         (None, None, None) => match forwarded_readiness_timeouts {
             Some(timeouts) => {
                 let mut host_config = satelle_core::SatelleConfig::defaults()
@@ -9371,6 +9389,15 @@ const fn should_resolve_on_demand_host(
     durable_ssh_launch: bool,
 ) -> bool {
     !foreground && !bootstrap_token_stdin && !durable_ssh_launch
+}
+
+const fn should_resolve_foreground_local_host(
+    foreground: bool,
+    bootstrap_token_stdin: bool,
+    launchd_service: bool,
+    service_configured: bool,
+) -> bool {
+    foreground && !bootstrap_token_stdin && !launchd_service && !service_configured
 }
 
 fn ssh_launch_readiness_timeouts(
@@ -10585,6 +10612,25 @@ mod on_demand_idle_timeout_tests {
         assert!(!should_resolve_on_demand_host(false, true, false));
         assert!(!should_resolve_on_demand_host(false, true, true));
         assert!(!should_resolve_on_demand_host(true, false, false));
+    }
+
+    #[test]
+    fn plain_foreground_start_resolves_only_the_local_host_policy() {
+        assert!(should_resolve_foreground_local_host(
+            true, false, false, false
+        ));
+        assert!(!should_resolve_foreground_local_host(
+            false, false, false, false
+        ));
+        assert!(!should_resolve_foreground_local_host(
+            true, true, false, false
+        ));
+        assert!(!should_resolve_foreground_local_host(
+            true, false, true, false
+        ));
+        assert!(!should_resolve_foreground_local_host(
+            true, false, false, true
+        ));
     }
 
     #[test]
