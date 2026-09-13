@@ -11,6 +11,9 @@ public Satelle result and event schema sources. CI rejects hand-edited or stale 
 
 | Public schema source | Production source | Serialized schema version |
 | --- | --- | --- |
+| `BATCH_REQUEST_SCHEMA_VERSION` | `crates/satelle-cli/src/automation.rs` | `satelle.batch.request.v1` |
+| `BATCH_RESULT_SCHEMA_VERSION` | `crates/satelle-cli/src/automation.rs` | `satelle.batch.result.v1` |
+| `BATCH_SUMMARY_SCHEMA_VERSION` | `crates/satelle-cli/src/automation.rs` | `satelle.batch.summary.v1` |
 | `CONFIG_REPAIR_SCHEMA_VERSION` | `crates/satelle-cli/src/output.rs` | `satelle.config.repair.v1` |
 | `DoctorEventSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.doctor.events.v1` |
 | `DoctorSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.doctor.v1` |
@@ -35,6 +38,7 @@ Satelle sends command uplinks to a visible remote host and returns telemetry fro
 Usage: satelle [OPTIONS] <COMMAND>
 
 Commands:
+  batch        Execute versioned NDJSON command requests with bounded concurrency
   completions
   setup
   repair
@@ -93,6 +97,23 @@ Local repair records an exact optional dependency in the owning project.
   --dry-run   Show the owner and repair command without changing files
   --no-color  Use plain output
   -h, --help  Show this help
+```
+
+## `satelle batch`
+
+```text
+Execute versioned NDJSON command requests with bounded concurrency
+
+Usage: satelle batch [OPTIONS] --input <PATH_OR_DASH>
+
+Options:
+      --input <PATH_OR_DASH>       NDJSON request file, or - for standard input
+      --no-color                   Disable colored human output
+      --concurrency <CONCURRENCY>  Maximum commands executed at once [default: 4]
+      --log-verbosity <LEVEL>      Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>             Apply a named user-level configuration profile
+      --error-format <FORMAT>      Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                       Print help
 ```
 
 ## `satelle completions`

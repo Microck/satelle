@@ -1,3 +1,4 @@
+mod automation;
 #[path = "bootstrap-lock.rs"]
 mod bootstrap_lock;
 #[path = "command-history.rs"]
@@ -31,6 +32,7 @@ mod transport;
 #[path = "windows-interactive-bootstrap.rs"]
 mod windows_interactive_bootstrap;
 
+use automation::{BatchCommand, BatchContext, run_batch};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use cliclack::{Theme, ThemeState};
 use completions::{CompletionsCommand, run_completions};
@@ -349,6 +351,8 @@ impl<'a> ConfigContext<'a> {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Execute versioned NDJSON command requests with bounded concurrency.
+    Batch(BatchCommand),
     Completions(CompletionsCommand),
     Setup(SetupCommand),
     Repair(RepairCommand),
@@ -2480,6 +2484,20 @@ fn execute_command(
     human_style.install();
 
     match command {
+        Command::Batch(command) => {
+            let context = BatchContext::current(profile, no_color).map_err(failure)?;
+            let status = run_batch(command, context).map_err(failure)?;
+            if status.failed == 0 {
+                Ok(None)
+            } else {
+                Err(CliFailure {
+                    error: SatelleError::batch_partial_failure(status.failed),
+                    history_session_id: None,
+                    error_reported: true,
+                    exit_code_override: Some(1),
+                })
+            }
+        }
         Command::Completions(command) => run_completions(command).map_err(failure).map(|_| None),
         Command::Setup(command) => run_setup(
             command,
@@ -3206,6 +3224,12 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
         } if command.dry_run => return None,
         Command::Mcp { .. } => HistoryTarget {
             family: "mcp",
+            selects_host: false,
+            explicit_host: None,
+            session_id: None,
+        },
+        Command::Batch(_) => HistoryTarget {
+            family: "batch",
             selects_host: false,
             explicit_host: None,
             session_id: None,

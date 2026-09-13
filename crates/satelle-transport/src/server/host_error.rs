@@ -642,6 +642,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::StorageMigrationRollbackFailed
         | ErrorCode::NoRemoteHostSelected
         | ErrorCode::RemoteUpdatePartialFailure
+        | ErrorCode::BatchPartialFailure
         // Setup action and partial-application failures are Controller-local
         // execution results.
         | ErrorCode::SetupActionFailed
