@@ -1368,18 +1368,14 @@ fn native_readiness_prompt(
             if !allowed_app_ids.contains("satelle.exe") {
                 return Err("native_app_approval_unavailable");
             }
-            // The signed bridge exposes the Win32 button through its stable
-            // accessibility label. Use the exact window returned by
-            // list_apps, then keep the fresh binding returned by every state
-            // observation. The explicit get_window and activate_window paths
-            // both require foreground activation, while input methods activate
-            // their target automatically. The painted drag surfaces have no
-            // accessibility elements, so bind their fixed full-window
-            // coordinates to a fresh screenshot. Desktop reset can leave the
-            // bridge responsive before app discovery and UI event delivery
-            // settle, so bound both transient operations instead of treating
-            // one slow response as proof that native actions are unavailable.
-            let script = "globalThis.sky ??= (await import('@oai/sky')).sky; var apps = null; var satelle = null; var listAppsError = null; for (var attempt = 0; attempt < 2 && !satelle; attempt++) { try { apps = await sky.list_apps(); listAppsError = null; satelle = apps.find(app => app.id.toLowerCase().endsWith('satelle.exe')); } catch (error) { apps = null; listAppsError = error; } if (!satelle && attempt < 1) await new Promise(resolve => setTimeout(resolve, 500)); } if (!apps) throw listAppsError; if (!satelle) throw new Error('Satelle is unavailable'); var probeWindow = satelle.windows.find(window => window.title === 'Satelle native readiness probe'); if (!probeWindow) throw new Error('Satelle native readiness probe window is unavailable'); var state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); probeWindow = state.window; var buttonLine = state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); var buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) }); for (attempt = 0; attempt < 8; attempt++) { await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 300 : 250)); state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); probeWindow = state.window; if (state.accessibility.tree.includes('Click event observed')) break; } if (!state.accessibility.tree.includes('Click event observed')) throw new Error('native click event missing'); var screenshot = state.screenshots[0]; if (!screenshot) throw new Error('window screenshot missing after click'); await sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 578, to_y: 406, screenshotId: screenshot.id }); var finalState = null; for (attempt = 0; attempt < 8; attempt++) { await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 500 : 250)); finalState = await sky.get_window_state({ window: probeWindow, include_screenshot: false, include_text: true }); probeWindow = finalState.window; if (finalState.accessibility.tree.includes('Drag event observed')) break; } if (!finalState.accessibility.tree.includes('Drag event observed')) throw new Error('native drag event missing'); nodeRepl.write('Native click and drag actions observed');".to_string();
+            // Resolve the indexed button by its stable label and keep the fresh
+            // window binding returned after the click for the screenshot-bound
+            // drag. The private loopback target is the authority for both event
+            // acknowledgements, so duplicating those checks in this generated
+            // cell only lengthens a script that the model must reproduce exactly.
+            // Desktop reset can leave app discovery briefly incomplete, so only
+            // that external transition receives a bounded retry.
+            let script = "globalThis.sky ??= (await import('@oai/sky')).sky; var apps = null; var satelle = null; var listAppsError = null; for (var attempt = 0; attempt < 2 && !satelle; attempt++) { try { apps = await sky.list_apps(); listAppsError = null; satelle = apps.find(app => app.id.toLowerCase().endsWith('satelle.exe')); } catch (error) { apps = null; listAppsError = error; } if (!satelle && attempt < 1) await new Promise(resolve => setTimeout(resolve, 500)); } if (!apps) throw listAppsError; if (!satelle) throw new Error('Satelle is unavailable'); var probeWindow = satelle.windows.find(window => window.title === 'Satelle native readiness probe'); if (!probeWindow) throw new Error('Satelle native readiness probe window is unavailable'); var state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); probeWindow = state.window; var buttonLine = state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); var buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({ window: probeWindow, element_index: Number(buttonMatch[1]) }); await new Promise(resolve => setTimeout(resolve, 250)); state = await sky.get_window_state({ window: probeWindow, include_screenshot: true, include_text: true }); probeWindow = state.window; var screenshot = state.screenshots[0]; if (!screenshot) throw new Error('window screenshot missing after click'); await sky.drag({ window: probeWindow, from_x: 238, from_y: 356, to_x: 578, to_y: 406, screenshotId: screenshot.id }); nodeRepl.write('Native click and drag actions dispatched');".to_string();
             // The `exec` tool yields after roughly ten seconds and reports a
             // background cell instead of a result. On slow hosts the readiness
             // script outlives that window, and a model that obeys "no other
@@ -4578,7 +4574,6 @@ mod tests {
         assert!(!prompt.contains("sky.activate_window"));
         assert!(!prompt.contains("sky.type_text"));
         assert!(prompt.contains("sky.get_window_state({ window: probeWindow"));
-        assert!(prompt.contains("finalState.accessibility.tree"));
         assert!(prompt.contains("accessibility tree is formatted text"));
         // Resolve the indexed native button by its stable label. Only the
         // painted drag surface remains bound to the fixed window geometry.
@@ -4610,10 +4605,8 @@ mod tests {
         assert!(prompt.contains("only other tool call permitted"));
         assert!(prompt.contains("complete readiness script as the exact `code` argument"));
         assert!(!prompt.contains("functions.exec"));
-        assert!(prompt.contains("Click event observed"));
-        assert!(prompt.contains("Drag event observed"));
-        assert!(prompt.contains("native click event missing"));
-        assert!(prompt.contains("native drag event missing"));
+        assert!(!prompt.contains("Click event observed"));
+        assert!(!prompt.contains("Drag event observed"));
         assert!(prompt.contains(
             "Do not use shell, separate file tools, browser automation, or network tools"
         ));
@@ -4961,7 +4954,6 @@ mod tests {
         assert!(prompt.contains("click"));
         assert!(prompt.contains("drag"));
         assert!(!prompt.contains("readiness-nonce"));
-        assert!(prompt.contains("finalState.accessibility.tree.includes('Drag event observed')"));
         assert!(prompt.contains(
             "state.accessibility.tree.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm'))"
         ));
@@ -4975,9 +4967,10 @@ mod tests {
         assert!(prompt.contains("catch (error) { apps = null; listAppsError = error; }"));
         assert!(prompt.contains("if (!satelle && attempt < 1)"));
         assert!(prompt.contains("if (!apps) throw listAppsError"));
-        assert!(prompt.contains("attempt < 8"));
-        assert!(prompt.contains("state.accessibility.tree.includes('Click event observed')"));
-        assert!(prompt.contains("attempt === 0 ? 500 : 250"));
+        assert!(prompt.contains("await new Promise(resolve => setTimeout(resolve, 250))"));
+        assert!(prompt.contains("include_screenshot: true, include_text: true"));
+        assert!(!prompt.contains("include_screenshot: false"));
+        assert!(!prompt.contains("attempt < 8"));
     }
 
     #[test]
