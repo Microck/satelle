@@ -436,6 +436,7 @@ fn main() {
         Some("hang-with-escaped-descendant-exit") => spawn_escaped_descendant(),
         Some("version-with-descendant") => version_with_descendant(),
         Some("version-with-escaped-descendant") => version_with_escaped_descendant(),
+        Some("version-then-slow") => version_then_slow(),
         Some("inventory-success") => println!("{{\"installed\":[]}}"),
         Some("inventory-with-escaped-descendant") => {
             spawn_escaped_descendant();
@@ -494,6 +495,15 @@ fn version_with_descendant() {
 fn version_with_escaped_descendant() {
     spawn_escaped_descendant();
     println!("codex-cli 0.144.0");
+}
+
+fn version_then_slow() {
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(b"codex-cli 0.144.0\n")
+        .expect("write slow version fixture output");
+    stdout.flush().expect("flush slow version fixture output");
+    std::thread::sleep(Duration::from_secs(5));
 }
 
 fn spawn_descendant() {
@@ -772,7 +782,7 @@ fn native_isolation_budget_covers_inventories_and_macos_authentication() {
 #[test]
 fn default_control_plane_budget_covers_a_cold_managed_runtime() {
     assert!(
-        PROBE_TIMEOUT >= Duration::from_secs(60),
+        PROBE_TIMEOUT >= Duration::from_secs(90),
         "schema generation and the live handshake must fit after a cold runtime integrity check"
     );
 }

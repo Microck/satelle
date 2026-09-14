@@ -1,0 +1,124 @@
+---
+title: Remote fleet operations
+description: Configure, authenticate, and manage remote macOS and Windows Hosts over SSH and direct HTTPS.
+---
+
+In multi-machine environments, an operator on a Linux, macOS, or Windows controller
+dispatches native Computer Use tasks to remote Hosts that own physical or virtual
+displays.
+
+Satelle provides two authenticated network transports:
+
+1. **SSH on-demand transport:** Uploads and starts a loopback Host Daemon over
+   system OpenSSH as needed.
+2. **Direct HTTPS/WSS transport:** Connects to a persistent or already-running
+   daemon over TLS with pinned Host identity.
+
+## Configuring a remote Host
+
+<Tabs items={['SSH transport', 'Direct HTTPS']}>
+  <Tab value="SSH transport">
+    Configure the SSH destination and API token file in user configuration:
+
+    ```toml title="~/.config/satelle/config.toml"
+    [hosts.studio-mac]
+    transport = "ssh"
+    adapter = "codex"
+    address = "operator@studio-mac.internal.net"
+    expected_host_id = "host-018f-example"
+
+    [hosts.studio-mac.api_token]
+    kind = "file"
+    path = "/home/operator/.config/satelle/tokens/studio-mac"
+    ```
+
+    <Steps>
+      <Step>
+        #### Plan the transport setup
+
+        Verify connectivity and view planned token provisioning actions:
+
+        ```sh
+        satelle setup --host studio-mac --component transport --dry-run --json
+        ```
+      </Step>
+      <Step>
+        #### Apply with explicit consent
+
+        Execute the token handoff and verify daemon communication:
+
+        ```sh
+        satelle setup --host studio-mac --component transport --yes
+        ```
+
+        This activates the durable token file in the configured path and records
+        the Host identity.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab value="Direct HTTPS">
+    Configure the direct endpoint, CA bundle, and token file:
+
+    ```toml title="~/.config/satelle/config.toml"
+    [hosts.lab-windows]
+    transport = "direct"
+    adapter = "codex"
+    address = "https://lab-windows.internal.net:3001"
+    ca_bundle = "/etc/satelle/certs/internal-ca.pem"
+
+    [hosts.lab-windows.api_token]
+    kind = "file"
+    path = "/home/operator/.config/satelle/tokens/lab-windows"
+    ```
+
+    <Steps>
+      <Step>
+        #### Run the Host Daemon on the target
+
+        Start the daemon listening on the network interface with TLS certificates:
+
+        ```sh
+        satelle host start --bind 0.0.0.0:3001 --tls-cert /etc/satelle/cert.pem --tls-key /etc/satelle/key.pem --foreground
+        ```
+      </Step>
+      <Step>
+        #### Pin Host trust
+
+        Authenticate the observed certificate and pin the stable Host ID:
+
+        ```sh
+        satelle host trust --host lab-windows
+        ```
+
+        For non-interactive automation:
+
+        ```sh
+        satelle host trust --host lab-windows --expected-host-id <host_id> --yes --no-input
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Verifying fleet health
+
+Before sending work, verify that remote hosts are accessible and reporting healthy
+runtime state:
+
+```sh
+satelle config check --host studio-mac --json
+satelle host status --host studio-mac --json
+satelle host sessions --host studio-mac --json
+```
+
+## Running distributed work
+
+Dispatch detached jobs to specific machines in the fleet:
+
+```sh
+satelle run --host studio-mac --detach --json "Verify application rendering"
+satelle run --host lab-windows --detach --json "Perform cross-platform smoke tests"
+```
+
+Save each returned `session_id` to poll status or collect logs across your nodes.

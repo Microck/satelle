@@ -1157,6 +1157,26 @@ fn version_probe_times_out_and_terminates_a_slow_process() {
 }
 
 #[test]
+#[cfg(windows)]
+fn version_probe_accepts_a_complete_line_after_group_cleanup() {
+    let fixture = super::control_plane_tests::compile_stdio_fixture();
+    let mut command = Command::new(fixture.executable());
+    command.arg("version-then-slow");
+    let started = Instant::now();
+
+    assert_eq!(
+        probe_codex_version_command(command, Duration::from_secs(2)),
+        CodexVersionEvidence::Detected {
+            version: MINIMUM_CODEX_VERSION,
+        }
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the Windows version probe waited for the slow process after reading its version"
+    );
+}
+
+#[test]
 fn version_probe_terminates_stdout_inheriting_descendants_after_leader_exit() {
     let fixture = super::control_plane_tests::compile_stdio_fixture();
     let mut command = Command::new(fixture.executable());

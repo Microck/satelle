@@ -1,0 +1,105 @@
+---
+title: Interactive task automation and steering
+description: Run native tasks, stream live lifecycle events, steer ongoing work, and safely stop turns.
+---
+
+Satelle provides durable session execution on native desktop hosts. When running
+interactive or complex workflows, an operator often needs to observe live events,
+supply follow-up guidance, or intervene if an action goes off track.
+
+## Execution model
+
+A Satelle **Session** represents a durable sequence of turns. Each turn is an
+atomic interaction cycle executed by the Host Daemon. Only one active turn executes
+at any given moment within a session.
+
+```text
+Operator / CLI               Satelle Host Daemon               Native Desktop
+     |                                |                              |
+     |--- satelle run "Open docs" --->|                              |
+     |    (stream live events)        |--- execute actions --------->|
+     |<-- emit TurnStarted -----------|    (mouse, keyboard, app)    |
+     |<-- emit TurnCompleted ---------|                              |
+     |                                |                              |
+     |--- satelle steer "Search X" -->|                              |
+     |    (continue same session)     |--- execute next turn ------->|
+     |                                |                              |
+```
+
+## Step-by-step workflow
+
+<Steps>
+  <Step>
+    ### Start the session
+
+    Begin work by launching an attached run command:
+
+    ```sh
+    satelle run --host local-demo --events human "Open the documentation page in the default browser"
+    ```
+
+    To run headlessly or in background scripts, pass `--detach`:
+
+    ```sh
+    satelle run --host local-demo --detach --json "Open the documentation page in the default browser"
+    ```
+
+    Save the returned `session_id`. It is required for all subsequent interactions.
+  </Step>
+
+  <Step>
+    ### Monitor session status
+
+    Inspect the authoritative state of the session at any time:
+
+    ```sh
+    satelle status <session_id> --host local-demo --json
+    ```
+
+    The status output indicates whether the current turn is active, completed, or
+    stopped, along with timestamps and terminal verdicts.
+  </Step>
+
+  <Step>
+    ### Steer with follow-up instructions
+
+    Once the initial turn reaches a terminal state, continue the workflow within the
+    same session context:
+
+    ```sh
+    satelle steer <session_id> --host local-demo "Click the search bar and type 'quick start'"
+    ```
+
+    Because the session state and application context are preserved on the Host, the
+    desktop application remains open and ready for the next instruction.
+  </Step>
+
+  <Step>
+    ### Intervene and stop if needed
+
+    If the current turn needs to be cancelled immediately, invoke `stop`:
+
+    ```sh
+    satelle stop <session_id> --host local-demo --json
+    ```
+
+    <Callout title="Non-destructive cancellation" type="info">
+      Stopping a turn cancels the active desktop action cycle, but preserves the
+      session metadata and logs. The session remains inspectable, and subsequent
+      steer commands can still be issued.
+    </Callout>
+  </Step>
+
+  <Step>
+    ### Review normalized logs
+
+    Review the audit trail of what the Host performed:
+
+    ```sh
+    satelle logs --host local-demo --session <session_id> --tail 50 --json
+    ```
+
+    Logs filter by subsystem source (`host_daemon`, `storage`, `codex_adapter`) and
+    by log level (`info`, `warn`, `error`).
+  </Step>
+</Steps>

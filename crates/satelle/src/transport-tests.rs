@@ -6230,6 +6230,123 @@ fn direct_logs_classify_a_dropped_response_body_as_transient_reachability_loss()
 }
 
 #[test]
+fn direct_admission_replays_the_same_idempotency_key_after_a_dropped_response() {
+    const IDEMPOTENCY_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f10";
+
+    fn read_headers(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound admission request read");
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut chunk = [0_u8; 1024];
+            let count = stream.read(&mut chunk).expect("read admission request");
+            assert_ne!(count, 0, "admission request closed before its headers");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        String::from_utf8(request).expect("admission headers are UTF-8")
+    }
+
+    fn header<'a>(headers: &'a str, expected_name: &str) -> &'a str {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(expected_name)
+                    .then_some(value.trim())
+            })
+            .expect("expected admission header")
+    }
+
+    let mut fixture = DirectFixture::start();
+    let expected = fixture
+        .transport()
+        .run_detached(&TurnRequest::new("seed replay response"))
+        .expect("seed a valid Session response");
+    let host_identity = fixture.host_identity.clone();
+    let response_session = expected.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind admission replay fixture");
+    let address = listener
+        .local_addr()
+        .expect("read admission replay address");
+    let peer = thread::spawn(move || {
+        let (mut first, _) = listener.accept().expect("accept first admission request");
+        let first_headers = read_headers(&mut first);
+        assert_eq!(header(&first_headers, "idempotency-key"), IDEMPOTENCY_KEY);
+        let first_request_id = header(&first_headers, "satelle-request-id");
+        let partial_body = r#"{"schema_version":"satelle.session.v2""#;
+        write!(
+            first,
+            "HTTP/1.1 202 Accepted\r\nSatelle-Request-Id: {first_request_id}\r\nSatelle-Host-Identity: {host_identity}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{partial_body}",
+            partial_body.len() + 100
+        )
+        .expect("write dropped admission response");
+        first.flush().expect("flush dropped admission response");
+        drop(first);
+
+        let (mut replay, _) = listener
+            .accept()
+            .expect("accept replayed admission request");
+        let replay_headers = read_headers(&mut replay);
+        assert_eq!(header(&replay_headers, "idempotency-key"), IDEMPOTENCY_KEY);
+        let replay_request_id = header(&replay_headers, "satelle-request-id");
+        let mut body = serde_json::to_value(response_session).expect("encode Session");
+        let object = body
+            .as_object_mut()
+            .expect("Session wire value is an object");
+        object.insert(
+            "schema_version".to_string(),
+            serde_json::Value::String("satelle.session.v2".to_string()),
+        );
+        object.insert(
+            "request_id".to_string(),
+            serde_json::Value::String(replay_request_id.to_string()),
+        );
+        object.insert(
+            "host_identity".to_string(),
+            serde_json::Value::String(host_identity.clone()),
+        );
+        let body = serde_json::to_vec(&body).expect("encode Session response");
+        write!(
+            replay,
+            "HTTP/1.1 202 Accepted\r\nSatelle-Request-Id: {replay_request_id}\r\nSatelle-Host-Identity: {host_identity}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write replayed admission response headers");
+        replay
+            .write_all(&body)
+            .expect("write replayed admission response body");
+    });
+    let client = DaemonClient::loopback(
+        address,
+        ApiBearerToken::generate().expect("generate admission replay token"),
+        &fixture.host_identity,
+    )
+    .expect("construct admission replay client");
+    fixture
+        .transport
+        .as_mut()
+        .expect("fixture transport is present")
+        .client = Arc::new(client);
+    let request = TurnRequest::new("replay this exact admission");
+    let transport = fixture.transport();
+    let recovered = transport
+        .event_runtime
+        .block_on(transport.blocking_replayable_admission_http(
+            move |client| {
+                client
+                    .create_session(&request, IDEMPOTENCY_KEY)
+                    .map(|response| response.session().clone())
+            },
+            direct_run_admission_error,
+        ))
+        .expect("recover the dropped admission response");
+    peer.join().expect("admission replay peer must not panic");
+
+    assert_eq!(recovered, expected);
+}
+
+#[test]
 fn direct_attached_run_and_steer_follow_committed_host_events() {
     let fixture = DirectFixture::start();
     let mut run_events = Vec::new();

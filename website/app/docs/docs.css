@@ -1,0 +1,53 @@
+@import "tailwindcss";
+@source "../../../node_modules/fumadocs-ui/dist/**/*.js";
+@import "fumadocs-ui/css/black.css";
+@import "fumadocs-ui/css/preset.css";
+
+/*
+ * Satelle brand tokens for the docs tree. Plain :root/.dark overrides win
+ * over the Fumadocs theme by source order. Values come from website/DESIGN.md:
+ * accent #E5184D, ground #0F0D17, light ground #F9FAFF, dark text #D6D8E0.
+ */
+:root {
+  --color-fd-background: #f9faff;
+  --color-fd-foreground: #0f0d17;
+  --color-fd-muted: #f4f5f9;
+  --color-fd-muted-foreground: #5a5a63;
+  --color-fd-popover: #ffffff;
+  --color-fd-popover-foreground: #0f0d17;
+  --color-fd-card: #ffffff;
+  --color-fd-card-foreground: #0f0d17;
+  --color-fd-border: #d1d2d8;
+  --color-fd-primary: #e5184d;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-secondary: #ecedf2;
+  --color-fd-secondary-foreground: #0f0d17;
+  --color-fd-accent: #fdeaef;
+  --color-fd-accent-foreground: #c4003d;
+  --color-fd-ring: #e5184d;
+  --color-fd-warning: #96620a;
+  --color-fd-error: #c51d28;
+  --color-fd-success: #0a7c4a;
+}
+
+.dark {
+  --color-fd-background: #0f0d17;
+  --color-fd-foreground: #d6d8e0;
+  --color-fd-muted: #171620;
+  --color-fd-muted-foreground: #a9aab3;
+  --color-fd-popover: #1f1e28;
+  --color-fd-popover-foreground: #d6d8e0;
+  --color-fd-card: #171620;
+  --color-fd-card-foreground: #d6d8e0;
+  --color-fd-border: #3f3e49;
+  --color-fd-primary: #f43f6e;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-secondary: #1f1e28;
+  --color-fd-secondary-foreground: #d6d8e0;
+  --color-fd-accent: rgb(229 24 77 / 0.16);
+  --color-fd-accent-foreground: #fda4af;
+  --color-fd-ring: #f43f6e;
+  --color-fd-warning: #fbbf24;
+  --color-fd-error: #f87171;
+  --color-fd-success: #4ade80;
+}

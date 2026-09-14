@@ -2517,6 +2517,20 @@ pub fn load_user_api_rate_limits(user_config_path: &Path) -> Result<ApiRateLimit
         .unwrap_or_default())
 }
 
+pub fn load_user_host_config(
+    user_config_path: &Path,
+    alias: &str,
+) -> Result<HostConfig, SatelleError> {
+    let mut config = SatelleConfig::defaults();
+    if let Some(user_config) = read_user_config_file(user_config_path)? {
+        config = config.merge(user_config.config);
+    }
+    config
+        .hosts
+        .remove(alias)
+        .ok_or_else(|| SatelleError::host_not_found(alias.to_string()))
+}
+
 pub fn load_config(cwd: &Path, flag_profile: Option<&str>) -> Result<ResolvedConfig, SatelleError> {
     load_config_with_profile_selection(cwd, flag_profile, true, None, None)
 }

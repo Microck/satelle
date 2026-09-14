@@ -1,5 +1,6 @@
 pub(super) const READY: &str = "satelle-bootstrap-lock-v2";
 pub(super) const BUSY: &str = "satelle-bootstrap-busy-v1";
+pub(super) const BUSY_EXIT_CODE: i32 = 75;
 pub(super) const HEARTBEAT: &str = "satelle-bootstrap-heartbeat-v1";
 pub(super) const RELEASE: &str = "satelle-bootstrap-release-v1";
 pub(super) const MUTATION_STARTED: &str = "satelle-bootstrap-mutation-started-v1";

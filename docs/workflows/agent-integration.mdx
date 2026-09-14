@@ -1,0 +1,108 @@
+---
+title: AI Agent and MCP integration
+description: Connect autonomous agents to Satelle using the Model Context Protocol, the Agent Skills bundle, and structured JSON.
+---
+
+import { Bot, Wrench, ShieldCheck, Sparkles } from 'lucide-react';
+
+Satelle enables AI coding agents and autonomous models to control native desktops
+safely. Agents can interact through:
+
+1. **Model Context Protocol (MCP):** Exposes Satelle tools to MCP-compliant clients
+   such as Codex, Claude Desktop, and Cursor.
+2. **Agent Skills Bundle:** Built-in operational guides discoverable at runtime.
+3. **Structured CLI JSON:** Script-friendly commands with typed schemas and exit codes.
+
+## Model Context Protocol (MCP) server
+
+Satelle implements an MCP server communicating over standard I/O (stdio).
+
+<Cards>
+  <Card icon={<Wrench />} title="Read-only tools (default)">
+    Includes inspection tools: `satelle_status`, `satelle_logs`, `satelle_doctor`,
+    `satelle_config_check`, and `satelle_host_status`.
+  </Card>
+  <Card icon={<ShieldCheck />} title="Mutation tools (--enable-mutations)">
+    Exposes active execution tools: `satelle_run`, `satelle_steer`, `satelle_stop`,
+    `satelle_setup`, and `satelle_repair`.
+  </Card>
+</Cards>
+
+### Running the server
+
+To launch the MCP server for an attached client:
+
+```sh
+satelle mcp serve
+```
+
+To expose state-changing execution tools to the agent:
+
+```sh
+satelle mcp serve --enable-mutations
+```
+
+<Callout title="Segregation of tools from consent" type="info">
+  Enabling mutation tools allows the client to call execution tools, but does not
+  bypass safety checks. Every tool call strictly enforces the same CLI consent,
+  Trusted Profile, readiness validation, and host-busy policies.
+</Callout>
+
+### Automated client installation
+
+Satelle can automatically register itself in supported client configurations:
+
+```sh
+satelle mcp install --target codex --dry-run --json
+satelle mcp install --target codex
+```
+
+## The embedded Agent Skills bundle
+
+Satelle bundles four release-matched agent skills:
+
+| Skill | Purpose |
+| --- | --- |
+| `satelle` | Top-level router to select the narrowest appropriate skill |
+| `satelle-setup` | Planning, configuring, and verifying Hosts |
+| `satelle-use` | Operating sessions, steering turns, and reading logs |
+| `satelle-recover` | Diagnosing failures and applying safe repairs |
+
+Agents discover and inspect these skills dynamically:
+
+```sh
+satelle skills list
+satelle skills get satelle-use
+satelle skills path satelle-use
+```
+
+## Programmatic orchestration with JSON
+
+When driving Satelle from an automated workflow, always append `--json` to obtain
+structured schemas without terminal ANSI styling:
+
+```sh
+satelle run --host local-demo --detach --json "Perform spreadsheet reconciliation"
+```
+
+The output returns the assigned `session_id`:
+
+```json
+{
+  "session_id": "018f3a2b-7c10-7e4a-9c2e-4a8b12345678",
+  "status": "admitted",
+  "host": "local-demo"
+}
+```
+
+Poll for completion:
+
+```sh
+satelle status <session_id> --host local-demo --json
+```
+
+And retrieve structured logs with cursor pagination:
+
+```sh
+satelle logs --host local-demo --session <session_id> --json --tail 100
+```

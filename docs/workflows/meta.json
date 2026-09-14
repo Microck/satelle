@@ -1,0 +1,11 @@
+{
+  "title": "Workflows",
+  "pages": [
+    "index",
+    "interactive-steering",
+    "remote-fleet",
+    "agent-integration",
+    "ci-cd-verification",
+    "incident-triage"
+  ]
+}

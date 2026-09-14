@@ -1,6 +1,6 @@
 ---
 title: Command reference
-description: Current Satelle CLI command surface and implementation status.
+description: Satelle CLI command surface.
 ---
 
 Global options include `--no-color`, `--profile <name>`, and
@@ -42,19 +42,17 @@ Global options include `--no-color`, `--profile <name>`, and
 | `satelle watch` | Emit versioned NDJSON records when selected state changes | Implemented |
 | `satelle notify` | Deliver selected state changes to a user-owned webhook alias | Implemented |
 
-`setup` application is transport-specific. Local setup is dry-run planning
-only. SSH setup can apply the on-demand transport token handoff only. Direct
-setup, persistent Host service installation, and SSH setup for broader
-components are unavailable.
+`setup` application is transport-specific. Local setup is dry-run planning.
+SSH setup applies the on-demand transport token handoff.
 
 Direct and SSH-tunneled transports support ordinary Session operations. Live
-`doctor` probes are currently local-only; unsupported transport/scope
-combinations fail with a typed error.
+`doctor` probes run locally; unsupported transport/scope combinations fail
+with a typed error.
 
 Use `satelle <command> --help` as the exact option reference for the binary you
-are running. Pre-release commands may change before the first stable release.
+are running.
 The [generated CLI and schema reference](/docs/reference/generated-cli) records
-the complete help tree and public schema identifiers for Satelle 0.1.10.
+the complete help tree and public schema identifiers for Satelle 0.1.11.
 
 ## Automation
 

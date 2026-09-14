@@ -1914,6 +1914,14 @@ impl BlockedComputerUseAdapter {
 
 #[cfg(test)]
 impl ComputerUseAdapter for BlockedComputerUseAdapter {
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<Option<crate::host::ReadinessCacheKey>, SatelleError> {
+        self.blocked()
+    }
+
     fn preflight(
         &self,
         _host: &str,

@@ -1,0 +1,74 @@
+---
+title: CI/CD desktop verification
+description: Run automated desktop tests, pre-flight readiness checks, and collect test evidence in CI pipelines.
+---
+
+Integrating native desktop testing into continuous integration pipelines requires
+verifying display readiness, running non-interactive test turns, and collecting
+reproducible logs upon failure.
+
+## Pipeline architecture
+
+```text
+[ CI Runner Step ]
+       |
+       +--> 1. Pre-flight checks (satelle doctor --scope computer-use --refresh)
+       |
+       +--> 2. Execute test turn (satelle run --detach --json)
+       |
+       +--> 3. Poll status until terminal state (satelle status --json)
+       |
+       +--> 4. Collect logs on failure (satelle logs --session <session_id>)
+```
+
+## Step 1: Pre-flight readiness gate
+
+Before launching test suites, ensure that the runner's visible desktop is unlocked,
+the Codex runtime is accessible, and the native Computer Use probe succeeds:
+
+```sh
+satelle config check --all --json
+satelle doctor --host local-demo --scope computer-use --refresh --json
+```
+
+If the doctor check fails, the pipeline fails early with clear diagnostic blockers
+before wasting execution time.
+
+## Step 2: Non-interactive execution
+
+Execute the test prompt in detached mode:
+
+```sh
+satelle run --host local-demo --detach --json "Run the client UI verification suite"
+```
+
+Parse the returned JSON to obtain the `session_id`.
+
+## Step 3: Polling for terminal verdict
+
+Poll the session status until the turn reaches a terminal state:
+
+```sh
+satelle status <session_id> --host local-demo --json
+```
+
+Check the `status` field:
+- `succeeded`: The turn completed all requested steps successfully.
+- `failed`: The turn encountered an unrecoverable failure.
+- `stopped`: The turn was cancelled.
+
+## Step 4: Collecting failure logs
+
+If the test fails, export normalized logs to preserve detailed diagnostic context
+for artifact archiving:
+
+```sh
+satelle logs --host local-demo --session <session_id> --level warn --tail 200 --json
+```
+
+<Callout title="Redact before archiving" type="warn">
+  Satelle redacts provider secrets from normalized logs, but metadata such as
+  Host aliases, paths, tailnet names, and Session identifiers remains. Redact
+  metadata and restrict artifact access before uploading pipeline logs to CI
+  artifact storage.
+</Callout>
