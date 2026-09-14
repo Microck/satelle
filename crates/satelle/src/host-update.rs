@@ -122,7 +122,7 @@ pub enum HostUpdatePlanError {
         cli_version: String,
     },
     HostArtifactUnavailable {
-        cli_version: String,
+        target_version: String,
         remote_platform: String,
     },
     HostUpdateRequiresCliUpgrade {
@@ -238,7 +238,7 @@ fn plan_host_targets(
                 &request.host_inspection.remote_platform,
             )?
             .ok_or_else(|| HostUpdatePlanError::HostArtifactUnavailable {
-                cli_version: request.target_version.to_string(),
+                target_version: request.target_version.to_string(),
                 remote_platform: request.host_inspection.remote_platform.clone(),
             })?;
         if artifact.version != request.target_version
@@ -1390,7 +1390,7 @@ mod tests {
         assert_eq!(
             error,
             HostUpdatePlanError::HostArtifactUnavailable {
-                cli_version: "1.2.3".to_string(),
+                target_version: "1.2.3".to_string(),
                 remote_platform: "linux-x64".to_string(),
             }
         );
@@ -1584,7 +1584,7 @@ mod tests {
         assert_eq!(
             unavailable_error,
             HostUpdatePlanError::HostArtifactUnavailable {
-                cli_version: "1.2.3".to_string(),
+                target_version: "1.2.3".to_string(),
                 remote_platform: "linux-x64-musl".to_string(),
             }
         );

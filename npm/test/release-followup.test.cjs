@@ -230,9 +230,8 @@ test("release workflow validates six targets and publishes only a fully verified
   );
   assert.match(
     workflow,
-    /pnpm --dir "\$install_root" add --ignore-scripts "\$package_spec"/,
+    /pnpm --config\.minimumReleaseAge=0 --dir "\$install_root" add --ignore-scripts "\$package_spec"/,
   );
-  assert.doesNotMatch(workflow, /minimum-release-age/);
   assert.match(
     workflow,
     /GH_TOKEN="\$RELEASE_POLICY_TOKEN" gh api[\s\S]*repos\/\$GITHUB_REPOSITORY\/immutable-releases[\s\S]*immutable releases are not enabled/,

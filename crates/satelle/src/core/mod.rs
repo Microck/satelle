@@ -7668,18 +7668,17 @@ impl SatelleError {
         }
     }
 
-    pub fn host_artifact_unavailable(cli_version: &str, remote_platform: &str) -> Self {
+    pub fn host_artifact_unavailable(target_version: &str, remote_platform: &str) -> Self {
         let mut details = BTreeMap::new();
-        details.insert("cli_version".to_string(), Value::from(cli_version));
+        details.insert("target_version".to_string(), Value::from(target_version));
         details.insert("remote_platform".to_string(), Value::from(remote_platform));
         Self {
             code: ErrorCode::HostArtifactUnavailable,
             message: format!(
-                "Satelle {cli_version} has no verified Host artifact for {remote_platform}"
+                "Satelle {target_version} has no verified Host artifact for {remote_platform}"
             ),
             recovery_command: Some(
-                "install a Satelle CLI release that publishes an artifact for this Host platform"
-                    .into(),
+                "select a Satelle release that publishes an artifact for this Host platform".into(),
             ),
             source_detail: None,
             details,

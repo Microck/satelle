@@ -31,6 +31,7 @@ const releaseScriptPath = path.join(repositoryRoot, "npm", "scripts", "release.c
 const {
   ReleaseError,
   createReleaseContext,
+  readWorkspaceVersion,
   zipInflateMaximumOutputLength,
 } = require(releaseScriptPath);
 const {
@@ -87,6 +88,19 @@ function workspaceVersion() {
   assert.ok(version, "Cargo workspace version is missing");
   return version;
 }
+
+test("workspace version parser accepts TOML spacing and ignores package versions", () => {
+  const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-workspace-version-"));
+  try {
+    writeFileSync(
+      path.join(fixtureRoot, "Cargo.toml"),
+      `[workspace]\nmembers = ["crate"]\n\n[workspace.package]\nversion="1.2.3"\n\n[package]\nversion = "9.9.9"\n`,
+    );
+    assert.equal(readWorkspaceVersion(fixtureRoot), "1.2.3");
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
 
 function writeSyntheticNative(filePath, target, size = 256) {
   const binary = Buffer.alloc(Math.max(size, target.startsWith("win32-") ? 1024 : 512));

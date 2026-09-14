@@ -6,6 +6,7 @@ use super::{
     RequestIdentity, RunCommand, RuntimeHandle, RuntimeProviderPolicy, RuntimeStartupState,
     SteerCommand, StopCommand,
 };
+use super::{RuntimeDesktopProviderPolicy, selected_provider_desktop_binding};
 use crate::core::session::{
     ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
     ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, PublicSession, PublicTurn,
@@ -30,6 +31,7 @@ use crate::host::{
 use crate::test_contract::assert_privacy_canaries_absent;
 use base64::Engine as _;
 use sha2::Digest as _;
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -1025,6 +1027,27 @@ fn project_selection_requires_exact_host_owned_binding_consent() {
     };
     assert!(binding.allow_project_selection());
     assert_eq!(binding.model(), "host-review-model");
+}
+
+#[test]
+fn implicit_provider_binding_distinguishes_missing_from_ambiguous_desktop_bindings() {
+    let intent = ProviderComputerUseIntent::host_default();
+    let missing = selected_provider_desktop_binding(&intent, &BTreeMap::new())
+        .expect_err("an empty Host binding map requires explicit setup");
+    assert_eq!(missing.code, crate::core::ErrorCode::DesktopBindingRequired);
+
+    let configured = [
+        ("alice".to_string(), RuntimeDesktopProviderPolicy::default()),
+        ("bob".to_string(), RuntimeDesktopProviderPolicy::default()),
+    ]
+    .into_iter()
+    .collect();
+    let ambiguous = selected_provider_desktop_binding(&intent, &configured)
+        .expect_err("multiple Host bindings require an explicit selection");
+    assert_eq!(
+        ambiguous.code,
+        crate::core::ErrorCode::DesktopBindingAmbiguous
+    );
 }
 
 #[test]

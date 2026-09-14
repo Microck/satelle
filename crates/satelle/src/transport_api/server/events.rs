@@ -513,6 +513,12 @@ async fn controller_loop(
                     }
                     Err(LiveEventReceiveError::Empty) => continue,
                 };
+                if !subscriptions
+                    .iter()
+                    .any(|subscription: &EventSubscription| subscription.matches(&event))
+                {
+                    continue;
+                }
                 match event_visible_to_principal(&state, principal, &event).await {
                     Ok(true) => {}
                     Ok(false) => continue,
@@ -522,12 +528,6 @@ async fn controller_loop(
                             reason: WsCloseReason::InternalError,
                         };
                     }
-                }
-                if !subscriptions
-                    .iter()
-                    .any(|subscription: &EventSubscription| subscription.matches(&event))
-                {
-                    continue;
                 }
                 let Some(next_sequence) = sequence.checked_add(1) else {
                     return ConnectionEnd::Failure {

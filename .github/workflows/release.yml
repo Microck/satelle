@@ -765,14 +765,16 @@ jobs:
             404)
               test -n "$CARGO_REGISTRY_TOKEN" || \
                 cargo_publish_error cargo-publish-token-missing "CARGO_REGISTRY_TOKEN is not configured"
-              # The exact archive already passed cargo package verification in collect.
+              cargo package --locked -p satelle
+              cmp --silent "$expected" "target/package/$crate_name" || \
+                cargo_publish_error cargo-package-digest-mismatch "repacked crate differs from the validated artifact"
               cargo publish --locked --no-verify -p satelle
               for attempt in $(seq 1 20); do
                 status=$(curl --silent --show-error --location \
                   --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
                   --output "$registry" \
                   --write-out '%{http_code}' \
-                  "$download") || continue
+                  "$download") || status=
                 if [ "$status" = 200 ]; then
                   cmp --silent "$expected" "$registry" || \
                     cargo_publish_error cargo-registry-version-conflict "published package bytes do not match the validated artifact"
@@ -975,6 +977,7 @@ jobs:
 
       - name: Require every approved package and provenance attestation
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: v${{ inputs.version }}
           RELEASE_VERSION: ${{ inputs.version }}
         shell: bash
@@ -1064,7 +1067,7 @@ jobs:
                   npm install --prefix "$install_root" --include=optional --ignore-scripts --no-audit --no-fund "$package_spec"
                   npm audit signatures --prefix "$install_root"
                   ;;
-                pnpm) pnpm --dir "$install_root" add --ignore-scripts "$package_spec" ;;
+                pnpm) pnpm --config.minimumReleaseAge=0 --dir "$install_root" add --ignore-scripts "$package_spec" ;;
                 bun) bun add --cwd "$install_root" --ignore-scripts "$package_spec" ;;
               esac
               smoke "$install_root/node_modules/.bin/satelle"

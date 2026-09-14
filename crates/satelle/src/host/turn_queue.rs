@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use time::OffsetDateTime;
 
-pub(crate) const QUEUE_PAYLOAD_SCHEMA_VERSION: &str = "satelle.queue.payload.v2";
+pub(crate) const QUEUE_PAYLOAD_SCHEMA_VERSION: &str = "satelle.queue.payload.v3";
 const MAX_QUEUE_PAYLOAD_BYTES: usize = 16 * 1_024 * 1_024;
 
 struct QueueWorkerOwner {
@@ -62,6 +62,7 @@ pub(crate) struct QueuedPrincipal {
     credential_revision: u64,
     scopes: u8,
     desktop_bindings: BTreeSet<String>,
+    durable_setup_active: bool,
     #[serde(with = "time::serde::rfc3339::option")]
     expires_at: Option<OffsetDateTime>,
 }
@@ -84,6 +85,7 @@ impl QueuedPrincipal {
             credential_revision: principal.credential_revision(),
             scopes: principal.scopes().bits(),
             desktop_bindings: principal.desktop_bindings().clone(),
+            durable_setup_active: principal.is_durable_setup_active(),
             expires_at: principal.expires_at(),
         })
     }
@@ -105,7 +107,7 @@ impl QueuedPrincipal {
             expires_at: self.expires_at,
             process_local_ssh_bootstrap: false,
             durable_setup_pending: false,
-            durable_setup_active: true,
+            durable_setup_active: self.durable_setup_active,
         })
     }
 
@@ -759,4 +761,33 @@ fn validate_file_name(file_name: &str) -> Result<(), SatelleError> {
     QueueRequestId::parse(id)
         .map(|_| ())
         .map_err(|_| queue_storage_error("validate a private queue payload name"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn principal(durable_setup_active: bool) -> ApiPrincipal {
+        ApiPrincipal {
+            token_id: "queued-token".to_string(),
+            principal_ref: "queued-principal".to_string(),
+            credential_revision: 1,
+            scopes: ApiScopes::CONTROL,
+            desktop_bindings: ["desktop".to_string()].into_iter().collect(),
+            expires_at: None,
+            process_local_ssh_bootstrap: false,
+            durable_setup_pending: false,
+            durable_setup_active,
+        }
+    }
+
+    #[test]
+    fn queued_principal_preserves_durable_setup_state() {
+        for durable_setup_active in [false, true] {
+            let queued = QueuedPrincipal::capture(&principal(durable_setup_active))
+                .expect("capture queue principal");
+            let restored = queued.restore().expect("restore queue principal");
+            assert_eq!(restored.is_durable_setup_active(), durable_setup_active);
+        }
+    }
 }

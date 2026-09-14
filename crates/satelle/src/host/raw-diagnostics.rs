@@ -15,6 +15,38 @@ pub(crate) struct RawProtocolCapture {
     inner: Arc<Mutex<CaptureState>>,
 }
 
+/// Finishes a prospective raw export on every dispatch exit, including an
+/// early terminal winner, a failed thread spawn, or an unwinding adapter.
+pub(crate) struct RawDiagnosticCompletion {
+    exports: RawDiagnosticExports,
+    storage: Arc<Mutex<Storage>>,
+    turn_id: TurnId,
+}
+
+impl RawDiagnosticCompletion {
+    pub(crate) fn new(
+        exports: RawDiagnosticExports,
+        storage: Arc<Mutex<Storage>>,
+        turn_id: TurnId,
+    ) -> Self {
+        Self {
+            exports,
+            storage,
+            turn_id,
+        }
+    }
+}
+
+impl Drop for RawDiagnosticCompletion {
+    fn drop(&mut self) {
+        self.exports.complete(
+            Arc::clone(&self.storage),
+            &self.turn_id,
+            OffsetDateTime::now_utc(),
+        );
+    }
+}
+
 struct CaptureState {
     manifest: RawDiagnosticManifest,
     redactor: DiagnosticRedactor,
@@ -580,6 +612,54 @@ mod tests {
                 .download(&storage.lock().unwrap(), "creator", &turn_id, now)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn completion_guard_finishes_export_during_unwind() {
+        let state = crate::host::TestStateDir::new().unwrap();
+        let (storage, _) = Storage::open(state.path()).unwrap();
+        let storage = Arc::new(Mutex::new(storage));
+        let exports = RawDiagnosticExports::default();
+        let turn_id = TurnId::new();
+        let now = OffsetDateTime::now_utc();
+        let capture = exports.begin(
+            &storage.lock().unwrap(),
+            "creator",
+            RawDiagnosticManifest::new(
+                "remote-demo",
+                "host-test",
+                RawDiagnosticCommand::Run,
+                SessionId::new(),
+                turn_id.clone(),
+            ),
+            now,
+        );
+        capture.record(ProtocolDirection::FromCodex, br#"{"result":"done"}"#);
+        let completion =
+            RawDiagnosticCompletion::new(exports.clone(), Arc::clone(&storage), turn_id.clone());
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _completion = completion;
+            panic!("adapter panic");
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(
+            exports
+                .download(&storage.lock().unwrap(), "creator", &turn_id, now)
+                .unwrap()
+                .records
+                .len(),
+            1
+        );
+        exports
+            .acknowledge(
+                &storage.lock().unwrap(),
+                "creator",
+                &turn_id,
+                RawDiagnosticExportOutcome::Exported,
+                now,
+            )
+            .unwrap();
     }
 
     #[test]

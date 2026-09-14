@@ -198,6 +198,7 @@
 - satelle npm, pnpm, and bun installation docs use the same scoped and unscoped npm-registry package identities across package managers instead of separate package identities per package manager @spec @mvp @implemented
 - after publication, npm installs the canonical scoped launcher package with `npm install --global <package> --include=optional` and exposes the `satelle` executable @spec @contract @mvp @implemented
 - after publication, pnpm installs the canonical scoped launcher package with `pnpm add --global <package>` and exposes the `satelle` executable @spec @contract @mvp @implemented
+- post-publication pnpm validation disables pnpm's minimum release age for the exact Satelle version being validated so a newly published immutable version can be installed immediately @spec @release-gate @verification @implemented
 - after publication, bun installs the canonical scoped launcher package with `bun add --global <package>` and exposes the `satelle` executable @spec @contract @mvp @implemented
 - after publication, canonical npm one-shot execution uses `npm exec --package=<package> -- satelle <args>` @spec @contract @mvp @implemented
 - after publication, canonical npx one-shot execution uses `npx --package=<package> -- satelle <args>` @spec @contract @mvp @implemented
@@ -325,6 +326,7 @@
 - satelle npm staged publishing, when adopted, uses trusted publisher stage-only permission for CI so CI can run npm stage publish but cannot directly run npm publish for configured packages @spec @later @phase4 @implemented
 - satelle npm staged publishing approval checks every staged top-level and platform-specific native npm package for version, artifact digest, package metadata, provenance, and release alignment before any staged package is approved @spec @later @phase4 @implemented
 - satelle npm staged publishing approval rejects the entire npm release when any staged Satelle npm package is missing, mismatched, or fails release validation instead of approving a partial platform package set @spec @later @phase4 @implemented
+- each interactive npm staged package approval has a 10 minute process deadline so a stalled 2FA prompt cannot block release finalization indefinitely @spec @later @phase4 @implemented
 - satelle local CLI can fetch a version-matched target host binary artifact for a different remote OS or architecture from the same release artifact set when SSH bootstrap or host update needs it @spec @mvp @implemented
 - satelle verifies integrity metadata for fetched native binary artifacts before uploading or executing them on a remote host @spec @mvp @implemented
 - satelle remote hosts do not need Node.js, npm, pnpm, or bun installed to run the Satelle Host Daemon because the uploaded host component is a self-contained native binary @spec @mvp @implemented
@@ -469,6 +471,7 @@
 - satelle setup prefers a user-level or login-session service over a privileged system service for native Computer Use hosts because visible desktop control usually belongs to the signed-in user session @spec @mvp @implemented
 - satelle setup uses a privileged system service only when the requested host mode requires it and the setup plan states the privilege, service account, and desktop-session implications before mutation @spec @mvp @implemented
 - satelle MVP binds each concrete host alias to one Satelle Desktop Binding instead of selecting a desktop user per run @spec @mvp @implemented
+- provider execution without an explicit Desktop Binding reports desktop-binding-required when the Host has none configured and desktop-binding-ambiguous only when it has multiple configured bindings @spec @phase4 @implemented
 - before first trust, a user-level Host Binding may set expected_host_id = null so setup can discover but not silently pre-trust the reachable Host Identity @spec @mvp @implemented
 - satelle setup defaults the Satelle Desktop Binding to the authenticated bootstrap OS account when that account has a compatible active desktop session @mvp @implemented
 - satelle setup supports setup-time desktop binding selection through an interactive prompt or user-level host configuration when multiple candidate desktop users are visible @mvp @implemented
@@ -625,7 +628,7 @@
 - a replayed migration begin must still prove current source maintenance ownership before it authorizes service stop; a rolled-back operation cannot reuse its historical request acknowledgement to stop newly admitted work @spec @contract @phase4 @implemented
 - source cleanup preserves its original file plan in the destination SQLite store before deleting source files, resumes an interrupted deletion from that plan, and persists the completed report for request replay @spec @contract @phase4 @implemented
 - satelle setup reports a typed host-binary-newer-than-cli error instead of downgrading automatically when the reachable Satelle Host Daemon version is newer than the invoking local CLI version @spec @mvp @implemented
-- satelle setup reports a typed host-artifact-unavailable error when the invoking local CLI release artifact set lacks a verified Host Daemon binary for the detected remote platform @spec @mvp @implemented
+- satelle setup and host update report a typed host-artifact-unavailable error with target_version and remote_platform details when the selected release lacks a verified Host Daemon binary for the detected remote platform @spec @contract @mvp @implemented
 - satelle exposes satelle host update as the explicit maintenance command for ordinary updates to Satelle host binaries and supported standalone Codex runtime components @implemented @mvp
 - satelle host update is distinct from setup and repair: setup onboards prerequisites, repair restores broken readiness or compatibility, and host update performs user-requested maintenance updates @spec @mvp @implemented
 - satelle host update does not start prompt execution or modify Satelle sessions as a side effect @spec @mvp @implemented
@@ -1055,6 +1058,7 @@
 - satelle machine-readable error modes never emit ANSI styling, spinners, progress bars, hyperlinks, or human help prose in the machine-readable error stream @spec @mvp @implemented
 - satelle parser and semantic usage errors write their error contract to stderr and leave stdout empty unless a command-specific streaming contract states otherwise @spec @mvp @implemented
 - every satelle.error.v1 envelope includes schema_version, code, category, retryable, message, details, docs_url, and suggested_commands, using null for unavailable details or docs_url and an empty array for unavailable suggestions @spec @contract @mvp @implemented
+- a computer-use-not-ready error with reason native_readiness_native_action_unavailable is retryable because the native action can become available after the user completes the required system action @spec @contract @mvp @implemented
 - satelle machine-readable error output is stable enough for AI clients and scripts to branch on code, category, retryable, and suggested_commands without parsing human text @spec @mvp @implemented
 - satelle JSON errors include a stable code, a human message, optional structured details, and actionable recovery guidance when the recovery path is known @implemented @mvp
 - satelle human error messages state the user-visible outcome first, explain the known cause, identify preserved state when relevant, and provide the next recovery step @spec @mvp @implemented
@@ -1567,6 +1571,7 @@
 - every accepted Queued Turn Request receives a public identifier using the exact rq_ prefix followed by a canonical lowercase UUIDv7 @spec @contract @phase4 @implemented
 - enqueueing creates a Queued Turn Request but no upstream thread or Turn; queued run creates its Session, upstream thread, and starting Turn atomically only when admitted, while queued steer links to its existing Session @spec @phase4 @implemented
 - satelle queue status <queue_request_id> and satelle queue cancel <queue_request_id> are the canonical inspection and cancellation commands @spec @phase4 @implemented
+- queue-request-not-found errors direct the user to check the public queue request identifier before retrying @spec @contract @phase4 @implemented
 - satelle queue status JSON v1 uses schema_version satelle.queue.status.v1 and includes queue_request_id, status, position, enqueued_at, expires_at, session_id, turn_id, failure, and state revision fields where applicable @spec @contract @phase4 @implemented
 - satelle queue cancel JSON v1 uses schema_version satelle.queue.cancel.v1 and includes queue_request_id, outcome, changed, session_id, and turn_id; outcome is cancelled or already_terminal @spec @contract @phase4 @implemented
 - queue cancel on an already admitted request reports queue-already-admitted with its Session and Turn identifiers plus a stop command instead of attempting to cancel the queue record @spec @phase4 @implemented
@@ -1577,6 +1582,7 @@
 - satelle queued run and steer requests are stored, ordered, and started by the target Host Daemon instead of by the local CLI process @spec @phase4 @implemented
 - satelle queued run and steer requests revalidate host reachability, native Computer Use readiness, provider Computer Use compatibility, desktop session resolution, and session existence immediately before starting instead of treating enqueue-time preflight as authorization to execute later @spec @phase4 @implemented
 - each Queued Turn Request stores the non-secret API Principal token id and token credential revision, immutable request digest, and requested execution policy without storing bearer-token material @spec @phase4 @implemented
+- each Queued Turn Request stores and restores the API Principal's durable setup state without granting ordinary queued principals setup-active authority @spec @phase4 @implemented
 - immediately before a queued request starts, the Host Daemon revalidates that its API Principal and token credential revision still exist, are not expired or revoked, retain the required scopes, and remain authorized by current Host, Desktop Binding, provider, YOLO, and execution-policy constraints @spec @phase4 @implemented
 - token expiry, revocation, or rotation cancels not-yet-started queued requests authorized by the affected token credential revision and records a typed queued-principal-no-longer-authorized outcome @spec @phase4 @implemented
 - satelle queued run and steer requests support explicit cancellation before they start and report typed errors for canceled, expired, full-queue, and pre-start-validation-failed outcomes @spec @phase4 @implemented
@@ -1589,8 +1595,10 @@
 - explicit queueing warns that the queued prompt and attachment staging must be retained until the request starts, is cancelled, or expires @spec @phase4 @implemented
 - queued prompt payloads are stored separately from Session and Turn metadata under the sensitive-state filesystem boundary @spec @phase4 @implemented
 - queued prompt payloads and attachments are deleted after Turn admission, cancellation, expiry, or bounded crash-recovery cleanup @spec @phase4 @implemented
+- Host Daemon startup reports failed expired or orphaned queue-payload deletion for later cleanup without blocking otherwise valid queue recovery @spec @phase4 @implemented
 - satelle queue status and logs expose queued position, enqueue time, expiry time, and normalized pre-start failure without exposing raw prompt or attachment content @spec @phase4 @implemented
 - Satelle Events distinguish turn_queued, queue_position_changed, turn_dequeued, turn_queue_cancelled, turn_queue_expired, and turn_queue_validation_failed @spec @phase4 @implemented
+- turn_queue_cancelled, turn_queue_expired, and turn_queue_validation_failed are terminal Satelle Events for their attached command stream, while turn_dequeued continues into the admitted Turn lifecycle @spec @phase4 @implemented
 - satelle maps each Satelle session to the underlying Codex thread, turn, and goal identifiers inside the Host Daemon adapter layer @spec @mvp @implemented
 - the Host Daemon durably persists each newly observed upstream Codex thread or Turn identifier before the Codex adapter continues waiting for later upstream work @mvp @implemented
 - persisting an upstream Codex identifier does not change Session or Turn lifecycle state, state revisions, safe logs, idempotency outcomes, or Control Lease ownership @mvp @implemented
@@ -1680,6 +1688,7 @@
 - satelle later exposes satelle desktop snapshot --host <alias> --output <path> as the only Desktop Snapshot Export command @spec @implemented
 - satelle desktop snapshot JSON v1 uses schema_version satelle.desktop.snapshot.v1 and includes source Host, Host Identity, Desktop Binding, output path, artifact format, artifact byte size, redaction metadata, and created_at @spec @contract @implemented
 - a Desktop Snapshot Export requires the selected Host Alias to resolve to exactly one trusted Host Identity and Desktop Binding and reports typed desktop-snapshot-target-required or desktop-snapshot-ambiguous errors otherwise @spec @implemented
+- the Host Daemon captures a Desktop Snapshot only when the authenticated API Principal is authorized for the selected Desktop Binding @spec @implemented
 - a Desktop Snapshot Export captures only the current visible desktop at invocation time, acquires the applicable Control Lease, reports host-busy on conflict, and never claims to export imagery from an earlier Session or Turn @spec @implemented
 - Desktop Snapshot Exports require an explicit --output <path> destination controlled by the invoking OS user and never choose an upload destination, support endpoint, cloud bucket, public URL, or remote storage destination automatically @spec @implemented
 - Desktop Snapshot Exports show the exact output path, artifact format, storage implication, redaction policy version, and remaining unredacted visual-risk categories before asking for confirmation @spec @implemented
@@ -1695,6 +1704,7 @@
 - satelle later run and steer accept --record <events|transcript|screenshots|video> and --record-retention <duration>; recording applies only to the Turn started by that invocation and begins only after preflight and explicit consent complete @spec @phase4 @implemented
 - satelle never reconstructs or labels a recording for an earlier Turn from retained Session metadata @spec @phase4 @implemented
 - recording modes require explicit consent for the prospective Turn before capturing screenshots, desktop video, full transcripts, or replayable Satelle Event streams @spec @phase4 @implemented
+- recording failure and abort paths independently attempt to delete video staging files and the recording directory even when artifact creation or recording-state cleanup fails @spec @phase4 @implemented
 - satelle recording mode consent is scoped to one prospective Turn request and its resulting Session and Turn and cannot be stored in project configuration, user configuration, Satelle Trusted Profiles, environment variables, YOLO mode, --yes, --verbose, --debug, --json, --events, or --plain @spec @phase4 @implemented
 - satelle Host Daemon enforces host recording policy before recording capture begins and refuses recording modes that the selected host policy disables or narrows @spec @phase4 @implemented
 - satelle recording mode preflight reports the selected mode, source Host, Host policy constraints, resolved recording_root, retention expiry, and known unredacted risk categories before asking for consent @spec @phase4 @implemented
@@ -1702,8 +1712,10 @@
 - satelle recording artifacts include a manifest with recording mode, session id, source host, created_at, artifact paths, retention expiry, redaction policy version, redaction categories applied, and known unredacted risk categories @spec @phase4 @implemented
 - satelle recording modes apply the default Satelle redaction policy to transcript, event, metadata, and text-derived artifacts before export or display @spec @phase4 @implemented
 - satelle recording modes that capture visible desktop pixels warn that screenshots or desktop video may contain unredacted visible desktop content even when metadata and text artifacts are redacted @spec @phase4 @implemented
+- satelle desktop video recording stops before staged PNG frames exceed 512 MiB and reports a typed video-too-large recording failure instead of allowing unbounded capture growth @spec @phase4 @implemented
 - satelle recording mode output reports every produced artifact path, retention expiry, and cleanup command so storage remains visible to the invoking user @spec @phase4 @implemented
 - satelle recording modes record audit metadata in the Host Daemon SQLite store without storing screenshot bytes, desktop video bytes, full transcripts, raw prompts, provider request bodies, provider response bodies, or raw artifact contents in the audit record @spec @phase4 @implemented
+- satelle keeps Session and Turn metadata referenced by a capturing or retained recording until recording cleanup removes the files and marks the audit failed or expired, so session retention cannot orphan recording artifacts @spec @phase4 @implemented
 - Host Daemon Session HTTP responses use the canonical PublicSession and PublicTurn lifecycle states and revisions and never embed Satelle Event streams or Controller-owned Host Alias fields @spec @contract @mvp @implemented
 - one upstream Codex thread identifier belongs to at most one Satelle Session, and recording it for another Session fails closed @implemented @mvp
 - one upstream Codex Turn identifier belongs to at most one Satelle Turn, and recording it for another Turn fails closed @implemented @mvp
@@ -2287,6 +2299,7 @@
 - satelle constructs OpenSSH argv values without invoking a local shell @spec @mvp @implemented
 - remote prompts, bearer tokens, provider secrets, and raw configuration are never embedded in SSH command strings @spec @mvp @implemented
 - SSH bootstrap tunnels bind only to Controller loopback by default @spec @mvp @implemented
+- satelle stops an SSH tunnel attempt with a typed internal readiness timeout when system OpenSSH does not bind the Controller loopback tunnel within 30 seconds @spec @mvp @implemented
 - id: cr4
   label: Host Daemon API authentication remains required inside an SSH tunnel
   command: cargo test --locked -p satelle --test http conformance::established_ssh_tunnel_requires_api_authentication_for_http_and_websocket -- --exact
@@ -2372,6 +2385,7 @@
 - the initial satelle crates.io package does not promise a stable public Rust library API @spec @later @phase4 @implemented
 - satelle crates.io publishing requires documented Cargo SemVer commitments, package owner policy, package contents policy, and CI-only publish controls before it can become part of a public release @spec @later @phase4 @implemented
 - satelle crates.io package versions, when introduced, use the same Satelle release version as GitHub release assets and npm-registry packages @spec @later @phase4 @implemented
+- after crates.io publication, registry readback retries preserve their 15-second backoff when a readback request fails at the transport layer @spec @release-gate @verification @later @phase4 @implemented
 - satelle crates.io publication remains a later release milestone rather than an MVP release blocker @spec @later @phase4 @implemented
 - satelle ordinary public release flow starts with a release pull request before any public package or binary publishing occurs @spec @mvp @implemented
 - satelle release pull request updates version metadata, Tegami changelog output, package lockfiles, generated package manifests, and release configuration needed for the target version @spec @mvp @implemented

@@ -183,9 +183,10 @@ impl RecordingPolicy {
             .min(higher.max_retention.milliseconds());
         self.max_retention = RecordingRetention::from_milliseconds(max_milliseconds)
             .expect("validated recording retention remains positive");
-        let default_milliseconds = higher
+        let default_milliseconds = self
             .default_retention
             .milliseconds()
+            .min(higher.default_retention.milliseconds())
             .min(max_milliseconds);
         self.default_retention = RecordingRetention::from_milliseconds(default_milliseconds)
             .expect("validated recording retention remains positive");
@@ -348,6 +349,17 @@ mod tests {
         host.narrow(&profile);
         assert!(host.permits(RecordingMode::Events, 24 * 60 * 60 * 1_000));
         assert!(!host.permits(RecordingMode::Transcript, 1));
+
+        let mut shorter_host_default = RecordingPolicy {
+            allowed_modes: [RecordingMode::Events].into_iter().collect(),
+            default_retention: RecordingRetention::parse("6h").unwrap(),
+            max_retention: RecordingRetention::parse("7d").unwrap(),
+        };
+        shorter_host_default.narrow(&profile);
+        assert_eq!(
+            shorter_host_default.default_retention.milliseconds(),
+            RecordingRetention::parse("6h").unwrap().milliseconds()
+        );
 
         let mut disabled = RecordingPolicy::default();
         disabled.narrow(&host);

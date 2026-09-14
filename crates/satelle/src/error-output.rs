@@ -251,13 +251,20 @@ pub(crate) fn error_envelope(error: &SatelleError) -> Value {
         schema_version: ERROR_SCHEMA_VERSION,
         code: error.code.as_str(),
         category: contract.category,
-        retryable: contract.retryable,
+        retryable: error_is_retryable(error, contract.retryable),
         message: &error.message,
         details,
         docs_url: None,
         suggested_commands: error.recovery_command.iter().map(String::as_str).collect(),
     })
     .expect("the closed error envelope is JSON serializable")
+}
+
+fn error_is_retryable(error: &SatelleError, retryable_by_code: bool) -> bool {
+    retryable_by_code
+        || (error.code == ErrorCode::ComputerUseNotReady
+            && error.details.get("reason").and_then(Value::as_str)
+                == Some("native_readiness_native_action_unavailable"))
 }
 
 pub(crate) fn error_categories() -> Vec<&'static str> {
@@ -486,14 +493,19 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
             outcome: "The requested work could not start.",
             default_recovery: "reduce concurrent work or wait for capacity, then retry",
         },
-        ErrorCode::HostNotFound
-        | ErrorCode::SessionNotFound
-        | ErrorCode::QueueRequestNotFound
-        | ErrorCode::LogsCursorExpired => ErrorContract {
+        ErrorCode::HostNotFound | ErrorCode::SessionNotFound | ErrorCode::LogsCursorExpired => {
+            ErrorContract {
+                category: ErrorCategory::NotFound,
+                retryable: false,
+                outcome: "The requested Satelle resource was not found.",
+                default_recovery: "check the configured Host or Session identifier and retry",
+            }
+        }
+        ErrorCode::QueueRequestNotFound => ErrorContract {
             category: ErrorCategory::NotFound,
             retryable: false,
-            outcome: "The requested Satelle resource was not found.",
-            default_recovery: "check the configured Host or Session identifier and retry",
+            outcome: "The requested queue entry was not found.",
+            default_recovery: "check the queue request identifier and retry",
         },
         ErrorCode::InvalidUsage
         | ErrorCode::ScopeSelectionConflict
@@ -924,10 +936,43 @@ mod tests {
     }
 
     #[test]
+    fn missing_queue_request_names_the_identifier_to_check() {
+        let contract = error_contract(ErrorCode::QueueRequestNotFound);
+
+        assert_eq!(contract.outcome, "The requested queue entry was not found.");
+        assert_eq!(
+            contract.default_recovery,
+            "check the queue request identifier and retry"
+        );
+    }
+
+    #[test]
     fn native_readiness_timeout_is_retryable_readiness_failure() {
         let contract = error_contract(ErrorCode::NativeReadinessTimeout);
         assert_eq!(contract.category.as_str(), "readiness");
         assert!(contract.retryable);
+    }
+
+    #[test]
+    fn unavailable_native_readiness_action_is_retryable() {
+        let mut error = error_with_code(ErrorCode::ComputerUseNotReady);
+        error.details.insert(
+            "reason".to_string(),
+            json!("native_readiness_native_action_unavailable"),
+        );
+
+        assert_eq!(error_envelope(&error)["retryable"], true);
+    }
+
+    #[test]
+    fn other_computer_use_readiness_failures_remain_non_retryable() {
+        let mut error = error_with_code(ErrorCode::ComputerUseNotReady);
+        assert_eq!(error_envelope(&error)["retryable"], false);
+
+        error
+            .details
+            .insert("reason".to_string(), json!("native_readiness_failed"));
+        assert_eq!(error_envelope(&error)["retryable"], false);
     }
 
     #[test]

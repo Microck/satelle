@@ -15,6 +15,7 @@ use time::OffsetDateTime;
 
 const VIDEO_FRAME_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_TEXT_RECORDING_BYTES: usize = 32 * 1024 * 1024;
+const MAX_VIDEO_RECORDING_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct RecordingCapture {
@@ -440,8 +441,10 @@ fn start_video_capture(directory: &Path) -> Result<VideoCapture, SatelleError> {
         .name("satelle-recording-video".to_string())
         .spawn(move || {
             let mut frames = Vec::new();
+            let mut captured_bytes = 0;
             loop {
                 let png = crate::host::desktop_snapshot::capture_current_desktop_png()?;
+                captured_bytes = next_video_capture_size(captured_bytes, png.len())?;
                 let path = worker_root.join(format!("frame-{:08}.png", frames.len() + 1));
                 write_private_new(&path, &png)?;
                 frames.push(path);
@@ -464,6 +467,21 @@ fn start_video_capture(directory: &Path) -> Result<VideoCapture, SatelleError> {
     })
 }
 
+fn next_video_capture_size(
+    captured_bytes: usize,
+    frame_bytes: usize,
+) -> Result<usize, SatelleError> {
+    captured_bytes
+        .checked_add(frame_bytes)
+        .filter(|bytes| *bytes <= MAX_VIDEO_RECORDING_BYTES)
+        .ok_or_else(|| {
+            recording_error(
+                "video_too_large",
+                "the desktop video recording exceeded its 512 MiB capture limit",
+            )
+        })
+}
+
 fn finish_video(state: &mut CaptureState) -> Result<Vec<RecordingArtifactMetadata>, SatelleError> {
     let mut video = state.video.take().ok_or_else(|| {
         recording_error(
@@ -472,36 +490,41 @@ fn finish_video(state: &mut CaptureState) -> Result<Vec<RecordingArtifactMetadat
         )
     })?;
     let _ = video.stop.send(());
-    let frames = video
-        .worker
-        .take()
-        .expect("video worker exists until finalization")
-        .join()
-        .map_err(|_| {
-            recording_error(
-                "video_worker_failed",
-                "the desktop video capture worker stopped unexpectedly",
-            )
-        })??;
-    if frames.is_empty() {
-        return Err(recording_error(
-            "video_empty",
-            "the desktop video recording produced no frames",
-        ));
-    }
-    let path = state.directory.join("desktop-video.avi");
-    write_mpng_avi(&path, &frames)?;
-    fs::remove_dir_all(&video.staging_root).map_err(|_| {
+    let finished = (|| {
+        let frames = video
+            .worker
+            .take()
+            .expect("video worker exists until finalization")
+            .join()
+            .map_err(|_| {
+                recording_error(
+                    "video_worker_failed",
+                    "the desktop video capture worker stopped unexpectedly",
+                )
+            })??;
+        if frames.is_empty() {
+            return Err(recording_error(
+                "video_empty",
+                "the desktop video recording produced no frames",
+            ));
+        }
+        let path = state.directory.join("desktop-video.avi");
+        write_mpng_avi(&path, &frames)?;
+        Ok(vec![artifact_metadata(
+            &path,
+            "video/x-motion-png",
+            state.created_at,
+        )?])
+    })();
+    let cleaned = fs::remove_dir_all(&video.staging_root).map_err(|_| {
         recording_error(
             "video_staging_cleanup_failed",
             "desktop video staging files could not be removed",
         )
-    })?;
-    Ok(vec![artifact_metadata(
-        &path,
-        "video/x-motion-png",
-        state.created_at,
-    )?])
+    });
+    let artifacts = finished?;
+    cleaned?;
+    Ok(artifacts)
 }
 
 fn write_mpng_avi(path: &Path, frames: &[PathBuf]) -> Result<(), SatelleError> {
@@ -885,5 +908,15 @@ mod tests {
         assert_eq!(&bytes[..4], b"RIFF");
         assert!(bytes.windows(4).any(|window| window == b"MPNG"));
         assert!(bytes.windows(4).any(|window| window == b"idx1"));
+    }
+
+    #[test]
+    fn video_capture_rejects_the_frame_that_would_exceed_its_budget() {
+        assert_eq!(
+            next_video_capture_size(MAX_VIDEO_RECORDING_BYTES - 1, 1).unwrap(),
+            MAX_VIDEO_RECORDING_BYTES
+        );
+        let error = next_video_capture_size(MAX_VIDEO_RECORDING_BYTES, 1).unwrap_err();
+        assert_eq!(error.details["recording_reason"], "video_too_large");
     }
 }

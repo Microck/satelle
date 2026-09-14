@@ -264,6 +264,8 @@ pub(super) struct ExecutionPlan {
     pub(super) attachments: crate::host::attachment::StagedAttachments,
     pub(super) live_events: super::request::LocalLiveEventBuffer,
     pub(super) raw_protocol_capture: Option<crate::host::raw_diagnostics::RawProtocolCapture>,
+    pub(super) _raw_protocol_completion:
+        Option<crate::host::raw_diagnostics::RawDiagnosticCompletion>,
     pub(super) recording_capture: Option<crate::host::recording::RecordingCapture>,
 }
 
@@ -423,11 +425,16 @@ impl RuntimeEngine {
         };
         let recording_id = capture.recording_id()?;
         let directory = capture.directory()?;
-        capture.abort()?;
-        self.lock_storage()?
-            .fail_recording(&recording_id)
-            .map_err(model::storage_failure)?;
-        super::remove_recording_directory(&directory)
+        let stopped = capture.abort();
+        let failed = self.lock_storage().and_then(|storage| {
+            storage
+                .fail_recording(&recording_id)
+                .map_err(model::storage_failure)
+        });
+        let removed = super::remove_recording_directory(&directory);
+        stopped?;
+        failed?;
+        removed
     }
 
     fn execute_once(
@@ -500,13 +507,6 @@ impl RuntimeEngine {
             .with_raw_protocol_capture(plan.raw_protocol_capture.clone())
             .with_recording_capture(plan.recording_capture.clone()),
         );
-        if plan.raw_protocol_capture.is_some() {
-            self.raw_diagnostics.complete(
-                Arc::clone(&self.storage),
-                &turn_id,
-                OffsetDateTime::now_utc(),
-            );
-        }
         let result = match adapter_result {
             Ok(result) => result,
             Err(error) => {

@@ -2645,6 +2645,28 @@ mod tests {
     }
 
     #[test]
+    fn desktop_snapshot_rejects_a_principal_without_the_binding_grant() {
+        let state = crate::host::TestStateDir::new().expect("temporary state directory");
+        let service = HostService::local_demo_for_tests_at(state.path())
+            .expect("construct deterministic service");
+        let principal = broker_principal(&["another-binding"]);
+
+        let Err(error) = service.capture_desktop_snapshot(
+            &principal,
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "local-demo-console",
+        ) else {
+            panic!("the principal cannot capture another binding's desktop");
+        };
+
+        assert_eq!(
+            error.code,
+            crate::core::ErrorCode::DesktopBindingUnauthorized
+        );
+    }
+
+    #[test]
     fn broker_hides_sessions_from_principals_without_the_binding_grant() {
         let state = crate::host::TestStateDir::new().expect("temporary state directory");
         let service = HostService::local_demo_for_tests_at(state.path())

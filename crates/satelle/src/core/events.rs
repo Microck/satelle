@@ -85,6 +85,9 @@ impl EventType {
         matches!(
             self,
             Self::CommandFailed
+                | Self::TurnQueueCancelled
+                | Self::TurnQueueExpired
+                | Self::TurnQueueValidationFailed
                 | Self::TurnCompleted
                 | Self::TurnBlocked
                 | Self::TurnFailed
@@ -685,6 +688,15 @@ mod tests {
         assert!(EventType::TurnStarted.requires_turn_subject());
 
         for event_type in [
+            EventType::TurnQueueCancelled,
+            EventType::TurnQueueExpired,
+            EventType::TurnQueueValidationFailed,
+        ] {
+            assert!(event_type.is_terminal());
+            assert!(!event_type.requires_turn_subject());
+        }
+
+        for event_type in [
             EventType::TurnCompleted,
             EventType::TurnBlocked,
             EventType::TurnFailed,
@@ -698,6 +710,9 @@ mod tests {
             EventType::Preflight,
             EventType::Readiness,
             EventType::ProviderSmoke,
+            EventType::TurnQueued,
+            EventType::QueuePositionChanged,
+            EventType::TurnDequeued,
             EventType::TurnProgress,
             EventType::ActionRequired,
         ] {

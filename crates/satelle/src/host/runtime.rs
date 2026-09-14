@@ -641,7 +641,10 @@ fn selected_provider_desktop_binding(
     if let Some(binding) = provider_intent.desktop_binding() {
         return Ok(binding.clone());
     }
-    if configured.len() != 1 {
+    if configured.is_empty() {
+        return Err(SatelleError::desktop_binding_required(&BTreeSet::new()));
+    }
+    if configured.len() > 1 {
         return Err(SatelleError::desktop_binding_ambiguous(
             configured.keys().cloned(),
         ));
@@ -939,7 +942,13 @@ impl RuntimeEngine {
             .expire_queue_requests(observed_at)
             .map_err(model::storage_failure)?
         {
-            queue_payloads.delete(&record.payload_file)?;
+            if let Err(error) = queue_payloads.delete(&record.payload_file) {
+                tracing::warn!(
+                    ?error,
+                    payload_file = %record.payload_file,
+                    "could not remove an expired queue payload"
+                );
+            }
         }
         let retained_queue_payloads = storage
             .queued_payload_files()
@@ -947,7 +956,9 @@ impl RuntimeEngine {
             .into_iter()
             .map(|(file_name, _)| file_name)
             .collect();
-        queue_payloads.retain_only(&retained_queue_payloads)?;
+        if let Err(error) = queue_payloads.retain_only(&retained_queue_payloads) {
+            tracing::warn!(?error, "could not prune orphaned queue payloads");
+        }
         storage.set_log_retention(storage_policy.sqlite_log_retention);
         if let Some(fingerprinter) = provider_smoke_fingerprinter {
             let key = storage
@@ -2468,6 +2479,13 @@ impl RuntimeEngine {
                         time::OffsetDateTime::now_utc(),
                     ))
                 });
+                let raw_protocol_completion = raw_protocol_capture.as_ref().map(|_| {
+                    crate::host::raw_diagnostics::RawDiagnosticCompletion::new(
+                        self.raw_diagnostics.clone(),
+                        Arc::clone(&self.storage),
+                        work.subject.turn_id().clone(),
+                    )
+                });
                 let recording_capture = match execution.recording {
                     Some(recording) => Some(self.begin_recording(
                         &recording.principal_ref,
@@ -2490,6 +2508,7 @@ impl RuntimeEngine {
                     attachments: execution.attachments,
                     live_events: execution.live_events,
                     raw_protocol_capture,
+                    _raw_protocol_completion: raw_protocol_completion,
                     recording_capture,
                 };
                 match execution.dispatch_preference {
@@ -4771,35 +4790,23 @@ impl RuntimeHandle {
         queue_request_id: &QueueRequestId,
     ) -> Result<Option<StoredQueueRecord>, SatelleError> {
         let engine = self.engine()?;
-        let before = engine
-            .lock_storage()?
-            .queue_status(principal_ref, queue_request_id)
-            .map_err(model::storage_failure)?;
-        let record = engine
+        let cancellation = engine
             .lock_storage()?
             .cancel_queue_request(principal_ref, queue_request_id)
             .map_err(model::storage_failure)?;
-        if let Some(record) = &record
-            && record.status.status == crate::core::queue::QueueRequestStatus::Cancelled
-            && before.as_ref().is_some_and(|before| {
-                before.status.status == crate::core::queue::QueueRequestStatus::Queued
-            })
+        if let Some(cancellation) = &cancellation
+            && let Some(cancelled_position) = cancellation.cancelled_position
         {
+            let record = &cancellation.record;
             engine.queue_payloads.delete(&record.payload_file)?;
             engine.publish_queue_event(
                 crate::core::EventType::TurnQueueCancelled,
                 &record.status,
                 "cancelled queued Turn request",
             )?;
-            self.publish_queue_position_changes(
-                &record.lease_key,
-                before
-                    .as_ref()
-                    .and_then(|before| before.status.position)
-                    .unwrap_or(1),
-            )?;
+            self.publish_queue_position_changes(&record.lease_key, cancelled_position)?;
         }
-        Ok(record)
+        Ok(cancellation.map(|cancellation| cancellation.record))
     }
 
     pub(crate) fn read_queued_turn(

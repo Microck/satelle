@@ -318,7 +318,7 @@ planning work without changing the migration contract.
   authenticated phase with a durable operation identity. Activation failures
   enter the recorded rollback path and retain explicit recovery commands.
 - A successful migration preserves and fences the source as a rollback copy.
-  `host storage cleanup` deletes only the recorded unchanged source files and
+  `host storage source cleanup` deletes only the recorded unchanged source files and
   can resume after a partial cleanup.
 
 ## Mutual TLS contract decisions

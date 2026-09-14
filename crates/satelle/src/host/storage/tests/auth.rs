@@ -61,12 +61,17 @@ fn client_certificate_audit_survives_restart_and_obeys_log_retention() {
         })
         .unwrap();
     assert_eq!(count, 0);
+    let older_request_id = uuid::Uuid::now_v7();
     storage
-        .record_client_certificate_auth(&principal, request_id, &[2; 32], at(1))
+        .record_client_certificate_auth(&principal, older_request_id, &[2; 32], at(1))
+        .unwrap();
+    let current_request_id = uuid::Uuid::now_v7();
+    storage
+        .record_client_certificate_auth(&principal, current_request_id, &[3; 32], at(3))
         .unwrap();
     storage
-        .record_client_certificate_auth(&principal, request_id, &[3; 32], at(3))
-        .unwrap();
+        .prune_expired_session_metadata(at(3))
+        .expect("prune certificate audit through retention ownership");
     let fingerprints = storage
         .connection_for_test()
         .prepare("SELECT certificate_sha256 FROM client_certificate_audit")

@@ -808,7 +808,14 @@ test(
   { skip: process.platform !== "win32" },
   (context) => {
     const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-long-exec-"));
-    context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+    context.after(() =>
+      rmSync(fixtureRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 20,
+        retryDelay: 100,
+      }),
+    );
     const longRoot = path.join(
       fixtureRoot,
       ...Array.from({ length: 12 }, () => "pnpm-dlx-package-layout"),

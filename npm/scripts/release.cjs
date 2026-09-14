@@ -62,6 +62,14 @@ function fail(code, message) {
   throw new ReleaseError(code, message);
 }
 
+function readWorkspaceVersion(repositoryRoot = defaultRepositoryRoot) {
+  const cargo = readFileSync(path.join(repositoryRoot, "Cargo.toml"), "utf8");
+  const workspacePackage = cargo.match(/\[workspace\.package\]([\s\S]*?)(?:\n\[|$)/);
+  const version = workspacePackage?.[1].match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+  if (!version) fail("release-version-missing", "Cargo workspace version is missing");
+  return version;
+}
+
 function readJson(filePath) {
   return JSON.parse(readFileSync(filePath, "utf8"));
 }
@@ -795,14 +803,6 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
     return path.join(npmRoot, packageDirectory(packageName), "package.json");
   }
 
-  function readWorkspaceVersion() {
-    const cargo = readFileSync(path.join(repositoryRoot, "Cargo.toml"), "utf8");
-    const workspacePackage = cargo.match(/\[workspace\.package\]([\s\S]*?)(?:\n\[|$)/);
-    const version = workspacePackage?.[1].match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-    if (!version) fail("release-version-missing", "Cargo workspace version is missing");
-    return version;
-  }
-
   function validatePublishMetadata(packageName, manifest) {
     if (
       manifest.private === true ||
@@ -945,7 +945,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
   }
 
   function validateReleaseState(tag) {
-    const version = readWorkspaceVersion();
+    const version = readWorkspaceVersion(repositoryRoot);
     if (tag !== undefined && tag !== `v${version}`) {
       fail(
         "release-version-mismatch",
@@ -2576,6 +2576,7 @@ if (require.main === module) {
 module.exports = {
   ReleaseError,
   createReleaseContext,
+  readWorkspaceVersion,
   sha512Integrity,
   zipInflateMaximumOutputLength,
 };

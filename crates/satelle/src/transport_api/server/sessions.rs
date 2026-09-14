@@ -466,14 +466,14 @@ pub(super) async fn capture_desktop_snapshot(
     {
         return request_error(&state, &authorized, "desktop snapshot target is invalid");
     }
-    let principal_ref = authorized.principal().principal_ref().to_string();
+    let principal = authorized.principal().clone();
     let source_host = request.source_host().to_string();
     let desktop_binding = request.desktop_binding().to_string();
     let desktop_session_identity = request.desktop_session_identity().to_string();
     let service = Arc::clone(&state.service);
     let artifact = match host_call(&state, &authorized, move || {
         service.capture_desktop_snapshot(
-            &principal_ref,
+            &principal,
             &source_host,
             &desktop_binding,
             &desktop_session_identity,

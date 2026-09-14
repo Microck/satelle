@@ -753,7 +753,7 @@ pub enum PublicPayloadGuard {
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum AuthorityModelError {
-    #[error("an MVP Host requires exactly one explicitly authorized Desktop Binding")]
+    #[error("a Host requires at least one explicitly authorized Desktop Binding")]
     MissingDesktopBinding,
     #[error("an MVP Host cannot own more than one Desktop Binding")]
     MultipleDesktopBindings,

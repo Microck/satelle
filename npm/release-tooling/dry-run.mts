@@ -13,9 +13,11 @@ import { tegami } from "tegami";
 import { cargo } from "tegami/plugins/cargo";
 import tegamiPackage from "tegami/package.json" with { type: "json" };
 import type { TegamiPlugin } from "tegami";
+import releaseTooling from "../scripts/release.cjs";
 
 const toolRoot = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(toolRoot, "../..");
+const { readWorkspaceVersion } = releaseTooling;
 
 function cargoInventory(capture: string[]): TegamiPlugin {
   return {
@@ -58,10 +60,7 @@ const repositoryPaper = tegami({
   plugins: [cargo({ bumpDep: () => false }), cargoInventory(discoveredCargoPackages)],
 });
 await repositoryPaper.draft();
-const expectedCargoPackage = `cargo:satelle@${readFileSync(
-  path.join(repositoryRoot, "Cargo.toml"),
-  "utf8",
-).match(/^version = "([^"]+)"$/m)?.[1]}`;
+const expectedCargoPackage = `cargo:satelle@${readWorkspaceVersion(repositoryRoot)}`;
 if (
   discoveredCargoPackages.length !== 1 ||
   discoveredCargoPackages[0] !== expectedCargoPackage

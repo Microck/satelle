@@ -241,6 +241,56 @@ fn terminal_session_expires_only_after_the_exact_seven_day_boundary() {
 }
 
 #[test]
+fn session_retention_waits_for_recording_cleanup() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let terminal_at = at(1);
+    let session = terminal_session(&mut storage, SESSION_1, TURN_1, at(0), terminal_at);
+    let recording_expires_at = terminal_at + time::Duration::days(30);
+    storage
+        .begin_recording(
+            "recording-retention-test",
+            "principal-test",
+            session.id(),
+            &turn_id(TURN_1),
+            "host-test",
+            crate::core::recording::RecordingMode::Events,
+            std::path::Path::new("/recordings/recording-retention-test"),
+            terminal_at,
+            recording_expires_at,
+        )
+        .expect("record the retained artifact owner");
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE recording_audit SET status = 'retained' WHERE recording_id = ?1",
+            ["recording-retention-test"],
+        )
+        .expect("finish the recording fixture");
+
+    storage
+        .prune_expired_session_metadata(terminal_at + time::Duration::days(8))
+        .expect("retain metadata that still owns recording files");
+    assert!(storage.load_session(session.id()).unwrap().is_some());
+    assert_eq!(
+        table_rows_for_session(&storage, "recording_audit", session.id()),
+        1
+    );
+
+    storage
+        .mark_recordings_expired(recording_expires_at)
+        .expect("record successful file cleanup");
+    storage
+        .prune_expired_session_metadata(recording_expires_at + time::Duration::NANOSECOND)
+        .expect("prune metadata after recording cleanup");
+    assert!(storage.load_session(session.id()).unwrap().is_none());
+    assert_eq!(
+        table_rows_for_session(&storage, "recording_audit", session.id()),
+        0
+    );
+}
+
+#[test]
 fn terminal_setup_ledgers_expire_only_after_the_exact_thirty_day_boundary() {
     for status in [
         SetupRunStatus::Completed,

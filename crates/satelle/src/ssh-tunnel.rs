@@ -3,11 +3,12 @@ use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const REMOTE_DAEMON_PORT: u16 = 3001;
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const HOST_KEY_FAILURE_MARKERS: [&[u8]; 2] = [
     b"Host key verification failed.",
     b"REMOTE HOST IDENTIFICATION HAS CHANGED!",
@@ -68,6 +69,7 @@ impl SshTunnel {
     }
 
     fn wait_until_listening(&mut self) -> Result<(), SshTunnelError> {
+        let deadline = Instant::now() + READY_TIMEOUT;
         loop {
             if self
                 .child
@@ -76,6 +78,9 @@ impl SshTunnel {
                 .is_some()
             {
                 return Err(self.exited_before_ready());
+            }
+            if Instant::now() >= deadline {
+                return Err(SshTunnelError::ReadinessTimeout);
             }
             if let Ok(connection) = TcpStream::connect(self.local_addr) {
                 drop(connection);
@@ -193,6 +198,8 @@ pub(super) enum SshTunnelError {
     HostKeyVerificationRequired,
     #[error("system OpenSSH exited before the tunnel became ready")]
     ExitedBeforeReady,
+    #[error("system OpenSSH did not make the tunnel ready before the deadline")]
+    ReadinessTimeout,
 }
 
 #[cfg(test)]

@@ -285,6 +285,8 @@ fn terminal_session_candidates(
 ) -> Result<Vec<SessionId>, StorageError> {
     // The turns table CHECK constraint makes terminal_at NULL exactly for
     // nonterminal states, so retention does not duplicate the state tokens.
+    // Recording audit rows own their external directories until cleanup moves
+    // them out of capturing or retained state.
     let mut statement = connection
         .prepare(
             "SELECT s.session_id, latest.terminal_at
@@ -308,6 +310,11 @@ fn terminal_session_candidates(
                    SELECT 1 FROM logs retained_log
                    WHERE retained_log.session_id = s.session_id
                      AND retained_log.recorded_at_unix_nanos >= ?1
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM recording_audit recording
+                   WHERE recording.session_id = s.session_id
+                     AND recording.status IN ('capturing', 'retained')
                )
              ORDER BY s.session_id",
         )

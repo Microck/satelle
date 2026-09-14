@@ -1294,7 +1294,7 @@ impl TransportClient for LocalTransport {
         &self,
         request: &satelle::transport::DesktopSnapshotCaptureRequest,
     ) -> Result<satelle::core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
-        self.service.capture_desktop_snapshot(
+        self.service.capture_local_desktop_snapshot(
             "local-principal-v1",
             request.source_host(),
             request.desktop_binding(),
@@ -7014,9 +7014,9 @@ fn map_host_update_plan_error(error: crate::host_update::HostUpdatePlanError) ->
             cli_version,
         } => SatelleError::host_binary_newer_than_cli(&host_version, &cli_version),
         HostUpdatePlanError::HostArtifactUnavailable {
-            cli_version,
+            target_version,
             remote_platform,
-        } => SatelleError::host_artifact_unavailable(&cli_version, &remote_platform),
+        } => SatelleError::host_artifact_unavailable(&target_version, &remote_platform),
         HostUpdatePlanError::HostUpdateRequiresCliUpgrade { cli_version } => {
             SatelleError::host_update_requires_cli_upgrade(&cli_version)
         }
@@ -11754,7 +11754,7 @@ mod bootstrap_ordering_tests {
             serde_json::json!("darwin-arm64")
         );
         assert_eq!(
-            missing_error.details["cli_version"],
+            missing_error.details["target_version"],
             serde_json::json!("1.2.3")
         );
 

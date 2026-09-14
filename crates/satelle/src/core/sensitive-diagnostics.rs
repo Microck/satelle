@@ -182,7 +182,7 @@ impl DesktopSnapshotManifest {
             && self
                 .desktop_session_identity
                 .as_deref()
-                .is_some_and(|identity| !identity.is_empty())
+                .is_none_or(|identity| !identity.is_empty())
             && self
                 .included
                 .iter()
@@ -533,6 +533,7 @@ impl DiagnosticRedactor {
                     }
                 }
                 redact_authorization_text(text);
+                redact_sensitive_assignments(text);
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
@@ -707,5 +708,28 @@ mod tests {
             "ordinary [REDACTED] text\nOPENAI_API_KEY=[REDACTED]\nAuthorization:[REDACTED]\nerror: safe detail\n"
         );
         assert!(redactor.redact_text(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn validates_an_unknown_desktop_session_and_redacts_assignments_in_json_strings() {
+        let mut manifest = DesktopSnapshotManifest::new(
+            uuid::Uuid::now_v7().hyphenated().to_string(),
+            "demo",
+            "host-id",
+            "desktop",
+            None,
+            1,
+        );
+        assert!(manifest.has_valid_contract());
+        manifest.desktop_session_identity = Some(String::new());
+        assert!(!manifest.has_valid_contract());
+
+        let redacted = DiagnosticRedactor::default()
+            .redact_json(br#"{"message":"OPENAI_API_KEY=KEY_CANARY\nsafe detail"}"#)
+            .unwrap();
+        assert_eq!(
+            redacted["message"],
+            "OPENAI_API_KEY=[REDACTED]\nsafe detail"
+        );
     }
 }

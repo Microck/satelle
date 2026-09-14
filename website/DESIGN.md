@@ -375,8 +375,8 @@ sources, all in this repository:
 | Log cursor shape | `slc1_%016x` |
 | Session id shape | `rs_` + UUIDv7, lowercase (`crates/satelle/src/core/ids.rs`) |
 | MCP tool names | `crates/satelle/src/mcp/schema.rs`: `config_check`, `config_explain`, `paths`, `status`, `logs`, `doctor`, `host_status`, `host_sessions`, and mutations `run`, `steer`, `stop`, `setup`, `repair`, `host_update`, `host_lifecycle` |
-| Flags | `docs/reference/generated-cli.mdx`, which CI checks against `satelle --help` |
-| Schema versions | `satelle.run.v2`, `satelle.status.v2`, `satelle.steer.v2`, `satelle.stop.v1`, `satelle.doctor.v1`, `satelle.events.v2`, `satelle.logs.entry.v1` |
+| Flags | `docs/reference/generated-cli.mdx`, which CI checks against native `satelle --help` output and JavaScript launcher help for `satelle native repair` |
+| Schema versions | `satelle.run.v2`, `satelle.status.v2`, `satelle.steer.v2`, `satelle.stop.v1`, `satelle.doctor.v1`, `satelle.events.v2`, `satelle.logs.entry.v2` |
 
 Demo task content comes from an independent computer-use showcase pack (MIT):
 four synthetic desktop workflows in LibreOffice Calc, KiCad, Godot, and

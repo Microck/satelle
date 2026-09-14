@@ -283,7 +283,12 @@ test("npm, pnpm, and Bun install and execute the unscoped forwarding package", (
     const nativePackageManifest = createRequire(canonicalLauncherPath).resolve(
       `${currentTargetEntry()[1].packageName}/package.json`,
     );
-    rmSync(path.dirname(nativePackageManifest), { recursive: true, force: true });
+    rmSync(path.dirname(nativePackageManifest), {
+      recursive: true,
+      force: true,
+      maxRetries: 20,
+      retryDelay: 100,
+    });
     const missingNativeExecution = spawnCommand(executable, [], {
       cwd: consumerRoot,
       encoding: "utf8",
@@ -446,7 +451,12 @@ test("native repair uses real package managers to restore a missing native depen
       realpathSync(path.join(consumerRoot, "node_modules", "satelle", "package.json")),
     ).resolve("@microck/satelle/launcher");
     const nativeManifestPath = createRequire(canonicalLauncher).resolve(`${target.packageName}/package.json`);
-    rmSync(path.dirname(nativeManifestPath), { recursive: true, force: true });
+    rmSync(path.dirname(nativeManifestPath), {
+      recursive: true,
+      force: true,
+      maxRetries: 20,
+      retryDelay: 100,
+    });
     const before = readFileSync(manifestPath);
     const preview = spawnCommand(executable, ["native", "repair", "--dry-run"], {
       cwd: consumerRoot, encoding: "utf8", env: environment,

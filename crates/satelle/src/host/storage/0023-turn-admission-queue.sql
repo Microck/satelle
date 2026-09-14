@@ -35,7 +35,7 @@ CREATE INDEX turn_admission_queue_fifo
 ON turn_admission_queue(lease_key, status, rtrim(enqueued_at, 'Z'), queue_request_id);
 
 CREATE INDEX turn_admission_queue_expiry
-ON turn_admission_queue(status, expires_at);
+ON turn_admission_queue(status, rtrim(expires_at, 'Z'));
 
 -- Queue lifecycle logs use the normal authoritative Log Cursor stream. The
 -- queue status JSON is the same redacted public object returned by queue

@@ -18,6 +18,7 @@ const repositoryRoot = path.resolve(__dirname, "../..");
 const versionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const sha1Pattern = /^[0-9a-f]{40}$/;
+const stagedApprovalTimeoutMilliseconds = 600_000;
 
 class StagedReleaseError extends Error {
   constructor(code, message) {
@@ -279,7 +280,11 @@ function reviewAndApprove(recordPath) {
     // No 2FA prompt can occur until every package's metadata, OIDC provenance,
     // release version, archive contents, and exact digest have passed above.
     for (const entry of record.packages) {
-      execFileSync("npm", ["stage", "approve", entry.stageId], { stdio: "inherit" });
+      execFileSync("npm", ["stage", "approve", entry.stageId], {
+        stdio: "inherit",
+        timeout: stagedApprovalTimeoutMilliseconds,
+        killSignal: "SIGTERM",
+      });
     }
   } finally {
     rmSync(reviewRoot, { recursive: true, force: true });

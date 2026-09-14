@@ -65,6 +65,11 @@ pub(crate) enum QueueEnqueueOutcome {
     Full,
 }
 
+pub(crate) struct QueueCancellation {
+    pub(crate) record: StoredQueueRecord,
+    pub(crate) cancelled_position: Option<u16>,
+}
+
 impl Storage {
     pub(crate) fn queued_payload_files(&self) -> Result<Vec<(String, String)>, StorageError> {
         self.connection
@@ -206,7 +211,8 @@ impl Storage {
         let queue_request_ids = transaction
             .prepare(
                 "SELECT queue_request_id FROM turn_admission_queue
-                 WHERE status = 'queued' AND expires_at <= ?1",
+                 WHERE status = 'queued'
+                   AND rtrim(expires_at, 'Z') <= rtrim(?1, 'Z')",
             )
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?
             .query_map(params![cutoff], |row| row.get::<_, String>(0))
@@ -231,7 +237,8 @@ impl Storage {
             .execute(
                 "UPDATE turn_admission_queue
                  SET status = 'expired', state_revision = state_revision + 1
-                 WHERE status = 'queued' AND expires_at <= ?1",
+                 WHERE status = 'queued'
+                   AND rtrim(expires_at, 'Z') <= rtrim(?1, 'Z')",
                 params![cutoff],
             )
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
@@ -330,7 +337,7 @@ impl Storage {
         &mut self,
         principal_ref: &str,
         queue_request_id: &QueueRequestId,
-    ) -> Result<Option<StoredQueueRecord>, StorageError> {
+    ) -> Result<Option<QueueCancellation>, StorageError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -338,7 +345,11 @@ impl Storage {
         let Some(before) = load_queue_record(&transaction, principal_ref, queue_request_id)? else {
             return Ok(None);
         };
-        if before.status.status == QueueRequestStatus::Queued {
+        let cancelled_position = if before.status.status == QueueRequestStatus::Queued {
+            let position = before
+                .status
+                .position
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
             transaction
                 .execute(
                     "UPDATE turn_admission_queue
@@ -347,7 +358,10 @@ impl Storage {
                     params![queue_request_id.as_str()],
                 )
                 .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        }
+            Some(position)
+        } else {
+            None
+        };
         let after = load_queue_record(&transaction, principal_ref, queue_request_id)?
             .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
         if before.status.status == QueueRequestStatus::Queued
@@ -367,7 +381,10 @@ impl Storage {
         transaction
             .commit()
             .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-        Ok(Some(after))
+        Ok(Some(QueueCancellation {
+            record: after,
+            cancelled_position,
+        }))
     }
 
     pub(crate) fn admit_queue_request(
@@ -816,7 +833,17 @@ mod tests {
             .cancel_queue_request("principal-test", &first_id)
             .expect("cancel first")
             .expect("first exists");
-        assert_eq!(cancelled.status.status, QueueRequestStatus::Cancelled);
+        assert_eq!(cancelled.cancelled_position, Some(1));
+        assert_eq!(
+            cancelled.record.status.status,
+            QueueRequestStatus::Cancelled
+        );
+        let replayed = storage
+            .cancel_queue_request("principal-test", &first_id)
+            .expect("replay cancellation")
+            .expect("first still exists");
+        assert_eq!(replayed.cancelled_position, None);
+        assert_eq!(replayed.record.status.state_revision, 2);
         let moved = storage
             .advance_queue_positions("host-test:desktop-test", 1)
             .expect("commit the derived FIFO position change");
@@ -824,7 +851,7 @@ mod tests {
         assert_eq!(moved[0].status.position, Some(1));
         assert_eq!(moved[0].status.state_revision, 2);
         let expired = storage
-            .expire_queue_requests(at + time::Duration::HOUR + time::Duration::SECOND)
+            .expire_queue_requests(at + time::Duration::HOUR + time::Duration::milliseconds(300))
             .expect("expire remaining request");
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].0.status.status, QueueRequestStatus::Expired);

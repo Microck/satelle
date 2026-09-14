@@ -4756,6 +4756,31 @@ impl HostService {
 
     pub fn capture_desktop_snapshot(
         &self,
+        principal: &ApiPrincipal,
+        source_host: &str,
+        desktop_binding: &str,
+        desktop_session_identity: &str,
+    ) -> Result<crate::core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
+        let desktop_binding = crate::core::session::DesktopBindingRef::new(desktop_binding)
+            .map_err(|_| SatelleError::desktop_snapshot_target_required(source_host))?;
+        if !principal.allows_desktop_binding(desktop_binding.as_str()) {
+            return Err(SatelleError::desktop_binding_unauthorized(
+                desktop_binding.as_str(),
+            ));
+        }
+        self.capture_desktop_snapshot_for_owner(
+            principal.principal_ref(),
+            source_host,
+            &desktop_binding,
+            desktop_session_identity,
+        )
+    }
+
+    /// The same-process transport is trusted and has no bearer-token Desktop
+    /// Binding grant to recheck. Remote transports must use the principal-aware
+    /// capture path above.
+    pub fn capture_local_desktop_snapshot(
+        &self,
         principal_ref: &str,
         source_host: &str,
         desktop_binding: &str,
@@ -4763,6 +4788,21 @@ impl HostService {
     ) -> Result<crate::core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
         let desktop_binding = crate::core::session::DesktopBindingRef::new(desktop_binding)
             .map_err(|_| SatelleError::desktop_snapshot_target_required(source_host))?;
+        self.capture_desktop_snapshot_for_owner(
+            principal_ref,
+            source_host,
+            &desktop_binding,
+            desktop_session_identity,
+        )
+    }
+
+    fn capture_desktop_snapshot_for_owner(
+        &self,
+        principal_ref: &str,
+        source_host: &str,
+        desktop_binding: &crate::core::session::DesktopBindingRef,
+        desktop_session_identity: &str,
+    ) -> Result<crate::core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
         let desktop_user = self
             .runtime
             .desktop_user_for_binding(desktop_binding.as_str())?;
@@ -4785,7 +4825,7 @@ impl HostService {
         self.runtime.capture_desktop_snapshot(
             principal_ref,
             source_host,
-            &desktop_binding,
+            desktop_binding,
             desktop_session_identity,
         )
     }

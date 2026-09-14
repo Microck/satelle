@@ -1289,6 +1289,7 @@ mod tests {
             "schema": WINDOWS_SERVICE_CONFIG_SCHEMA,
             "daemon_arguments": ["host", "start", "--foreground", "--bind", "127.0.0.1:3001"],
             "environment": {},
+            "queue": crate::core::queue::QueueConfig::default(),
             "storage_policy": {
                 "setup_ledger_retention_ms": 0,
                 "session_metadata_retention_hours": 720,

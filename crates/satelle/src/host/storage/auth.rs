@@ -312,41 +312,22 @@ impl ApiTokenMutation {
 
 impl Storage {
     pub(crate) fn record_client_certificate_auth(
-        &mut self,
+        &self,
         principal: &ApiPrincipal,
         request_id: Uuid,
         certificate_sha256: &[u8; 32],
         at: OffsetDateTime,
     ) -> Result<(), StorageError> {
-        let cutoff = at
-            .checked_sub(self.log_retention)
-            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
         let credential_revision = i64::try_from(principal.credential_revision())
             .map_err(|_| StorageError::new(StorageErrorKind::InvalidInput))?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| {
-                StorageError::with_source(StorageErrorKind::OperationFailed, source)
-            })?;
-        transaction
-            .execute(
-                "DELETE FROM client_certificate_audit WHERE recorded_at_unix_nanos < ?1",
-                [unix_timestamp_nanos(cutoff)?],
-            )
-            .map_err(|source| {
-                StorageError::with_source(StorageErrorKind::OperationFailed, source)
-            })?;
-        transaction.execute(
+        self.connection.execute(
             "INSERT INTO client_certificate_audit \
              (request_id, principal_ref, token_id, credential_revision, scopes, certificate_sha256, recorded_at_unix_nanos) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![request_id.hyphenated().to_string(), principal.principal_ref(), principal.token_id(),
                 credential_revision, principal.scopes().bits(), certificate_sha256.as_slice(), unix_timestamp_nanos(at)?],
         ).map_err(|source| StorageError::with_source(StorageErrorKind::OperationFailed, source))?;
-        transaction
-            .commit()
-            .map_err(|source| StorageError::with_source(StorageErrorKind::OperationFailed, source))
+        Ok(())
     }
 
     pub(crate) fn api_token_mutation_replay(
