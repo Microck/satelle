@@ -35,11 +35,34 @@ those pull requests merge, the integration branch gets a final pull request to
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Merged in PR #247 |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Merged in PR #252 |
 | Automation | Batch, watch, webhook notifications, REPL, command history | Batch merged in PR #256; watch and notify merged in PR #257; REPL merged in PR #259 |
-| Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Cargo package merged in PR #261; staged npm publishing and package repository policy implemented |
+| Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Cargo package merged in PR #261; staged npm publishing merged in PR #262; guarded relay contract implemented in PR #263 |
 
 Package repository submissions, staged npm publishing, and native action relay
 retain the prerequisites declared in `.facts`. A missing external capability
 or approval is a blocker, never proof of implementation.
+
+## Native action relay contract
+
+Satelle exposes `--relay-native-actions` on `run` and `steer`, the canonical
+`ra_` UUIDv7 identifier type, and the exact detached response command. The
+effective YOLO policy is checked first and produces
+`native-action-policy-conflict`. `--yes` does not enable the relay.
+
+Host capabilities v7 carries a dedicated `native_action_relay` verdict through
+local and direct transports. The production Codex adapter advertises false
+because the stable app-server protocol has generic command, file, and
+permission approvals but no native Computer Use action request with stable
+accept and deny callbacks. Opted-in commands therefore return
+`native-action-relay-not-supported` before creating a Session or Turn. Satelle
+does not substitute generic approvals, app-selection elicitation, terminal UI
+scraping, or undocumented desktop automation.
+
+The dormant contract is fixed for the first adapter that can truthfully
+advertise support: bounded redacted `action_required` events, explicit attached
+allow or deny with deny as the default, control-scoped detached responses,
+five-minute or terminal-Turn expiry, and an upstream deny on expiry while the
+callback remains available. No action store or callback path exists while the
+capability is false.
 
 ## Batch automation contract
 

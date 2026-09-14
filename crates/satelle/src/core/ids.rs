@@ -8,12 +8,15 @@ use uuid::{Uuid, Variant, Version};
 const SESSION_ID_PREFIX: &str = "rs_";
 const TURN_ID_PREFIX: &str = "rt_";
 const QUEUE_REQUEST_ID_PREFIX: &str = "rq_";
+const ACTION_REQUEST_ID_PREFIX: &str = "ra_";
 
 /// JSON Schema pattern for the canonical public Session identifier format.
 pub const SESSION_ID_PATTERN: &str =
     "^rs_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 pub const QUEUE_REQUEST_ID_PATTERN: &str =
     "^rq_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
+pub const ACTION_REQUEST_ID_PATTERN: &str =
+    "^ra_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 
 /// Explains why a public Satelle identifier could not be parsed.
 ///
@@ -182,6 +185,11 @@ define_public_id!(
     QUEUE_REQUEST_ID_PREFIX,
     "a Satelle queue request identifier in rq_<canonical lowercase UUIDv7> form"
 );
+define_public_id!(
+    ActionRequestId,
+    ACTION_REQUEST_ID_PREFIX,
+    "a Satelle action request identifier in ra_<canonical lowercase UUIDv7> form"
+);
 
 #[cfg(test)]
 mod tests {
@@ -211,6 +219,17 @@ mod tests {
         assert_eq!(
             Err(IdParseError::InvalidPrefix { expected: "rt_" }),
             TurnId::parse(&format!("rs_{UUID_V7}"))
+        );
+    }
+
+    #[test]
+    fn action_request_ids_use_the_canonical_action_prefix() {
+        let id = ActionRequestId::parse(&format!("ra_{UUID_V7}")).expect("valid action request ID");
+
+        assert_eq!(format!("ra_{UUID_V7}"), id.as_str());
+        assert_eq!(
+            Err(IdParseError::InvalidPrefix { expected: "ra_" }),
+            ActionRequestId::parse(&format!("rq_{UUID_V7}"))
         );
     }
 

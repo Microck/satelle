@@ -1265,7 +1265,7 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         response.json().await.expect("decode capabilities JSON");
     assert_eq!(
         capabilities_json["schema_version"],
-        "satelle.capabilities.v6"
+        "satelle.capabilities.v7"
     );
     let expected_target = if cfg!(all(
         target_os = "linux",
@@ -1302,7 +1302,11 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         .remove("target");
     assert!(
         serde_json::from_value::<CapabilitiesResponse>(missing_target).is_err(),
-        "capabilities v6 requires authenticated release-target identity"
+        "capabilities v7 requires authenticated release-target identity"
+    );
+    assert_eq!(
+        capabilities_json["runtime_capabilities"]["native_action_relay"], false,
+        "generic Codex approvals must not advertise native action relay"
     );
     assert_eq!(
         capabilities_json["provider_secret_upload"],
@@ -1349,6 +1353,17 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         "the protocol hard cut must reject legacy v5 capabilities"
     );
 
+    let mut legacy_v6 = capabilities_json.clone();
+    legacy_v6["schema_version"] = serde_json::json!("satelle.capabilities.v6");
+    legacy_v6["runtime_capabilities"]
+        .as_object_mut()
+        .expect("runtime capabilities are an object")
+        .remove("native_action_relay");
+    assert!(
+        serde_json::from_value::<CapabilitiesResponse>(legacy_v6).is_err(),
+        "the protocol hard cut must reject capabilities without relay evidence"
+    );
+
     let mut obsolete_v4 = capabilities_json.clone();
     obsolete_v4["schema_version"] = serde_json::json!("satelle.capabilities.v4");
     assert!(serde_json::from_value::<CapabilitiesResponse>(obsolete_v4).is_err());
@@ -1373,6 +1388,7 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
         65_536
     );
     assert_eq!(capabilities.host_identity(), running.host_identity);
+    assert!(!capabilities.native_action_relay());
     assert_eq!(capabilities.operations(), EXPECTED_OPERATIONS);
     assert_eq!(capabilities.limits().json_body_bytes(), 1_048_576);
     assert_eq!(capabilities.limits().http_connections(), 128);

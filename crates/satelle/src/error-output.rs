@@ -315,6 +315,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         | ErrorCode::ComputerUseNotReady
         | ErrorCode::YoloNotSupported
         | ErrorCode::YoloBlockedByNativeApproval
+        | ErrorCode::NativeActionRelayNotSupported
         | ErrorCode::UnsupportedProviderComputerUse
         | ErrorCode::DesktopSessionUnavailable
         | ErrorCode::DesktopSessionAmbiguous
@@ -497,6 +498,7 @@ fn error_contract(code: ErrorCode) -> ErrorContract {
         ErrorCode::InvalidUsage
         | ErrorCode::ScopeSelectionConflict
         | ErrorCode::PromptSourceConflict
+        | ErrorCode::NativeActionPolicyConflict
         | ErrorCode::EventsWithDetach
         | ErrorCode::InterruptModeConflict
         | ErrorCode::OutputModeConflict

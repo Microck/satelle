@@ -64,16 +64,16 @@ use satelle::core::telemetry::{
     TelemetryStatus,
 };
 use satelle::core::{
-    BEACON_CORAL, DaemonPathOverrides, DesktopSelectionPolicy, DesktopSessionPreference,
-    DoctorEventRecord, DoctorEventSchemaVersion, DoctorEventType, DoctorFinding,
-    DoctorFixDelegation, DoctorFixFlow, DoctorFixFlowStatus, DoctorFixOwner, DoctorFixPostcheck,
-    DoctorFixRequest, DoctorFixability, DoctorOptions, DoctorReport, ERROR_RED, ErrorCode,
-    EventSource, EventType, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST, LogVerbosity,
-    MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField, ProviderSecretSource,
-    QueueRequestId, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError, SatelleEvent,
-    SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary, SetupReport,
-    SetupRequiredInput, SetupSchemaVersion, SetupVerification, TransportKind, TurnId, load_config,
-    load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
+    ActionRequestId, BEACON_CORAL, DaemonPathOverrides, DesktopSelectionPolicy,
+    DesktopSessionPreference, DoctorEventRecord, DoctorEventSchemaVersion, DoctorEventType,
+    DoctorFinding, DoctorFixDelegation, DoctorFixFlow, DoctorFixFlowStatus, DoctorFixOwner,
+    DoctorFixPostcheck, DoctorFixRequest, DoctorFixability, DoctorOptions, DoctorReport, ERROR_RED,
+    ErrorCode, EventSource, EventType, HostConfig, HostSessionsReport, LOCAL_DEMO_HOST,
+    LogVerbosity, MutationCommandFamily, OwnerOnlyDirectory, PRODUCT_NAME, ProfileField,
+    ProviderSecretSource, QueueRequestId, RELAY_ROSE, ResolvedConfig, SUCCESS_GREEN, SatelleError,
+    SatelleEvent, SatelleEventBody, SecureFileError, SessionId, SetupMode, SetupReadinessSummary,
+    SetupReport, SetupRequiredInput, SetupSchemaVersion, SetupVerification, TransportKind, TurnId,
+    load_config, load_config_for_profile, load_config_without_profile, load_user_api_rate_limits,
     open_new_owner_only_file, open_or_create_owner_only_directory, open_or_create_owner_only_file,
     open_owner_only_directory, persist_new_owner_only_diagnostic_file,
     publish_new_owner_only_directory, read_owner_controlled_config_file,
@@ -103,10 +103,10 @@ use tailscale::{
     execute_transport_only_doctor, prepare_transport_only_doctor, transport_doctor_probe,
 };
 use transport::{
-    AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, api_token_file_exists,
-    authenticated_ssh_bootstrap_user, discover_direct_host_identity, discover_ssh_host,
-    ssh_initial_state_requires_identity_discovery, transport_for, transport_for_setup,
-    transport_for_with_ssh_bootstrap, validate_api_token_file,
+    AttachedTurnOutcome, SshBootstrapScope, SshHostDiscovery, TransportClient,
+    api_token_file_exists, authenticated_ssh_bootstrap_user, discover_direct_host_identity,
+    discover_ssh_host, ssh_initial_state_requires_identity_discovery, transport_for,
+    transport_for_setup, transport_for_with_ssh_bootstrap, validate_api_token_file,
 };
 use uuid::Uuid;
 
@@ -391,6 +391,10 @@ enum Command {
     },
     Run(RunCommand),
     Steer(SteerCommand),
+    Action {
+        #[command(subcommand)]
+        command: ActionCommand,
+    },
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
@@ -414,6 +418,21 @@ enum Command {
         #[command(subcommand)]
         command: SupportCommand,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ActionCommand {
+    /// Answer a detached native action request.
+    Respond(ActionRespondCommand),
+}
+
+#[derive(Args, Debug)]
+struct ActionRespondCommand {
+    action_request_id: String,
+    #[arg(long, conflicts_with = "deny", required_unless_present = "deny")]
+    allow: bool,
+    #[arg(long, conflicts_with = "allow", required_unless_present = "allow")]
+    deny: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1289,6 +1308,11 @@ struct RunCommand {
     yolo: bool,
     #[arg(long, help = "Disable YOLO mode for this command")]
     no_yolo: bool,
+    #[arg(
+        long,
+        help = "Relay supported native Computer Use action requests for explicit allow or deny decisions"
+    )]
+    relay_native_actions: bool,
     #[arg(long, value_enum, default_value_t = EventMode::Auto)]
     events: EventMode,
     #[arg(
@@ -1376,6 +1400,11 @@ struct SteerCommand {
     yolo: bool,
     #[arg(long, help = "Disable YOLO mode for this command")]
     no_yolo: bool,
+    #[arg(
+        long,
+        help = "Relay supported native Computer Use action requests for explicit allow or deny decisions"
+    )]
+    relay_native_actions: bool,
     #[arg(long, value_enum, default_value_t = EventMode::Auto)]
     events: EventMode,
     #[arg(
@@ -1515,6 +1544,83 @@ struct QueueCancelCommand {
     host: Option<String>,
     #[command(flatten)]
     output_args: OutputArgs,
+}
+
+#[cfg(test)]
+mod native_action_cli_tests {
+    use super::*;
+
+    const ACTION_REQUEST_ID: &str = "ra_01890a5d-ac96-7b7c-8f89-37c3d0a66f10";
+
+    #[test]
+    fn run_and_steer_parse_only_the_explicit_relay_flag() {
+        let run = Cli::try_parse_from(["satelle", "run", "--relay-native-actions", "work"])
+            .expect("parse relayed run");
+        let Command::Run(run) = run.command else {
+            panic!("expected run command");
+        };
+        assert!(run.relay_native_actions);
+
+        let ordinary = Cli::try_parse_from(["satelle", "run", "--yes", "work"])
+            .expect("parse ordinary consent");
+        let Command::Run(ordinary) = ordinary.command else {
+            panic!("expected run command");
+        };
+        assert!(!ordinary.relay_native_actions);
+
+        let steer = Cli::try_parse_from([
+            "satelle",
+            "steer",
+            "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66f11",
+            "--relay-native-actions",
+            "continue",
+        ])
+        .expect("parse relayed steer");
+        let Command::Steer(steer) = steer.command else {
+            panic!("expected steer command");
+        };
+        assert!(steer.relay_native_actions);
+    }
+
+    #[test]
+    fn detached_action_response_requires_one_explicit_decision() {
+        for decision in ["--allow", "--deny"] {
+            let command =
+                Cli::try_parse_from(["satelle", "action", "respond", ACTION_REQUEST_ID, decision])
+                    .expect("parse action response");
+            assert!(matches!(
+                command.command,
+                Command::Action {
+                    command: ActionCommand::Respond(_)
+                }
+            ));
+        }
+
+        assert!(Cli::try_parse_from(["satelle", "action", "respond", ACTION_REQUEST_ID]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "satelle",
+                "action",
+                "respond",
+                ACTION_REQUEST_ID,
+                "--allow",
+                "--deny",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn relay_policy_conflict_uses_the_effective_yolo_state() {
+        let active = YoloPolicy {
+            active: true,
+            source: "user_config_profile",
+        };
+        let error = validate_native_action_policy(true, &active).unwrap_err();
+        assert_eq!(error.error.code, ErrorCode::NativeActionPolicyConflict);
+
+        assert!(validate_native_action_policy(false, &active).is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -2567,6 +2673,9 @@ fn execute_command(
         }
         Command::Run(command) => run_prompt(command, config, output),
         Command::Steer(command) => steer_prompt(command, config, output),
+        Command::Action {
+            command: ActionCommand::Respond(command),
+        } => respond_to_native_action(command).map(|_| None),
         Command::Queue {
             command: QueueCommand::Status(command),
         } => show_queue_status(command, config, output).map(|_| None),
@@ -3220,6 +3329,12 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             selects_host: true,
             explicit_host: command.host.as_deref(),
             session_id: canonical_history_session_id(&command.session_id),
+        },
+        Command::Action { .. } => HistoryTarget {
+            family: "action-respond",
+            selects_host: false,
+            explicit_host: None,
+            session_id: None,
         },
         Command::Queue { command } => HistoryTarget {
             family: match command {
@@ -9294,6 +9409,26 @@ fn resolve_yolo_policy(
         active: false,
         source: "absent",
     }
+}
+
+fn validate_native_action_policy(
+    relay_native_actions: bool,
+    yolo_policy: &YoloPolicy,
+) -> Result<(), CliFailure> {
+    if relay_native_actions && yolo_policy.active {
+        return Err(failure(SatelleError::native_action_policy_conflict()));
+    }
+    Ok(())
+}
+
+fn validate_native_action_relay_support(
+    relay_native_actions: bool,
+    transport: &dyn TransportClient,
+) -> Result<(), CliFailure> {
+    if relay_native_actions && !transport.native_action_relay_supported().map_err(failure)? {
+        return Err(failure(SatelleError::native_action_relay_not_supported()));
+    }
+    Ok(())
 }
 
 fn resolve_experimental_provider_computer_use(
@@ -15925,6 +16060,11 @@ fn run_prompt(
         command.yolo,
         command.no_yolo,
     );
+    report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        validate_native_action_policy(command.relay_native_actions, &yolo_policy),
+    )?;
     let provider_selection = report_not_admitted(
         &mut event_output,
         Some(&host.alias),
@@ -15967,6 +16107,11 @@ fn run_prompt(
             return Err(transport_failure);
         }
     };
+    report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        validate_native_action_relay_support(command.relay_native_actions, transport.as_ref()),
+    )?;
     let provider_validation = match transport.validate_provider_descriptor(
         provider_selection.desktop_binding(),
         provider_selection
@@ -16242,8 +16387,18 @@ fn steer_prompt(
         command.yolo,
         command.no_yolo,
     );
+    report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        validate_native_action_policy(command.relay_native_actions, &yolo_policy),
+    )?;
     let transport =
         report_not_admitted(&mut event_output, Some(&host.alias), transport_for(&host))?;
+    report_not_admitted(
+        &mut event_output,
+        Some(&host.alias),
+        validate_native_action_relay_support(command.relay_native_actions, transport.as_ref()),
+    )?;
     let selected_desktop_binding = match command.desktop_binding.as_deref() {
         Some(binding) => report_not_admitted(
             &mut event_output,
@@ -16665,6 +16820,12 @@ fn print_queue_status(
         println!("Failure: {}: {}", queue_failure.code, queue_failure.message);
     }
     Ok(())
+}
+
+fn respond_to_native_action(command: ActionRespondCommand) -> Result<(), CliFailure> {
+    let _action_request_id = ActionRequestId::from_str(&command.action_request_id)
+        .map_err(|error| failure(error.into()))?;
+    Err(failure(SatelleError::native_action_relay_not_supported()))
 }
 
 fn show_status(

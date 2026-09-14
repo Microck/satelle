@@ -416,6 +416,10 @@ pub(crate) trait TransportClient: Send {
     fn supported_image_media_types(&self) -> Result<Vec<String>, SatelleError> {
         Ok(Vec::new())
     }
+
+    fn native_action_relay_supported(&self) -> Result<bool, SatelleError> {
+        Ok(false)
+    }
     fn setup(
         &self,
         dry_run: bool,
@@ -938,6 +942,13 @@ impl TransportClient for LocalTransport {
         } else {
             Vec::new()
         })
+    }
+
+    fn native_action_relay_supported(&self) -> Result<bool, SatelleError> {
+        Ok(self
+            .service
+            .daemon_runtime_capabilities()?
+            .native_action_relay())
     }
 
     fn setup(
@@ -7889,6 +7900,14 @@ impl TransportClient for DirectTransport {
             .map_err(|error| direct_transport_error(&self.alias, error))?
             .supported_attachment_media_types()
             .to_vec())
+    }
+
+    fn native_action_relay_supported(&self) -> Result<bool, SatelleError> {
+        Ok(self
+            .client
+            .capabilities()
+            .map_err(|error| direct_transport_error(&self.alias, error))?
+            .native_action_relay())
     }
 
     fn setup(
