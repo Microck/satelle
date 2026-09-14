@@ -13630,28 +13630,31 @@ fn run_prompt(
                     .emit(&host.alias, event.clone())
                     .map_err(failure)?;
             }
-            let history_session_id = attached_failure
+            let durable_handles = attached_failure
                 .durable_handles()
-                .map(|(session_id, _)| Box::new(session_id.clone()));
+                .map(|(session_id, turn_id)| (session_id.clone(), turn_id.clone()));
+            let admission_phase = attached_failure.phase();
+            let failure = failure_for_attached_turn(
+                &host.alias,
+                attached_failure.into_error(),
+                durable_handles.clone(),
+            );
             event_output
                 .emit_admission_failure(
                     &host.alias,
-                    attached_failure.error(),
-                    attached_failure.phase(),
-                    attached_failure.durable_handles(),
+                    &failure.error,
+                    admission_phase,
+                    durable_handles
+                        .as_ref()
+                        .map(|(session_id, turn_id)| (session_id, turn_id)),
                 )
                 .map_err(|error| CliFailure {
                     error,
-                    history_session_id: history_session_id.clone(),
+                    history_session_id: failure.history_session_id.clone(),
                     error_reported: false,
                     exit_code_override: None,
                 })?;
-            return Err(CliFailure {
-                error: attached_failure.into_error(),
-                history_session_id,
-                error_reported: false,
-                exit_code_override: None,
-            });
+            return Err(failure);
         }
     };
     print_turn_session(
@@ -13877,28 +13880,31 @@ fn steer_prompt(
                     .emit(&host.alias, event.clone())
                     .map_err(failure)?;
             }
-            let history_session_id = attached_failure
+            let durable_handles = attached_failure
                 .durable_handles()
-                .map(|(session_id, _)| Box::new(session_id.clone()));
+                .map(|(session_id, turn_id)| (session_id.clone(), turn_id.clone()));
+            let admission_phase = attached_failure.phase();
+            let failure = failure_for_attached_turn(
+                &host.alias,
+                attached_failure.into_error(),
+                durable_handles.clone(),
+            );
             event_output
                 .emit_admission_failure(
                     &host.alias,
-                    attached_failure.error(),
-                    attached_failure.phase(),
-                    attached_failure.durable_handles(),
+                    &failure.error,
+                    admission_phase,
+                    durable_handles
+                        .as_ref()
+                        .map(|(session_id, turn_id)| (session_id, turn_id)),
                 )
                 .map_err(|error| CliFailure {
                     error,
-                    history_session_id: history_session_id.clone(),
+                    history_session_id: failure.history_session_id.clone(),
                     error_reported: false,
                     exit_code_override: None,
                 })?;
-            return Err(CliFailure {
-                error: attached_failure.into_error(),
-                history_session_id,
-                error_reported: false,
-                exit_code_override: None,
-            });
+            return Err(failure);
         }
     };
     print_turn_session(
@@ -14770,6 +14776,30 @@ fn failure_for_admitted_session(error: SatelleError, session_id: &SessionId) -> 
     }
 }
 
+fn failure_for_attached_turn(
+    host: &str,
+    mut error: SatelleError,
+    durable_handles: Option<(SessionId, satelle_core::TurnId)>,
+) -> CliFailure {
+    let Some((session_id, turn_id)) = durable_handles else {
+        return failure(error);
+    };
+    let status_command = format!("satelle status {session_id} --host {host}");
+    error.recovery_command = Some(status_command.clone());
+    error.details.insert(
+        "admission_phase".to_string(),
+        json!(TurnAdmissionPhase::Admitted.as_str()),
+    );
+    error
+        .details
+        .insert("session_id".to_string(), json!(session_id));
+    error.details.insert("turn_id".to_string(), json!(turn_id));
+    error
+        .details
+        .insert("status_command".to_string(), json!(status_command));
+    failure_for_admitted_session(error, &session_id)
+}
+
 #[cfg(test)]
 mod setup_desktop_binding_tests {
     use super::*;
@@ -15076,6 +15106,7 @@ mod setup_desktop_binding_tests {
 #[cfg(test)]
 mod admitted_session_failure_tests {
     use super::*;
+    use crate::error_output::error_envelope;
 
     fn native_readiness_error(status: &str) -> SatelleError {
         let mut error = SatelleError::native_readiness_timeout();
@@ -15116,6 +15147,46 @@ mod admitted_session_failure_tests {
         );
 
         assert_eq!(failure.history_session_id.as_deref(), Some(&session_id));
+    }
+
+    #[test]
+    fn admitted_turn_failure_exposes_its_durable_handles() {
+        let session_id = SessionId::new();
+        let turn_id = satelle_core::TurnId::new();
+        let failure = failure_for_attached_turn(
+            "direct-host",
+            SatelleError::host_unreachable("direct-host"),
+            Some((session_id.clone(), turn_id.clone())),
+        );
+        let envelope = error_envelope(&failure.error);
+        let event = command_failed_event_body(
+            "direct-host",
+            &failure.error,
+            TurnAdmissionPhase::Admitted,
+            Some((&session_id, &turn_id)),
+        )
+        .expect("construct command-failed event");
+
+        assert_eq!(failure.history_session_id.as_deref(), Some(&session_id));
+        assert_eq!(envelope["details"]["admission_phase"], "admitted");
+        assert_eq!(envelope["details"]["session_id"], session_id.as_str());
+        assert_eq!(envelope["details"]["turn_id"], turn_id.as_str());
+        assert_eq!(
+            envelope["details"]["status_command"],
+            format!("satelle status {session_id} --host direct-host")
+        );
+        assert_eq!(
+            envelope["suggested_commands"][0],
+            envelope["details"]["status_command"]
+        );
+        assert_eq!(
+            event.data()["recovery_command"],
+            envelope["details"]["status_command"]
+        );
+        assert_eq!(
+            event.data()["details"]["status_command"],
+            envelope["details"]["status_command"]
+        );
     }
 
     fn assert_unknown_machine_event(host: &str) {
