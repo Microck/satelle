@@ -35,7 +35,7 @@ those pull requests merge, the integration branch gets a final pull request to
 | Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Merged in PR #247 |
 | Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Merged in PR #252 |
 | Automation | Batch, watch, webhook notifications, REPL, command history | Batch merged in PR #256; watch and notify merged in PR #257; REPL merged in PR #259 |
-| Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Cargo package in progress |
+| Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Cargo package merged in PR #261; staged npm publishing and package repository policy implemented |
 
 Package repository submissions, staged npm publishing, and native action relay
 retain the prerequisites declared in `.facts`. A missing external capability

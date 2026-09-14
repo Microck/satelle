@@ -2142,7 +2142,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
 
   function validateNpmArtifacts(directory, options = {}) {
     if (!directory) fail("release-destination-missing", "release destination is required");
-    const version = expectedVersion(process.env.RELEASE_TAG);
+    const version = expectedVersion(options.releaseTag ?? process.env.RELEASE_TAG);
     const packages = publicationOrder.map((packageName) => {
       const file = npmArtifactName(packageName);
       const artifactPath = path.join(directory, file);
@@ -2576,5 +2576,6 @@ if (require.main === module) {
 module.exports = {
   ReleaseError,
   createReleaseContext,
+  sha512Integrity,
   zipInflateMaximumOutputLength,
 };

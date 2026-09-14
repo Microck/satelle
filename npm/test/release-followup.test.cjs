@@ -191,39 +191,38 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.doesNotMatch(workflow, /npm publish[^\n]*--dry-run/);
   assert.match(
     workflow,
-    /publish-candidates:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[attest, collect, draft-release\]/,
+    /stage-npm:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[attest, collect, draft-release, publish-cargo\]/,
   );
   assert.match(
     workflow,
-    /publish-candidates:\n[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?id-token: write/,
+    /stage-npm:\n[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?id-token: write/,
   );
   assert.match(
     workflow,
-    /Install OIDC-capable npm CLI[\s\S]*?npm install --global npm@11\.5\.1[\s\S]*?test "\$\(npm --version\)" = "11\.5\.1"/,
+    /Install staged-publishing npm CLI[\s\S]*?npm install --global npm@11\.15\.0[\s\S]*?test "\$\(npm --version\)" = "11\.15\.0"/,
   );
-  assert.match(workflow, /npm-candidate-publication\.cjs advance/);
-  const candidateJob = workflow.match(
-    /^  publish-candidates:[\s\S]*?(?=^  validate-registry-candidates:)/m,
+  assert.match(workflow, /npm-staged-release\.cjs record/);
+  const stageJob = workflow.match(
+    /^  stage-npm:[\s\S]*?(?=^  authorize-finalization-tag:)/m,
   )?.[0];
-  assert.ok(candidateJob, "candidate publication job is missing");
-  assert.doesNotMatch(candidateJob, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
+  assert.ok(stageJob, "staged npm publication job is missing");
+  assert.doesNotMatch(stageJob, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
   assert.match(
-    candidateJob,
+    stageJob,
     /EXPECTED_SOURCE_DIGEST: \$\{\{ needs\.attest\.outputs\.source-digest \}\}/,
   );
   assert.match(
-    candidateJob,
+    stageJob,
     /EXPECTED_TAG_DIGEST: \$\{\{ needs\.attest\.outputs\.tag-digest \}\}/,
   );
   assert.match(
-    candidateJob,
-    /recheck_release_tag[\s\S]*git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*gh release view[\s\S]*--jq \.isDraft[\s\S]*while [\s\S]*recheck_release_tag[\s\S]*npm-candidate-publication\.cjs advance/,
+    stageJob,
+    /recheck_release_tag[\s\S]*git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*gh release view[\s\S]*while package=[\s\S]*npm stage publish/,
   );
   assert.match(workflow, /gh release create "\$GITHUB_REF_NAME"[\s\S]*?--draft/);
   assert.match(workflow, /gh release upload "\$GITHUB_REF_NAME"/);
   assert.match(workflow, /release asset set does not match the validated artifact set/);
-  assert.match(workflow, /candidate_pattern=.*npm-candidate-v.*\[0-9\]\+/);
-  assert.match(workflow, /promotion_pattern=.*npm-promotion-v.*\[0-9\]\+/);
+  assert.match(workflow, /stage_pattern="\^npm-stages-v/);
   assert.match(workflow, /sha256sum --check/);
   assert.match(
     workflow,
@@ -263,7 +262,7 @@ test("release workflow validates six targets and publishes only a fully verified
   );
   assert.match(
     workflow,
-    /authorize-recovery-tag:\n[\s\S]*?permissions:\n\s+contents: read\n\s+pull-requests: read/,
+    /authorize-finalization-tag:\n[\s\S]*?permissions:\n\s+contents: read\n\s+pull-requests: read/,
   );
   assert.match(workflow, /scripts\/install\.sh" --version/);
   assert.match(workflow, /: > "\$policy_log"/);
@@ -288,7 +287,7 @@ test("release workflow validates six targets and publishes only a fully verified
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
   ) ?? [];
-  assert.equal(checkoutUses.length, 12);
+  assert.equal(checkoutUses.length, 8);
   assert.equal(hardenedCheckoutUses.length, checkoutUses.length);
 });
 

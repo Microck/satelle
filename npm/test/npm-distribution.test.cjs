@@ -152,11 +152,11 @@ test("installation docs freeze package identities, ownership, and cache contract
   );
   assert.match(
     normalizedInstallationGuide,
-    /The first-party Homebrew tap remains the canonical Homebrew path until Satelle is accepted into Homebrew core and core updates prove reliable\./,
+    /The first-party tap stays canonical until core accepts the formula and proves reliable\./,
   );
   assert.match(
     normalizedInstallationGuide,
-    /The first-party Scoop bucket remains the canonical Scoop path until a Scoop Main manifest is accepted and its updates prove they do not lag normal Satelle releases\./,
+    /The first-party Scoop bucket stays canonical until Scoop Main accepts a manifest and its updates keep pace with normal releases\./,
   );
   assert.match(
     normalizedInstallationGuide,
@@ -179,19 +179,13 @@ test("installation docs freeze package identities, ownership, and cache contract
     normalizedInstallationGuide,
     /Cold offline npm-registry installation and one-shot execution are not guaranteed\./,
   );
-  for (const excludedEcosystem of [
-    ".deb",
-    ".rpm",
-    "AUR",
-    "WinGet",
-    "Chocolatey",
-    "Nixpkgs",
-    "MacPorts",
-    "Homebrew core",
-    "Scoop Main",
-  ]) {
-    assert.ok(installationGuide.includes(excludedEcosystem), excludedEcosystem);
-  }
+  assert.match(normalizedInstallationGuide, /WinGet and Scoop Main are first/);
+  assert.match(normalizedInstallationGuide, /Homebrew core follows only after/);
+  assert.match(normalizedInstallationGuide, /Chocolatey follows WinGet and Scoop Main only after/);
+  assert.match(
+    normalizedInstallationGuide,
+    /AUR, Debian and RPM repositories, Nixpkgs, and MacPorts require clear user demand or an ecosystem maintainer/,
+  );
 
   for (const publicEntryPoint of [readme, documentationIndex]) {
     assert.ok(publicEntryPoint.includes("install-satelle"));
