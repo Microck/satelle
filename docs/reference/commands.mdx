@@ -6,30 +6,41 @@ description: Satelle CLI command surface.
 Global options include `--no-color`, `--profile <name>`, and
 `--error-format human|json`. Most state-reading commands also accept `--json`.
 
-| Command | Purpose |
-| --- | --- |
-| `satelle setup` | Plan Host onboarding and apply the SSH token handoff |
-| `satelle repair` | Repair a Host from live readiness evidence and retained action-ledger state |
-| `satelle doctor` | Run diagnostic probes |
-| `satelle config check` | Validate one or all local contexts |
-| `satelle config explain` | Explain effective values and sources |
-| `satelle paths` | Print resolved config, state, cache, and log paths |
-| `satelle host start` | Run Host Daemon mode |
-| `satelle host trust --host <alias>` | Authenticate a direct Host and pin its stable identity |
-| `satelle host status` | Read Host status |
-| `satelle host sessions` | List eligible native desktop sessions |
-| `satelle host update` | Update the current Host or one selected remote Host |
-| `satelle run` | Create a Session and first Turn |
-| `satelle steer` | Add a follow-up Turn to a Session |
-| `satelle status` | Read authoritative Session state |
-| `satelle stop` | Stop the active Turn |
-| `satelle logs` | Read normalized retained Host logs |
-| `satelle mcp serve` | Serve the MCP interface over stdio |
-| `satelle mcp install` | Configure a supported AI client to call Satelle MCP |
-| `satelle skills list` / `get` / `path` | Discover and materialize the release-matched Agent Skill Bundle |
-| `satelle support bundle` | Export a redacted support bundle |
-| `satelle self update` | Update the local executable with an optional single-Host handoff |
-| `satelle completions` | Generate shell completions |
+| Command | Purpose | Status |
+| --- | --- | --- |
+| `satelle setup` | Plan Host onboarding and apply SSH token handoff | Local planning and SSH token handoff implemented |
+| `satelle repair` | Repair a Host from live readiness evidence and retained action-ledger state | Implemented |
+| `satelle doctor` | Run diagnostic probes | Implemented |
+| `satelle config check` | Validate one or all local contexts | Implemented |
+| `satelle config explain` | Explain effective values and sources | Implemented |
+| `satelle config repair` | Preview and repair local configuration with private backups | Implemented |
+| `satelle paths` | Print resolved config, state, cache, and log paths | Implemented |
+| `satelle host start` | Run Host Daemon mode | Implemented |
+| `satelle host trust --host <alias>` | Authenticate a direct Host and pin its stable identity | Implemented |
+| `satelle host status` | Read Host status | Implemented |
+| `satelle host sessions` | List eligible native desktop sessions | Implemented |
+| `satelle host stop` / `restart` | Control Host service lifecycle | Not implemented |
+| `satelle host update` | Update remote components | Current Host and single selected remote Host updates implemented; explicit multi-Host selectors remain unavailable |
+| `satelle host storage migrate` | Move one Host's storage with verified activation and rollback | Implemented |
+| `satelle host storage complete` | Confirm an interrupted migration's active destination | Implemented |
+| `satelle host storage source cleanup` | Preview or delete a completed migration's preserved source files | Implemented |
+| `satelle run` | Create a Session and first Turn | Implemented |
+| `satelle steer` | Add a follow-up Turn to a Session | Implemented |
+| `satelle action respond <action_request_id> --allow\|--deny` | Answer a detached relayed native action request | Guarded; current Codex adapters report `native-action-relay-not-supported` |
+| `satelle status` | Read authoritative Session state | Implemented |
+| `satelle stop` | Stop the active Turn | Implemented |
+| `satelle logs` | Read normalized retained Host logs | Implemented |
+| `satelle desktop snapshot` | Export the current visible desktop after explicit consent | Implemented |
+| `satelle telemetry status` | Inspect Controller or Host telemetry policy and queue state | Implemented |
+| `satelle mcp serve` | Serve the MCP interface over stdio | Implemented |
+| `satelle mcp install` | Configure a supported AI client to call Satelle MCP | Implemented |
+| `satelle skills list` / `get` / `path` | Discover and materialize the release-matched Agent Skill Bundle | Implemented |
+| `satelle support bundle` | Export a redacted support bundle | Implemented |
+| `satelle self update` | Update the executable and optional remotes | Verified local update and optional stable-release single-Host handoff implemented; prerelease and explicit multi-Host handoffs remain unavailable |
+| `satelle completions` | Generate shell completions | Implemented |
+| `satelle batch` | Run versioned NDJSON command requests with bounded concurrency | Implemented |
+| `satelle watch` | Emit versioned NDJSON records when selected state changes | Implemented |
+| `satelle notify` | Deliver selected state changes to a user-owned webhook alias | Implemented |
 
 `setup` application is transport-specific. Local setup is dry-run planning.
 SSH setup applies the on-demand transport token handoff.
@@ -43,18 +54,150 @@ are running.
 The [generated CLI and schema reference](/docs/reference/generated-cli) records
 the complete help tree and public schema identifiers for Satelle 0.1.11.
 
+## Automation
+
+`satelle batch --input <path|->` runs closed, versioned NDJSON requests with 1
+through 16 workers and emits results in input order. `satelle watch` accepts
+`sessions`, `logs`, `doctor`, or `host`; it emits the first successful state and
+later changes as `satelle.watch.change.v1` NDJSON. It stops on interrupt or
+after its bounded consecutive reconnect budget. Doctor probe timing does not
+count as a state change.
+
+`satelle notify --watch <target> --webhook <alias>` sends the same change-only
+records to a user-configured HTTPS endpoint with at most three delivery
+attempts. Add `--dry-run` to print `satelle.notify.webhook.v1` payloads without
+resolving authorization or making a request.
+
+`satelle repl --host <alias>` opens an interactive terminal for repeated `run`,
+`steer`, `status`, `logs`, `doctor`, `config check`, and `config explain`
+commands against one resolved Host and profile. Add `--export <path>` to create
+an owner-only `satelle.repl.transcript.v1` NDJSON transcript. Path-bearing
+arguments are always redacted; inline prompts are redacted unless
+`--include-prompts` is set. Ctrl-C interrupts the active child and returns to
+the prompt.
+
+## Output formats
+
+Commands with a final result accept `--format human|json|compact-json|toon|markdown`.
+`--json` is an exact alias for `--format json`. Each command's help lists its
+supported formats.
+
+| Format | Result |
+| --- | --- |
+| `human` | Command-specific text |
+| `json` | The complete versioned JSON report, pretty-printed |
+| `compact-json` | The same report as one minified JSON value followed by LF |
+| `toon` | The complete JSON data model encoded as TOON 4.1 with two-space indentation and comma delimiters |
+| `markdown` | The complete pretty JSON report inside one `json` fenced code block |
+| `csv` | Available only for `skills list`, using the fixed columns below |
+
+Structured formats retain schema identifiers, data values, array order, consent
+requirements, and exit codes. JSON remains the canonical machine contract. TOON
+preserves signed and unsigned 64-bit integers, escapes C0 control characters,
+and writes finite numbers as decimals; negative zero becomes zero. Decode a
+Markdown result by reading the JSON inside its fenced block.
+
+`satelle skills list --format csv` emits the RFC 4180 header
+`schema_version,bundle_version,name,description`, followed by one record per
+bundled skill in bundle order. Each row repeats the schema and bundle versions.
+All data fields are quoted, embedded quotes are doubled, and records end in CRLF.
+No nested fields are discarded to produce a table.
+
+Structured final results suppress interactive prompts and implicit human events
+under the same rules as JSON. Errors use the typed JSON contract on stderr unless
+`--error-format` explicitly selects another error format. Unsupported formats fail
+before configuration loading or Host access.
+
+`logs` supports only human output and its existing JSON records. `--events json`
+continues to select an NDJSON event stream. It cannot combine with `--json` or
+any explicit `--format`; `doctor --events` has the same restriction.
+
 ## Session commands
 
 `run` and `steer` accept `--host`, `--detach`, `--quiet`, `--verbose`,
-`--events auto|human|json|none`, `--prompt-file`, `--yolo`, and `--no-yolo`.
-The prompt can be an argument or `-` for stdin. `steer`, `status`, and `stop`
-take a public `session_id` positional argument.
+`--events auto|human|json|none`, `--prompt-file`, `--yolo`, `--no-yolo`, and
+`--relay-native-actions`. The prompt can be an argument or `-` for stdin.
+`steer`, `status`, and `stop` take a public `session_id` positional argument.
+
+Native action relay is an explicit per-command policy. It cannot combine with
+effective YOLO from a flag, Host configuration, or a Trusted Profile. That
+combination fails before Turn start with `native-action-policy-conflict`.
+`--yes` never enables the relay. A Host advertises relay support only when its
+Codex adapter exposes stable native Computer Use action requests and matching
+accept and deny callbacks. Current stable Codex does not expose that callback
+pair, so an opted-in run or steer fails before Turn start with
+`native-action-relay-not-supported`.
+
+When the upstream callback pair becomes available, relayed requests use
+`ra_<canonical-lowercase-UUIDv7>` identifiers. Attached commands require an
+explicit allow or deny decision and default to deny. Detached decisions use
+`satelle action respond <action_request_id> --allow` or `--deny` and require
+control scope for the owning Session. A request expires after five minutes or
+when its Turn becomes terminal. Expiry denies the upstream request while its
+callback remains available. Event summaries stay bounded and redacted; they
+exclude screenshots and raw desktop content.
 
 When experimental provider Computer Use is enabled, attached `run` and `steer`
 JSON results include `provider_smoke` with `status`, `source`, `observed_at`,
 `expires_at`, and `age_ms`. The source is `live`, `cache`, or `refresh`.
 `--refresh-provider-smoke-test` forces `refresh` before prompt execution.
 Provider fingerprints, prompts, transcripts, and desktop content are excluded.
+
+## Raw protocol exports
+
+Use `satelle run --raw-protocol --output <path>` or
+`satelle steer <session_id> --raw-protocol --output <path>` to capture the
+selected Turn's Codex app-server JSON messages. Satelle shows the full
+sensitivity warning before capture starts. Interactive use requires
+confirmation. Noninteractive use requires both `--no-input` and `--yes`.
+Raw capture cannot run with `--detach`.
+
+The invoking CLI writes one private `satelle.raw-diagnostics.v1` JSON file,
+then acknowledges that write to the Host. Satelle does not upload or cache the
+file. The Host redacts known credentials before transfer, caps one capture at
+8 MiB, keeps at most eight pending exports, and discards unacknowledged data
+ten minutes after the Turn finishes or when the Host restarts. Inspect the
+artifact before sharing it because unknown secrets and visible session content
+can remain after redaction.
+
+## Desktop snapshots
+
+Use `satelle desktop snapshot --host <alias> --output <path>` to capture the
+current visible desktop from one trusted Host and Desktop Binding. The command
+shows the exact local output path, PNG format, redaction policy, storage effect,
+and visual risks before asking for confirmation. It requires an interactive
+terminal and one confirmation for that invocation. `--no-input`, redirected
+stdin, or declined consent fails before capture.
+
+The Host checks native capture permission, holds the Desktop Binding's Control
+Lease during capture, removes PNG metadata, and transfers the artifact only to
+the invoking Controller. The Controller writes a new owner-only file without
+replacing an existing path, then acknowledges publication. The Host stores only
+bounded audit metadata. It does not store pixels, thumbnails, OCR text, prompts,
+transcripts, or output artifact contents. The PNG can still contain visible app
+content, notifications, credentials, and personal data, so inspect it before
+sharing it.
+
+## Telemetry
+
+Use `satelle telemetry status` for the local Controller. Add `--host <alias>`
+to read an authenticated Host status. The result reports enabled state,
+endpoint origin, buffered count and bytes, oldest record age, last delivery
+outcome, and the excluded data categories. It never resolves or prints the
+authorization Secret Source.
+
+Opt-in telemetry contains bounded operation duration, outcome class, typed
+error code, retry count, queue depth, and optional CPU and peak-memory values.
+Resource attributes are limited to Satelle version, component kind, platform
+class, and the configured deployment label. It excludes Host and Principal
+identities, Session and Turn identifiers, arguments, prompts, transcripts,
+desktop content, paths, addresses, secrets, artifacts, and provider payloads.
+
+Failed delivery uses an owner-private local queue capped at 10 MiB and 24
+hours. The oldest records are removed first. Collection and delivery do not
+hold command or Host request completion open. Setting `enabled = false` stops
+new capture, deletes that component's unsent queue, and makes no collector
+request.
 
 ## Doctor options
 
@@ -65,3 +208,98 @@ eligible refresh scope and requires explicit units.
 `doctor --scope provider --refresh` runs the provider smoke probe as a
 diagnostic, updates the normal Host readiness cache, and reports whether the
 result was refreshed. It does not create a Session or admit a prompt Turn.
+
+## Support bundles
+
+`satelle support bundle --host <alias> --output <path>` writes a private local
+archive. It includes configuration shape, versions, readiness, normalized
+logs, transport diagnostics, and setup-ledger summaries. It does not upload
+the archive.
+
+`setup_ledger.json` contains the 200 most recent Host maintenance operations,
+ordered by start time. Each entry reports operation kind, status, timestamps,
+and counts of planned, started, completed, failed, skipped, and uncertain
+actions. `truncated` reports omitted older operations. Private references,
+action labels, recovery text, and raw subprocess streams are excluded.
+
+If a category cannot be read, the manifest lists it under `not_collected` with
+the failure reason. An available empty history is reported as collected.
+
+## Raw setup and repair subprocess output
+
+Use `--raw-subprocess-output --output <path>` with `satelle setup` or
+`satelle repair` to export selected redacted subprocess stdout from that one
+invocation. Noninteractive use requires `--no-input --yes` as explicit raw
+diagnostic consent. The command refuses an existing output path and does not
+support this export in dry-run mode.
+
+The artifact includes stable command identifiers, timestamps, exit status,
+and redaction metadata. Satelle excludes token-bearing subprocesses, provider
+traffic, prompts, transcripts, screenshots, and recordings. It does not add
+this output to logs, setup history, status, Doctor, Operator Log Files, caches,
+support bundles, or automatic uploads.
+
+## Host version compatibility
+
+Use `satelle host update --host <alias> --component host --version <version>`
+to select a compatible stable release. Add `--dry-run --json` to inspect its
+plan. Without `--version`, the target is the invoking CLI's exact release.
+Explicit selection requires a remote Host and cannot include Codex components.
+The following compatibility checks apply to explicit selection.
+
+| Decision | Policy |
+| --- | --- |
+| Version skew | Stable patch releases within the same major/minor series |
+| Protocol | One exact supported protocol; no fallback negotiation |
+| Storage | Current and selected releases must use the CLI's storage schema |
+| Features | Use the selected Host's advertised capabilities and normal readiness checks |
+| Upgrade order | Upgrade the CLI first when the selected release requires a newer minimum CLI |
+| Downgrade | Requires an explicit lower version and the same compatibility checks |
+| Integrity | Verify `satelle-compatibility.json` against checksums and signed release attestations before planning; verify the platform archive before upload |
+| Recovery | Resume the recorded update operation with its pinned version and artifact digest using the reported `satelle repair --run` command |
+
+Missing or invalid compatibility metadata blocks explicit selection. The
+metadata declares `schema_version`, `version`, `protocol_version`,
+`storage_schema_version`, and `minimum_cli_version`. There are no update
+channels or implicit latest-release selections.
+
+The version option selects this update's target. It does not create a permanent
+version pin for future setup, repair, or missing-daemon bootstrap operations.
+
+## Host update plain records
+
+`satelle host update --plain` writes UTF-8, LF-terminated records to stdout.
+Fields are separated by TAB, with no header row:
+
+| Position | Field | Values |
+| --- | --- | --- |
+| 1 | `schema` | `satelle.host.update.plain.v1` |
+| 2 | `host` | Selected Host alias |
+| 3 | `component` | `host_daemon`, `host_daemon_service`, `codex_runtime`, `codex_native_computer_use`, or `unknown` when planning fails before targets are known |
+| 4 | `phase` | `plan`, `apply`, or `postcheck` |
+| 5 | `status` | `planned`, `unchanged`, `skipped`, `succeeded`, `failed`, `postcheck_failed`, or `cancelled` |
+| 6 | `current_version` | Observed version, or `-` |
+| 7 | `target_version` | Selected version, or `-` |
+| 8 | `changed` | `true` when this target has a confirmed applied action, otherwise `false` |
+| 9 | `restart_required` | `true` or `false` from this target's plan |
+| 10 | `error_code` | Typed error token with hyphens replaced by underscores, or `-` |
+| 11 | `recovery_command` | Shell-safe command, or `-` |
+
+Inside fields, backslash, TAB, LF, and CR become `\\`, `\t`, `\n`, and `\r`.
+The v1 field order, escaping, and token meanings are fixed. A command emits one
+plan record per target and, when it reaches application, one terminal record
+per target. Completed targets retain their outcomes when another target fails.
+Dry-runs and already-current targets do not require confirmation.
+
+`--plain` conflicts with `--json` and every explicit `--format` value. It keeps
+diagnostics and prompts on stderr, suppresses colors and human summaries, and
+uses the same consent rules and exit codes as the equivalent update command.
+`--quiet` does not suppress plain records. JSON remains the complete report.
+
+## Unavailable command families
+
+Commands can appear in `--help` before their implementation is complete.
+Host stop/restart currently return typed not-implemented errors. See
+[Move Host storage](/docs/how-to/move-host-storage) for migration, cleanup,
+and interruption recovery. The embedded Agent Skill Bundle is
+version-matched to this source tree and available through `satelle skills`.
