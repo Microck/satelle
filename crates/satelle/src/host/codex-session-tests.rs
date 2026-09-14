@@ -1,0 +1,1874 @@
+use super::*;
+use serde_json::{Value, json};
+use sha2::Digest as _;
+use std::fs::{OpenOptions, read_to_string};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+#[path = "codex-session-tests/approvals.rs"]
+mod approvals;
+
+const FIXTURE_SOURCE: &str = r##"
+use std::fs::OpenOptions;
+use std::io::{BufRead, Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct MouseInput {
+    dx: i32,
+    dy: i32,
+    mouse_data: u32,
+    flags: u32,
+    time: u32,
+    extra_info: usize,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+union InputValue {
+    mouse: std::mem::ManuallyDrop<MouseInput>,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Input {
+    kind: u32,
+    value: InputValue,
+}
+
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("descendant") {
+        let escaped_marker = std::env::args().nth(2).unwrap();
+        let release_marker = PathBuf::from(std::env::args().nth(3).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !release_marker.exists() {
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(escaped_marker, "escaped").unwrap();
+        return;
+    }
+    if let Some(path) = std::env::var_os("SATELLE_FIXTURE_ARGS_LOG") {
+        let args = std::env::args().skip(1).collect::<Vec<_>>().join("\n");
+        std::fs::write(path, args).unwrap();
+    }
+    if let Some(path) = std::env::var_os("SATELLE_FIXTURE_PROVIDER_ENV_LOG") {
+        let value = std::env::var("SATELLE_CODEX_API_KEY").unwrap_or_default();
+        std::fs::write(path, value).unwrap();
+    }
+    let scenario = std::env::var("SATELLE_FIXTURE_SCENARIO").unwrap();
+    let log = PathBuf::from(std::env::var_os("SATELLE_FIXTURE_LOG").unwrap());
+    std::fs::write(
+        std::env::var_os("SATELLE_FIXTURE_CWD_LOG").unwrap(),
+        std::env::current_dir().unwrap().to_string_lossy().as_bytes(),
+    ).unwrap();
+    let thread_marker = PathBuf::from(std::env::var_os("SATELLE_THREAD_MARKER").unwrap());
+    let turn_marker = PathBuf::from(std::env::var_os("SATELLE_TURN_MARKER").unwrap());
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+
+    receive(&mut input, &log);
+    match scenario.as_str() {
+        "wrong-id" => send(&mut output, r#"{"id":9,"result":{}}"#),
+        "out-of-order" => send(&mut output, r#"{"id":2,"result":{"thread":{"id":"thread-early"}}}"#),
+        "malformed" => send(&mut output, "not-json"),
+        "non-object" => send(&mut output, "[]"),
+        "unterminated" => {
+            output.write_all(br#"{"id":1,"result":{}}"#).unwrap();
+            output.flush().unwrap();
+            // A valid JSON fragment without the JSON Lines delimiter is not a
+            // protocol message and cannot advance the exchange.
+            hang();
+        }
+        "oversized" => {
+            output.write_all(&vec![b'x'; 2 * 1024 * 1024 + 1]).unwrap();
+            output.write_all(b"\n").unwrap();
+            output.flush().unwrap();
+        }
+        "eof" => return,
+        "timeout" | "timeout-local-image" => hang(),
+        _ => {}
+    }
+    if matches!(scenario.as_str(), "wrong-id" | "out-of-order" | "malformed" | "non-object" | "oversized" | "unterminated") {
+        hang();
+    }
+
+    send(&mut output, r#"{"id":1,"result":{"userAgent":"fixture","codexHome":"/fixture","platformFamily":"fixture","platformOs":"fixture"}}"#);
+    if scenario == "descendant-timeout" {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("descendant")
+            .arg(std::env::var_os("SATELLE_DESCENDANT_MARKER").unwrap())
+            .arg(std::env::var_os("SATELLE_DESCENDANT_RELEASE_MARKER").unwrap())
+            .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::null())
+            .spawn().unwrap();
+        hang();
+    }
+    if scenario == "flood-timeout" {
+        let payload = "x".repeat(64 * 1024);
+        for _ in 0..10_000 {
+            send(&mut output, &format!(r#"{{"method":"private/flood","params":{{"raw":"{payload}"}}}}"#));
+        }
+        hang();
+    }
+    receive(&mut input, &log);
+    if scenario.starts_with("read-") {
+        let request = receive(&mut input, &log);
+        assert!(request.contains(r#""method":"thread/read""#));
+        assert!(request.contains(r#""threadId":"thread-1""#));
+        assert!(request.contains(r#""includeTurns":true"#));
+        let status = scenario.strip_prefix("read-").unwrap();
+        send(&mut output, &format!(r#"{{"id":2,"result":{{"thread":{{"id":"thread-1","turns":[{{"id":"turn-1","status":"{status}"}}]}}}}}}"#));
+        hang();
+    }
+    let thread_request = receive(&mut input, &log);
+    if scenario == "thread-policy-response-error" {
+        send(&mut output, r#"{"id":2,"error":{"code":-32602,"message":"unknown field approvalPolicy"}}"#);
+        hang();
+    }
+    if scenario == "thread-response-error" {
+        send(&mut output, r#"{"id":2,"error":{"code":-32000,"message":"thread service unavailable"}}"#);
+        hang();
+    }
+    let thread_id = if thread_request.contains(r#""threadId":"thread-existing""#) {
+        "thread-existing"
+    } else {
+        "thread-1"
+    };
+    let thread_response = format!(r#"{{"id":2,"result":{{"thread":{{"id":"{thread_id}"}}}}}}"#);
+    let mut provider_probe_request = None;
+
+    if matches!(scenario.as_str(), "notification-first" | "mcp-notification-first") {
+        if scenario == "notification-first" {
+            send(&mut output, &format!(r#"{{"method":"thread/started","params":{{"thread":{{"id":"{thread_id}"}}}}}}"#));
+        }
+        send_mcp_ready(&mut output, thread_id);
+        wait_for(&thread_marker);
+        let plugin_request = receive(&mut input, &log);
+        assert_plugin_inventory_request(&plugin_request);
+        send_plugin_inventory(&mut output, false);
+        receive(&mut input, &log);
+        send(&mut output, &format!(r#"{{"method":"turn/started","params":{{"threadId":"{thread_id}","turn":{{"id":"turn-1","status":"inProgress"}}}}}}"#));
+        wait_for(&turn_marker);
+        send(&mut output, &thread_response);
+    } else if scenario == "conflict" {
+        send(&mut output, &thread_response);
+        wait_for(&thread_marker);
+        send(&mut output, r#"{"method":"thread/started","params":{"thread":{"id":"thread-conflict"}}}"#);
+        hang();
+    } else {
+        send(&mut output, &thread_response);
+        if scenario == "unexpected-mcp-server" {
+            send(&mut output, &format!(r#"{{"method":"mcpServer/startupStatus/updated","params":{{"threadId":"{thread_id}","name":"unexpected","status":"starting","error":null,"failureReason":null}}}}"#));
+            hang();
+        }
+        send_mcp_ready(&mut output, thread_id);
+        if thread_id == "thread-1" { wait_for(&thread_marker); }
+        let plugin_request = receive(&mut input, &log);
+        assert_plugin_inventory_request(&plugin_request);
+        if scenario == "unexpected-plugin" {
+            send_plugin_inventory(&mut output, true);
+            hang();
+        }
+        send_plugin_inventory(&mut output, false);
+        if scenario == "blocked-write" { hang(); }
+        let next_request = receive(&mut input, &log);
+        if scenario.starts_with("goal") {
+            assert!(next_request.contains(r#""id":3"#));
+            assert!(next_request.contains(r#""method":"thread/goal/set""#));
+            assert!(next_request.contains(r#""threadId":"thread-1""#));
+            let status = if scenario == "goal-active" { "active" } else { "paused" };
+            send(&mut output, &format!(r#"{{"id":3,"result":{{"goal":{{"threadId":"thread-1","objective":"perform the harmless action PRIVATE_PROMPT_CANARY","status":"{status}","createdAt":1,"updatedAt":1,"tokensUsed":0,"timeUsedSeconds":0,"tokenBudget":null}}}}}}"#));
+            receive(&mut input, &log);
+        } else if matches!(
+            scenario.as_str(),
+            "provider-probe-responses" | "provider-probe-invalidated-after-callbacks"
+        ) {
+            provider_probe_request = Some(next_request);
+        }
+    }
+
+    match scenario.as_str() {
+        "duplicate" => { send(&mut output, &thread_response); hang(); }
+        "turn-policy-response-error" => {
+            send(&mut output, r#"{"id":3,"error":{"code":-32602,"message":"unknown field sandboxPolicy"}}"#);
+            hang();
+        }
+        "response-error" => {
+            send(&mut output, r#"{"id":3,"error":{"code":-1,"message":"PRIVATE_RAW_CANARY"}}"#);
+            hang();
+        }
+        _ => {}
+    }
+
+    if scenario == "goal" {
+        send(&mut output, r#"{"id":4,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}"#);
+    } else {
+        send(&mut output, r#"{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}"#);
+    }
+    wait_for(&turn_marker);
+    if scenario == "approval-write-failure" {
+        send(&mut output, &format!(r#"{{"id":"approval-write-failure","method":"item/commandExecution/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"additionalPermissions":{{"fileSystem":{{"entries":[]}}}},"availableDecisions":["accept","decline"]}}}}"#));
+        std::process::exit(0);
+    }
+    if scenario.starts_with("native-task-") {
+        let script = r#"globalThis.sky ??= (await import('@oai/sky')).sky; sky.list_apps()"#;
+        if !matches!(
+            scenario.as_str(),
+            "native-task-no-approval"
+        ) {
+            send(&mut output, &format!(r#"{{"id":"native-script","method":"mcpServer/elicitation/request","params":{{"_meta":{{"codex_approval_kind":"mcp_tool_call","persist":["session","always"],"tool_description":"Run JavaScript in a persistent Node-backed kernel.","tool_params":{{"code":"{script}"}},"tool_params_display":[{{"name":"code","display_name":"code","value":"{script}"}}]}},"message":"Allow the node_repl MCP server to run tool \"js\"?","mode":"form","requestedSchema":{{"type":"object","properties":{{}}}},"serverName":"node_repl","threadId":"{thread_id}","turnId":"turn-1"}}}}"#));
+            let approval = receive(&mut input, &log);
+            assert!(approval.contains(r#""action":"accept""#));
+        }
+
+        if matches!(
+            scenario.as_str(),
+            "native-task-success"
+                | "native-task-failed"
+                | "native-task-failed-then-success"
+                | "native-task-no-approval"
+                | "native-task-script-conflict"
+                | "native-task-thread-conflict"
+        ) {
+            let item_prefix = format!(r#"{{"id":"native-item","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{{"code":"{script}"}}"#);
+            let started = format!(r#"{item_prefix},"status":"inProgress"}}"#);
+            send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{started}}}}}"#));
+            let terminal_status = if matches!(
+                scenario.as_str(),
+                "native-task-success"
+                    | "native-task-no-approval"
+                    | "native-task-script-conflict"
+                    | "native-task-thread-conflict"
+            ) {
+                "completed"
+            } else {
+                "failed"
+            };
+            let mut completed = started.replace(
+                r#""status":"inProgress""#,
+                &format!(r#""status":"{terminal_status}""#),
+            );
+            if scenario == "native-task-script-conflict" {
+                completed = completed.replace(&script, "different script");
+            }
+            completed.pop();
+            completed.push_str(r#","result":{"content":[],"structuredContent":null,"_meta":{"codex/nodeReplExecutionDurationMs":7}}}"#);
+            let item_thread = if scenario == "native-task-thread-conflict" {
+                "thread-conflict"
+            } else {
+                thread_id
+            };
+            send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{item_thread}","turnId":"turn-1","item":{completed}}}}}"#));
+            if scenario == "native-task-failed-then-success" {
+                let retry_prefix = item_prefix.replace("native-item", "native-item-retry");
+                let retry = format!(r#"{retry_prefix},"status":"inProgress"}}"#);
+                send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{retry}}}}}"#));
+                let mut retry = retry.replace(
+                    r#""status":"inProgress""#,
+                    r#""status":"completed""#,
+                );
+                retry.pop();
+                retry.push_str(r#","result":{"content":[],"structuredContent":null,"_meta":{"codex/nodeReplExecutionDurationMs":5}}}"#);
+                send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{retry}}}}}"#));
+            }
+        }
+    }
+    if scenario == "controlled-interrupt" {
+        let interrupt = receive(&mut input, &log);
+        assert!(interrupt.contains(r#""id":4"#));
+        assert!(interrupt.contains(r#""method":"turn/interrupt""#));
+        assert!(interrupt.contains(r#""threadId":"thread-1""#));
+        assert!(interrupt.contains(r#""turnId":"turn-1""#));
+        send(&mut output, r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted"}}}"#);
+        send(&mut output, r#"{"id":4,"result":{}}"#);
+        return;
+    }
+    if scenario == "native-controlled-interrupt" {
+        let started = r#"{"id":"item-native","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{"code":"PRIVATE_NATIVE_SCRIPT"},"status":"inProgress"}"#;
+        send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"thread-1","turnId":"turn-1","item":{started}}}}}"#));
+        let completed = started.replace(r#""status":"inProgress""#, r#""status":"completed""#);
+        send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"thread-1","turnId":"turn-1","item":{completed}}}}}"#));
+        let interrupt = receive(&mut input, &log);
+        assert!(interrupt.contains(r#""id":4"#));
+        assert!(interrupt.contains(r#""method":"turn/interrupt""#));
+        assert!(interrupt.contains(r#""threadId":"thread-1""#));
+        assert!(interrupt.contains(r#""turnId":"turn-1""#));
+        send(&mut output, r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted"}}}"#);
+        send(&mut output, r#"{"id":4,"result":{}}"#);
+        return;
+    }
+    if matches!(
+        scenario.as_str(),
+        "provider-probe-responses" | "provider-probe-invalidated-after-callbacks"
+    ) {
+        let next_request = provider_probe_request.as_deref().unwrap();
+        let script_start = next_request.find("globalThis.sky ??=").unwrap();
+        let script_end = script_start
+            + next_request[script_start..]
+                .find(r#"\""#)
+                .expect("provider probe script must end at the JSON string boundary");
+        let encoded_script = &next_request[script_start..script_end];
+        let item = format!(r#"{{"id":"item-native","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{{"code":"{encoded_script}"}},"status":"inProgress"}}"#);
+        send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{item}}}}}"#));
+        complete_provider_probe_actions(&next_request);
+        let mut item = item.replace(r#""status":"inProgress""#, r#""status":"completed""#);
+        item.pop();
+        item.push_str(r#", "result":{"content":[],"structuredContent":null,"_meta":{"codex/nodeReplExecutionDurationMs":5}}}"#);
+        send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{item}}}}}"#));
+        if scenario == "provider-probe-invalidated-after-callbacks" {
+            send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{{"id":"item-extra","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{{"code":"unexpected()"}},"status":"inProgress"}}}}}}"#));
+        }
+    }
+    if scenario == "server-requests" {
+        send(&mut output, &format!(r#"{{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"additionalPermissions":{{"fileSystem":{{"entries":[]}}}},"availableDecisions":["accept","decline"]}}}}"#));
+        receive(&mut input, &log);
+        send(&mut output, &format!(r#"{{"id":"file-1","method":"item/fileChange/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-2","startedAtMs":2}}}}"#));
+        receive(&mut input, &log);
+        send(&mut output, &format!(r#"{{"id":"permissions-1","method":"item/permissions/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-3","startedAtMs":3,"cwd":"/fixture","permissions":{{"fileSystem":{{"entries":[]}},"network":{{"enabled":true}}}}}}}}"#));
+        receive(&mut input, &log);
+        send(&mut output, &format!(r#"{{"id":"legacy-patch","method":"applyPatchApproval","params":{{"callId":"patch-1","conversationId":"{thread_id}","fileChanges":{{}}}}}}"#));
+        receive(&mut input, &log);
+        send(&mut output, &format!(r#"{{"id":"legacy-command","method":"execCommandApproval","params":{{"callId":"command-1","command":[],"conversationId":"{thread_id}","cwd":"/fixture","parsedCmd":[]}}}}"#));
+        receive(&mut input, &log);
+        send(&mut output, &format!(r#"{{"id":"input-1","method":"item/tool/requestUserInput","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-4","questions":[]}}}}"#));
+        receive(&mut input, &log);
+        send(&mut output, r#"{"id":"native-ui","method":"private/osPrivacy/requestApproval"}"#);
+        receive(&mut input, &log);
+        send(&mut output, r#"{"id":99,"method":"account/chatgptAuthTokens/refresh"}"#);
+        receive(&mut input, &log);
+    }
+    if scenario == "unsupported-permission" {
+        send(&mut output, &format!(r#"{{"id":"permissions-unsupported","method":"item/permissions/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"cwd":"/fixture","permissions":{{"osPrivacy":{{"screenRecording":true}}}}}}}}"#));
+        receive(&mut input, &log);
+    }
+    if scenario == "malformed-permission" {
+        send(&mut output, &format!(r#"{{"id":"permissions-malformed","method":"item/permissions/requestApproval","params":{{"threadId":"{thread_id}","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"cwd":"/fixture","permissions":{{"network":"enabled"}}}}}}"#));
+        hang();
+    }
+    if scenario == "server-request-conflict" {
+        send(&mut output, r#"{"id":"approval-conflict","method":"item/fileChange/requestApproval","params":{"threadId":"thread-conflict","turnId":"turn-1","itemId":"item-1","startedAtMs":1}}"#);
+        hang();
+    }
+    if scenario == "legacy-server-request-conflict" {
+        send(&mut output, r#"{"id":"legacy-conflict","method":"execCommandApproval","params":{"callId":"command-1","command":[],"conversationId":"thread-conflict","cwd":"/fixture","parsedCmd":[]}}"#);
+        hang();
+    }
+    if scenario == "unknown-canary" {
+        send(&mut output, r#"{"method":"private/future","params":{"raw":"PRIVATE_RAW_CANARY"}}"#);
+        send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{{"raw":"PRIVATE_RAW_CANARY"}}}}}}"#));
+        send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{{"raw":"PRIVATE_RAW_CANARY"}}}}}}"#));
+    }
+    let mut graceful_descendant = None;
+    if matches!(scenario.as_str(), "descendant" | "graceful-descendant") {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("descendant")
+            .arg(std::env::var_os("SATELLE_DESCENDANT_MARKER").unwrap())
+            .arg(std::env::var_os("SATELLE_DESCENDANT_RELEASE_MARKER").unwrap())
+            .stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::null());
+        #[cfg(unix)]
+        if scenario == "graceful-descendant" {
+            // Model node_repl's sandboxed kernel, which creates a process
+            // group outside the app-server's direct containment group.
+            command.process_group(0);
+        }
+        let child = command.spawn().unwrap();
+        if scenario == "graceful-descendant" {
+            graceful_descendant = Some(child);
+        }
+    }
+    let status = match scenario.as_str() {
+        "interrupted" => "interrupted",
+        "failed" | "upstream-http-failed" => "failed",
+        _ => "completed",
+    };
+    let terminal_turn = if scenario == "turn-conflict" { "turn-conflict" } else { "turn-1" };
+    let error = if scenario == "upstream-http-failed" {
+        r#","error":{"message":"PRIVATE_PROVIDER_ERROR_CANARY","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":503}},"additionalDetails":"PRIVATE_PROVIDER_DETAILS_CANARY"}"#
+    } else {
+        ""
+    };
+    send(&mut output, &format!(r#"{{"method":"turn/completed","params":{{"threadId":"{thread_id}","turn":{{"id":"{terminal_turn}","status":"{status}"{error}}}}}}}"#));
+    if let Some(mut descendant) = graceful_descendant {
+        // A real app-server shuts its MCP servers down after Satelle closes
+        // stdin. Give this fixture the same cleanup contract: the escaped
+        // kernel is stopped before the app-server leader exits.
+        let mut remaining = Vec::new();
+        input.read_to_end(&mut remaining).unwrap();
+        descendant.kill().unwrap();
+        descendant.wait().unwrap();
+        return;
+    }
+    hang();
+}
+
+fn receive(input: &mut impl BufRead, log_path: &Path) -> String {
+    let mut line = String::new();
+    assert_ne!(input.read_line(&mut line).unwrap(), 0);
+    OpenOptions::new().create(true).append(true).open(log_path)
+        .unwrap().write_all(line.as_bytes()).unwrap();
+    line
+}
+
+fn send(output: &mut impl Write, line: &str) {
+    writeln!(output, "{line}").unwrap();
+    output.flush().unwrap();
+}
+
+fn send_mcp_ready(output: &mut impl Write, thread_id: &str) {
+    send(output, &format!(r#"{{"method":"mcpServer/startupStatus/updated","params":{{"threadId":"{thread_id}","name":"computer-use","status":"ready","error":null,"failureReason":null}}}}"#));
+}
+
+fn assert_plugin_inventory_request(request: &str) {
+    assert!(request.contains(r#""id":7"#));
+    assert!(request.contains(r#""method":"plugin/list""#));
+    assert!(request.contains(r#""cwds""#));
+}
+
+fn send_plugin_inventory(output: &mut impl Write, include_unexpected: bool) {
+    let marketplaces = if include_unexpected {
+        r#"[{"name":"unexpected","plugins":[{"id":"unexpected","installed":true,"enabled":true}]}]"#
+    } else {
+        "[]"
+    };
+    send(
+        output,
+        &format!(
+            r#"{{"id":7,"result":{{"marketplaces":{marketplaces},"marketplaceLoadErrors":[],"featuredPluginIds":[]}}}}"#,
+        ),
+    );
+}
+
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn complete_provider_probe_actions(turn_request: &str) {
+    let url_start = turn_request.find("http://127.0.0.1:").unwrap();
+    let url_tail = &turn_request[url_start..];
+    let url_end = url_tail
+        .find(|character: char| character == '\'' || character.is_whitespace())
+        .unwrap();
+    let url = &url_tail[..url_end];
+    let without_scheme = url.strip_prefix("http://").unwrap();
+    let (host, target) = without_scheme.split_once('/').unwrap();
+    let target = format!("/{target}");
+
+    let mut page_stream = TcpStream::connect(host).unwrap();
+    write!(
+        page_stream,
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    page_stream.flush().unwrap();
+    let mut page = String::new();
+    page_stream.read_to_string(&mut page).unwrap();
+    assert!(page.starts_with("HTTP/1.1 200 OK"));
+    assert!(page.contains("id=confirm type=button"));
+    assert!(page.contains("id=source type=range min=0 max=100 value=0"));
+    assert!(page.contains("id=target"));
+    assert!(page.contains("source.addEventListener('input',completeDrag)"));
+
+    let nonce_start = page.find("<strong>").unwrap() + "<strong>".len();
+    let nonce_end = nonce_start + page[nonce_start..].find("</strong>").unwrap();
+    let nonce = &page[nonce_start..nonce_end];
+    let completion_start = page.find("fetch('").unwrap() + "fetch('".len();
+    let completion_end =
+        completion_start + page[completion_start..].find('\'').unwrap();
+    let completion_target = &page[completion_start..completion_end];
+    for (action, delta_x) in [("click", 1), ("drag", -1)] {
+        record_native_input_for_probe_test(delta_x);
+        let body = format!("nonce={nonce}&action={action}");
+        let mut completion_stream = TcpStream::connect(host).unwrap();
+        write!(
+            completion_stream,
+            "POST {completion_target} HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        completion_stream.flush().unwrap();
+        let mut completion = String::new();
+        completion_stream
+            .read_to_string(&mut completion)
+            .unwrap();
+        assert!(completion.starts_with("HTTP/1.1 204 No Content"));
+    }
+}
+
+fn record_native_input_for_probe_test(_delta_x: i32) {
+    #[cfg(windows)]
+    {
+        // Windows accepts a probe receipt only after the session's real input
+        // counter advances. Use the same checked SendInput mouse movement as
+        // the direct native probe test instead of a second fixture-only path.
+        const INPUT_MOUSE: u32 = 0;
+        const MOUSE_EVENT_MOVE: u32 = 0x0001;
+        std::thread::sleep(Duration::from_millis(20));
+        let input = Input {
+            kind: INPUT_MOUSE,
+            value: InputValue {
+                mouse: std::mem::ManuallyDrop::new(MouseInput {
+                    dx: _delta_x,
+                    dy: 0,
+                    mouse_data: 0,
+                    flags: MOUSE_EVENT_MOVE,
+                    time: 0,
+                    extra_info: 0,
+                }),
+            },
+        };
+        assert_eq!(
+            unsafe {
+                SendInput(
+                    1,
+                    &input,
+                    i32::try_from(std::mem::size_of::<Input>()).unwrap(),
+                )
+            },
+            1,
+            "Windows did not accept the provider fixture input"
+        );
+    }
+}
+
+fn hang() -> ! {
+    std::thread::sleep(Duration::from_secs(5));
+    std::process::exit(0)
+}
+"##;
+
+pub(crate) struct CompiledFixture {
+    _directory: tempfile::TempDir,
+    executable: PathBuf,
+}
+
+impl CompiledFixture {
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+}
+
+pub(crate) fn compile_fixture() -> CompiledFixture {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let source = directory.path().join("codex-session-fixture.rs");
+    std::fs::write(&source, FIXTURE_SOURCE).expect("write fixture source");
+    let executable = directory.path().join(if cfg!(windows) {
+        "codex-session-fixture.exe"
+    } else {
+        "codex-session-fixture"
+    });
+    let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .arg(&source)
+        .arg("--edition=2024")
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .expect("compile fixture");
+    assert!(
+        output.status.success(),
+        "fixture compilation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    CompiledFixture {
+        _directory: directory,
+        executable,
+    }
+}
+
+struct ScenarioResult {
+    result: Result<CodexSessionTerminal, CodexSessionError>,
+    session_elapsed: Duration,
+    turn_dispatch_attempted: bool,
+    requests: Vec<Value>,
+    persisted_threads: Vec<String>,
+    persisted_turns: Vec<String>,
+    native_approval_requests: usize,
+    child_working_directory: PathBuf,
+    staged_image_path: Option<PathBuf>,
+    _fixture: CompiledFixture,
+    directory: tempfile::TempDir,
+}
+
+#[derive(Clone, Copy)]
+enum PersistFailure {
+    None,
+    Thread,
+    Turn,
+}
+
+#[derive(Clone)]
+struct ScenarioExecution {
+    mode: TurnExecutionMode,
+    approval_policy: CodexApprovalPolicy,
+    sandbox_policy: CodexSandboxPolicy,
+    native_apps_allowed: bool,
+    native_action_evidence: Option<NativeActionEvidence>,
+}
+
+impl ScenarioExecution {
+    const STANDARD: Self = Self {
+        mode: TurnExecutionMode::Standard,
+        approval_policy: CodexApprovalPolicy::OnRequest,
+        sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+        native_apps_allowed: false,
+        native_action_evidence: None,
+    };
+
+    const YOLO: Self = Self {
+        mode: TurnExecutionMode::Yolo,
+        approval_policy: CodexApprovalPolicy::Never,
+        sandbox_policy: CodexSandboxPolicy::DangerFullAccess,
+        native_apps_allowed: false,
+        native_action_evidence: None,
+    };
+
+    const NATIVE: Self = Self {
+        mode: TurnExecutionMode::Standard,
+        approval_policy: CodexApprovalPolicy::OnRequest,
+        sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+        native_apps_allowed: true,
+        native_action_evidence: None,
+    };
+
+    const fn new(
+        mode: TurnExecutionMode,
+        approval_policy: CodexApprovalPolicy,
+        sandbox_policy: CodexSandboxPolicy,
+    ) -> Self {
+        Self {
+            mode,
+            approval_policy,
+            sandbox_policy,
+            native_apps_allowed: false,
+            native_action_evidence: None,
+        }
+    }
+}
+
+fn run_scenario(
+    scenario: &str,
+    existing_thread_ref: Option<&str>,
+    timeout: Duration,
+) -> ScenarioResult {
+    run_scenario_with_options(
+        scenario,
+        existing_thread_ref,
+        timeout,
+        "perform the harmless action PRIVATE_PROMPT_CANARY",
+        PersistFailure::None,
+        ScenarioExecution::STANDARD,
+    )
+}
+
+fn run_scenario_with_prompt(
+    scenario: &str,
+    existing_thread_ref: Option<&str>,
+    timeout: Duration,
+    prompt: &str,
+) -> ScenarioResult {
+    run_scenario_with_options(
+        scenario,
+        existing_thread_ref,
+        timeout,
+        prompt,
+        PersistFailure::None,
+        ScenarioExecution::STANDARD,
+    )
+}
+
+fn run_yolo_scenario(scenario: &str, timeout: Duration) -> ScenarioResult {
+    run_scenario_with_options(
+        scenario,
+        None,
+        timeout,
+        "perform the harmless action PRIVATE_PROMPT_CANARY",
+        PersistFailure::None,
+        ScenarioExecution::YOLO,
+    )
+}
+
+fn run_native_scenario(scenario: &str, timeout: Duration) -> ScenarioResult {
+    run_scenario_with_options(
+        scenario,
+        None,
+        timeout,
+        "perform the native action PRIVATE_PROMPT_CANARY",
+        PersistFailure::None,
+        ScenarioExecution::NATIVE,
+    )
+}
+
+fn run_scenario_with_options(
+    scenario: &str,
+    existing_thread_ref: Option<&str>,
+    timeout: Duration,
+    prompt: &str,
+    persist_failure: PersistFailure,
+    execution: ScenarioExecution,
+) -> ScenarioResult {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("scenario directory");
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        directory.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("make scenario directory owner-only");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let descendant_marker = directory.path().join("descendant-escaped");
+    let descendant_release_marker = directory.path().join("descendant-release");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("SATELLE_FIXTURE_SCENARIO", scenario)
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env("SATELLE_DESCENDANT_MARKER", &descendant_marker)
+        .env(
+            "SATELLE_DESCENDANT_RELEASE_MARKER",
+            &descendant_release_marker,
+        );
+
+    let mut persisted_threads = Vec::new();
+    let mut persisted_turns = Vec::new();
+    let mut persist_thread = |value: &str| {
+        if matches!(persist_failure, PersistFailure::Thread) {
+            return Err(());
+        }
+        persisted_threads.push(value.to_owned());
+        touch(&thread_marker);
+        Ok(())
+    };
+    let mut persist_turn = |value: &str| {
+        if matches!(persist_failure, PersistFailure::Turn) {
+            return Err(());
+        }
+        persisted_turns.push(value.to_owned());
+        touch(&turn_marker);
+        Ok(())
+    };
+    let mut native_approval_requests = 0;
+    let mut observe_native_approval = || native_approval_requests += 1;
+    let uses_local_image = matches!(scenario, "local-image" | "timeout-local-image");
+    let staged = if uses_local_image {
+        let bytes = b"\x89PNG\r\n\x1a\nfixture";
+        let digest = sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let verified =
+            crate::host::attachment::accept_inputs(vec![crate::host::AttachmentInput::upload(
+                "image/png",
+                bytes.len() as u64,
+                digest,
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            )])
+            .expect("verify local image fixture");
+        let verified = crate::host::attachment::resolve_images(&verified)
+            .expect("resolve local image fixture");
+        crate::host::attachment::AttachmentStore::open(directory.path().join("attachments"))
+            .expect("open attachment fixture store")
+            .stage(verified)
+            .expect("stage local image fixture")
+    } else {
+        crate::host::attachment::StagedAttachments::default()
+    };
+    let staged_image_path = staged
+        .images()
+        .first()
+        .map(|image| image.path().to_path_buf());
+    let computer_use_allowed_app_ids = if execution.native_apps_allowed {
+        BTreeSet::from(["calculator.exe".to_string()])
+    } else {
+        BTreeSet::default()
+    };
+    let session_started = Instant::now();
+    let session_result = run_codex_session(
+        command,
+        CodexSessionRequest {
+            working_directory: directory.path(),
+            prompt,
+            existing_thread_ref,
+            model: Some("gpt-fixture"),
+            model_provider: Some("fixture-provider"),
+            provider_endpoint: None,
+            provider_secret: None,
+            execution_mode: execution.mode,
+            approval_policy: execution.approval_policy,
+            sandbox_policy: execution.sandbox_policy,
+            deadline: Instant::now() + timeout,
+            persist_thread_ref: &mut persist_thread,
+            persist_turn_ref: &mut persist_turn,
+            observe_native_approval: Some(&mut observe_native_approval),
+            native_action_evidence: execution.native_action_evidence,
+            expected_mcp_server_name: "computer-use",
+            computer_use_allowed_app_ids: &computer_use_allowed_app_ids,
+            control: None,
+            goal_set_supported: scenario.starts_with("goal"),
+            image_input_mode: if uses_local_image {
+                crate::host::codex_capabilities::CodexImageInputMode::Local
+            } else {
+                crate::host::codex_capabilities::CodexImageInputMode::Unsupported
+            },
+            attachments: staged.images(),
+            raw_protocol_capture: None,
+            recording_capture: None,
+        },
+    );
+    drop(staged);
+    let session_elapsed = session_started.elapsed();
+    let turn_dispatch_attempted = session_result
+        .as_ref()
+        .err()
+        .is_some_and(|failure| failure.turn_dispatch_attempted());
+    let result = session_result.map_err(CodexSessionFailure::error);
+    let requests = read_to_string(&log_path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("request JSON"))
+        .collect();
+    ScenarioResult {
+        result,
+        session_elapsed,
+        turn_dispatch_attempted,
+        requests,
+        persisted_threads,
+        persisted_turns,
+        native_approval_requests,
+        child_working_directory: PathBuf::from(
+            std::fs::read_to_string(cwd_log_path).expect("child working-directory record"),
+        ),
+        staged_image_path,
+        _fixture: fixture,
+        directory,
+    }
+}
+fn touch(path: &Path) {
+    writeln!(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("persistence marker"),
+        "persisted"
+    )
+    .expect("write persistence marker");
+}
+
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for fixture marker"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn process_startup_timeout(default: Duration) -> Duration {
+    // Native Windows and macOS runners need enough time to initialize the
+    // fixture before a timeout test starts exercising active-turn cleanup.
+    if cfg!(any(windows, target_os = "macos")) {
+        default.max(Duration::from_secs(3))
+    } else {
+        default
+    }
+}
+
+#[test]
+fn first_thread_uses_exact_policy_order_and_persists_refs() {
+    let run = run_scenario("completed", None, Duration::from_secs(3));
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.persisted_threads, ["thread-1"]);
+    assert_eq!(run.persisted_turns, ["turn-1"]);
+    assert_eq!(
+        std::fs::canonicalize(&run.child_working_directory).unwrap(),
+        std::fs::canonicalize(run.directory.path()).unwrap()
+    );
+    assert_ne!(
+        run.child_working_directory,
+        std::env::current_dir().unwrap()
+    );
+    assert_eq!(run.requests.len(), 5);
+    assert_eq!(
+        run.requests[0],
+        json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "satelle-host",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": false,
+                    "mcpServerOpenaiFormElicitation": true
+                }
+            }
+        })
+    );
+    assert_eq!(run.requests[1], json!({"method": "initialized"}));
+    assert_eq!(
+        run.requests[2],
+        json!({"id":2,"method":"thread/start","params":{
+        "model":"gpt-fixture","modelProvider":"fixture-provider",
+        "approvalPolicy":"on-request","sandbox":"workspace-write"}})
+    );
+    assert_eq!(
+        run.requests[3],
+        json!({"id":7,"method":"plugin/list","params":{
+            "cwds":[run.directory.path()]}})
+    );
+    assert_eq!(
+        run.requests[4],
+        json!({"id":3,"method":"turn/start","params":{
+        "input":[{"type":"text","text":"perform the harmless action PRIVATE_PROMPT_CANARY"}],
+        "threadId":"thread-1","model":"gpt-fixture","approvalPolicy":"on-request",
+        "sandboxPolicy":{"type":"workspaceWrite","writableRoots":[run.directory.path()],"networkAccess":false,
+            "excludeTmpdirEnvVar":true,"excludeSlashTmp":true}}})
+    );
+}
+
+#[test]
+fn provider_child_overrides_are_process_scoped_and_secret_safe() {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("provider child fixture directory");
+    let home = tempfile::tempdir().expect("isolated provider child home");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let args_log_path = directory.path().join("child-args");
+    let provider_env_log_path = directory.path().join("child-provider-env");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("HOME", home.path())
+        .env("SATELLE_FIXTURE_SCENARIO", "completed")
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_FIXTURE_ARGS_LOG", &args_log_path)
+        .env("SATELLE_FIXTURE_PROVIDER_ENV_LOG", &provider_env_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env(
+            "SATELLE_DESCENDANT_MARKER",
+            directory.path().join("unused-descendant"),
+        );
+    let mut persist_thread = |_: &str| {
+        touch(&thread_marker);
+        Ok(())
+    };
+    let mut persist_turn = |_: &str| {
+        touch(&turn_marker);
+        Ok(())
+    };
+    let secret = "PRIVATE_PROVIDER_CHILD_SECRET_CANARY";
+    let endpoint = "https://provider.invalid/v1";
+    let result = run_codex_session(
+        command,
+        CodexSessionRequest {
+            working_directory: directory.path(),
+            prompt: "PRIVATE_PROVIDER_PROMPT",
+            existing_thread_ref: None,
+            model: Some("provider-concrete-model"),
+            model_provider: Some(PROVIDER_CHILD_ID),
+            provider_endpoint: Some(endpoint),
+            provider_secret: Some(
+                crate::host::provider_auth::ResolvedProviderSecret::for_test(secret),
+            ),
+            execution_mode: TurnExecutionMode::Standard,
+            approval_policy: CodexApprovalPolicy::OnRequest,
+            sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+            deadline: Instant::now() + Duration::from_secs(3),
+            persist_thread_ref: &mut persist_thread,
+            persist_turn_ref: &mut persist_turn,
+            observe_native_approval: None,
+            native_action_evidence: None,
+            expected_mcp_server_name: "computer-use",
+            computer_use_allowed_app_ids: &BTreeSet::new(),
+            control: None,
+            goal_set_supported: false,
+            image_input_mode: crate::host::codex_capabilities::CodexImageInputMode::Unsupported,
+            attachments: &[],
+            raw_protocol_capture: None,
+            recording_capture: None,
+        },
+    );
+
+    assert_eq!(result, Ok(CodexSessionTerminal::Completed));
+    let args = read_to_string(&args_log_path).expect("read provider child args");
+    for expected in [
+        "model=\"provider-concrete-model\"",
+        "model_provider=\"satelle_runtime\"",
+        "model_providers.satelle_runtime.name=\"Satelle\"",
+        "model_providers.satelle_runtime.base_url=\"https://provider.invalid/v1\"",
+        "model_providers.satelle_runtime.env_key=\"SATELLE_CODEX_API_KEY\"",
+        "model_providers.satelle_runtime.wire_api=\"responses\"",
+        "model_providers.satelle_runtime.requires_openai_auth=false",
+        "shell_environment_policy.exclude=[\"SATELLE_CODEX_API_KEY\"]",
+    ] {
+        assert!(
+            args.lines().any(|arg| arg == expected),
+            "missing {expected}"
+        );
+    }
+    assert_eq!(args.lines().filter(|arg| *arg == "-c").count(), 8);
+    assert!(!args.contains(secret));
+    assert_eq!(
+        read_to_string(provider_env_log_path).expect("read provider child environment"),
+        secret
+    );
+    let requests = read_to_string(&log_path).expect("read provider protocol log");
+    assert!(requests.contains(r#""modelProvider":"satelle_runtime""#));
+    assert!(!requests.contains(secret));
+    assert!(!format!("{result:?}").contains(secret));
+    for (label, path) in [
+        ("provider child arguments", &args_log_path),
+        ("provider protocol transcript", &log_path),
+        ("provider child working directory", &cwd_log_path),
+        ("persisted thread marker", &thread_marker),
+        ("persisted turn marker", &turn_marker),
+    ] {
+        let artifact = std::fs::read(path).unwrap_or_default();
+        assert!(
+            !artifact
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "{label} must not retain the provider secret"
+        );
+    }
+    assert!(
+        !home.path().join(".codex").join("config.toml").exists(),
+        "provider child overrides must not write global Codex config"
+    );
+}
+
+#[test]
+fn builtin_openai_provider_secret_is_process_scoped_and_shell_excluded() {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("built-in OpenAI child fixture directory");
+    let home = tempfile::tempdir().expect("isolated built-in OpenAI child home");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let args_log_path = directory.path().join("child-args");
+    let provider_env_log_path = directory.path().join("child-provider-env");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("HOME", home.path())
+        .env("SATELLE_FIXTURE_SCENARIO", "completed")
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_FIXTURE_ARGS_LOG", &args_log_path)
+        .env("SATELLE_FIXTURE_PROVIDER_ENV_LOG", &provider_env_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env(
+            "SATELLE_DESCENDANT_MARKER",
+            directory.path().join("unused-descendant"),
+        );
+    let mut persist_thread = |_: &str| {
+        touch(&thread_marker);
+        Ok(())
+    };
+    let mut persist_turn = |_: &str| {
+        touch(&turn_marker);
+        Ok(())
+    };
+    let secret = "PRIVATE_BUILTIN_OPENAI_SECRET_CANARY";
+    let result = run_codex_session(
+        command,
+        CodexSessionRequest {
+            working_directory: directory.path(),
+            prompt: "PRIVATE_BUILTIN_OPENAI_PROMPT",
+            existing_thread_ref: None,
+            model: Some("gpt-fixture"),
+            model_provider: Some("openai"),
+            provider_endpoint: None,
+            provider_secret: Some(
+                crate::host::provider_auth::ResolvedProviderSecret::for_test(secret),
+            ),
+            execution_mode: TurnExecutionMode::Standard,
+            approval_policy: CodexApprovalPolicy::OnRequest,
+            sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+            deadline: Instant::now() + Duration::from_secs(3),
+            persist_thread_ref: &mut persist_thread,
+            persist_turn_ref: &mut persist_turn,
+            observe_native_approval: None,
+            native_action_evidence: None,
+            expected_mcp_server_name: "computer-use",
+            computer_use_allowed_app_ids: &BTreeSet::new(),
+            control: None,
+            goal_set_supported: false,
+            image_input_mode: crate::host::codex_capabilities::CodexImageInputMode::Unsupported,
+            attachments: &[],
+            raw_protocol_capture: None,
+            recording_capture: None,
+        },
+    );
+
+    assert_eq!(result, Ok(CodexSessionTerminal::Completed));
+    let args = read_to_string(&args_log_path).expect("read built-in OpenAI child args");
+    for expected in [
+        "model_providers.openai.env_key=\"SATELLE_CODEX_API_KEY\"",
+        "model_providers.openai.requires_openai_auth=false",
+        "shell_environment_policy.exclude=[\"SATELLE_CODEX_API_KEY\"]",
+    ] {
+        assert!(
+            args.lines().any(|arg| arg == expected),
+            "missing {expected}"
+        );
+    }
+    assert_eq!(args.lines().filter(|arg| *arg == "-c").count(), 3);
+    assert!(!args.contains(secret));
+    assert_eq!(
+        read_to_string(provider_env_log_path).expect("read built-in OpenAI child environment"),
+        secret
+    );
+    let requests = read_to_string(log_path).expect("read built-in OpenAI protocol log");
+    assert!(requests.contains(r#""modelProvider":"openai""#));
+    assert!(!requests.contains(secret));
+    assert!(!format!("{result:?}").contains(secret));
+    assert!(
+        !home.path().join(".codex").join("config.toml").exists(),
+        "built-in OpenAI overrides must not write global Codex config"
+    );
+}
+
+#[test]
+fn supported_goal_is_confirmed_before_the_first_turn() {
+    let run = run_scenario("goal", None, Duration::from_secs(3));
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.requests.len(), 6);
+    assert_eq!(run.requests[2]["method"], "thread/start");
+    assert_eq!(run.requests[4]["id"], 3);
+    assert_eq!(run.requests[4]["method"], "thread/goal/set");
+    assert_eq!(run.requests[4]["params"]["threadId"], "thread-1");
+    assert_eq!(
+        run.requests[4]["params"]["objective"],
+        "perform the harmless action PRIVATE_PROMPT_CANARY"
+    );
+    assert_eq!(run.requests[4]["params"]["status"], "paused");
+    assert_eq!(run.requests[5]["id"], 4);
+    assert_eq!(run.requests[5]["method"], "turn/start");
+}
+
+#[test]
+fn active_goal_response_blocks_the_competing_explicit_turn() {
+    let run = run_scenario("goal-active", None, Duration::from_secs(3));
+    assert_eq!(run.result, Err(CodexSessionError::MalformedMessage));
+    assert_eq!(run.requests.len(), 5);
+    assert_eq!(run.requests[4]["method"], "thread/goal/set");
+}
+
+#[test]
+fn staged_images_are_sent_as_daemon_local_image_inputs() {
+    let run = run_scenario("local-image", None, Duration::from_secs(3));
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.requests[4]["method"], "turn/start");
+    assert_eq!(run.requests[4]["params"]["input"][0]["type"], "text");
+    assert_eq!(run.requests[4]["params"]["input"][1]["type"], "localImage");
+    let image_path = run.requests[4]["params"]["input"][1]["path"]
+        .as_str()
+        .expect("local image path");
+    assert!(Path::new(image_path).starts_with(run.directory.path()));
+    assert!(!run.requests[4].to_string().contains("data:image"));
+}
+
+#[test]
+fn timeout_drops_staged_local_images() {
+    let run = run_scenario(
+        "timeout-local-image",
+        None,
+        process_startup_timeout(Duration::from_millis(500)),
+    );
+
+    assert_eq!(run.result, Err(CodexSessionError::Timeout));
+    assert!(
+        !run.staged_image_path
+            .expect("timeout scenario staged an image")
+            .exists()
+    );
+}
+
+#[test]
+fn resume_uses_persisted_thread_without_persisting_it_again() {
+    let run = run_scenario("completed", Some("thread-existing"), Duration::from_secs(3));
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert!(run.persisted_threads.is_empty());
+    assert_eq!(run.persisted_turns, ["turn-1"]);
+    assert_eq!(run.requests[2]["method"], "thread/resume");
+    assert_eq!(run.requests[2]["params"]["threadId"], "thread-existing");
+    assert_eq!(run.requests[4]["params"]["threadId"], "thread-existing");
+}
+
+#[test]
+fn notifications_may_precede_correlated_responses() {
+    let run = run_scenario("notification-first", None, Duration::from_secs(3));
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.persisted_threads, ["thread-1"]);
+    assert_eq!(run.persisted_turns, ["turn-1"]);
+}
+
+#[test]
+fn mcp_startup_notification_may_establish_the_new_thread_identity() {
+    let run = run_scenario("mcp-notification-first", None, Duration::from_secs(3));
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.persisted_threads, ["thread-1"]);
+    assert_eq!(run.persisted_turns, ["turn-1"]);
+}
+
+#[test]
+fn terminal_status_is_closed() {
+    for (scenario, expected) in [
+        ("completed", CodexSessionTerminal::Completed),
+        ("interrupted", CodexSessionTerminal::Interrupted),
+        (
+            "failed",
+            CodexSessionTerminal::Failed(CodexFailedTurnKind::Other),
+        ),
+        (
+            "upstream-http-failed",
+            CodexSessionTerminal::Failed(CodexFailedTurnKind::Other),
+        ),
+    ] {
+        let result = run_scenario(scenario, None, Duration::from_secs(3)).result;
+        assert_eq!(result, Ok(expected));
+        let debug = format!("{result:?}");
+        assert!(!debug.contains("PRIVATE_PROVIDER_ERROR_CANARY"));
+        assert!(!debug.contains("PRIVATE_PROVIDER_DETAILS_CANARY"));
+    }
+}
+
+#[test]
+fn configured_native_action_evidence_still_requires_a_native_tool() {
+    let native_action_evidence = NativeActionEvidence::new();
+    native_action_evidence.expect_script("PRIVATE_NATIVE_SCRIPT");
+    let run = run_scenario_with_options(
+        "completed",
+        None,
+        Duration::from_secs(3),
+        "perform the native action PRIVATE_PROMPT_CANARY",
+        PersistFailure::None,
+        ScenarioExecution {
+            native_action_evidence: Some(native_action_evidence),
+            ..ScenarioExecution::NATIVE
+        },
+    );
+
+    assert_eq!(run.result, Err(CodexSessionError::NativeActionUnavailable));
+}
+
+#[test]
+fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("control scenario directory");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let descendant_marker = directory.path().join("descendant-escaped");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("SATELLE_FIXTURE_SCENARIO", "controlled-interrupt")
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env("SATELLE_DESCENDANT_MARKER", &descendant_marker);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let control = CodexSessionControl::new(deadline);
+    let session_control = control.clone();
+    let session_directory = directory.path().to_path_buf();
+    let session_thread_marker = thread_marker.clone();
+    let session_turn_marker = turn_marker.clone();
+    let session = std::thread::spawn(move || {
+        let mut persist_thread = |_: &str| {
+            touch(&session_thread_marker);
+            Ok(())
+        };
+        let mut persist_turn = |_: &str| {
+            touch(&session_turn_marker);
+            Ok(())
+        };
+        run_codex_session(
+            command,
+            CodexSessionRequest {
+                working_directory: &session_directory,
+                prompt: "PRIVATE_CONTROLLED_STOP_PROMPT",
+                existing_thread_ref: None,
+                model: Some("gpt-fixture"),
+                model_provider: Some("fixture-provider"),
+                provider_endpoint: None,
+                provider_secret: None,
+                execution_mode: TurnExecutionMode::Standard,
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+                deadline,
+                persist_thread_ref: &mut persist_thread,
+                persist_turn_ref: &mut persist_turn,
+                observe_native_approval: None,
+                native_action_evidence: None,
+                expected_mcp_server_name: "computer-use",
+                computer_use_allowed_app_ids: &BTreeSet::new(),
+                control: Some(session_control),
+                goal_set_supported: false,
+                image_input_mode: crate::host::codex_capabilities::CodexImageInputMode::Unsupported,
+                attachments: &[],
+                raw_protocol_capture: None,
+                recording_capture: None,
+            },
+        )
+    });
+    wait_for(&turn_marker);
+
+    assert_eq!(
+        control.interrupt(),
+        StopObservation::UpstreamInactiveConfirmed
+    );
+    assert!(
+        !session.is_finished(),
+        "execution must wait until the stopped state is durable"
+    );
+    control.stop_committed();
+
+    assert_eq!(
+        session.join().expect("join controlled execution"),
+        Ok(CodexSessionTerminal::StoppedByControl)
+    );
+}
+
+#[test]
+fn interrupt_before_any_session_claims_control_confirms_inactive_upstream_and_skips_dispatch() {
+    let directory = tempfile::tempdir().expect("early stop scenario directory");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let control = CodexSessionControl::new(deadline);
+
+    // The stop arrives during pre-dispatch work, before any process exists.
+    assert_eq!(
+        control.interrupt(),
+        StopObservation::UpstreamInactiveConfirmed
+    );
+
+    // A missing executable proves the session never tried to dispatch.
+    let command = Command::new(directory.path().join("codex-must-not-start"));
+    let session_control = control.clone();
+    let session_directory = directory.path().to_path_buf();
+    let session = std::thread::spawn(move || {
+        let mut persist_thread = |_: &str| Ok(());
+        let mut persist_turn = |_: &str| Ok(());
+        run_codex_session(
+            command,
+            CodexSessionRequest {
+                working_directory: &session_directory,
+                prompt: "PRIVATE_EARLY_STOP_PROMPT",
+                existing_thread_ref: None,
+                model: Some("gpt-fixture"),
+                model_provider: Some("fixture-provider"),
+                provider_endpoint: None,
+                provider_secret: None,
+                execution_mode: TurnExecutionMode::Standard,
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+                deadline,
+                persist_thread_ref: &mut persist_thread,
+                persist_turn_ref: &mut persist_turn,
+                observe_native_approval: None,
+                native_action_evidence: None,
+                expected_mcp_server_name: "computer-use",
+                computer_use_allowed_app_ids: &BTreeSet::new(),
+                control: Some(session_control),
+                goal_set_supported: false,
+                image_input_mode: crate::host::codex_capabilities::CodexImageInputMode::Unsupported,
+                attachments: &[],
+                raw_protocol_capture: None,
+                recording_capture: None,
+            },
+        )
+    });
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !session.is_finished(),
+        "execution must wait until the stopped state is durable"
+    );
+    // A repeated stop during the wait gets the same confirmed answer.
+    assert_eq!(
+        control.interrupt(),
+        StopObservation::UpstreamInactiveConfirmed
+    );
+    control.stop_committed();
+
+    assert_eq!(
+        session.join().expect("join early stopped execution"),
+        Ok(CodexSessionTerminal::StoppedByControl)
+    );
+}
+
+#[test]
+fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("provider timeout scenario directory");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("SATELLE_FIXTURE_SCENARIO", "controlled-interrupt")
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env(
+            "SATELLE_DESCENDANT_MARKER",
+            directory.path().join("unused-descendant"),
+        );
+    let mut persist_thread = |_: &str| {
+        touch(&thread_marker);
+        Ok(())
+    };
+    let mut persist_turn = |_: &str| {
+        touch(&turn_marker);
+        Ok(())
+    };
+
+    let timeout_deadline = Instant::now() + process_startup_timeout(Duration::from_millis(100));
+    let cancellation_grace = Duration::from_secs(1);
+    let registered_control = CodexSessionControl::new(timeout_deadline + cancellation_grace);
+    let run = run_codex_session_with_timeout_cancellation(
+        command,
+        CodexSessionRequest {
+            working_directory: directory.path(),
+            prompt: "PRIVATE_PROVIDER_SMOKE_PROMPT",
+            existing_thread_ref: None,
+            model: Some("gpt-fixture"),
+            model_provider: Some("fixture-provider"),
+            provider_endpoint: None,
+            provider_secret: None,
+            execution_mode: TurnExecutionMode::Standard,
+            approval_policy: CodexApprovalPolicy::OnRequest,
+            sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+            deadline: timeout_deadline,
+            persist_thread_ref: &mut persist_thread,
+            persist_turn_ref: &mut persist_turn,
+            observe_native_approval: None,
+            native_action_evidence: None,
+            expected_mcp_server_name: "computer-use",
+            computer_use_allowed_app_ids: &BTreeSet::new(),
+            control: Some(registered_control.clone()),
+            goal_set_supported: false,
+            image_input_mode: crate::host::codex_capabilities::CodexImageInputMode::Unsupported,
+            attachments: &[],
+            raw_protocol_capture: None,
+            recording_capture: None,
+        },
+        cancellation_grace,
+        None,
+    );
+
+    assert_eq!(
+        run.cancellation,
+        Some(StopObservation::UpstreamInactiveConfirmed)
+    );
+    assert_eq!(run.result, Ok(CodexSessionTerminal::StoppedByControl));
+    assert!(matches!(
+        registered_control.claim_receiver(),
+        Err(CodexSessionError::Control)
+    ));
+    let requests = read_to_string(log_path).expect("provider timeout protocol log");
+    assert!(requests.contains(r#""method":"turn/interrupt""#));
+    assert!(requests.contains(r#""threadId":"thread-1""#));
+    assert!(requests.contains(r#""turnId":"turn-1""#));
+}
+
+#[test]
+fn native_action_completion_requests_correlated_upstream_cancellation() {
+    let fixture = compile_fixture();
+    let directory = tempfile::tempdir().expect("native completion scenario directory");
+    let log_path = directory.path().join("requests.jsonl");
+    let cwd_log_path = directory.path().join("child-cwd");
+    let thread_marker = directory.path().join("thread-persisted");
+    let turn_marker = directory.path().join("turn-persisted");
+    let mut command = Command::new(&fixture.executable);
+    command
+        .env("SATELLE_FIXTURE_SCENARIO", "native-controlled-interrupt")
+        .env("SATELLE_FIXTURE_LOG", &log_path)
+        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+        .env("SATELLE_THREAD_MARKER", &thread_marker)
+        .env("SATELLE_TURN_MARKER", &turn_marker)
+        .env(
+            "SATELLE_DESCENDANT_MARKER",
+            directory.path().join("unused-descendant"),
+        );
+    let mut persist_thread = |_: &str| {
+        touch(&thread_marker);
+        Ok(())
+    };
+    let mut persist_turn = |_: &str| {
+        touch(&turn_marker);
+        Ok(())
+    };
+    let native_action_evidence = NativeActionEvidence::new();
+    native_action_evidence.expect_script("PRIVATE_NATIVE_SCRIPT");
+    let action_driver = native_action_evidence.clone();
+    let actions = std::thread::spawn(move || {
+        assert!(action_driver.observe_click_for_test());
+        assert!(action_driver.observe_drag_for_test());
+    });
+    let timeout = process_startup_timeout(Duration::from_secs(3));
+    let timeout_deadline = Instant::now() + timeout;
+    let cancellation_grace = Duration::from_secs(1);
+    let registered_control = CodexSessionControl::new(timeout_deadline + cancellation_grace);
+    let started_at = Instant::now();
+
+    let run = run_codex_session_with_native_action_completion(
+        command,
+        CodexSessionRequest {
+            working_directory: directory.path(),
+            prompt: "PRIVATE_NATIVE_PROMPT",
+            existing_thread_ref: None,
+            model: Some("gpt-fixture"),
+            model_provider: Some("fixture-provider"),
+            provider_endpoint: None,
+            provider_secret: None,
+            execution_mode: TurnExecutionMode::Standard,
+            approval_policy: CodexApprovalPolicy::OnRequest,
+            sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+            deadline: timeout_deadline,
+            persist_thread_ref: &mut persist_thread,
+            persist_turn_ref: &mut persist_turn,
+            observe_native_approval: None,
+            native_action_evidence: None,
+            expected_mcp_server_name: "computer-use",
+            computer_use_allowed_app_ids: &BTreeSet::new(),
+            control: Some(registered_control),
+            goal_set_supported: false,
+            image_input_mode: crate::host::codex_capabilities::CodexImageInputMode::Unsupported,
+            attachments: &[],
+            raw_protocol_capture: None,
+            recording_capture: None,
+        },
+        native_action_evidence,
+        cancellation_grace,
+        None,
+    );
+    actions.join().expect("join native action driver");
+
+    assert!(started_at.elapsed() < timeout);
+    assert_eq!(
+        run.cancellation,
+        Some(StopObservation::UpstreamInactiveConfirmed)
+    );
+    assert_eq!(run.result, Ok(CodexSessionTerminal::StoppedByControl));
+    assert!(thread_marker.exists());
+    assert!(turn_marker.exists());
+    let requests = read_to_string(log_path).expect("native completion protocol log");
+    assert!(requests.contains(r#""method":"turn/interrupt""#));
+    assert!(requests.contains(r#""threadId":"thread-1""#));
+    assert!(requests.contains(r#""turnId":"turn-1""#));
+}
+
+#[test]
+fn restart_observation_reads_only_the_matching_persisted_turn() {
+    for (status, expected) in [
+        ("inProgress", CodexTurnStatus::InProgress),
+        ("completed", CodexTurnStatus::Completed),
+        ("interrupted", CodexTurnStatus::Interrupted),
+        ("failed", CodexTurnStatus::Failed),
+    ] {
+        let fixture = compile_fixture();
+        let directory = tempfile::tempdir().expect("read scenario directory");
+        let log_path = directory.path().join("requests.jsonl");
+        let cwd_log_path = directory.path().join("child-cwd");
+        let mut command = Command::new(&fixture.executable);
+        command
+            .env("SATELLE_FIXTURE_SCENARIO", format!("read-{status}"))
+            .env("SATELLE_FIXTURE_LOG", &log_path)
+            .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+            .env(
+                "SATELLE_THREAD_MARKER",
+                directory.path().join("unused-thread"),
+            )
+            .env("SATELLE_TURN_MARKER", directory.path().join("unused-turn"))
+            .env(
+                "SATELLE_DESCENDANT_MARKER",
+                directory.path().join("unused-descendant"),
+            );
+
+        let observed = read_codex_turn(
+            command,
+            CodexTurnReadRequest {
+                working_directory: directory.path(),
+                thread_ref: "thread-1",
+                turn_ref: "turn-1",
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
+        assert!(
+            observed.is_ok(),
+            "read matching durable Turn failed with {observed:?}; requests: {}",
+            read_to_string(&log_path).unwrap_or_default()
+        );
+        let observed = observed.unwrap();
+
+        assert_eq!(observed, expected);
+    }
+}
+
+#[test]
+fn malformed_and_adversarial_messages_fail_closed() {
+    for (scenario, expected) in [
+        ("conflict", CodexSessionError::ConflictingIdentity),
+        ("wrong-id", CodexSessionError::UnexpectedResponse),
+        ("out-of-order", CodexSessionError::UnexpectedResponse),
+        ("duplicate", CodexSessionError::DuplicateResponse),
+        ("oversized", CodexSessionError::OversizedMessage),
+        ("malformed", CodexSessionError::MalformedMessage),
+        ("non-object", CodexSessionError::MalformedMessage),
+        ("turn-conflict", CodexSessionError::ConflictingIdentity),
+        (
+            "server-request-conflict",
+            CodexSessionError::ConflictingIdentity,
+        ),
+        ("unterminated", CodexSessionError::Timeout),
+        ("eof", CodexSessionError::PrematureExit),
+        ("response-error", CodexSessionError::ResponseError),
+        ("thread-response-error", CodexSessionError::ResponseError),
+        ("timeout", CodexSessionError::Timeout),
+    ] {
+        // This table checks protocol classification, not process-start or pipe
+        // throughput. Keep short deadlines only for scenarios that must prove
+        // timeout behavior; loaded Windows and macOS runners need more time to
+        // reach the later protocol states and transfer the oversized fixture.
+        let timeout = if matches!(scenario, "timeout" | "unterminated") {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(3)
+        };
+        let run = run_scenario(scenario, None, timeout);
+        let error = run.result.expect_err("adversarial fixture must fail");
+        assert_eq!(error, expected, "scenario {scenario}");
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains("PRIVATE_RAW_CANARY"));
+        assert!(!rendered.contains("PRIVATE_PROMPT_CANARY"));
+        assert!(!rendered.contains("thread-"));
+        assert!(!rendered.contains("turn-"));
+    }
+}
+
+#[test]
+fn an_unexpected_thread_mcp_server_blocks_turn_dispatch() {
+    let run = run_scenario("unexpected-mcp-server", None, Duration::from_secs(3));
+
+    assert_eq!(run.result, Err(CodexSessionError::ConflictingIdentity));
+    assert!(!run.turn_dispatch_attempted);
+}
+
+#[test]
+fn an_unexpected_enabled_plugin_blocks_turn_dispatch() {
+    let run = run_scenario("unexpected-plugin", None, Duration::from_secs(3));
+
+    assert_eq!(run.result, Err(CodexSessionError::ConflictingIdentity));
+    assert!(!run.turn_dispatch_attempted);
+}
+
+#[test]
+fn persistence_failure_stops_before_dependent_protocol_work() {
+    let thread_failure = run_scenario_with_options(
+        "completed",
+        None,
+        Duration::from_secs(3),
+        "PRIVATE_THREAD_PERSISTENCE_FAILURE_PROMPT",
+        PersistFailure::Thread,
+        ScenarioExecution::STANDARD,
+    );
+    assert_eq!(thread_failure.result, Err(CodexSessionError::Persistence));
+    assert!(!thread_failure.turn_dispatch_attempted);
+    assert_eq!(thread_failure.requests.len(), 3);
+    assert!(thread_failure.persisted_threads.is_empty());
+    assert!(thread_failure.persisted_turns.is_empty());
+
+    let turn_failure = run_scenario_with_options(
+        "completed",
+        None,
+        Duration::from_secs(3),
+        "PRIVATE_TURN_PERSISTENCE_FAILURE_PROMPT",
+        PersistFailure::Turn,
+        ScenarioExecution::STANDARD,
+    );
+    assert_eq!(turn_failure.result, Err(CodexSessionError::Persistence));
+    assert!(turn_failure.turn_dispatch_attempted);
+    assert_eq!(turn_failure.requests.len(), 5);
+    assert_eq!(turn_failure.persisted_threads, ["thread-1"]);
+    assert!(turn_failure.persisted_turns.is_empty());
+}
+
+#[test]
+fn a_non_reading_child_cannot_block_a_large_prompt_past_the_deadline() {
+    // Large enough to exceed a normal pipe buffer, but small enough that JSON
+    // serialization itself does not consume the test deadline on slow CI.
+    let prompt = "x".repeat(128 * 1024);
+    let run = run_scenario_with_prompt("blocked-write", None, Duration::from_secs(2), &prompt);
+
+    assert_eq!(run.result, Err(CodexSessionError::Timeout));
+    assert!(run.turn_dispatch_attempted);
+    assert!(
+        run.session_elapsed < Duration::from_secs(5),
+        "a blocked app-server stdin exceeded the whole-session deadline"
+    );
+}
+
+#[test]
+fn notification_flood_is_backpressured_and_cleanup_remains_bounded() {
+    let run = run_scenario("flood-timeout", None, Duration::from_secs(1));
+
+    assert_eq!(run.result, Err(CodexSessionError::Timeout));
+    assert!(
+        run.session_elapsed < Duration::from_secs(5),
+        "a backpressured notification flood deadlocked session cleanup"
+    );
+}
+
+#[test]
+fn unknown_and_item_payloads_are_discarded_without_leaking_canaries() {
+    let run = run_scenario("unknown-canary", None, Duration::from_secs(3));
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    assert_eq!(run.requests.len(), 5);
+    assert_eq!(run.persisted_threads, ["thread-1"]);
+    assert_eq!(run.persisted_turns, ["turn-1"]);
+
+    let retained = format!(
+        "{:?} {}",
+        run.result,
+        serde_json::to_string(&(&run.requests, &run.persisted_threads, &run.persisted_turns,))
+            .expect("retained protocol state serializes")
+    );
+    assert!(!retained.contains("PRIVATE_RAW_CANARY"));
+}
+
+#[test]
+fn terminating_a_successful_session_contains_descendants() {
+    let run = run_scenario("descendant", None, Duration::from_secs(3));
+    let escaped_marker = run.directory.path().join("descendant-escaped");
+    let release_marker = run.directory.path().join("descendant-release");
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+    touch(&release_marker);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline && !escaped_marker.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!escaped_marker.exists(), "a descendant escaped containment");
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_session_closes_stdin_before_forcing_process_group_shutdown() {
+    let run = run_scenario("graceful-descendant", None, Duration::from_secs(3));
+    let escaped_marker = run.directory.path().join("descendant-escaped");
+    let release_marker = run.directory.path().join("descendant-release");
+    assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+
+    touch(&release_marker);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline && !escaped_marker.exists() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !escaped_marker.exists(),
+        "an MCP kernel escaped because app-server stdin was not closed gracefully"
+    );
+}
+
+#[test]
+fn timeout_cleanup_contains_descendants() {
+    let run = run_scenario(
+        "descendant-timeout",
+        None,
+        process_startup_timeout(Duration::from_millis(250)),
+    );
+    let escaped_marker = run.directory.path().join("descendant-escaped");
+    let release_marker = run.directory.path().join("descendant-release");
+
+    assert_eq!(run.result, Err(CodexSessionError::Timeout));
+    touch(&release_marker);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !escaped_marker.exists(),
+        "an error-path descendant escaped process containment"
+    );
+}
+
+#[test]
+fn every_closed_policy_has_an_exact_protocol_mapping() {
+    assert_eq!(
+        CodexApprovalPolicy::Untrusted.as_protocol_value(),
+        "untrusted"
+    );
+    assert_eq!(
+        CodexApprovalPolicy::OnRequest.as_protocol_value(),
+        "on-request"
+    );
+    assert_eq!(CodexApprovalPolicy::Never.as_protocol_value(), "never");
+    assert_eq!(CodexSandboxPolicy::ReadOnly.as_thread_value(), "read-only");
+    assert_eq!(
+        CodexSandboxPolicy::WorkspaceWrite.as_thread_value(),
+        "workspace-write"
+    );
+    assert_eq!(
+        CodexSandboxPolicy::DangerFullAccess.as_thread_value(),
+        "danger-full-access"
+    );
+    assert_eq!(
+        CodexSandboxPolicy::ReadOnly
+            .as_turn_value(Path::new("/fixture"))
+            .unwrap(),
+        json!({"type": "readOnly", "networkAccess": false})
+    );
+    assert_eq!(
+        CodexSandboxPolicy::DangerFullAccess
+            .as_turn_value(Path::new("/fixture"))
+            .unwrap(),
+        json!({"type": "dangerFullAccess"})
+    );
+}
+
+#[test]
+fn an_expired_writer_does_not_mark_turn_dispatch() {
+    let writer = ProtocolWriter::expired_for_test();
+    let mut dispatched = false;
+
+    assert_eq!(
+        writer.write_after_queue(&json!({"method": "turn/start"}), || dispatched = true),
+        Err(CodexSessionError::Timeout)
+    );
+    assert!(!dispatched);
+}

@@ -12,14 +12,14 @@ const binary = process.env.SATELLE_DOCS_BINARY
   ? resolve(process.env.SATELLE_DOCS_BINARY)
   : undefined;
 const publicSchemaSources = [
-  'crates/satelle-core/src/lib.rs',
-  'crates/satelle-core/src/events.rs',
-  'crates/satelle-core/src/telemetry.rs',
-  'crates/satelle-cli/src/output.rs',
-  'crates/satelle-cli/src/automation.rs',
-  'crates/satelle-cli/src/error-output.rs',
-  'crates/satelle-cli/src/support.rs',
-  'crates/satelle-host/src/log-page.rs',
+  'crates/satelle/src/core/mod.rs',
+  'crates/satelle/src/core/events.rs',
+  'crates/satelle/src/core/telemetry.rs',
+  'crates/satelle/src/output.rs',
+  'crates/satelle/src/automation.rs',
+  'crates/satelle/src/error-output.rs',
+  'crates/satelle/src/support.rs',
+  'crates/satelle/src/host/log-page.rs',
 ];
 
 if (!['generate', 'check', 'schema-check'].includes(mode)) {

@@ -42,7 +42,7 @@ jobs:
         run: node website/scripts/docs-contract.mjs schema-check
 
       - name: Build matching Satelle binary
-        run: cargo build --release --locked -p satelle-cli
+        run: cargo build --release --locked -p satelle
 
       - name: Reject stale generated reference
         env:

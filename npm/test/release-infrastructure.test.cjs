@@ -526,7 +526,7 @@ function fixtureRepository(context) {
   for (const fileName of ["Cargo.toml", "README.md"]) {
     cpSync(path.join(repositoryRoot, fileName), path.join(fixtureRoot, fileName));
   }
-  const compatibilitySource = "crates/satelle-core/src/host-update.rs";
+  const compatibilitySource = "crates/satelle/src/core/host-update.rs";
   mkdirSync(path.dirname(path.join(fixtureRoot, compatibilitySource)), { recursive: true });
   cpSync(path.join(repositoryRoot, compatibilitySource), path.join(fixtureRoot, compatibilitySource));
   mkdirSync(path.join(fixtureRoot, "npm"), { recursive: true });
@@ -557,6 +557,11 @@ function expectReleaseError(code, messageIncludes) {
 }
 
 test("release check returns the canonical package and archive ownership plan", () => {
+  assert.deepEqual(
+    readJson(path.join(repositoryRoot, "crates", "satelle", "assets", "platforms.json")),
+    platformMatrix,
+    "the packaged platform contract must match the npm release source",
+  );
   const release = createReleaseContext(repositoryRoot);
   const plan = release.check();
   const version = workspaceVersion();
@@ -3723,6 +3728,7 @@ test("release workflow gates draft publication on candidate validation and promo
   ).replaceAll("\r\n", "\n");
   const draftRelease = workflowJob(workflow, "draft-release");
   const buildRelease = workflowJob(workflow, "build");
+  const collectRelease = workflowJob(workflow, "collect");
   const buildReleaseExecutable = workflowStep(
     buildRelease,
     "Build native release executable",
@@ -3740,6 +3746,12 @@ test("release workflow gates draft publication on candidate validation and promo
     "Verify GNU ABI floor",
   );
   const publishCandidates = workflowJob(workflow, "publish-candidates");
+  const publishCargo = workflowJob(workflow, "publish-cargo");
+  const packageCargo = workflowStep(collectRelease, "Package the crates.io artifact");
+  const cargoPublishStep = workflowStep(
+    publishCargo,
+    "Publish or verify the immutable Cargo version",
+  );
   const validateRegistryCandidates = workflowJob(workflow, "validate-registry-candidates");
   const promoteAndPublish = workflowJob(workflow, "promote-and-publish");
   const authorizeRecoveryTag = workflowJob(workflow, "authorize-recovery-tag");
@@ -3848,7 +3860,7 @@ test("release workflow gates draft publication on candidate validation and promo
   );
   assert.match(
     buildGnuReleaseExecutable,
-    /cargo zigbuild --locked --release -p satelle-cli[\s\S]*--target "\$\{\{ matrix\.rust-target \}\}\.\$\{\{ matrix\.glibc-version \}\}"/,
+    /cargo zigbuild --locked --release -p satelle[\s\S]*--target "\$\{\{ matrix\.rust-target \}\}\.\$\{\{ matrix\.glibc-version \}\}"/,
   );
   assert.match(
     verifyGnuAbiFloor,
@@ -3865,6 +3877,19 @@ test("release workflow gates draft publication on candidate validation and promo
   assert.match(draftRelease, /candidate_pattern=.*npm-candidate-v.*\[0-9\]\+/);
   assert.match(draftRelease, /promotion_pattern=.*npm-promotion-v.*\[0-9\]\+/);
   assert.doesNotMatch(draftRelease, /startswith\("npm-(?:candidate|promotion)-"\)/);
+  assert.match(packageCargo, /cargo package --locked -p satelle/);
+  assert.match(packageCargo, /validated\/cargo[\s\S]*sha256sum/);
+  assert.match(publishCargo, /^    needs: \[attest, collect, draft-release\]$/m);
+  assert.match(
+    cargoPublishStep,
+    /git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*sha256sum --check --strict[\s\S]*cargo publish --locked --no-verify -p satelle/,
+  );
+  assert.match(
+    cargoPublishStep,
+    /--user-agent 'OpenAI File Downloader, XaiImageApiFetch\/1\.0'/,
+  );
+  assert.match(cargoPublishStep, /cargo-registry-version-conflict/);
+  assert.match(promoteAndPublish, /needs\.publish-cargo\.result == 'success'/);
   assert.match(publishCandidates, /^    permissions:\n(?:      .*\n)*      id-token: write$/m);
   assert.match(publishCandidates, /^    needs: \[attest, collect, draft-release\]$/m);
   assert.match(publishCandidates, /npm-candidate-publication\.cjs advance/);
@@ -3977,7 +4002,7 @@ test("release workflow gates draft publication on candidate validation and promo
   assert.doesNotMatch(validateRegistryCandidates, /minimum-release-age/);
   assert.match(
     promoteAndPublish,
-    /^    needs: \[attest, authorize-recovery-tag, collect, draft-release, validate-registry-candidates\]$/m,
+    /^    needs: \[attest, authorize-recovery-tag, collect, draft-release, publish-cargo, validate-registry-candidates\]$/m,
   );
   assert.match(promoteAndPublish, /inputs\.operation == 'candidate-finalize'/);
   assert.match(promoteAndPublish, /needs\.authorize-recovery-tag\.result == 'success'/);

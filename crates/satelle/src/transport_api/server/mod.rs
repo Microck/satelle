@@ -1,0 +1,2073 @@
+mod api_json;
+#[path = "api-tokens.rs"]
+mod api_tokens;
+mod auth;
+mod events;
+mod host_error;
+mod listener;
+mod logs;
+mod sessions;
+mod setup;
+
+use crate::core::{ApiRateLimits, SatelleError};
+use crate::host::{DaemonRuntimeCapabilities, HostService};
+use crate::transport::contract::{
+    ApiError, ApiErrorCategory, ApiErrorCode, CapabilitiesResponse, EffectiveLimits,
+    HostDesktopSessionsResponse, HostPathsResponse, HostStatusResponse,
+    HostTelemetryStatusResponse, LiveResponse, LocalDaemonRelaunchResponse,
+    LocalDoctorOperationRequest, LocalDoctorOperationResponse, LocalSetupOperationRequest,
+    LocalSetupOperationResponse, MaintenanceUpdateEvidenceResponse, PROTOCOL_VERSION,
+    PROTOCOL_VERSION_HEADER, RequestId, effective_limits,
+};
+use api_json::ApiJson;
+use auth::{AuthorizedRequest, REQUEST_ID_HEADER};
+use axum::Router;
+use axum::extract::Request;
+use axum::extract::{Extension, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
+use listener::{ConnectionActivity, ConnectionContext, LimitedTcpListener};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fmt;
+use std::hash::Hash;
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use time::OffsetDateTime;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+
+const DEFAULT_MAX_CONNECTIONS: usize = 128;
+const HOST_IDENTITY_HEADER: &str = "satelle-host-identity";
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_RATE_KEYS: usize = 4096;
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonServerConfig {
+    bind_addr: SocketAddr,
+    max_connections: usize,
+    shutdown_grace: Duration,
+    idle_timeout: Option<Duration>,
+    trusted_proxies: Arc<[TrustedProxy]>,
+    api_rate_limits: ApiRateLimits,
+    local_relaunch: bool,
+}
+
+impl DaemonServerConfig {
+    pub fn loopback(bind_addr: SocketAddr) -> Self {
+        Self {
+            bind_addr,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
+            idle_timeout: None,
+            trusted_proxies: Arc::from([]),
+            api_rate_limits: ApiRateLimits::default(),
+            local_relaunch: false,
+        }
+    }
+
+    pub const fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections;
+        self
+    }
+
+    pub const fn with_shutdown_grace(mut self, shutdown_grace: Duration) -> Self {
+        self.shutdown_grace = shutdown_grace;
+        self
+    }
+
+    pub const fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = Some(idle_timeout);
+        self
+    }
+
+    pub const fn with_api_rate_limits(mut self, api_rate_limits: ApiRateLimits) -> Self {
+        self.api_rate_limits = api_rate_limits;
+        self
+    }
+
+    /// Enables the private loopback lifecycle route used by the managed local
+    /// daemon when its daemon-owned configuration changes.
+    pub const fn with_local_relaunch(mut self) -> Self {
+        self.local_relaunch = true;
+        self
+    }
+
+    /// Trusts forwarded client addresses only when the transport peer matches
+    /// one of these Host-owned exact addresses or CIDR ranges.
+    pub fn with_trusted_proxies(
+        mut self,
+        trusted_proxies: impl IntoIterator<Item = TrustedProxy>,
+    ) -> Self {
+        self.trusted_proxies = trusted_proxies.into_iter().collect();
+        self
+    }
+}
+
+/// One Host-owned proxy address or CIDR range allowed to supply forwarded
+/// client identity. The empty default keeps all proxy headers untrusted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrustedProxy {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxy {
+    pub const fn exact(address: IpAddr) -> Self {
+        Self {
+            network: address,
+            prefix_len: match address {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            },
+        }
+    }
+
+    fn contains(self, address: IpAddr) -> bool {
+        match (self.network, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                masked_v4(network, self.prefix_len) == masked_v4(address, self.prefix_len)
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                masked_v6(network, self.prefix_len) == masked_v6(address, self.prefix_len)
+            }
+            (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
+        }
+    }
+}
+
+fn masked_v4(address: std::net::Ipv4Addr, prefix_len: u8) -> u32 {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    u32::from(address) & mask
+}
+
+fn masked_v6(address: std::net::Ipv6Addr, prefix_len: u8) -> u128 {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix_len)
+    };
+    u128::from(address) & mask
+}
+
+impl From<IpAddr> for TrustedProxy {
+    fn from(address: IpAddr) -> Self {
+        Self::exact(address)
+    }
+}
+
+impl FromStr for TrustedProxy {
+    type Err = TrustedProxyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (address, prefix_len) = match value.split_once('/') {
+            Some((address, prefix_len)) => (address, Some(prefix_len)),
+            None => (value, None),
+        };
+        let network = address
+            .parse::<IpAddr>()
+            .map_err(|_| TrustedProxyParseError::InvalidAddress)?;
+        let maximum = if network.is_ipv4() { 32 } else { 128 };
+        let prefix_len = prefix_len
+            .map(str::parse::<u8>)
+            .transpose()
+            .map_err(|_| TrustedProxyParseError::InvalidPrefix)?
+            .unwrap_or(maximum);
+        if prefix_len > maximum {
+            return Err(TrustedProxyParseError::InvalidPrefix);
+        }
+        Ok(Self {
+            network,
+            prefix_len,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum TrustedProxyParseError {
+    #[error("the trusted proxy address is not a valid IP address")]
+    InvalidAddress,
+    #[error("the trusted proxy CIDR prefix is invalid for its address family")]
+    InvalidPrefix,
+}
+
+/// Fully validated Host-side TLS configuration. Construction validates every
+/// supplied chain link, rejects certificates outside their validity windows,
+/// and proves that the private key matches before a network listener is opened.
+#[derive(Clone)]
+pub struct DaemonTlsConfig {
+    server: Arc<rustls::ServerConfig>,
+    requires_client_certificate: bool,
+}
+
+/// Explicit client trust anchors and optional signed revocation lists.
+pub struct DaemonClientTrust<'a> {
+    pub ca_pem: &'a [u8],
+    pub crl_pem: Option<&'a [u8]>,
+}
+
+impl fmt::Debug for DaemonTlsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DaemonTlsConfig")
+            .finish_non_exhaustive()
+    }
+}
+
+impl DaemonTlsConfig {
+    pub fn from_pem(
+        certificate_chain_pem: &[u8],
+        private_key_pem: &[u8],
+        client_trust: Option<DaemonClientTrust<'_>>,
+    ) -> Result<Self, DaemonTlsConfigError> {
+        let certificates = CertificateDer::pem_slice_iter(certificate_chain_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?;
+        if certificates.is_empty() {
+            return Err(DaemonTlsConfigError::InvalidCertificateChain);
+        }
+        let parsed_certificates = certificates
+            .iter()
+            .map(|certificate_der| {
+                let (remaining, certificate) =
+                    x509_parser::parse_x509_certificate(certificate_der.as_ref())
+                        .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?;
+                if !remaining.is_empty() {
+                    return Err(DaemonTlsConfigError::InvalidCertificateChain);
+                }
+                Ok(certificate)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let now = x509_parser::time::ASN1Time::now();
+        for certificate in &parsed_certificates {
+            let has_unsupported_critical_extension = certificate.extensions().iter().any(|ext| {
+                ext.critical
+                    && matches!(
+                        ext.parsed_extension(),
+                        x509_parser::extensions::ParsedExtension::UnsupportedExtension { .. }
+                            | x509_parser::extensions::ParsedExtension::ParseError { .. }
+                            | x509_parser::extensions::ParsedExtension::Unparsed
+                    )
+            });
+            if has_unsupported_critical_extension {
+                return Err(DaemonTlsConfigError::InvalidCertificateChain);
+            }
+            // This startup validator supports only unconstrained chains. A
+            // constrained CA must fail closed until the full RFC 5280 name
+            // constraint algorithm is part of this pre-bind validation path.
+            if certificate
+                .name_constraints()
+                .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+                .is_some()
+            {
+                return Err(DaemonTlsConfigError::InvalidCertificateChain);
+            }
+            let validity = certificate.validity();
+            if validity.not_after <= now {
+                return Err(DaemonTlsConfigError::CertificateExpired);
+            }
+            if validity.not_before > now {
+                return Err(DaemonTlsConfigError::CertificateNotYetValid);
+            }
+        }
+        let leaf = &parsed_certificates[0];
+        let leaf_is_ca = leaf
+            .basic_constraints()
+            .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+            .is_some_and(|constraints| constraints.value.ca);
+        let leaf_has_server_name = leaf
+            .subject_alternative_name()
+            .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+            .is_some_and(|names| {
+                names.value.general_names.iter().any(|name| match name {
+                    x509_parser::extensions::GeneralName::DNSName(name) => {
+                        let validation_name = name.strip_prefix("*.").unwrap_or(name);
+                        matches!(
+                            ServerName::try_from(validation_name.to_owned()),
+                            Ok(ServerName::DnsName(_))
+                        )
+                    }
+                    x509_parser::extensions::GeneralName::IPAddress(address) => {
+                        matches!(address.len(), 4 | 16)
+                    }
+                    _ => false,
+                })
+            });
+        let leaf_allows_signing = leaf
+            .key_usage()
+            .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+            .is_none_or(|usage| usage.value.digital_signature());
+        let leaf_allows_server_auth = leaf
+            .extended_key_usage()
+            .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+            .is_none_or(|usage| usage.value.any || usage.value.server_auth);
+        if leaf_is_ca || !leaf_has_server_name || !leaf_allows_signing || !leaf_allows_server_auth {
+            return Err(DaemonTlsConfigError::InvalidCertificateChain);
+        }
+        for (link_index, chain_link) in parsed_certificates.windows(2).enumerate() {
+            let certificate = &chain_link[0];
+            let issuer = &chain_link[1];
+            let issuer_constraints = issuer
+                .basic_constraints()
+                .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+                .ok_or(DaemonTlsConfigError::InvalidCertificateChain)?;
+            let issuer_can_sign = issuer
+                .key_usage()
+                .map_err(|_| DaemonTlsConfigError::InvalidCertificateChain)?
+                .is_none_or(|usage| usage.value.key_cert_sign());
+            let issuer_index = link_index + 1;
+            let subordinate_ca_count = parsed_certificates[1..issuer_index]
+                .iter()
+                .filter(|subordinate| subordinate.subject() != subordinate.issuer())
+                .count();
+            let path_length_exceeded = issuer_constraints
+                .value
+                .path_len_constraint
+                .is_some_and(|limit| subordinate_ca_count > limit as usize);
+            if certificate.issuer() != issuer.subject()
+                || !issuer_constraints.value.ca
+                || !issuer_can_sign
+                || path_length_exceeded
+                || certificate
+                    .verify_signature(Some(issuer.public_key()))
+                    .is_err()
+            {
+                return Err(DaemonTlsConfigError::InvalidCertificateChain);
+            }
+        }
+        let private_key = PrivateKeyDer::from_pem_slice(private_key_pem)
+            .map_err(|_| DaemonTlsConfigError::InvalidPrivateKey)?;
+        let requires_client_certificate = client_trust.is_some();
+        let builder = rustls::ServerConfig::builder();
+        let builder = match client_trust {
+            Some(trust) => builder.with_client_cert_verifier(client_certificate_verifier(trust)?),
+            None => builder.with_no_client_auth(),
+        };
+        let server = builder
+            .with_single_cert(certificates, private_key)
+            .map_err(|error| match error {
+                rustls::Error::InconsistentKeys(_) => DaemonTlsConfigError::CertificateKeyMismatch,
+                _ => DaemonTlsConfigError::InvalidCertificateChain,
+            })?;
+        Ok(Self {
+            server: Arc::new(server),
+            requires_client_certificate,
+        })
+    }
+}
+
+fn client_certificate_verifier(
+    trust: DaemonClientTrust<'_>,
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, DaemonTlsConfigError> {
+    let authorities = CertificateDer::pem_slice_iter(trust.ca_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| DaemonTlsConfigError::InvalidClientCa)?;
+    if authorities.is_empty() {
+        return Err(DaemonTlsConfigError::InvalidClientCa);
+    }
+    let now = x509_parser::time::ASN1Time::now();
+    let mut roots = rustls::RootCertStore::empty();
+    let mut parsed_authorities = Vec::with_capacity(authorities.len());
+    for encoded in &authorities {
+        let (remaining, certificate) = x509_parser::parse_x509_certificate(encoded)
+            .map_err(|_| DaemonTlsConfigError::InvalidClientCa)?;
+        let is_ca = certificate
+            .basic_constraints()
+            .map_err(|_| DaemonTlsConfigError::InvalidClientCa)?
+            .is_some_and(|extension| extension.value.ca);
+        let can_sign = certificate
+            .key_usage()
+            .map_err(|_| DaemonTlsConfigError::InvalidClientCa)?
+            .is_none_or(|extension| extension.value.key_cert_sign());
+        if !remaining.is_empty() || !is_ca || !can_sign {
+            return Err(DaemonTlsConfigError::InvalidClientCa);
+        }
+        if certificate.validity().not_after <= now || certificate.validity().not_before > now {
+            return Err(DaemonTlsConfigError::ClientCaOutsideValidity);
+        }
+        roots
+            .add(encoded.clone())
+            .map_err(|_| DaemonTlsConfigError::InvalidClientCa)?;
+        parsed_authorities.push(certificate);
+    }
+    let mut builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots));
+    if let Some(crl_pem) = trust.crl_pem {
+        let crls = CertificateRevocationListDer::pem_slice_iter(crl_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DaemonTlsConfigError::InvalidClientCrl)?;
+        if crls.is_empty() {
+            return Err(DaemonTlsConfigError::InvalidClientCrl);
+        }
+        for encoded in &crls {
+            let (remaining, crl) = x509_parser::parse_x509_crl(encoded)
+                .map_err(|_| DaemonTlsConfigError::InvalidClientCrl)?;
+            if !remaining.is_empty() {
+                return Err(DaemonTlsConfigError::InvalidClientCrl);
+            }
+            if crl.last_update() > now || crl.next_update().is_none_or(|expiry| expiry <= now) {
+                return Err(DaemonTlsConfigError::ClientCrlOutsideValidity);
+            }
+            // Require the issuing CA in the explicit bundle so bad replacement
+            // CRLs fail before installation, even when no client is connected.
+            let signature_valid = parsed_authorities.iter().any(|issuer| {
+                issuer.subject() == crl.issuer()
+                    && issuer
+                        .key_usage()
+                        .is_ok_and(|usage| usage.is_none_or(|usage| usage.value.crl_sign()))
+                    && crl.verify_signature(issuer.public_key()).is_ok()
+            });
+            if !signature_valid {
+                return Err(DaemonTlsConfigError::InvalidClientCrl);
+            }
+        }
+        // Rustls also checks signatures, full-chain revocation coverage and
+        // expiry at every handshake. Unknown revocation status stays denied.
+        builder = builder.with_crls(crls).enforce_revocation_expiration();
+    }
+    builder
+        .build()
+        .map(|verifier| verifier as Arc<dyn rustls::server::danger::ClientCertVerifier>)
+        .map_err(|_| DaemonTlsConfigError::InvalidClientCrl)
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum DaemonTlsConfigError {
+    #[error("the TLS certificate chain is empty or malformed")]
+    InvalidCertificateChain,
+    #[error("the TLS certificate has expired")]
+    CertificateExpired,
+    #[error("the TLS certificate is not valid yet")]
+    CertificateNotYetValid,
+    #[error("the TLS private key is empty or malformed")]
+    InvalidPrivateKey,
+    #[error("the TLS certificate and private key do not match")]
+    CertificateKeyMismatch,
+    #[error("the TLS client CA bundle is empty, malformed, or contains a non-CA certificate")]
+    InvalidClientCa,
+    #[error("a TLS client CA certificate is outside its validity window")]
+    ClientCaOutsideValidity,
+    #[error(
+        "the TLS client revocation list is empty, malformed, or not signed by a CA in the client bundle"
+    )]
+    InvalidClientCrl,
+    #[error(
+        "a TLS client revocation list is outside its validity window or has no next-update time"
+    )]
+    ClientCrlOutsideValidity,
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
+pub enum DaemonTlsReloadError {
+    #[error("the replacement Host Daemon TLS configuration is invalid: {0}")]
+    InvalidConfiguration(#[source] DaemonTlsConfigError),
+    #[error("the Host Daemon listener is not configured for TLS")]
+    TlsNotConfigured,
+    #[error("the Host Daemon listener stopped before TLS reload completed")]
+    ListenerStopped,
+}
+
+/// Replaces TLS material for future handshakes. A change involving client
+/// authentication also closes existing connections so they must reauthenticate.
+#[derive(Clone)]
+pub struct DaemonTlsReloader(watch::Sender<DaemonTlsConfig>);
+
+impl DaemonTlsReloader {
+    pub fn reload(&self, tls: DaemonTlsConfig) -> Result<(), DaemonTlsReloadError> {
+        self.0
+            .send(tls)
+            .map_err(|_| DaemonTlsReloadError::ListenerStopped)
+    }
+
+    pub fn reload_from_pem(
+        &self,
+        certificate_chain_pem: &[u8],
+        private_key_pem: &[u8],
+        client_trust: Option<DaemonClientTrust<'_>>,
+    ) -> Result<(), DaemonTlsReloadError> {
+        let tls = DaemonTlsConfig::from_pem(certificate_chain_pem, private_key_pem, client_trust)
+            .map_err(DaemonTlsReloadError::InvalidConfiguration)?;
+        self.reload(tls)
+    }
+}
+
+pub struct DaemonServer {
+    local_addr: SocketAddr,
+    shutdown: Option<watch::Sender<bool>>,
+    task: Option<JoinHandle<Result<(), std::io::Error>>>,
+    shutdown_grace: Duration,
+    shutdown_service: HostService,
+    tls_reloader: Option<DaemonTlsReloader>,
+}
+
+#[derive(Clone, Debug)]
+/// A cloneable signal for gracefully stopping a running Host listener.
+pub struct DaemonShutdownHandle(watch::Sender<bool>);
+
+impl DaemonShutdownHandle {
+    /// Requests graceful shutdown without taking ownership of the server.
+    pub fn request_shutdown(&self) {
+        let _ = self.0.send(true);
+    }
+}
+
+impl DaemonServer {
+    pub async fn bind(
+        service: HostService,
+        config: DaemonServerConfig,
+    ) -> Result<Self, DaemonServerError> {
+        Self::bind_inner(service, config, None).await
+    }
+
+    /// Binds a Host listener using a fully validated TLS configuration.
+    pub async fn bind_tls(
+        service: HostService,
+        config: DaemonServerConfig,
+        tls: DaemonTlsConfig,
+    ) -> Result<Self, DaemonServerError> {
+        Self::bind_inner(service, config, Some(tls)).await
+    }
+
+    async fn bind_inner(
+        service: HostService,
+        config: DaemonServerConfig,
+        tls: Option<DaemonTlsConfig>,
+    ) -> Result<Self, DaemonServerError> {
+        if service.uses_ssh_bootstrap_authentication() && !config.bind_addr.ip().is_loopback() {
+            return Err(DaemonServerError::SshBootstrapNonLoopbackBind);
+        }
+        if !config.bind_addr.ip().is_loopback() && tls.is_none() {
+            return Err(DaemonServerError::NonLoopbackPlaintextBind);
+        }
+        if config.max_connections == 0 {
+            return Err(DaemonServerError::InvalidConnectionLimit);
+        }
+        if config.shutdown_grace.is_zero() {
+            return Err(DaemonServerError::InvalidShutdownGrace);
+        }
+        if config.idle_timeout.is_some_and(|timeout| timeout.is_zero()) {
+            return Err(DaemonServerError::InvalidIdleTimeout);
+        }
+        let initialized = service
+            .initialize_daemon()
+            .map_err(DaemonServerError::HostInitializationFailed)?;
+        service.prepare_queue_worker_for_daemon();
+        let capabilities = service
+            .daemon_runtime_capabilities()
+            .map_err(DaemonServerError::HostInitializationFailed)?;
+        let listener = TcpListener::bind(config.bind_addr)
+            .await
+            .map_err(DaemonServerError::BindFailed)?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(DaemonServerError::BindFailed)?;
+        let shutdown_service = service.clone();
+        let limits = effective_limits(config.max_connections, config.api_rate_limits);
+        let (shutdown, mut receiver) = watch::channel(false);
+        let state = Arc::new(DaemonState {
+            service: Arc::new(service),
+            host_identity: initialized.host_identity().to_string(),
+            started_at: OffsetDateTime::now_utc(),
+            capabilities,
+            limits,
+            trusted_proxies: Arc::clone(&config.trusted_proxies),
+            failed_auth_limit: FailedAuthLimiter::new(limits.failed_auth_attempts_per_minute()),
+            authenticated_limit: FixedWindowLimiter::new(
+                limits.authenticated_requests_per_minute(),
+            ),
+            control_limit: FixedWindowLimiter::new(limits.control_requests_per_minute()),
+            websocket_inbound_limit: FixedWindowLimiter::new(
+                limits.websocket_inbound_messages_per_minute(),
+            ),
+            websocket_connections: events::ConnectionRegistry::new(
+                limits.websocket_connections_per_principal(),
+            ),
+            setup_issuances: Mutex::new(HashMap::new()),
+            setup_mutations: Mutex::new(HashMap::new()),
+            provider_secret_uploads: Mutex::new(HashMap::new()),
+            shutdown: shutdown.clone(),
+            local_relaunch: config.local_relaunch,
+        });
+        state.service.start_queue_worker();
+        let router = router(Arc::clone(&state));
+        let (listener, tls_reloader) = match tls {
+            Some(tls) => {
+                let (tls_reload, tls_config) = watch::channel(tls);
+                (
+                    LimitedTcpListener::with_tls(listener, config.max_connections, tls_config),
+                    Some(DaemonTlsReloader(tls_reload)),
+                )
+            }
+            None => (
+                LimitedTcpListener::new(listener, config.max_connections),
+                None,
+            ),
+        };
+        let connection_activity = listener.activity();
+        let idle_service = Arc::clone(&state.service);
+        let queue_shutdown_service = Arc::clone(&state.service);
+        let idle_timeout = config.idle_timeout;
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<ConnectionContext>(),
+            )
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    () = wait_for_shutdown(&mut receiver) => {}
+                    () = wait_for_idle(
+                        idle_service,
+                        connection_activity,
+                        idle_timeout,
+                        config.local_relaunch,
+                    ) => {}
+                }
+                queue_shutdown_service.request_queue_worker_shutdown();
+            })
+            .await
+        });
+        Ok(Self {
+            local_addr,
+            shutdown: Some(shutdown),
+            task: Some(task),
+            shutdown_grace: config.shutdown_grace,
+            shutdown_service,
+            tls_reloader,
+        })
+    }
+
+    pub const fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Validates and atomically installs TLS material for future handshakes.
+    /// Existing connections and the last valid configuration remain untouched
+    /// when validation fails.
+    pub fn reload_tls_from_pem(
+        &self,
+        certificate_chain_pem: &[u8],
+        private_key_pem: &[u8],
+        client_trust: Option<DaemonClientTrust<'_>>,
+    ) -> Result<(), DaemonTlsReloadError> {
+        self.tls_reloader
+            .as_ref()
+            .ok_or(DaemonTlsReloadError::TlsNotConfigured)?
+            .reload_from_pem(certificate_chain_pem, private_key_pem, client_trust)
+    }
+
+    pub fn tls_reloader(&self) -> Option<DaemonTlsReloader> {
+        self.tls_reloader.clone()
+    }
+
+    /// Returns a handle that can request graceful shutdown from another task.
+    pub fn shutdown_handle(&self) -> DaemonShutdownHandle {
+        DaemonShutdownHandle(
+            self.shutdown
+                .as_ref()
+                .expect("a running daemon retains its shutdown sender")
+                .clone(),
+        )
+    }
+
+    pub async fn wait(mut self) -> Result<(), DaemonServerError> {
+        let mut task = self.task.take().expect("server task is present");
+        let mut shutdown = self
+            .shutdown
+            .as_ref()
+            .expect("a running daemon retains its shutdown sender")
+            .subscribe();
+        let task_result = tokio::select! {
+            result = &mut task => result,
+            () = wait_for_shutdown(&mut shutdown) => {
+                match tokio::time::timeout(self.shutdown_grace, &mut task).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        task.abort();
+                        let _ = task.await;
+                        return Err(DaemonServerError::ShutdownTimedOut);
+                    }
+                }
+            }
+        };
+        let result = match task_result {
+            Ok(Ok(())) => self.wait_for_workers().await,
+            Ok(Err(error)) => Err(DaemonServerError::ServeFailed(error)),
+            Err(error) => Err(DaemonServerError::TaskFailed(error)),
+        };
+        self.shutdown.take();
+        result
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), DaemonServerError> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(true);
+        }
+        self.finish_bounded().await
+    }
+
+    async fn finish_bounded(&mut self) -> Result<(), DaemonServerError> {
+        let mut task = self.task.take().expect("server task is present");
+        match tokio::time::timeout(self.shutdown_grace, &mut task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => return Err(DaemonServerError::ServeFailed(error)),
+            Ok(Err(error)) => return Err(DaemonServerError::TaskFailed(error)),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                return Err(DaemonServerError::ShutdownTimedOut);
+            }
+        }
+        self.wait_for_workers().await
+    }
+
+    async fn wait_for_workers(&self) -> Result<(), DaemonServerError> {
+        let deadline = tokio::time::Instant::now() + self.shutdown_grace;
+        loop {
+            let service = self.shutdown_service.clone();
+            match tokio::task::spawn_blocking(move || service.daemon_workers_idle()).await {
+                Ok(Ok(true)) => return Ok(()),
+                Ok(Ok(false)) => {}
+                Ok(Err(_)) | Err(_) => return Err(DaemonServerError::HostShutdownFailed),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(DaemonServerError::ShutdownTimedOut);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Longest time an on-demand daemon waits for its launching client before the
+/// idle timeout may retire it. Matches the Controller's launch budget class.
+const STARTUP_IDLE_GRACE: Duration = Duration::from_secs(30);
+
+async fn wait_for_idle(
+    service: Arc<HostService>,
+    connections: ConnectionActivity,
+    idle_timeout: Option<Duration>,
+    launched_on_demand: bool,
+) {
+    let Some(idle_timeout) = idle_timeout else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let poll_interval = idle_timeout.min(Duration::from_secs(1));
+    let confirmation_interval = idle_timeout.min(Duration::from_millis(10));
+    // A Controller-launched daemon serves a client that has not connected
+    // yet. Until the first connection arrives, a short idle timeout would
+    // race that client's initial probe, so the idle clock waits out a
+    // startup grace period that is never shorter than the idle timeout.
+    // Daemons started any other way keep the plain idle contract.
+    let startup_grace = if launched_on_demand {
+        idle_timeout.max(STARTUP_IDLE_GRACE)
+    } else {
+        Duration::ZERO
+    };
+    let booted_at = tokio::time::Instant::now();
+    let (_, initial_connection_generation) = connections.snapshot();
+    let mut observed_generation = None;
+    let mut idle_since = None;
+    let mut expiry_candidate = None;
+
+    loop {
+        let activity_service = Arc::clone(&service);
+        let host_activity =
+            tokio::task::spawn_blocking(move || activity_service.daemon_activity_snapshot()).await;
+        let (connected_clients, connection_generation) = connections.snapshot();
+        let now = tokio::time::Instant::now();
+        let awaiting_first_client = connection_generation == initial_connection_generation
+            && now.duration_since(booted_at) < startup_grace;
+
+        match host_activity {
+            Ok(Ok(host_activity)) => {
+                let generation = (host_activity.generation(), connection_generation);
+                if observed_generation != Some(generation) {
+                    observed_generation = Some(generation);
+                    idle_since = None;
+                    expiry_candidate = None;
+                }
+
+                if host_activity.is_idle() && connected_clients == 0 && !awaiting_first_client {
+                    let started = idle_since.get_or_insert(now);
+                    if now.duration_since(*started) >= idle_timeout {
+                        if expiry_candidate == Some(generation) {
+                            return;
+                        }
+                        // A second full snapshot after the deadline closes the
+                        // race where work arrives as the final poll expires.
+                        expiry_candidate = Some(generation);
+                        tokio::time::sleep(confirmation_interval).await;
+                        continue;
+                    }
+                } else {
+                    idle_since = None;
+                    expiry_candidate = None;
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                idle_since = None;
+                expiry_candidate = None;
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+impl fmt::Debug for DaemonServer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DaemonServer")
+            .field("local_addr", &self.local_addr)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DaemonServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(true);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum DaemonServerError {
+    SshBootstrapNonLoopbackBind,
+    NonLoopbackPlaintextBind,
+    InvalidConnectionLimit,
+    InvalidShutdownGrace,
+    InvalidIdleTimeout,
+    HostInitializationFailed(SatelleError),
+    BindFailed(std::io::Error),
+    ServeFailed(std::io::Error),
+    TaskFailed(tokio::task::JoinError),
+    ShutdownTimedOut,
+    HostShutdownFailed,
+}
+
+impl DaemonServerError {
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::SshBootstrapNonLoopbackBind => "ssh-bootstrap-non-loopback-bind",
+            Self::NonLoopbackPlaintextBind => "non-loopback-plaintext-bind",
+            Self::InvalidConnectionLimit => "invalid-connection-limit",
+            Self::InvalidShutdownGrace => "invalid-shutdown-grace",
+            Self::InvalidIdleTimeout => "invalid-idle-timeout",
+            Self::HostInitializationFailed(error) => error.code.as_str(),
+            Self::BindFailed(_) => "bind-failed",
+            Self::ServeFailed(_) => "serve-failed",
+            Self::TaskFailed(_) => "server-task-failed",
+            Self::ShutdownTimedOut => "shutdown-timeout",
+            Self::HostShutdownFailed => "host-shutdown-failed",
+        }
+    }
+
+    pub const fn host_error(&self) -> Option<&SatelleError> {
+        match self {
+            Self::HostInitializationFailed(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for DaemonServerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::SshBootstrapNonLoopbackBind => {
+                "SSH bootstrap authentication is restricted to a loopback listener"
+            }
+            Self::NonLoopbackPlaintextBind => {
+                "plaintext Host Daemon transport must bind to a loopback address"
+            }
+            Self::InvalidConnectionLimit => "the Host Daemon connection limit must be positive",
+            Self::InvalidShutdownGrace => "the Host Daemon shutdown grace period must be positive",
+            Self::InvalidIdleTimeout => "the Host Daemon idle timeout must be positive",
+            Self::HostInitializationFailed(_) => {
+                "the Host Daemon could not initialize its authoritative state"
+            }
+            Self::BindFailed(_) => "the Host Daemon could not bind its listener",
+            Self::ServeFailed(_) => "the Host Daemon listener failed",
+            Self::TaskFailed(_) => "the Host Daemon server task failed",
+            Self::ShutdownTimedOut => {
+                "the Host Daemon exceeded its graceful HTTP shutdown deadline"
+            }
+            Self::HostShutdownFailed => "the Host Daemon could not finalize its execution workers",
+        })
+    }
+}
+
+impl std::error::Error for DaemonServerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HostInitializationFailed(error) => Some(error),
+            Self::BindFailed(error) | Self::ServeFailed(error) => Some(error),
+            Self::TaskFailed(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+pub(super) struct DaemonState {
+    service: Arc<HostService>,
+    host_identity: String,
+    started_at: OffsetDateTime,
+    capabilities: DaemonRuntimeCapabilities,
+    limits: EffectiveLimits,
+    trusted_proxies: Arc<[TrustedProxy]>,
+    failed_auth_limit: FailedAuthLimiter,
+    authenticated_limit: FixedWindowLimiter<String>,
+    control_limit: FixedWindowLimiter<String>,
+    websocket_inbound_limit: FixedWindowLimiter<String>,
+    websocket_connections: Arc<events::ConnectionRegistry>,
+    setup_issuances: Mutex<HashMap<(String, String), setup::SetupTokenIssuance>>,
+    // SSH bootstrap principals are process-local, so their replay window is
+    // exactly this daemon lifetime. Keep successful setup mutations here and
+    // bind each operation/key pair to one token target.
+    setup_mutations: Mutex<
+        HashMap<(String, setup::SetupTokenMutationOperation, String), setup::SetupTokenMutation>,
+    >,
+    provider_secret_uploads: Mutex<HashMap<String, setup::PendingProviderSecretUpload>>,
+    shutdown: watch::Sender<bool>,
+    local_relaunch: bool,
+}
+
+fn router(state: Arc<DaemonState>) -> Router {
+    let capacity_state = Arc::clone(&state);
+    let live_route = Router::new()
+        .route("/v1/live", get(live).fallback(live_method_not_allowed))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::reject_public_bearer_carriers,
+        ));
+    let capabilities_route = Router::new()
+        .route("/v1/capabilities", get(capabilities))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_protocol_read,
+        ));
+    let maintenance_read_route = Router::new()
+        .route(
+            "/v1/maintenance/storage-migration/{operation_id}/source/cleanup",
+            get(setup::plan_storage_migration_cleanup),
+        )
+        .route(
+            "/v1/maintenance/update-evidence",
+            get(maintenance_update_evidence),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_protocol_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_read,
+        ));
+    let bodyless_read_routes = Router::new()
+        .route("/v1/setup/api-token/current", get(setup::confirm_api_token))
+        .route("/v1/host/status", get(host_status))
+        .route("/v1/host/telemetry", get(host_telemetry_status))
+        .route("/v1/host/paths", get(host_paths))
+        .route("/v1/diagnostics/setup-history", get(setup_history))
+        .route("/v1/host/desktop-sessions", get(host_desktop_sessions))
+        .route("/v1/sessions/{session_id}", get(sessions::get_session))
+        .route(
+            "/v1/queue/{queue_request_id}",
+            get(sessions::get_queue_request),
+        )
+        .route(
+            "/v1/sessions/{session_id}/task-artifacts",
+            get(sessions::get_task_artifacts),
+        )
+        .route("/v1/events", get(events::get_events))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_read,
+        ));
+    let logs_route = Router::new()
+        .route("/v1/logs", get(logs::get_logs))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_query_read,
+        ));
+    let raw_diagnostic_read_route = Router::new()
+        .route(
+            "/v1/diagnostics/recording/{turn_id}",
+            get(sessions::get_recording_manifest),
+        )
+        .route(
+            "/v1/diagnostics/raw-protocol/{turn_id}",
+            get(sessions::get_raw_protocol_export),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_diagnostics_sensitive,
+        ));
+    let read_routes = bodyless_read_routes
+        .merge(capabilities_route)
+        .merge(maintenance_read_route)
+        .merge(logs_route)
+        .merge(raw_diagnostic_read_route)
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_read,
+        ));
+    let host_update_maintenance_route = Router::new()
+        .route(
+            "/v1/maintenance/host-update/{operation_id}/begin",
+            post(setup::begin_host_update_maintenance),
+        )
+        .route(
+            "/v1/maintenance/repair/{operation_id}/begin",
+            post(setup::begin_repair_maintenance),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_setup_mutation,
+        ));
+    let bootstrap_maintenance_routes = Router::new()
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/complete",
+            post(setup::complete_bootstrap_maintenance),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/{operation_kind}/{plan_kind}/begin",
+            post(setup::begin_bootstrap_maintenance),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/start",
+            post(setup::start_maintenance_action),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/apply-managed-setup",
+            post(setup::apply_managed_setup_action),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/complete",
+            post(setup::complete_maintenance_action),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/skip",
+            post(setup::skip_maintenance_action),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/fail/{failure_kind}",
+            post(setup::fail_maintenance_action),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/action/{action_id}/postcheck",
+            post(setup::run_maintenance_postcheck),
+        )
+        .route(
+            "/v1/maintenance/bootstrap/{operation_id}/finish",
+            post(setup::finish_maintenance_plan),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_setup_mutation,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_setup_mutation,
+        ));
+    let setup_routes = Router::new()
+        .route("/v1/setup/api-token", post(setup::issue_api_token))
+        .route(
+            "/v1/setup/api-token/{token_id}/activate",
+            post(setup::activate_api_token),
+        )
+        .route(
+            "/v1/setup/api-token/{token_id}/abort",
+            post(setup::abort_api_token),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_setup_mutation,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_setup_mutation,
+        ));
+    let provider_binding_authorization_routes = Router::new()
+        .route(
+            "/v1/setup/provider-bindings/{provider_alias}/{model_alias}",
+            put(setup::authorize_provider_binding),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
+    let provider_binding_deletion_route = Router::new()
+        .route(
+            "/v1/setup/provider-bindings/{provider_alias}/{model_alias}",
+            axum::routing::delete(setup::delete_provider_binding),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
+    let provider_descriptor_validation_route = Router::new()
+        .route(
+            "/v1/setup/provider-bindings/{provider_alias}/{model_alias}/validate",
+            post(setup::validate_provider_descriptor),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
+    let provider_secret_provisioning_routes = Router::new()
+        .route(
+            "/v1/setup/provider-secret/preview",
+            post(setup::preview_provider_secret_provisioning),
+        )
+        .route(
+            "/v1/setup/provider-secret",
+            post(setup::provision_provider_secret),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
+    let setup_verification_route = Router::new()
+        .route("/v1/setup/verify", post(setup::verify_setup))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
+    let setup_repair_plan_route = Router::new()
+        .route("/v1/setup/repair-plan", post(setup::plan_setup_repair))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
+    let native_readiness_invalidation_route = Router::new()
+        .route(
+            "/v1/setup/readiness/native/invalidate",
+            post(setup::invalidate_native_readiness),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
+    // These operations are used only by the managed local daemon. They keep
+    // setup and Doctor behind the same durable state owner as session control.
+    let local_setup_operation_route = Router::new()
+        .route("/v1/local/setup", post(local_setup_operation))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
+    let local_doctor_operation_route = Router::new()
+        .route("/v1/local/doctor", post(local_doctor_operation))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
+    let local_daemon_relaunch_route = if state.local_relaunch {
+        Router::new()
+            .route(
+                "/v1/local/relaunch-if-idle",
+                post(local_daemon_relaunch_if_idle),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth::require_admin_mutation,
+            ))
+    } else {
+        Router::new()
+    };
+    let control_routes = Router::new()
+        .route("/v1/sessions", post(sessions::create_session))
+        .route(
+            "/v1/sessions/{session_id}/turns",
+            post(sessions::create_turn),
+        )
+        .route(
+            "/v1/sessions/{session_id}/stop",
+            post(sessions::stop_session),
+        )
+        .route(
+            "/v1/queue/{queue_request_id}",
+            axum::routing::delete(sessions::cancel_queue_request),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ));
+    let sensitive_diagnostic_routes = Router::new()
+        .route(
+            "/v1/diagnostics/recording/preflight",
+            post(sessions::recording_preflight),
+        )
+        .route(
+            "/v1/diagnostics/desktop-snapshot",
+            post(sessions::capture_desktop_snapshot),
+        )
+        .route(
+            "/v1/diagnostics/desktop-snapshot/{snapshot_id}/acknowledge",
+            post(sessions::acknowledge_desktop_snapshot),
+        )
+        .route(
+            "/v1/diagnostics/raw-protocol/{turn_id}/acknowledge",
+            post(sessions::acknowledge_raw_protocol_export),
+        )
+        .route(
+            "/v1/diagnostics/raw-subprocess",
+            post(sessions::begin_raw_subprocess_export),
+        )
+        .route(
+            "/v1/diagnostics/raw-subprocess/{invocation_id}/prepare",
+            post(sessions::prepare_raw_subprocess_export),
+        )
+        .route(
+            "/v1/diagnostics/raw-subprocess/{invocation_id}/acknowledge",
+            post(sessions::acknowledge_raw_subprocess_export),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_control,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_diagnostics_sensitive,
+        ));
+    let api_token_routes = Router::new()
+        .route("/v1/api-tokens", post(api_tokens::issue))
+        .route("/v1/api-tokens/{token_id}/rotate", post(api_tokens::rotate))
+        .route("/v1/api-tokens/{token_id}/revoke", post(api_tokens::revoke))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
+    let storage_migration_route = Router::new()
+        .route(
+            "/v1/maintenance/storage-migration/{operation_id}/source/cleanup",
+            post(setup::apply_storage_migration_cleanup),
+        )
+        .route(
+            "/v1/maintenance/storage-migration/{operation_id}/complete",
+            post(setup::complete_storage_migration),
+        )
+        .route(
+            "/v1/maintenance/storage-migration/{operation_id}/begin",
+            post(setup::begin_storage_migration),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_admin_mutation,
+        ));
+    let protected = read_routes
+        .merge(api_token_routes)
+        .merge(storage_migration_route)
+        .merge(host_update_maintenance_route)
+        .merge(bootstrap_maintenance_routes)
+        .merge(setup_routes)
+        .merge(provider_binding_authorization_routes)
+        .merge(provider_binding_deletion_route)
+        .merge(provider_descriptor_validation_route)
+        .merge(provider_secret_provisioning_routes)
+        .merge(setup_verification_route)
+        .merge(setup_repair_plan_route)
+        .merge(native_readiness_invalidation_route)
+        .merge(local_setup_operation_route)
+        .merge(local_doctor_operation_route)
+        .merge(local_daemon_relaunch_route)
+        .merge(control_routes)
+        .merge(sensitive_diagnostic_routes)
+        .method_not_allowed_fallback(protected_method_not_allowed)
+        .fallback(protected_not_found)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::authorize,
+        ));
+    let telemetry_state = Arc::clone(&state);
+    Router::new()
+        .merge(live_route)
+        .merge(protected)
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            telemetry_state,
+            record_telemetry,
+        ))
+        .layer(middleware::from_fn_with_state(
+            capacity_state,
+            listener::enforce_capacity,
+        ))
+}
+
+async fn record_telemetry(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let started = Instant::now();
+    let response = next.run(request).await;
+    if !state.service.telemetry_enabled() {
+        return response;
+    }
+    let status = response.status();
+    let outcome = if status.is_success() {
+        crate::core::telemetry::TelemetryOutcome::Success
+    } else {
+        crate::core::telemetry::TelemetryOutcome::Failure
+    };
+    let error_code = match status {
+        StatusCode::UNAUTHORIZED => Some(crate::core::ErrorCode::AuthenticationFailed),
+        StatusCode::FORBIDDEN => Some(crate::core::ErrorCode::AuthorizationInsufficientScope),
+        StatusCode::TOO_MANY_REQUESTS => Some(crate::core::ErrorCode::HostBusy),
+        status if status.is_client_error() => Some(crate::core::ErrorCode::InvalidUsage),
+        status if status.is_server_error() => Some(crate::core::ErrorCode::RemoteExecution),
+        _ => None,
+    };
+    let service = Arc::clone(&state.service);
+    let duration = started.elapsed();
+    tokio::task::spawn_blocking(move || service.record_telemetry(duration, outcome, error_code));
+    response
+}
+
+async fn live(headers: HeaderMap) -> Response {
+    json_response(
+        StatusCode::OK,
+        &LiveResponse::new(),
+        request_id_or_new(&headers),
+    )
+}
+
+async fn live_method_not_allowed(headers: HeaderMap) -> Response {
+    api_error_response(
+        request_id_or_new(&headers),
+        None,
+        ApiFailure {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            code: ApiErrorCode::MethodNotAllowed,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the requested method is not supported by the liveness route",
+            details: None,
+        },
+    )
+}
+
+async fn capabilities(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let response = CapabilitiesResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        env!("CARGO_PKG_VERSION").to_string(),
+        state.capabilities.codex_runtime(),
+        state.capabilities.native_computer_use(),
+        state.capabilities.provider_computer_use(),
+        state.capabilities.image_attachments(),
+        state.limits,
+    );
+    let mut response = authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    );
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(PROTOCOL_VERSION_HEADER),
+        HeaderValue::from_static(PROTOCOL_VERSION),
+    );
+    response
+}
+
+async fn maintenance_update_evidence(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let codex_update_evidence = match tokio::task::spawn_blocking(move || {
+        service.maintenance_codex_update_evidence()
+    })
+    .await
+    {
+        Ok(Ok(evidence)) => evidence,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = MaintenanceUpdateEvidenceResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        codex_update_evidence,
+    );
+    let mut response = authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    );
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(PROTOCOL_VERSION_HEADER),
+        HeaderValue::from_static(PROTOCOL_VERSION),
+    );
+    response
+}
+
+async fn local_setup_operation(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    ApiJson(request): ApiJson<LocalSetupOperationRequest>,
+) -> Response {
+    let (host, dry_run, setup_mode, setup_components, daemon_path_overrides) = request.into_parts();
+    let service = Arc::clone(&state.service);
+    let result = match tokio::task::spawn_blocking(move || {
+        service.setup(
+            &host,
+            dry_run,
+            setup_mode,
+            setup_components,
+            daemon_path_overrides,
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = LocalSetupOperationResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        result,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn local_doctor_operation(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    ApiJson(request): ApiJson<LocalDoctorOperationRequest>,
+) -> Response {
+    let (host, scope_selection, options, provider_intent) = match request.into_inputs() {
+        Ok(inputs) => inputs,
+        Err(error) => return host_error::response(&state, &authorized, &error),
+    };
+    let service = Arc::clone(&state.service);
+    let result = match tokio::task::spawn_blocking(move || {
+        service.doctor_with_ready_controller_transport(
+            &host,
+            &scope_selection,
+            options,
+            &provider_intent,
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = LocalDoctorOperationResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        result,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn local_daemon_relaunch_if_idle(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    match state.service.daemon_workers_idle() {
+        Ok(true) => {
+            let response = LocalDaemonRelaunchResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+            );
+            let response = authenticated_json_response(
+                StatusCode::OK,
+                &response,
+                authorized.request_id(),
+                &state.host_identity,
+            );
+            let _ = state.shutdown.send(true);
+            response
+        }
+        Ok(false) => host_error::response(&state, &authorized, &SatelleError::state_conflict()),
+        Err(error) => host_error::response(&state, &authorized, &error),
+    }
+}
+
+async fn host_status(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let status = match tokio::task::spawn_blocking(move || service.daemon_runtime_status()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) | Err(_) => {
+            return api_error_response(
+                authorized.request_id().clone(),
+                Some(state.host_identity.clone()),
+                ApiFailure {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: ApiErrorCode::InternalError,
+                    category: ApiErrorCategory::Internal,
+                    retryable: false,
+                    message: "the Host Daemon could not read authoritative status",
+                    details: None,
+                },
+            );
+        }
+    };
+    let response = HostStatusResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        env!("CARGO_PKG_VERSION").to_string(),
+        state.started_at,
+        status.session_count(),
+        status.active_turn_count(),
+        status.recovery_pending_turn_count(),
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn host_telemetry_status(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let status = match tokio::task::spawn_blocking(move || service.telemetry_status()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    authenticated_json_response(
+        StatusCode::OK,
+        &HostTelemetryStatusResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            status,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn host_desktop_sessions(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let sessions =
+        match tokio::task::spawn_blocking(move || service.daemon_desktop_sessions()).await {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+            Err(_) => return host_error::task_failure(&state, &authorized),
+        };
+    let response = HostDesktopSessionsResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        sessions,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn host_paths(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let paths = match tokio::task::spawn_blocking(move || service.daemon_resolved_paths()).await {
+        Ok(Ok(paths)) => paths,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    let response = HostPathsResponse::new(
+        authorized.request_id().clone(),
+        state.host_identity.clone(),
+        paths,
+    );
+    authenticated_json_response(
+        StatusCode::OK,
+        &response,
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn setup_history(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    let service = Arc::clone(&state.service);
+    let history = match tokio::task::spawn_blocking(move || service.setup_history()).await {
+        Ok(Ok(history)) => history,
+        Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+        Err(_) => return host_error::task_failure(&state, &authorized),
+    };
+    authenticated_json_response(
+        StatusCode::OK,
+        &crate::transport::SetupHistoryResponse::new(
+            authorized.request_id().clone(),
+            state.host_identity.clone(),
+            history,
+        ),
+        authorized.request_id(),
+        &state.host_identity,
+    )
+}
+
+async fn protected_not_found(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    api_error_response(
+        authorized.request_id().clone(),
+        Some(state.host_identity.clone()),
+        ApiFailure {
+            status: StatusCode::NOT_FOUND,
+            code: ApiErrorCode::RouteNotFound,
+            category: ApiErrorCategory::NotFound,
+            retryable: false,
+            message: "the requested Host Daemon route does not exist",
+            details: None,
+        },
+    )
+}
+
+async fn protected_method_not_allowed(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    api_error_response(
+        authorized.request_id().clone(),
+        Some(state.host_identity.clone()),
+        ApiFailure {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            code: ApiErrorCode::MethodNotAllowed,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the requested method is not supported by this Host Daemon route",
+            details: None,
+        },
+    )
+}
+
+pub(super) struct ApiFailure {
+    pub(super) status: StatusCode,
+    pub(super) code: ApiErrorCode,
+    pub(super) category: ApiErrorCategory,
+    pub(super) retryable: bool,
+    pub(super) message: &'static str,
+    pub(super) details: Option<Value>,
+}
+
+pub(super) fn api_error_response(
+    request_id: RequestId,
+    host_identity: Option<String>,
+    failure: ApiFailure,
+) -> Response {
+    let fallback_request_id = request_id.clone();
+    let fallback_host_identity = host_identity.clone();
+    json_response_with_context(
+        failure.status,
+        &ApiError::new(
+            request_id,
+            host_identity,
+            failure.code,
+            failure.category,
+            failure.retryable,
+            failure.message,
+            failure.details,
+        ),
+        fallback_request_id,
+        fallback_host_identity,
+    )
+}
+
+fn json_response(status: StatusCode, value: &impl Serialize, request_id: RequestId) -> Response {
+    json_response_with_context(status, value, request_id, None)
+}
+
+pub(super) fn authenticated_json_response(
+    status: StatusCode,
+    value: &impl Serialize,
+    request_id: &RequestId,
+    host_identity: &str,
+) -> Response {
+    json_response_with_context(
+        status,
+        value,
+        request_id.clone(),
+        Some(host_identity.to_string()),
+    )
+}
+
+pub(super) fn authenticated_json_bytes_response(
+    status: StatusCode,
+    body: Vec<u8>,
+    request_id: &RequestId,
+    host_identity: &str,
+) -> Response {
+    json_bytes_response_with_context(
+        status,
+        body,
+        request_id.clone(),
+        Some(host_identity.to_string()),
+    )
+}
+
+fn json_response_with_context(
+    status: StatusCode,
+    value: &impl Serialize,
+    request_id: RequestId,
+    host_identity: Option<String>,
+) -> Response {
+    let response_host_identity = host_identity.clone();
+    let (status, body) = match serde_json::to_vec(value) {
+        Ok(body) => (status, body),
+        Err(_) => {
+            let fallback = ApiError::new(
+                request_id.clone(),
+                host_identity,
+                ApiErrorCode::InternalError,
+                ApiErrorCategory::Internal,
+                false,
+                "the Host Daemon could not encode its response",
+                None,
+            );
+            let body = serde_json::to_vec(&fallback)
+                .expect("the closed fallback ApiError contract must serialize");
+            (StatusCode::INTERNAL_SERVER_ERROR, body)
+        }
+    };
+    json_bytes_response_with_context(status, body, request_id, response_host_identity)
+}
+
+fn json_bytes_response_with_context(
+    status: StatusCode,
+    body: Vec<u8>,
+    request_id: RequestId,
+    host_identity: Option<String>,
+) -> Response {
+    let mut response = (status, body).into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    security_headers(with_response_context(
+        response,
+        &request_id,
+        host_identity.as_deref(),
+    ))
+}
+
+pub(super) fn with_response_context(
+    mut response: Response,
+    request_id: &RequestId,
+    host_identity: Option<&str>,
+) -> Response {
+    let response_request_id = HeaderValue::try_from(request_id.as_str())
+        .expect("a canonical UUIDv7 is always a valid HTTP header value");
+    tracing::debug!(
+        request_id = %request_id,
+        status = response.status().as_u16(),
+        "Host Daemon HTTP response completed"
+    );
+    response
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, response_request_id);
+    if let Some(host_identity) = host_identity {
+        let response_host_identity = HeaderValue::try_from(host_identity)
+            .expect("a stored Host Identity is always a valid HTTP header value");
+        response
+            .headers_mut()
+            .insert(HOST_IDENTITY_HEADER, response_host_identity);
+    }
+    response
+}
+
+pub(super) fn security_headers(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+pub(super) fn header_request_id(headers: &HeaderMap) -> Option<RequestId> {
+    let mut values = headers.get_all(REQUEST_ID_HEADER).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    RequestId::parse(value).ok()
+}
+
+pub(super) fn request_id_or_new(headers: &HeaderMap) -> RequestId {
+    header_request_id(headers).unwrap_or_default()
+}
+
+struct RateWindow {
+    started_at: Instant,
+    count: usize,
+}
+
+impl RateWindow {
+    fn is_active(&self, now: Instant) -> bool {
+        now.duration_since(self.started_at) < RATE_WINDOW
+    }
+
+    fn retry_after(&self, now: Instant) -> Duration {
+        RATE_WINDOW.saturating_sub(now.saturating_duration_since(self.started_at))
+    }
+}
+
+struct FixedWindowLimiter<K> {
+    limit: usize,
+    entries: Mutex<HashMap<K, RateWindow>>,
+}
+
+impl<K> FixedWindowLimiter<K>
+where
+    K: Eq + Hash,
+{
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns `None` when the request is admitted and the remaining window
+    /// when it is limited. Keeping the duration in the limiter prevents HTTP
+    /// and WebSocket callers from reconstructing timing from policy constants.
+    fn admit(&self, key: K) -> Option<Duration> {
+        self.admit_at(key, Instant::now())
+    }
+
+    fn admit_at(&self, key: K, now: Instant) -> Option<Duration> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        entries.retain(|_, window| window.is_active(now));
+        if !entries.contains_key(&key) && entries.len() >= MAX_RATE_KEYS {
+            return entries.values().map(|window| window.retry_after(now)).min();
+        }
+        let window = entries.entry(key).or_insert(RateWindow {
+            started_at: now,
+            count: 0,
+        });
+        if window.count >= self.limit {
+            Some(window.retry_after(now))
+        } else {
+            window.count += 1;
+            None
+        }
+    }
+}
+
+struct FailedAuthLimiter {
+    limit: usize,
+    entries: Mutex<HashMap<IpAddr, RateWindow>>,
+}
+
+impl FailedAuthLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn retry_after(&self, source: IpAddr) -> Option<Duration> {
+        self.retry_after_at(source, Instant::now())
+    }
+
+    fn retry_after_at(&self, source: IpAddr, now: Instant) -> Option<Duration> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        entries.retain(|_, window| window.is_active(now));
+        entries
+            .get(&source)
+            .filter(|window| window.count >= self.limit)
+            .map(|window| window.retry_after(now))
+    }
+
+    fn record_failure(&self, source: IpAddr) {
+        self.record_failure_at(source, Instant::now());
+    }
+
+    fn record_failure_at(&self, source: IpAddr, now: Instant) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        entries.retain(|_, window| window.is_active(now));
+        if !entries.contains_key(&source) && entries.len() >= MAX_RATE_KEYS {
+            return;
+        }
+        entries
+            .entry(source)
+            .and_modify(|window| window.count = window.count.saturating_add(1))
+            .or_insert(RateWindow {
+                started_at: now,
+                count: 1,
+            });
+    }
+}
+
+fn retry_after_ms(duration: Duration) -> u64 {
+    let rounded_millis =
+        duration.as_millis() + u128::from(!duration.subsec_nanos().is_multiple_of(1_000_000));
+    u64::try_from(rounded_millis).expect("the one-minute rate window fits in u64 milliseconds")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    struct SerializationFailure;
+
+    impl Serialize for SerializationFailure {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("forced serialization failure"))
+        }
+    }
+
+    #[tokio::test]
+    async fn serialization_failure_still_returns_the_typed_error_contract() {
+        let request_id = RequestId::new();
+        let response = json_response_with_context(
+            StatusCode::OK,
+            &SerializationFailure,
+            request_id.clone(),
+            Some("host-test".to_string()),
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .expect("read typed fallback body");
+        let error: ApiError = serde_json::from_slice(&body).expect("decode typed fallback");
+        assert_eq!(error.code(), ApiErrorCode::InternalError);
+        assert_eq!(error.request_id(), &request_id);
+        assert_eq!(error.host_identity(), Some("host-test"));
+    }
+
+    #[test]
+    fn fixed_window_reports_remaining_time_and_reopens_at_expiry() {
+        let limiter = FixedWindowLimiter::new(1);
+        let started_at = Instant::now();
+
+        assert_eq!(limiter.admit_at("principal", started_at), None);
+        assert_eq!(
+            limiter.admit_at("principal", started_at + Duration::from_millis(125),),
+            Some(RATE_WINDOW - Duration::from_millis(125))
+        );
+        assert_eq!(
+            limiter.admit_at("principal", started_at + RATE_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_auth_window_reports_remaining_time_and_expires() {
+        let limiter = FailedAuthLimiter::new(10);
+        let source = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let started_at = Instant::now();
+        for _ in 0..10 {
+            limiter.record_failure_at(source, started_at);
+        }
+
+        assert_eq!(
+            limiter.retry_after_at(source, started_at + Duration::from_millis(250)),
+            Some(RATE_WINDOW - Duration::from_millis(250))
+        );
+        assert_eq!(
+            limiter.retry_after_at(source, started_at + RATE_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn full_key_table_reports_the_earliest_window_expiry() {
+        let limiter = FixedWindowLimiter::new(1);
+        let started_at = Instant::now();
+        for key in 0..MAX_RATE_KEYS {
+            assert_eq!(limiter.admit_at(key, started_at), None);
+        }
+
+        assert_eq!(
+            limiter.admit_at(MAX_RATE_KEYS, started_at + Duration::from_secs(1)),
+            Some(RATE_WINDOW - Duration::from_secs(1))
+        );
+        assert_eq!(
+            limiter.admit_at(MAX_RATE_KEYS, started_at + RATE_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn retry_metadata_rounds_up_to_the_next_millisecond() {
+        assert_eq!(retry_after_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(retry_after_ms(Duration::from_micros(1_001)), 2);
+        assert_eq!(retry_after_ms(Duration::from_millis(60_000)), 60_000);
+    }
+}

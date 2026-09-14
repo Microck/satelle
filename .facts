@@ -9,7 +9,7 @@
 - Satelle public MVP acceptance requires the primary successful-use journey and recovery after client reconnect to pass end to end on every declared MVP Computer Use Host Platform @spec @mvp @release-gate @verification @implemented
 - id: 0jf
   label: Satelle public MVP acceptance requires the same public Session, error, and event contracts across SSH-tunneled and direct transports
-  command: cargo test --locked -p satelle-transport --test http conformance::direct_and_established_ssh_tunnel_share_session_error_and_event_contracts -- --exact
+  command: cargo test --locked -p satelle --test http conformance::direct_and_established_ssh_tunnel_share_session_error_and_event_contracts -- --exact
   tags: [spec, mvp, release-gate, verification, implemented, ci]
 
 # domain
@@ -60,16 +60,16 @@
 - a Satelle Platform-Native Log Sink is an OS-owned logging destination such as journald, Windows Event Log, or macOS unified logging that receives mirrored redacted Satelle Log Entries without becoming a Satelle-owned store @spec @phase4 @implemented
 - a Satelle Path Set is the runtime-resolved collection of config, cache, local state, operator log, SQLite store, and recording artifact paths for one OS user on one machine @spec @mvp @implemented
 - label: a Satelle Desktop Binding is one configured remote OS user account whose compatible visible desktop sessions a Host Daemon is authorized to observe and control
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  command: cargo test --locked -p satelle --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
 - label: a Satelle Desktop Session is one active visible GUI session for a Desktop Binding that native Computer Use can observe and control
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  command: cargo test --locked -p satelle --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
 - label: a Satelle Desktop Session Preference is a Host-level selector that narrows one Desktop Binding to one compatible Desktop Session without changing the bound OS user
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  command: cargo test --locked -p satelle --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
 - label: a Satelle Native Desktop Session Selector is an advanced OS-specific selector copied from a Host Daemon session listing for one Computer Use Host Platform
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  command: cargo test --locked -p satelle --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
 - a Satelle Multi-User Broker permits an authorized API Principal to select among multiple Desktop Bindings owned by one Host Identity at request time while preserving per-user authorization, isolation, and audit boundaries @spec @implemented
 - a Satelle Secret Source is a typed reference to secret material stored outside Satelle config files, such as an operating-system credential store item, environment variable, file path, or remote-Host-owned provider auth store @spec @mvp @implemented
@@ -81,7 +81,7 @@
 - a Satelle Agent Skill Bundle is a versioned set of Satelle-owned SKILL.md guides for AI agents setting up, using, and recovering Satelle @spec @mvp @implemented
 - a Satelle Automation Workflow is a user-requested batch, watch, notify, or REPL flow that coordinates Satelle commands without changing underlying authority and safety rules @spec @phase4 @implemented
 - label: a Satelle Command History Entry is a local redacted record of one Satelle command invocation, outcome, duration, target, and stable command family
-  command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
+  command: cargo test --locked -p satelle --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
   tags: [spec, mvp, implemented, ci]
 
 # brand
@@ -142,14 +142,14 @@
 - satelle steer JSON v2 uses schema_version satelle.steer.v2 @contract @mvp @implemented
 - id: i3f
   label: satelle stop JSON v1 uses schema_version satelle.stop.v1
-  command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
+  command: cargo test --locked -p satelle --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
   tags: [spec, contract, mvp, implemented, ci]
 - label: satelle stop JSON v1 includes outcome, session_id, turn_id, previous_state, current_state, changed, and stopped_at fields; outcome is stopped or already_terminal
-  command: cargo test --locked -p satelle-cli --features test-support --test output-format-contract stop_json_v1_has_one_closed_contract_for_stopped_and_already_terminal_turns -- --exact
+  command: cargo test --locked -p satelle --features test-support --test output-format-contract stop_json_v1_has_one_closed_contract_for_stopped_and_already_terminal_turns -- --exact
   tags: [spec, contract, mvp, implemented, ci]
 - id: 5hb
   label: satelle stop on an already-terminal Turn exits 0 with outcome already_terminal and changed false
-  command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
+  command: cargo test --locked -p satelle --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
   tags: [spec, contract, mvp, implemented, ci]
 - satelle status JSON v2 uses schema_version satelle.status.v2 @contract @mvp @implemented
 - satelle logs initial and followed JSON records each use schema_version satelle.logs.entry.v2 and emit exactly one record per line without a top-level wrapper @spec @contract @mvp @implemented
@@ -451,7 +451,7 @@
 - satelle stop stops the active Turn in a Session by default without stopping the Host Daemon lifecycle @spec @mvp @implemented
 - id: hav
   label: satelle stop preserves the Session and records the active Turn as stopped instead of deleting the Session
-  command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_detached_turn_returns_exact_stop_contract -- --exact
+  command: cargo test --locked -p satelle --features test-support --test cli stopping_detached_turn_returns_exact_stop_contract -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle allows later steer commands to continue from a stopped session when the stored Codex thread identifier remains available @implemented @mvp
 
@@ -478,41 +478,41 @@
 - satelle setup prompts for a Satelle Desktop Session Preference when multiple compatible sessions are visible and stdin is interactive @mvp @implemented
 - satelle setup with --no-input reports a typed desktop-session-ambiguous diagnostic when multiple compatible sessions are visible and no desktop_session_preference is configured @mvp @implemented
 - label: satelle run and steer report a typed desktop-session-ambiguous diagnostic instead of picking a session when multiple compatible sessions match the bound desktop_user and no configured preference resolves to exactly one session
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests::automatic_and_only_selection_never_hide_ambiguity -- --exact && cargo test --locked -p satelle-cli --features test-support --test cli run_and_steer_fail_before_admission_when_desktop_selection_is_invalid -- --exact
+  command: cargo test --locked -p satelle --lib desktop_selection_tests::automatic_and_only_selection_never_hide_ambiguity -- --exact && cargo test --locked -p satelle --features test-support --test cli run_and_steer_fail_before_admission_when_desktop_selection_is_invalid -- --exact
   tags: [spec, mvp, implemented]
 - label: satelle run and steer report a typed desktop-session-preference-unmatched diagnostic when the configured desktop_session_preference does not resolve to one active compatible session
-  command: cargo test --locked -p satelle-cli --features test-support --test cli run_and_steer_fail_before_admission_when_desktop_selection_is_invalid -- --exact
+  command: cargo test --locked -p satelle --features test-support --test cli run_and_steer_fail_before_admission_when_desktop_selection_is_invalid -- --exact
   tags: [spec, mvp, implemented]
 - label: satelle MVP does not default to the physical console session when multiple compatible sessions are visible because that can control the wrong desktop
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  command: cargo test --locked -p satelle --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
 - satelle MVP portable desktop_session_preference values are only and console @implemented @mvp
 - label: satelle treats desktop_session_preference = only as selecting a Satelle Desktop Session only when exactly one compatible session is visible
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  command: cargo test --locked -p satelle --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
 - label: satelle treats desktop_session_preference = console as selecting the OS-reported physical console session only when that session belongs to the bound desktop_user and is compatible with native Computer Use
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  command: cargo test --locked -p satelle --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
 - label: satelle reports a typed desktop-session-console-unavailable diagnostic when desktop_session_preference = console has no matching compatible console session
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  command: cargo test --locked -p satelle --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
 - satelle MVP supports Satelle Native Desktop Session Selector configuration as an advanced escape hatch separate from portable desktop_session_preference values @implemented @mvp
 - satelle rejects host configuration that sets both desktop_session_preference and a Satelle Native Desktop Session Selector for the same concrete host alias @implemented @mvp
 - label: satelle reports a typed desktop-session-selector-conflict diagnostic when both portable and native session selectors are configured for one concrete host alias
-  command: cargo test --locked -p satelle-cli --features test-support --test cli config_rejects_portable_and_native_desktop_selectors_together -- --exact
+  command: cargo test --locked -p satelle --features test-support --test cli config_rejects_portable_and_native_desktop_selectors_together -- --exact
   tags: [spec, mvp, implemented]
 - label: satelle reports a typed desktop-session-native-selector-wrong-platform diagnostic when a Satelle Native Desktop Session Selector platform does not match the detected remote operating system
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  command: cargo test --locked -p satelle --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
 - label: satelle reports a typed desktop-session-native-selector-unmatched diagnostic when a Satelle Native Desktop Session Selector does not resolve to exactly one active compatible session
-  command: cargo test --locked -p satelle-core --lib desktop_selection_tests -- --test-threads=1
+  command: cargo test --locked -p satelle --lib desktop_selection_tests -- --test-threads=1
   tags: [spec, mvp, implemented]
 - satelle Host Daemon refuses native Computer Use sessions for desktop sessions that do not match its configured Satelle Desktop Binding @mvp @implemented
 - label: satelle MVP supports multiple users on one physical machine only through separate per-user Host Daemon installations, Host Identities, Host Aliases, and Desktop Bindings running under their respective OS accounts
-  command: cargo test --locked -p satelle-cli --features test-support --test cli user_host_config_accepts_desktop_binding_and_daemon_path_fields -- --exact && cargo test --locked -p satelle-transport --lib contract::session::tests::mvp_turn_requests_cannot_route_across_desktop_bindings -- --exact
+  command: cargo test --locked -p satelle --features test-support --test cli user_host_config_accepts_desktop_binding_and_daemon_path_fields -- --exact && cargo test --locked -p satelle --lib contract::session::tests::mvp_turn_requests_cannot_route_across_desktop_bindings -- --exact
   tags: [spec, mvp, implemented]
 - label: satelle MVP does not provide a Satelle Multi-User Broker for one host alias to route across multiple Satelle Desktop Bindings
-  command: cargo test --locked -p satelle-transport --lib contract::session::tests::mvp_turn_requests_cannot_route_across_desktop_bindings -- --exact
+  command: cargo test --locked -p satelle --lib contract::session::tests::mvp_turn_requests_cannot_route_across_desktop_bindings -- --exact
   tags: [spec, mvp, implemented]
 - a Satelle Multi-User Broker fronts one Host Identity and routes an authorized Host Alias and API Principal to one of multiple explicitly authorized Desktop Bindings @spec @implemented
 - satelle Satelle Multi-User Broker requires per-user authorization, separate Desktop Binding identity, session isolation, provider-auth isolation, path-set isolation, log attribution, audit records, and explicit user or session selection before prompt execution @spec @implemented
@@ -536,11 +536,11 @@
 - satelle setup does not inherit local SATELLE_HOME, SATELLE_CONFIG_FILE, SATELLE_STATE_DIR, SATELLE_CACHE_DIR, or SATELLE_LOG_DIR into daemon service configuration automatically @spec @mvp @implemented
 - id: l00
   label: satelle setup preserves daemon path override text until SSH detects the remote Host platform, then validates every override with that platform's path rules before constructing or applying a remote Host Daemon command
-  command: cargo test --locked -p satelle-cli --features test-support --bin satelle remote_daemon_path_overrides_ -- --test-threads=1
+  command: cargo test --locked -p satelle --features test-support --bin satelle remote_daemon_path_overrides_ -- --test-threads=1
   tags: [spec, mvp, implemented]
 - id: rse
   label: satelle SSH bootstrap applies the validated remote daemon path environment to state-owner release and every detached Host Daemon launch for the selected path set
-  command: cargo test --locked -p satelle-cli --features test-support --bin satelle remote_daemon_path_environment_ -- --test-threads=1
+  command: cargo test --locked -p satelle --features test-support --bin satelle remote_daemon_path_environment_ -- --test-threads=1
   tags: [spec, mvp, implemented]
 - satelle setup reports a typed daemon-path-override-not-absolute usage or configuration error when a daemon path override is relative or tilde-prefixed @implemented @mvp
 - satelle setup stores daemon path overrides in a Satelle-owned per-service configuration surface instead of the global operating-system environment @spec @mvp @implemented
@@ -1029,7 +1029,7 @@
 - authenticated capabilities advertise the maximum subscriptions per WebSocket and the inbound WebSocket message rate per API Principal @spec @mvp @implemented
 - id: q82
   label: exceeding a WebSocket subscription or inbound-message limit closes the connection with a typed capacity or rate-limit reason without affecting active Turns or other subscribers
-  command: cargo test --locked -p satelle-transport --test http events::limits::failing_sockets_do_not_interrupt_an_unrelated_live_subscriber -- --exact
+  command: cargo test --locked -p satelle --test http events::limits::failing_sockets_do_not_interrupt_an_unrelated_live_subscriber -- --exact
   tags: [spec, mvp, implemented, ci]
 - every inbound WebSocket text, binary, ping, or pong frame consumes the API Principal's inbound-message allowance, while a close frame may terminate without consuming allowance @spec @contract @mvp @implemented
 - WebSocket connection capacity and inbound-message limits both aggregate by the authenticated Principal reference rather than by bearer token id, so rotating or issuing another token cannot multiply one Principal's limits @spec @contract @mvp @implemented
@@ -1179,7 +1179,7 @@
 - satelle host sessions human output marks the session selected by current host configuration, portable selector matches, and available native selectors @implemented @mvp
 - satelle host sessions --json includes session_id, desktop_user, state, session_kind, is_console, is_remote, display_summary, portable_selectors, native_selectors, and selected_by_current_config fields @implemented @mvp
 - label: satelle Native Desktop Session Selector values must be copied from native_selectors reported by satelle host sessions for the same host platform
-  command: cargo test --locked -p satelle-cli --features test-support --test cli host_sessions_marks_only_the_session_selected_by_effective_host_config -- --exact
+  command: cargo test --locked -p satelle --features test-support --test cli host_sessions_marks_only_the_session_selected_by_effective_host_config -- --exact
   tags: [spec, mvp, implemented]
 - satelle discovers project-level configuration by walking upward from the current working directory to the nearest .satelle/config.toml @implemented @mvp
 - satelle project-level configuration discovery works outside Git repositories @implemented @mvp
@@ -1446,15 +1446,15 @@
 ## lifecycle-state
 - id: 0hy
   label: Satelle Turn nonterminal states are starting, running, and recovery_pending
-  command: cargo test --locked -p satelle-core --lib session::tests::states_have_exact_names_and_terminal_partition -- --exact
+  command: cargo test --locked -p satelle --lib session::tests::states_have_exact_names_and_terminal_partition -- --exact
   tags: [spec, mvp, implemented, ci]
 - id: ftq
   label: Satelle Turn terminal states are completed, blocked, failed, and stopped
-  command: cargo test --locked -p satelle-core --lib session::tests::states_have_exact_names_and_terminal_partition -- --exact
+  command: cargo test --locked -p satelle --lib session::tests::states_have_exact_names_and_terminal_partition -- --exact
   tags: [spec, mvp, implemented, ci]
 - id: hjz
   label: a terminal Satelle Turn never transitions to another Turn state
-  command: cargo test --locked -p satelle-core --lib session::tests::transition_matrix_is_exhaustive -- --exact && cargo test --locked -p satelle-core --lib session::tests::stale_revision_cannot_overwrite_the_winning_terminal_state -- --exact
+  command: cargo test --locked -p satelle --lib session::tests::transition_matrix_is_exhaustive -- --exact && cargo test --locked -p satelle --lib session::tests::stale_revision_cannot_overwrite_the_winning_terminal_state -- --exact
   tags: [spec, mvp, implemented, ci]
 - a Satelle Session has at most one nonterminal Turn @spec @mvp @implemented
 - a Satelle Session is active exactly when it references one nonterminal Turn @spec @mvp @implemented
@@ -1462,16 +1462,16 @@
 - a Satelle Session remains steerable after a terminal Turn while its Host and internal Codex thread mapping remain available @mvp @implemented
 - id: ksl
   label: the Host Identity and Desktop Binding of a Satelle Session are immutable after Session creation
-  command: cargo test --locked -p satelle-core --lib session::tests::policy_is_snapshotted_and_desktop_binding_is_immutable -- --exact
+  command: cargo test --locked -p satelle --lib session::tests::policy_is_snapshotted_and_desktop_binding_is_immutable -- --exact
   tags: [spec, mvp, implemented, ci]
 - each Turn stores the effective model, Provider Binding, desktop target, approval policy, sandbox policy, timeout policy, and experimental-feature choices used for that Turn @spec @mvp @implemented
 - id: lwp
   label: every Session record has a monotonically increasing session_state_revision and every Turn record has a monotonically increasing turn_state_revision updated by each committed lifecycle mutation of that record
-  command: cargo test --locked -p satelle-core --lib session::tests::each_turn_commit_checks_and_increments_both_revisions_once -- --exact && cargo test --locked -p satelle-core --lib session::tests::follow_up_preserves_history_and_at_most_one_turn_is_active -- --exact && cargo test --locked -p satelle-core --lib session::tests::stop_without_confirmation_retains_active_or_recovery_ownership -- --exact && cargo test --locked -p satelle-host --lib storage::tests::lifecycle::terminal_session_round_trips_with_follow_up_and_exact_snapshot -- --exact
+  command: cargo test --locked -p satelle --lib session::tests::each_turn_commit_checks_and_increments_both_revisions_once -- --exact && cargo test --locked -p satelle --lib session::tests::follow_up_preserves_history_and_at_most_one_turn_is_active -- --exact && cargo test --locked -p satelle --lib session::tests::stop_without_confirmation_retains_active_or_recovery_ownership -- --exact && cargo test --locked -p satelle --lib storage::tests::lifecycle::terminal_session_round_trips_with_follow_up_and_exact_snapshot -- --exact
   tags: [spec, contract, mvp, implemented, ci]
 - id: g60
   label: public Session responses include session_state_revision and public Turn responses include turn_state_revision
-  command: cargo test --locked -p satelle-core --lib session::tests::public_json_has_exact_safe_allowlist -- --exact
+  command: cargo test --locked -p satelle --lib session::tests::public_json_has_exact_safe_allowlist -- --exact
   tags: [spec, contract, mvp, implemented, ci]
 - lifecycle Satelle Events include state_subject plus the corresponding session_state_revision or turn_state_revision, and Turn lifecycle events may include both revisions when one commit mutates both records @spec @contract @mvp @implemented
 - the Host Daemon passes the committed Turn Execution Policy to the Codex adapter before Turn start @mvp @implemented
@@ -1499,7 +1499,7 @@
 - the Host Daemon refreshes live Control and Maintenance Lease heartbeats at least every 5 seconds, and a missing heartbeat becomes stale after 30 seconds by default without permitting automatic lease release @spec @mvp @implemented
 - Host Daemon startup treats an orphaned Control or Maintenance Lease as recovery_pending and blocks conflicting admission until reconciliation completes @spec @mvp @implemented
 - label: an orphaned non-Turn Control Lease for a readiness or provider probe is classified outcome_unknown, reconciled against its probe process and upstream capability state, and resolved to a durable terminal Readiness Result before lease release
-  command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact && cargo test --locked -p satelle --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
   tags: [spec, mvp, implemented, ci]
 - an orphaned Maintenance Lease operation is classified outcome_unknown and reconciled from its action postconditions before retry or release @spec @mvp @implemented
 - lease expiry alone never proves that an external Computer Use or maintenance side effect stopped @spec @mvp @implemented
@@ -1522,15 +1522,15 @@
 - satelle stop transitions a starting, running, or recovery_pending Turn to stopped only after the adapter confirms cancellation or otherwise proves that the same upstream Turn is no longer active @mvp @implemented
 - id: kqy
   label: satelle stop on a terminal Turn returns already_terminal without changing stored history
-  command: cargo test --locked -p satelle-cli --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
+  command: cargo test --locked -p satelle --features test-support --test cli stopping_terminal_turn_preserves_history_and_allows_later_steer -- --exact
   tags: [spec, mvp, implemented, ci]
 - id: t10
   label: concurrent completion and stop use a compare-and-set transition so exactly one terminal state wins
-  command: cargo test --locked -p satelle-host --lib runtime::tests::reads_and_stop_remain_available_during_slow_execution_and_stop_observation -- --exact && cargo test --locked -p satelle-host --lib storage::tests::lifecycle::lifecycle_completion_wins_a_stop_race_without_redeleting_its_lease -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::reads_and_stop_remain_available_during_slow_execution_and_stop_observation -- --exact && cargo test --locked -p satelle --lib storage::tests::lifecycle::lifecycle_completion_wins_a_stop_race_without_redeleting_its_lease -- --exact
   tags: [spec, mvp, implemented, ci]
 - id: sp8
   label: a late Codex completion cannot overwrite a previously committed stopped state
-  command: cargo test --locked -p satelle-host --lib runtime::tests::review_regressions::attached_execution_losing_to_stop_returns_the_durable_stopped_state -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::review_regressions::attached_execution_losing_to_stop_returns_the_durable_stopped_state -- --exact
   tags: [spec, mvp, implemented, ci]
 - a stop request that cannot confirm upstream cancellation reports stop-not-confirmed instead of persisting a false stopped state @mvp @implemented
 - stop-not-confirmed leaves the Turn nonterminal, preserves running when the same upstream Turn is known active or recovery_pending when its state is ambiguous, and retains the Control Lease @mvp @implemented
@@ -1543,7 +1543,7 @@
 - an attached CLI that cannot confirm stop after interruption prints the Session identifier and a status recovery command before exiting 130 @spec @mvp @implemented
 - id: zpt
   label: Host Daemon startup marks every stored nonterminal Turn as recovery_pending before accepting a new Turn for the same Control Lease
-  command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_restart_work_blocks_new_admission_until_stop_resolves_it -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::unknown_restart_work_blocks_new_admission_until_stop_resolves_it -- --exact
   tags: [spec, mvp, implemented, ci]
 - startup reconciliation queries the Codex adapter before resolving a recovery_pending Turn @mvp @implemented
 - startup reconciliation restores running only when the adapter proves that the same upstream Turn remains active @mvp @implemented
@@ -1613,17 +1613,17 @@
 - expiration of Satelle metadata does not claim to delete Codex, provider, or operating-system records outside Satelle ownership @spec @mvp @implemented
 - satelle can export a redacted task artifact set containing plan.md, worklog.md, and goal.md for a selected session so another agent or human can audit what happened without replaying raw desktop content @spec @mvp @implemented
 - label: satelle records local redacted command history for setup, repair, run, steer, status, stop, logs, doctor, host, config, and MCP installer commands when local state storage is available
-  command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
+  command: cargo test --locked -p satelle --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle extends local redacted command history to batch, watch, notify, and REPL Automation Workflows @spec @phase4 @implemented
 - label: satelle local command history stores command family, selected host, selected profile, session id when present, started_at, duration_ms, outcome status, typed error code, and Satelle CLI version without storing raw provider secrets, raw prompts, screenshots, or transcripts by default
-  command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
+  command: cargo test --locked -p satelle --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle local command history can be disabled through user-level configuration or an environment option before the command starts
-  command: cargo test --locked -p satelle-cli --features test-support --test command-history user_config_and_environment_can_disable_history_before_dispatch -- --exact
+  command: cargo test --locked -p satelle --features test-support --test command-history user_config_and_environment_can_disable_history_before_dispatch -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle local aggregate stats summarize command counts, success and failure counts, last-used hosts, last-used profiles, and common typed error codes from redacted command history
-  command: cargo test --locked -p satelle-cli --features test-support --test command-history aggregate_views_summarize_outcomes_targets_profiles_and_errors -- --exact
+  command: cargo test --locked -p satelle --features test-support --test command-history aggregate_views_summarize_outcomes_targets_profiles_and_errors -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle local aggregate stats are diagnostic convenience data and are never treated as authoritative remote host state @spec @mvp @implemented
 - satelle exposes a top-level logs command in MVP @implemented @mvp
@@ -1767,42 +1767,42 @@
 - logs follow reconnection uses a Log Cursor instead of timestamp alone @spec @mvp @implemented
 - a Log Cursor older than retained log history reports a typed logs-cursor-expired error and identifies the earliest available cursor @spec @mvp @implemented
 - label: satelle stores the Satelle Setup Action Ledger in the remote Host Daemon SQLite store instead of storing it only on the local CLI machine
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle treats the remote Host Daemon SQLite setup action ledger as authoritative for setup and repair recovery because it records mutations against that remote host @spec @mvp @implemented
 - satelle CLI may cache setup action ledger summaries for display convenience but must refresh from the Host Daemon before reporting authoritative setup or repair state @spec @mvp @implemented
 - label: satelle setup action ledger records are scoped to the target host, OS user or desktop session when relevant, Satelle host binary version, and setup run identifier
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_ignores_history_from_other_bindings_or_satelle_versions -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::repair_ignores_history_from_other_bindings_or_satelle_versions -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle setup action ledger entries store stable action id, action label, action status, start time, completion or failure time, retry safety, error code, and recovery hint metadata
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: a setup action is durably recorded as started before its external mutation begins
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: a setup action is durably recorded as completed only after its postcondition is verified
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::setup_action_ledger_migrates_and_persists_ordered_state_transitions -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: a setup action left started after a crash is classified as outcome_unknown
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::restart_classifies_started_setup_actions_as_outcome_unknown -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::restart_classifies_started_setup_actions_as_outcome_unknown -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: repair never reruns an outcome_unknown action until live probes determine its postcondition
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_waits_for_a_live_postcondition_before_retrying_outcome_unknown -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::repair_waits_for_a_live_postcondition_before_retrying_outcome_unknown -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: repair reruns an incomplete action automatically only when the action is marked retry_safe
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_uses_the_durable_retry_safe_marker_for_incomplete_actions -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::repair_uses_the_durable_retry_safe_marker_for_incomplete_actions -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle setup action ledger entries store normalized action summaries instead of raw installer, shell, service-manager, or operating-system command output by default
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle setup action ledger entries do not store raw stdout or raw stderr from setup and repair subprocesses by default
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle setup action ledger entries store subprocess exit status or platform-specific termination status when that status is available
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle setup action ledger entries store redacted failure hints only when the hint can be derived without preserving raw stdout or stderr
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::failed_actions_store_normalized_metadata_without_raw_stream_columns -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle setup and repair human output does not print raw installer stdout or stderr by default, even in verbose mode @spec @mvp @implemented
 - satelle setup and repair verbose output expands normalized action status, typed errors, exit status, and recovery hints without exposing raw subprocess streams by default @spec @mvp @implemented
@@ -1822,26 +1822,26 @@
 - satelle setup action ledger retention cleanup deletes ledger metadata only and does not uninstall, roll back, or modify completed setup actions @mvp @implemented
 - satelle normal prompt execution does not require retained setup action ledger records after the host passes current native Computer Use readiness checks @mvp @implemented
 - label: satelle repair uses retained setup action ledger records when available but can re-plan from live host probes when the relevant ledger records expired or are missing
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle repair treats missing, expired, or incompatible setup action ledger records as non-blocking when live host probes can run
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle repair reports setup action ledger availability as diagnostic context instead of treating missing history as the repair cause when live host probes identify current blockers @spec @mvp @implemented
 - label: satelle repair performs fresh OS-aware live probes before generating a repair plan when no usable setup action ledger is available
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle repair generates a fresh idempotent action plan from current host probe results, effective configuration, target operating system, transport capabilities, and current Codex readiness blockers when no usable setup action ledger is available
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle repair does not assume previously completed setup actions succeeded unless the current host probes verify the resulting state
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle repair writes a new setup action ledger for the new repair run even when the previous setup action ledger expired or is missing
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle repair does not automatically execute a live-probe-derived repair plan solely because no usable setup action ledger is available
-  command: cargo test --locked -p satelle-host --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::setup_ledger::repair_replans_from_live_probes_when_ledger_history_is_missing -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle repair follows the same plan presentation, final interactive confirmation, --dry-run, --yes, and --no-input --yes mutation consent rules when no usable setup action ledger is available @spec @mvp @implemented
 - satelle repair with no usable setup action ledger requires --no-input --yes before mutating the remote host in non-interactive mode @spec @mvp @implemented
@@ -1871,7 +1871,7 @@
 - host storage restore verifies backup integrity and compatibility, preserves the failed store separately, runs under the applicable Maintenance Lease or Bootstrap Lock, and atomically activates the restored store before restarting API service @spec @mvp @implemented
 - host storage restore follows maintenance plan presentation, --dry-run, interactive confirmation, --yes, --no-input --yes, action-ledger, and partial-failure rules @spec @mvp @implemented
 - label: Restore activation errors put the prior active database and every moved SQLite sidecar back under their active names before returning.
-  command: cargo test --locked -p satelle-host --lib storage::open::backup_tests::activation_errors_restore_active_sidecars -- --exact
+  command: cargo test --locked -p satelle --lib storage::open::backup_tests::activation_errors_restore_active_sidecars -- --exact
   tags: [spec, implemented]
 - migration-backup cleanup retains the newest validated pre-migration backup and at least one previous validated backup by default @spec @mvp @implemented
 - Windows migration-backup cleanup moves each quarantined pair member to one identity-stable, retry-discoverable deleting name before handle-relative deletion without appending a second UUID @spec @mvp @implemented
@@ -1954,7 +1954,7 @@
 - SSH authentication and Tailscale identity do not replace Host Daemon API authentication or authorization @spec @mvp @implemented
 - id: kyc
   label: an unauthenticated liveness endpoint may reveal only that the Host Daemon process is alive
-  command: cargo test --locked -p satelle-transport --test http liveness_is_exact_and_reveals_no_protected_metadata -- --exact
+  command: cargo test --locked -p satelle --test http liveness_is_exact_and_reveals_no_protected_metadata -- --exact
   tags: [spec, mvp, implemented, ci]
 - readiness details, versions, capabilities, Host Identity, and Session metadata require read scope @spec @mvp @implemented
 - satelle Direct Host Daemon transport optionally requires a verified client certificate at the TLS connection boundary in addition to the normal scoped bearer token @contract @phase4
@@ -2007,7 +2007,7 @@
 - satelle reports a typed yolo-blocked-by-native-approval error when native Computer Use blocks on a non-bypassable OS, app, or sensitive-action approval while YOLO mode is active @spec @mvp @implemented
 - id: htr
   label: satelle host trust atomically replaces the user-level configuration without changing its POSIX mode or Windows DACL and revalidates the replacement before reporting success
-  command: cargo test --locked -p satelle-cli --features test-support --bin satelle host_trust::tests::host_identity_update_preserves_unrelated_toml_and_is_idempotent -- --exact
+  command: cargo test --locked -p satelle --features test-support --bin satelle host_trust::tests::host_identity_update_preserves_unrelated_toml_and_is_idempotent -- --exact
   tags: [mvp, implemented]
 
 ## control-plane
@@ -2096,28 +2096,28 @@
 - satelle invalidates native Computer Use readiness cache entries when the target host, OS user or desktop session, Codex version, native Computer Use runtime version, Computer Use plugin version, detectable OS permission state, or detectable app approval state changes @spec @mvp @implemented
 - satelle retains failed native Computer Use readiness cache entries for diagnostics but does not treat a cached failure as the only current blocker when the host and Codex control plane are reachable for a fresh prompt execution attempt @spec @mvp @implemented
 - label: satelle native Computer Use readiness smoke tests use a 120 second timeout by default
-  command: cargo test --locked -p satelle-host --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
+  command: cargo test --locked -p satelle --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle native Computer Use readiness smoke-test timeout values are configurable per host or profile @spec @mvp @implemented
 - satelle timeouts.native_readiness configuration values are human duration strings with explicit units such as "120s" or "2m" @implemented @mvp
 - satelle rejects bare integer timeouts.native_readiness configuration values with a typed duration-unit-required configuration error @implemented @mvp
 - label: satelle run and steer do not wait indefinitely for native Computer Use readiness smoke tests before prompt execution
-  command: cargo test --locked -p satelle-host --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle reports a typed native-readiness-timeout error when a native Computer Use readiness smoke test exceeds its effective timeout
-  command: cargo test --locked -p satelle-host --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: a native Computer Use readiness smoke-test timeout requests upstream cancellation and blocks prompt execution
-  command: cargo test --locked -p satelle-host --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: a timed-out native readiness probe stores a terminal timed_out Readiness Result and releases its Control Lease only after the Codex adapter confirms that no upstream probe Turn remains active
-  command: cargo test --locked -p satelle-host --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::confirmed_native_probe_timeout_is_terminal_and_releases_control -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: when timed-out native readiness probe cancellation cannot be confirmed, Satelle records outcome_unknown diagnostics, keeps the Control Lease recovery_pending, and blocks conflicting Turn or probe admission until reconciliation succeeds
-  command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle does not allow prompt execution or remote-control flows on hosts that fail native Codex Computer Use readiness
-  command: cargo test --locked -p satelle-host --lib tests::unsupported_or_unproven_production_execution_is_blocked_before_admission -- --exact
+  command: cargo test --locked -p satelle --lib tests::unsupported_or_unproven_production_execution_is_blocked_before_admission -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle may keep a host that lacks native Codex Computer Use only for diagnostics, installation, and repair flows @spec @mvp @implemented
 - satelle host capability checks are OS-aware for Windows, Linux, and macOS instead of assuming one platform's Codex or Computer Use behavior applies to every platform @mvp @implemented
@@ -2144,25 +2144,25 @@
 - satelle provider smoke tests report manual-action-required only for an authoritative Host OS permission or app approval denial and do not infer target-access failure from an unobserved probe action or callback @spec @mvp @implemented
 - satelle provider smoke tests time out, close or retire the probe surface, and clean up probe session state after completion or failure @spec @mvp @implemented
 - label: satelle provider smoke tests use a 120 second timeout by default
-  command: cargo test --locked -p satelle-host --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
+  command: cargo test --locked -p satelle --lib tests::admission_request_timeout_tracks_both_configured_readiness_phases -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle provider smoke-test timeout values are configurable per host or profile @spec @mvp @implemented
 - satelle timeouts.provider_smoke_test configuration values are human duration strings with explicit units such as "120s" or "2m" @implemented @mvp
 - satelle rejects bare integer timeouts.provider_smoke_test configuration values with a typed duration-unit-required configuration error @implemented @mvp
 - label: satelle run and steer do not wait indefinitely for provider smoke tests before prompt execution
-  command: cargo test --locked -p satelle-host --lib codex_session::tests::timed_provider_exchange_requests_correlated_upstream_cancellation -- --exact
+  command: cargo test --locked -p satelle --lib codex_session::tests::timed_provider_exchange_requests_correlated_upstream_cancellation -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle reports a typed provider-smoke-test-timeout error when a provider smoke test exceeds its effective timeout
-  command: cargo test --locked -p satelle-host --lib runtime::codex_adapter::tests::provider_smoke_timeout_and_incompatibility_remain_distinct -- --exact
+  command: cargo test --locked -p satelle --lib runtime::codex_adapter::tests::provider_smoke_timeout_and_incompatibility_remain_distinct -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: a provider smoke-test timeout requests upstream cancellation and blocks prompt execution
-  command: cargo test --locked -p satelle-host --lib codex_session::tests::timed_provider_exchange_requests_correlated_upstream_cancellation -- --exact
+  command: cargo test --locked -p satelle --lib codex_session::tests::timed_provider_exchange_requests_correlated_upstream_cancellation -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: a timed-out provider probe stores a terminal timed_out Readiness Result and releases its Control Lease only after the Codex adapter confirms that no upstream probe Turn remains active
-  command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: when timed-out provider probe cancellation cannot be confirmed, Satelle records outcome_unknown diagnostics, keeps the Control Lease recovery_pending, and blocks conflicting Turn or probe admission until reconciliation succeeds
-  command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact
+  command: cargo test --locked -p satelle --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact
   tags: [spec, mvp, implemented, ci]
 - satelle provider smoke tests store normalized pass/fail metadata and typed failure reasons but do not store screenshots, full transcripts, or desktop recordings by default @mvp @implemented
 - satelle provider smoke test cache misses during prompt execution trigger a live provider smoke test when the selected provider requires experimental provider Computer Use and the user has opted into that experimental mode @spec @mvp @implemented
@@ -2245,7 +2245,7 @@
 ## transport
 - id: srl
   label: SSH durable daemon relaunches acquire the remote bootstrap lock, recheck readiness after acquisition, and retain the lock through launch and authenticated readiness
-  command: cargo test --locked -p satelle-cli --features test-support --bin satelle transport::tests::serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock -- --exact
+  command: cargo test --locked -p satelle --features test-support --bin satelle transport::tests::serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock -- --exact
   tags: [spec, mvp, implemented]
 - satelle treats Tailscale as an optional first-class private connectivity option for reaching configured remote hosts @spec @mvp @implemented
 - satelle does not require Tailscale for core remote host configuration or execution flows @spec @mvp @implemented
@@ -2271,7 +2271,7 @@
 - satelle MVP does not configure Tailscale Funnel or public internet exposure as a normal setup path @spec @mvp @implemented
 - id: n4h
   label: satelle Tailscale Serve setup blocks apply when any live top-level, VIP Service, or Foreground route with Funnel or public exposure targets the Satelle listener
-  command: cargo test --locked -p satelle-cli --features test-support --bin satelle tailscale_serve::tests::live_ -- --test-threads=1
+  command: cargo test --locked -p satelle --features test-support --bin satelle tailscale_serve::tests::live_ -- --test-threads=1
   tags: [spec, mvp, implemented]
 - satelle MVP supports SSH transport for bootstrap, file upload, remote command execution, and tunneled access to the on-demand Host Daemon @spec @mvp @implemented
 - satelle MVP supports direct HTTPS and WSS transport for already reachable or persistently installed Host Daemons @spec @mvp @implemented
@@ -2289,7 +2289,7 @@
 - SSH bootstrap tunnels bind only to Controller loopback by default @spec @mvp @implemented
 - id: cr4
   label: Host Daemon API authentication remains required inside an SSH tunnel
-  command: cargo test --locked -p satelle-transport --test http conformance::established_ssh_tunnel_requires_api_authentication_for_http_and_websocket -- --exact
+  command: cargo test --locked -p satelle --test http conformance::established_ssh_tunnel_requires_api_authentication_for_http_and_websocket -- --exact
   tags: [spec, mvp, implemented, ci]
 - uploaded Host Daemon binaries are verified against release integrity metadata before remote execution @spec @mvp @implemented
 - uploaded binaries are staged under generated names and atomically promoted only after verification @spec @mvp @implemented
@@ -2365,14 +2365,14 @@
 - satelle first MVP public release publishes GitHub release assets and npm-registry packages but does not publish a crates.io crate @spec @mvp @implemented
 - satelle release workflow may run cargo package or cargo publish --dry-run to validate future crates.io readiness without uploading a crate to crates.io @spec @mvp @implemented
 - satelle does not publish a placeholder crates.io package only to reserve the satelle crate name @spec @mvp @implemented
-- satelle later crates.io publishing provides one Cargo package named satelle whose only public installation surface is the `satelle` binary installed by `cargo install satelle` @spec @contract @later
-- before crates.io publishing, Satelle consolidates the current satelle-cli, satelle-core, satelle-host, and satelle-transport package sources into one self-contained publishable Cargo package while preserving their module boundaries @spec @later
-- the published satelle Cargo package has no path, Git, or registry dependencies on unpublished Satelle-internal crates @spec @release-gate @verification @later
-- Satelle does not publish satelle-core, satelle-host, or satelle-transport as separate crates when the binary-only satelle Cargo package is introduced @spec @later
-- the initial satelle crates.io package does not promise a stable public Rust library API @spec @later
-- satelle crates.io publishing requires documented Cargo SemVer commitments, package owner policy, package contents policy, and CI-only publish controls before it can become part of a public release @spec @later
-- satelle crates.io package versions, when introduced, use the same Satelle release version as GitHub release assets and npm-registry packages @spec @later
-- satelle crates.io publication remains a later release milestone rather than an MVP release blocker @spec @later
+- satelle later crates.io publishing provides one Cargo package named satelle whose only public installation surface is the `satelle` binary installed by `cargo install satelle` @spec @contract @later @phase4 @implemented
+- before crates.io publishing, Satelle consolidates the current satelle-cli, satelle-core, satelle-host, and satelle-transport package sources into one self-contained publishable Cargo package while preserving their module boundaries @spec @later @phase4 @implemented
+- the published satelle Cargo package has no path, Git, or registry dependencies on unpublished Satelle-internal crates @spec @release-gate @verification @later @phase4 @implemented
+- Satelle does not publish satelle-core, satelle-host, or satelle-transport as separate crates when the binary-only satelle Cargo package is introduced @spec @later @phase4 @implemented
+- the initial satelle crates.io package does not promise a stable public Rust library API @spec @later @phase4 @implemented
+- satelle crates.io publishing requires documented Cargo SemVer commitments, package owner policy, package contents policy, and CI-only publish controls before it can become part of a public release @spec @later @phase4 @implemented
+- satelle crates.io package versions, when introduced, use the same Satelle release version as GitHub release assets and npm-registry packages @spec @later @phase4 @implemented
+- satelle crates.io publication remains a later release milestone rather than an MVP release blocker @spec @later @phase4 @implemented
 - satelle ordinary public release flow starts with a release pull request before any public package or binary publishing occurs @spec @mvp @implemented
 - satelle release pull request updates version metadata, Tegami changelog output, package lockfiles, generated package manifests, and release configuration needed for the target version @spec @mvp @implemented
 - satelle release pull request verification builds and validates release candidate artifacts without publishing public npm packages or final GitHub release assets @spec @mvp @implemented
@@ -2432,7 +2432,7 @@
 - a partial npm publication or validation failure records which immutable candidate versions exist plus an idempotent recovery procedure before any npm promotion transaction may begin @spec @mvp @implemented
 - release recovery never moves the signed version tag or republishes different bytes under an already published package version @spec @mvp @implemented
 - label: the release-candidate offline JSON smoke command is satelle paths --json and must emit schema_version satelle.paths.v2 before target-specific online smoke tests run
-  command: cargo build --workspace --release --locked && cargo test --locked -p satelle-cli --test release-binary-contract release_binary_satisfies_offline_contract -- --exact --ignored
+  command: cargo build --workspace --release --locked && cargo test --locked -p satelle --test release-binary-contract release_binary_satisfies_offline_contract -- --exact --ignored
   tags: [release-gate, verification, mvp, spec, implemented, ci]
 - release-candidate validation installs, executes the --version contract, runs satelle paths --json, upgrades, and uninstalls Satelle on every Controller target @spec @verification @mvp @implemented
 
@@ -2460,27 +2460,27 @@
 - every versioned JSON and NDJSON surface has contract tests for schema_version, required fields, enum tokens, stdout, stderr, and exit status @spec @verification @mvp @implemented
 - id: zox
   label: parser failures and semantic validation failures share the same human and JSON error conformance suite
-  command: cargo test --locked -p satelle-cli --test error-output-contract parser_and_semantic_usage_failures_share_the_human_and_json_contract_and_status -- --exact
+  command: cargo test --locked -p satelle --test error-output-contract parser_and_semantic_usage_failures_share_the_human_and_json_contract_and_status -- --exact
   tags: [spec, verification, mvp, implemented, ci]
 - id: imt
   label: direct and SSH-tunneled Host Daemon transports pass one shared API and Session conformance suite
-  command: cargo test --locked -p satelle-transport --test http conformance::direct_and_established_ssh_tunnel_share_session_error_and_event_contracts -- --exact
+  command: cargo test --locked -p satelle --test http conformance::direct_and_established_ssh_tunnel_share_session_error_and_event_contracts -- --exact
   tags: [spec, verification, mvp, implemented, ci]
 - label: concurrent admission tests prove that one Control Lease cannot create two active Turns across processes
-  command: cargo test --locked -p satelle-host --lib storage::tests::security::control_lease_process::cross_process_control_lease_blocks_competing_turn_after_owner_handoff -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::security::control_lease_process::cross_process_control_lease_blocks_competing_turn_after_owner_handoff -- --exact
   tags: [spec, verification, mvp, implemented, ci]
 - label: stop and completion race tests prove that exactly one immutable terminal Turn state wins
-  command: cargo test --locked -p satelle-core --lib session::tests::stale_revision_cannot_overwrite_the_winning_terminal_state -- --exact && cargo test --locked -p satelle-host --lib storage::tests::lifecycle::lifecycle_completion_wins_a_stop_race_without_redeleting_its_lease -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::review_regressions::attached_execution_losing_to_stop_returns_the_durable_stopped_state -- --exact
+  command: cargo test --locked -p satelle --lib session::tests::stale_revision_cannot_overwrite_the_winning_terminal_state -- --exact && cargo test --locked -p satelle --lib storage::tests::lifecycle::lifecycle_completion_wins_a_stop_race_without_redeleting_its_lease -- --exact && cargo test --locked -p satelle --lib runtime::tests::review_regressions::attached_execution_losing_to_stop_returns_the_durable_stopped_state -- --exact
   tags: [spec, verification, mvp, implemented, ci]
 - label: Host Daemon restart tests prove recovery_pending reconciliation before replacement Turn admission
-  command: cargo test --locked -p satelle-host --lib storage::tests::lifecycle::restart_marks_active_turn_recovery_pending_and_retains_lease -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::new_admission_reconciles_restart_work_without_blocking_reads -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::unknown_restart_work_blocks_new_admission_until_stop_resolves_it -- --exact
+  command: cargo test --locked -p satelle --lib storage::tests::lifecycle::restart_marks_active_turn_recovery_pending_and_retains_lease -- --exact && cargo test --locked -p satelle --lib runtime::tests::new_admission_reconciles_restart_work_without_blocking_reads -- --exact && cargo test --locked -p satelle --lib runtime::tests::unknown_restart_work_blocks_new_admission_until_stop_resolves_it -- --exact
   tags: [spec, verification, mvp, implemented, ci]
 - setup, repair, Host update, self-update remotes, and doctor fix have no-mutation dry-run tests @spec @verification @mvp @implemented
 - storage migration and config repair have no-mutation dry-run tests @spec @verification @phase4 @implemented
 - a canary secret and canary prompt are absent from every normal log, error, event, setup ledger, status result, and public API response @spec @verification @mvp @implemented
 - later diagnostic bundle and Raw Diagnostic Export redaction tests remove canary secrets from every artifact category covered by the declared redaction policy @spec @verification @phase4 @implemented
 - label: project configuration trust tests prove a checkout cannot replace a concrete Host Binding, redirect an endpoint, select an unauthorized binding, or activate consent and YOLO policy
-  command: cargo test --locked -p satelle-cli --features test-support --test project-host-binding && cargo test --locked -p satelle-cli --features test-support --test cli project_config_forbidden_keys_report_typed_errors -- --exact && cargo test --locked -p satelle-cli --features test-support --test config-profiles untrusted_profile_selectors_do_not_activate_yolo_policy -- --exact
+  command: cargo test --locked -p satelle --features test-support --test project-host-binding && cargo test --locked -p satelle --features test-support --test cli project_config_forbidden_keys_report_typed_errors -- --exact && cargo test --locked -p satelle --features test-support --test config-profiles untrusted_profile_selectors_do_not_activate_yolo_policy -- --exact
   tags: [spec, verification, mvp, implemented, ci]
 - each declared Controller target has release-candidate build, install, upgrade, smoke, and uninstall coverage @spec @verification @mvp @implemented
 - each declared Computer Use Host Platform has end-to-end setup, readiness, run, status, steer, stop, reconnect, and recovery coverage @spec @verification @mvp @implemented

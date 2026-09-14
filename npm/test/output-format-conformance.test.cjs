@@ -9,7 +9,7 @@ test("TOON output fixtures agree with the upstream encoder and decoder", async (
   const { encode, decode } = await import("@toon-format/toon");
   const fixtures = JSON.parse(readFileSync(path.join(
     __dirname,
-    "../../crates/satelle-cli/tests/fixtures/toon-reference.json",
+    "../../crates/satelle/assets/toon-reference.json",
   ), "utf8"));
   assert.equal(fixtures.reference, "@toon-format/toon@4.1.1");
   for (const fixture of fixtures.cases) {
