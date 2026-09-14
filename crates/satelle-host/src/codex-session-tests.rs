@@ -1287,6 +1287,30 @@ fn failed_turn_projects_only_closed_codex_error_classes() {
         assert!(!debug.contains("PRIVATE_PROVIDER_DETAILS_CANARY"));
     }
 
+    let generic_stream_disconnect = json!({
+        "error": {
+            "message": "stream disconnected before completion: PRIVATE_PROVIDER_URL_CANARY",
+            "codexErrorInfo": "other"
+        }
+    });
+    let classified = failed_turn_kind(generic_stream_disconnect.as_object().unwrap());
+    assert_eq!(
+        classified,
+        CodexFailedTurnKind::Classified("codex_response_stream_disconnected")
+    );
+    assert!(!format!("{classified:?}").contains("PRIVATE_PROVIDER_URL_CANARY"));
+
+    let unrelated_other = json!({
+        "error": {
+            "message": "PRIVATE_PROVIDER_ERROR_CANARY",
+            "codexErrorInfo": "other"
+        }
+    });
+    assert_eq!(
+        failed_turn_kind(unrelated_other.as_object().unwrap()),
+        CodexFailedTurnKind::Classified("codex_other")
+    );
+
     for info in [
         json!(null),
         json!("futureError"),

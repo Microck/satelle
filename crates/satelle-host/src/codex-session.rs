@@ -1349,11 +1349,10 @@ impl<'a> SessionExchange<'a> {
 fn failed_turn_kind(turn: &Map<String, Value>) -> CodexFailedTurnKind {
     // Codex error messages and additional details can contain provider text.
     // Project only the protocol's closed error class into durable state.
-    let Some(info) = turn
-        .get("error")
-        .and_then(Value::as_object)
-        .and_then(|error| error.get("codexErrorInfo"))
-    else {
+    let Some(error) = turn.get("error").and_then(Value::as_object) else {
+        return CodexFailedTurnKind::Other;
+    };
+    let Some(info) = error.get("codexErrorInfo") else {
         return CodexFailedTurnKind::Other;
     };
     let kind = match info {
@@ -1376,7 +1375,14 @@ fn failed_turn_kind(turn: &Map<String, Value>) -> CodexFailedTurnKind {
         "badRequest" => "codex_bad_request",
         "threadRollbackFailed" => "codex_thread_rollback_failed",
         "sandboxError" => "codex_sandbox_error",
-        "other" => "codex_other",
+        // Codex 0.144 can report a response-stream disconnect through its
+        // generic `other` class. Match only its fixed prefix and continue to
+        // discard the message, which can include a private provider URL.
+        "other" => error
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| message.starts_with("stream disconnected before completion:"))
+            .map_or("codex_other", |_| "codex_response_stream_disconnected"),
         "httpConnectionFailed" => "codex_http_connection_failed",
         "responseStreamConnectionFailed" => "codex_response_stream_connection_failed",
         "responseStreamDisconnected" => "codex_response_stream_disconnected",
