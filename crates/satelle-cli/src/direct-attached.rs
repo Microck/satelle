@@ -1,6 +1,6 @@
 use super::{
     AttachedTurnOutcome, DirectTransport, InterruptSource, ProcessInterrupt,
-    direct_admission_error, direct_event_error, direct_transport_error,
+    direct_admission_error, direct_event_error, direct_transport_error, response_connection_lost,
     unconfirmed_interrupt_error,
 };
 use satelle_core::session::{PublicSession, TurnAdmissionFailure, TurnState, TurnStateRevision};
@@ -108,6 +108,46 @@ impl DirectTransport {
             + Send
             + 'static,
     {
+        let client = Arc::clone(&self.client);
+        tokio::task::spawn_blocking(move || operation(client))
+            .await
+            .map_err(|_| {
+                TurnAdmissionFailure::admission_unknown(SatelleError::host_unreachable(&self.alias))
+            })?
+            .map_err(|error| map_error(&self.alias, error))
+    }
+
+    pub(super) async fn blocking_replayable_admission_http<T, F>(
+        &self,
+        operation: F,
+        map_error: fn(&str, DaemonClientError) -> TurnAdmissionFailure,
+    ) -> Result<T, TurnAdmissionFailure>
+    where
+        T: Send + 'static,
+        F: Fn(Arc<satelle_transport::DaemonClient>) -> Result<T, DaemonClientError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let operation = Arc::new(operation);
+        let client = Arc::clone(&self.client);
+        let first_operation = Arc::clone(&operation);
+        let first = tokio::task::spawn_blocking(move || first_operation(client))
+            .await
+            .map_err(|_| {
+                TurnAdmissionFailure::admission_unknown(SatelleError::host_unreachable(&self.alias))
+            })?;
+        let error = match first {
+            Ok(value) => return Ok(value),
+            Err(error) if admission_error_allows_exact_replay(&error) => error,
+            Err(error) => return Err(map_error(&self.alias, error)),
+        };
+
+        tracing::debug!(
+            host = self.alias,
+            error = ?error,
+            "replaying exact admission after losing its response"
+        );
         let client = Arc::clone(&self.client);
         tokio::task::spawn_blocking(move || operation(client))
             .await
@@ -608,7 +648,7 @@ impl DirectTransport {
         let cancellation_key = idempotency_key.clone();
         let (admitted, buffered_events, mut initial_connection_error) = stream
             .buffer_events_until(async {
-                let admission = self.blocking_admission_http(
+                let admission = self.blocking_replayable_admission_http(
                     move |client| {
                         client
                             .create_session(&request, &idempotency_key)
@@ -800,7 +840,7 @@ impl DirectTransport {
         let cancellation_session_id = session_id.clone();
         let (admitted, buffered_events, mut initial_connection_error) = stream
             .buffer_events_until(async {
-                let admission = self.blocking_admission_http(
+                let admission = self.blocking_replayable_admission_http(
                     move |client| {
                         client
                             .create_turn(&admitted_session_id, &request, &idempotency_key)
@@ -1049,6 +1089,14 @@ fn interrupted_approval_events(
                 && event.turn_id() == Some(turn_id)
         })
         .collect()
+}
+
+fn admission_error_allows_exact_replay(error: &DaemonClientError) -> bool {
+    match error {
+        DaemonClientError::Transport(error) => !error.is_connect(),
+        DaemonClientError::InvalidResponse(error) => response_connection_lost(error),
+        _ => false,
+    }
 }
 
 fn pre_admission_interruption_error(outcome: Option<AdmissionCancellationOutcome>) -> SatelleError {
