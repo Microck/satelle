@@ -1,0 +1,453 @@
+use super::codec::{idempotent_operation_token, unix_timestamp_nanos};
+use super::open::sqlite_error;
+use super::sql::{logs_need_pruning, prune_expired_logs};
+use super::{IdempotentOperation, Storage, StorageError, StorageErrorKind};
+use crate::core::SessionId;
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+pub(crate) const DEFAULT_SESSION_RETENTION: time::Duration =
+    time::Duration::hours(crate::core::DEFAULT_SESSION_METADATA_RETENTION_HOURS as i64);
+pub(crate) const DEFAULT_LOG_RETENTION: time::Duration =
+    time::Duration::hours(crate::core::DEFAULT_SQLITE_LOG_RETENTION_HOURS as i64);
+pub(crate) const DEFAULT_SETUP_LEDGER_RETENTION: time::Duration = time::Duration::milliseconds(
+    crate::core::daemon_service::DEFAULT_SETUP_LEDGER_RETENTION_MS as i64,
+);
+
+impl Storage {
+    /// Removes only expired Satelle-owned Session and setup-ledger metadata.
+    ///
+    /// Canonical log-prefix pruning runs first because it alone owns cursor
+    /// expiry. A Session remains until no retained lifecycle log references it;
+    /// expired replay records, the Session cascade, bounded sessionless
+    /// operation replays, and known terminal setup runs are then deleted in the
+    /// same immediate transaction. Setup cleanup cannot invoke an executor or
+    /// change external host state.
+    #[cfg(test)]
+    pub(crate) fn prune_expired_session_metadata(
+        &mut self,
+        observed_at: OffsetDateTime,
+    ) -> Result<(), StorageError> {
+        self.prune_expired_session_metadata_with_retention(
+            observed_at,
+            DEFAULT_SESSION_RETENTION,
+            DEFAULT_SETUP_LEDGER_RETENTION,
+        )
+    }
+
+    pub(crate) fn prune_expired_session_metadata_with_retention(
+        &mut self,
+        observed_at: OffsetDateTime,
+        session_retention: time::Duration,
+        setup_ledger_retention: time::Duration,
+    ) -> Result<(), StorageError> {
+        let session_cutoff = observed_at
+            .checked_sub(session_retention)
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
+        let retained_log_cutoff_nanos = unix_timestamp_nanos(
+            observed_at
+                .checked_sub(self.log_retention)
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?,
+        )?;
+        let setup_cutoff = observed_at
+            .checked_sub(setup_ledger_retention)
+            .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidInput))?;
+        // Status and log polling call this path frequently. Keep the common
+        // no-work case read-only instead of taking SQLite write ownership.
+        if !retention_needs_pruning(
+            &self.connection,
+            session_cutoff,
+            retained_log_cutoff_nanos,
+            setup_cutoff,
+            observed_at,
+            self.log_retention,
+        )? {
+            return Ok(());
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        prune_expired_logs(&transaction, observed_at, self.log_retention)?;
+        transaction
+            .execute(
+                "DELETE FROM client_certificate_audit WHERE recorded_at_unix_nanos < ?1",
+                [retained_log_cutoff_nanos],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        transaction
+            .execute(
+                "DELETE FROM raw_diagnostic_audit WHERE created_at_unix_nanos < ?1",
+                [retained_log_cutoff_nanos],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        transaction
+            .execute(
+                "DELETE FROM desktop_snapshot_audit WHERE created_at_unix_nanos < ?1",
+                [retained_log_cutoff_nanos],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        prune_expired_admission_cancellations(&transaction, observed_at)?;
+        prune_expired_sessionless_idempotency(&transaction, observed_at)?;
+        let candidates =
+            terminal_session_candidates(&transaction, session_cutoff, retained_log_cutoff_nanos)?;
+
+        for session_id in candidates {
+            if !idempotency_records_allow_deletion(&transaction, &session_id, observed_at)? {
+                continue;
+            }
+            delete_session_metadata(&transaction, &session_id)?;
+        }
+        for run_id in terminal_setup_run_candidates(&transaction, setup_cutoff)? {
+            delete_setup_run_metadata(&transaction, &run_id)?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))
+    }
+}
+
+fn retention_needs_pruning(
+    connection: &Connection,
+    session_cutoff: OffsetDateTime,
+    retained_log_cutoff_nanos: i64,
+    setup_cutoff: OffsetDateTime,
+    observed_at: OffsetDateTime,
+    log_retention: time::Duration,
+) -> Result<bool, StorageError> {
+    if logs_need_pruning(connection, observed_at, log_retention)? {
+        return Ok(true);
+    }
+    let expired_audit: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM client_certificate_audit WHERE recorded_at_unix_nanos < ?1)
+                 OR EXISTS(SELECT 1 FROM raw_diagnostic_audit WHERE created_at_unix_nanos < ?1)
+                 OR EXISTS(SELECT 1 FROM desktop_snapshot_audit WHERE created_at_unix_nanos < ?1)",
+            [retained_log_cutoff_nanos],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    if expired_audit {
+        return Ok(true);
+    }
+    if admission_cancellations_need_pruning(connection, observed_at)? {
+        return Ok(true);
+    }
+    if !expired_sessionless_idempotency(connection, observed_at)?.is_empty() {
+        return Ok(true);
+    }
+    for session_id in
+        terminal_session_candidates(connection, session_cutoff, retained_log_cutoff_nanos)?
+    {
+        if idempotency_records_allow_deletion(connection, &session_id, observed_at)? {
+            return Ok(true);
+        }
+    }
+    Ok(!terminal_setup_run_candidates(connection, setup_cutoff)?.is_empty())
+}
+
+fn admission_cancellations_need_pruning(
+    connection: &Connection,
+    observed_at: OffsetDateTime,
+) -> Result<bool, StorageError> {
+    let mut statement = connection
+        .prepare("SELECT expires_at FROM admission_cancellations WHERE outcome = 'cancelled'")
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    for row in rows {
+        let expires_at =
+            row.map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if parse_stored_time(&expires_at)? <= observed_at {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn prune_expired_admission_cancellations(
+    transaction: &Transaction<'_>,
+    observed_at: OffsetDateTime,
+) -> Result<(), StorageError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT principal_ref, operation, idempotency_key, expires_at
+             FROM admission_cancellations
+             WHERE outcome = 'cancelled'",
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let mut expired = Vec::new();
+    for row in rows {
+        let (principal_ref, operation, key, expires_at) =
+            row.map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if parse_stored_time(&expires_at)? <= observed_at {
+            expired.push((principal_ref, operation, key));
+        }
+    }
+    drop(statement);
+    for (principal_ref, operation, key) in expired {
+        transaction
+            .execute(
+                "DELETE FROM admission_cancellations
+                 WHERE principal_ref = ?1 AND operation = ?2 AND idempotency_key = ?3",
+                params![principal_ref, operation, key],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    }
+    Ok(())
+}
+
+fn prune_expired_sessionless_idempotency(
+    transaction: &Transaction<'_>,
+    observed_at: OffsetDateTime,
+) -> Result<(), StorageError> {
+    for (principal_ref, operation, key) in
+        expired_sessionless_idempotency(transaction, observed_at)?
+    {
+        transaction
+            .execute(
+                "DELETE FROM idempotency_records
+                 WHERE principal_ref = ?1
+                   AND operation = ?2
+                   AND idempotency_key = ?3
+                   AND session_id IS NULL",
+                params![principal_ref, operation, key],
+            )
+            .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    }
+    Ok(())
+}
+
+fn expired_sessionless_idempotency(
+    connection: &Connection,
+    observed_at: OffsetDateTime,
+) -> Result<Vec<(String, String, String)>, StorageError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT principal_ref, operation, idempotency_key, expires_at
+             FROM idempotency_records
+             WHERE session_id IS NULL
+               AND (
+                   (operation = ?1 AND status IN ('in_progress', 'terminal'))
+                   OR (operation IN (?2, ?3, ?4, ?5, ?6, ?7) AND status = 'terminal')
+               )",
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let rows = statement
+        .query_map(
+            params![
+                idempotent_operation_token(IdempotentOperation::ProviderDescriptorValidation),
+                idempotent_operation_token(IdempotentOperation::ProviderSecretProvisioning),
+                idempotent_operation_token(IdempotentOperation::ProviderBindingAuthorization),
+                idempotent_operation_token(IdempotentOperation::ProviderBindingDeletion),
+                idempotent_operation_token(IdempotentOperation::SetupVerification),
+                idempotent_operation_token(IdempotentOperation::NativeReadinessInvalidation),
+                idempotent_operation_token(IdempotentOperation::StorageMigration),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let mut expired = Vec::new();
+    for row in rows {
+        let (principal_ref, operation, key, expires_at) =
+            row.map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if parse_stored_time(&expires_at)? <= observed_at {
+            expired.push((principal_ref, operation, key));
+        }
+    }
+    Ok(expired)
+}
+
+fn terminal_session_candidates(
+    connection: &Connection,
+    cutoff: OffsetDateTime,
+    retained_log_cutoff_nanos: i64,
+) -> Result<Vec<SessionId>, StorageError> {
+    // The turns table CHECK constraint makes terminal_at NULL exactly for
+    // nonterminal states, so retention does not duplicate the state tokens.
+    let mut statement = connection
+        .prepare(
+            "SELECT s.session_id, latest.terminal_at
+             FROM sessions s
+             JOIN turns latest ON latest.session_id = s.session_id
+             WHERE latest.ordinal = (
+                 SELECT max(candidate.ordinal) FROM turns candidate
+                 WHERE candidate.session_id = s.session_id
+             )
+               AND latest.terminal_at IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM turns nonterminal
+                   WHERE nonterminal.session_id = s.session_id
+                     AND nonterminal.terminal_at IS NULL
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM control_leases lease
+                   WHERE lease.session_id = s.session_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM logs retained_log
+                   WHERE retained_log.session_id = s.session_id
+                     AND retained_log.recorded_at_unix_nanos >= ?1
+               )
+             ORDER BY s.session_id",
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let rows = statement
+        .query_map([retained_log_cutoff_nanos], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (session_id, terminal_at) =
+            row.map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if parse_stored_time(&terminal_at)? < cutoff {
+            candidates.push(
+                SessionId::parse(&session_id)
+                    .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
+            );
+        }
+    }
+    Ok(candidates)
+}
+
+fn idempotency_records_allow_deletion(
+    connection: &Connection,
+    session_id: &SessionId,
+    observed_at: OffsetDateTime,
+) -> Result<bool, StorageError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT expires_at FROM idempotency_records
+             WHERE session_id = ?1",
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let rows = statement
+        .query_map([session_id.as_str()], |row| row.get::<_, String>(0))
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    for row in rows {
+        let expires_at =
+            row.map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        if parse_stored_time(&expires_at)? > observed_at {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn delete_session_metadata(
+    transaction: &Transaction<'_>,
+    session_id: &SessionId,
+) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "DELETE FROM idempotency_records WHERE session_id = ?1",
+            [session_id.as_str()],
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let deleted = transaction
+        .execute(
+            "DELETE FROM sessions
+             WHERE session_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM control_leases lease
+                   WHERE lease.session_id = sessions.session_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM turns nonterminal
+                   WHERE nonterminal.session_id = sessions.session_id
+                     AND nonterminal.terminal_at IS NULL
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM logs retained_log
+                   WHERE retained_log.session_id = sessions.session_id
+               )",
+            params![session_id.as_str()],
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    if deleted != 1 {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    Ok(())
+}
+
+fn terminal_setup_run_candidates(
+    connection: &Connection,
+    cutoff: OffsetDateTime,
+) -> Result<Vec<String>, StorageError> {
+    // Running and outcome-unknown rows remain authoritative recovery input.
+    // Parse timestamps instead of ordering RFC 3339 text because fractional
+    // second spellings are not lexicographically chronological.
+    let mut statement = connection
+        .prepare(
+            "SELECT run_id, finished_at
+             FROM setup_runs
+             WHERE status IN ('completed', 'failed', 'partial_failure')",
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (run_id, finished_at) =
+            row.map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+        let finished_at = parse_stored_time(&finished_at)?;
+        if finished_at < cutoff {
+            candidates.push((finished_at, run_id));
+        }
+    }
+    candidates.sort_by(|(left_time, left_id), (right_time, right_id)| {
+        left_time
+            .cmp(right_time)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    Ok(candidates.into_iter().map(|(_, run_id)| run_id).collect())
+}
+
+fn delete_setup_run_metadata(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+) -> Result<(), StorageError> {
+    // setup_actions cascade from setup_runs. No setup executor participates in
+    // retention, so deleting this metadata cannot undo a completed action.
+    let deleted = transaction
+        .execute(
+            "DELETE FROM setup_runs
+             WHERE run_id = ?1
+               AND status IN ('completed', 'failed', 'partial_failure')",
+            [run_id],
+        )
+        .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
+    if deleted != 1 {
+        return Err(StorageError::new(StorageErrorKind::StateConflict));
+    }
+    Ok(())
+}
+
+fn parse_stored_time(value: &str) -> Result<OffsetDateTime, StorageError> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))
+}

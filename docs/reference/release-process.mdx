@@ -21,19 +21,40 @@ npm ci --prefix npm/release-tooling --ignore-scripts
 npm run dry-run --prefix npm/release-tooling
 ```
 
-The report records the Node.js and Tegami versions, Cargo package discovery,
-the temporary fixture's generated files, version and dependency updates, and
-the registry targets skipped by the dry run. The Cargo plugin is configured to
-avoid a duplicate dependent bump because all Satelle crates inherit one shared
-workspace version. Cargo package discovery and version updates stay enabled,
-while crates.io publication is disabled for MVP.
-Satelle does not publish a crates.io crate.
+The report records the Node.js and Tegami versions, discovery of the single
+`satelle` Cargo package, the temporary fixture's generated files, version and
+dependency updates, and the registry targets skipped by the dry run. Tegami
+owns changelog and version planning. It does not publish the Cargo package.
 
 On the normal path, the release workflow runs Tegami's publication plan after
-the dry run passes. Tegami keeps crates.io disabled, then `release.yml` acts as
-the explicit hook that builds, signs, and publishes the binary and npm graph.
-This keeps the recoverable npm transaction outside Tegami without bypassing
-Tegami's changelog and version plan.
+the dry run passes. `release.yml` is the explicit publication hook for native
+binaries, the Cargo package, and the npm graph. This keeps registry writes out
+of Tegami without bypassing its changelog and version plan.
+
+## Cargo package contract
+
+The workspace contains one publishable Cargo package named `satelle`.
+`cargo install satelle` installs its only supported public surface, the
+`satelle` executable. The package keeps the core, Host, and transport module
+boundaries in one source tree and has no path or Git dependency on an internal
+Satelle crate. Its Rust modules are implementation details and do not promise a
+stable library API.
+
+Cargo versions match the GitHub and npm release version. Semantic versioning
+applies to the executable's documented commands and machine-readable
+contracts. It does not make undocumented Rust module paths stable.
+
+The package contents are limited by its manifest to the Rust sources and
+conformance tests, bundled skills and platform contract, changelog, readme, and
+required third-party license notices. `cargo package --locked` builds that exact
+archive during pull request validation. The signed-tag workflow publishes the validated version
+and compares an existing crates.io version byte-for-byte on a retry. A local
+developer command must not publish it.
+
+Crates.io ownership is limited to the release-maintainer team. Add or remove an
+owner only through a reviewed repository administration change. The Actions
+secret `CARGO_REGISTRY_TOKEN` holds a crates.io token scoped to publishing this
+package. Do not copy it to a developer machine or reuse it for other crates.
 
 If Tegami validation fails, the release pull request can select the manual release
 fallback by adding `npm/release-tooling/manual-release.json`. The reviewed file
@@ -47,7 +68,7 @@ hook. Without that reviewed record, a Tegami failure stops publication.
 ## Release pull request
 
 The release pull request must contain one reviewed version everywhere the
-release contract requires it: Rust workspace metadata, all eight npm package
+release contract requires it: the Cargo package, all eight npm package
 manifests, exact launcher dependency ranges, lockfiles, and Tegami changelog
 output. At least one committed Cargo package `CHANGELOG.md` must contain a
 heading for that exact version. Run the repository release checks without
@@ -58,10 +79,11 @@ node npm/scripts/release.cjs check
 npm test
 ```
 
-The GitHub Actions pull request run builds all six Controller targets, packs
-all eight npm packages, validates native binary formats and archive roots,
-compares archive and npm executable digests, creates `SHA256SUMS`, runs npm
-publish dry runs, and exercises install, upgrade, smoke, and uninstall paths.
+The GitHub Actions pull request run builds all six Controller targets, packages
+the crates.io archive, packs all eight npm packages, validates native binary
+formats and archive roots, compares archive and npm executable digests, creates
+checksums, runs registry dry runs, and exercises install, upgrade, smoke, and
+uninstall paths.
 
 ## Signed release tag
 
@@ -217,6 +239,11 @@ checkout:
 - The `v*` GitHub tag ruleset is active.
 - Immutable releases are enabled for the repository.
 - Each npm package identity exists and trusts `release.yml` for OIDC publish.
+- The `satelle` crates.io name is available for the first signed-tag run, or the
+  existing package has byte-identical history and the approved release team as
+  its only owners.
+- `CARGO_REGISTRY_TOKEN` can publish only the `satelle` crate and is stored only
+  as a GitHub Actions secret.
 - `NPM_DIST_TAG_TOKEN` has the minimum working dist-tag scope.
 - The token identity is the sole read-write collaborator on all eight npm
   packages; human and team access is read-only during promotion and recovery.

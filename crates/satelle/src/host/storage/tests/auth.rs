@@ -1,0 +1,852 @@
+use super::*;
+use crate::host::ApiScopes;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+const TOKEN_ID: &str = "token-01890a5d-ac96-7b7c-8f89-37c3d0a66e31";
+const PRINCIPAL_ID: &str = "principal-01890a5d-ac96-7b7c-8f89-37c3d0a66e32";
+const PAYLOAD_CANARY: &[u8] = b"PRIVATE_CANONICAL_PROMPT_PAYLOAD_CANARY";
+const PROVIDER_SECRET_CANARY: &str = "PRIVATE_PROVIDER_SECRET_RESTART_CANARY";
+fn test_desktop_bindings() -> std::collections::BTreeSet<String> {
+    std::collections::BTreeSet::from(["desktop-test".to_string()])
+}
+
+#[test]
+fn client_certificate_audit_survives_restart_and_obeys_log_retention() {
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let token = crate::host::ApiBearerToken::generate().unwrap();
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new(
+                &token,
+                "audit-principal",
+                1,
+                ApiScopes::READ,
+                test_desktop_bindings(),
+                None,
+                at(0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let principal = storage
+        .authenticate_api_token(&token, at(0))
+        .unwrap()
+        .unwrap();
+    let request_id = uuid::Uuid::now_v7();
+    storage
+        .record_client_certificate_auth(&principal, request_id, &[1; 32], at(0))
+        .unwrap();
+    drop(storage);
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let observed: (String, Vec<u8>) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT request_id, certificate_sha256 FROM client_certificate_audit",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(observed, (request_id.hyphenated().to_string(), vec![1; 32]));
+    // A cutoff within the same second exercises integer timestamp ordering.
+    storage.set_log_retention(time::Duration::seconds(1));
+    storage
+        .prune_expired_session_metadata(at(0) + time::Duration::milliseconds(1001))
+        .unwrap();
+    let count: i64 = storage
+        .connection_for_test()
+        .query_row("SELECT count(*) FROM client_certificate_audit", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    storage
+        .record_client_certificate_auth(&principal, request_id, &[2; 32], at(1))
+        .unwrap();
+    storage
+        .record_client_certificate_auth(&principal, request_id, &[3; 32], at(3))
+        .unwrap();
+    let fingerprints = storage
+        .connection_for_test()
+        .prepare("SELECT certificate_sha256 FROM client_certificate_audit")
+        .unwrap()
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(fingerprints, vec![vec![3; 32]]);
+}
+
+#[test]
+fn token_lifecycle_replays_metadata_after_restart_and_preserves_authority() {
+    use crate::host::{ApiTokenMutation, ApiTokenMutationOutcome};
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let expiry = at(0) + time::Duration::days(1);
+    let issue = ApiTokenMutation::Issue {
+        desktop_bindings: test_desktop_bindings(),
+        scopes: ApiScopes::CONTROL | ApiScopes::DIAGNOSTICS_SENSITIVE,
+        expires_at: Some(expiry),
+    };
+    let issue_input = idempotency(IdempotentOperation::ApiTokenIssue, "issue-token", at(0));
+    let issued = storage
+        .mutate_api_token(&issue_input, &issue, at(0))
+        .unwrap();
+    let original_token = issued.bearer_token.unwrap();
+    let ApiTokenMutationOutcome::Completed(original) = issued.outcome else {
+        panic!("token must be issued")
+    };
+    assert_eq!(original.credential_revision, 1);
+    drop(storage);
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let replay = storage
+        .mutate_api_token(&issue_input, &issue, at(1))
+        .unwrap();
+    assert_eq!(
+        replay.outcome,
+        ApiTokenMutationOutcome::Completed(original.clone())
+    );
+    assert!(replay.bearer_token.is_none());
+    let rotate = ApiTokenMutation::Rotate {
+        token_id: original.token_id.clone(),
+        expected_credential_revision: 1,
+    };
+    let rotate_input = idempotency(IdempotentOperation::ApiTokenRotate, "rotate-token", at(2));
+    let rotated = storage
+        .mutate_api_token(&rotate_input, &rotate, at(2))
+        .unwrap();
+    let replacement = rotated.bearer_token.unwrap();
+    let ApiTokenMutationOutcome::Completed(current) = rotated.outcome else {
+        panic!("token must rotate")
+    };
+    assert_eq!(current.token_id, original.token_id);
+    assert_eq!(current.principal_ref, original.principal_ref);
+    assert_eq!(current.scopes, original.scopes);
+    assert_eq!(current.expires_at, original.expires_at);
+    assert_eq!(current.credential_revision, 2);
+    assert!(
+        storage
+            .authenticate_api_token(&original_token, at(3))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .authenticate_api_token(&replacement, at(3))
+            .unwrap()
+            .is_some()
+    );
+    let stale = storage
+        .mutate_api_token(
+            &idempotency(IdempotentOperation::ApiTokenRotate, "stale-rotate", at(3)),
+            &rotate,
+            at(3),
+        )
+        .unwrap();
+    assert_eq!(
+        stale.outcome,
+        ApiTokenMutationOutcome::Rejected(crate::host::ApiTokenRejection::StateConflict)
+    );
+    let revoke = ApiTokenMutation::Revoke {
+        token_id: original.token_id,
+        expected_credential_revision: 2,
+    };
+    let revoke_input = idempotency(IdempotentOperation::ApiTokenRevoke, "revoke-token", at(4));
+    let revoked = storage
+        .mutate_api_token(&revoke_input, &revoke, at(4))
+        .unwrap();
+    assert!(revoked.bearer_token.is_none());
+    assert!(
+        storage
+            .authenticate_api_token(&replacement, at(5))
+            .unwrap()
+            .is_none()
+    );
+    drop(storage);
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    assert_eq!(
+        storage
+            .mutate_api_token(&revoke_input, &revoke, at(5))
+            .unwrap()
+            .outcome,
+        revoked.outcome
+    );
+    let replay = storage
+        .mutate_api_token(&rotate_input, &rotate, at(5))
+        .unwrap();
+    assert_eq!(replay.outcome, ApiTokenMutationOutcome::Completed(current));
+    assert!(replay.bearer_token.is_none());
+    storage.checkpoint_for_test();
+    let database = fs::read(state.path().join("satelle.sqlite3")).unwrap();
+    for token in [&original_token, &replacement] {
+        assert!(!contains_bytes(&database, token.expose().as_bytes()));
+    }
+}
+
+#[test]
+fn token_verifier_changes_roll_back_when_replay_record_cannot_commit() {
+    use crate::host::ApiTokenMutation;
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let issued = storage
+        .mutate_api_token(
+            &idempotency(IdempotentOperation::ApiTokenIssue, "before-failure", at(0)),
+            &ApiTokenMutation::Issue {
+                desktop_bindings: test_desktop_bindings(),
+                scopes: ApiScopes::READ,
+                expires_at: None,
+            },
+            at(0),
+        )
+        .unwrap();
+    let token = issued.bearer_token.unwrap();
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "CREATE TRIGGER reject_token_replay BEFORE INSERT ON idempotency_records
+         BEGIN SELECT RAISE(ABORT, 'injected replay write failure'); END;",
+        )
+        .unwrap();
+    for (operation, mutation) in [
+        (
+            IdempotentOperation::ApiTokenIssue,
+            ApiTokenMutation::Issue {
+                desktop_bindings: test_desktop_bindings(),
+                scopes: ApiScopes::ADMIN,
+                expires_at: None,
+            },
+        ),
+        (
+            IdempotentOperation::ApiTokenRotate,
+            ApiTokenMutation::Rotate {
+                token_id: token.token_id().to_string(),
+                expected_credential_revision: 1,
+            },
+        ),
+        (
+            IdempotentOperation::ApiTokenRevoke,
+            ApiTokenMutation::Revoke {
+                token_id: token.token_id().to_string(),
+                expected_credential_revision: 1,
+            },
+        ),
+    ] {
+        assert!(
+            storage
+                .mutate_api_token(
+                    &idempotency(operation, "failed-operation", at(1)),
+                    &mutation,
+                    at(1)
+                )
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .authenticate_api_token(&token, at(2))
+                .unwrap()
+                .unwrap()
+                .credential_revision(),
+            1
+        );
+        let count: i64 = storage
+            .connection_for_test()
+            .query_row("SELECT count(*) FROM api_tokens", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+}
+
+#[test]
+fn expired_tokens_cannot_rotate_but_can_be_revoked() {
+    use crate::host::{ApiTokenMutation, ApiTokenMutationOutcome, ApiTokenRejection};
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let issued = storage
+        .mutate_api_token(
+            &idempotency(IdempotentOperation::ApiTokenIssue, "expiring-token", at(0)),
+            &ApiTokenMutation::Issue {
+                desktop_bindings: test_desktop_bindings(),
+                scopes: ApiScopes::READ,
+                expires_at: Some(at(1)),
+            },
+            at(0),
+        )
+        .unwrap();
+    let token = issued.bearer_token.unwrap();
+    let rotated = storage
+        .mutate_api_token(
+            &idempotency(
+                IdempotentOperation::ApiTokenRotate,
+                "expired-rotation",
+                at(2),
+            ),
+            &ApiTokenMutation::Rotate {
+                token_id: token.token_id().to_string(),
+                expected_credential_revision: 1,
+            },
+            at(2),
+        )
+        .unwrap();
+    assert_eq!(
+        rotated.outcome,
+        ApiTokenMutationOutcome::Rejected(ApiTokenRejection::StateConflict)
+    );
+    assert!(rotated.bearer_token.is_none());
+    let revoked = storage
+        .mutate_api_token(
+            &idempotency(
+                IdempotentOperation::ApiTokenRevoke,
+                "expired-revocation",
+                at(3),
+            ),
+            &ApiTokenMutation::Revoke {
+                token_id: token.token_id().to_string(),
+                expected_credential_revision: 1,
+            },
+            at(3),
+        )
+        .unwrap();
+    let ApiTokenMutationOutcome::Completed(metadata) = revoked.outcome else {
+        panic!("expired token remains revocable")
+    };
+    assert_eq!(metadata.revoked_at, Some(at(3)));
+    assert_eq!(metadata.credential_revision, 1);
+}
+
+#[test]
+fn daemon_identity_and_idempotency_hmac_survive_restart() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, recovery) = Storage::open(state.path()).expect("open new storage");
+    assert!(recovery.is_empty());
+
+    let first_identity = storage.host_identity().expect("load Host Identity");
+    let first_digest = storage
+        .digest_idempotency_payload(PAYLOAD_CANARY)
+        .expect("digest canonical payload");
+    let provider_secret =
+        crate::host::provider_auth::ResolvedProviderSecret::for_test(PROVIDER_SECRET_CANARY);
+    let first_fingerprinter =
+        crate::host::provider_auth::ProviderSmokeCredentialFingerprinter::default();
+    first_fingerprinter.initialize(
+        storage
+            .provider_smoke_hmac_key()
+            .expect("load provider smoke HMAC key"),
+    );
+    let first_provider_fingerprint = first_fingerprinter
+        .fingerprint(&"a".repeat(64), Some(&provider_secret))
+        .expect("fingerprint provider credential");
+    assert_eq!(first_digest.key_version(), 1);
+    assert_eq!(first_digest.hex().len(), 64);
+    drop(storage);
+
+    let (storage, recovery) = Storage::open(state.path()).expect("reopen storage");
+    assert!(recovery.is_empty());
+    assert_eq!(
+        first_identity,
+        storage.host_identity().expect("reload Host Identity")
+    );
+    assert_eq!(
+        first_digest,
+        storage
+            .digest_idempotency_payload(PAYLOAD_CANARY)
+            .expect("recompute canonical digest")
+    );
+    let reopened_fingerprinter =
+        crate::host::provider_auth::ProviderSmokeCredentialFingerprinter::default();
+    reopened_fingerprinter.initialize(
+        storage
+            .provider_smoke_hmac_key()
+            .expect("reload provider smoke HMAC key"),
+    );
+    assert_eq!(
+        first_provider_fingerprint,
+        reopened_fingerprinter
+            .fingerprint(&"a".repeat(64), Some(&provider_secret))
+            .expect("recompute provider credential fingerprint")
+    );
+
+    storage.checkpoint_for_test();
+    let database = fs::read(state.path().join("satelle.sqlite3")).expect("read test database");
+    assert!(!contains_bytes(&database, PAYLOAD_CANARY));
+    assert!(!contains_bytes(
+        &database,
+        PROVIDER_SECRET_CANARY.as_bytes()
+    ));
+}
+
+#[test]
+fn missing_sensitive_singletons_fail_closed_on_reopen() {
+    for table in [
+        "daemon_identity",
+        "idempotency_hmac_keys",
+        "provider_smoke_hmac_key",
+    ] {
+        let state = TempDir::new().expect("temporary state directory");
+        let (storage, _) = Storage::open(state.path()).expect("open storage");
+        storage
+            .connection
+            .execute(&format!("DELETE FROM {table}"), [])
+            .expect("remove singleton for corruption test");
+        drop(storage);
+
+        let error = match Storage::open(state.path()) {
+            Ok(_) => panic!("missing singleton must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), StorageErrorKind::InvalidStoredState);
+    }
+}
+
+#[test]
+fn retired_hmac_keys_remain_usable_for_replay_digests() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let first = storage
+        .digest_idempotency_payload(PAYLOAD_CANARY)
+        .expect("digest with initial key");
+
+    assert_eq!(
+        storage
+            .rotate_idempotency_hmac_key(OffsetDateTime::now_utc() + time::Duration::seconds(1),)
+            .expect("rotate HMAC key"),
+        2
+    );
+    let active = storage
+        .digest_idempotency_payload(PAYLOAD_CANARY)
+        .expect("digest with active key");
+    let replay = storage
+        .digest_idempotency_payload_with_key(PAYLOAD_CANARY, first.key_version())
+        .expect("digest with retained key");
+
+    assert_eq!(active.key_version(), 2);
+    assert_ne!(active, first);
+    assert_eq!(replay, first);
+}
+
+#[test]
+fn token_authentication_persists_only_the_canonical_verifier() {
+    let state = TempDir::new().expect("temporary state directory");
+    let registered_token = token(TOKEN_ID, 0x2a);
+    let exposed = registered_token.expose();
+    let expected_verifier = registered_token.verifier();
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new(
+                &registered_token,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::READ | ApiScopes::CONTROL,
+                test_desktop_bindings(),
+                None,
+                at(1),
+            )
+            .expect("valid token registration"),
+        )
+        .expect("register token verifier");
+
+    let stored: Vec<u8> = storage
+        .connection
+        .query_row(
+            "SELECT verifier FROM api_tokens WHERE token_id = ?1",
+            [TOKEN_ID],
+            |row| row.get(0),
+        )
+        .expect("read stored verifier");
+    assert_eq!(stored, expected_verifier.as_bytes());
+    let principal = storage
+        .authenticate_api_token(&registered_token, at(2))
+        .expect("authenticate token")
+        .expect("token should match");
+    assert_eq!(principal.token_id(), TOKEN_ID);
+    assert_eq!(principal.principal_ref(), PRINCIPAL_ID);
+    assert_eq!(principal.credential_revision(), 1);
+    assert!(principal.scopes().allows(ApiScopes::READ));
+    assert!(principal.scopes().allows(ApiScopes::CONTROL));
+    assert!(!principal.scopes().allows(ApiScopes::ADMIN));
+    assert_eq!(principal.expires_at(), None);
+
+    let wrong_secret = token(TOKEN_ID, 0x5a);
+    assert!(
+        storage
+            .authenticate_api_token(&wrong_secret, at(2))
+            .expect("reject wrong verifier")
+            .is_none()
+    );
+    drop(storage);
+
+    let (storage, _) = Storage::open(state.path()).expect("reopen storage");
+    assert!(
+        storage
+            .authenticate_api_token(&registered_token, at(3))
+            .expect("authenticate after restart")
+            .is_some()
+    );
+    storage.checkpoint_for_test();
+    let database = fs::read(state.path().join("satelle.sqlite3")).expect("read test database");
+    assert!(!contains_bytes(&database, exposed.as_bytes()));
+    assert!(!contains_bytes(&database, &[0x2a; 32]));
+}
+
+#[test]
+fn token_rotation_is_atomic_and_invalidates_the_previous_secret() {
+    let state = TempDir::new().expect("temporary state directory");
+    let original = token(TOKEN_ID, 0x2a);
+    let replacement = token(TOKEN_ID, 0x3b);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new(
+                &original,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::ADMIN,
+                test_desktop_bindings(),
+                Some(at(10)),
+                at(1),
+            )
+            .expect("valid token registration"),
+        )
+        .expect("register token");
+    let original_principal = storage
+        .authenticate_api_token(&original, at(1))
+        .expect("authenticate original token")
+        .expect("original token is active");
+
+    let rotated = storage
+        .rotate_api_token(&replacement, 1, at(2))
+        .expect("rotate token");
+    assert_eq!(rotated.credential_revision(), 2);
+    assert_eq!(rotated.expires_at(), Some(at(10)));
+    assert!(rotated.scopes().allows(ApiScopes::READ));
+    assert!(
+        !storage
+            .api_principal_is_active(&original_principal, at(3))
+            .expect("check rotated principal")
+    );
+    assert!(
+        storage
+            .api_principal_is_active(&rotated, at(3))
+            .expect("check replacement principal")
+    );
+    assert!(
+        storage
+            .authenticate_api_token(&original, at(3))
+            .expect("old token lookup")
+            .is_none()
+    );
+    assert_eq!(
+        storage
+            .authenticate_api_token(&replacement, at(3))
+            .expect("new token lookup")
+            .expect("new token authenticates")
+            .credential_revision(),
+        2
+    );
+    assert_eq!(
+        storage
+            .rotate_api_token(&original, 1, at(4))
+            .expect_err("stale rotation must fail")
+            .kind(),
+        StorageErrorKind::StateConflict
+    );
+}
+
+#[test]
+fn pending_token_activation_atomically_removes_its_expiry() {
+    let state = TempDir::new().expect("temporary state directory");
+    let pending = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new_setup_pending(
+                &pending,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::CONTROL,
+                test_desktop_bindings(),
+                at(10),
+                at(1),
+            )
+            .expect("valid pending registration"),
+        )
+        .expect("register pending token");
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(2))
+            .expect("check pending token")
+            .is_none()
+    );
+    let recovery_principal = storage
+        .authenticate_pending_setup_api_token(&pending, at(2))
+        .expect("authenticate pending token for exact recovery")
+        .expect("unexpired pending token has recovery authority");
+    assert!(recovery_principal.is_durable_setup_pending());
+    assert!(!recovery_principal.is_durable_setup_active());
+
+    let activated = storage
+        .activate_api_token(TOKEN_ID, at(2))
+        .expect("activate pending token");
+    assert_eq!(activated.expires_at(), None);
+    assert_eq!(activated.credential_revision(), 1);
+    assert!(
+        storage
+            .authenticate_pending_setup_api_token(&pending, at(3))
+            .expect("check consumed pending authority")
+            .is_none()
+    );
+    assert_eq!(
+        storage
+            .authenticate_api_token(&pending, at(20))
+            .expect("authenticate activated token")
+            .expect("activated token remains valid")
+            .expires_at(),
+        None
+    );
+    let retried_activation = storage
+        .activate_api_token(TOKEN_ID, at(3))
+        .expect("activation retry returns the committed principal");
+    assert_eq!(retried_activation.token_id(), TOKEN_ID);
+    assert_eq!(retried_activation.expires_at(), None);
+    storage
+        .abort_setup_api_token(TOKEN_ID, at(4))
+        .expect("activated setup token remains abortable during handoff recovery");
+    storage
+        .abort_setup_api_token(TOKEN_ID, at(5))
+        .expect("abort retry confirms the setup token remains inactive");
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(4))
+            .expect("check aborted setup token")
+            .is_none()
+    );
+}
+
+#[test]
+fn pending_token_activation_compares_fractional_expiry_as_time() {
+    let state = TempDir::new().expect("temporary state directory");
+    let pending = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let activation = at(2) + time::Duration::milliseconds(100);
+    let expiry = at(2) + time::Duration::milliseconds(120);
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new_setup_pending(
+                &pending,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::CONTROL,
+                test_desktop_bindings(),
+                expiry,
+                at(1),
+            )
+            .expect("valid pending registration"),
+        )
+        .expect("register pending token");
+
+    storage
+        .activate_api_token(TOKEN_ID, activation)
+        .expect("fractionally unexpired pending token activates");
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(3))
+            .expect("authenticate activated token")
+            .is_some()
+    );
+}
+
+#[test]
+fn setup_token_lifecycle_rejects_timestamps_before_creation() {
+    let state = TempDir::new().expect("temporary state directory");
+    let pending = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new_setup_pending(
+                &pending,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::CONTROL,
+                test_desktop_bindings(),
+                at(10),
+                at(5),
+            )
+            .expect("valid pending registration"),
+        )
+        .expect("register pending token");
+
+    assert_eq!(
+        storage
+            .activate_api_token(TOKEN_ID, at(4))
+            .expect_err("activation cannot predate token creation")
+            .kind(),
+        StorageErrorKind::StateConflict
+    );
+    assert_eq!(
+        storage
+            .abort_setup_api_token(TOKEN_ID, at(4))
+            .expect_err("revocation cannot predate token creation")
+            .kind(),
+        StorageErrorKind::StateConflict
+    );
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(6))
+            .expect("check pending token")
+            .is_none()
+    );
+    storage
+        .activate_api_token(TOKEN_ID, at(6))
+        .expect("a later valid activation still succeeds");
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(7))
+            .expect("authenticate activated token")
+            .is_some()
+    );
+}
+
+#[test]
+fn expired_pending_token_cannot_be_activated() {
+    let state = TempDir::new().expect("temporary state directory");
+    let pending = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new_setup_pending(
+                &pending,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::CONTROL,
+                test_desktop_bindings(),
+                at(3),
+                at(1),
+            )
+            .expect("valid pending registration"),
+        )
+        .expect("register pending token");
+
+    assert_eq!(
+        storage
+            .activate_api_token(TOKEN_ID, at(3))
+            .expect_err("expired pending token must stay expired")
+            .kind(),
+        StorageErrorKind::StateConflict
+    );
+    assert!(
+        storage
+            .authenticate_api_token(&pending, at(3))
+            .expect("expired pending token remains unusable")
+            .is_none()
+    );
+    assert!(
+        storage
+            .authenticate_pending_setup_api_token(&pending, at(3))
+            .expect("expired pending recovery lookup")
+            .is_none()
+    );
+}
+
+#[test]
+fn ordinary_expiring_token_cannot_enter_the_setup_activation_path() {
+    let state = TempDir::new().expect("temporary state directory");
+    let expiring = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new(
+                &expiring,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::CONTROL,
+                test_desktop_bindings(),
+                Some(at(10)),
+                at(1),
+            )
+            .expect("valid expiring registration"),
+        )
+        .expect("register ordinary expiring token");
+
+    assert_eq!(
+        storage
+            .activate_api_token(TOKEN_ID, at(2))
+            .expect_err("ordinary credentials are not setup-pending")
+            .kind(),
+        StorageErrorKind::StateConflict
+    );
+    assert_eq!(
+        storage
+            .authenticate_api_token(&expiring, at(2))
+            .expect("ordinary expiring token authenticates")
+            .expect("ordinary expiring token remains active")
+            .expires_at(),
+        Some(at(10))
+    );
+    assert_eq!(
+        storage
+            .abort_setup_api_token(TOKEN_ID, at(2))
+            .expect_err("ordinary credentials are not setup-issued")
+            .kind(),
+        StorageErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn expired_revoked_and_unknown_tokens_share_the_absent_result() {
+    let state = TempDir::new().expect("temporary state directory");
+    let registered = token(TOKEN_ID, 0x2a);
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new(
+                &registered,
+                PRINCIPAL_ID,
+                1,
+                ApiScopes::READ,
+                test_desktop_bindings(),
+                Some(at(3)),
+                at(1),
+            )
+            .expect("valid expiring registration"),
+        )
+        .expect("register token verifier");
+
+    assert!(
+        storage
+            .authenticate_api_token(&registered, at(2))
+            .expect("authenticate before expiry")
+            .is_some()
+    );
+    assert!(
+        storage
+            .authenticate_api_token(&registered, at(3))
+            .expect("reject at expiry")
+            .is_none()
+    );
+
+    storage
+        .revoke_api_token(TOKEN_ID, at(2))
+        .expect("revoke token");
+    assert!(
+        storage
+            .authenticate_api_token(&registered, at(2))
+            .expect("reject revoked token")
+            .is_none()
+    );
+    assert!(
+        storage
+            .authenticate_api_token(
+                &token("token-01890a5d-ac96-7b7c-8f89-37c3d0a66e99", 0x7b),
+                at(2),
+            )
+            .expect("reject unknown token")
+            .is_none()
+    );
+}
+
+fn token(token_id: &str, secret_byte: u8) -> ApiBearerToken {
+    let encoded = URL_SAFE_NO_PAD.encode([secret_byte; 32]);
+    ApiBearerToken::parse(&format!("satelle_v1.{token_id}.{encoded}"))
+        .expect("fixed test token is valid")
+}

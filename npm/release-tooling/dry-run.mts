@@ -58,8 +58,17 @@ const repositoryPaper = tegami({
   plugins: [cargo({ bumpDep: () => false }), cargoInventory(discoveredCargoPackages)],
 });
 await repositoryPaper.draft();
-if (discoveredCargoPackages.length === 0) {
-  throw new Error("Tegami Cargo plugin did not discover the Satelle workspace packages");
+const expectedCargoPackage = `cargo:satelle@${readFileSync(
+  path.join(repositoryRoot, "Cargo.toml"),
+  "utf8",
+).match(/^version = "([^"]+)"$/m)?.[1]}`;
+if (
+  discoveredCargoPackages.length !== 1 ||
+  discoveredCargoPackages[0] !== expectedCargoPackage
+) {
+  throw new Error(
+    `Tegami Cargo plugin must discover only ${expectedCargoPackage}; found ${discoveredCargoPackages.join(", ")}`,
+  );
 }
 
 const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-tegami-dry-run-"));

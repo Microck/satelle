@@ -288,7 +288,7 @@ test("release workflow validates six targets and publishes only a fully verified
   const hardenedCheckoutUses = workflow.match(
     /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g,
   ) ?? [];
-  assert.equal(checkoutUses.length, 11);
+  assert.equal(checkoutUses.length, 12);
   assert.equal(hardenedCheckoutUses.length, checkoutUses.length);
 });
 
@@ -355,7 +355,7 @@ test("packet 27 gates release publication on Tegami and typed signed-tag trust",
   assert.match(releaseProcess, /Immutable releases are enabled/);
   assert.match(releaseProcess, /security and legal language review/i);
   assert.match(releaseProcess, /manual release/i);
-  assert.match(releaseProcess, /does not publish a crates\.io crate/i);
+  assert.match(releaseProcess, /does not publish the Cargo package/i);
 });
 
 test("release tooling gate selects Tegami and fails closed without reviewed fallback", (context) => {
@@ -409,7 +409,7 @@ test("release tooling gate binds committed changelog output to the release versi
   assert.deepEqual(verifyChangelogs("1.2.3", [changelog]), [
     path.relative(repositoryRoot, changelog).split(path.sep).join("/"),
   ]);
-  writeFileSync(changelog, "# Changelog\n\n## satelle-cli@1.2.3\n\n- Initial release.\n");
+  writeFileSync(changelog, "# Changelog\n\n## satelle@1.2.3\n\n- Initial release.\n");
   assert.deepEqual(verifyChangelogs("1.2.3", [changelog]), [
     path.relative(repositoryRoot, changelog).split(path.sep).join("/"),
   ]);

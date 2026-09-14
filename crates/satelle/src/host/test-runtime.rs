@@ -1,0 +1,514 @@
+#[path = "test-runtime/diagnostics.rs"]
+mod diagnostics;
+
+use crate::core::doctor::DoctorScopeSelection;
+use crate::core::session::{
+    ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
+    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy, StopObservation,
+    TimeoutPolicy, TurnTransition,
+};
+use crate::core::{
+    DaemonPathOverrides, DesktopSessionRecord, DoctorOptions, DoctorReport,
+    DoctorTransportObservation, EventSource, EventSubject, EventType, SatelleError, SatelleEvent,
+    SatelleEventBody, SetupReport,
+};
+use crate::host::HostService;
+use crate::host::runtime::{
+    AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest,
+    ExecuteResult, NativeProbeResult, ProviderSmokeEvidence, ProviderSmokeResult,
+    ProviderSmokeSource, ReadinessCacheKey, ReadinessEvidence, ReadinessProbeDriver,
+    RecoveryObservation,
+};
+use crate::host::storage::ProbeRecoverySubject;
+use serde_json::{Value, json};
+use time::OffsetDateTime;
+
+pub const DETACHED_EXECUTION_TRACE_MARKER: &str =
+    "satelle_host.local_test_adapter.detached_execution";
+
+impl HostService {
+    pub(super) fn fake_doctor(
+        &self,
+        host: &str,
+        scope_selection: &DoctorScopeSelection,
+        transport_observation: &DoctorTransportObservation,
+        options: DoctorOptions,
+        adapter: &FakeComputerUseAdapter,
+    ) -> Result<DoctorReport, SatelleError> {
+        diagnostics::doctor(
+            host,
+            scope_selection,
+            transport_observation,
+            options,
+            adapter,
+        )
+    }
+
+    pub(super) fn setup_fake(
+        &self,
+        host: &str,
+        dry_run: bool,
+        setup_mode: String,
+        setup_components: Vec<String>,
+        daemon_path_overrides: DaemonPathOverrides,
+    ) -> Result<SetupReport, SatelleError> {
+        Ok(setup_plan(
+            host,
+            dry_run,
+            setup_mode,
+            setup_components,
+            daemon_path_overrides,
+        ))
+    }
+
+    pub(super) fn desktop_sessions_fake(&self) -> Vec<DesktopSessionRecord> {
+        desktop_sessions()
+    }
+}
+
+pub(super) fn setup_plan(
+    host: &str,
+    dry_run: bool,
+    setup_mode: String,
+    setup_components: Vec<String>,
+    daemon_path_overrides: DaemonPathOverrides,
+) -> SetupReport {
+    diagnostics::setup(
+        host,
+        dry_run,
+        setup_mode,
+        setup_components,
+        daemon_path_overrides,
+    )
+}
+
+pub(super) fn desktop_sessions() -> Vec<DesktopSessionRecord> {
+    vec![DesktopSessionRecord {
+        session_id: "local-demo-console".to_string(),
+        desktop_user: "local-demo-user".to_string(),
+        state: "active".to_string(),
+        session_kind: "visible_desktop".to_string(),
+        is_console: true,
+        is_remote: false,
+        display_summary: "active local demo visible desktop".to_string(),
+        portable_selectors: vec!["console".to_string(), "active".to_string()],
+        native_selectors: vec!["local-demo:console:active".to_string()],
+        selected_by_current_config: false,
+    }]
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct FakeComputerUseAdapter;
+
+impl FakeComputerUseAdapter {
+    pub(super) fn readiness_contract() -> Result<
+        (
+            DesktopBindingRef,
+            ExecutionPolicy,
+            crate::host::ReadinessCacheKey,
+        ),
+        SatelleError,
+    > {
+        Self::readiness_contract_with_provider_feature(FeatureChoice::Enabled)
+    }
+
+    fn readiness_contract_with_provider_feature(
+        provider_computer_use: FeatureChoice,
+    ) -> Result<
+        (
+            DesktopBindingRef,
+            ExecutionPolicy,
+            crate::host::ReadinessCacheKey,
+        ),
+        SatelleError,
+    > {
+        let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1")
+            .map_err(|_| adapter_configuration_error("desktop binding"))?;
+        Self::readiness_contract_for_binding(desktop_binding, provider_computer_use)
+    }
+
+    fn readiness_contract_for_binding(
+        desktop_binding: DesktopBindingRef,
+        provider_computer_use: FeatureChoice,
+    ) -> Result<
+        (
+            DesktopBindingRef,
+            ExecutionPolicy,
+            crate::host::ReadinessCacheKey,
+        ),
+        SatelleError,
+    > {
+        let execution_policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("fake-model-v1")
+                .map_err(|_| adapter_configuration_error("model binding"))?,
+            ProviderBindingRef::new("fake-provider-v1")
+                .map_err(|_| adapter_configuration_error("provider binding"))?,
+            DesktopTarget::new(desktop_binding.clone(), "local-demo-session-v1"),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(30 * 60)
+                .map_err(|_| adapter_configuration_error("timeout policy"))?,
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, provider_computer_use),
+        );
+        let key = crate::host::ReadinessCacheKey::new(
+            "fake",
+            desktop_binding.clone(),
+            execution_policy.clone(),
+            "fake-codex-v1",
+            "fake-native-runtime-v1",
+            Some("fake-plugin-v1"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            crate::host::ReadinessObservationState::Unknown,
+            crate::host::ReadinessObservationState::Unknown,
+        )
+        .map_err(|_| adapter_configuration_error("readiness cache key"))?;
+        Ok((desktop_binding, execution_policy, key))
+    }
+}
+
+impl ReadinessProbeDriver for FakeComputerUseAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &crate::host::runtime::AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> NativeProbeResult {
+        let observed_at = OffsetDateTime::now_utc();
+        match key.evidence(
+            format!("native-probe-{}", crate::core::SessionId::new()),
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        ) {
+            Ok(evidence) => NativeProbeResult::Passed(evidence),
+            Err(_) => NativeProbeResult::UncachedFailure(adapter_configuration_error(
+                "readiness evidence",
+            )),
+        }
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        _cached: Option<ReadinessEvidence>,
+        _cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &crate::host::ProviderComputerUseIntent,
+        _provider_secret: Option<crate::host::provider_auth::ResolvedProviderSecret>,
+        _cancellation: &crate::host::runtime::AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        match self.preflight(host, provider_intent) {
+            Ok(readiness) => AdapterPreflight::Ready(readiness),
+            Err(error) => AdapterPreflight::UncachedFailure(error),
+        }
+    }
+
+    fn observe_readiness_probe(&self, _subject: &ProbeRecoverySubject) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+pub(super) struct PendingComputerUseAdapter;
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+pub(super) struct FailingComputerUseAdapter;
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug)]
+pub(super) struct ReadinessFailingComputerUseAdapter;
+
+#[cfg(feature = "test-support")]
+impl ComputerUseAdapter for ReadinessFailingComputerUseAdapter {
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<crate::core::ResolvedProviderBinding, SatelleError> {
+        FakeComputerUseAdapter.resolve_provider_binding(host, provider_intent)
+    }
+
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        Err(SatelleError::computer_use_not_ready())
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl ComputerUseAdapter for FailingComputerUseAdapter {
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<crate::core::ResolvedProviderBinding, SatelleError> {
+        FakeComputerUseAdapter.resolve_provider_binding(host, provider_intent)
+    }
+
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        Err(adapter_configuration_error("forced admitted failure"))
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl ComputerUseAdapter for PendingComputerUseAdapter {
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<crate::core::ResolvedProviderBinding, SatelleError> {
+        FakeComputerUseAdapter.resolve_provider_binding(host, provider_intent)
+    }
+
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        // Only short-lived CLI subprocess tests may use this adapter: no
+        // in-process owner should retain its permanently parked worker.
+        loop {
+            std::thread::park();
+        }
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+impl ComputerUseAdapter for FakeComputerUseAdapter {
+    fn resolve_provider_binding(
+        &self,
+        _host: &str,
+        provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<crate::core::ResolvedProviderBinding, SatelleError> {
+        let binding = provider_intent
+            .resolved_provider_binding()
+            .cloned()
+            .unwrap_or_else(|| {
+                crate::core::ResolvedProviderBinding::from_authorization(
+                    crate::core::ProviderBindingAuthorization::new(
+                        "fake-model-v1",
+                        "fake-provider-v1",
+                        "fake-model-v1",
+                        "fake-provider-v1",
+                    ),
+                    crate::core::ProviderBindingSource::HostOwned,
+                )
+            });
+        Ok(binding)
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<Option<crate::host::ReadinessCacheKey>, SatelleError> {
+        if !provider_intent.refresh() && provider_intent.resolved_provider_binding().is_none() {
+            return Ok(None);
+        }
+        let key = match provider_intent.desktop_binding() {
+            Some(binding) => {
+                Self::readiness_contract_for_binding(binding.clone(), FeatureChoice::Enabled)?
+            }
+            None => Self::readiness_contract()?,
+        }
+        .2;
+        Ok(Some(match provider_intent.resolved_provider_binding() {
+            Some(binding) => key.with_provider_binding(binding),
+            None => key,
+        }))
+    }
+
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        let (desktop_binding, execution_policy, readiness_key) =
+            match provider_intent.desktop_binding() {
+                Some(binding) => {
+                    Self::readiness_contract_for_binding(binding.clone(), FeatureChoice::Enabled)?
+                }
+                None => Self::readiness_contract()?,
+            };
+        let resolved_binding = self.resolve_provider_binding(host, provider_intent)?;
+        let readiness_key = readiness_key.with_provider_binding(&resolved_binding);
+        let observed_at = time::OffsetDateTime::now_utc();
+        let evidence = readiness_key
+            .evidence(
+                format!("readiness-{}", crate::core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .map_err(|_| adapter_configuration_error("readiness evidence"))?;
+        let provider_evidence = Some(
+            ProviderSmokeEvidence::new(
+                format!("provider-smoke-{}", crate::core::SessionId::new()),
+                readiness_key.provider_config_fingerprint(),
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                observed_at,
+                observed_at + time::Duration::hours(24),
+            )
+            .map_err(|_| adapter_configuration_error("provider smoke evidence"))?
+            .with_source(if provider_intent.refresh() {
+                ProviderSmokeSource::Refresh
+            } else {
+                ProviderSmokeSource::Live
+            }),
+        );
+        AdapterReadiness::ready(
+            "fake",
+            "fake native computer-use adapter is ready for local demo",
+            desktop_binding,
+            execution_policy,
+            evidence,
+            provider_evidence,
+            Some(resolved_binding),
+        )
+        .map_err(|_| adapter_configuration_error("preflight evidence policy"))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        let subject = request.subject();
+        if !subject.host_identity().as_str().starts_with("host-")
+            || !subject.has_request_token()
+            || subject.has_upstream_references()
+        {
+            return Err(adapter_configuration_error("admitted work identity"));
+        }
+        tracing::info!(
+            marker = DETACHED_EXECUTION_TRACE_MARKER,
+            "local test adapter detached execution marker"
+        );
+        let _private_prompt = request.prompt();
+        for event in events(&request) {
+            request.publish_live_event(event.into_body());
+        }
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
+    }
+
+    fn observe_stop(&self, _subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        Ok(StopObservation::UpstreamInactiveConfirmed)
+    }
+
+    fn observe_recovery(
+        &self,
+        _subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        // A fresh CLI process cannot prove that the prior deterministic owner
+        // is alive. Keep durable ownership until an explicit stop resolves it.
+        Ok(RecoveryObservation::Unknown)
+    }
+}
+
+// Adapter live events are sideband observations. Lifecycle types such as
+// TurnStarted, TurnProgress, and TurnCompleted belong to the Host's committed
+// state transitions, and attached followers drop adapter copies of them at an
+// already-delivered revision.
+fn events(request: &ExecuteRequest<'_>) -> Vec<SatelleEvent> {
+    vec![
+        event(
+            request,
+            EventType::Preflight,
+            1,
+            "resolved local demo host",
+            json!({"transport": "local", "adapter": "fake"}),
+        ),
+        event(
+            request,
+            EventType::Readiness,
+            2,
+            "fake computer-use adapter is ready",
+            json!({"ready": true}),
+        ),
+    ]
+}
+
+fn event(
+    request: &ExecuteRequest<'_>,
+    event_type: EventType,
+    seq: u64,
+    message: &str,
+    data: Value,
+) -> SatelleEvent {
+    let subject = request.subject();
+    SatelleEventBody::new(
+        event_type,
+        EventSource::HostDaemon,
+        OffsetDateTime::now_utc(),
+        subject.host_identity().as_str(),
+        Some(EventSubject::Turn {
+            session_id: subject.session_id().clone(),
+            turn_id: subject.turn_id().clone(),
+            session_state_revision: request.committed_session_revision(),
+            turn_state_revision: request.committed_turn_revision(),
+        }),
+        message,
+        data,
+    )
+    .and_then(|body| body.with_seq(seq))
+    .expect("the deterministic adapter emits a valid Satelle Event")
+}
+
+fn adapter_configuration_error(subject: &str) -> SatelleError {
+    SatelleError {
+        code: crate::core::ErrorCode::StorageIntegrityFailed,
+        message: format!("the deterministic adapter has an invalid {subject}"),
+        recovery_command: None,
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
+    }
+}

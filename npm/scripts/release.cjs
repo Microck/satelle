@@ -1860,7 +1860,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
 
   function hostReleaseCompatibility(version) {
     const source = readFileSync(
-      path.join(repositoryRoot, "crates/satelle-core/src/host-update.rs"),
+      path.join(repositoryRoot, "crates/satelle/src/core/host-update.rs"),
       "utf8",
     );
     const protocol = source.match(/^pub const HOST_PROTOCOL_VERSION: &str = "([0-9]+)";$/m)?.[1];

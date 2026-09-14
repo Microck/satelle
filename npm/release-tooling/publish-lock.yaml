@@ -1,5 +1,5 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle-cli:\n    type: patch\n---\n\n## Windows native startup and doctor diagnostics\n\nFix Windows native Computer Use startup failing to read `kernel.js` by granting\nthe Codex sandbox read and execute access to each session's private bridge\nfiles. Keep those files until process shutdown is confirmed.\n\nReport doctor timeouts from the current probe execution instead of showing\nstale timeout diagnostics.\n"
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Windows native startup and doctor diagnostics\n\nFix Windows native Computer Use startup failing to read `kernel.js` by granting\nthe Codex sandbox read and execute access to each session's private bridge\nfiles. Keep those files until process shutdown is confirmed.\n\nReport doctor timeouts from the current probe execution instead of showing\nstale timeout diagnostics.\n"
     filename: 2026-09-08-windows-native-startup.md
     v: 0.0.0
 core:packages:
@@ -9,15 +9,7 @@ core:packages:
     updated: false
   - changelogIds:
       - 2026-09-08-windows-native-startup.md
-    id: cargo:satelle-cli
-    updated: true
-  - id: cargo:satelle-core
-    updated: true
-  - id: cargo:satelle-host
-    updated: true
-  - id: cargo:satelle-test-contract
-    updated: true
-  - id: cargo:satelle-transport
+    id: cargo:satelle
     updated: true
 npm:packages:
   - id: npm:satelle-repository

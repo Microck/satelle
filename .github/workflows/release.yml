@@ -152,7 +152,7 @@ jobs:
           CARGO_PROFILE_RELEASE_DEBUG: 0
           RUSTFLAGS: -D warnings
         run: >-
-          cargo zigbuild --locked --release -p satelle-cli
+          cargo zigbuild --locked --release -p satelle
           --target "${{ matrix.rust-target }}.${{ matrix.glibc-version }}"
 
       - name: Build native release executable
@@ -161,7 +161,7 @@ jobs:
           CARGO_BUILD_JOBS: 1
           CARGO_PROFILE_RELEASE_DEBUG: 0
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
-        run: cargo build --locked --release -p satelle-cli --target ${{ matrix.rust-target }}
+        run: cargo build --locked --release -p satelle --target ${{ matrix.rust-target }}
 
       - name: Verify GNU ABI floor
         if: matrix.glibc-version != ''
@@ -234,6 +234,9 @@ jobs:
           node-version: 24
           cache: npm
 
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal
+
       - name: Install npm workspace
         run: npm ci --ignore-scripts
 
@@ -262,6 +265,17 @@ jobs:
 
       - name: Validate native archives and create SHA256SUMS
         run: node npm/scripts/release.cjs validate-native-release-archives dist validated
+
+      - name: Package the crates.io artifact
+        env:
+          RELEASE_VERSION: ${{ steps.plan.outputs.version }}
+        shell: bash
+        run: |
+          cargo package --locked -p satelle
+          crate_name="satelle-${RELEASE_VERSION}.crate"
+          mkdir -p validated/cargo
+          cp "target/package/$crate_name" "validated/cargo/$crate_name"
+          (cd validated/cargo && sha256sum "$crate_name" > "$crate_name.sha256")
 
       - name: Validate Tegami Cargo release behavior
         id: tegami
@@ -447,6 +461,11 @@ jobs:
               "$SOURCE_DIGEST" \
               "$ATTESTATION_BUNDLE"
           done
+
+      - name: Attest the Cargo package
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: validated/cargo/satelle-*.crate
 
   lifecycle:
     name: Install, upgrade, smoke, and uninstall ${{ matrix.target }}
@@ -651,10 +670,12 @@ jobs:
             validated/tegami-validation.json \
             validated/tegami-changelog-validation.json \
             validated/release-orchestration.json \
+            validated/cargo/* \
             validated/github/* \
             validated/npm/npm-artifacts.json
           expected_assets=$(
             {
+              find validated/cargo -maxdepth 1 -type f -printf '%f\n'
               find validated/github -maxdepth 1 -type f -printf '%f\n'
               printf '%s\n' \
                 npm-artifacts.json \
@@ -683,6 +704,98 @@ jobs:
             printf '%s\n' "release asset set does not match the validated artifact set" >&2
             exit 1
           fi
+
+  publish-cargo:
+    name: Publish the crates.io package
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [attest, collect, draft-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal
+
+      - name: Download validated release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: validated-release-candidate
+          path: validated
+
+      - name: Publish or verify the immutable Cargo version
+        env:
+          CARGO_HTTP_USER_AGENT: OpenAI File Downloader, XaiImageApiFetch/1.0
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.attest.outputs.source-digest }}
+          EXPECTED_TAG_DIGEST: ${{ needs.attest.outputs.tag-digest }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.collect.outputs.version }}
+        shell: bash
+        run: |
+          cargo_publish_error() {
+            printf '{"code":"%s","message":"%s"}\n' "$1" "$2" >&2
+            exit 1
+          }
+          current_tag_digest=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" \
+            --jq 'select(.object.type == "tag") | .object.sha') || \
+            cargo_publish_error release-tag-not-trusted "release tag ref cannot be resolved"
+          test -n "$current_tag_digest" && test "$current_tag_digest" = "$EXPECTED_TAG_DIGEST" || \
+            cargo_publish_error release-tag-not-trusted "release tag object moved after attestation"
+          current_source_digest=$(gh api \
+            "repos/$GITHUB_REPOSITORY/git/tags/$EXPECTED_TAG_DIGEST" \
+            --jq 'select(.verification.verified == true and .object.type == "commit") | .object.sha') || \
+            cargo_publish_error release-tag-not-trusted "annotated release tag cannot be resolved"
+          test -n "$current_source_digest" && test "$current_source_digest" = "$EXPECTED_SOURCE_DIGEST" || \
+            cargo_publish_error release-tag-not-trusted "release tag source changed after attestation"
+
+          crate_name="satelle-${RELEASE_VERSION}.crate"
+          expected="validated/cargo/$crate_name"
+          (cd validated/cargo && sha256sum --check --strict "$crate_name.sha256") || \
+            cargo_publish_error cargo-package-digest-mismatch "validated Cargo package checksum failed"
+          registry="$RUNNER_TEMP/registry.crate"
+          download="https://crates.io/api/v1/crates/satelle/${RELEASE_VERSION}/download"
+          status=$(curl --silent --show-error --location \
+            --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+            --output "$registry" \
+            --write-out '%{http_code}' \
+            "$download") || \
+            cargo_publish_error cargo-registry-unavailable "crates.io version lookup failed"
+          case "$status" in
+            200)
+              cmp --silent "$expected" "$registry" || \
+                cargo_publish_error cargo-registry-version-conflict "crates.io already has different package bytes for this version"
+              ;;
+            404)
+              test -n "$CARGO_REGISTRY_TOKEN" || \
+                cargo_publish_error cargo-publish-token-missing "CARGO_REGISTRY_TOKEN is not configured"
+              # The exact archive already passed cargo package verification in collect.
+              cargo publish --locked --no-verify -p satelle
+              for attempt in $(seq 1 20); do
+                status=$(curl --silent --show-error --location \
+                  --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+                  --output "$registry" \
+                  --write-out '%{http_code}' \
+                  "$download") || continue
+                if [ "$status" = 200 ]; then
+                  cmp --silent "$expected" "$registry" || \
+                    cargo_publish_error cargo-registry-version-conflict "published package bytes do not match the validated artifact"
+                  exit 0
+                fi
+                test "$attempt" = 20 || sleep 15
+              done
+              cargo_publish_error cargo-registry-timeout "published Cargo version did not become readable"
+              ;;
+            *)
+              cargo_publish_error cargo-registry-unavailable "crates.io version lookup returned HTTP $status"
+              ;;
+          esac
 
   publish-candidates:
     name: Publish immutable npm candidates
@@ -879,13 +992,14 @@ jobs:
           (startsWith(github.ref, 'refs/tags/v') &&
             needs.attest.result == 'success' &&
             needs.collect.result == 'success' &&
-            needs.draft-release.result == 'success') ||
+            needs.draft-release.result == 'success' &&
+            needs.publish-cargo.result == 'success') ||
           (github.event_name == 'workflow_dispatch' &&
             inputs.operation == 'candidate-finalize' &&
             needs.authorize-recovery-tag.result == 'success')
         )
       }}
-    needs: [attest, authorize-recovery-tag, collect, draft-release, validate-registry-candidates]
+    needs: [attest, authorize-recovery-tag, collect, draft-release, publish-cargo, validate-registry-candidates]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
