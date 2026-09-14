@@ -231,13 +231,20 @@ pub(crate) fn error_envelope(error: &SatelleError) -> Value {
         schema_version: ERROR_SCHEMA_VERSION,
         code: error.code.as_str(),
         category: contract.category,
-        retryable: contract.retryable,
+        retryable: error_is_retryable(error, contract.retryable),
         message: &error.message,
         details,
         docs_url: None,
         suggested_commands: error.recovery_command.iter().map(String::as_str).collect(),
     })
     .expect("the closed error envelope is JSON serializable")
+}
+
+fn error_is_retryable(error: &SatelleError, retryable_by_code: bool) -> bool {
+    retryable_by_code
+        || (error.code == ErrorCode::ComputerUseNotReady
+            && error.details.get("reason").and_then(Value::as_str)
+                == Some("native_readiness_native_action_unavailable"))
 }
 
 pub(crate) fn error_categories() -> Vec<&'static str> {
@@ -817,6 +824,28 @@ mod tests {
         let contract = error_contract(ErrorCode::NativeReadinessTimeout);
         assert_eq!(contract.category.as_str(), "readiness");
         assert!(contract.retryable);
+    }
+
+    #[test]
+    fn unavailable_native_readiness_action_is_retryable() {
+        let mut error = error_with_code(ErrorCode::ComputerUseNotReady);
+        error.details.insert(
+            "reason".to_string(),
+            json!("native_readiness_native_action_unavailable"),
+        );
+
+        assert_eq!(error_envelope(&error)["retryable"], true);
+    }
+
+    #[test]
+    fn other_computer_use_readiness_failures_remain_non_retryable() {
+        let mut error = error_with_code(ErrorCode::ComputerUseNotReady);
+        assert_eq!(error_envelope(&error)["retryable"], false);
+
+        error
+            .details
+            .insert("reason".to_string(), json!("native_readiness_failed"));
+        assert_eq!(error_envelope(&error)["retryable"], false);
     }
 
     #[test]
