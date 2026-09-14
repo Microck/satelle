@@ -1,6 +1,7 @@
 "use strict";
 
 const { accessSync, constants, readFileSync, statSync } = require("node:fs");
+const { createHash } = require("node:crypto");
 const path = require("node:path");
 
 function fail(message) {
@@ -12,8 +13,8 @@ const packageRoot = process.cwd();
 const manifest = JSON.parse(readFileSync(path.join(packageRoot, "package.json"), "utf8"));
 const packagedFiles = manifest.files;
 
-if (!Array.isArray(packagedFiles) || packagedFiles.length !== 1) {
-  fail(`${manifest.name} must package exactly one native binary.`);
+if (!Array.isArray(packagedFiles) || packagedFiles.length !== 2 || packagedFiles[1] !== "SHA256SUMS") {
+  fail(`${manifest.name} must package one native binary and SHA256SUMS.`);
 }
 
 const binaryRelativePath = packagedFiles[0];
@@ -32,9 +33,13 @@ try {
   if (expectedBinaryPath !== "bin/satelle.exe" && (binary.mode & 0o111) === 0) {
     fail(`${binaryRelativePath} is not executable.`);
   }
+  const digest = createHash("sha256").update(readFileSync(binaryPath)).digest("hex");
+  if (readFileSync(path.join(packageRoot, "SHA256SUMS"), "utf8") !== `${digest}  ${binaryRelativePath}\n`) {
+    fail("SHA256SUMS does not match the packaged executable.");
+  }
 } catch (error) {
   if (error?.code === "ENOENT") {
-    fail(`${manifest.name} is missing ${binaryRelativePath}; assemble the native artifact before packing.`);
+    fail(`${manifest.name} is missing its executable or SHA256SUMS; assemble the native artifact before packing.`);
   }
   throw error;
 }

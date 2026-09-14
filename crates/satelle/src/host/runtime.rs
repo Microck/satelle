@@ -1,0 +1,5551 @@
+#[path = "runtime-adapter.rs"]
+mod adapter;
+#[path = "runtime-codex-adapter.rs"]
+mod codex_adapter;
+#[path = "daemon-activity.rs"]
+mod daemon_activity;
+#[path = "runtime-events.rs"]
+mod events;
+#[path = "runtime-model.rs"]
+mod model;
+#[path = "runtime-recovery.rs"]
+mod recovery;
+#[path = "runtime-request.rs"]
+mod request;
+#[path = "runtime-stop.rs"]
+mod stop;
+#[path = "runtime-worker.rs"]
+mod worker;
+
+pub use adapter::{
+    AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
+    ExecuteRequest, ExecuteResult, ProviderComputerUseIntent, ProviderSmokeEvidence,
+    ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource, ReadinessCacheKey,
+    ReadinessEvidence, ReadinessObservationState, RecoveryObservation,
+};
+pub(crate) use adapter::{
+    AdmittedAppApproval, NativeProbeResult, ReadinessProbeDriver, ReadinessSource,
+};
+pub(crate) use codex_adapter::{
+    ProductionAdapterPolicy, ProductionComputerUseAdapter, validate_provider_endpoint,
+};
+pub use request::AdmissionCancellation;
+pub(crate) use request::{
+    AdmissionCancellationState, RequestIdentity, RunCommand, SteerCommand, StopCommand,
+};
+pub(crate) use stop::RuntimeStopOutcome;
+use worker::{
+    ExecutionPlan, LeaseHeartbeatGuard, MaintenanceOperationGuard, TurnWork, WorkerRegistry,
+};
+
+use daemon_activity::{DaemonActivity, DaemonActivityGuard};
+
+use crate::core::sensitive_diagnostics::{
+    RawDiagnosticCommand, RawDiagnosticExportOutcome, RawProtocolArtifact,
+};
+use crate::core::session::{DesktopBindingRef, PublicSession, TurnAdmissionFailure};
+use crate::core::{
+    ControlPlaneOperation, ErrorCode, LOCAL_DEMO_HOST, ProviderBindingAuthorization,
+    ProviderBindingSource, PublicResolvedProviderBinding, QueueRequestId, ResolvedProviderBinding,
+    SatelleError, SatelleEvent, SessionId, TurnId,
+};
+use crate::host::live_events::LiveEventHub;
+use crate::host::process_identity::ProcessIdentity;
+use crate::host::storage::{
+    AdmissionOutcome, ApiTokenRegistration, BeginProviderSecretProvisioning, CommittedLogMirrors,
+    IdempotentOperation, LeaseOwner, LogPageStorageError, NativeReadinessInvalidationReplay,
+    NativeReadinessInvalidationTarget, NewQueueRecord, ObservedUpstreamRef, OperatorLogPolicy,
+    ProviderBindingAuthorizationReplay, ProviderBindingDeletionReplay,
+    ProviderSecretProvisioningPhase, ProviderSecretProvisioningPlan,
+    ProviderSecretProvisioningPreflight, ProviderSecretProvisioningReplay, QueueEnqueueOutcome,
+    ReadinessProbeKind, ReadinessProbeTerminal, SensitiveRequestDigest, SetupActionSkipReason,
+    SetupRepairPlan, SetupRepairProbe, SetupRunPlan, SetupRunRecord, SetupRunStatus, Storage,
+    StorageSnapshot, StoredQueueRecord, TurnQueueOperation,
+};
+use crate::host::turn_queue::{QueuePayloadStore, QueuedTurnPayload};
+use crate::host::{
+    ApiBearerToken, ApiPrincipal, DaemonLogPage, LogCursor, LogPageQuery, LogSubject,
+    TaskArtifactSet,
+};
+use recovery::RecoveryQueue;
+pub(crate) use recovery::VerifiedSetupPostconditions;
+#[cfg(test)]
+pub(crate) use recovery::verify_setup_postconditions;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use zeroize::Zeroizing;
+
+pub(crate) fn storage_failure(error: crate::host::storage::StorageError) -> SatelleError {
+    model::storage_failure(error)
+}
+
+fn artifact_time(value: time::OffsetDateTime) -> Result<String, SatelleError> {
+    value
+        .to_offset(time::UtcOffset::UTC)
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|_| model::integrity_failure("stored task artifact time is invalid"))
+}
+
+fn remove_recording_directory(path: &Path) -> Result<(), SatelleError> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SatelleError::config_error(
+            format!(
+                "recording directory '{}' could not be removed",
+                path.display()
+            ),
+            Some(error.to_string()),
+        )),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_MAINTENANCE_START_AND_RETAIN: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeTurnOutcome {
+    pub(crate) session: PublicSession,
+    pub(crate) events: Vec<SatelleEvent>,
+    pub(crate) recording: Option<crate::core::recording::RecordingManifest>,
+}
+
+#[derive(Debug)]
+pub(super) struct RuntimeTurnFailure {
+    error: Box<SatelleError>,
+    events: Vec<SatelleEvent>,
+}
+
+impl RuntimeTurnFailure {
+    pub(super) fn new(error: SatelleError, events: Vec<SatelleEvent>) -> Self {
+        Self {
+            error: Box::new(error),
+            events,
+        }
+    }
+}
+
+impl From<SatelleError> for RuntimeTurnFailure {
+    fn from(error: SatelleError) -> Self {
+        Self::new(error, Vec::new())
+    }
+}
+
+impl std::ops::Deref for RuntimeTurnFailure {
+    type Target = SatelleError;
+
+    fn deref(&self) -> &Self::Target {
+        &self.error
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "status", content = "result", rename_all = "snake_case")]
+enum ProviderDescriptorValidationReplay {
+    Completed(crate::core::PublicProviderDescriptorValidation),
+    Failed(SatelleError),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "status", content = "result", rename_all = "snake_case")]
+enum SetupVerificationReplay {
+    Completed(Box<crate::core::DoctorReport>),
+    Failed(SatelleError),
+}
+
+pub(crate) struct PendingProviderReadiness {
+    readiness: Option<AdapterReadiness>,
+    heartbeat: Option<LeaseHeartbeatGuard>,
+}
+
+pub(crate) enum ProviderSecretValidationFailure {
+    Terminal(SatelleError),
+    RecoveryRequired(SatelleError),
+}
+
+impl PendingProviderReadiness {
+    pub(crate) fn readiness(&self) -> Result<&AdapterReadiness, SatelleError> {
+        self.readiness
+            .as_ref()
+            .ok_or_else(|| integrity_error("provider readiness was already consumed"))
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.heartbeat.take();
+    }
+
+    pub(crate) fn retain_for_recovery(mut self) {
+        self.heartbeat.take();
+    }
+}
+
+impl Drop for PendingProviderReadiness {
+    fn drop(&mut self) {
+        // An unconsumed deferred result intentionally leaves the durable lease
+        // active. Startup reconciliation owns the only safe decision after
+        // the caller exits without T3 or an explicit rollback.
+        self.heartbeat.take();
+    }
+}
+
+enum ProviderPreflightSuccess {
+    Committed(AdapterReadiness),
+    Deferred(PendingProviderReadiness),
+}
+
+impl ProviderPreflightSuccess {
+    fn committed(self) -> Result<AdapterReadiness, SatelleError> {
+        match self {
+            Self::Committed(readiness) => Ok(readiness),
+            Self::Deferred(_) => Err(integrity_error(
+                "deferred provider evidence reached a normal preflight caller",
+            )),
+        }
+    }
+
+    fn deferred(self) -> Result<PendingProviderReadiness, SatelleError> {
+        match self {
+            Self::Deferred(readiness) => Ok(readiness),
+            Self::Committed(_) => Err(integrity_error(
+                "committed provider evidence reached a provisioning caller",
+            )),
+        }
+    }
+}
+
+pub(crate) struct OwnedProviderProbe {
+    provider_probe_ref: String,
+    heartbeat: LeaseHeartbeatGuard,
+}
+
+struct AdmissionExecution<'a> {
+    host: &'a str,
+    prompt: &'a str,
+    execution_mode: crate::core::session::TurnExecutionMode,
+    admitted_app_approval: AdmittedAppApproval,
+    dispatch_preference: request::DispatchPreference,
+    provider_smoke_event: Option<crate::core::SatelleEventBody>,
+    resolved_provider_binding: Option<crate::core::ResolvedProviderBinding>,
+    resolved_provider_secret: Option<crate::host::provider_auth::ResolvedProviderSecret>,
+    attachments: crate::host::attachment::StagedAttachments,
+    live_events: request::LocalLiveEventBuffer,
+    raw_protocol: Option<RawCaptureAdmission>,
+    recording: Option<RecordingAdmission>,
+}
+
+struct RawCaptureAdmission {
+    principal_ref: String,
+    source_host: String,
+    command: RawDiagnosticCommand,
+}
+
+struct RecordingAdmission {
+    principal_ref: String,
+    request: crate::core::recording::RecordingRequest,
+}
+
+/// The Host's closed resolution result for one exact model/provider pair.
+///
+/// A named but unavailable descriptor stays observable to setup and
+/// diagnostics without pretending that the binding is execution-ready.
+#[derive(Clone, Debug)]
+pub enum ProviderBindingResolution {
+    Ready(ResolvedProviderBinding),
+    MissingDescriptor {
+        binding: ResolvedProviderBinding,
+        auth_source_name: String,
+    },
+}
+
+impl ProviderBindingResolution {
+    fn into_ready(self) -> Result<ResolvedProviderBinding, SatelleError> {
+        match self {
+            Self::Ready(binding) => Ok(binding),
+            Self::MissingDescriptor {
+                auth_source_name, ..
+            } => Err(provider_secret_source_missing(&auth_source_name)),
+        }
+    }
+
+    fn with_experimental_provider_computer_use(self, requested: bool) -> Self {
+        match self {
+            Self::Ready(binding) => {
+                let enabled = binding.experimental_provider_computer_use() || requested;
+                Self::Ready(binding.with_experimental_provider_computer_use(enabled))
+            }
+            Self::MissingDescriptor {
+                binding,
+                auth_source_name,
+            } => {
+                let enabled = binding.experimental_provider_computer_use() || requested;
+                Self::MissingDescriptor {
+                    binding: binding.with_experimental_provider_computer_use(enabled),
+                    auth_source_name,
+                }
+            }
+        }
+    }
+}
+
+/// Exclusive in-process authority for one live setup or repair operation.
+///
+/// The handle is intentionally non-Clone. Dropping it without a successful
+/// terminal commit synchronously stops its heartbeat and retains the exact
+/// durable owner as recovery_pending.
+pub struct MaintenanceOperationHandle {
+    operation_id: String,
+    operation: Option<MaintenanceOperationGuard>,
+    activity: Option<DaemonActivityGuard>,
+}
+
+impl MaintenanceOperationHandle {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    fn operation(&self) -> Result<&MaintenanceOperationGuard, crate::host::storage::StorageError> {
+        self.operation
+            .as_ref()
+            .ok_or_else(crate::host::storage::StorageError::state_conflict)
+    }
+
+    fn disarm(&mut self) {
+        if let Some(operation) = self.operation.as_mut() {
+            operation.disarm();
+        }
+        drop(self.operation.take());
+        drop(self.activity.take());
+    }
+}
+
+impl std::fmt::Debug for MaintenanceOperationHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MaintenanceOperationHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct VerifiedMaintenancePostcheck {
+    evidence: Option<ReadinessEvidence>,
+    outcome: VerifiedMaintenancePostcheckOutcome,
+}
+
+#[derive(Clone, Copy)]
+enum VerifiedMaintenancePostcheckOutcome {
+    Passed,
+    Failed {
+        reason: &'static str,
+        terminal: ReadinessProbeTerminal,
+    },
+    Unknown,
+}
+
+impl VerifiedMaintenancePostcheck {
+    fn passed(evidence: ReadinessEvidence) -> Self {
+        Self {
+            evidence: Some(evidence),
+            outcome: VerifiedMaintenancePostcheckOutcome::Passed,
+        }
+    }
+
+    fn failed(
+        evidence: ReadinessEvidence,
+        reason: &'static str,
+        terminal: ReadinessProbeTerminal,
+    ) -> Self {
+        Self {
+            evidence: Some(evidence),
+            outcome: VerifiedMaintenancePostcheckOutcome::Failed { reason, terminal },
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            evidence: None,
+            outcome: VerifiedMaintenancePostcheckOutcome::Unknown,
+        }
+    }
+
+    pub(crate) fn evidence(&self) -> Option<&ReadinessEvidence> {
+        self.evidence.as_ref()
+    }
+
+    pub(crate) const fn terminal(&self) -> Option<ReadinessProbeTerminal> {
+        match self.outcome {
+            VerifiedMaintenancePostcheckOutcome::Passed => None,
+            VerifiedMaintenancePostcheckOutcome::Failed { terminal, .. } => Some(terminal),
+            VerifiedMaintenancePostcheckOutcome::Unknown => {
+                Some(ReadinessProbeTerminal::OutcomeUnknown)
+            }
+        }
+    }
+
+    pub(crate) const fn failure_reason(&self) -> Option<&'static str> {
+        match self.outcome {
+            VerifiedMaintenancePostcheckOutcome::Failed { reason, .. } => Some(reason),
+            VerifiedMaintenancePostcheckOutcome::Passed
+            | VerifiedMaintenancePostcheckOutcome::Unknown => None,
+        }
+    }
+
+    pub(crate) const fn is_unknown(&self) -> bool {
+        matches!(self.outcome, VerifiedMaintenancePostcheckOutcome::Unknown)
+    }
+}
+
+impl RuntimeTurnOutcome {
+    pub(crate) fn into_command_outcome(self) -> crate::host::TurnOutcome {
+        crate::host::TurnOutcome {
+            session: self.session,
+            events: self.events,
+            recording: self.recording,
+        }
+    }
+}
+
+pub(crate) fn admitted_session(
+    result: Result<RuntimeTurnOutcome, TurnAdmissionFailure>,
+) -> Result<PublicSession, SatelleError> {
+    match result {
+        Ok(outcome) => Ok(outcome.session),
+        Err(TurnAdmissionFailure::Admitted { session, .. }) => Ok(*session),
+        Err(failure) => Err(failure.into_error()),
+    }
+}
+
+pub(crate) struct RuntimeAdmissionReplay {
+    outcome: RuntimeTurnOutcome,
+    turn_id: TurnId,
+}
+
+pub(crate) enum RuntimeAdmissionState {
+    Missing,
+    Admitted(Box<RuntimeAdmissionReplay>),
+    Cancelled,
+    RecoveryPending,
+}
+
+impl RuntimeAdmissionReplay {
+    pub(crate) fn into_parts(self) -> (PublicSession, TurnId) {
+        (self.outcome.session, self.turn_id)
+    }
+}
+
+pub(crate) fn storage_error(error: crate::host::storage::StorageError) -> SatelleError {
+    model::storage_failure(error)
+}
+
+pub(crate) fn integrity_error(message: impl Into<String>) -> SatelleError {
+    model::integrity_failure(message)
+}
+
+pub(crate) fn idempotency_conflict() -> SatelleError {
+    model::idempotency_conflict()
+}
+
+fn heartbeat_start_failure(error: std::io::Error) -> SatelleError {
+    SatelleError {
+        code: ErrorCode::HostUnreachable,
+        message: format!("the Host lease heartbeat driver could not start: {error}"),
+        recovery_command: Some("retry after verifying Host process resources".to_string()),
+        source_detail: None,
+        details: std::collections::BTreeMap::new(),
+    }
+}
+
+fn start_maintenance_operation_guard(
+    engine: &Arc<RuntimeEngine>,
+    capability: crate::host::storage::MaintenanceLeaseCapability,
+) -> Result<MaintenanceOperationGuard, SatelleError> {
+    #[cfg(test)]
+    if FAIL_NEXT_MAINTENANCE_START_AND_RETAIN.with(|fail| fail.replace(false)) {
+        let operation_id = capability.operation_id().to_string();
+        engine
+            .lock_storage()?
+            .force_bootstrap_retain_conflict_for_test(&operation_id)
+            .map_err(model::storage_failure)?;
+        return retain_after_heartbeat_start_failure(
+            engine,
+            std::io::Error::other("forced maintenance heartbeat startup failure"),
+            capability,
+        );
+    }
+    match MaintenanceOperationGuard::start(Arc::clone(&engine.storage), capability) {
+        Ok(operation) => Ok(operation),
+        Err((error, capability)) => retain_after_heartbeat_start_failure(engine, error, capability),
+    }
+}
+
+fn retain_after_heartbeat_start_failure(
+    engine: &Arc<RuntimeEngine>,
+    heartbeat_error: std::io::Error,
+    capability: crate::host::storage::MaintenanceLeaseCapability,
+) -> Result<MaintenanceOperationGuard, SatelleError> {
+    let owner = capability.lease_owner().clone();
+    match engine.lock_storage()?.retain_lease_recovery(&owner) {
+        Ok(()) => Err(heartbeat_start_failure(heartbeat_error)),
+        Err(recovery_error) => Err(model::integrity_failure(format!(
+            "the Host lease heartbeat driver could not start and the committed maintenance operation could not enter recovery_pending: heartbeat={heartbeat_error}; recovery={recovery_error}"
+        ))),
+    }
+}
+
+fn readiness_probe_terminal(
+    error: &SatelleError,
+    persistence_failed: bool,
+    cancellation_detail: &str,
+    timeout_code: Option<ErrorCode>,
+) -> ReadinessProbeTerminal {
+    if persistence_failed {
+        return ReadinessProbeTerminal::OutcomeUnknown;
+    }
+    match error
+        .details
+        .get(cancellation_detail)
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("outcome_unknown" | "upstream_still_active") => ReadinessProbeTerminal::OutcomeUnknown,
+        Some("confirmed") => ReadinessProbeTerminal::TimedOut,
+        _ if timeout_code.is_some_and(|code| error.code == code) => {
+            ReadinessProbeTerminal::TimedOut
+        }
+        _ => ReadinessProbeTerminal::Failed,
+    }
+}
+
+fn probe_dispatch_possible(error: &SatelleError) -> bool {
+    error
+        .details
+        .get("probe_dispatch_possible")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn readiness_probe_terminal_with_dispatch(
+    error: &SatelleError,
+    persistence_failed: bool,
+    cancellation_detail: &str,
+    timeout_code: Option<ErrorCode>,
+    dispatch_possible: bool,
+) -> ReadinessProbeTerminal {
+    let cancellation_confirmed = error
+        .details
+        .get(cancellation_detail)
+        .and_then(serde_json::Value::as_str)
+        == Some("confirmed");
+    if dispatch_possible && !cancellation_confirmed {
+        return ReadinessProbeTerminal::OutcomeUnknown;
+    }
+    readiness_probe_terminal(error, persistence_failed, cancellation_detail, timeout_code)
+}
+
+pub(crate) fn verify_maintenance_postcheck(
+    observation: NativeProbeResult,
+    persistence_error: Option<SatelleError>,
+) -> (VerifiedMaintenancePostcheck, Option<SatelleError>) {
+    match (observation, persistence_error) {
+        (NativeProbeResult::Passed(evidence), None) => {
+            (VerifiedMaintenancePostcheck::passed(evidence), None)
+        }
+        (NativeProbeResult::Passed(_), Some(error)) => {
+            (VerifiedMaintenancePostcheck::unknown(), Some(error))
+        }
+        (
+            NativeProbeResult::Failed {
+                evidence,
+                reason,
+                error,
+                dispatch_possible,
+            },
+            persistence_error,
+        ) => {
+            let terminal = readiness_probe_terminal_with_dispatch(
+                &error,
+                persistence_error.is_some(),
+                "native_readiness_cancellation",
+                Some(ErrorCode::NativeReadinessTimeout),
+                dispatch_possible,
+            );
+            if terminal == ReadinessProbeTerminal::OutcomeUnknown {
+                (
+                    VerifiedMaintenancePostcheck::unknown(),
+                    Some(persistence_error.unwrap_or(error)),
+                )
+            } else {
+                (
+                    VerifiedMaintenancePostcheck::failed(evidence, reason, terminal),
+                    Some(error),
+                )
+            }
+        }
+        (NativeProbeResult::UncachedFailure(error), _) => {
+            (VerifiedMaintenancePostcheck::unknown(), Some(error))
+        }
+        (NativeProbeResult::Cancelled(observation), persistence_error) => {
+            let error = persistence_error.unwrap_or_else(|| {
+                if matches!(
+                    observation,
+                    crate::core::session::StopObservation::CancellationConfirmed
+                        | crate::core::session::StopObservation::UpstreamInactiveConfirmed
+                ) {
+                    SatelleError::interrupted_attached_command()
+                } else {
+                    readiness_probe_recovery_pending(ReadinessProbeKind::Native)
+                }
+            });
+            (VerifiedMaintenancePostcheck::unknown(), Some(error))
+        }
+    }
+}
+
+fn readiness_probe_recovery_pending(kind: ReadinessProbeKind) -> SatelleError {
+    let mut error = SatelleError::computer_use_not_ready();
+    error.details.insert(
+        "reason".to_string(),
+        serde_json::Value::String(format!("{}_recovery_pending", kind.owner_kind())),
+    );
+    error
+}
+
+fn require_project_binding_consent(
+    host: &str,
+    desktop_binding: &DesktopBindingRef,
+    provider_intent: &ProviderComputerUseIntent,
+    binding: &ResolvedProviderBinding,
+) -> Result<(), SatelleError> {
+    if provider_intent.requires_project_binding_consent() && !binding.allow_project_selection() {
+        return Err(SatelleError::project_provider_selection_not_allowed(
+            host,
+            desktop_binding.as_str(),
+            binding.requested_provider_alias(),
+            binding.requested_model_alias(),
+        ));
+    }
+    Ok(())
+}
+
+fn selected_provider_desktop_binding(
+    provider_intent: &ProviderComputerUseIntent,
+    configured: &BTreeMap<String, RuntimeDesktopProviderPolicy>,
+) -> Result<DesktopBindingRef, SatelleError> {
+    if let Some(binding) = provider_intent.desktop_binding() {
+        return Ok(binding.clone());
+    }
+    if configured.is_empty() {
+        return Err(SatelleError::desktop_binding_required(&BTreeSet::new()));
+    }
+    if configured.len() > 1 {
+        return Err(SatelleError::desktop_binding_ambiguous(
+            configured.keys().cloned(),
+        ));
+    }
+    DesktopBindingRef::new(
+        configured
+            .first_key_value()
+            .expect("one configured Desktop Binding exists")
+            .0
+            .clone(),
+    )
+    .map_err(|_| SatelleError::desktop_binding_not_found("invalid"))
+}
+
+fn model_provider_binding_missing(provider_intent: &ProviderComputerUseIntent) -> SatelleError {
+    let mut details = BTreeMap::new();
+    if let Some(model) = provider_intent.model() {
+        details.insert(
+            "requested_model_alias".to_string(),
+            serde_json::Value::String(model.as_str().to_string()),
+        );
+    }
+    if let Some(provider) = provider_intent.provider() {
+        details.insert(
+            "requested_provider_alias".to_string(),
+            serde_json::Value::String(provider.as_str().to_string()),
+        );
+    }
+    SatelleError {
+        code: ErrorCode::ModelProviderBindingMissing,
+        message: "the requested model and provider aliases have no exact authorized Host binding"
+            .to_string(),
+        recovery_command: Some(
+            "authorize the exact model/provider pair through SSH bootstrap setup".to_string(),
+        ),
+        source_detail: None,
+        details,
+    }
+}
+
+fn provider_secret_source_missing(auth_source: &str) -> SatelleError {
+    SatelleError {
+        code: ErrorCode::ProviderSecretResolutionFailed,
+        message: "the Host provider binding references an unavailable Secret Source".to_string(),
+        recovery_command: Some(
+            "repair the referenced provider_auth descriptor on the selected Host".to_string(),
+        ),
+        source_detail: None,
+        details: BTreeMap::from([(
+            "auth_source".to_string(),
+            serde_json::Value::String(auth_source.to_string()),
+        )]),
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeStartupState {
+    Ready,
+    RecoveryRequired,
+}
+
+pub(crate) struct RuntimeEngine {
+    // This is the sole SQLite owner for the runtime. The mutex protects short
+    // admission/read/commit sections only and is never held across adapter or
+    // log-sink I/O.
+    storage: Arc<Mutex<Storage>>,
+    log_mirrors: Mutex<CommittedLogMirrors>,
+    adapter: Arc<dyn ComputerUseAdapter>,
+    provider_policy: RuntimeProviderPolicy,
+    readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
+    recovery: Mutex<RecoveryQueue>,
+    restart_recovery_initialized: Mutex<bool>,
+    workers: Mutex<WorkerRegistry>,
+    live_events: LiveEventHub,
+    process_identity: ProcessIdentity,
+    attachment_store: crate::host::attachment::AttachmentStore,
+    raw_diagnostics: crate::host::raw_diagnostics::RawDiagnosticExports,
+    recording_root: PathBuf,
+    recording_policy: crate::core::recording::RecordingPolicy,
+    queue_payloads: QueuePayloadStore,
+    session_metadata_retention: time::Duration,
+    setup_ledger_retention: time::Duration,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeStoragePolicy {
+    session_metadata_retention: time::Duration,
+    sqlite_log_retention: time::Duration,
+    setup_ledger_retention: time::Duration,
+    operator_log_retained_files: usize,
+    platform_log_sink: bool,
+    recording_policy: crate::core::recording::RecordingPolicy,
+    queue_config: crate::core::queue::QueueConfig,
+}
+
+impl RuntimeStoragePolicy {
+    pub(crate) fn from_host_config(config: &crate::core::HostConfig) -> Self {
+        Self {
+            session_metadata_retention: config.session_metadata_retention.as_ref().map_or(
+                crate::host::storage::DEFAULT_SESSION_RETENTION,
+                |retention| time::Duration::hours(retention.hours() as i64),
+            ),
+            sqlite_log_retention: config
+                .sqlite_log_retention
+                .as_ref()
+                .map_or(crate::host::storage::DEFAULT_LOG_RETENTION, |retention| {
+                    time::Duration::hours(retention.hours() as i64)
+                }),
+            setup_ledger_retention: config.setup_ledger_retention.as_ref().map_or(
+                crate::host::storage::DEFAULT_SETUP_LEDGER_RETENTION,
+                crate::host::duration_to_time,
+            ),
+            operator_log_retained_files: config
+                .operator_log_retained_files
+                .unwrap_or(crate::core::DEFAULT_OPERATOR_LOG_RETAINED_FILES),
+            platform_log_sink: config.platform_log_sink,
+            recording_policy: config.recording.clone().unwrap_or_default(),
+            queue_config: config.queue.clone(),
+        }
+    }
+}
+
+impl Default for RuntimeStoragePolicy {
+    fn default() -> Self {
+        Self {
+            session_metadata_retention: crate::host::storage::DEFAULT_SESSION_RETENTION,
+            sqlite_log_retention: crate::host::storage::DEFAULT_LOG_RETENTION,
+            setup_ledger_retention: crate::host::storage::DEFAULT_SETUP_LEDGER_RETENTION,
+            operator_log_retained_files: crate::core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
+            platform_log_sink: false,
+            recording_policy: crate::core::recording::RecordingPolicy::default(),
+            queue_config: crate::core::queue::QueueConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeProviderPolicy {
+    desktop_bindings: BTreeMap<String, RuntimeDesktopProviderPolicy>,
+    experimental_provider_computer_use: Option<bool>,
+    experimental_provider_computer_use_by_provider: BTreeMap<String, bool>,
+}
+
+impl Default for RuntimeProviderPolicy {
+    fn default() -> Self {
+        Self {
+            desktop_bindings: BTreeMap::from([(
+                "local-demo-desktop-v1".to_string(),
+                RuntimeDesktopProviderPolicy {
+                    desktop_user: "local-demo-user".to_string(),
+                    ..RuntimeDesktopProviderPolicy::default()
+                },
+            )]),
+            experimental_provider_computer_use: None,
+            experimental_provider_computer_use_by_provider: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RuntimeDesktopProviderPolicy {
+    desktop_user: String,
+    provider_bindings: BTreeMap<String, BTreeMap<String, crate::core::ProviderBindingConfig>>,
+    provider_auth: BTreeMap<String, crate::core::ProviderSecretSource>,
+}
+
+impl RuntimeProviderPolicy {
+    pub(crate) fn from_host_config(config: &crate::core::HostConfig) -> Self {
+        Self {
+            desktop_bindings: config
+                .desktop_bindings
+                .iter()
+                .map(|(alias, binding)| {
+                    (
+                        alias.clone(),
+                        RuntimeDesktopProviderPolicy {
+                            desktop_user: binding.desktop_user.clone(),
+                            provider_bindings: binding.provider_bindings.clone(),
+                            provider_auth: binding.provider_auth.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            experimental_provider_computer_use: config.experimental_provider_computer_use,
+            experimental_provider_computer_use_by_provider: config
+                .experimental_provider_computer_use_by_provider
+                .clone(),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn from_test_support_host_config(config: &crate::core::HostConfig) -> Self {
+        Self {
+            desktop_bindings: config
+                .desktop_bindings
+                .iter()
+                .map(|(alias, binding)| {
+                    (
+                        alias.clone(),
+                        RuntimeDesktopProviderPolicy {
+                            desktop_user: binding.desktop_user.clone(),
+                            ..RuntimeDesktopProviderPolicy::default()
+                        },
+                    )
+                })
+                .collect(),
+            experimental_provider_computer_use: config.experimental_provider_computer_use,
+            experimental_provider_computer_use_by_provider: config
+                .experimental_provider_computer_use_by_provider
+                .clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeSnapshot {
+    host_identity: crate::core::session::HostIdentityRef,
+    storage: StorageSnapshot,
+    operator_log_health: crate::host::storage::OperatorLogSinkHealth,
+    platform_log_sink_health: crate::host::storage::PlatformLogSinkHealth,
+}
+
+impl RuntimeSnapshot {
+    pub(crate) fn host_identity(&self) -> &crate::core::session::HostIdentityRef {
+        &self.host_identity
+    }
+
+    pub(crate) const fn session_count(&self) -> usize {
+        self.storage.session_count()
+    }
+
+    pub(crate) const fn active_turn_count(&self) -> usize {
+        self.storage.active_turn_count()
+    }
+
+    pub(crate) const fn recovery_pending_turn_count(&self) -> usize {
+        self.storage.recovery_pending_turn_count()
+    }
+
+    pub(crate) const fn operator_log_health(&self) -> crate::host::storage::OperatorLogSinkHealth {
+        self.operator_log_health
+    }
+
+    pub(crate) const fn platform_log_sink_health(
+        &self,
+    ) -> crate::host::storage::PlatformLogSinkHealth {
+        self.platform_log_sink_health
+    }
+}
+
+impl RuntimeEngine {
+    fn open(
+        state_root: &Path,
+        operator_log_root: PathBuf,
+        adapter: Arc<dyn ComputerUseAdapter>,
+        readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
+        provider_policy: RuntimeProviderPolicy,
+        storage_policy: RuntimeStoragePolicy,
+        provider_smoke_fingerprinter: Option<
+            crate::host::provider_auth::ProviderSmokeCredentialFingerprinter,
+        >,
+    ) -> Result<Arc<Self>, SatelleError> {
+        let process_identity =
+            ProcessIdentity::current().map_err(model::process_identity_failure)?;
+        let mut storage =
+            Storage::open_without_restart_recovery(state_root).map_err(model::storage_failure)?;
+        storage
+            .recover_raw_diagnostic_exports(time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)?;
+        storage
+            .recover_desktop_snapshots(time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)?;
+        let abandoned_recordings = storage
+            .recover_recordings()
+            .map_err(model::storage_failure)?;
+        for directory in abandoned_recordings {
+            remove_recording_directory(&directory)?;
+        }
+        storage
+            .mark_abandoned_recordings_failed()
+            .map_err(model::storage_failure)?;
+        let observed_at = time::OffsetDateTime::now_utc();
+        let expired_recordings = storage
+            .expired_recordings(observed_at)
+            .map_err(model::storage_failure)?;
+        for directory in expired_recordings {
+            remove_recording_directory(&directory)?;
+        }
+        storage
+            .mark_recordings_expired(observed_at)
+            .map_err(model::storage_failure)?;
+        let queue_payloads = QueuePayloadStore::open(state_root.join("turn-queue"))?;
+        for (record, _) in storage
+            .expire_queue_requests(observed_at)
+            .map_err(model::storage_failure)?
+        {
+            if let Err(error) = queue_payloads.delete(&record.payload_file) {
+                tracing::warn!(
+                    ?error,
+                    payload_file = %record.payload_file,
+                    "could not remove an expired queue payload"
+                );
+            }
+        }
+        let retained_queue_payloads = storage
+            .queued_payload_files()
+            .map_err(model::storage_failure)?
+            .into_iter()
+            .map(|(file_name, _)| file_name)
+            .collect();
+        if let Err(error) = queue_payloads.retain_only(&retained_queue_payloads) {
+            tracing::warn!(?error, "could not prune orphaned queue payloads");
+        }
+        storage.set_log_retention(storage_policy.sqlite_log_retention);
+        if let Some(fingerprinter) = provider_smoke_fingerprinter {
+            let key = storage
+                .provider_smoke_hmac_key()
+                .map_err(model::storage_failure)?;
+            fingerprinter.initialize(key);
+        }
+        let attachment_store =
+            crate::host::attachment::AttachmentStore::open(state_root.join("attachments"))?;
+        let mirrored_cursor = storage
+            .latest_log_cursor()
+            .map_err(model::storage_failure)?;
+        let engine = Arc::new(Self {
+            storage: Arc::new(Mutex::new(storage)),
+            log_mirrors: Mutex::new(CommittedLogMirrors::new(
+                OperatorLogPolicy::new(operator_log_root)
+                    .with_retained_files(storage_policy.operator_log_retained_files),
+                mirrored_cursor,
+                storage_policy.platform_log_sink,
+            )),
+            adapter,
+            provider_policy,
+            readiness_probe_driver,
+            recovery: Mutex::new(RecoveryQueue::new(Vec::new())),
+            restart_recovery_initialized: Mutex::new(false),
+            workers: Mutex::new(WorkerRegistry::default()),
+            live_events: LiveEventHub::new(),
+            process_identity,
+            attachment_store,
+            raw_diagnostics: crate::host::raw_diagnostics::RawDiagnosticExports::default(),
+            recording_root: state_root.join("recordings"),
+            recording_policy: storage_policy.recording_policy.clone(),
+            queue_payloads,
+            session_metadata_retention: storage_policy.session_metadata_retention,
+            setup_ledger_retention: storage_policy.setup_ledger_retention,
+        });
+        Ok(engine)
+    }
+
+    fn replay_admission(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+    ) -> Result<Option<RuntimeAdmissionReplay>, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(requested_at)?;
+        let idempotency = model::idempotency(operation, identity, requested_at)?;
+        let replay = self
+            .lock_storage()?
+            .replay_admission_if_present(operation, &idempotency, expected_session_id)
+            .map_err(model::storage_failure)?;
+        replay
+            .map(|replay| {
+                let (outcome, _session_id, turn_id) = replay.into_parts();
+                let outcome = match outcome {
+                    AdmissionOutcome::InProgress(session) | AdmissionOutcome::Complete(session) => {
+                        model::turn_outcome(&session, Vec::new())
+                    }
+                    AdmissionOutcome::Execute { .. } => {
+                        return Err(model::integrity_failure(
+                            "a stored idempotency replay requested new adapter execution",
+                        ));
+                    }
+                };
+                Ok(RuntimeAdmissionReplay { outcome, turn_id })
+            })
+            .transpose()
+    }
+
+    fn resolve_admission_operation(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+    ) -> Result<RuntimeAdmissionState, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(requested_at)?;
+        let idempotency = model::idempotency(operation, identity, requested_at)?;
+        let state = self
+            .lock_storage()?
+            .resolve_admission_operation(operation, &idempotency, expected_session_id, requested_at)
+            .map_err(model::storage_failure)?;
+        self.runtime_admission_state(state)
+    }
+
+    fn record_admission_cancellation(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+        outcome: crate::host::storage::DurableCancellationOutcome,
+        reconciled: bool,
+    ) -> Result<RuntimeAdmissionState, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(requested_at)?;
+        let idempotency = model::idempotency(operation, identity, requested_at)?;
+        let mut storage = self.lock_storage()?;
+        let state = if reconciled {
+            storage.reconcile_admission_cancellation(
+                operation,
+                &idempotency,
+                expected_session_id,
+                outcome,
+                requested_at,
+            )
+        } else {
+            storage.record_admission_cancellation(
+                operation,
+                &idempotency,
+                expected_session_id,
+                outcome,
+                requested_at,
+            )
+        }
+        .map_err(model::storage_failure)?;
+        self.runtime_admission_state(state)
+    }
+
+    fn runtime_admission_state(
+        &self,
+        state: crate::host::storage::DurableAdmissionState,
+    ) -> Result<RuntimeAdmissionState, SatelleError> {
+        match state {
+            crate::host::storage::DurableAdmissionState::Missing => {
+                Ok(RuntimeAdmissionState::Missing)
+            }
+            crate::host::storage::DurableAdmissionState::Cancelled => {
+                Ok(RuntimeAdmissionState::Cancelled)
+            }
+            crate::host::storage::DurableAdmissionState::RecoveryPending => {
+                Ok(RuntimeAdmissionState::RecoveryPending)
+            }
+            crate::host::storage::DurableAdmissionState::Admitted(replay) => {
+                let (outcome, _session_id, turn_id) = (*replay).into_parts();
+                let outcome = match outcome {
+                    AdmissionOutcome::InProgress(session) | AdmissionOutcome::Complete(session) => {
+                        model::turn_outcome(&session, Vec::new())
+                    }
+                    AdmissionOutcome::Execute { .. } => {
+                        return Err(model::integrity_failure(
+                            "a stored idempotency replay requested new adapter execution",
+                        ));
+                    }
+                };
+                Ok(RuntimeAdmissionState::Admitted(Box::new(
+                    RuntimeAdmissionReplay { outcome, turn_id },
+                )))
+            }
+        }
+    }
+
+    fn initialize_restart_recovery(&self, runtime: &RuntimeHandle) -> Result<(), SatelleError> {
+        let mut initialized = self.restart_recovery_initialized.lock().map_err(|_| {
+            model::integrity_failure("the restart recovery initialization lock was poisoned")
+        })?;
+        if *initialized {
+            return Ok(());
+        }
+        self.recover_provider_secret_provisionings(runtime)?;
+        let subjects = self
+            .lock_storage()?
+            .initialize_restart_recovery()
+            .map_err(model::storage_failure)?;
+        *self.recovery.lock().map_err(|_| {
+            model::integrity_failure("the runtime recovery lock was poisoned during startup")
+        })? = RecoveryQueue::new(subjects);
+        *initialized = true;
+        Ok(())
+    }
+
+    fn recover_provider_secret_provisionings(
+        &self,
+        runtime: &RuntimeHandle,
+    ) -> Result<(), SatelleError> {
+        let journals = self
+            .lock_storage()?
+            .pending_provider_secret_provisionings()
+            .map_err(model::storage_failure)?;
+        for journal in journals {
+            let original_phase = journal.phase();
+            if matches!(
+                original_phase,
+                ProviderSecretProvisioningPhase::Staged
+                    | ProviderSecretProvisioningPhase::Validated
+                    | ProviderSecretProvisioningPhase::PublishIntent
+            ) {
+                self.lock_storage()?
+                    .mark_provider_secret_provisioning_rollback_pending(
+                        journal.operation_id(),
+                        original_phase,
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .map_err(model::storage_failure)?;
+            }
+            self.recover_provider_secret_provisioning(runtime, &journal, original_phase)?;
+        }
+        Ok(())
+    }
+
+    fn recover_provider_secret_provisioning(
+        &self,
+        runtime: &RuntimeHandle,
+        journal: &crate::host::storage::ProviderSecretProvisioningJournal,
+        original_phase: ProviderSecretProvisioningPhase,
+    ) -> Result<(), SatelleError> {
+        let paths = crate::host::storage::provider_secret_file_paths(
+            journal.destination_path(),
+            journal.operation_id(),
+        )
+        .map_err(|_| provider_secret_recovery_failure())?;
+        if paths.staging() != journal.staged_path()
+            || journal
+                .backup_path()
+                .is_some_and(|backup| backup != paths.backup())
+        {
+            return Err(provider_secret_recovery_failure());
+        }
+        let rollback_may_hold_unowned_artifacts = matches!(
+            original_phase,
+            ProviderSecretProvisioningPhase::PublishIntent
+                | ProviderSecretProvisioningPhase::RollbackPending
+        );
+        let staging = inspect_provider_secret_recovery_artifact(
+            runtime,
+            paths.staging(),
+            journal,
+            rollback_may_hold_unowned_artifacts,
+        )?;
+        let backup = inspect_provider_secret_recovery_artifact(
+            runtime,
+            paths.backup(),
+            journal,
+            rollback_may_hold_unowned_artifacts,
+        )?;
+        let destination = if original_phase == ProviderSecretProvisioningPhase::Planned {
+            None
+        } else {
+            inspect_provider_secret_recovery_artifact(runtime, paths.destination(), journal, true)?
+        };
+
+        if !rollback_may_hold_unowned_artifacts
+            && (staging
+                .as_ref()
+                .is_some_and(|artifact| artifact.candidate.is_none())
+                || backup
+                    .as_ref()
+                    .is_some_and(|artifact| artifact.prior.is_none()))
+        {
+            return Err(provider_secret_recovery_failure());
+        }
+
+        match original_phase {
+            ProviderSecretProvisioningPhase::Planned => {
+                if backup.is_some() {
+                    return Err(provider_secret_recovery_failure());
+                }
+                crate::core::cleanup_owner_only_secret_file(
+                    &paths,
+                    staging
+                        .as_ref()
+                        .and_then(|artifact| artifact.candidate.as_ref())
+                        .map(ProviderSecretRecoveryComparison::as_evidence),
+                    None,
+                )
+                .map_err(|_| provider_secret_recovery_failure())?;
+                self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+            }
+            ProviderSecretProvisioningPhase::Committed => {
+                let candidate = destination
+                    .as_ref()
+                    .and_then(|artifact| artifact.candidate.as_ref())
+                    .ok_or_else(provider_secret_recovery_failure)?;
+                let prior = backup.as_ref().and_then(|artifact| artifact.prior.as_ref());
+                if journal.destination_existed() == Some(false) && backup.is_some() {
+                    return Err(provider_secret_recovery_failure());
+                }
+                crate::core::cleanup_owner_only_secret_file(
+                    &paths,
+                    Some(candidate.as_evidence()),
+                    prior.map(ProviderSecretRecoveryComparison::as_evidence),
+                )
+                .map_err(|_| provider_secret_recovery_failure())?;
+                self.lock_storage()?
+                    .finish_provider_secret_provisioning_success(
+                        journal.operation_id(),
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .map_err(model::storage_failure)?;
+            }
+            ProviderSecretProvisioningPhase::Staged
+            | ProviderSecretProvisioningPhase::Validated
+            | ProviderSecretProvisioningPhase::PublishIntent
+            | ProviderSecretProvisioningPhase::RollbackPending => {
+                let overwritten = journal
+                    .destination_existed()
+                    .ok_or_else(provider_secret_recovery_failure)?;
+                if !overwritten && !rollback_may_hold_unowned_artifacts {
+                    if backup.is_some() {
+                        return Err(provider_secret_recovery_failure());
+                    }
+                    if let Some(candidate) = staging
+                        .as_ref()
+                        .and_then(|artifact| artifact.candidate.as_ref())
+                    {
+                        crate::core::cleanup_owner_only_secret_file(
+                            &paths,
+                            Some(candidate.as_evidence()),
+                            None,
+                        )
+                        .map_err(|_| provider_secret_recovery_failure())?;
+                        self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+                        return Ok(());
+                    }
+                    if destination.is_none()
+                        || destination
+                            .as_ref()
+                            .is_some_and(|artifact| artifact.unowned)
+                    {
+                        self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+                        return Ok(());
+                    }
+                }
+                if matches!(
+                    original_phase,
+                    ProviderSecretProvisioningPhase::Staged
+                        | ProviderSecretProvisioningPhase::Validated
+                ) && staging.is_none()
+                {
+                    return Err(provider_secret_recovery_failure());
+                }
+                if !rollback_may_hold_unowned_artifacts {
+                    if overwritten {
+                        if destination.as_ref().is_some_and(|artifact| {
+                            artifact.candidate.is_none() && artifact.prior.is_none()
+                        }) || backup.is_none()
+                            && destination
+                                .as_ref()
+                                .and_then(|artifact| artifact.prior.as_ref())
+                                .is_none()
+                        {
+                            return Err(provider_secret_recovery_failure());
+                        }
+                    } else if backup.is_some()
+                        || destination
+                            .as_ref()
+                            .is_some_and(|artifact| artifact.candidate.is_none())
+                    {
+                        return Err(provider_secret_recovery_failure());
+                    }
+                }
+                if !overwritten && destination.is_none() && staging.is_none() {
+                    self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+                    return Ok(());
+                }
+                if rollback_may_hold_unowned_artifacts
+                    && destination
+                        .as_ref()
+                        .is_some_and(|artifact| artifact.unowned)
+                    && staging.is_none()
+                    && backup.is_none()
+                {
+                    self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+                    return Ok(());
+                }
+                let prior = backup
+                    .as_ref()
+                    .and_then(|artifact| artifact.prior.as_ref())
+                    .or_else(|| {
+                        destination
+                            .as_ref()
+                            .and_then(|artifact| artifact.prior.as_ref())
+                    });
+                let candidate = staging
+                    .as_ref()
+                    .and_then(|artifact| artifact.candidate.as_ref())
+                    .or_else(|| {
+                        destination
+                            .as_ref()
+                            .and_then(|artifact| artifact.candidate.as_ref())
+                    })
+                    .or(prior)
+                    .ok_or_else(provider_secret_recovery_failure)?;
+                crate::core::rollback_owner_only_secret_file(
+                    &paths,
+                    overwritten,
+                    candidate.key.as_bytes(),
+                    &candidate.digest,
+                    prior.map(|comparison| comparison.key.as_bytes()),
+                    prior.map(|comparison| &comparison.digest),
+                )
+                .map_err(|_| provider_secret_recovery_failure())?;
+                self.finish_recovered_provider_secret_failure(journal.operation_id())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_recovered_provider_secret_failure(
+        &self,
+        operation_id: &str,
+    ) -> Result<(), SatelleError> {
+        self.lock_storage()?
+            .finish_provider_secret_provisioning_failure(
+                operation_id,
+                SatelleError::state_conflict(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)?;
+        Ok(())
+    }
+
+    fn run(
+        self: &Arc<Self>,
+        command: RunCommand<'_>,
+        readiness: AdapterReadiness,
+    ) -> Result<RuntimeTurnOutcome, RuntimeTurnFailure> {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let started_at = time::OffsetDateTime::now_utc();
+        let host_identity = self.host_identity()?;
+        let execution_policy = readiness
+            .execution_policy()
+            .for_turn(command.execution_mode, command.turn_execution_timeout);
+        let initial = model::initial_session(
+            session_id.clone(),
+            turn_id.clone(),
+            host_identity,
+            &readiness,
+            execution_policy,
+            started_at,
+        )?;
+        let context = model::admission(
+            IdempotentOperation::Run,
+            started_at,
+            &command.identity,
+            &self.process_identity,
+        )?
+        .with_readiness_ref(model::admission_readiness_ref(&readiness)?);
+        let attachments = self.attachment_store.stage(command.attachments)?;
+        let (outcome, provider_smoke_event) =
+            command
+                .cancellation
+                .with_commit_gate(session_id.clone(), turn_id.clone(), || {
+                    let mut storage = self.lock_storage()?;
+                    let outcome = storage
+                        .begin_session(&initial, &context)
+                        .map_err(model::storage_failure)?;
+                    let mut provider_smoke_event = None;
+                    if let AdmissionOutcome::Execute { session, .. } = &outcome {
+                        self.publish_native_readiness(&readiness, session, &turn_id);
+                        self.publish_committed_turn(session, &turn_id);
+                        provider_smoke_event =
+                            self.publish_provider_smoke(&readiness, session, &turn_id);
+                    }
+                    Ok((outcome, provider_smoke_event))
+                })?;
+        let raw_protocol =
+            command
+                .raw_protocol_source_host
+                .map(|source_host| RawCaptureAdmission {
+                    principal_ref: command.identity.principal_ref().to_string(),
+                    source_host,
+                    command: RawDiagnosticCommand::Run,
+                });
+        let recording = command.recording.map(|request| RecordingAdmission {
+            principal_ref: command.identity.principal_ref().to_string(),
+            request,
+        });
+        self.finish_admission(
+            AdmissionExecution {
+                host: command.host,
+                prompt: command.prompt,
+                execution_mode: command.execution_mode,
+                admitted_app_approval: readiness.admitted_app_approval().clone(),
+                dispatch_preference: command.dispatch,
+                provider_smoke_event,
+                resolved_provider_binding: readiness.resolved_provider_binding().cloned(),
+                resolved_provider_secret: readiness.take_resolved_provider_secret(),
+                attachments,
+                live_events: command.cancellation.live_event_buffer(),
+                raw_protocol,
+                recording,
+            },
+            outcome,
+            context.lease_owner().clone(),
+        )
+    }
+
+    fn steer(
+        self: &Arc<Self>,
+        command: SteerCommand<'_>,
+        readiness: AdapterReadiness,
+    ) -> Result<RuntimeTurnOutcome, RuntimeTurnFailure> {
+        // Preflight can outlive the retention observation made during replay
+        // admission. Recheck at the authoritative Session load so a follow-up
+        // cannot revive metadata that crossed the retention boundary meanwhile.
+        self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
+        let existing = self
+            .lock_storage()?
+            .load_session(&command.session_id)
+            .map_err(model::storage_failure)?
+            .ok_or_else(|| SatelleError::session_not_found(&command.session_id))?;
+        model::validate_follow_up_bindings(&existing, &readiness)?;
+        let turn_id = TurnId::new();
+        let started_at = model::monotonic_now(&existing);
+        let execution_policy = readiness
+            .execution_policy()
+            .for_turn(command.execution_mode, command.turn_execution_timeout);
+        let context = model::admission(
+            IdempotentOperation::Steer,
+            started_at,
+            &command.identity,
+            &self.process_identity,
+        )?
+        .with_readiness_ref(model::admission_readiness_ref(&readiness)?);
+        let attachments = self.attachment_store.stage(command.attachments)?;
+        let (outcome, provider_smoke_event) = command.cancellation.with_commit_gate(
+            command.session_id.clone(),
+            turn_id.clone(),
+            || {
+                let mut storage = self.lock_storage()?;
+                let outcome = storage
+                    .begin_follow_up(
+                        &command.session_id,
+                        existing.session_state_revision(),
+                        turn_id.clone(),
+                        execution_policy,
+                        started_at,
+                        self.adapter.requires_upstream_thread_for_follow_up(),
+                        &context,
+                    )
+                    .map_err(model::storage_failure)?;
+                let mut provider_smoke_event = None;
+                if let AdmissionOutcome::Execute { session, .. } = &outcome {
+                    self.publish_native_readiness(&readiness, session, &turn_id);
+                    self.publish_committed_turn(session, &turn_id);
+                    provider_smoke_event =
+                        self.publish_provider_smoke(&readiness, session, &turn_id);
+                }
+                Ok((outcome, provider_smoke_event))
+            },
+        )?;
+        let raw_protocol =
+            command
+                .raw_protocol_source_host
+                .map(|source_host| RawCaptureAdmission {
+                    principal_ref: command.identity.principal_ref().to_string(),
+                    source_host,
+                    command: RawDiagnosticCommand::Steer,
+                });
+        let recording = command.recording.map(|request| RecordingAdmission {
+            principal_ref: command.identity.principal_ref().to_string(),
+            request,
+        });
+        self.finish_admission(
+            AdmissionExecution {
+                host: LOCAL_DEMO_HOST,
+                prompt: command.prompt,
+                execution_mode: command.execution_mode,
+                admitted_app_approval: readiness.admitted_app_approval().clone(),
+                dispatch_preference: command.dispatch,
+                provider_smoke_event,
+                resolved_provider_binding: readiness.resolved_provider_binding().cloned(),
+                resolved_provider_secret: readiness.take_resolved_provider_secret(),
+                attachments,
+                live_events: command.cancellation.live_event_buffer(),
+                raw_protocol,
+                recording,
+            },
+            outcome,
+            context.lease_owner().clone(),
+        )
+    }
+
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        cancellation: &AdmissionCancellation,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.preflight_with_native(host, provider_intent, cancellation, None)
+    }
+
+    fn preflight_with_native(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        cancellation: &AdmissionCancellation,
+        supplied_native: Option<ReadinessEvidence>,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.preflight_with_native_mode(
+            host,
+            provider_intent,
+            cancellation,
+            supplied_native,
+            None,
+            None,
+            false,
+            None,
+        )?
+        .committed()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preflight_with_native_mode(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        cancellation: &AdmissionCancellation,
+        supplied_native: Option<ReadinessEvidence>,
+        provider_secret: Option<crate::host::provider_auth::ResolvedProviderSecret>,
+        owned_provider_probe: Option<OwnedProviderProbe>,
+        defer_success: bool,
+        deferred_recovery_required: Option<&std::cell::Cell<bool>>,
+    ) -> Result<ProviderPreflightSuccess, SatelleError> {
+        if cancellation.is_requested() {
+            cancellation.finish(AdmissionCancellationState::Cancelled);
+            return Err(SatelleError::interrupted_attached_command());
+        }
+        // Native readiness is independent of provider credentials. Attach the
+        // exact binding descriptor so the adapter can build its native cache
+        // identity, but defer a missing secret descriptor until native state
+        // has been proved.
+        let (provider_intent, deferred_provider_error) = self
+            .prepare_provider_intent_for_native_readiness(
+                host,
+                provider_intent,
+                supplied_native.is_some(),
+            )?;
+        let native_cache_key = self.adapter.readiness_cache_key(host, &provider_intent)?;
+        if let (Some(key), Some(driver)) = (
+            native_cache_key.as_ref(),
+            self.readiness_probe_driver.as_ref(),
+        ) {
+            self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Native)?;
+        }
+        let mut cached = match supplied_native {
+            Some(evidence)
+                if native_cache_key
+                    .as_ref()
+                    .is_some_and(|key| key.matches_evidence(&evidence)) =>
+            {
+                Some(evidence)
+            }
+            Some(_) => {
+                return Err(integrity_error(
+                    "supplied native readiness does not match the current Host cache key",
+                ));
+            }
+            None if provider_intent.refresh() => None,
+            None => {
+                if let Some(key) = native_cache_key.as_ref() {
+                    self.lock_storage()?
+                        .load_reusable_readiness(key, time::OffsetDateTime::now_utc())
+                        .map_err(model::storage_failure)?
+                } else {
+                    None
+                }
+            }
+        };
+        if cached.is_none()
+            && let (Some(key), Some(driver)) = (
+                native_cache_key.as_ref(),
+                self.readiness_probe_driver.as_ref(),
+            )
+        {
+            cached = Some(self.run_live_native_probe(key, driver.as_ref(), cancellation)?);
+        }
+
+        // Provider authorization and provider-smoke ownership begin only
+        // after native readiness has completed successfully.
+        if let Some(error) = deferred_provider_error {
+            return Err(error);
+        }
+        let provider_intent = self.authorize_provider_intent(host, &provider_intent)?;
+        let cache_key = self.adapter.readiness_cache_key(host, &provider_intent)?;
+        let provider_smoke_enabled = cache_key.as_ref().is_some_and(|key| {
+            key.execution_policy()
+                .experimental_features()
+                .provider_computer_use()
+                == crate::core::session::FeatureChoice::Enabled
+        });
+        if owned_provider_probe.is_none()
+            && let (Some(key), Some(driver)) =
+                (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
+        {
+            self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Provider)?;
+        }
+        let cached_provider = if let Some(key) = cache_key.as_ref() {
+            if provider_smoke_enabled && !provider_intent.refresh() {
+                self.lock_storage()?
+                    .load_reusable_provider_smoke(key, time::OffsetDateTime::now_utc())
+                    .map_err(model::storage_failure)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // The adapter resolves the exact credential only inside preflight.
+        // Hold probe ownership even for a cache candidate so credential
+        // rotation cannot turn that candidate into untracked live provider I/O.
+        let requires_live_provider_probe = provider_smoke_enabled;
+        let (provider_probe_ref, mut provider_heartbeat) = if let Some(owned) = owned_provider_probe
+        {
+            (Some(owned.provider_probe_ref), Some(owned.heartbeat))
+        } else if requires_live_provider_probe
+            && self.readiness_probe_driver.is_some()
+            && let Some(key) = cache_key.as_ref()
+        {
+            let provider_probe_ref = format!("provider-probe-{}", SessionId::new());
+            let now = time::OffsetDateTime::now_utc();
+            let owner = LeaseOwner::new(
+                provider_probe_ref.clone(),
+                self.process_identity.process_id(),
+                self.process_identity.process_start_ref(),
+                self.process_identity.boot_identity_ref(),
+                now,
+            )
+            .map_err(model::storage_failure)?;
+            self.lock_storage()?
+                .begin_provider_probe(key, &provider_probe_ref, &owner)
+                .map_err(model::storage_failure)?;
+            let heartbeat = match LeaseHeartbeatGuard::start(Arc::clone(&self.storage), &owner) {
+                Ok(heartbeat) => heartbeat,
+                Err(error) => {
+                    self.lock_storage()?
+                        .retain_provider_probe_recovery(&provider_probe_ref)
+                        .map_err(model::storage_failure)?;
+                    cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                    return Err(heartbeat_start_failure(error));
+                }
+            };
+            (Some(provider_probe_ref), Some(heartbeat))
+        } else {
+            (None, None)
+        };
+
+        let persistence_error = std::cell::RefCell::new(None);
+        let preflight = {
+            let mut persist_thread_ref = |value: &str| {
+                self.lock_storage()
+                    .and_then(|mut storage| {
+                        storage
+                            .persist_provider_probe_upstream_ref(
+                                provider_probe_ref.as_deref().unwrap_or_default(),
+                                ObservedUpstreamRef::thread(value)
+                                    .map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            let mut persist_turn_ref = |value: &str| {
+                self.lock_storage()
+                    .and_then(|mut storage| {
+                        storage
+                            .persist_provider_probe_upstream_ref(
+                                provider_probe_ref.as_deref().unwrap_or_default(),
+                                ObservedUpstreamRef::turn(value).map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            match self.readiness_probe_driver.as_ref() {
+                Some(driver) if provider_probe_ref.is_some() => driver
+                    .preflight_terminal_with_provider_probe(
+                        host,
+                        cached,
+                        cached_provider,
+                        &provider_intent,
+                        provider_secret,
+                        cancellation,
+                        &mut persist_thread_ref,
+                        &mut persist_turn_ref,
+                    ),
+                _ => {
+                    self.adapter
+                        .preflight_terminal(host, cached, cached_provider, &provider_intent)
+                }
+            }
+        };
+        let persistence_failed = persistence_error.into_inner().is_some();
+
+        match preflight {
+            AdapterPreflight::Cancelled(observation) => {
+                let terminal = matches!(
+                    observation,
+                    crate::core::session::StopObservation::CancellationConfirmed
+                        | crate::core::session::StopObservation::UpstreamInactiveConfirmed
+                );
+                if defer_success {
+                    if let Some(recovery_required) = deferred_recovery_required {
+                        recovery_required.set(!terminal || persistence_failed);
+                    }
+                    provider_heartbeat.take();
+                    return Err(adapter::admission_cancelled_error(observation));
+                }
+                if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
+                    if terminal {
+                        self.lock_storage()?
+                            .release_provider_probe(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    } else {
+                        self.lock_storage()?
+                            .retain_provider_probe_recovery(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    }
+                }
+                cancellation.finish(if terminal {
+                    AdmissionCancellationState::Cancelled
+                } else {
+                    AdmissionCancellationState::RecoveryPending
+                });
+                Err(adapter::admission_cancelled_error(observation))
+            }
+            AdapterPreflight::Ready(readiness) => {
+                if defer_success {
+                    if provider_probe_ref.is_none() {
+                        return Err(integrity_error(
+                            "deferred provider validation lost durable ownership",
+                        ));
+                    }
+                    return Ok(ProviderPreflightSuccess::Deferred(
+                        PendingProviderReadiness {
+                            readiness: Some(readiness),
+                            heartbeat: provider_heartbeat.take(),
+                        },
+                    ));
+                }
+                self.lock_storage()?
+                    .store_preflight_successes(
+                        readiness.adapter(),
+                        readiness.desktop_binding(),
+                        readiness.execution_policy(),
+                        readiness.evidence(),
+                        readiness.provider_smoke_evidence(),
+                    )
+                    .map_err(model::storage_failure)?;
+                if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
+                    self.lock_storage()?
+                        .release_provider_probe(provider_probe_ref)
+                        .map_err(model::storage_failure)?;
+                }
+                Ok(ProviderPreflightSuccess::Committed(readiness))
+            }
+            AdapterPreflight::Failed {
+                key,
+                evidence,
+                reason,
+                error,
+                dispatch_possible,
+            } => {
+                if defer_success {
+                    if let Some(recovery_required) = deferred_recovery_required {
+                        recovery_required.set(dispatch_possible || persistence_failed);
+                    }
+                    provider_heartbeat.take();
+                    return Err(error);
+                }
+                self.lock_storage()?
+                    .store_preflight_failure(&key, &evidence, reason)
+                    .map_err(model::storage_failure)?;
+                if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
+                    if dispatch_possible || persistence_failed {
+                        self.lock_storage()?
+                            .retain_provider_probe_recovery(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    } else {
+                        self.lock_storage()?
+                            .release_provider_probe(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    }
+                }
+                if dispatch_possible || persistence_failed {
+                    cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                } else if cancellation.is_requested() {
+                    cancellation.finish(AdmissionCancellationState::Cancelled);
+                }
+                Err(error)
+            }
+            AdapterPreflight::ProviderFailed {
+                key,
+                readiness,
+                failure,
+                error,
+            } => {
+                let terminal = readiness_probe_terminal_with_dispatch(
+                    &error,
+                    persistence_failed,
+                    "provider_smoke_cancellation",
+                    Some(ErrorCode::ProviderSmokeTestTimeout),
+                    probe_dispatch_possible(&error),
+                );
+                if defer_success {
+                    if let Some(recovery_required) = deferred_recovery_required {
+                        recovery_required.set(terminal == ReadinessProbeTerminal::OutcomeUnknown);
+                    }
+                    provider_heartbeat.take();
+                    return Err(error);
+                }
+                if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
+                    self.lock_storage()?
+                        .finish_provider_probe_failure(
+                            provider_probe_ref,
+                            &key,
+                            &readiness,
+                            &failure,
+                            terminal,
+                        )
+                        .map_err(model::storage_failure)?;
+                } else {
+                    self.lock_storage()?
+                        .store_provider_smoke_failure(&key, &readiness, &failure)
+                        .map_err(model::storage_failure)?;
+                }
+                if terminal == ReadinessProbeTerminal::OutcomeUnknown {
+                    cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                } else if cancellation.is_requested() {
+                    cancellation.finish(AdmissionCancellationState::Cancelled);
+                }
+                Err(error)
+            }
+            AdapterPreflight::UncachedFailure(error) => {
+                let recovery_pending = probe_dispatch_possible(&error) || persistence_failed;
+                if defer_success {
+                    if let Some(recovery_required) = deferred_recovery_required {
+                        recovery_required.set(recovery_pending);
+                    }
+                    provider_heartbeat.take();
+                    return Err(error);
+                }
+                if let Some(provider_probe_ref) = provider_probe_ref.as_deref() {
+                    if recovery_pending {
+                        self.lock_storage()?
+                            .retain_provider_probe_recovery(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    } else {
+                        self.lock_storage()?
+                            .release_provider_probe(provider_probe_ref)
+                            .map_err(model::storage_failure)?;
+                    }
+                }
+                if recovery_pending {
+                    cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                } else if cancellation.is_requested() {
+                    cancellation.finish(AdmissionCancellationState::Cancelled);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn provider_secret_provisioning_probe(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        native_readiness: ReadinessEvidence,
+        provider_secret: crate::host::provider_auth::ResolvedProviderSecret,
+        owned_provider_probe: OwnedProviderProbe,
+    ) -> Result<PendingProviderReadiness, ProviderSecretValidationFailure> {
+        let recovery_required = std::cell::Cell::new(false);
+        let success = self
+            .preflight_with_native_mode(
+                host,
+                provider_intent,
+                &AdmissionCancellation::new(),
+                Some(native_readiness),
+                Some(provider_secret),
+                Some(owned_provider_probe),
+                true,
+                Some(&recovery_required),
+            )
+            .map_err(|error| {
+                if recovery_required.get() {
+                    ProviderSecretValidationFailure::RecoveryRequired(error)
+                } else {
+                    ProviderSecretValidationFailure::Terminal(error)
+                }
+            })?;
+        success
+            .deferred()
+            .map_err(ProviderSecretValidationFailure::RecoveryRequired)
+    }
+
+    #[cfg(test)]
+    fn cached_provider_smoke(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ProviderSmokeResult>, SatelleError> {
+        let provider_intent = self.authorize_provider_intent(host, provider_intent)?;
+        let Some(key) = self.adapter.readiness_cache_key(host, &provider_intent)? else {
+            return Ok(None);
+        };
+        self.lock_storage()?
+            .load_reusable_provider_smoke(&key, time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)
+    }
+
+    fn authorize_provider_intent(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ProviderComputerUseIntent, SatelleError> {
+        if let Some(binding) = provider_intent.resolved_provider_binding() {
+            let effective_binding = binding.clone().with_experimental_provider_computer_use(
+                binding.experimental_provider_computer_use()
+                    || provider_intent.experimental_provider_computer_use(),
+            );
+            return Ok(provider_intent
+                .clone()
+                .with_resolved_provider_binding(effective_binding));
+        }
+        let Some(resolution) = self.resolve_requested_provider_binding(host, provider_intent)?
+        else {
+            return Ok(provider_intent.clone());
+        };
+        let binding = resolution.into_ready()?;
+        let enabled = binding.experimental_provider_computer_use()
+            || provider_intent.experimental_provider_computer_use();
+        let binding = binding.with_experimental_provider_computer_use(enabled);
+        Ok(provider_intent
+            .clone()
+            .with_resolved_provider_binding(binding))
+    }
+
+    fn prepare_provider_intent_for_native_readiness(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        defer_missing_binding: bool,
+    ) -> Result<(ProviderComputerUseIntent, Option<SatelleError>), SatelleError> {
+        if provider_intent.resolved_provider_binding().is_some() {
+            return self
+                .authorize_provider_intent(host, provider_intent)
+                .map(|intent| (intent, None));
+        }
+        let resolution = match self.resolve_requested_provider_binding(host, provider_intent) {
+            Ok(resolution) => resolution,
+            Err(error)
+                if error.code == ErrorCode::ModelProviderBindingMissing
+                    && provider_intent.model().is_some()
+                    && provider_intent.provider().is_some()
+                    && defer_missing_binding =>
+            {
+                return Ok((provider_intent.clone(), Some(error)));
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(resolution) = resolution else {
+            return Ok((provider_intent.clone(), None));
+        };
+        let resolution = resolution.with_experimental_provider_computer_use(
+            provider_intent.experimental_provider_computer_use(),
+        );
+        let (binding, deferred_provider_error) = match resolution {
+            ProviderBindingResolution::Ready(binding) => (binding, None),
+            ProviderBindingResolution::MissingDescriptor {
+                binding,
+                auth_source_name,
+            } => (
+                binding,
+                Some(provider_secret_source_missing(&auth_source_name)),
+            ),
+        };
+        Ok((
+            provider_intent
+                .clone()
+                .with_resolved_provider_binding(binding),
+            deferred_provider_error,
+        ))
+    }
+
+    fn resolve_requested_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ProviderBindingResolution>, SatelleError> {
+        if (provider_intent.model_from_project() && provider_intent.model().is_none())
+            || (provider_intent.provider_from_project() && provider_intent.provider().is_none())
+        {
+            return Err(SatelleError::config_error(
+                "project Provider Binding provenance requires the corresponding alias",
+                None,
+            ));
+        }
+        let requested_pair = match (provider_intent.model(), provider_intent.provider()) {
+            (None, None) => return Ok(None),
+            (Some(model), Some(provider)) => (model.as_str(), provider.as_str()),
+            _ => return Err(model_provider_binding_missing(provider_intent)),
+        };
+        let desktop_binding = selected_provider_desktop_binding(
+            provider_intent,
+            &self.provider_policy.desktop_bindings,
+        )?;
+        if let Some(resolution) = self.resolve_remote_host_binding(
+            host,
+            &desktop_binding,
+            requested_pair.0,
+            requested_pair.1,
+            provider_intent.requires_project_binding_consent(),
+        )? {
+            return Ok(Some(resolution));
+        }
+        let binding = self
+            .lock_storage()?
+            .load_authorized_provider_binding(&desktop_binding, requested_pair.0, requested_pair.1)
+            .map_err(model::storage_failure)?
+            .ok_or_else(|| model_provider_binding_missing(provider_intent))?;
+        require_project_binding_consent(host, &desktop_binding, provider_intent, &binding)?;
+        Ok(Some(ProviderBindingResolution::Ready(binding)))
+    }
+
+    fn resolve_remote_host_binding(
+        &self,
+        host: &str,
+        desktop_binding: &DesktopBindingRef,
+        model_alias: &str,
+        provider_alias: &str,
+        project_selection: bool,
+    ) -> Result<Option<ProviderBindingResolution>, SatelleError> {
+        let desktop_policy = self
+            .provider_policy
+            .desktop_bindings
+            .get(desktop_binding.as_str())
+            .ok_or_else(|| SatelleError::desktop_binding_not_found(desktop_binding.as_str()))?;
+        let Some(binding) = desktop_policy
+            .provider_bindings
+            .get(provider_alias)
+            .and_then(|models| models.get(model_alias))
+        else {
+            return Ok(None);
+        };
+        if project_selection && !binding.allow_project_selection {
+            return Err(SatelleError::project_provider_selection_not_allowed(
+                host,
+                desktop_binding.as_str(),
+                provider_alias,
+                model_alias,
+            ));
+        }
+        let mut authorization = ProviderBindingAuthorization::new(
+            model_alias,
+            provider_alias,
+            &binding.model,
+            &binding.model_provider,
+        )
+        .with_allow_project_selection(binding.allow_project_selection);
+        if let Some(endpoint) = binding.endpoint.as_deref() {
+            authorization = authorization.with_endpoint(endpoint);
+        }
+        let missing_auth_source_name =
+            if let Some(auth_source_name) = binding.auth_source.as_deref() {
+                match desktop_policy.provider_auth.get(auth_source_name).cloned() {
+                    Some(descriptor) => {
+                        authorization = authorization.with_auth_source(descriptor);
+                        None
+                    }
+                    None => Some(auth_source_name.to_string()),
+                }
+            } else {
+                None
+            };
+        let experimental = self
+            .provider_policy
+            .experimental_provider_computer_use_by_provider
+            .get(provider_alias)
+            .copied()
+            .or(self.provider_policy.experimental_provider_computer_use)
+            .unwrap_or(false);
+        authorization = authorization.with_experimental_provider_computer_use(experimental);
+        let binding = crate::host::provider_auth::prepare_provider_binding(
+            authorization,
+            ProviderBindingSource::HostOwned,
+            host,
+        )?;
+        Ok(Some(match missing_auth_source_name {
+            Some(auth_source_name) => ProviderBindingResolution::MissingDescriptor {
+                binding,
+                auth_source_name,
+            },
+            None => ProviderBindingResolution::Ready(binding),
+        }))
+    }
+
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ProviderBindingResolution, SatelleError> {
+        if let Some(resolution) = self.resolve_requested_provider_binding(host, provider_intent)? {
+            return Ok(resolution.with_experimental_provider_computer_use(
+                provider_intent.experimental_provider_computer_use(),
+            ));
+        }
+        self.adapter
+            .resolve_provider_binding(host, provider_intent)
+            .map(|binding| {
+                ProviderBindingResolution::Ready(binding.with_experimental_provider_computer_use(
+                    provider_intent.experimental_provider_computer_use(),
+                ))
+            })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn authorize_provider_binding(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        binding: &ResolvedProviderBinding,
+    ) -> Result<(), SatelleError> {
+        self.lock_storage()?
+            .authorize_provider_binding(desktop_binding, binding, time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn provider_binding_digest(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<Option<String>, SatelleError> {
+        self.lock_storage()?
+            .load_authorized_provider_binding(desktop_binding, model_alias, provider_alias)
+            .map(|binding| binding.map(|binding| binding.binding_digest().to_string()))
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn authorize_provider_binding_if_unchanged(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        binding: &ResolvedProviderBinding,
+        expected_previous_digest: Option<&str>,
+    ) -> Result<(), SatelleError> {
+        self.lock_storage()?
+            .authorize_provider_binding_if_unchanged(
+                desktop_binding,
+                binding,
+                expected_previous_digest,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn delete_provider_binding(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<bool, SatelleError> {
+        self.lock_storage()?
+            .delete_authorized_provider_binding(desktop_binding, model_alias, provider_alias)
+            .map_err(model::storage_failure)
+    }
+
+    fn run_live_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        driver: &dyn ReadinessProbeDriver,
+        cancellation: &AdmissionCancellation,
+    ) -> Result<ReadinessEvidence, SatelleError> {
+        let native_probe_ref = format!("native-probe-{}", SessionId::new());
+        let now = time::OffsetDateTime::now_utc();
+        let owner = LeaseOwner::new(
+            native_probe_ref.clone(),
+            self.process_identity.process_id(),
+            self.process_identity.process_start_ref(),
+            self.process_identity.boot_identity_ref(),
+            now,
+        )
+        .map_err(model::storage_failure)?;
+        self.lock_storage()?
+            .begin_native_probe(key, &native_probe_ref, &owner)
+            .map_err(model::storage_failure)?;
+        let _heartbeat = match LeaseHeartbeatGuard::start(Arc::clone(&self.storage), &owner) {
+            Ok(heartbeat) => heartbeat,
+            Err(error) => {
+                self.lock_storage()?
+                    .retain_native_probe_recovery(&native_probe_ref)
+                    .map_err(model::storage_failure)?;
+                cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                return Err(heartbeat_start_failure(error));
+            }
+        };
+
+        let persistence_error = std::cell::RefCell::new(None);
+        let probe = {
+            let mut persist_thread_ref = |value: &str| {
+                self.lock_storage()
+                    .and_then(|mut storage| {
+                        storage
+                            .persist_native_probe_upstream_ref(
+                                &native_probe_ref,
+                                ObservedUpstreamRef::thread(value)
+                                    .map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            let mut persist_turn_ref = |value: &str| {
+                self.lock_storage()
+                    .and_then(|mut storage| {
+                        storage
+                            .persist_native_probe_upstream_ref(
+                                &native_probe_ref,
+                                ObservedUpstreamRef::turn(value).map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            driver.run_native_probe(
+                key,
+                cancellation,
+                &mut persist_thread_ref,
+                &mut persist_turn_ref,
+            )
+        };
+        let persistence_failed = persistence_error.into_inner().is_some();
+
+        match probe {
+            NativeProbeResult::Cancelled(observation) => {
+                let terminal = matches!(
+                    observation,
+                    crate::core::session::StopObservation::CancellationConfirmed
+                        | crate::core::session::StopObservation::UpstreamInactiveConfirmed
+                );
+                if terminal {
+                    self.lock_storage()?
+                        .release_native_probe(&native_probe_ref)
+                        .map_err(model::storage_failure)?;
+                } else {
+                    self.lock_storage()?
+                        .retain_native_probe_recovery(&native_probe_ref)
+                        .map_err(model::storage_failure)?;
+                }
+                cancellation.finish(if terminal {
+                    AdmissionCancellationState::Cancelled
+                } else {
+                    AdmissionCancellationState::RecoveryPending
+                });
+                Err(adapter::admission_cancelled_error(observation))
+            }
+            NativeProbeResult::Passed(evidence) if !persistence_failed => {
+                self.lock_storage()?
+                    .finish_native_probe_success(&native_probe_ref, key, &evidence)
+                    .map_err(model::storage_failure)?;
+                Ok(evidence)
+            }
+            NativeProbeResult::Passed(_) => {
+                self.lock_storage()?
+                    .retain_native_probe_recovery(&native_probe_ref)
+                    .map_err(model::storage_failure)?;
+                cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                Err(readiness_probe_recovery_pending(ReadinessProbeKind::Native))
+            }
+            NativeProbeResult::Failed {
+                evidence,
+                reason,
+                error,
+                dispatch_possible,
+            } => {
+                let terminal = readiness_probe_terminal_with_dispatch(
+                    &error,
+                    persistence_failed,
+                    "native_readiness_cancellation",
+                    Some(ErrorCode::NativeReadinessTimeout),
+                    dispatch_possible,
+                );
+                self.lock_storage()?
+                    .finish_native_probe_failure(
+                        &native_probe_ref,
+                        key,
+                        &evidence,
+                        reason,
+                        terminal,
+                    )
+                    .map_err(model::storage_failure)?;
+                if terminal == ReadinessProbeTerminal::OutcomeUnknown {
+                    cancellation.finish(AdmissionCancellationState::RecoveryPending);
+                } else if cancellation.is_requested() {
+                    cancellation.finish(AdmissionCancellationState::Cancelled);
+                }
+                Err(error)
+            }
+            NativeProbeResult::UncachedFailure(error) => {
+                self.lock_storage()?
+                    .release_native_probe(&native_probe_ref)
+                    .map_err(model::storage_failure)?;
+                if cancellation.is_requested() {
+                    cancellation.finish(AdmissionCancellationState::Cancelled);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn reconcile_readiness_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        driver: &dyn ReadinessProbeDriver,
+        kind: ReadinessProbeKind,
+    ) -> Result<(), SatelleError> {
+        let subject = {
+            let storage = self.lock_storage()?;
+            let host_identity = storage.host_identity().map_err(model::storage_failure)?;
+            match kind {
+                ReadinessProbeKind::Native => storage
+                    .pending_native_probe(&host_identity, key.desktop_binding())
+                    .map_err(model::storage_failure)?,
+                ReadinessProbeKind::Provider => storage
+                    .pending_provider_probe(&host_identity, key.desktop_binding())
+                    .map_err(model::storage_failure)?,
+            }
+        };
+        let Some(subject) = subject else {
+            return Ok(());
+        };
+        debug_assert_eq!(kind, subject.probe_kind());
+        if !subject.is_recovery_pending() {
+            return Err(readiness_probe_recovery_pending(kind));
+        }
+        match driver.observe_readiness_probe(&subject) {
+            RecoveryObservation::Completed
+            | RecoveryObservation::Blocked
+            | RecoveryObservation::Failed => {
+                let mut storage = self.lock_storage()?;
+                match kind {
+                    ReadinessProbeKind::Native => storage
+                        .release_reconciled_native_probe(subject.probe_ref())
+                        .map_err(model::storage_failure),
+                    ReadinessProbeKind::Provider => storage
+                        .release_reconciled_provider_probe(subject.probe_ref())
+                        .map_err(model::storage_failure),
+                }
+            }
+            RecoveryObservation::Running | RecoveryObservation::Unknown => {
+                Err(readiness_probe_recovery_pending(kind))
+            }
+        }
+    }
+
+    fn has_reusable_readiness(&self, host: &str) -> Result<bool, SatelleError> {
+        let intent = ProviderComputerUseIntent::host_default();
+        let key = match self.adapter.readiness_cache_key(host, &intent) {
+            Ok(Some(key)) => key,
+            Ok(None) => return Ok(false),
+            Err(error)
+                if matches!(
+                    error.code,
+                    ErrorCode::ComputerUseNotReady
+                        | ErrorCode::IncompatibleControlPlane
+                        | ErrorCode::ExperimentalProviderOptInRequired
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        self.lock_storage()?
+            .load_reusable_readiness(&key, time::OffsetDateTime::now_utc())
+            .map(|result| result.is_some())
+            .map_err(model::storage_failure)
+    }
+
+    fn finish_admission(
+        self: &Arc<Self>,
+        execution: AdmissionExecution<'_>,
+        outcome: AdmissionOutcome,
+        lease_owner: LeaseOwner,
+    ) -> Result<RuntimeTurnOutcome, RuntimeTurnFailure> {
+        match outcome {
+            AdmissionOutcome::InProgress(session) | AdmissionOutcome::Complete(session) => {
+                Ok(model::turn_outcome(&session, Vec::new()))
+            }
+            AdmissionOutcome::Execute {
+                session,
+                recovery_subject,
+            } => {
+                let heartbeat =
+                    match LeaseHeartbeatGuard::start(Arc::clone(&self.storage), &lease_owner) {
+                        Ok(heartbeat) => heartbeat,
+                        Err(error) => {
+                            self.preserve_unknown_execution(&recovery_subject)?;
+                            return Err(heartbeat_start_failure(error).into());
+                        }
+                    };
+                let work = TurnWork {
+                    session,
+                    subject: *recovery_subject,
+                    _heartbeat: heartbeat,
+                };
+                let admitted = model::turn_outcome(&work.session, Vec::new());
+                let raw_protocol_capture = execution.raw_protocol.and_then(|raw| {
+                    let storage = self.lock_storage().ok()?;
+                    let manifest = crate::core::sensitive_diagnostics::RawDiagnosticManifest::new(
+                        &raw.source_host,
+                        work.subject.host_identity().as_str(),
+                        raw.command,
+                        work.subject.session_id().clone(),
+                        work.subject.turn_id().clone(),
+                    );
+                    Some(self.raw_diagnostics.begin(
+                        &storage,
+                        &raw.principal_ref,
+                        manifest,
+                        time::OffsetDateTime::now_utc(),
+                    ))
+                });
+                let raw_protocol_completion = raw_protocol_capture.as_ref().map(|_| {
+                    crate::host::raw_diagnostics::RawDiagnosticCompletion::new(
+                        self.raw_diagnostics.clone(),
+                        Arc::clone(&self.storage),
+                        work.subject.turn_id().clone(),
+                    )
+                });
+                let recording_capture = match execution.recording {
+                    Some(recording) => Some(self.begin_recording(
+                        &recording.principal_ref,
+                        &recording.request,
+                        work.subject.session_id(),
+                        work.subject.turn_id(),
+                        execution.prompt,
+                    )?),
+                    None => None,
+                };
+                let plan = ExecutionPlan {
+                    host: execution.host.to_string(),
+                    prompt: execution.prompt.to_string(),
+                    execution_mode: execution.execution_mode,
+                    admitted_app_approval: execution.admitted_app_approval,
+                    work,
+                    provider_smoke_event: execution.provider_smoke_event,
+                    resolved_provider_binding: execution.resolved_provider_binding,
+                    resolved_provider_secret: execution.resolved_provider_secret,
+                    attachments: execution.attachments,
+                    live_events: execution.live_events,
+                    raw_protocol_capture,
+                    _raw_protocol_completion: raw_protocol_completion,
+                    recording_capture,
+                };
+                match execution.dispatch_preference {
+                    request::DispatchPreference::Inline => self.execute(plan),
+                    request::DispatchPreference::Detached => {
+                        self.schedule(plan)?;
+                        Ok(admitted)
+                    }
+                }
+            }
+        }
+    }
+
+    fn begin_recording(
+        &self,
+        principal_ref: &str,
+        request: &crate::core::recording::RecordingRequest,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+        prompt: &str,
+    ) -> Result<crate::host::recording::RecordingCapture, SatelleError> {
+        if !self
+            .recording_policy
+            .permits(request.mode, request.retention_ms)
+        {
+            return Err(SatelleError::invalid_usage(
+                "the selected Host recording policy does not permit this mode or retention",
+            ));
+        }
+        self.cleanup_expired_recordings(time::OffsetDateTime::now_utc())?;
+        let created_at = time::OffsetDateTime::now_utc();
+        let capture = crate::host::recording::RecordingCapture::begin(
+            &self.recording_root,
+            request,
+            session_id.clone(),
+            turn_id.clone(),
+            prompt,
+            created_at,
+        )?;
+        let recording_id = capture.recording_id()?;
+        let directory = capture.directory()?;
+        let expires_at = capture.expires_at()?;
+        if let Err(error) = self.lock_storage()?.begin_recording(
+            &recording_id,
+            principal_ref,
+            session_id,
+            turn_id,
+            &request.source_host,
+            request.mode,
+            &directory,
+            created_at,
+            expires_at,
+        ) {
+            let _ = std::fs::remove_dir_all(directory);
+            return Err(model::storage_failure(error));
+        }
+        if let Err(error) = capture.start() {
+            let _ = self.lock_storage()?.fail_recording(&recording_id);
+            let _ = std::fs::remove_dir_all(directory);
+            return Err(error);
+        }
+        Ok(capture)
+    }
+
+    fn cleanup_expired_recordings(
+        &self,
+        observed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        let directories = self
+            .lock_storage()?
+            .expired_recordings(observed_at)
+            .map_err(model::storage_failure)?;
+        for directory in directories {
+            remove_recording_directory(&directory)?;
+        }
+        self.lock_storage()?
+            .mark_recordings_expired(observed_at)
+            .map_err(model::storage_failure)
+    }
+
+    fn status(&self, session_id: &SessionId) -> Result<PublicSession, SatelleError> {
+        self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
+        let session = self
+            .lock_storage()?
+            .load_session(session_id)
+            .map_err(model::storage_failure)?
+            .ok_or_else(|| SatelleError::session_not_found(session_id))?;
+        Ok(session.to_public())
+    }
+
+    fn task_artifacts(&self, session_id: &SessionId) -> Result<TaskArtifactSet, SatelleError> {
+        // One export uses one retention boundary so a later page cannot expire
+        // a cursor that an earlier page in the same export already delivered.
+        let observed_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(observed_at)?;
+        // Keep one storage guard for the full export so the Session, recovery
+        // subjects, and log pages all describe one coherent durable snapshot.
+        let mut storage = self.lock_storage()?;
+        let session = storage
+            .load_session(session_id)
+            .map_err(model::storage_failure)?
+            .ok_or_else(|| SatelleError::session_not_found(session_id))?;
+
+        let mut plan = String::new();
+        writeln!(plan, "# Plan\n").expect("writing to a String cannot fail");
+        writeln!(plan, "- Session ID: {}", session.id()).expect("writing to a String cannot fail");
+        writeln!(
+            plan,
+            "- Host Identity: {}",
+            session.host_identity().as_str()
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            plan,
+            "- Desktop Binding: {}\n",
+            session.desktop_binding().as_str()
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(plan, "## Turns\n").expect("writing to a String cannot fail");
+
+        for (ordinal, turn) in session.turns().enumerate() {
+            let subject = storage
+                .recovery_subject(session.id(), turn.id())
+                .map_err(model::storage_failure)?;
+            let policy = turn.execution_policy();
+            writeln!(plan, "### Turn {}\n", ordinal + 1).expect("writing to a String cannot fail");
+            writeln!(plan, "- Turn ID: {}", turn.id()).expect("writing to a String cannot fail");
+            writeln!(plan, "- State: {}", turn.state().as_str())
+                .expect("writing to a String cannot fail");
+            writeln!(plan, "- Model: {}", policy.effective_model().as_str())
+                .expect("writing to a String cannot fail");
+            writeln!(plan, "- Provider: {}", policy.provider_binding().as_str())
+                .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Desktop Session: {}",
+                policy.desktop_target().session_id()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Approval Policy: {}",
+                policy.approval_policy().as_str()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Sandbox Policy: {}",
+                policy.sandbox_policy().as_str()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Turn Timeout Seconds: {}",
+                policy.timeout_policy().seconds()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Computer Use: {}",
+                policy.experimental_features().computer_use().as_str()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Provider Computer Use: {}",
+                policy
+                    .experimental_features()
+                    .provider_computer_use()
+                    .as_str()
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(plan, "- Started At: {}", artifact_time(turn.started_at())?)
+                .expect("writing to a String cannot fail");
+            writeln!(plan, "- Updated At: {}", artifact_time(turn.updated_at())?)
+                .expect("writing to a String cannot fail");
+            writeln!(
+                plan,
+                "- Terminal At: {}",
+                turn.terminal_at()
+                    .map(artifact_time)
+                    .transpose()?
+                    .unwrap_or_else(|| "not recorded".to_string())
+            )
+            .expect("writing to a String cannot fail");
+            if let Some(readiness) = subject.admission_readiness() {
+                writeln!(
+                    plan,
+                    "- Native Readiness: result={}, observed_at={}, source={}",
+                    readiness.native_result_id(),
+                    artifact_time(readiness.native_observed_at())?,
+                    readiness.native_source()
+                )
+                .expect("writing to a String cannot fail");
+                match (
+                    readiness.provider_result_id(),
+                    readiness.provider_observed_at(),
+                    readiness.provider_source(),
+                ) {
+                    (Some(result_id), Some(observed_at), Some(source)) => {
+                        writeln!(
+                            plan,
+                            "- Provider Readiness: result={result_id}, observed_at={}, source={source}\n",
+                            artifact_time(observed_at)?
+                        )
+                        .expect("writing to a String cannot fail");
+                    }
+                    _ => writeln!(plan, "- Provider Readiness: not recorded\n")
+                        .expect("writing to a String cannot fail"),
+                }
+            } else {
+                writeln!(plan, "- Native Readiness: not recorded")
+                    .expect("writing to a String cannot fail");
+                writeln!(plan, "- Provider Readiness: not recorded\n")
+                    .expect("writing to a String cannot fail");
+            }
+        }
+
+        let mut goal = String::new();
+        writeln!(goal, "# Goal\n").expect("writing to a String cannot fail");
+        writeln!(goal, "- Session ID: {}", session.id()).expect("writing to a String cannot fail");
+        writeln!(goal, "- Upstream Goal Reference: not recorded")
+            .expect("writing to a String cannot fail");
+
+        let mut worklog = String::new();
+        writeln!(worklog, "# Worklog\n").expect("writing to a String cannot fail");
+        let mut cursor = None;
+        loop {
+            let query = LogPageQuery::forward(cursor, 10_000)
+                .expect("the artifact log page size is valid")
+                .with_session(session.id().clone());
+            let page = match storage.log_page(&query, observed_at) {
+                Ok(page) => page,
+                Err(LogPageStorageError::Storage(error)) => {
+                    return Err(model::storage_failure(error));
+                }
+                Err(LogPageStorageError::CursorExpired { .. }) => {
+                    return Err(model::integrity_failure(
+                        "task artifact log pagination crossed the retention boundary",
+                    ));
+                }
+                Err(LogPageStorageError::CursorAhead) => {
+                    return Err(model::integrity_failure(
+                        "task artifact log pagination crossed the Host log tail",
+                    ));
+                }
+            };
+            for entry in page.entries() {
+                let turn_id = match entry.subject() {
+                    LogSubject::Turn { turn_id, .. } => turn_id.as_str(),
+                    LogSubject::Host => "host",
+                    LogSubject::Queue { queue_status, .. } => {
+                        queue_status.queue_request_id.as_str()
+                    }
+                };
+                writeln!(
+                    worklog,
+                    "- {} [{}] source={} event={} turn={} cursor={}: {}",
+                    artifact_time(entry.timestamp())?,
+                    entry.severity().as_str(),
+                    entry.source().as_str(),
+                    entry.event().as_str(),
+                    turn_id,
+                    entry.cursor(),
+                    entry.event().message(),
+                )
+                .expect("writing to a String cannot fail");
+            }
+            if !page.truncated() {
+                break;
+            }
+            cursor = Some(page.next_cursor());
+        }
+        for turn in session.turns() {
+            if let Some(summary) = turn.safe_summary() {
+                writeln!(
+                    worklog,
+                    "- Turn {} terminal summary: {}",
+                    turn.id(),
+                    summary.as_str()
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+
+        Ok(TaskArtifactSet::new(
+            session.id().clone(),
+            plan,
+            worklog,
+            goal,
+        ))
+    }
+
+    fn log_page(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
+        let observed_at = time::OffsetDateTime::now_utc();
+        self.maintain_session_retention(observed_at)?;
+        match self.lock_storage()?.log_page(query, observed_at) {
+            Ok(page) => Ok(page),
+            Err(LogPageStorageError::Storage(error)) => Err(model::storage_failure(error)),
+            Err(LogPageStorageError::CursorExpired {
+                earliest_available_cursor,
+                resume_cursor,
+            }) => Err(SatelleError::logs_cursor_expired(
+                earliest_available_cursor
+                    .map(|cursor| LogCursor::from_position(cursor).to_string()),
+                LogCursor::from_position(resume_cursor).to_string(),
+            )),
+            Err(LogPageStorageError::CursorAhead) => Err(SatelleError::invalid_usage(
+                "the Log Cursor is ahead of this Host log history",
+            )),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn append_log_for_tests(
+        &self,
+        timestamp: time::OffsetDateTime,
+        source: crate::host::LogSource,
+        severity: crate::host::LogSeverity,
+    ) -> Result<LogCursor, SatelleError> {
+        let record = crate::host::storage::SafeLogRecord::new(
+            timestamp,
+            source,
+            severity,
+            crate::host::LogEvent::StoreOpened,
+            crate::host::LogSubject::Host,
+        )
+        .map_err(model::storage_failure)?;
+        self.lock_storage()?
+            .append_safe_log(&record)
+            .map(LogCursor::from_position)
+            .map_err(model::storage_failure)
+    }
+
+    fn host_identity(&self) -> Result<crate::core::session::HostIdentityRef, SatelleError> {
+        self.lock_storage()?
+            .host_identity()
+            .map_err(model::storage_failure)
+    }
+
+    fn snapshot(&self) -> Result<RuntimeSnapshot, SatelleError> {
+        self.maintain_session_retention(time::OffsetDateTime::now_utc())?;
+        let (host_identity, storage_snapshot) = {
+            let storage = self.lock_storage()?;
+            (
+                storage.host_identity().map_err(model::storage_failure)?,
+                storage.snapshot().map_err(model::storage_failure)?,
+            )
+        };
+        let (operator_log_health, platform_log_sink_health) = {
+            let mirrors = self.log_mirrors.lock().map_err(|_| {
+                model::integrity_failure("the committed log mirror lock was poisoned")
+            })?;
+            (mirrors.health(), mirrors.platform_health())
+        };
+        Ok(RuntimeSnapshot {
+            host_identity,
+            storage: storage_snapshot,
+            operator_log_health,
+            platform_log_sink_health,
+        })
+    }
+
+    fn platform_log_sink_health(
+        &self,
+    ) -> Result<crate::host::storage::PlatformLogSinkHealth, SatelleError> {
+        self.log_mirrors
+            .lock()
+            .map(|mirrors| mirrors.platform_health())
+            .map_err(|_| model::integrity_failure("the committed log mirror lock was poisoned"))
+    }
+
+    fn reap_finished_workers(&self) -> Result<bool, SatelleError> {
+        let mut workers = self.workers.lock().map_err(|_| {
+            model::integrity_failure("the detached runtime worker registry was poisoned")
+        })?;
+        workers.reap_finished()?;
+        Ok(workers.is_empty())
+    }
+
+    fn subscribe_live_events(&self) -> crate::host::LiveEventSubscription {
+        self.live_events.subscribe()
+    }
+
+    fn maintain_session_retention(
+        &self,
+        observed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.lock_storage()?
+            .prune_expired_session_metadata_with_retention(
+                observed_at,
+                self.session_metadata_retention,
+                self.setup_ledger_retention,
+            )
+            .map_err(model::storage_failure)
+    }
+
+    fn lock_storage(&self) -> Result<RuntimeStorageGuard<'_>, SatelleError> {
+        self.storage
+            .lock()
+            .map(|storage| RuntimeStorageGuard {
+                storage: Some(storage),
+                storage_owner: self.storage.as_ref(),
+                log_mirrors: &self.log_mirrors,
+            })
+            .map_err(|_| {
+                model::integrity_failure(
+                    "the runtime storage lock was poisoned by a failed operation",
+                )
+            })
+    }
+}
+
+struct RuntimeStorageGuard<'a> {
+    storage: Option<MutexGuard<'a, Storage>>,
+    storage_owner: &'a Mutex<Storage>,
+    log_mirrors: &'a Mutex<CommittedLogMirrors>,
+}
+
+impl Deref for RuntimeStorageGuard<'_> {
+    type Target = Storage;
+
+    fn deref(&self) -> &Self::Target {
+        self.storage
+            .as_deref()
+            .expect("the storage guard remains present until drop")
+    }
+}
+
+impl DerefMut for RuntimeStorageGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.storage
+            .as_deref_mut()
+            .expect("the storage guard remains present until drop")
+    }
+}
+
+impl Drop for RuntimeStorageGuard<'_> {
+    fn drop(&mut self) {
+        // Never wait for or write to an external sink while holding SQLite.
+        // The mirror lock preserves cursor order while SQLite is reacquired only
+        // long enough to load and format the next batch of committed records.
+        drop(self.storage.take());
+        let Ok(mut log_mirrors) = self.log_mirrors.lock() else {
+            return;
+        };
+        let prepared = {
+            let Ok(storage) = self.storage_owner.lock() else {
+                return;
+            };
+            log_mirrors.prepare_committed(&storage)
+        };
+        log_mirrors.write_prepared(prepared);
+    }
+}
+
+struct LazyRuntime {
+    state_root: Result<PathBuf, SatelleError>,
+    operator_log_root: Result<PathBuf, SatelleError>,
+    engine: Option<Arc<RuntimeEngine>>,
+    provider_policy: RuntimeProviderPolicy,
+    storage_policy: RuntimeStoragePolicy,
+    provider_smoke_fingerprinter:
+        Option<crate::host::provider_auth::ProviderSmokeCredentialFingerprinter>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeHandle {
+    adapter: Arc<dyn ComputerUseAdapter>,
+    readiness_probe_driver: Option<Arc<dyn ReadinessProbeDriver>>,
+    activity: Arc<DaemonActivity>,
+    lazy: Arc<Mutex<LazyRuntime>>,
+    queue_worker_running: Arc<AtomicBool>,
+    queue_worker_threads: Arc<AtomicUsize>,
+    queue_worker_shutdown: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for RuntimeHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeHandle {
+    pub(crate) fn queue_config(&self) -> Result<crate::core::queue::QueueConfig, SatelleError> {
+        self.lazy
+            .lock()
+            .map(|lazy| lazy.storage_policy.queue_config.clone())
+            .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))
+    }
+
+    pub(crate) fn configured_desktop_bindings(&self) -> Result<BTreeSet<String>, SatelleError> {
+        self.lazy
+            .lock()
+            .map(|lazy| {
+                lazy.provider_policy
+                    .desktop_bindings
+                    .keys()
+                    .cloned()
+                    .collect()
+            })
+            .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_queue_config_for_tests(
+        &self,
+        config: crate::core::queue::QueueConfig,
+    ) -> Result<(), SatelleError> {
+        self.lazy
+            .lock()
+            .map(|mut lazy| lazy.storage_policy.queue_config = config)
+            .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn configure_host_policy_for_tests(
+        &self,
+        config: &crate::core::HostConfig,
+    ) -> Result<(), SatelleError> {
+        self.lazy
+            .lock()
+            .map(|mut lazy| {
+                // Test adapters still model user-configured Provider Bindings as
+                // Controller proposals. Only Desktop Binding ownership belongs
+                // to the fake Host before setup authorizes a provider binding.
+                lazy.provider_policy = RuntimeProviderPolicy::from_test_support_host_config(config);
+                lazy.storage_policy = RuntimeStoragePolicy::from_host_config(config);
+            })
+            .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))
+    }
+
+    pub(crate) fn desktop_user_for_binding(
+        &self,
+        desktop_binding: &str,
+    ) -> Result<String, SatelleError> {
+        self.lazy
+            .lock()
+            .map_err(|_| model::integrity_failure("the lazy runtime lock was poisoned"))?
+            .provider_policy
+            .desktop_bindings
+            .get(desktop_binding)
+            .map(|binding| binding.desktop_user.clone())
+            .ok_or_else(|| SatelleError::desktop_binding_not_found(desktop_binding))
+    }
+
+    pub(crate) fn try_start_queue_worker(&self) -> bool {
+        if self.queue_worker_shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        self.queue_worker_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn finish_queue_worker(&self) {
+        self.queue_worker_running.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn queue_worker_thread_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.queue_worker_threads)
+    }
+
+    pub(crate) fn prepare_queue_worker_for_daemon(&self) {
+        self.queue_worker_shutdown.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn request_queue_worker_shutdown(&self) {
+        self.queue_worker_shutdown.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn queue_worker_shutdown_requested(&self) -> bool {
+        self.queue_worker_shutdown.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn recording_preflight(
+        &self,
+        mode: crate::core::recording::RecordingMode,
+        retention_ms: Option<u64>,
+        source_host: &str,
+    ) -> Result<crate::core::recording::RecordingPreflight, SatelleError> {
+        if mode.captures_pixels() && !cfg!(any(target_os = "macos", target_os = "windows")) {
+            return Err(SatelleError::invalid_usage(
+                "screenshots and video recording are supported only on macOS and Windows Hosts",
+            ));
+        }
+        let lazy = self
+            .lazy
+            .lock()
+            .map_err(|_| integrity_error("the lazy runtime lock was poisoned"))?;
+        let policy = &lazy.storage_policy.recording_policy;
+        let retention_ms = retention_ms.unwrap_or(policy.default_retention.milliseconds());
+        let recording_root = lazy.state_root.clone()?.join("recordings");
+        crate::core::recording::RecordingPreflight::new(
+            mode,
+            source_host,
+            policy,
+            recording_root.display().to_string(),
+            retention_ms,
+            time::OffsetDateTime::now_utc(),
+        )
+        .ok_or_else(|| {
+            SatelleError::config_error(
+                "the selected Host policy does not permit this recording",
+                Some(format!(
+                    "mode={} retention_ms={retention_ms}",
+                    mode.as_str()
+                )),
+            )
+        })
+    }
+
+    pub(crate) fn recording_manifest(
+        &self,
+        principal_ref: &str,
+        turn_id: &TurnId,
+    ) -> Result<Option<crate::core::recording::RecordingManifest>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .recording_manifest(principal_ref, turn_id)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn readiness_probe_timeouts(&self) -> (std::time::Duration, std::time::Duration) {
+        self.readiness_probe_driver.as_ref().map_or(
+            (
+                crate::host::DEFAULT_NATIVE_READINESS_TIMEOUT,
+                crate::host::DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
+            ),
+            |driver| driver.readiness_probe_timeouts(),
+        )
+    }
+
+    pub(crate) fn platform_log_sink_health(
+        &self,
+    ) -> Result<crate::host::storage::PlatformLogSinkHealth, SatelleError> {
+        let (engine, enabled) = {
+            let lazy = self
+                .lazy
+                .lock()
+                .map_err(|_| integrity_error("the lazy runtime lock was poisoned"))?;
+            (lazy.engine.clone(), lazy.storage_policy.platform_log_sink)
+        };
+        match engine {
+            Some(engine) => engine.platform_log_sink_health(),
+            None if enabled => Ok(crate::host::storage::PlatformLogSinkHealth::Healthy),
+            None => Ok(crate::host::storage::PlatformLogSinkHealth::Disabled),
+        }
+    }
+
+    pub(crate) fn provider_secret_provisioning_hmac(
+        &self,
+        domain: &'static str,
+        secret: &crate::host::provider_auth::ResolvedProviderSecret,
+    ) -> Result<String, SatelleError> {
+        let fingerprinter = self
+            .lazy
+            .lock()
+            .map_err(|_| integrity_error("the lazy runtime lock was poisoned"))?
+            .provider_smoke_fingerprinter
+            .clone()
+            .ok_or_else(|| integrity_error("the provider secret HMAC key is unavailable"))?;
+        fingerprinter
+            .fingerprint(domain, Some(secret))
+            .ok_or_else(|| integrity_error("the provider secret HMAC key is uninitialized"))
+    }
+
+    pub(crate) fn begin_setup_run(
+        &self,
+        plan: &SetupRunPlan,
+    ) -> Result<MaintenanceOperationHandle, SatelleError> {
+        self.begin_maintenance_operation(plan, Storage::begin_setup_run)
+    }
+
+    pub(crate) fn begin_bootstrap_maintenance(
+        &self,
+        plan: &SetupRunPlan,
+    ) -> Result<MaintenanceOperationHandle, SatelleError> {
+        self.begin_maintenance_operation(plan, Storage::begin_bootstrap_maintenance)
+    }
+
+    fn begin_maintenance_operation(
+        &self,
+        plan: &SetupRunPlan,
+        begin: impl FnOnce(
+            &mut Storage,
+            &SetupRunPlan,
+            LeaseOwner,
+        ) -> Result<
+            crate::host::storage::MaintenanceLeaseCapability,
+            crate::host::storage::StorageError,
+        >,
+    ) -> Result<MaintenanceOperationHandle, SatelleError> {
+        let activity = self.activity.begin();
+        let engine = self.engine()?;
+        let capability = {
+            let mut storage = engine.lock_storage()?;
+            let acquired_at = time::OffsetDateTime::now_utc();
+            let owner = LeaseOwner::new(
+                plan.run_id(),
+                engine.process_identity.process_id(),
+                engine.process_identity.process_start_ref(),
+                engine.process_identity.boot_identity_ref(),
+                acquired_at,
+            )
+            .map_err(model::storage_failure)?;
+            begin(&mut storage, plan, owner).map_err(model::storage_failure)?
+        };
+        let operation = start_maintenance_operation_guard(&engine, capability)?;
+        Ok(MaintenanceOperationHandle {
+            operation_id: plan.run_id().to_string(),
+            operation: Some(operation),
+            activity: Some(activity),
+        })
+    }
+
+    pub(crate) fn adopt_recovery_maintenance(
+        &self,
+        operation_id: &str,
+    ) -> Result<MaintenanceOperationHandle, SatelleError> {
+        let activity = self.activity.begin();
+        let engine = self.engine()?;
+        let capability = {
+            let mut storage = engine.lock_storage()?;
+            let acquired_at = time::OffsetDateTime::now_utc();
+            let owner = LeaseOwner::new(
+                operation_id,
+                engine.process_identity.process_id(),
+                engine.process_identity.process_start_ref(),
+                engine.process_identity.boot_identity_ref(),
+                acquired_at,
+            )
+            .map_err(model::storage_failure)?;
+            storage
+                .adopt_recovery_maintenance(operation_id, owner)
+                .map_err(model::storage_failure)?
+        };
+        let operation = start_maintenance_operation_guard(&engine, capability)?;
+        Ok(MaintenanceOperationHandle {
+            operation_id: operation_id.to_string(),
+            operation: Some(operation),
+            activity: Some(activity),
+        })
+    }
+
+    pub(crate) fn start_setup_action(
+        &self,
+        operation: &MaintenanceOperationHandle,
+        action_id: &str,
+        started_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.with_maintenance_operation(operation, |storage, capability| {
+            storage.start_setup_action(capability, action_id, started_at)
+        })
+    }
+
+    /// Stops the in-process heartbeat without classifying the action as
+    /// abandoned. The caller must own the external offline-operation fence
+    /// and reopen the store to reconcile the exact action outcome.
+    pub(crate) fn handoff_offline_maintenance(&self, operation: &mut MaintenanceOperationHandle) {
+        operation.disarm();
+    }
+
+    pub(crate) fn complete_setup_action_after_verified_postcondition(
+        &self,
+        operation: &MaintenanceOperationHandle,
+        action_id: &str,
+        completed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.with_maintenance_operation(operation, |storage, capability| {
+            storage.complete_setup_action_after_verified_postcondition(
+                capability,
+                action_id,
+                completed_at,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fail_setup_action(
+        &self,
+        operation: &MaintenanceOperationHandle,
+        action_id: &str,
+        error_code: &str,
+        exit_status: Option<i64>,
+        recovery_hint: Option<&str>,
+        failed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.with_maintenance_operation(operation, |storage, capability| {
+            storage.fail_setup_action(
+                capability,
+                action_id,
+                error_code,
+                exit_status,
+                recovery_hint,
+                failed_at,
+            )
+        })
+    }
+
+    pub(crate) fn skip_setup_action(
+        &self,
+        operation: &MaintenanceOperationHandle,
+        action_id: &str,
+        reason: SetupActionSkipReason,
+        skipped_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.with_maintenance_operation(operation, |storage, capability| {
+            storage.skip_setup_action(capability, action_id, reason, skipped_at)
+        })
+    }
+
+    pub(crate) fn run_maintenance_postcheck(
+        &self,
+        operation: &mut MaintenanceOperationHandle,
+        key: &ReadinessCacheKey,
+        postcheck_action_id: &str,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        let driver = self.readiness_probe_driver.as_ref().ok_or_else(|| {
+            model::integrity_failure("the maintenance postcheck observer is unavailable")
+        })?;
+        let native_probe_ref = format!("maintenance-postcheck-{}", SessionId::new());
+        self.with_maintenance_operation(operation, |storage, capability| {
+            storage.begin_maintenance_postcheck(
+                key,
+                &native_probe_ref,
+                postcheck_action_id,
+                capability,
+            )
+        })?;
+
+        let persistence_error = std::cell::RefCell::new(None);
+        let observation = {
+            let mut persist_thread_ref = |value: &str| {
+                self.engine()
+                    .and_then(|engine| {
+                        let mut storage = engine.lock_storage()?;
+                        storage
+                            .persist_native_probe_upstream_ref(
+                                &native_probe_ref,
+                                ObservedUpstreamRef::thread(value)
+                                    .map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            let mut persist_turn_ref = |value: &str| {
+                self.engine()
+                    .and_then(|engine| {
+                        let mut storage = engine.lock_storage()?;
+                        storage
+                            .persist_native_probe_upstream_ref(
+                                &native_probe_ref,
+                                ObservedUpstreamRef::turn(value).map_err(model::storage_failure)?,
+                            )
+                            .map_err(model::storage_failure)
+                    })
+                    .map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+            };
+            driver.run_native_probe(
+                key,
+                &AdmissionCancellation::new(),
+                &mut persist_thread_ref,
+                &mut persist_turn_ref,
+            )
+        };
+        let persistence_error = persistence_error.into_inner();
+        let (verified, terminal_error) =
+            verify_maintenance_postcheck(observation, persistence_error);
+        let engine = self.engine()?;
+        let guard = operation.operation().map_err(model::storage_failure)?;
+        let status = engine
+            .lock_storage()?
+            .finish_maintenance_postcheck(
+                guard.capability(),
+                &native_probe_ref,
+                postcheck_action_id,
+                key,
+                &verified,
+            )
+            .map_err(model::storage_failure)?;
+        operation.disarm();
+        if let Some(mut error) = terminal_error {
+            // The CLI must distinguish a known terminal readiness failure,
+            // whose ledger and leases were finalized above, from an unknown
+            // outcome whose leases remain recovery-pending.
+            error.details.insert(
+                "maintenance_postcheck_terminal".to_string(),
+                serde_json::Value::Bool(status.is_some()),
+            );
+            return Err(error);
+        }
+        status.ok_or_else(|| {
+            model::integrity_failure("a passed maintenance postcheck was not terminal")
+        })
+    }
+
+    pub(crate) fn run_default_maintenance_postcheck(
+        &self,
+        operation: &mut MaintenanceOperationHandle,
+        postcheck_action_id: &str,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        let engine = self.engine()?;
+        let key = engine
+            .adapter
+            .readiness_cache_key(
+                crate::host::LOCAL_DEMO_HOST,
+                &crate::host::ProviderComputerUseIntent::host_default(),
+            )?
+            .ok_or_else(|| {
+                model::integrity_failure("the native readiness postcheck key is unavailable")
+            })?;
+        self.run_maintenance_postcheck(operation, &key, postcheck_action_id)
+    }
+
+    pub(crate) fn finish_setup_run(
+        &self,
+        operation: &mut MaintenanceOperationHandle,
+        finished_at: time::OffsetDateTime,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        let engine = self.engine()?;
+        let guard = operation.operation().map_err(model::storage_failure)?;
+        let status = engine
+            .lock_storage()?
+            .finish_setup_run_and_release_maintenance(guard.capability(), finished_at)
+            .map_err(model::storage_failure)?;
+        operation.disarm();
+        Ok(status)
+    }
+
+    pub(crate) fn complete_bootstrap_maintenance(
+        &self,
+        operation: &mut MaintenanceOperationHandle,
+        finished_at: time::OffsetDateTime,
+    ) -> Result<SetupRunStatus, SatelleError> {
+        let engine = self.engine()?;
+        let operation_id = operation.operation_id().to_string();
+        let status = {
+            let guard = operation.operation().map_err(model::storage_failure)?;
+            let mut storage = engine.lock_storage()?;
+            storage
+                .finalize_fresh_ssh_identity_commit(&operation_id)
+                .map_err(model::storage_failure)?;
+            storage
+                .complete_bootstrap_maintenance(guard.capability(), finished_at)
+                .map_err(model::storage_failure)?
+        };
+        operation.disarm();
+        Ok(status)
+    }
+
+    fn with_maintenance_operation<T>(
+        &self,
+        operation: &MaintenanceOperationHandle,
+        mutate: impl FnOnce(
+            &mut Storage,
+            &crate::host::storage::MaintenanceLeaseCapability,
+        ) -> Result<T, crate::host::storage::StorageError>,
+    ) -> Result<T, SatelleError> {
+        let engine = self.engine()?;
+        let operation = operation.operation().map_err(model::storage_failure)?;
+        let mut storage = engine.lock_storage()?;
+        mutate(&mut storage, operation.capability()).map_err(model::storage_failure)
+    }
+
+    pub(crate) fn setup_history(&self) -> Result<crate::host::SetupHistory, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .setup_history()
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn raw_protocol_export(
+        &self,
+        principal_ref: &str,
+        turn_id: &TurnId,
+    ) -> Result<RawProtocolArtifact, SatelleError> {
+        let engine = self.engine()?;
+        let storage = engine.lock_storage()?;
+        engine.raw_diagnostics.download(
+            &storage,
+            principal_ref,
+            turn_id,
+            time::OffsetDateTime::now_utc(),
+        )
+    }
+
+    pub(crate) fn acknowledge_raw_protocol_export(
+        &self,
+        principal_ref: &str,
+        turn_id: &TurnId,
+        outcome: RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        let storage = engine.lock_storage()?;
+        engine.raw_diagnostics.acknowledge(
+            &storage,
+            principal_ref,
+            turn_id,
+            outcome,
+            time::OffsetDateTime::now_utc(),
+        )
+    }
+
+    pub(crate) fn begin_raw_subprocess_export(
+        &self,
+        principal_ref: &str,
+        manifest: &crate::core::sensitive_diagnostics::RawSubprocessManifest,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .begin_raw_diagnostic_export(
+                principal_ref,
+                &manifest.into(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn prepare_raw_subprocess_export(
+        &self,
+        invocation_id: &str,
+        artifact_byte_size: usize,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .prepare_raw_diagnostic_export(invocation_id, artifact_byte_size)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn acknowledge_raw_subprocess_export(
+        &self,
+        principal_ref: &str,
+        invocation_id: &str,
+        outcome: RawDiagnosticExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .finish_raw_diagnostic_export(
+                principal_ref,
+                invocation_id,
+                outcome,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn capture_desktop_snapshot(
+        &self,
+        principal_ref: &str,
+        source_host: &str,
+        desktop_binding: &DesktopBindingRef,
+        desktop_session_identity: &str,
+    ) -> Result<crate::core::sensitive_diagnostics::DesktopSnapshotArtifact, SatelleError> {
+        let engine = self.engine()?;
+        let host_identity = engine.host_identity()?;
+        let snapshot_id = uuid::Uuid::now_v7().hyphenated().to_string();
+        let acquired_at = time::OffsetDateTime::now_utc();
+        let owner = LeaseOwner::new(
+            snapshot_id.clone(),
+            engine.process_identity.process_id(),
+            engine.process_identity.process_start_ref(),
+            engine.process_identity.boot_identity_ref(),
+            acquired_at,
+        )
+        .map_err(model::storage_failure)?;
+        if let Err(error) = engine.lock_storage()?.begin_desktop_snapshot(
+            principal_ref,
+            source_host,
+            &host_identity,
+            desktop_binding,
+            Some(desktop_session_identity),
+            &owner,
+        ) {
+            return if error.kind() == crate::host::storage::StorageErrorKind::LeaseConflict {
+                Err(SatelleError::host_busy_without_owner(source_host))
+            } else {
+                Err(model::storage_failure(error))
+            };
+        }
+        let heartbeat = match LeaseHeartbeatGuard::start(Arc::clone(&engine.storage), &owner) {
+            Ok(heartbeat) => heartbeat,
+            Err(_) => {
+                engine
+                    .lock_storage()?
+                    .fail_desktop_snapshot(&snapshot_id, time::OffsetDateTime::now_utc())
+                    .map_err(model::storage_failure)?;
+                return Err(SatelleError::desktop_snapshot_host_export_failed(
+                    "lease_heartbeat_unavailable",
+                ));
+            }
+        };
+        let png = match crate::host::desktop_snapshot::capture_current_desktop_png() {
+            Ok(png) => png,
+            Err(error) => {
+                drop(heartbeat);
+                engine
+                    .lock_storage()?
+                    .fail_desktop_snapshot(&snapshot_id, time::OffsetDateTime::now_utc())
+                    .map_err(model::storage_failure)?;
+                return Err(error);
+            }
+        };
+        let manifest = crate::core::sensitive_diagnostics::DesktopSnapshotManifest::new(
+            snapshot_id.clone(),
+            source_host,
+            host_identity.as_str(),
+            desktop_binding.as_str(),
+            Some(desktop_session_identity.to_string()),
+            png.len(),
+        );
+        if let Err(error) = engine.lock_storage()?.prepare_desktop_snapshot(&manifest) {
+            drop(heartbeat);
+            engine
+                .lock_storage()?
+                .fail_desktop_snapshot(&snapshot_id, time::OffsetDateTime::now_utc())
+                .map_err(model::storage_failure)?;
+            return Err(model::storage_failure(error));
+        }
+        drop(heartbeat);
+        Ok(crate::core::sensitive_diagnostics::DesktopSnapshotArtifact { manifest, png })
+    }
+
+    pub(crate) fn acknowledge_desktop_snapshot(
+        &self,
+        principal_ref: &str,
+        snapshot_id: &str,
+        outcome: crate::core::sensitive_diagnostics::DesktopSnapshotExportOutcome,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .finish_desktop_snapshot(
+                principal_ref,
+                snapshot_id,
+                outcome,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn load_setup_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<SetupRunRecord>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .load_setup_run(run_id)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn plan_setup_repair(
+        &self,
+        desktop_binding: Option<&DesktopBindingRef>,
+        run_id: Option<&str>,
+        probes: &[SetupRepairProbe],
+    ) -> Result<SetupRepairPlan, SatelleError> {
+        let engine = self.engine()?;
+        let storage = engine.lock_storage()?;
+        let selected_run = run_id
+            .map(|run_id| {
+                storage
+                    .load_setup_run(run_id)
+                    .map_err(model::storage_failure)?
+                    .ok_or_else(|| SatelleError::setup_ledger_unavailable(run_id))
+            })
+            .transpose()?;
+        storage
+            .plan_setup_repair(desktop_binding, selected_run.as_ref(), probes)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn reconcile_setup_maintenance(
+        &self,
+        observer: &mut dyn crate::host::SetupPostconditionObserver,
+    ) -> Result<Option<SetupRunStatus>, SatelleError> {
+        self.engine()?.reconcile_maintenance(observer)
+    }
+
+    pub(crate) fn verify_storage_migration(
+        &self,
+        operation_id: &str,
+        expected_paths: &crate::core::daemon_service::DaemonResolvedPathSet,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .verify_storage_migration(operation_id, expected_paths)
+    }
+
+    pub(crate) fn storage_migration_request_state(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<Option<crate::host::storage::StorageMigrationRequestState>, SatelleError> {
+        let input = model::idempotency(
+            IdempotentOperation::StorageMigration,
+            identity,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        self.engine()?
+            .lock_storage()?
+            .storage_migration_request_state(&input)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn start_storage_migration_request(
+        &self,
+        identity: &RequestIdentity,
+        cleanup: Option<&crate::host::StorageMigrationCleanup>,
+    ) -> Result<(), SatelleError> {
+        let input = model::idempotency(
+            IdempotentOperation::StorageMigration,
+            identity,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        self.engine()?
+            .lock_storage()?
+            .start_storage_migration_request(&input, cleanup)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn finish_storage_migration_request(
+        &self,
+        identity: &RequestIdentity,
+        reply: &crate::host::storage::StorageMigrationReply,
+    ) -> Result<(), SatelleError> {
+        let now = time::OffsetDateTime::now_utc();
+        let input = model::idempotency(IdempotentOperation::StorageMigration, identity, now)?;
+        self.engine()?
+            .lock_storage()?
+            .finish_storage_migration_request(&input, reply, now)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn cleanup_storage_migration_source(
+        &self,
+        operation_id: &str,
+        paths: &crate::core::daemon_service::DaemonResolvedPathSet,
+        approved: Option<&crate::host::StorageMigrationCleanup>,
+    ) -> Result<crate::host::StorageMigrationCleanup, SatelleError> {
+        let receipt = self
+            .engine()?
+            .lock_storage()?
+            .migration_source_for_cleanup(operation_id, paths)?;
+        receipt.cleanup(approved)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn new<A: ComputerUseAdapter>(
+        state_root: Result<PathBuf, SatelleError>,
+        adapter: A,
+    ) -> Self {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
+        Self {
+            adapter: Arc::new(adapter),
+            readiness_probe_driver: None,
+            activity: Arc::new(DaemonActivity::default()),
+            lazy: Arc::new(Mutex::new(LazyRuntime {
+                state_root,
+                operator_log_root,
+                engine: None,
+                provider_policy: RuntimeProviderPolicy::default(),
+                storage_policy: RuntimeStoragePolicy::default(),
+                provider_smoke_fingerprinter: None,
+            })),
+            queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_threads: Arc::new(AtomicUsize::new(0)),
+            queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_provider_policy<A: ComputerUseAdapter>(
+        state_root: Result<PathBuf, SatelleError>,
+        adapter: A,
+        provider_policy: RuntimeProviderPolicy,
+    ) -> Self {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
+        Self {
+            adapter: Arc::new(adapter),
+            readiness_probe_driver: None,
+            activity: Arc::new(DaemonActivity::default()),
+            lazy: Arc::new(Mutex::new(LazyRuntime {
+                state_root,
+                operator_log_root,
+                engine: None,
+                provider_policy,
+                storage_policy: RuntimeStoragePolicy::default(),
+                provider_smoke_fingerprinter: Some(
+                    crate::host::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
+                ),
+            })),
+            queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_threads: Arc::new(AtomicUsize::new(0)),
+            queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_provider_policy_and_readiness_probe_driver<A, D>(
+        state_root: Result<PathBuf, SatelleError>,
+        adapter: A,
+        readiness_probe_driver: D,
+        provider_policy: RuntimeProviderPolicy,
+    ) -> Self
+    where
+        A: ComputerUseAdapter,
+        D: ReadinessProbeDriver,
+    {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
+        Self {
+            adapter: Arc::new(adapter),
+            readiness_probe_driver: Some(Arc::new(readiness_probe_driver)),
+            activity: Arc::new(DaemonActivity::default()),
+            lazy: Arc::new(Mutex::new(LazyRuntime {
+                state_root,
+                operator_log_root,
+                engine: None,
+                provider_policy,
+                storage_policy: RuntimeStoragePolicy::default(),
+                provider_smoke_fingerprinter: Some(
+                    crate::host::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
+                ),
+            })),
+            queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_threads: Arc::new(AtomicUsize::new(0)),
+            queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn new_production(
+        state_root: Result<PathBuf, SatelleError>,
+        operator_log_root: Result<PathBuf, SatelleError>,
+        adapter: ProductionComputerUseAdapter,
+        provider_policy: RuntimeProviderPolicy,
+        storage_policy: RuntimeStoragePolicy,
+    ) -> Self {
+        let provider_smoke_fingerprinter = adapter.provider_smoke_fingerprinter();
+        let adapter = Arc::new(adapter);
+        let computer_use_adapter: Arc<dyn ComputerUseAdapter> = adapter.clone();
+        let readiness_probe_driver: Arc<dyn ReadinessProbeDriver> = adapter;
+        Self {
+            adapter: computer_use_adapter,
+            readiness_probe_driver: Some(readiness_probe_driver),
+            activity: Arc::new(DaemonActivity::default()),
+            lazy: Arc::new(Mutex::new(LazyRuntime {
+                state_root,
+                operator_log_root,
+                engine: None,
+                provider_policy,
+                storage_policy,
+                provider_smoke_fingerprinter: Some(provider_smoke_fingerprinter),
+            })),
+            queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_threads: Arc::new(AtomicUsize::new(0)),
+            queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn setup_ledger_retention_for_tests(&self) -> time::Duration {
+        self.lazy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .storage_policy
+            .setup_ledger_retention
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sqlite_log_retention_for_tests(&self) -> time::Duration {
+        self.lazy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .storage_policy
+            .sqlite_log_retention
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn new_with_readiness_probe_driver<A, D>(
+        state_root: Result<PathBuf, SatelleError>,
+        adapter: A,
+        readiness_probe_driver: D,
+    ) -> Self
+    where
+        A: ComputerUseAdapter,
+        D: ReadinessProbeDriver,
+    {
+        let operator_log_root = state_root
+            .as_ref()
+            .map(|root| root.join("logs"))
+            .map_err(Clone::clone);
+        Self {
+            adapter: Arc::new(adapter),
+            readiness_probe_driver: Some(Arc::new(readiness_probe_driver)),
+            activity: Arc::new(DaemonActivity::default()),
+            lazy: Arc::new(Mutex::new(LazyRuntime {
+                state_root,
+                operator_log_root,
+                engine: None,
+                provider_policy: RuntimeProviderPolicy::default(),
+                storage_policy: RuntimeStoragePolicy::default(),
+                provider_smoke_fingerprinter: Some(
+                    crate::host::provider_auth::ProviderSmokeCredentialFingerprinter::default(),
+                ),
+            })),
+            queue_worker_running: Arc::new(AtomicBool::new(false)),
+            queue_worker_threads: Arc::new(AtomicUsize::new(0)),
+            queue_worker_shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn replay_admission_if_present(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+    ) -> Result<Option<RuntimeAdmissionReplay>, SatelleError> {
+        let Some(engine) = self.existing_engine()? else {
+            return Ok(None);
+        };
+        engine.replay_admission(operation, identity, expected_session_id)
+    }
+
+    pub(crate) fn resolve_admission_operation(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+    ) -> Result<RuntimeAdmissionState, SatelleError> {
+        self.engine()?
+            .resolve_admission_operation(operation, identity, expected_session_id)
+    }
+
+    pub(crate) fn record_admission_cancellation(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+        outcome: crate::host::storage::DurableCancellationOutcome,
+        reconciled: bool,
+    ) -> Result<RuntimeAdmissionState, SatelleError> {
+        self.engine()?.record_admission_cancellation(
+            operation,
+            identity,
+            expected_session_id,
+            outcome,
+            reconciled,
+        )
+    }
+
+    pub(crate) fn run(
+        &self,
+        command: RunCommand<'_>,
+    ) -> Result<RuntimeTurnOutcome, TurnAdmissionFailure> {
+        if let Some(replay) = self
+            .replay_admission_if_present(IdempotentOperation::Run, &command.identity, None)
+            .map_err(TurnAdmissionFailure::admission_unknown)?
+        {
+            return Ok(replay.outcome);
+        }
+        let existing_engine = self
+            .existing_engine()
+            .map_err(TurnAdmissionFailure::admission_unknown)?;
+        if let Err(error) = self.adapter.admit_operation(ControlPlaneOperation::Run) {
+            return self.resolve_precommit_failure(
+                IdempotentOperation::Run,
+                &command.identity,
+                None,
+                error,
+            );
+        }
+        let needs_persistent_replay = existing_engine.is_none();
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(error) => {
+                return self.resolve_precommit_failure(
+                    IdempotentOperation::Run,
+                    &command.identity,
+                    None,
+                    error,
+                );
+            }
+        };
+        if needs_persistent_replay
+            && let Some(replay) = engine
+                .replay_admission(IdempotentOperation::Run, &command.identity, None)
+                .map_err(TurnAdmissionFailure::admission_unknown)?
+        {
+            return Ok(replay.outcome);
+        }
+        if let Err(error) = engine.reconcile_before_admission() {
+            return self.resolve_precommit_failure(
+                IdempotentOperation::Run,
+                &command.identity,
+                None,
+                error,
+            );
+        }
+        let provider_intent = command
+            .provider_intent
+            .clone()
+            .with_desktop_binding(command.desktop_binding.clone());
+        let readiness =
+            match engine.preflight(command.host, &provider_intent, &command.cancellation) {
+                Ok(readiness) => readiness,
+                Err(error) => {
+                    return self.resolve_precommit_failure(
+                        IdempotentOperation::Run,
+                        &command.identity,
+                        None,
+                        error,
+                    );
+                }
+            };
+        let identity = command.identity.clone();
+        match engine.run(command, readiness) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(Self::classify_failed_admission(
+                &engine,
+                IdempotentOperation::Run,
+                &identity,
+                None,
+                error,
+            )),
+        }
+    }
+
+    pub(crate) fn steer(
+        &self,
+        command: SteerCommand<'_>,
+    ) -> Result<RuntimeTurnOutcome, TurnAdmissionFailure> {
+        if let Some(replay) = self
+            .replay_admission_if_present(
+                IdempotentOperation::Steer,
+                &command.identity,
+                Some(&command.session_id),
+            )
+            .map_err(TurnAdmissionFailure::admission_unknown)?
+        {
+            return Ok(replay.outcome);
+        }
+        let existing_engine = self
+            .existing_engine()
+            .map_err(TurnAdmissionFailure::admission_unknown)?;
+        if let Err(error) = self.adapter.admit_operation(ControlPlaneOperation::Steer) {
+            return self.resolve_precommit_failure(
+                IdempotentOperation::Steer,
+                &command.identity,
+                Some(&command.session_id),
+                error,
+            );
+        }
+        let needs_persistent_replay = existing_engine.is_none();
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(error) => {
+                return self.resolve_precommit_failure(
+                    IdempotentOperation::Steer,
+                    &command.identity,
+                    Some(&command.session_id),
+                    error,
+                );
+            }
+        };
+        if needs_persistent_replay
+            && let Some(replay) = engine
+                .replay_admission(
+                    IdempotentOperation::Steer,
+                    &command.identity,
+                    Some(&command.session_id),
+                )
+                .map_err(TurnAdmissionFailure::admission_unknown)?
+        {
+            return Ok(replay.outcome);
+        }
+        if let Err(error) = engine.reconcile_before_admission() {
+            return self.resolve_precommit_failure(
+                IdempotentOperation::Steer,
+                &command.identity,
+                Some(&command.session_id),
+                error,
+            );
+        }
+        let provider_intent = command
+            .provider_intent
+            .clone()
+            .with_desktop_binding(command.desktop_binding.clone());
+        let readiness =
+            match engine.preflight(LOCAL_DEMO_HOST, &provider_intent, &command.cancellation) {
+                Ok(readiness) => readiness,
+                Err(error) => {
+                    return self.resolve_precommit_failure(
+                        IdempotentOperation::Steer,
+                        &command.identity,
+                        Some(&command.session_id),
+                        error,
+                    );
+                }
+            };
+        let identity = command.identity.clone();
+        let session_id = command.session_id.clone();
+        match engine.steer(command, readiness) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => Err(Self::classify_failed_admission(
+                &engine,
+                IdempotentOperation::Steer,
+                &identity,
+                Some(&session_id),
+                error,
+            )),
+        }
+    }
+
+    fn classify_failed_admission(
+        engine: &RuntimeEngine,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+        failure: RuntimeTurnFailure,
+    ) -> TurnAdmissionFailure {
+        let RuntimeTurnFailure { error, events } = failure;
+        match engine.replay_admission(operation, identity, expected_session_id) {
+            Ok(Some(replay)) => TurnAdmissionFailure::admitted_with_events(
+                *error,
+                replay.outcome.session,
+                replay.turn_id,
+                events,
+            ),
+            Ok(None) => TurnAdmissionFailure::not_admitted(*error),
+            Err(_) => TurnAdmissionFailure::admission_unknown_with_events(*error, events),
+        }
+    }
+
+    fn resolve_precommit_failure(
+        &self,
+        operation: IdempotentOperation,
+        identity: &RequestIdentity,
+        expected_session_id: Option<&SessionId>,
+        error: SatelleError,
+    ) -> Result<RuntimeTurnOutcome, TurnAdmissionFailure> {
+        let engine = match self.existing_engine() {
+            Ok(Some(engine)) => engine,
+            Ok(None) => return Err(TurnAdmissionFailure::not_admitted(error)),
+            Err(_) => return Err(TurnAdmissionFailure::admission_unknown(error)),
+        };
+        match engine.replay_admission(operation, identity, expected_session_id) {
+            Ok(Some(replay)) => Ok(replay.outcome),
+            Ok(None) => Err(TurnAdmissionFailure::not_admitted(error)),
+            Err(_) => Err(TurnAdmissionFailure::admission_unknown(error)),
+        }
+    }
+
+    pub(crate) fn status(&self, session_id: SessionId) -> Result<PublicSession, SatelleError> {
+        self.engine()?.status(&session_id)
+    }
+
+    pub(crate) fn task_artifacts(
+        &self,
+        session_id: SessionId,
+    ) -> Result<TaskArtifactSet, SatelleError> {
+        self.engine()?.task_artifacts(&session_id)
+    }
+
+    pub(crate) fn log_page(&self, query: &LogPageQuery) -> Result<DaemonLogPage, SatelleError> {
+        self.engine()?.log_page(query)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn append_log_for_tests(
+        &self,
+        timestamp: time::OffsetDateTime,
+        source: crate::host::LogSource,
+        severity: crate::host::LogSeverity,
+    ) -> Result<LogCursor, SatelleError> {
+        self.engine()?
+            .append_log_for_tests(timestamp, source, severity)
+    }
+
+    pub(crate) fn reconcile_and_snapshot(&self) -> Result<RuntimeSnapshot, SatelleError> {
+        let engine = self.engine()?;
+        engine.reconcile_pending()?;
+        engine.snapshot()
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<RuntimeSnapshot, SatelleError> {
+        self.engine()?.snapshot()
+    }
+
+    pub(crate) fn has_reusable_readiness(&self, host: &str) -> Result<bool, SatelleError> {
+        self.engine()?.has_reusable_readiness(host)
+    }
+
+    /// Runs readiness preflight without admitting a Session or Turn. Doctor
+    /// uses this path so a provider refresh updates the normal Host cache but
+    /// can never cross into prompt execution.
+    pub(crate) fn refresh_provider_smoke(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        let _activity = self.activity.begin();
+        self.engine()?
+            .preflight(host, provider_intent, &AdmissionCancellation::new())
+    }
+
+    pub(crate) fn provider_secret_provisioning_ownership(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        operation_id: &str,
+    ) -> Result<
+        (
+            crate::core::session::HostIdentityRef,
+            ReadinessCacheKey,
+            LeaseOwner,
+        ),
+        SatelleError,
+    > {
+        let engine = self.engine()?;
+        let authorized = engine.authorize_provider_intent(host, provider_intent)?;
+        let key = engine
+            .adapter
+            .readiness_cache_key(host, &authorized)?
+            .ok_or_else(SatelleError::computer_use_not_ready)?;
+        let now = time::OffsetDateTime::now_utc();
+        let owner = LeaseOwner::new(
+            operation_id,
+            engine.process_identity.process_id(),
+            engine.process_identity.process_start_ref(),
+            engine.process_identity.boot_identity_ref(),
+            now,
+        )
+        .map_err(model::storage_failure)?;
+        Ok((engine.host_identity()?, key, owner))
+    }
+
+    pub(crate) fn provider_secret_provisioning_replay(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<Option<crate::core::ProviderSecretProvisioningResult>, SatelleError> {
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderSecretProvisioning,
+            identity,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        match self
+            .engine()?
+            .lock_storage()?
+            .provider_secret_provisioning_replay(&idempotency)
+            .map_err(model::storage_failure)?
+        {
+            ProviderSecretProvisioningPreflight::Absent => Ok(None),
+            ProviderSecretProvisioningPreflight::InProgress => Err(SatelleError::state_conflict()),
+            ProviderSecretProvisioningPreflight::Replay(
+                ProviderSecretProvisioningReplay::Completed(result),
+            ) => Ok(Some(result)),
+            ProviderSecretProvisioningPreflight::Replay(
+                ProviderSecretProvisioningReplay::Failed(error),
+            ) => Err(error),
+        }
+    }
+
+    pub(crate) fn begin_provider_secret_provisioning(
+        &self,
+        identity: &RequestIdentity,
+        key: &ReadinessCacheKey,
+        owner: &LeaseOwner,
+        plan: ProviderSecretProvisioningPlan,
+    ) -> Result<BeginProviderSecretProvisioning, SatelleError> {
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderSecretProvisioning,
+            identity,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        self.engine()?
+            .lock_storage()?
+            .begin_provider_secret_provisioning(&idempotency, key, owner, plan)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn record_staged_provider_secret(
+        &self,
+        operation_id: &str,
+        destination_existed: bool,
+        backup_path: Option<&Path>,
+        prior_secret_hmac: Option<&str>,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .record_staged_provider_secret(
+                operation_id,
+                destination_existed,
+                backup_path,
+                prior_secret_hmac,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn transition_provider_secret_provisioning(
+        &self,
+        operation_id: &str,
+        expected: ProviderSecretProvisioningPhase,
+        next: ProviderSecretProvisioningPhase,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .transition_provider_secret_provisioning(
+                operation_id,
+                expected,
+                next,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn mark_provider_secret_provisioning_rollback_pending(
+        &self,
+        operation_id: &str,
+        expected: ProviderSecretProvisioningPhase,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .mark_provider_secret_provisioning_rollback_pending(
+                operation_id,
+                expected,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_provider_secret_provisioning(
+        &self,
+        operation_id: &str,
+        binding: &ResolvedProviderBinding,
+        key: &ReadinessCacheKey,
+        readiness: &ReadinessEvidence,
+        provider: Option<&ProviderSmokeEvidence>,
+    ) -> Result<(), SatelleError> {
+        let provider = binding
+            .experimental_provider_computer_use()
+            .then_some(provider)
+            .flatten();
+        self.engine()?
+            .lock_storage()?
+            .commit_provider_secret_provisioning(
+                operation_id,
+                binding,
+                key,
+                readiness,
+                provider,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn finish_provider_secret_provisioning_success(
+        &self,
+        operation_id: &str,
+    ) -> Result<crate::core::ProviderSecretProvisioningResult, SatelleError> {
+        match self
+            .engine()?
+            .lock_storage()?
+            .finish_provider_secret_provisioning_success(
+                operation_id,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)?
+        {
+            ProviderSecretProvisioningReplay::Completed(result) => Ok(result),
+            ProviderSecretProvisioningReplay::Failed(_) => Err(integrity_error(
+                "successful provider provisioning produced a failure replay",
+            )),
+        }
+    }
+
+    pub(crate) fn finish_provider_secret_provisioning_failure(
+        &self,
+        operation_id: &str,
+        error: SatelleError,
+    ) -> Result<SatelleError, SatelleError> {
+        match self
+            .engine()?
+            .lock_storage()?
+            .finish_provider_secret_provisioning_failure(
+                operation_id,
+                error,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)?
+        {
+            ProviderSecretProvisioningReplay::Failed(error) => Ok(error),
+            ProviderSecretProvisioningReplay::Completed(_) => Err(integrity_error(
+                "failed provider provisioning produced a success replay",
+            )),
+        }
+    }
+
+    pub(crate) fn validate_staged_provider_secret(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        native_readiness: ReadinessEvidence,
+        provider_secret: crate::host::provider_auth::ResolvedProviderSecret,
+        owned_provider_probe: OwnedProviderProbe,
+    ) -> Result<PendingProviderReadiness, ProviderSecretValidationFailure> {
+        let _activity = self.activity.begin();
+        self.engine()
+            .map_err(ProviderSecretValidationFailure::Terminal)?
+            .provider_secret_provisioning_probe(
+                host,
+                provider_intent,
+                native_readiness,
+                provider_secret,
+                owned_provider_probe,
+            )
+    }
+
+    pub(crate) fn start_owned_provider_probe(
+        &self,
+        provider_probe_ref: impl Into<String>,
+        owner: &LeaseOwner,
+    ) -> Result<OwnedProviderProbe, SatelleError> {
+        let engine = self.engine()?;
+        let heartbeat = LeaseHeartbeatGuard::start(Arc::clone(&engine.storage), owner)
+            .map_err(heartbeat_start_failure)?;
+        Ok(OwnedProviderProbe {
+            provider_probe_ref: provider_probe_ref.into(),
+            heartbeat,
+        })
+    }
+
+    /// Runs only the live native setup phase for the current explicit Host
+    /// context. Provider authorization cannot run before this returns.
+    pub(crate) fn refresh_setup_native_readiness(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ReadinessEvidence, SatelleError> {
+        let cancellation = AdmissionCancellation::new();
+        self.refresh_setup_native_readiness_with_cancellation(host, provider_intent, &cancellation)
+    }
+
+    pub(crate) fn refresh_setup_native_readiness_with_cancellation(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        cancellation: &AdmissionCancellation,
+    ) -> Result<ReadinessEvidence, SatelleError> {
+        let _activity = self.activity.begin();
+        let engine = self.engine()?;
+        let provider_intent = provider_intent.clone().with_refresh(true);
+        let key = engine
+            .adapter
+            .readiness_cache_key(host, &provider_intent)?
+            .ok_or_else(SatelleError::computer_use_not_ready)?;
+        let driver = engine
+            .readiness_probe_driver
+            .as_ref()
+            .ok_or_else(SatelleError::computer_use_not_ready)?;
+        engine.reconcile_readiness_probe(&key, driver.as_ref(), ReadinessProbeKind::Native)?;
+        engine.run_live_native_probe(&key, driver.as_ref(), cancellation)
+    }
+
+    /// Runs provider authorization and a live provider smoke probe using the
+    /// native evidence returned by `refresh_setup_native_readiness`.
+    pub(crate) fn refresh_setup_provider_readiness_with_cancellation(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+        native: ReadinessEvidence,
+        cancellation: &AdmissionCancellation,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        let _activity = self.activity.begin();
+        let intent = provider_intent.clone().with_refresh(true);
+        self.engine()?
+            .preflight_with_native(host, &intent, cancellation, Some(native))
+    }
+
+    pub(crate) fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ProviderBindingResolution, SatelleError> {
+        self.engine()?
+            .resolve_provider_binding(host, provider_intent)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn authorize_provider_binding(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        binding: &ResolvedProviderBinding,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .authorize_provider_binding(desktop_binding, binding)
+    }
+
+    pub(crate) fn provider_binding_digest(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<Option<String>, SatelleError> {
+        self.engine()?
+            .provider_binding_digest(desktop_binding, model_alias, provider_alias)
+    }
+
+    pub(crate) fn authorize_provider_binding_if_unchanged(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        binding: &ResolvedProviderBinding,
+        expected_previous_digest: Option<&str>,
+    ) -> Result<(), SatelleError> {
+        self.engine()?.authorize_provider_binding_if_unchanged(
+            desktop_binding,
+            binding,
+            expected_previous_digest,
+        )
+    }
+
+    pub(crate) fn delete_provider_binding(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> Result<bool, SatelleError> {
+        self.engine()?
+            .delete_provider_binding(desktop_binding, model_alias, provider_alias)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_provider_smoke(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ProviderSmokeResult>, SatelleError> {
+        self.engine()?.cached_provider_smoke(host, provider_intent)
+    }
+
+    pub(crate) fn daemon_workers_idle(&self) -> Result<bool, SatelleError> {
+        Ok(self.engine()?.reap_finished_workers()?
+            && !self.queue_worker_running.load(Ordering::Acquire)
+            && self.queue_worker_threads.load(Ordering::Acquire) == 0)
+    }
+
+    pub(crate) fn daemon_activity_snapshot(&self) -> Result<(bool, u64), SatelleError> {
+        let workers_idle = self.engine()?.reap_finished_workers()?;
+        let activity = self.activity.snapshot();
+        Ok((workers_idle && activity.is_idle(), activity.generation()))
+    }
+
+    pub(crate) fn subscribe_live_events(
+        &self,
+    ) -> Result<crate::host::LiveEventSubscription, SatelleError> {
+        Ok(self.engine()?.subscribe_live_events())
+    }
+
+    pub(crate) fn register_api_token(
+        &self,
+        registration: ApiTokenRegistration,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .register_api_token(registration)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn authenticate_api_token(
+        &self,
+        token: &ApiBearerToken,
+        at: time::OffsetDateTime,
+    ) -> Result<Option<ApiPrincipal>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .authenticate_api_token(token, at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn record_client_certificate_auth(
+        &self,
+        principal: &ApiPrincipal,
+        request_id: uuid::Uuid,
+        certificate_sha256: &[u8; 32],
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .record_client_certificate_auth(
+                principal,
+                request_id,
+                certificate_sha256,
+                time::OffsetDateTime::now_utc(),
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn authenticate_pending_setup_api_token(
+        &self,
+        token: &ApiBearerToken,
+        at: time::OffsetDateTime,
+    ) -> Result<Option<ApiPrincipal>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .authenticate_pending_setup_api_token(token, at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn api_principal_is_active(
+        &self,
+        principal: &ApiPrincipal,
+        at: time::OffsetDateTime,
+    ) -> Result<bool, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .api_principal_is_active(principal, at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn queue_lease_key(&self, desktop_binding: &str) -> Result<String, SatelleError> {
+        let host_identity = self
+            .engine()?
+            .lock_storage()?
+            .host_identity()
+            .map_err(model::storage_failure)?;
+        Ok(format!("{}:{}", host_identity.as_str(), desktop_binding))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_turn_queue(
+        &self,
+        queue_request_id: &QueueRequestId,
+        lease_key: &str,
+        desktop_binding: &DesktopBindingRef,
+        token_id: &str,
+        credential_revision: u64,
+        principal_ref: &str,
+        operation: TurnQueueOperation,
+        idempotency_key: &str,
+        session_id: Option<&SessionId>,
+        payload: &[u8],
+        enqueued_at: time::OffsetDateTime,
+        expires_at: time::OffsetDateTime,
+        max_depth: u16,
+    ) -> Result<Option<StoredQueueRecord>, SatelleError> {
+        let engine = self.engine()?;
+        let (payload_file, payload_sha256) =
+            engine.queue_payloads.write(queue_request_id, payload)?;
+        let record = NewQueueRecord {
+            queue_request_id,
+            lease_key,
+            desktop_binding: desktop_binding.clone(),
+            token_id,
+            credential_revision,
+            principal_ref,
+            operation,
+            idempotency_key,
+            request_digest: &payload_sha256,
+            payload_file: &payload_file,
+            payload_sha256: &payload_sha256,
+            enqueued_at,
+            expires_at,
+            session_id,
+        };
+        let outcome = engine
+            .lock_storage()?
+            .enqueue_queue_request(&record, max_depth)
+            .map_err(model::storage_failure);
+        match outcome {
+            Ok(QueueEnqueueOutcome::Inserted(record)) => {
+                engine.publish_queue_event(
+                    crate::core::EventType::TurnQueued,
+                    &record.status,
+                    "queued Turn request",
+                )?;
+                Ok(Some(record))
+            }
+            Ok(QueueEnqueueOutcome::Replayed(record)) => {
+                engine.queue_payloads.delete(&payload_file)?;
+                Ok(Some(record))
+            }
+            Ok(QueueEnqueueOutcome::Full) => {
+                engine.queue_payloads.delete(&payload_file)?;
+                Ok(None)
+            }
+            Err(error) => {
+                let _ = engine.queue_payloads.delete(&payload_file);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn expire_turn_queue(
+        &self,
+        observed_at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        let expired = engine
+            .lock_storage()?
+            .expire_queue_requests(observed_at)
+            .map_err(model::storage_failure)?;
+        let mut changed_positions = BTreeMap::<String, u16>::new();
+        for (record, old_position) in expired {
+            engine.queue_payloads.delete(&record.payload_file)?;
+            engine.publish_queue_event(
+                crate::core::EventType::TurnQueueExpired,
+                &record.status,
+                "queued Turn request expired",
+            )?;
+            changed_positions
+                .entry(record.lease_key)
+                .and_modify(|position| *position = (*position).min(old_position))
+                .or_insert(old_position);
+        }
+        for (lease_key, first_changed_position) in changed_positions {
+            self.publish_queue_position_changes(&lease_key, first_changed_position)?;
+        }
+        Ok(())
+    }
+
+    fn publish_queue_position_changes(
+        &self,
+        lease_key: &str,
+        first_changed_position: u16,
+    ) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        let records = engine
+            .lock_storage()?
+            .advance_queue_positions(lease_key, first_changed_position)
+            .map_err(model::storage_failure)?;
+        for record in records {
+            engine.publish_queue_event(
+                crate::core::EventType::QueuePositionChanged,
+                &record.status,
+                "queued Turn position changed",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn next_queued_turn(
+        &self,
+        lease_key: &str,
+    ) -> Result<Option<StoredQueueRecord>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .first_queued_request(lease_key)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn queued_turn_status(
+        &self,
+        principal_ref: &str,
+        queue_request_id: &QueueRequestId,
+    ) -> Result<Option<StoredQueueRecord>, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .queue_status(principal_ref, queue_request_id)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn cancel_queued_turn(
+        &self,
+        principal_ref: &str,
+        queue_request_id: &QueueRequestId,
+    ) -> Result<Option<StoredQueueRecord>, SatelleError> {
+        let engine = self.engine()?;
+        let cancellation = engine
+            .lock_storage()?
+            .cancel_queue_request(principal_ref, queue_request_id)
+            .map_err(model::storage_failure)?;
+        if let Some(cancellation) = &cancellation
+            && let Some(cancelled_position) = cancellation.cancelled_position
+        {
+            let record = &cancellation.record;
+            engine.queue_payloads.delete(&record.payload_file)?;
+            engine.publish_queue_event(
+                crate::core::EventType::TurnQueueCancelled,
+                &record.status,
+                "cancelled queued Turn request",
+            )?;
+            self.publish_queue_position_changes(&record.lease_key, cancelled_position)?;
+        }
+        Ok(cancellation.map(|cancellation| cancellation.record))
+    }
+
+    pub(crate) fn read_queued_turn(
+        &self,
+        record: &StoredQueueRecord,
+    ) -> Result<QueuedTurnPayload, SatelleError> {
+        self.engine()?
+            .queue_payloads
+            .read(&record.payload_file, &record.payload_sha256)
+    }
+
+    pub(crate) fn finish_queued_turn_admitted(
+        &self,
+        record: &StoredQueueRecord,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        engine
+            .lock_storage()?
+            .admit_queue_request(&record.status.queue_request_id, session_id, turn_id)
+            .map_err(model::storage_failure)?;
+        engine.queue_payloads.delete(&record.payload_file)?;
+        let admitted = engine
+            .lock_storage()?
+            .queue_status_unowned(&record.status.queue_request_id)
+            .map_err(model::storage_failure)?
+            .ok_or_else(SatelleError::state_conflict)?;
+        engine.publish_queue_event(
+            crate::core::EventType::TurnDequeued,
+            &admitted.status,
+            "admitted queued Turn request",
+        )?;
+        self.publish_queue_position_changes(&record.lease_key, record.status.position.unwrap_or(1))
+    }
+
+    pub(crate) fn finish_queued_turn_failed(
+        &self,
+        record: &StoredQueueRecord,
+        failure: &crate::core::queue::QueueFailure,
+    ) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        engine
+            .lock_storage()?
+            .fail_queue_request(&record.status.queue_request_id, failure)
+            .map_err(model::storage_failure)?;
+        engine.queue_payloads.delete(&record.payload_file)?;
+        let failed = engine
+            .lock_storage()?
+            .queue_status_unowned(&record.status.queue_request_id)
+            .map_err(model::storage_failure)?
+            .ok_or_else(SatelleError::state_conflict)?;
+        engine.publish_queue_event(
+            crate::core::EventType::TurnQueueValidationFailed,
+            &failed.status,
+            "queued Turn failed pre-start validation",
+        )?;
+        self.publish_queue_position_changes(&record.lease_key, record.status.position.unwrap_or(1))
+    }
+
+    pub(crate) fn rotate_api_token(
+        &self,
+        replacement: &ApiBearerToken,
+        expected_credential_revision: u64,
+        at: time::OffsetDateTime,
+    ) -> Result<ApiPrincipal, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .rotate_api_token(replacement, expected_credential_revision, at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn api_token_mutation_replay(
+        &self,
+        input: &crate::host::storage::IdempotencyInput,
+        principal: &ApiPrincipal,
+    ) -> Result<Option<crate::host::ApiTokenMutationOutcome>, SatelleError> {
+        let engine = self.engine()?;
+        let storage = engine.lock_storage()?;
+        if !storage
+            .api_principal_is_active(principal, time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)?
+        {
+            return Ok(Some(crate::host::ApiTokenMutationOutcome::Rejected(
+                crate::host::ApiTokenRejection::AuthenticationFailed,
+            )));
+        }
+        storage
+            .api_token_mutation_replay(input)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn mutate_api_token(
+        &self,
+        input: &crate::host::storage::IdempotencyInput,
+        mutation: &crate::host::ApiTokenMutation,
+        principal: &ApiPrincipal,
+    ) -> Result<crate::host::ApiTokenMutationResult, SatelleError> {
+        let engine = self.engine()?;
+        let mut storage = engine.lock_storage()?;
+        let at = time::OffsetDateTime::now_utc();
+        // Authentication may have changed while this operation acquired
+        // capacity. The storage lock holds that authority stable through commit.
+        if !storage
+            .api_principal_is_active(principal, at)
+            .map_err(model::storage_failure)?
+        {
+            return Ok(crate::host::ApiTokenMutationResult {
+                outcome: crate::host::ApiTokenMutationOutcome::Rejected(
+                    crate::host::ApiTokenRejection::AuthenticationFailed,
+                ),
+                bearer_token: None,
+            });
+        }
+        let affected_credential = match mutation {
+            crate::host::ApiTokenMutation::Rotate {
+                token_id,
+                expected_credential_revision,
+            }
+            | crate::host::ApiTokenMutation::Revoke {
+                token_id,
+                expected_credential_revision,
+            } => Some((token_id.as_str(), *expected_credential_revision)),
+            crate::host::ApiTokenMutation::Issue { .. } => None,
+        };
+        let result = storage
+            .mutate_api_token(input, mutation, at)
+            .map_err(model::storage_failure)?;
+        let queued = if matches!(
+            &result.outcome,
+            crate::host::ApiTokenMutationOutcome::Completed(_)
+        ) {
+            match affected_credential {
+                Some((token_id, credential_revision)) => storage
+                    .fail_queue_requests_for_credential(
+                        token_id,
+                        credential_revision,
+                        &crate::core::queue::QueueFailure {
+                            code: ErrorCode::QueuedPrincipalNoLongerAuthorized
+                                .as_str()
+                                .to_string(),
+                            message: "the queued API Principal is no longer authorized".to_string(),
+                        },
+                    )
+                    .map_err(model::storage_failure)?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        drop(storage);
+        let mut affected_leases = BTreeMap::<String, u16>::new();
+        for (record, old_position) in queued {
+            engine.queue_payloads.delete(&record.payload_file)?;
+            engine.publish_queue_event(
+                crate::core::EventType::TurnQueueValidationFailed,
+                &record.status,
+                "queued Turn credential is no longer authorized",
+            )?;
+            affected_leases
+                .entry(record.lease_key)
+                .and_modify(|position| *position = (*position).min(old_position))
+                .or_insert(old_position);
+        }
+        for (lease_key, first_changed_position) in affected_leases {
+            self.publish_queue_position_changes(&lease_key, first_changed_position)?;
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn activate_api_token(
+        &self,
+        token_id: &str,
+        at: time::OffsetDateTime,
+    ) -> Result<ApiPrincipal, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .activate_api_token(token_id, at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn abort_setup_api_token(
+        &self,
+        token_id: &str,
+        at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .abort_setup_api_token(token_id, at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn revoke_api_token(
+        &self,
+        token_id: &str,
+        at: time::OffsetDateTime,
+    ) -> Result<(), SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .revoke_api_token(token_id, at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn rotate_idempotency_hmac_key(&self) -> Result<u16, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .rotate_idempotency_hmac_key(time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn authenticated_request_identity(
+        &self,
+        principal: &ApiPrincipal,
+        operation: IdempotentOperation,
+        idempotency_key: &str,
+        canonical_payload: &[u8],
+        digest_schema_version: u16,
+    ) -> Result<RequestIdentity, SatelleError> {
+        let engine = self.engine()?;
+        engine.maintain_session_retention(time::OffsetDateTime::now_utc())?;
+        let storage = engine.lock_storage()?;
+        let key_version = storage
+            .idempotency_hmac_key_version(principal.principal_ref(), operation, idempotency_key)
+            .map_err(model::storage_failure)?;
+        let digest: SensitiveRequestDigest = match key_version {
+            Some(key_version) => storage
+                .digest_idempotency_payload_with_key(canonical_payload, key_version)
+                .map_err(model::storage_failure),
+            None => storage
+                .digest_idempotency_payload(canonical_payload)
+                .map_err(model::storage_failure),
+        }?;
+        Ok(RequestIdentity::authenticated(
+            principal.principal_ref(),
+            idempotency_key,
+            digest.hex(),
+            digest_schema_version,
+            digest.key_version(),
+        ))
+    }
+
+    pub(crate) fn claim_provider_descriptor_validation(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<Option<crate::core::PublicProviderDescriptorValidation>, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderDescriptorValidation,
+            identity,
+            requested_at,
+        )?;
+        let replay = self
+            .engine()?
+            .lock_storage()?
+            .claim_provider_descriptor_validation(&idempotency)
+            .map_err(model::storage_failure)?;
+        match replay
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|_| {
+                    integrity_error("stored provider validation replay is not valid canonical JSON")
+                })
+            })
+            .transpose()?
+        {
+            Some(ProviderDescriptorValidationReplay::Completed(result)) => Ok(Some(result)),
+            Some(ProviderDescriptorValidationReplay::Failed(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn complete_provider_descriptor_validation(
+        &self,
+        identity: &RequestIdentity,
+        result: &crate::core::PublicProviderDescriptorValidation,
+    ) -> Result<(), SatelleError> {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderDescriptorValidation,
+            identity,
+            completed_at,
+        )?;
+        let result_json = serde_json::to_string(&ProviderDescriptorValidationReplay::Completed(
+            result.clone(),
+        ))
+        .map_err(|_| {
+            integrity_error("provider validation result could not be serialized for durable replay")
+        })?;
+        self.engine()?
+            .lock_storage()?
+            .complete_provider_descriptor_validation(
+                &idempotency,
+                &result_json,
+                false,
+                completed_at,
+            )
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn fail_provider_descriptor_validation(
+        &self,
+        identity: &RequestIdentity,
+        error: &SatelleError,
+    ) -> Result<(), SatelleError> {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderDescriptorValidation,
+            identity,
+            completed_at,
+        )?;
+        let result_json =
+            serde_json::to_string(&ProviderDescriptorValidationReplay::Failed(error.clone()))
+                .map_err(|_| {
+                    integrity_error(
+                        "provider validation failure could not be serialized for durable replay",
+                    )
+                })?;
+        self.engine()?
+            .lock_storage()?
+            .complete_provider_descriptor_validation(&idempotency, &result_json, true, completed_at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn claim_setup_verification(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<Option<crate::core::DoctorReport>, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::SetupVerification,
+            identity,
+            requested_at,
+        )?;
+        let replay = self
+            .engine()?
+            .lock_storage()?
+            .claim_setup_verification(&idempotency)
+            .map_err(model::storage_failure)?;
+        match replay
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|_| {
+                    integrity_error("stored setup verification replay is not valid canonical JSON")
+                })
+            })
+            .transpose()?
+        {
+            Some(SetupVerificationReplay::Completed(result)) => Ok(Some(*result)),
+            Some(SetupVerificationReplay::Failed(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn complete_setup_verification(
+        &self,
+        identity: &RequestIdentity,
+        result: &crate::core::DoctorReport,
+    ) -> Result<(), SatelleError> {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::SetupVerification,
+            identity,
+            completed_at,
+        )?;
+        let result_json = serde_json::to_string(&SetupVerificationReplay::Completed(Box::new(
+            result.clone(),
+        )))
+        .map_err(|_| {
+            integrity_error("setup verification result could not be serialized for durable replay")
+        })?;
+        self.engine()?
+            .lock_storage()?
+            .complete_setup_verification(&idempotency, &result_json, false, completed_at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn fail_setup_verification(
+        &self,
+        identity: &RequestIdentity,
+        error: &SatelleError,
+    ) -> Result<(), SatelleError> {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::SetupVerification,
+            identity,
+            completed_at,
+        )?;
+        let result_json = serde_json::to_string(&SetupVerificationReplay::Failed(error.clone()))
+            .map_err(|_| {
+                integrity_error(
+                    "setup verification failure could not be serialized for durable replay",
+                )
+            })?;
+        self.engine()?
+            .lock_storage()?
+            .complete_setup_verification(&idempotency, &result_json, true, completed_at)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn invalidate_native_readiness_idempotent(
+        &self,
+        identity: &RequestIdentity,
+        host: &str,
+        provider_intent: Option<&ProviderComputerUseIntent>,
+        host_wide: bool,
+    ) -> Result<u64, SatelleError> {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::NativeReadinessInvalidation,
+            identity,
+            completed_at,
+        )?;
+        let engine = self.engine()?;
+        let key = provider_intent
+            .map(|provider_intent| engine.adapter.readiness_cache_key(host, provider_intent))
+            .transpose()?
+            .flatten();
+        let target = if host_wide {
+            NativeReadinessInvalidationTarget::Host
+        } else {
+            NativeReadinessInvalidationTarget::Intent(key.as_ref())
+        };
+        let replay = engine
+            .lock_storage()?
+            .invalidate_native_readiness_idempotent(
+                &idempotency,
+                target,
+                completed_at,
+                model::storage_failure_ref,
+            )
+            .map_err(model::storage_failure)?;
+        match replay {
+            NativeReadinessInvalidationReplay::Completed(deleted) => Ok(deleted),
+            NativeReadinessInvalidationReplay::Failed(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn invalidate_native_readiness(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<u64, SatelleError> {
+        let engine = self.engine()?;
+        let Some(key) = engine.adapter.readiness_cache_key(host, provider_intent)? else {
+            return Ok(0);
+        };
+        engine
+            .lock_storage()?
+            .invalidate_native_readiness(&key)
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn invalidate_all_native_readiness(&self) -> Result<u64, SatelleError> {
+        self.engine()?
+            .lock_storage()?
+            .invalidate_all_native_readiness()
+            .map_err(model::storage_failure)
+    }
+
+    pub(crate) fn provider_binding_authorization_replay(
+        &self,
+        identity: &RequestIdentity,
+    ) -> Result<Option<PublicResolvedProviderBinding>, SatelleError> {
+        let requested_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderBindingAuthorization,
+            identity,
+            requested_at,
+        )?;
+        match self
+            .engine()?
+            .lock_storage()?
+            .provider_binding_authorization_replay(&idempotency)
+            .map_err(model::storage_failure)?
+        {
+            Some(ProviderBindingAuthorizationReplay::Completed(binding)) => Ok(Some(binding)),
+            Some(ProviderBindingAuthorizationReplay::Failed(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn authorize_provider_binding_idempotent<F>(
+        &self,
+        identity: &RequestIdentity,
+        desktop_binding: &DesktopBindingRef,
+        model_alias: &str,
+        provider_alias: &str,
+        validate: F,
+    ) -> Result<PublicResolvedProviderBinding, SatelleError>
+    where
+        F: FnOnce() -> Result<ResolvedProviderBinding, SatelleError>,
+    {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderBindingAuthorization,
+            identity,
+            completed_at,
+        )?;
+        let engine = self.engine()?;
+        if let Some(replay) = engine
+            .lock_storage()?
+            .provider_binding_authorization_replay(&idempotency)
+            .map_err(model::storage_failure)?
+        {
+            return match replay {
+                ProviderBindingAuthorizationReplay::Completed(binding) => Ok(binding),
+                ProviderBindingAuthorizationReplay::Failed(error) => Err(error),
+            };
+        }
+        let expected_previous_digest =
+            engine.provider_binding_digest(desktop_binding, model_alias, provider_alias)?;
+        let validation = validate();
+        let replay = engine
+            .lock_storage()?
+            .authorize_provider_binding_idempotent(
+                &idempotency,
+                desktop_binding,
+                expected_previous_digest.as_deref(),
+                completed_at,
+                || validation,
+                model::storage_failure_ref,
+            )
+            .map_err(model::storage_failure)?;
+        match replay {
+            ProviderBindingAuthorizationReplay::Completed(binding) => Ok(binding),
+            ProviderBindingAuthorizationReplay::Failed(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn delete_provider_binding_idempotent<F>(
+        &self,
+        identity: &RequestIdentity,
+        desktop_binding: &DesktopBindingRef,
+        model_alias: &str,
+        provider_alias: &str,
+        validate: F,
+    ) -> Result<bool, SatelleError>
+    where
+        F: FnOnce() -> Result<(), SatelleError>,
+    {
+        let completed_at = time::OffsetDateTime::now_utc();
+        let idempotency = model::idempotency(
+            IdempotentOperation::ProviderBindingDeletion,
+            identity,
+            completed_at,
+        )?;
+        let replay = self
+            .engine()?
+            .lock_storage()?
+            .delete_provider_binding_idempotent(
+                &idempotency,
+                desktop_binding,
+                model_alias,
+                provider_alias,
+                validate,
+                model::storage_failure_ref,
+            )
+            .map_err(model::storage_failure)?;
+        match replay {
+            ProviderBindingDeletionReplay::Completed(deleted) => Ok(deleted),
+            ProviderBindingDeletionReplay::Failed(error) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_state(&self) -> Result<RuntimeStartupState, SatelleError> {
+        self.engine()?.startup_state()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_background(&self) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        worker::wait_for_background(&engine.workers)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_worker_registry_for_tests(&self) -> Result<(), SatelleError> {
+        let engine = self.engine()?;
+        let poisoner = std::thread::spawn(move || {
+            let _worker_registry = engine
+                .workers
+                .lock()
+                .expect("the worker registry should be healthy before the test poisons it");
+            panic!("poison the worker registry for deterministic dispatch failure");
+        });
+        assert!(poisoner.join().is_err());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_maintenance_start_and_retain_for_tests(&self) {
+        FAIL_NEXT_MAINTENANCE_START_AND_RETAIN.with(|fail| {
+            assert!(
+                !fail.replace(true),
+                "maintenance failpoint was already armed"
+            );
+        });
+    }
+
+    fn engine(&self) -> Result<Arc<RuntimeEngine>, SatelleError> {
+        let engine = self.engine_without_restart_recovery()?;
+        engine.initialize_restart_recovery(self)?;
+        Ok(engine)
+    }
+
+    fn engine_without_restart_recovery(&self) -> Result<Arc<RuntimeEngine>, SatelleError> {
+        let mut lazy = self.lazy.lock().map_err(|_| {
+            model::integrity_failure("the lazy runtime lock was poisoned while opening storage")
+        })?;
+        if let Some(engine) = &lazy.engine {
+            return Ok(Arc::clone(engine));
+        }
+        let state_root = lazy.state_root.clone()?;
+        let operator_log_root = lazy.operator_log_root.clone()?;
+        let engine = RuntimeEngine::open(
+            &state_root,
+            operator_log_root,
+            Arc::clone(&self.adapter),
+            self.readiness_probe_driver.clone(),
+            lazy.provider_policy.clone(),
+            lazy.storage_policy.clone(),
+            lazy.provider_smoke_fingerprinter.clone(),
+        )?;
+        lazy.engine = Some(Arc::clone(&engine));
+        Ok(engine)
+    }
+
+    fn existing_engine(&self) -> Result<Option<Arc<RuntimeEngine>>, SatelleError> {
+        let state_root = {
+            let lazy = self.lazy.lock().map_err(|_| {
+                model::integrity_failure("the lazy runtime lock was poisoned while reading storage")
+            })?;
+            if let Some(engine) = &lazy.engine {
+                return Ok(Some(Arc::clone(engine)));
+            }
+            lazy.state_root.clone()?
+        };
+        if !Storage::has_existing_state(&state_root).map_err(model::storage_failure)? {
+            return Ok(None);
+        }
+        self.engine_without_restart_recovery().map(Some)
+    }
+}
+
+struct ProviderSecretRecoveryComparison {
+    key: Zeroizing<String>,
+    digest: [u8; 32],
+}
+
+impl ProviderSecretRecoveryComparison {
+    fn as_evidence(&self) -> (&[u8], &[u8; 32]) {
+        (self.key.as_bytes(), &self.digest)
+    }
+}
+
+struct ProviderSecretRecoveryArtifact {
+    candidate: Option<ProviderSecretRecoveryComparison>,
+    prior: Option<ProviderSecretRecoveryComparison>,
+    unowned: bool,
+}
+
+fn inspect_provider_secret_recovery_artifact(
+    runtime: &RuntimeHandle,
+    path: &Path,
+    journal: &crate::host::storage::ProviderSecretProvisioningJournal,
+    allow_unowned: bool,
+) -> Result<Option<ProviderSecretRecoveryArtifact>, SatelleError> {
+    if !crate::core::owner_only_secret_destination_exists(path)
+        .map_err(|_| provider_secret_recovery_failure())?
+    {
+        return Ok(None);
+    }
+    let secret = crate::core::read_owner_only_secret_file(path)
+        .map(crate::host::provider_auth::ResolvedProviderSecret::from_provisioning)
+        .map_err(|_| provider_secret_recovery_failure())?;
+    let candidate = provider_secret_recovery_comparison(
+        runtime,
+        path,
+        crate::host::storage::PROVIDER_SECRET_CANDIDATE_HMAC_DOMAIN,
+        &secret,
+        journal.candidate_secret_hmac(),
+    )?;
+    let prior = journal
+        .prior_secret_hmac()
+        .map(|expected| {
+            provider_secret_recovery_comparison(
+                runtime,
+                path,
+                crate::host::storage::PROVIDER_SECRET_PRIOR_HMAC_DOMAIN,
+                &secret,
+                expected,
+            )
+        })
+        .transpose()?
+        .flatten();
+    if candidate.is_none() && prior.is_none() {
+        if allow_unowned {
+            return Ok(Some(ProviderSecretRecoveryArtifact {
+                candidate,
+                prior,
+                unowned: true,
+            }));
+        }
+        return Err(provider_secret_recovery_failure());
+    }
+    Ok(Some(ProviderSecretRecoveryArtifact {
+        candidate,
+        prior,
+        unowned: false,
+    }))
+}
+
+fn provider_secret_recovery_comparison(
+    runtime: &RuntimeHandle,
+    path: &Path,
+    domain: &'static str,
+    secret: &crate::host::provider_auth::ResolvedProviderSecret,
+    expected: &str,
+) -> Result<Option<ProviderSecretRecoveryComparison>, SatelleError> {
+    let key = Zeroizing::new(runtime.provider_secret_provisioning_hmac(domain, secret)?);
+    let digest = crate::core::keyed_owner_only_secret_file_comparison_digest(path, key.as_bytes())
+        .map_err(|_| provider_secret_recovery_failure())?;
+    let actual = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok((actual == expected).then_some(ProviderSecretRecoveryComparison { key, digest }))
+}
+
+fn provider_secret_recovery_failure() -> SatelleError {
+    model::integrity_failure(
+        "provider secret provisioning recovery could not prove durable artifact ownership",
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use self::codex_adapter::resolve_provider_child_secret as resolve_provider_child_secret_for_test;
+
+#[cfg(test)]
+#[path = "runtime-retention-tests.rs"]
+mod retention_tests;
+#[cfg(test)]
+#[path = "runtime-tests.rs"]
+mod tests;

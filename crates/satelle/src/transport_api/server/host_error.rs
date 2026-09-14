@@ -1,0 +1,1335 @@
+use super::auth::AuthorizedRequest;
+use super::{ApiFailure, DaemonState, api_error_response};
+use crate::core::{ErrorCode, IncompatibleControlPlaneDetails, SatelleError, SessionId, TurnId};
+use crate::transport::contract::{ApiErrorCategory, ApiErrorCode};
+use axum::http::StatusCode;
+use axum::response::Response;
+
+pub(super) fn response(
+    state: &DaemonState,
+    authorized: &AuthorizedRequest,
+    error: &SatelleError,
+) -> Response {
+    api_error_response(
+        authorized.request_id().clone(),
+        Some(state.host_identity.clone()),
+        failure(error),
+    )
+}
+
+pub(super) fn task_failure(state: &DaemonState, authorized: &AuthorizedRequest) -> Response {
+    api_error_response(
+        authorized.request_id().clone(),
+        Some(state.host_identity.clone()),
+        ApiFailure {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ApiErrorCode::InternalError,
+            category: ApiErrorCategory::Internal,
+            retryable: false,
+            message: "the Host operation task did not complete",
+            details: None,
+        },
+    )
+}
+
+fn failure(error: &SatelleError) -> ApiFailure {
+    let mut failure = match error.code {
+        ErrorCode::RawDiagnosticsRedactionFailed | ErrorCode::RawDiagnosticsStagingFailed
+        | ErrorCode::RawDiagnosticsExportFailed => ApiFailure {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: match error.code {
+                ErrorCode::RawDiagnosticsRedactionFailed => ApiErrorCode::RawDiagnosticsRedactionFailed,
+                ErrorCode::RawDiagnosticsStagingFailed => ApiErrorCode::RawDiagnosticsStagingFailed,
+                _ => ApiErrorCode::RawDiagnosticsExportFailed,
+            },
+            category: ApiErrorCategory::Storage,
+            retryable: false,
+            message: "the requested raw diagnostic export is unavailable; no raw staging files remain",
+            details: None,
+        },
+        ErrorCode::DesktopSnapshotPermissionRequired => ApiFailure {
+            status: StatusCode::FORBIDDEN,
+            code: ApiErrorCode::DesktopSnapshotPermissionRequired,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Host cannot capture the current visible desktop",
+            details: validated_string_details(error, &["reason"]),
+        },
+        ErrorCode::DesktopSnapshotRedactionFailed | ErrorCode::DesktopSnapshotExportFailed => {
+            ApiFailure {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: if error.code == ErrorCode::DesktopSnapshotRedactionFailed {
+                    ApiErrorCode::DesktopSnapshotRedactionFailed
+                } else {
+                    ApiErrorCode::DesktopSnapshotExportFailed
+                },
+                category: ApiErrorCategory::Storage,
+                retryable: false,
+                message: "the desktop snapshot could not be prepared for export",
+                details: None,
+            }
+        }
+        ErrorCode::InvalidUsage
+        | ErrorCode::ScopeSelectionConflict
+        | ErrorCode::PromptSourceConflict
+        | ErrorCode::ConfigError
+        | ErrorCode::ConfigNotFound
+        | ErrorCode::UnknownConfigKey
+        | ErrorCode::ProfileNotFound
+        | ErrorCode::ProjectProfileDefinitionNotAllowed
+        | ErrorCode::ConfigInterpolationNotSupported
+        | ErrorCode::UnknownTimeoutKey
+        | ErrorCode::DurationUnitRequired
+        | ErrorCode::TrustedProfileHostAllowlistRequired
+        | ErrorCode::UnsupportedTrustedProfileHostScope
+        | ErrorCode::TrustedProfileCommandAllowlistRequired
+        | ErrorCode::UnsupportedTrustedProfileCommandScope
+        | ErrorCode::UnsupportedConfigComposition
+        | ErrorCode::ConfigIncludeInvalid
+        | ErrorCode::ConfigIncludeOutsideSource
+        | ErrorCode::ConfigIncludeCycle
+        | ErrorCode::TrustedProfileExpired
+        | ErrorCode::ProjectDaemonPathOverrideNotAllowed
+        | ErrorCode::ProjectDesktopBindingNotAllowed
+        | ErrorCode::ProjectYoloEnableNotAllowed
+        | ErrorCode::ProjectExperimentalProviderOptInNotAllowed
+        | ErrorCode::ProjectMutationConsentNotAllowed
+        | ErrorCode::ProjectHostBindingNotAllowed
+        | ErrorCode::ProjectHostSelectionNotAllowed
+        | ErrorCode::ProjectSecretSourceNotAllowed
+        | ErrorCode::ProjectCredentialHelperNotAllowed
+        | ErrorCode::UnsupportedSecretSourceKind
+        | ErrorCode::SecretFilePathNotAbsolute
+        | ErrorCode::DesktopSessionSelectorConflict
+        | ErrorCode::PathOverrideNotAbsolute
+        | ErrorCode::DaemonPathOverrideNotAbsolute
+        | ErrorCode::EventsWithDetach
+        | ErrorCode::InterruptModeConflict
+        | ErrorCode::OutputModeConflict
+        | ErrorCode::LogTailLimitExceeded
+        | ErrorCode::LogPositionConflict
+        | ErrorCode::ConcurrencyWithoutRemoteUpdate
+        | ErrorCode::ComponentSelectionConflict
+        | ErrorCode::UnsupportedUpdateComponent
+        | ErrorCode::PersistentServiceUnsupported
+        | ErrorCode::SetupConsentRequired
+        | ErrorCode::DoctorFixConsentRequired
+        | ErrorCode::DoctorRefreshScopeRequired
+        | ErrorCode::DoctorRefreshTimeoutWithoutRefresh
+        | ErrorCode::RawDiagnosticsOutputRequired
+        | ErrorCode::RawDiagnosticsConsentRequired
+        | ErrorCode::DesktopSnapshotTargetRequired
+        | ErrorCode::DesktopSnapshotAmbiguous
+        | ErrorCode::DesktopSnapshotConsentRequired
+        | ErrorCode::InputRequired => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::InvalidRequest,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the Host rejected the operation input",
+            details: None,
+        },
+        ErrorCode::ExperimentalProviderOptInRequired => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::ExperimentalProviderOptInRequired,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the provider configuration cannot admit this operation",
+            details: None,
+        },
+        ErrorCode::ProviderSecretSourceRequired => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::ProviderSecretSourceRequired,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "provider authentication requires a Secret Source descriptor",
+            details: None,
+        },
+        ErrorCode::ProviderSecretProvisioningRequired => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::ProviderSecretProvisioningRequired,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "provider authentication requires interactive secret provisioning",
+            details: None,
+        },
+        ErrorCode::ProviderSecretOverwriteRequired => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::ProviderSecretOverwriteRequired,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "provider secret replacement requires explicit confirmation",
+            details: None,
+        },
+        ErrorCode::ModelProviderBindingMissing => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::ModelProviderBindingMissing,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the provider configuration cannot admit this operation",
+            details: None,
+        },
+        ErrorCode::ProjectProviderSelectionNotAllowed => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::ProjectProviderSelectionNotAllowed,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the provider configuration cannot admit this operation",
+            details: None,
+        },
+        ErrorCode::DesktopBindingRequired => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::DesktopBindingRequired,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "a Desktop Binding is required before native Computer Use can start",
+            details: validated_candidate_desktop_users_details(error),
+        },
+        ErrorCode::DesktopBindingAmbiguous => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::DesktopBindingAmbiguous,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the Turn must select one configured Desktop Binding",
+            details: error.details.get("desktop_bindings").cloned().map(|bindings| {
+                serde_json::json!({ "desktop_bindings": bindings })
+            }),
+        },
+        ErrorCode::DesktopBindingNotFound => ApiFailure {
+            status: StatusCode::NOT_FOUND,
+            code: ApiErrorCode::DesktopBindingNotFound,
+            category: ApiErrorCategory::NotFound,
+            retryable: false,
+            message: "the selected Desktop Binding is not configured on this Host",
+            details: validated_string_details(error, &["desktop_binding"]),
+        },
+        ErrorCode::DesktopBindingUnauthorized => ApiFailure {
+            status: StatusCode::FORBIDDEN,
+            code: ApiErrorCode::DesktopBindingUnauthorized,
+            category: ApiErrorCategory::Authorization,
+            retryable: false,
+            message: "the API Principal cannot use the selected Desktop Binding",
+            details: validated_string_details(error, &["desktop_binding"]),
+        },
+        ErrorCode::DesktopBindingSecureHandoffUnsupported => ApiFailure {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: ApiErrorCode::DesktopBindingSecureHandoffUnsupported,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Host cannot securely enter the selected OS user's desktop session",
+            details: validated_string_details(error, &["desktop_binding", "desktop_user"]),
+        },
+        ErrorCode::IdempotencyKeyConflict => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::IdempotencyKeyConflict,
+            category: ApiErrorCategory::Conflict,
+            retryable: false,
+            message: "the idempotency key was already used for a different request",
+            details: None,
+        },
+        ErrorCode::SessionNotFound => ApiFailure {
+            status: StatusCode::NOT_FOUND,
+            code: ApiErrorCode::SessionNotFound,
+            category: ApiErrorCategory::NotFound,
+            retryable: false,
+            message: "the requested Satelle Session does not exist",
+            details: None,
+        },
+        ErrorCode::SetupLedgerUnavailable => ApiFailure {
+            status: StatusCode::NOT_FOUND,
+            code: ApiErrorCode::SetupLedgerUnavailable,
+            category: ApiErrorCategory::NotFound,
+            retryable: false,
+            message: "the requested setup action ledger run is unavailable",
+            details: validated_string_details(error, &["run_id"]),
+        },
+        ErrorCode::LogsCursorExpired => ApiFailure {
+            status: StatusCode::GONE,
+            code: ApiErrorCode::LogsCursorExpired,
+            category: ApiErrorCategory::NotFound,
+            retryable: false,
+            message: "the Log Cursor is older than retained Host history",
+            details: Some(serde_json::json!({
+                "earliest_available_cursor": error
+                    .details
+                    .get("earliest_available_cursor")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "resume_cursor": error
+                    .details
+                    .get("resume_cursor")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            })),
+        },
+        ErrorCode::BootstrapBusy => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::HostBusy,
+            category: ApiErrorCategory::Conflict,
+            retryable: true,
+            message: "the Host is already controlling its authorized desktop",
+            details: None,
+        },
+        ErrorCode::HostBusy => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::HostBusy,
+            category: ApiErrorCategory::Conflict,
+            retryable: true,
+            message: "the Host is already controlling its authorized desktop",
+            details: Some(match (
+                error.details.get("active_session_id"),
+                error.details.get("active_operation_id"),
+            ) {
+                (Some(active_session_id), _) => serde_json::json!({
+                    "host": error.details.get("host").cloned().unwrap_or(serde_json::Value::Null),
+                    "active_session_id": active_session_id,
+                }),
+                (_, Some(active_operation_id)) => serde_json::json!({
+                    "host": error.details.get("host").cloned().unwrap_or(serde_json::Value::Null),
+                    "active_operation_id": active_operation_id,
+                }),
+                _ => serde_json::json!({
+                    "host": error.details.get("host").cloned().unwrap_or(serde_json::Value::Null),
+                }),
+            }),
+        },
+        ErrorCode::QueueDisabled => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::QueueDisabled,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the durable Turn queue is not enabled for this request",
+            details: None,
+        },
+        ErrorCode::QueueFull => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::QueueFull,
+            category: ApiErrorCategory::Conflict,
+            retryable: true,
+            message: "the durable Turn queue is full",
+            details: None,
+        },
+        ErrorCode::QueueRequestNotFound => ApiFailure {
+            status: StatusCode::NOT_FOUND,
+            code: ApiErrorCode::QueueRequestNotFound,
+            category: ApiErrorCategory::NotFound,
+            retryable: false,
+            message: "the queue request does not exist for this API Principal",
+            details: None,
+        },
+        ErrorCode::QueueAlreadyAdmitted => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::QueueAlreadyAdmitted,
+            category: ApiErrorCategory::Conflict,
+            retryable: false,
+            message: "the queued Turn has already been admitted",
+            details: error.recovery_command.as_ref().map(|command| {
+                serde_json::json!({"stop_command": command})
+            }),
+        },
+        ErrorCode::QueuedPrincipalNoLongerAuthorized => ApiFailure {
+            status: StatusCode::FORBIDDEN,
+            code: ApiErrorCode::QueuedPrincipalNoLongerAuthorized,
+            category: ApiErrorCategory::Authentication,
+            retryable: false,
+            message: "the queued API Principal is no longer authorized",
+            details: None,
+        },
+        ErrorCode::StoreInUse => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::StoreInUse,
+            category: ApiErrorCategory::Storage,
+            retryable: true,
+            message: "the Host state store is already owned by another daemon process",
+            details: None,
+        },
+        ErrorCode::StateConflict => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::StateConflict,
+            category: ApiErrorCategory::Conflict,
+            retryable: true,
+            message: "the Host state changed before the operation could commit",
+            details: None,
+        },
+        ErrorCode::StopNotConfirmed => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::StopNotConfirmed,
+            category: ApiErrorCategory::Conflict,
+            retryable: true,
+            message: "upstream cancellation could not be confirmed",
+            details: validated_stop_not_confirmed_details(error),
+        },
+        ErrorCode::IncompatibleControlPlane => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::IncompatibleControlPlane,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Codex control plane cannot admit this operation",
+            details: validated_control_plane_details(error),
+        },
+        ErrorCode::ComputerUseNotReady => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::ComputerUseNotReady,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "native Computer Use is not ready on this Host",
+            details: validated_computer_use_not_ready_details(error),
+        },
+        ErrorCode::YoloNotSupported => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::YoloNotSupported,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Codex control plane cannot apply YOLO policy",
+            details: None,
+        },
+        ErrorCode::YoloBlockedByNativeApproval => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::YoloBlockedByNativeApproval,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "native Computer Use approval blocks YOLO execution",
+            details: None,
+        },
+        ErrorCode::DoctorReadinessBlockersFound | ErrorCode::SetupVerificationFailed => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::ComputerUseNotReady,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "native Computer Use is not ready on this Host",
+            details: None,
+        },
+        ErrorCode::CredentialHelperArgvInvalid => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::CredentialHelperArgvInvalid,
+            category: ApiErrorCategory::InvalidRequest,
+            retryable: false,
+            message: "the credential helper executable path is not absolute for the target Host",
+            details: None,
+        },
+        ErrorCode::CredentialHelperTimeout => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::CredentialHelperTimeout,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Host credential helper exceeded its timeout",
+            details: None,
+        },
+        ErrorCode::SecretFileTildeFormUnsupported | ErrorCode::SecretFileHomeUnavailable => {
+            let details = serde_json::json!(error.details);
+            ApiFailure {
+                status: StatusCode::BAD_REQUEST,
+                code: if error.code == ErrorCode::SecretFileHomeUnavailable {
+                    ApiErrorCode::SecretFileHomeUnavailable
+                } else {
+                    ApiErrorCode::SecretFileTildeFormUnsupported
+                },
+                category: ApiErrorCategory::InvalidRequest,
+                retryable: false,
+                message: "the Host cannot expand the provider secret file reference",
+                details: crate::core::secret_file_error_details(&details).is_some().then_some(details),
+            }
+        }
+        ErrorCode::ProviderSecretResolutionFailed => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::ProviderSecretResolutionFailed,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the selected provider is not ready on this Host",
+            details: None,
+        },
+        ErrorCode::ExperimentalProviderNotValidated => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::ExperimentalProviderNotValidated,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the selected provider is not ready on this Host",
+            details: None,
+        },
+        ErrorCode::DesktopSessionUnavailable => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionUnavailable,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "no compatible active Desktop Session is available",
+            details: validated_optional_desktop_user_details(error),
+        },
+        ErrorCode::DesktopSessionAmbiguous => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionAmbiguous,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the Desktop Binding resolves to multiple compatible active Desktop Sessions",
+            details: validated_string_details(error, &["desktop_user"]),
+        },
+        ErrorCode::DesktopSessionPreferenceUnmatched => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionPreferenceUnmatched,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the desktop session preference does not select exactly one compatible active Desktop Session",
+            details: validated_string_details(
+                error,
+                &["desktop_user", "desktop_session_preference"],
+            ),
+        },
+        ErrorCode::DesktopSessionConsoleUnavailable => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionConsoleUnavailable,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "no compatible active physical console session is available for the Desktop Binding",
+            details: validated_string_details(
+                error,
+                &["desktop_user", "desktop_session_preference"],
+            ),
+        },
+        ErrorCode::DesktopSessionNativeSelectorWrongPlatform => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the configured native desktop session selector targets another Host platform",
+            details: validated_string_details(
+                error,
+                &["configured_platform", "detected_platform"],
+            ),
+        },
+        ErrorCode::DesktopSessionNativeSelectorUnmatched => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::DesktopSessionNativeSelectorUnmatched,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the native desktop session selector does not select exactly one compatible active Desktop Session",
+            details: validated_string_details(error, &["desktop_session_native_selector"]),
+        },
+        ErrorCode::NativeReadinessTimeout => ApiFailure {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: ApiErrorCode::NativeReadinessTimeout,
+            category: ApiErrorCategory::Readiness,
+            retryable: true,
+            message: "the native Computer Use readiness smoke test timed out",
+            details: None,
+        },
+        ErrorCode::ProviderSmokeTestTimeout => ApiFailure {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: ApiErrorCode::ProviderSmokeTestTimeout,
+            category: ApiErrorCategory::Readiness,
+            retryable: true,
+            message: "the live provider Computer Use smoke test timed out",
+            details: None,
+        },
+        ErrorCode::UnsupportedProviderComputerUse => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::UnsupportedProviderComputerUse,
+            category: ApiErrorCategory::Readiness,
+            retryable: false,
+            message: "the selected provider does not support native Computer Use",
+            details: None,
+        },
+        ErrorCode::HostUnreachable => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::HostUnreachable,
+            category: ApiErrorCategory::RemoteExecution,
+            retryable: true,
+            message: "the configured execution runtime is unreachable",
+            details: None,
+        },
+        ErrorCode::RemoteExecution => ApiFailure {
+            status: StatusCode::BAD_GATEWAY,
+            code: ApiErrorCode::RemoteExecutionFailed,
+            category: ApiErrorCategory::RemoteExecution,
+            retryable: true,
+            message: "the execution runtime could not complete the operation",
+            details: None,
+        },
+        ErrorCode::StorageBusy => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::StorageBusy,
+            category: ApiErrorCategory::Storage,
+            retryable: true,
+            message: "the Host state store is temporarily busy",
+            details: None,
+        },
+        ErrorCode::StorageMigrationSourceInvalid => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::StorageMigrationSourceInvalid,
+            category: ApiErrorCategory::Storage,
+            retryable: false,
+            message: "the selected migration source is invalid",
+            details: validated_string_details(error, &["path"]),
+        },
+        ErrorCode::StorageMigrationDestinationInvalid => ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            code: ApiErrorCode::StorageMigrationDestinationInvalid,
+            category: ApiErrorCategory::Storage,
+            retryable: false,
+            message: "the selected migration destination is invalid",
+            details: validated_string_details(error, &["path"]),
+        },
+        ErrorCode::StorageMigrationPathsOverlap => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::StorageMigrationPathsOverlap,
+            category: ApiErrorCategory::Storage,
+            retryable: false,
+            message: "the migration source and destination overlap",
+            details: validated_string_details(error, &["path"]),
+        },
+        ErrorCode::StorageMigrationDestinationNotEmpty => ApiFailure {
+            status: StatusCode::CONFLICT,
+            code: ApiErrorCode::StorageMigrationDestinationNotEmpty,
+            category: ApiErrorCategory::Storage,
+            retryable: false,
+            message: "the migration destination contains existing files",
+            details: validated_string_details(error, &["path"]),
+        },
+        ErrorCode::SetupPartiallyApplied if error.details.contains_key("cleanup") => ApiFailure {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ApiErrorCode::SetupPartiallyApplied,
+            category: ApiErrorCategory::Storage,
+            retryable: true,
+            message: "source cleanup stopped after removing some files; inspect the remaining files before retrying",
+            details: error.details.get("cleanup").cloned()
+                .and_then(|report| serde_json::from_value::<crate::host::StorageMigrationCleanup>(report).ok())
+                .map(|report| serde_json::json!({"cleanup": report})),
+        },
+        // Completion installation and profile activation are Controller-local workflows. If
+        // either code crosses the Host boundary, expose only the stable internal-error contract.
+        ErrorCode::CompletionInstallFailed
+        | ErrorCode::CompletionProfileUpdateFailed
+        // Config repair is also a Controller-local operation.
+        | ErrorCode::ConfigRepairManualActionRequired
+        | ErrorCode::ConfigRepairConsentRequired
+        | ErrorCode::ConfigRepairSourceChanged
+        | ErrorCode::CertificateUntrusted
+        | ErrorCode::CertificateHostnameMismatch
+        | ErrorCode::CertificateExpired
+        | ErrorCode::TlsVersionUnsupported
+        | ErrorCode::TlsHandshakeFailed
+        | ErrorCode::AuthenticationFailed
+        | ErrorCode::AuthorizationInsufficientScope
+        | ErrorCode::HostIdentityMismatch
+        // Self-update is a Controller-local installation workflow. None of
+        // its process errors belong in the Host wire-error vocabulary.
+        | ErrorCode::SelfUpdateManagedInstall
+        | ErrorCode::SelfUpdateInstallOwnerUnknown
+        | ErrorCode::SelfUpdateVersionInvalid
+        | ErrorCode::SelfUpdateExplicitVersionRequired
+        | ErrorCode::UnsupportedLocalPlatform
+        | ErrorCode::UnsupportedReleaseTarget
+        | ErrorCode::SelfUpdateLocked
+        | ErrorCode::SelfUpdateRollbackFailed
+        | ErrorCode::SelfUpdateReceiptInvalid
+        | ErrorCode::SelfUpdateVerificationFailed
+        | ErrorCode::SelfUpdateFailed
+        // This is a Controller-local reachability error. If it ever reaches
+        // the Host boundary, fail closed instead of inventing a wire code.
+        | ErrorCode::HostDaemonUnreachable
+        | ErrorCode::DirectDaemonUnreachable
+        | ErrorCode::SshBootstrapUnavailable
+        // Host update planning is Controller-owned. These typed CLI errors
+        // must never be reclassified as Host wire failures.
+        | ErrorCode::HostBinaryNewerThanCli
+        | ErrorCode::HostArtifactUnavailable
+        | ErrorCode::HostUpdateRecoveryIdentityMismatch
+        | ErrorCode::ReleaseVerifierUnavailable
+        | ErrorCode::HostUpdateRequiresCliUpgrade
+        | ErrorCode::HostUpdateRecoveryPending
+        | ErrorCode::AmbiguousCodexComponentOwnership
+        | ErrorCode::HostUpdatePartiallyApplied
+        | ErrorCode::HostUpdatePostcheckFailed
+        // Restoring the previous service and binding is coordinated by the Controller.
+        | ErrorCode::StorageMigrationRollbackFailed
+        | ErrorCode::NoRemoteHostSelected
+        | ErrorCode::RemoteUpdatePartialFailure
+        | ErrorCode::BatchPartialFailure
+        | ErrorCode::WatchReconnectExhausted
+        | ErrorCode::NotifyDeliveryFailed
+        // Setup action and partial-application failures are Controller-local
+        // execution results.
+        | ErrorCode::SetupActionFailed
+        | ErrorCode::SetupPartiallyApplied
+        // Process interruption is a Controller-local process-exit contract.
+        // If it crosses the Host boundary, expose no extra API surface.
+        | ErrorCode::Interrupted
+        // Relay policy and capability failures are Controller preflight
+        // results. The Host never admits their prospective Turn.
+        | ErrorCode::NativeActionRelayNotSupported
+        | ErrorCode::NativeActionPolicyConflict
+        // Log targeting and follow recovery are also Controller-local. The
+        // Host API exposes finite pages, not the CLI's polling lifecycle.
+        | ErrorCode::LogsTargetRequired
+        | ErrorCode::LogsFollowIdentityChanged
+        | ErrorCode::LogsFollowReconnectExhausted
+        | ErrorCode::SshHostKeyVerificationRequired => ApiFailure {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ApiErrorCode::InternalError,
+            category: ApiErrorCategory::Internal,
+            retryable: false,
+            message: "the Host operation failed unexpectedly",
+            details: None,
+        },
+        ErrorCode::CapacityExceeded | ErrorCode::ConcurrencyLimitExceeded => ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::CapacityExceeded,
+            category: ApiErrorCategory::Capacity,
+            retryable: true,
+            message: "the Host has no operation capacity available",
+            details: None,
+        },
+        ErrorCode::StorageIntegrityFailed | ErrorCode::PlatformDirectoriesUnavailable => {
+            ApiFailure {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: ApiErrorCode::StorageIntegrityFailed,
+                category: ApiErrorCategory::Storage,
+                retryable: false,
+                message: "the Host state failed an integrity requirement",
+                details: None,
+            }
+        }
+        ErrorCode::HostNotFound | ErrorCode::NotImplemented => ApiFailure {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code: ApiErrorCode::InternalError,
+            category: ApiErrorCategory::Internal,
+            retryable: false,
+            message: "the Host does not implement the requested operation",
+            details: None,
+        },
+    };
+
+    // Maintenance postcheck finalization can attach this one authenticated
+    // state bit to readiness and storage failures. Merge only that validated
+    // bit after normal mapping, while preserving the detail-free InternalError
+    // contract for Controller-local or otherwise unexposed Host errors.
+    if failure.code != ApiErrorCode::InternalError
+        && let Some(serde_json::Value::Object(terminal_details)) =
+            validated_maintenance_postcheck_details(error)
+    {
+        match &mut failure.details {
+            Some(serde_json::Value::Object(details)) => details.extend(terminal_details),
+            _ => failure.details = Some(serde_json::Value::Object(terminal_details)),
+        }
+    }
+    failure
+}
+
+fn validated_control_plane_details(error: &SatelleError) -> Option<serde_json::Value> {
+    let value = serde_json::Value::Object(error.details.clone().into_iter().collect());
+    let details = serde_json::from_value::<IncompatibleControlPlaneDetails>(value).ok()?;
+    serde_json::to_value(details).ok()
+}
+
+fn validated_maintenance_postcheck_details(error: &SatelleError) -> Option<serde_json::Value> {
+    let terminal = error
+        .details
+        .get("maintenance_postcheck_terminal")?
+        .as_bool()?;
+    Some(serde_json::json!({
+        "maintenance_postcheck_terminal": terminal
+    }))
+}
+
+fn validated_stop_not_confirmed_details(error: &SatelleError) -> Option<serde_json::Value> {
+    if error.details.len() != 7 {
+        return None;
+    }
+    let session_id = error.details.get("session_id")?.as_str()?;
+    let turn_id = error.details.get("turn_id")?.as_str()?;
+    SessionId::parse(session_id).ok()?;
+    TurnId::parse(turn_id).ok()?;
+    let ownership = error.details.get("ownership")?.as_str()?;
+    if !matches!(ownership, "active" | "recovery_pending") {
+        return None;
+    }
+    let state_changed = error.details.get("state_changed")?.as_bool()?;
+    let session_state_revision = error
+        .details
+        .get("session_state_revision")?
+        .as_u64()
+        .and_then(|value| crate::core::session::SessionStateRevision::new(value).ok())?;
+    let turn_state_revision = error
+        .details
+        .get("turn_state_revision")?
+        .as_u64()
+        .and_then(|value| crate::core::session::TurnStateRevision::new(value).ok())?;
+    if !error.details.get("retryable")?.as_bool()? {
+        return None;
+    }
+    Some(serde_json::json!({
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "ownership": ownership,
+        "state_changed": state_changed,
+        "session_state_revision": session_state_revision,
+        "turn_state_revision": turn_state_revision,
+        "retryable": true
+    }))
+}
+
+fn validated_candidate_desktop_users_details(error: &SatelleError) -> Option<serde_json::Value> {
+    if error.details.len() != 1 {
+        return None;
+    }
+    let users = error
+        .details
+        .get("candidate_desktop_users")?
+        .as_array()?
+        .iter()
+        .map(serde_json::Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    if users.len() < 2 || users.iter().any(|user| user.is_empty()) {
+        return None;
+    }
+    Some(serde_json::json!({ "candidate_desktop_users": users }))
+}
+
+fn validated_optional_desktop_user_details(error: &SatelleError) -> Option<serde_json::Value> {
+    if error.details.is_empty() {
+        return None;
+    }
+    validated_string_details(error, &["desktop_user"])
+}
+
+/// Publishes the closed readiness detail shapes. The Host records why native
+/// Computer Use is not ready as a snake_case `reason` token; without it the
+/// client can only print the generic message and an operator cannot tell a
+/// failed readiness probe from an isolation or recovery block. Any other
+/// detail stays private.
+fn validated_computer_use_not_ready_details(error: &SatelleError) -> Option<serde_json::Value> {
+    if let Some(details) = validated_manual_computer_use_setup_details(error) {
+        return Some(details);
+    }
+    let reason = error.details.get("reason")?.as_str()?;
+    is_closed_reason_token(reason).then(|| serde_json::json!({ "reason": reason }))
+}
+
+/// Accepts only the identifier form every Host reason uses, so free text or
+/// interpolated private values never reach the wire.
+fn is_closed_reason_token(reason: &str) -> bool {
+    !reason.is_empty()
+        && reason.len() <= 64
+        && reason
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validated_manual_computer_use_setup_details(error: &SatelleError) -> Option<serde_json::Value> {
+    let details = validated_string_details(error, &["reason", "status"])?;
+    (details
+        == serde_json::json!({
+            "reason": "macos_native_computer_use_prerequisite_missing",
+            "status": "manual_action_required"
+        }))
+    .then_some(details)
+}
+
+fn validated_string_details(error: &SatelleError, keys: &[&str]) -> Option<serde_json::Value> {
+    if error.details.len() != keys.len() {
+        return None;
+    }
+    let mut details = serde_json::Map::new();
+    for key in keys {
+        let value = error.details.get(*key)?.as_str()?;
+        if value.is_empty() {
+            return None;
+        }
+        details.insert(
+            (*key).to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    Some(serde_json::Value::Object(details))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{
+        ControlPlaneCapability, ControlPlaneFailureReason, ControlPlaneOperation,
+        IncompatibleControlPlaneDetails,
+    };
+    use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn secret_file_home_failures_preserve_only_the_closed_detail_envelope() {
+        for cause in [
+            crate::core::SecretFilePathError::HomeUnavailable,
+            crate::core::SecretFilePathError::TildeFormUnsupported,
+        ] {
+            let mut error = cause.diagnostic(None, None, Some("host-alias"), Some("windows"));
+            let mapped = failure(&error);
+            assert_eq!(mapped.code.as_str(), error.code.as_str());
+            assert_eq!(mapped.details, Some(json!(error.details)));
+            error
+                .details
+                .insert("private_diagnostic".to_string(), json!("must-not-leak"));
+            assert_eq!(failure(&error).details, None);
+        }
+    }
+
+    #[test]
+    fn computer_use_not_ready_exposes_only_a_closed_reason_token() {
+        let mut error = SatelleError::computer_use_not_ready();
+        error.details.insert(
+            "reason".to_string(),
+            json!("native_readiness_action_evidence_unavailable"),
+        );
+        error.details.insert(
+            "native_readiness".to_string(),
+            json!({ "status": "failed", "private": "PRIVATE_DETAILS_CANARY" }),
+        );
+        assert_eq!(
+            failure(&error).details,
+            Some(json!({ "reason": "native_readiness_action_evidence_unavailable" }))
+        );
+
+        for reason in [
+            "",
+            "Native Readiness Failed",
+            "PRIVATE/path",
+            &"a".repeat(65),
+        ] {
+            let mut error = SatelleError::computer_use_not_ready();
+            error.details.insert("reason".to_string(), json!(reason));
+            assert_eq!(failure(&error).details, None, "reason {reason:?}");
+        }
+
+        let mut error = SatelleError::computer_use_not_ready();
+        error.details.insert("reason".to_string(), json!(42));
+        assert_eq!(failure(&error).details, None);
+    }
+
+    #[test]
+    fn manual_macos_setup_exposes_only_the_closed_public_details() {
+        let mut error = SatelleError::computer_use_not_ready();
+        error.details.insert(
+            "reason".to_string(),
+            json!("macos_native_computer_use_prerequisite_missing"),
+        );
+        error
+            .details
+            .insert("status".to_string(), json!("manual_action_required"));
+        let mapped = failure(&error);
+        assert_eq!(
+            mapped.details,
+            Some(json!({
+                "reason": "macos_native_computer_use_prerequisite_missing",
+                "status": "manual_action_required"
+            }))
+        );
+
+        // An unexpected extra key breaks the closed manual-setup pair. Only the
+        // reason token stays public; the private key and the now-unpaired
+        // status never reach the wire.
+        error.details.insert("private".to_string(), json!(true));
+        assert_eq!(
+            failure(&error).details,
+            Some(json!({ "reason": "macos_native_computer_use_prerequisite_missing" }))
+        );
+    }
+
+    #[test]
+    fn incompatible_control_plane_is_a_sanitized_readiness_failure() {
+        let details = IncompatibleControlPlaneDetails::new(
+            ControlPlaneOperation::Run,
+            ControlPlaneFailureReason::RequiredCapabilityMissing,
+            &[ControlPlaneCapability::EventObservation],
+        )
+        .unwrap();
+        let failure = failure(&SatelleError::incompatible_control_plane(details));
+
+        assert_eq!(failure.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(failure.code, ApiErrorCode::IncompatibleControlPlane);
+        assert_eq!(failure.category, ApiErrorCategory::Readiness);
+        assert!(!failure.retryable);
+        assert_eq!(
+            failure.details,
+            Some(json!({
+                "operation": "run",
+                "reason": "required_capability_missing",
+                "required_capabilities": [
+                    "session_creation",
+                    "turn_start",
+                    "event_observation"
+                ],
+                "missing_capabilities": ["event_observation"]
+            }))
+        );
+    }
+
+    #[test]
+    fn provider_smoke_failures_keep_distinct_typed_api_codes() {
+        let timeout = failure(&SatelleError::provider_smoke_test_timeout());
+        assert_eq!(timeout.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(timeout.code, ApiErrorCode::ProviderSmokeTestTimeout);
+        assert!(timeout.retryable);
+
+        let unsupported = failure(&SatelleError::unsupported_provider_computer_use());
+        assert_eq!(unsupported.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unsupported.code,
+            ApiErrorCode::UnsupportedProviderComputerUse
+        );
+        assert!(!unsupported.retryable);
+    }
+
+    #[test]
+    fn native_readiness_timeout_is_a_retryable_gateway_timeout() {
+        let timeout = failure(&SatelleError::native_readiness_timeout());
+        assert_eq!(timeout.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(timeout.code, ApiErrorCode::NativeReadinessTimeout);
+        assert_eq!(timeout.category, ApiErrorCategory::Readiness);
+        assert!(timeout.retryable);
+    }
+
+    #[test]
+    fn maintenance_postcheck_terminal_detail_crosses_readiness_and_storage_error_mappings() {
+        for mut error in [
+            SatelleError::computer_use_not_ready(),
+            SatelleError::native_readiness_timeout(),
+            SatelleError {
+                code: ErrorCode::StorageIntegrityFailed,
+                message: "PRIVATE_MESSAGE_CANARY".to_string(),
+                recovery_command: None,
+                source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+                details: BTreeMap::new(),
+            },
+        ] {
+            error
+                .details
+                .insert("maintenance_postcheck_terminal".to_string(), json!(true));
+            error.details.insert(
+                "private_canary".to_string(),
+                json!("PRIVATE_DETAILS_CANARY"),
+            );
+
+            assert_eq!(
+                failure(&error).details,
+                Some(json!({ "maintenance_postcheck_terminal": true }))
+            );
+
+            error.details.insert(
+                "maintenance_postcheck_terminal".to_string(),
+                json!("PRIVATE_INVALID_TERMINAL"),
+            );
+            assert_eq!(failure(&error).details, None);
+        }
+    }
+
+    #[test]
+    fn maintenance_postcheck_terminal_detail_does_not_expand_internal_errors() {
+        for code in [ErrorCode::HostUpdatePostcheckFailed, ErrorCode::Interrupted] {
+            let error = SatelleError {
+                code,
+                message: "PRIVATE_MESSAGE_CANARY".to_string(),
+                recovery_command: None,
+                source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+                details: BTreeMap::from([
+                    ("maintenance_postcheck_terminal".to_string(), json!(true)),
+                    (
+                        "private_canary".to_string(),
+                        json!("PRIVATE_DETAILS_CANARY"),
+                    ),
+                ]),
+            };
+
+            let mapped = failure(&error);
+
+            assert_eq!(mapped.code, ApiErrorCode::InternalError);
+            assert_eq!(mapped.details, None);
+        }
+    }
+
+    #[test]
+    fn malformed_internal_details_never_cross_the_http_boundary() {
+        let error = SatelleError {
+            code: ErrorCode::IncompatibleControlPlane,
+            message: "PRIVATE_MESSAGE_CANARY".to_string(),
+            recovery_command: None,
+            source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+            details: BTreeMap::from([("raw_message".to_string(), json!("PRIVATE_DETAILS_CANARY"))]),
+        };
+
+        let mapped = failure(&error);
+
+        assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.code, ApiErrorCode::IncompatibleControlPlane);
+        assert_eq!(mapped.category, ApiErrorCategory::Readiness);
+        assert!(!mapped.retryable);
+        assert_eq!(mapped.details, None);
+        assert!(!mapped.message.contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn desktop_binding_required_has_a_distinct_sanitized_invalid_request_contract() {
+        let mapped = failure(&SatelleError::desktop_binding_required(&BTreeSet::from([
+            "alice", "bob",
+        ])));
+
+        assert_eq!(mapped.status, StatusCode::BAD_REQUEST);
+        assert_eq!(mapped.code, ApiErrorCode::DesktopBindingRequired);
+        assert_eq!(mapped.category, ApiErrorCategory::InvalidRequest);
+        assert!(!mapped.retryable);
+        assert_eq!(
+            mapped.details,
+            Some(json!({ "candidate_desktop_users": ["alice", "bob"] }))
+        );
+    }
+
+    #[test]
+    fn desktop_session_failures_keep_distinct_sanitized_readiness_contracts() {
+        for (error, expected_code, expected_details) in [
+            (
+                SatelleError::desktop_session_unavailable(Some("alice")),
+                ApiErrorCode::DesktopSessionUnavailable,
+                Some(json!({ "desktop_user": "alice" })),
+            ),
+            (
+                SatelleError::desktop_session_ambiguous("alice"),
+                ApiErrorCode::DesktopSessionAmbiguous,
+                Some(json!({ "desktop_user": "alice" })),
+            ),
+            (
+                SatelleError::desktop_session_preference_unmatched("alice", "only"),
+                ApiErrorCode::DesktopSessionPreferenceUnmatched,
+                Some(json!({
+                    "desktop_user": "alice",
+                    "desktop_session_preference": "only"
+                })),
+            ),
+            (
+                SatelleError::desktop_session_console_unavailable("alice"),
+                ApiErrorCode::DesktopSessionConsoleUnavailable,
+                Some(json!({
+                    "desktop_user": "alice",
+                    "desktop_session_preference": "console"
+                })),
+            ),
+            (
+                SatelleError::desktop_session_native_selector_wrong_platform("windows", "linux"),
+                ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform,
+                Some(json!({
+                    "configured_platform": "windows",
+                    "detected_platform": "linux"
+                })),
+            ),
+            (
+                SatelleError::desktop_session_native_selector_unmatched("windows:wts-session:3"),
+                ApiErrorCode::DesktopSessionNativeSelectorUnmatched,
+                Some(json!({
+                    "desktop_session_native_selector": "windows:wts-session:3"
+                })),
+            ),
+        ] {
+            let mapped = failure(&error);
+
+            assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(mapped.code, expected_code);
+            assert_eq!(mapped.category, ApiErrorCategory::Readiness);
+            assert!(!mapped.retryable);
+            assert_eq!(mapped.details, expected_details);
+        }
+
+        let unavailable = failure(&SatelleError::desktop_session_unavailable(None));
+        assert_eq!(unavailable.code, ApiErrorCode::DesktopSessionUnavailable);
+        assert_eq!(unavailable.details, None);
+    }
+
+    #[test]
+    fn malformed_desktop_selection_details_do_not_cross_the_http_boundary() {
+        let mut malformed_binding =
+            SatelleError::desktop_binding_required(&BTreeSet::from(["alice", "bob"]));
+        malformed_binding
+            .details
+            .insert("candidate_desktop_users".to_string(), json!(["alice", 7]));
+        assert_eq!(failure(&malformed_binding).details, None);
+
+        for mut error in [
+            SatelleError::desktop_session_unavailable(Some("alice")),
+            SatelleError::desktop_session_ambiguous("alice"),
+            SatelleError::desktop_session_preference_unmatched("alice", "only"),
+            SatelleError::desktop_session_console_unavailable("alice"),
+            SatelleError::desktop_session_native_selector_wrong_platform("windows", "linux"),
+            SatelleError::desktop_session_native_selector_unmatched("windows:wts-session:3"),
+        ] {
+            error.details.insert(
+                "private_canary".to_string(),
+                json!("PRIVATE_DETAILS_CANARY"),
+            );
+            assert_eq!(failure(&error).details, None);
+        }
+    }
+
+    #[test]
+    fn direct_daemon_unreachable_is_sanitized_at_the_host_boundary() {
+        let mapped = failure(&SatelleError::direct_daemon_unreachable(
+            "PRIVATE_HOST_CANARY",
+        ));
+
+        assert_eq!(mapped.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mapped.code, ApiErrorCode::InternalError);
+        assert_eq!(mapped.category, ApiErrorCategory::Internal);
+        assert!(!mapped.retryable);
+        assert_eq!(mapped.message, "the Host operation failed unexpectedly");
+        assert_eq!(mapped.details, None);
+        assert!(!mapped.message.contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn remote_batch_cli_failures_are_sanitized_at_the_host_boundary() {
+        for code in [
+            ErrorCode::NoRemoteHostSelected,
+            ErrorCode::RemoteUpdatePartialFailure,
+        ] {
+            let mapped = failure(&SatelleError {
+                code,
+                message: "PRIVATE_MESSAGE_CANARY".to_string(),
+                recovery_command: Some("PRIVATE_RECOVERY_CANARY".to_string()),
+                source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+                details: BTreeMap::from([(
+                    "private_canary".to_string(),
+                    json!("PRIVATE_DETAILS_CANARY"),
+                )]),
+            });
+
+            assert_eq!(mapped.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(mapped.code, ApiErrorCode::InternalError);
+            assert_eq!(mapped.category, ApiErrorCategory::Internal);
+            assert!(!mapped.retryable);
+            assert_eq!(mapped.message, "the Host operation failed unexpectedly");
+            assert_eq!(mapped.details, None);
+        }
+    }
+
+    #[test]
+    fn storage_busy_is_a_retryable_service_unavailable_response() {
+        let mapped = failure(&SatelleError::storage_busy());
+
+        assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.code, ApiErrorCode::StorageBusy);
+        assert_eq!(mapped.category, ApiErrorCategory::Storage);
+        assert!(mapped.retryable);
+        assert_eq!(mapped.details, None);
+    }
+
+    #[test]
+    fn host_busy_preserves_only_public_owner_details() {
+        let session_id = SessionId::new();
+        let mut error = SatelleError::host_busy("local-demo", &session_id);
+        error
+            .details
+            .insert("private".to_string(), json!("must-not-cross"));
+
+        let mapped = failure(&error);
+
+        assert_eq!(mapped.status, StatusCode::CONFLICT);
+        assert_eq!(mapped.code, ApiErrorCode::HostBusy);
+        assert_eq!(
+            mapped.details,
+            Some(json!({
+                "host": "local-demo",
+                "active_session_id": session_id,
+            }))
+        );
+
+        let operation = failure(&SatelleError::host_busy_without_owner("local-demo"));
+        assert_eq!(operation.status, StatusCode::CONFLICT);
+        assert_eq!(operation.code, ApiErrorCode::HostBusy);
+        assert_eq!(operation.details, Some(json!({"host": "local-demo"})));
+    }
+
+    #[test]
+    fn operation_capacity_failures_use_the_public_capacity_contract() {
+        for error in [
+            SatelleError::capacity_exceeded("operation", 1),
+            SatelleError::concurrency_limit_exceeded(1),
+        ] {
+            let mapped = failure(&error);
+
+            assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(mapped.code, ApiErrorCode::CapacityExceeded);
+            assert_eq!(mapped.category, ApiErrorCategory::Capacity);
+            assert!(mapped.retryable);
+            assert_eq!(mapped.details, None);
+        }
+    }
+
+    #[test]
+    fn store_in_use_is_a_retryable_storage_unavailable_response() {
+        let mapped = failure(&SatelleError::store_in_use());
+
+        assert_eq!(mapped.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.code, ApiErrorCode::StoreInUse);
+        assert_eq!(mapped.category, ApiErrorCategory::Storage);
+        assert!(mapped.retryable);
+        assert_eq!(mapped.details, None);
+    }
+
+    #[test]
+    fn state_conflict_is_a_retryable_conflict_response() {
+        let mapped = failure(&SatelleError::state_conflict());
+
+        assert_eq!(mapped.status, StatusCode::CONFLICT);
+        assert_eq!(mapped.code, ApiErrorCode::StateConflict);
+        assert_eq!(mapped.category, ApiErrorCategory::Conflict);
+        assert!(mapped.retryable);
+        assert_eq!(mapped.details, None);
+    }
+
+    #[test]
+    fn stop_not_confirmed_is_a_retryable_conflict_response() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let mapped = failure(&SatelleError {
+            code: ErrorCode::StopNotConfirmed,
+            message: "PRIVATE_INTERNAL_STOP_MESSAGE".to_string(),
+            recovery_command: None,
+            source_detail: None,
+            details: BTreeMap::from([
+                ("session_id".to_string(), json!(session_id)),
+                ("turn_id".to_string(), json!(turn_id)),
+                ("ownership".to_string(), json!("recovery_pending")),
+                ("state_changed".to_string(), json!(true)),
+                ("session_state_revision".to_string(), json!(3)),
+                ("turn_state_revision".to_string(), json!(2)),
+                ("retryable".to_string(), json!(true)),
+            ]),
+        });
+
+        assert_eq!(mapped.status, StatusCode::CONFLICT);
+        assert_eq!(mapped.code, ApiErrorCode::StopNotConfirmed);
+        assert_eq!(mapped.category, ApiErrorCategory::Conflict);
+        assert!(mapped.retryable);
+        assert!(!mapped.message.contains("PRIVATE_"));
+        assert_eq!(
+            mapped.details,
+            Some(json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "ownership": "recovery_pending",
+                "state_changed": true,
+                "session_state_revision": 3,
+                "turn_state_revision": 2,
+                "retryable": true
+            }))
+        );
+    }
+
+    #[test]
+    fn malformed_stop_details_do_not_cross_the_http_boundary() {
+        let mapped = failure(&SatelleError {
+            code: ErrorCode::StopNotConfirmed,
+            message: "PRIVATE_INTERNAL_STOP_MESSAGE".to_string(),
+            recovery_command: None,
+            source_detail: Some("PRIVATE_SOURCE_CANARY".to_string()),
+            details: BTreeMap::from([
+                ("ownership".to_string(), json!("PRIVATE_INVALID_OWNER")),
+                ("raw".to_string(), json!("PRIVATE_DETAILS_CANARY")),
+            ]),
+        });
+
+        assert_eq!(mapped.details, None);
+        assert!(!mapped.message.contains("PRIVATE_"));
+    }
+}

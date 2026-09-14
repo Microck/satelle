@@ -1,0 +1,173 @@
+[package]
+name = "satelle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A self-hosted control plane for durable native Computer Use"
+repository = "https://github.com/Microck/satelle"
+homepage = "https://github.com/Microck/satelle"
+readme = "README.md"
+keywords = ["automation", "cli", "computer-use", "self-hosted"]
+categories = ["command-line-utilities"]
+include = [
+    "/CHANGELOG.md",
+    "/assets/**",
+    "/licenses/**",
+    "/src/**",
+    "/tests/**",
+]
+
+[features]
+default = []
+test-support = []
+
+[dependencies]
+base64.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+cliclack.workspace = true
+console.workspace = true
+directories.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+hpke.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+notify.workspace = true
+percent-encoding.workspace = true
+rmcp.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+self-replace.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+subtle.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+time.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+x509-parser.workspace = true
+zip.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_Console",
+    "Win32_System_EventLog",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+] }
+
+[target.'cfg(windows)'.dependencies.winapi]
+version = "0.3.9"
+features = [
+    "handleapi",
+    "impl-default",
+    "ioapiset",
+    "jobapi2",
+    "processthreadsapi",
+    "tlhelp32",
+    "winbase",
+    "winerror",
+]
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+nix = { version = "0.27.1", default-features = false, features = ["fs", "poll", "signal"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+
+[[test]]
+name = "cli"
+required-features = ["test-support"]
+
+[[test]]
+name = "output-format-contract"
+required-features = ["test-support"]
+
+[[test]]
+name = "report-schema-contract"
+required-features = ["test-support"]
+
+[[test]]
+name = "config-profiles"
+required-features = ["test-support"]
+
+[[test]]
+name = "session-host-routing"
+required-features = ["test-support"]
+
+[[test]]
+name = "command-history"
+required-features = ["test-support"]
+
+[[test]]
+name = "automation"
+required-features = ["test-support"]
+
+[[test]]
+name = "mcp"
+required-features = ["test-support"]
+
+[[test]]
+name = "cli-output-error-contract"
+required-features = ["test-support"]
+
+[[test]]
+name = "error-output-contract"
+required-features = ["test-support"]
+
+[dev-dependencies]
+assert_cmd = "2.1.1"
+jsonschema = { version = "0.47.0", default-features = false }
+predicates = "3.1.3"
+rcgen = "=0.14.8"
+reqwest = { workspace = true, features = ["http2", "stream"] }
+
+[lib]
+doctest = false
+
+[[test]]
+name = "http"
+required-features = ["test-support"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
