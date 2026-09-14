@@ -70,6 +70,8 @@ Host.
 [hosts.local-demo]
 transport = "local"
 adapter = "codex"
+
+[hosts.local-demo.desktop_bindings.operator]
 desktop_user = "operator"
 desktop_session_preference = "console"
 ```
@@ -83,7 +85,7 @@ Store a Secret Source descriptor in user configuration. Do not put the secret
 value itself in the TOML file or command line.
 
 ```toml
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "environment"
 variable = "OPENAI_API_KEY"
 ```
