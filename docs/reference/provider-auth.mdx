@@ -4,12 +4,13 @@ description: Configure Host-resolved Secret Sources without exposing provider se
 ---
 
 Provider authentication belongs to the Host. User configuration stores only a
-descriptor that tells the Host where to resolve secret material.
+descriptor that tells the selected Desktop Binding where to resolve secret
+material. These examples use the Desktop Binding alias `operator`.
 
 ## Environment
 
 ```toml
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "environment"
 variable = "OPENAI_API_KEY"
 ```
@@ -17,15 +18,25 @@ variable = "OPENAI_API_KEY"
 ## Owner-only file
 
 ```toml
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "file"
 path = "/absolute/path/to/openai-token"
 ```
 
+A File descriptor can also use `path = "~/.config/provider/token"`. Satelle
+expands it on the Host using the daemon process account's OS home. Linux and
+macOS accept `~` and `~/`; Windows also accepts `~\`. Named-user forms such as
+`~alice`, other relative paths, environment substitutions, and command
+substitutions are invalid. The same owner-only file checks apply after expansion.
+
+Config inspection does not open the file. `config explain
+--show-secret-references` expands paths only for a known local on-demand account;
+remote references report `remote_home_not_checked`.
+
 ## Operating-system credential store
 
 ```toml
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "credential-store"
 service = "satelle"
 account = "openai"
@@ -34,10 +45,27 @@ account = "openai"
 ## Host-managed store
 
 ```toml
-[hosts.local-demo.provider_auth.openai]
+[hosts.local-demo.desktop_bindings.operator.provider_auth.openai]
 kind = "host-store"
 name = "openai-production"
 ```
+
+## Executable helper
+
+```toml
+[hosts.local-demo.desktop_bindings.operator.provider_auth.work]
+kind = "executable-helper"
+argv = ["/opt/credentials/provider-helper", "--account", "work"]
+timeout = "10s"
+environment = { HELPER_PROFILE = "work" }
+```
+
+The Host runs the helper only when a provider smoke test or execution needs
+authentication. The helper exchanges one JSON request and response over pipes
+and receives a restricted environment. See the
+[helper protocol and limits](/docs/reference/configuration#credential-helpers).
+Config inspection never runs helpers and always redacts their arguments and
+environment references, including with `--show-secret-references`.
 
 ## Interactive File provisioning
 

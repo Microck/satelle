@@ -16,16 +16,16 @@ import './agent.css';
  *
  * Every machine string is fixed by the crates:
  *
- *   - `tools(enable_mutations)` in crates/satelle-cli/src/mcp/schema.rs always
+ *   - `tools(enable_mutations)` in crates/satelle/src/mcp/schema.rs always
  *     advertises eight read-only tools and adds seven mutation tools only when
  *     the flag is set. That is why `steer` is absent rather than refused, and
  *     why the counts in the title bar are 8 and 15.
  *   - `status` takes `session_id` (required) and returns `satelle.status.v2`,
- *     whose fields are `StatusReport` in crates/satelle-cli/src/output.rs. Its
+ *     whose fields are `StatusReport` in crates/satelle/src/output.rs. Its
  *     `status` is the latest Turn's state, so `stopped` here is a Turn state.
  *   - `steer` requires `session_id` and `prompt`. It shells out to
  *     `satelle steer ... --json`, which for a detached Turn reaches
- *     print_detached_session in crates/satelle-cli/src/main.rs and emits
+ *     print_detached_session in crates/satelle/src/main.rs and emits
  *     `satelle.steer.v2` with the freshly seeded Turn's state, `starting`.
  *
  * The Session id is the page's shared example. The `turns` field is an array of
