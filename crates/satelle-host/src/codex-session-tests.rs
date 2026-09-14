@@ -1248,7 +1248,9 @@ fn terminal_status_is_closed() {
         ),
         (
             "upstream-http-failed",
-            CodexSessionTerminal::Failed(CodexFailedTurnKind::Other),
+            CodexSessionTerminal::Failed(CodexFailedTurnKind::Classified(
+                "codex_http_connection_failed",
+            )),
         ),
     ] {
         let result = run_scenario(scenario, None, Duration::from_secs(3)).result;
@@ -1256,6 +1258,45 @@ fn terminal_status_is_closed() {
         let debug = format!("{result:?}");
         assert!(!debug.contains("PRIVATE_PROVIDER_ERROR_CANARY"));
         assert!(!debug.contains("PRIVATE_PROVIDER_DETAILS_CANARY"));
+    }
+}
+
+#[test]
+fn failed_turn_projects_only_closed_codex_error_classes() {
+    for (info, expected) in [
+        (
+            json!("sessionBudgetExceeded"),
+            CodexFailedTurnKind::Classified("codex_session_budget_exceeded"),
+        ),
+        (
+            json!({"responseStreamDisconnected": {"httpStatusCode": 503}}),
+            CodexFailedTurnKind::Classified("codex_response_stream_disconnected"),
+        ),
+    ] {
+        let turn = json!({
+            "error": {
+                "message": "PRIVATE_PROVIDER_ERROR_CANARY",
+                "additionalDetails": "PRIVATE_PROVIDER_DETAILS_CANARY",
+                "codexErrorInfo": info
+            }
+        });
+        let classified = failed_turn_kind(turn.as_object().unwrap());
+        assert_eq!(classified, expected);
+        let debug = format!("{classified:?}");
+        assert!(!debug.contains("PRIVATE_PROVIDER_ERROR_CANARY"));
+        assert!(!debug.contains("PRIVATE_PROVIDER_DETAILS_CANARY"));
+    }
+
+    for info in [
+        json!(null),
+        json!("futureError"),
+        json!({"futureError": {}}),
+    ] {
+        let turn = json!({"error": {"codexErrorInfo": info}});
+        assert_eq!(
+            failed_turn_kind(turn.as_object().unwrap()),
+            CodexFailedTurnKind::Other
+        );
     }
 }
 
