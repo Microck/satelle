@@ -116,15 +116,26 @@ Install it on Windows PowerShell:
 & ([scriptblock]::Create((Invoke-RestMethod https://raw.githubusercontent.com/Microck/satelle/2a9bde9ec2fdc9c6289438d07a645b159866d00c/scripts/install.ps1)))
 ```
 
-Direct archives are available from the [latest GitHub release](https://github.com/Microck/satelle/releases/latest).
+Direct archives are available from the
+[latest GitHub release](https://github.com/Microck/satelle/releases/latest).
 
-The first-party Homebrew tap remains the canonical Homebrew path until Satelle
-is accepted into Homebrew core and core updates prove reliable. The first-party
-Scoop bucket remains the canonical Scoop path until a Scoop Main manifest is
-accepted and its updates prove they do not lag normal Satelle releases.
+Official repository work follows measured demand and a named maintainer, not a
+bulk submission checklist. WinGet and Scoop Main are first because their
+manifests can use Satelle's existing versioned Windows archives and checksums.
+The first-party Scoop bucket stays canonical until Scoop Main accepts a
+manifest and its updates keep pace with normal releases.
 
-Satelle MVP does not make `.deb`, `.rpm`, AUR, WinGet, Chocolatey, Nixpkgs,
-MacPorts, Homebrew core, or Scoop Main publication a release blocker.
+Homebrew core follows only after Satelle has a source-build formula that passes
+Homebrew-supported macOS CI, disables self-update, and meets Homebrew's
+stability and notability rules. The first-party tap stays canonical until core
+accepts the formula and proves reliable. Chocolatey follows WinGet and Scoop
+Main only after its moderation, validator, checksum, install, uninstall, and
+maintainer-response obligations have an owner.
+
+AUR, Debian and RPM repositories, Nixpkgs, and MacPorts require clear user
+demand or an ecosystem maintainer who commits to their source-build, review,
+update-lag, and support duties. None of these external submissions is a Satelle
+release blocker.
 
 ## Use the installation owner's lifecycle
 

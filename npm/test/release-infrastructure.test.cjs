@@ -34,40 +34,13 @@ const {
   zipInflateMaximumOutputLength,
 } = require(releaseScriptPath);
 const {
-  PromotionError,
-  requireReleaseAutomation,
-  assertExclusiveRegistryWriter,
-  auditRecords,
-  beginRollback,
-  checkpointOperation,
-  createPromotionRecord,
-  planRegistryOperation,
-  promotionReleaseRoot,
-  promotionTagValue,
-  restartPromotion,
-  sealPromotionRecord,
-  waitForAllLatest,
-  waitForLatest,
-  verifyCompleteRecord,
-} = require("../scripts/npm-promotion.cjs");
-const {
-  assertCandidateRecoveryAuthorization,
-  CandidatePublicationError,
-  candidateTagRepairAction,
-  candidateTagValue,
-  checkpointPublished,
-  createRecoveryProvenanceStatement,
-  createPublicationRecord,
-  npmPackagePurl,
-  npmView,
-  publicationRecoveryInstruction,
-  readPublishedCandidateState,
-  reconcileRecoveryPrefix,
-  recoveryReleaseRoot,
-  repairCandidateTags,
-  resolveArtifactPath,
-  waitForPublishedCandidate,
-} = require("../scripts/npm-candidate-publication.cjs");
+  StagedReleaseError,
+  assertRecordMatchesManifest,
+  assertStageView,
+  createStageRecord,
+  nextPendingPackage,
+  recordStagedPackage,
+} = require("../scripts/npm-staged-release.cjs");
 
 const platformMatrix = readJson(
   path.join(repositoryRoot, "npm", "satelle", "platforms.json"),
@@ -2563,1607 +2536,172 @@ test("local release CLI exposes no public publishing or promotion command", () =
   }
 });
 
-test("npm promotion records preserve dependency order and prior latest tags", () => {
-  const packageNames = createReleaseContext(repositoryRoot).check().publicationOrder;
-  const previousLatest = Object.fromEntries(
-    packageNames.map((packageName, index) => [packageName, index === 0 ? null : "0.0.9"]),
-  );
-  const record = createPromotionRecord({
-    version: workspaceVersion(),
-    packageNames,
-    previousLatest,
-    now: "2026-07-19T12:00:00.000Z",
-  });
-
-  assert.equal(record.schemaVersion, "satelle.npm-promotion.v1");
-  assert.equal(record.candidateTag, `rc-v${workspaceVersion()}`);
-  assert.equal(record.mode, "promotion");
-  assert.equal(record.status, "in_progress");
-  assert.deepEqual(record.packages.map(({ name }) => name), packageNames);
-  assert.deepEqual(record.packages.map(({ previousLatest: latest }) => latest), [
-    null,
-    ...packageNames.slice(1).map(() => "0.0.9"),
-  ]);
-});
-
-test("npm promotion audit fails closed on a corrupt durable checkpoint", (context) => {
-  const records = mkdtempSync(path.join(tmpdir(), "satelle-promotion-audit-"));
-  const signingKey = "test-only-promotion-record-key";
-  const auditOptions = { signingKey, expectedPackageNames: ["satelle"] };
-  context.after(() => rmSync(records, { recursive: true, force: true }));
-  writeFileSync(path.join(records, "17.json"), '{"schemaVersion":"corrupt"}\n');
-
-  assert.throws(
-    () => auditRecords(records, "1.2.3", auditOptions),
-    (error) =>
-      error instanceof PromotionError && error.code === "promotion-record-authentication-invalid",
-  );
-
-  rmSync(path.join(records, "17.json"));
-  const packageState = {
-    version: "1.2.3",
-    packageNames: ["satelle"],
-    previousLatest: { satelle: "1.2.2" },
-  };
-  writeFileSync(
-    path.join(records, "18.json"),
-    `${JSON.stringify(sealPromotionRecord(createPromotionRecord({
-      ...packageState,
-      now: "2026-07-19T12:00:00.000Z",
-    }), signingKey))}\n`,
-  );
-  writeFileSync(
-    path.join(records, "19.json"),
-    `${JSON.stringify(sealPromotionRecord(createPromotionRecord({
-      ...packageState,
-      now: "2026-07-19T12:00:01.000Z",
-    }), signingKey))}\n`,
-  );
-  assert.throws(
-    () => auditRecords(records, "1.2.3", auditOptions),
-    (error) => error instanceof PromotionError && error.code === "promotion-record-conflict",
-  );
-});
-
-test("npm promotion audit authenticates checkpoints and binds the canonical package graph", (context) => {
-  const records = mkdtempSync(path.join(tmpdir(), "satelle-promotion-auth-"));
-  context.after(() => rmSync(records, { recursive: true, force: true }));
-  const signingKey = "test-only-promotion-record-key";
-  const expectedPackageNames = ["native", "satelle"];
-  const canonicalRecord = createPromotionRecord({
-    version: "1.2.3",
-    packageNames: expectedPackageNames,
-    previousLatest: { native: null, satelle: "1.2.2" },
-  });
-  const tampered = sealPromotionRecord(canonicalRecord, signingKey);
-  tampered.record.packages[1].previousLatest = "0.0.1";
-  writeJson(path.join(records, "tampered.json"), tampered);
-
-  assert.throws(
-    () => auditRecords(records, "1.2.3", { signingKey, expectedPackageNames }),
-    (error) =>
-      error instanceof PromotionError && error.code === "promotion-record-authentication-invalid",
-  );
-
-  rmSync(path.join(records, "tampered.json"));
-  const wrongGraph = createPromotionRecord({
-    version: "1.2.3",
-    packageNames: ["attacker-controlled"],
-    previousLatest: { "attacker-controlled": "1.2.2" },
-  });
-  writeJson(path.join(records, "wrong-graph.json"), sealPromotionRecord(wrongGraph, signingKey));
-  assert.throws(
-    () => auditRecords(records, "1.2.3", { signingKey, expectedPackageNames }),
-    (error) => error instanceof PromotionError && error.code === "promotion-record-graph-mismatch",
-  );
-});
-
-test("npm promotion audit blocks another version until its transaction is terminal", (context) => {
-  const records = mkdtempSync(path.join(tmpdir(), "satelle-promotion-versions-"));
-  const signingKey = "test-only-promotion-record-key";
-  const auditOptions = { signingKey, expectedPackageNames: ["satelle"] };
-  context.after(() => rmSync(records, { recursive: true, force: true }));
-  const other = createPromotionRecord({
-    version: "1.2.2",
-    packageNames: ["satelle"],
-    previousLatest: { satelle: "1.2.1" },
-    now: "2026-07-19T12:00:00.000Z",
-  });
-  writeJson(path.join(records, "other.json"), sealPromotionRecord(other, signingKey));
-
-  assert.throws(
-    () => auditRecords(records, "1.2.3", auditOptions),
-    (error) => error instanceof PromotionError && error.code === "promotion-record-nonterminal",
-  );
-
-  other.status = "complete";
-  other.packages[0].promotionStatus = "promoted";
-  writeJson(path.join(records, "other.json"), sealPromotionRecord(other, signingKey));
-  assert.equal(auditRecords(records, "1.2.3", auditOptions), null);
-});
-
-test("npm promotion retries accept only the prior or candidate latest state", () => {
-  const record = createPromotionRecord({
-    version: "1.2.3",
-    packageNames: ["@microck/satelle-linux-x64-gnu", "@microck/satelle", "satelle"],
-    previousLatest: {
-      "@microck/satelle-linux-x64-gnu": null,
-      "@microck/satelle": "1.2.2",
-      satelle: "1.2.2",
-    },
-    now: "2026-07-19T12:00:00.000Z",
-  });
-
-  assert.deepEqual(planRegistryOperation(record, null), {
-    type: "set_latest",
-    packageName: "@microck/satelle-linux-x64-gnu",
-    version: "1.2.3",
-  });
-  let advanced = checkpointOperation(record, "1.2.3", {
-    now: "2026-07-19T12:00:01.000Z",
-  });
-  assert.deepEqual(planRegistryOperation(advanced, "1.2.3"), {
-    type: "checkpoint",
-    packageName: "@microck/satelle",
-  });
-  advanced = checkpointOperation(advanced, "1.2.3", {
-    now: "2026-07-19T12:00:02.000Z",
-  });
-
-  assert.throws(
-    () => planRegistryOperation(advanced, "9.9.9"),
-    (error) => error instanceof PromotionError && error.code === "promotion-state-conflict",
-  );
-});
-
-test("npm promotion waits for a stale latest read to converge", () => {
-  const states = ["1.2.2", "1.2.2", "1.2.3"];
-  const waits = [];
-
-  assert.equal(
-    waitForLatest("satelle", "1.2.3", "1.2.2", {
-      attempts: 3,
-      delayMs: 30,
-      read: () => states.shift(),
-      wait: (milliseconds) => waits.push(milliseconds),
-    }),
-    "1.2.3",
-  );
-  assert.deepEqual(waits, [30, 30]);
-  assert.equal(states.length, 0);
-});
-
-test("npm promotion polling rejects conflicts and bounds stale reads", () => {
-  const conflictWaits = [];
-  assert.throws(
-    () => waitForLatest("satelle", "1.2.3", "1.2.2", {
-      read: () => "9.9.9",
-      wait: (milliseconds) => conflictWaits.push(milliseconds),
-    }),
-    (error) => error instanceof PromotionError && error.code === "promotion-state-conflict",
-  );
-  assert.deepEqual(conflictWaits, []);
-
-  const staleWaits = [];
-  assert.throws(
-    () => waitForLatest("satelle", "1.2.3", "1.2.2", {
-      attempts: 3,
-      delayMs: 30,
-      read: () => "1.2.2",
-      wait: (milliseconds) => staleWaits.push(milliseconds),
-    }),
-    (error) =>
-      error instanceof PromotionError &&
-      error.code === "promotion-registry-propagation-timeout",
-  );
-  assert.deepEqual(staleWaits, [30, 30]);
-});
-
-test("npm promotion waits for the complete latest graph to converge", () => {
-  const record = createPromotionRecord({
-    version: "1.2.3",
-    packageNames: ["native", "launcher"],
-    previousLatest: { native: "1.2.2", launcher: "1.2.2" },
-    now: 0,
-  });
-  const states = {
-    native: ["1.2.2", "1.2.3"],
-    launcher: ["1.2.3"],
-  };
-  const waits = [];
-
-  assert.deepEqual(
-    waitForAllLatest(record, {
-      attempts: 2,
-      delayMs: 30,
-      read: (packageName) => states[packageName].shift(),
-      wait: (milliseconds) => waits.push(milliseconds),
-    }),
-    { native: "1.2.3", launcher: "1.2.3" },
-  );
-  assert.deepEqual(waits, [30]);
-});
-
-test("npm promotion restarts a recoverable checkpoint from registry state", () => {
-  const conflicted = {
-    ...createPromotionRecord({
-      version: "1.2.3",
-      packageNames: ["native", "launcher"],
-      previousLatest: { native: "1.2.2", launcher: "1.2.2" },
-      now: 0,
-    }),
-    mode: "rollback",
-    status: "conflicted",
-    sequence: 9,
-    conflict: { code: "promotion-state-conflict", message: "stale confirmation" },
-  };
-
-  const restarted = restartPromotion(conflicted, {
-    native: "1.2.3",
-    launcher: "1.2.2",
-  }, 1_000);
-  assert.equal(restarted.mode, "promotion");
-  assert.equal(restarted.status, "in_progress");
-  assert.equal(restarted.sequence, 10);
-  assert.equal(restarted.conflict, null);
-  assert.deepEqual(
-    restarted.packages.map(({ promotionStatus, restorationStatus }) => ({
-      promotionStatus,
-      restorationStatus,
-    })),
-    [
-      { promotionStatus: "promoted", restorationStatus: "pending" },
-      { promotionStatus: "pending", restorationStatus: "pending" },
-    ],
-  );
-  assert.throws(
-    () => restartPromotion(conflicted, { native: "9.9.9", launcher: "1.2.2" }),
-    (error) => error instanceof PromotionError && error.code === "promotion-state-conflict",
-  );
-
-  const rolledBack = {
-    ...conflicted,
-    status: "rolled_back",
-    conflict: null,
-  };
-  assert.throws(
-    () => restartPromotion(rolledBack, { native: "1.2.2", launcher: "1.2.2" }),
-    (error) => error instanceof PromotionError && error.code === "promotion-state-conflict",
-  );
-  assert.equal(
-    restartPromotion(
-      rolledBack,
-      { native: "1.2.2", launcher: "1.2.2" },
-      1_000,
-      { allowRolledBack: true },
-    ).status,
-    "in_progress",
-  );
-});
-
-test("npm promotion requires its token identity to be the only registry writer", () => {
-  assert.equal(
-    assertExclusiveRegistryWriter("satelle", "satelle-release", {
-      "docs-reader": "read-only",
-      "satelle-release": "read-write",
-    }),
-    "satelle-release",
-  );
-
-  for (const collaborators of [
-    { "satelle-release": "read-write", microck: "read-write" },
-    { microck: "read-write" },
-    { "satelle-release": "read-only" },
-  ]) {
-    assert.throws(
-      () => assertExclusiveRegistryWriter("satelle", "satelle-release", collaborators),
-      (error) =>
-        error instanceof PromotionError && error.code === "promotion-writer-access-conflict",
-    );
-  }
-});
-
-test("completed npm promotion revalidates every latest tag before release publication", () => {
-  let record = createPromotionRecord({
-    version: "1.2.3",
-    packageNames: ["native", "satelle"],
-    previousLatest: { native: "1.2.2", satelle: "1.2.2" },
-    now: "2026-07-19T12:00:00.000Z",
-  });
-  record = checkpointOperation(record, "1.2.3");
-  record = checkpointOperation(record, "1.2.3", {
-    allLatest: { native: "1.2.3", satelle: "1.2.3" },
-  });
-
-  assert.equal(
-    verifyCompleteRecord(record, { native: "1.2.3", satelle: "1.2.3" }).status,
-    "complete",
-  );
-  assert.throws(
-    () => verifyCompleteRecord(record, { native: "1.2.2", satelle: "1.2.3" }),
-    (error) => error instanceof PromotionError && error.code === "promotion-state-conflict",
-  );
-});
-
-test("npm rollback restores latest tags in reverse order and checkpoints retry-safe states", () => {
-  let record = createPromotionRecord({
-    version: "1.2.3",
-    packageNames: ["native", "@microck/satelle", "satelle"],
-    previousLatest: { native: null, "@microck/satelle": "1.2.2", satelle: "1.2.2" },
-    now: "2026-07-19T12:00:00.000Z",
-  });
-  for (const packageName of ["native", "@microck/satelle", "satelle"]) {
-    assert.equal(planRegistryOperation(record, record.packages.find((entry) => entry.name === packageName).previousLatest).packageName, packageName);
-    record = checkpointOperation(record, "1.2.3", {
-      now: "2026-07-19T12:00:01.000Z",
-      allLatest: packageName === "satelle"
-        ? { native: "1.2.3", "@microck/satelle": "1.2.3", satelle: "1.2.3" }
-        : undefined,
-    });
-  }
-  assert.equal(record.status, "complete");
-
-  record = beginRollback(record, "2026-07-19T12:00:04.000Z");
-  assert.deepEqual(planRegistryOperation(record, "1.2.3"), {
-    type: "set_latest",
-    packageName: "satelle",
-    version: "1.2.2",
-  });
-  record = checkpointOperation(record, "1.2.2", {
-    now: "2026-07-19T12:00:05.000Z",
-  });
-  assert.deepEqual(planRegistryOperation(record, "1.2.2"), {
-    type: "checkpoint",
-    packageName: "@microck/satelle",
-  });
-  record = checkpointOperation(record, "1.2.2", {
-    now: "2026-07-19T12:00:06.000Z",
-  });
-  assert.deepEqual(planRegistryOperation(record, "1.2.3"), {
-    type: "remove_latest",
-    packageName: "native",
-  });
-  record = checkpointOperation(record, null, {
-    now: "2026-07-19T12:00:07.000Z",
-  });
-  assert.equal(record.status, "rolled_back");
-});
-
-test("npm promotion refuses to advance conflicted or rolled-back records", () => {
-  const record = createPromotionRecord({
-    version: "1.2.3",
-    packageNames: ["native", "@microck/satelle", "satelle"],
-    previousLatest: { native: null, "@microck/satelle": "1.2.2", satelle: "1.2.2" },
-    now: "2026-07-19T12:00:00.000Z",
-  });
-
-  const conflicted = {
-    ...record,
-    status: "conflicted",
-    conflict: { code: "promotion-state-conflict", message: "operator intervention required" },
-  };
-  assert.throws(
-    () => planRegistryOperation(conflicted, null),
-    (error) =>
-      error instanceof PromotionError &&
-      error.code === "promotion-state-conflict" &&
-      error.message.includes("conflicted"),
-  );
-
-  const rolledBack = beginRollback(record, "2026-07-19T12:00:04.000Z");
-  for (const packageName of ["satelle", "@microck/satelle", "native"]) {
-    const prior = rolledBack.packages.find((entry) => entry.name === packageName).previousLatest;
-    rolledBack.packages.find((entry) => entry.name === packageName).restorationStatus = "restored";
-    assert.equal(prior, packageName === "native" ? null : "1.2.2");
-  }
-  rolledBack.status = "rolled_back";
-
-  assert.throws(
-    () => planRegistryOperation(rolledBack, null),
-    (error) =>
-      error instanceof PromotionError &&
-      error.code === "promotion-state-conflict" &&
-      error.message.includes("rolled_back"),
-  );
-});
-
-test("npm candidate publication records enforce native-first dependency order", () => {
-  const release = createReleaseContext(repositoryRoot);
-  const plan = release.check();
-  const manifest = {
+function stagedManifest() {
+  const plan = createReleaseContext(repositoryRoot).check();
+  return {
+    schemaVersion: "satelle.npm-artifacts.v1",
     version: plan.version,
-    packages: plan.publicationOrder.map((packageName) => ({
-      package: packageName,
-      version: plan.version,
-      file: packageName === "satelle"
-        ? "npm-satelle-unscoped.tgz"
-        : packageName === "@microck/satelle"
-          ? "npm-satelle-scoped.tgz"
-          : `npm-${packageName.slice("@microck/satelle-".length)}.tgz`,
-      integrity: `sha512-${Buffer.from(packageName).toString("base64")}`,
-    })),
+    packages: plan.publicationOrder.map((packageName) => {
+      const native = plan.artifacts.find((artifact) => artifact.package === packageName);
+      return {
+        package: packageName,
+        version: plan.version,
+        ...(native ? { target: native.target } : {}),
+        file: packageName === "satelle"
+          ? "npm-satelle-unscoped.tgz"
+          : packageName === "@microck/satelle"
+            ? "npm-satelle-scoped.tgz"
+            : native.npmArtifact,
+        integrity: `sha512-${Buffer.from(packageName).toString("base64")}`,
+      };
+    }),
   };
-  let record = createPublicationRecord(
-    plan.version,
+}
+
+function stageOutput(entry, version, index) {
+  return {
+    name: entry.name,
+    version,
+    integrity: entry.integrity,
+    shasum: String(index).padStart(40, "a").slice(-40),
+    stageId: `00000000-0000-7000-8000-${String(index).padStart(12, "0")}`,
+  };
+}
+
+test("npm staged release records preserve exact dependency order and artifact identity", () => {
+  const manifest = stagedManifest();
+  let record = createStageRecord(
+    manifest.version,
     manifest,
-    "2026-07-19T12:00:00.000Z",
+    "2026-09-14T00:00:00.000Z",
+  );
+  assert.equal(record.schemaVersion, "satelle.npm-staged-release.v1");
+  assert.equal(record.tag, "latest");
+  assert.equal(record.provenance, "github-actions-oidc");
+  assert.deepEqual(
+    record.packages.map(({ name }) => name),
+    createReleaseContext(repositoryRoot).check().publicationOrder,
   );
 
-  assert.deepEqual(record.packages.map(({ name }) => name), plan.publicationOrder);
-  record.status = "failed";
-  record.error = { code: "candidate-registry-read-failed", message: "retry" };
-  record = checkpointPublished(record, plan.publicationOrder[0], "2026-07-19T12:00:01.000Z");
-  assert.equal(record.status, "publishing");
-  assert.equal(record.error, null);
-  for (const packageName of plan.publicationOrder.slice(1)) {
-    record = checkpointPublished(record, packageName, "2026-07-19T12:00:01.000Z");
+  for (const [index, entry] of record.packages.entries()) {
+    assert.equal(nextPendingPackage(record).name, entry.name);
+    record = recordStagedPackage(
+      record,
+      entry.name,
+      stageOutput(entry, record.version, index + 1),
+      "2026-09-14T00:00:01.000Z",
+    );
   }
-  assert.equal(record.status, "complete");
-  assert.equal(record.packages.at(-2).name, "@microck/satelle");
-  assert.equal(record.packages.at(-1).name, "satelle");
+  assert.equal(nextPendingPackage(record), null);
+  assert.equal(record.status, "awaiting_approval");
+  assert.doesNotThrow(() => assertRecordMatchesManifest(record, manifest));
 });
 
-test("npm candidate publication recovery guidance follows the current failure", () => {
-  assert.equal(
-    publicationRecoveryInstruction("1.2.3", "candidate-registry-tag-mismatch"),
-    "dispatch candidate-tag-repair for v1.2.3, then rerun the signed-tag workflow without moving the tag or changing package bytes",
-  );
-  assert.equal(
-    publicationRecoveryInstruction("1.2.3", "candidate-registry-read-failed"),
-    "rerun the v1.2.3 release workflow without moving the signed tag or changing package bytes",
-  );
-});
-
-test("npm candidate publication waits for post-publish registry visibility", () => {
-  const entry = {
-    name: "@microck/satelle-darwin-arm64",
-    integrity: "sha512-expected",
-  };
-  const record = {
-    version: "1.2.3",
-    candidateTag: "rc-v1.2.3",
-  };
-  const states = [
-    { version: null, integrity: null, taggedVersion: null },
-    { version: "1.2.3", integrity: "sha512-expected", taggedVersion: null },
-    { version: "1.2.3", integrity: "sha512-expected", taggedVersion: "1.2.3" },
-  ];
-  const waits = [];
-
-  waitForPublishedCandidate(entry, record, {
-    attempts: 3,
-    delayMs: 30,
-    readState: () => states.shift(),
-    wait: (milliseconds) => waits.push(milliseconds),
-  });
-
-  assert.deepEqual(waits, [30, 30]);
-  assert.equal(states.length, 0);
-});
-
-test("npm candidate visibility polling fails closed without a final sleep", () => {
-  const entry = { name: "satelle", integrity: "sha512-expected" };
-  const record = { version: "1.2.3", candidateTag: "rc-v1.2.3" };
-  const waits = [];
-
-  assert.throws(
-    () => waitForPublishedCandidate(entry, record, {
-      attempts: 3,
-      delayMs: 30,
-      readState: () => ({
-        version: "1.2.3",
-        integrity: "sha512-expected",
-        taggedVersion: null,
-      }),
-      wait: (milliseconds) => waits.push(milliseconds),
-    }),
-    (error) =>
-      error instanceof CandidatePublicationError &&
-      error.code === "candidate-registry-tag-mismatch",
-  );
-  assert.deepEqual(waits, [30, 30]);
-});
-
-test("npm candidate visibility polling rejects immutable-byte mismatches immediately", () => {
-  const waits = [];
-  assert.throws(
-    () => waitForPublishedCandidate(
-      { name: "satelle", integrity: "sha512-expected" },
-      { version: "1.2.3", candidateTag: "rc-v1.2.3" },
-      {
-        readState: () => ({
-          version: "1.2.3",
-          integrity: "sha512-wrong",
-          taggedVersion: "1.2.3",
-        }),
-        wait: (milliseconds) => waits.push(milliseconds),
-      },
-    ),
-    (error) =>
-      error instanceof CandidatePublicationError &&
-      error.code === "candidate-registry-integrity-mismatch",
-  );
-  assert.deepEqual(waits, []);
-});
-
-test("npm candidate visibility polling rejects candidate tag conflicts immediately", () => {
-  const waits = [];
-  assert.throws(
-    () => waitForPublishedCandidate(
-      { name: "satelle", integrity: "sha512-expected" },
-      { version: "1.2.3", candidateTag: "rc-v1.2.3" },
-      {
-        readState: () => ({
-          version: "1.2.3",
-          integrity: "sha512-expected",
-          taggedVersion: "1.2.2",
-        }),
-        wait: (milliseconds) => waits.push(milliseconds),
-      },
-    ),
-    (error) =>
-      error instanceof CandidatePublicationError &&
-      error.code === "candidate-registry-tag-mismatch",
-  );
-  assert.deepEqual(waits, []);
-});
-
-test("npm candidate state preserves a conflicting tag when the requested version is absent", () => {
-  const calls = [];
-  const state = readPublishedCandidateState(
-    { name: "satelle" },
-    { version: "1.2.3", candidateTag: "rc-v1.2.3" },
-    (packageSpec, field) => {
-      calls.push([packageSpec, field]);
-      if (field === "version") return null;
-      if (field === "dist-tags") return { "rc-v1.2.3": "1.2.2" };
-      assert.fail(`unexpected npm field ${field}`);
-    },
-  );
-  assert.deepEqual(state, {
-    version: null,
-    integrity: null,
-    taggedVersion: "1.2.2",
-  });
-  assert.deepEqual(calls, [
-    ["satelle@1.2.3", "version"],
-    ["satelle", "dist-tags"],
-  ]);
-  assert.throws(
-    () => waitForPublishedCandidate(
-      { name: "satelle", integrity: "sha512-expected" },
-      { version: "1.2.3", candidateTag: "rc-v1.2.3" },
-      { readState: () => state, wait: () => assert.fail("a known conflict must not wait") },
-    ),
-    (error) =>
-      error instanceof CandidatePublicationError &&
-      error.code === "candidate-registry-tag-mismatch",
-  );
-});
-
-test("npm candidate visibility polling accepts a matching tag before its version appears", () => {
-  const states = [
-    { version: null, integrity: null, taggedVersion: "1.2.3" },
-    { version: "1.2.3", integrity: "sha512-expected", taggedVersion: "1.2.3" },
-  ];
-  const waits = [];
-  assert.equal(
-    waitForPublishedCandidate(
-      { name: "satelle", integrity: "sha512-expected" },
-      { version: "1.2.3", candidateTag: "rc-v1.2.3" },
-      {
-        attempts: 2,
-        delayMs: 30,
-        readState: () => states.shift(),
-        wait: (milliseconds) => waits.push(milliseconds),
-      },
-    ),
-    true,
-  );
-  assert.deepEqual(waits, [30]);
-  assert.deepEqual(states, []);
-});
-
-test("npm recovery provenance names the recovery workflow and signed release input", () => {
-  const environment = {
-    GITHUB_EVENT_NAME: "workflow_dispatch",
-    GITHUB_REPOSITORY: "Microck/satelle",
-    GITHUB_REPOSITORY_ID: "123",
-    GITHUB_REPOSITORY_OWNER_ID: "456",
-    GITHUB_REF: "refs/heads/main",
-    GITHUB_RUN_ATTEMPT: "2",
-    GITHUB_RUN_ID: "789",
-    GITHUB_SERVER_URL: "https://github.com",
-    GITHUB_SHA: "1".repeat(40),
-    GITHUB_WORKFLOW_REF: "Microck/satelle/.github/workflows/release.yml@refs/heads/main",
-    RUNNER_ENVIRONMENT: "github-hosted",
-    VERIFIED_SOURCE_DIGEST: "2".repeat(40),
-  };
-  const statement = createRecoveryProvenanceStatement(
-    { name: "@microck/satelle", integrity: `sha512-${Buffer.from("artifact").toString("base64")}` },
-    { version: "1.2.3" },
-    environment,
-  );
-  assert.equal(statement.subject[0].name, "pkg:npm/%40microck/satelle@1.2.3");
-  assert.equal(statement.subject[0].digest.sha512, Buffer.from("artifact").toString("hex"));
-  assert.equal(
-    statement.predicate.buildDefinition.externalParameters.workflow.ref,
-    "refs/heads/main",
-  );
-  assert.equal(
-    statement.predicate.buildDefinition.externalParameters.workflow.path,
-    ".github/workflows/release.yml",
-  );
-  assert.deepEqual(statement.predicate.buildDefinition.externalParameters.signedRelease, {
-    tag: "refs/tags/v1.2.3",
-    commit: "2".repeat(40),
-  });
-  assert.equal(
-    statement.predicate.buildDefinition.resolvedDependencies[0].uri,
-    "git+https://github.com/Microck/satelle@refs/tags/v1.2.3",
-  );
-  assert.equal(
-    statement.predicate.runDetails.metadata.invocationId,
-    "https://github.com/Microck/satelle/actions/runs/789/attempts/2",
-  );
-  assert.equal(environment.GITHUB_REF, "refs/heads/main");
-  assert.throws(
-    () => createRecoveryProvenanceStatement(
-      { name: "satelle", integrity: "sha512-invalid" },
-      { version: "1.2.3" },
-      {},
-    ),
-    (error) =>
-      error instanceof CandidatePublicationError &&
-      error.code === "release-recovery-not-authorized",
-  );
-});
-
-test("npm package provenance uses canonical package URLs", () => {
-  assert.equal(npmPackagePurl("@microck/satelle", "1.2.3"), "pkg:npm/%40microck/satelle@1.2.3");
-  assert.equal(npmPackagePurl("satelle", "1.2.3"), "pkg:npm/satelle@1.2.3");
-});
-
-test("npm recovery metadata requires a clean signed-source checkout", (context) => {
-  const workspace = mkdtempSync(path.join(tmpdir(), "satelle-signed-source-"));
-  const signedSource = path.join(workspace, "signed-release-source");
-  mkdirSync(signedSource);
-  context.after(() => rmSync(workspace, { recursive: true, force: true }));
-  execFileSync("git", ["init", "--quiet", signedSource]);
-  execFileSync("git", ["-C", signedSource, "config", "user.name", "Satelle Test"]);
-  execFileSync("git", ["-C", signedSource, "config", "user.email", "test@satelle.invalid"]);
-  writeFileSync(path.join(signedSource, "metadata.txt"), "signed\n");
-  execFileSync("git", ["-C", signedSource, "add", "metadata.txt"]);
-  execFileSync("git", ["-C", signedSource, "commit", "--quiet", "-m", "signed source"]);
-  const sourceDigest = execFileSync("git", ["-C", signedSource, "rev-parse", "HEAD"], {
-    encoding: "utf8",
-  }).trim();
-  const originalEnvironment = {
-    GITHUB_WORKSPACE: process.env.GITHUB_WORKSPACE,
-    SATELLE_RELEASE_RECOVERY: process.env.SATELLE_RELEASE_RECOVERY,
-    SATELLE_RELEASE_RECOVERY_OPERATION: process.env.SATELLE_RELEASE_RECOVERY_OPERATION,
-    SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: process.env.SATELLE_RELEASE_RECOVERY_SOURCE_ROOT,
-    VERIFIED_SOURCE_DIGEST: process.env.VERIFIED_SOURCE_DIGEST,
-  };
-  Object.assign(process.env, {
-    GITHUB_WORKSPACE: workspace,
-    SATELLE_RELEASE_RECOVERY: "1",
-    SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-finalize",
-    SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: signedSource,
-    VERIFIED_SOURCE_DIGEST: sourceDigest,
-  });
-  context.after(() => {
-    for (const [key, value] of Object.entries(originalEnvironment)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  });
-
-  assert.equal(recoveryReleaseRoot(), realpathSync(signedSource));
-  assert.equal(promotionReleaseRoot(), realpathSync(signedSource));
-
-  // A normal signed-tag run shares the operation label but must read metadata
-  // from its checked-out release source, not the recovery-only checkout.
-  process.env.SATELLE_RELEASE_RECOVERY = "0";
-  assert.equal(promotionReleaseRoot(), repositoryRoot);
-  process.env.SATELLE_RELEASE_RECOVERY = "1";
-
-  writeFileSync(path.join(signedSource, "untracked.txt"), "changed\n");
-  assert.throws(
-    () => recoveryReleaseRoot(),
-    (error) =>
-      error instanceof CandidatePublicationError &&
-      error.code === "release-recovery-not-authorized",
-  );
-  assert.throws(
-    () => promotionReleaseRoot(),
-    (error) =>
-      error instanceof PromotionError &&
-      error.code === "release-recovery-not-authorized",
-  );
-});
-
-test("npm candidate recovery reconciles the published prefix before retrying", (context) => {
-  const release = createReleaseContext(repositoryRoot);
-  const plan = release.check();
-  const manifest = {
-    version: plan.version,
-    packages: plan.publicationOrder.map((packageName) => ({
-      package: packageName,
-      version: plan.version,
-      file: `${packageName.replaceAll("/", "-")}.tgz`,
-      integrity: `sha512-${Buffer.from(packageName).toString("base64")}`,
-    })),
-  };
-  const root = mkdtempSync(path.join(tmpdir(), "satelle-candidate-reconcile-"));
-  const recordPath = path.join(root, "record.json");
-  const record = createPublicationRecord(plan.version, manifest);
-  writeJson(recordPath, record);
-  context.after(() => rmSync(root, { recursive: true, force: true }));
-
-  const environmentKeys = [
-    "GITHUB_ACTIONS",
-    "GITHUB_EVENT_NAME",
-    "GITHUB_REF",
-    "GITHUB_REPOSITORY",
-    "SATELLE_RELEASE_RECOVERY",
-    "SATELLE_RELEASE_RECOVERY_OPERATION",
-    "SATELLE_RELEASE_RECOVERY_TAG",
-  ];
-  const originalEnvironment = Object.fromEntries(
-    environmentKeys.map((key) => [key, process.env[key]]),
-  );
-  Object.assign(process.env, {
-    GITHUB_ACTIONS: "true",
-    GITHUB_EVENT_NAME: "workflow_dispatch",
-    GITHUB_REF: "refs/heads/main",
-    GITHUB_REPOSITORY: "Microck/satelle",
-    SATELLE_RELEASE_RECOVERY: "1",
-    SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-resume",
-    SATELLE_RELEASE_RECOVERY_TAG: `v${plan.version}`,
-  });
-
+test("npm staged release rejects reordered or mismatched artifacts before approval", () => {
+  const manifest = stagedManifest();
+  const record = createStageRecord(manifest.version, manifest);
   const first = record.packages[0];
-  const second = record.packages[1];
-  let secondReads = 0;
-  const waits = [];
-  try {
-    const reconciled = reconcileRecoveryPrefix(recordPath, {
-      attempts: 2,
-      delayMs: 1,
-      readState: (entry) => {
-        if (entry.name === first.name) {
-          return {
-            version: plan.version,
-            integrity: first.integrity,
-            taggedVersion: plan.version,
-          };
-        }
-        secondReads += 1;
-        if (secondReads < 3) {
-          return { version: null, integrity: null, taggedVersion: null };
-        }
-        return {
-          version: plan.version,
-          integrity: second.integrity,
-          taggedVersion: plan.version,
-        };
-      },
-      wait: (milliseconds) => waits.push(milliseconds),
-    });
-    assert.deepEqual(reconciled.packages.slice(0, 3).map((entry) => entry.status), [
-      "published",
-      "published",
-      "pending",
-    ]);
-    assert.deepEqual(waits, [1]);
-  } finally {
-    for (const [key, value] of Object.entries(originalEnvironment)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
+  assert.throws(
+    () => recordStagedPackage(
+      record,
+      record.packages[1].name,
+      stageOutput(record.packages[1], record.version, 2),
+    ),
+    (error) => error instanceof StagedReleaseError && error.code === "npm-stage-order-invalid",
+  );
+  assert.throws(
+    () => recordStagedPackage(
+      record,
+      first.name,
+      { ...stageOutput(first, record.version, 1), integrity: "sha512-wrong" },
+    ),
+    (error) => error instanceof StagedReleaseError && error.code === "npm-stage-output-invalid",
+  );
+  const changed = structuredClone(manifest);
+  changed.packages[0].integrity = "sha512-changed";
+  assert.throws(
+    () => assertRecordMatchesManifest(record, changed),
+    (error) => error instanceof StagedReleaseError && error.code === "npm-stage-record-invalid",
+  );
+  const duplicated = structuredClone(manifest);
+  duplicated.packages.push(structuredClone(duplicated.packages[0]));
+  assert.throws(
+    () => createStageRecord(manifest.version, duplicated),
+    (error) => error instanceof StagedReleaseError && error.code === "npm-stage-record-invalid",
+  );
 });
 
-test("npm candidate recovery polls partial registry visibility", (context) => {
-  const release = createReleaseContext(repositoryRoot);
-  const plan = release.check();
-  const manifest = {
-    version: plan.version,
-    packages: plan.publicationOrder.map((packageName) => ({
-      package: packageName,
-      version: plan.version,
-      file: `${packageName.replaceAll("/", "-")}.tgz`,
-      integrity: `sha512-${Buffer.from(packageName).toString("base64")}`,
-    })),
-  };
-  const root = mkdtempSync(path.join(tmpdir(), "satelle-candidate-partial-"));
-  const recordPath = path.join(root, "record.json");
-  const record = createPublicationRecord(plan.version, manifest);
-  writeJson(recordPath, record);
-  context.after(() => rmSync(root, { recursive: true, force: true }));
-
-  const originalEnvironment = { ...process.env };
-  Object.assign(process.env, {
-    GITHUB_ACTIONS: "true",
-    GITHUB_EVENT_NAME: "workflow_dispatch",
-    GITHUB_REF: "refs/heads/main",
-    GITHUB_REPOSITORY: "Microck/satelle",
-    SATELLE_RELEASE_RECOVERY: "1",
-    SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-resume",
-    SATELLE_RELEASE_RECOVERY_TAG: `v${plan.version}`,
-  });
+test("npm staged approval requires trusted automation and approval-ready metadata", () => {
+  const manifest = stagedManifest();
+  const record = createStageRecord(manifest.version, manifest);
   const entry = record.packages[0];
-  let reads = 0;
-  try {
-    const reconciled = reconcileRecoveryPrefix(recordPath, {
-      attempts: 1,
-      readState: () => {
-        reads += 1;
-        return reads === 1
-          ? { version: plan.version, integrity: null, taggedVersion: null }
-          : {
-              version: plan.version,
-              integrity: entry.integrity,
-              taggedVersion: plan.version,
-            };
-      },
-      wait: () => assert.fail("one successful poll must not sleep"),
-    });
-    assert.equal(reconciled.packages[0].status, "published");
-    assert.equal(reconciled.packages[1].status, "pending");
-    assert.equal(reads, 2);
-  } finally {
-    for (const key of Object.keys(process.env)) {
-      if (!(key in originalEnvironment)) delete process.env[key];
-    }
-    Object.assign(process.env, originalEnvironment);
-  }
-});
-
-test("npm candidate publication fails closed on process and artifact path boundaries", (context) => {
-  const originalPath = process.env.PATH;
-  const artifactRoot = mkdtempSync(path.join(tmpdir(), "satelle-candidate-artifacts-"));
-  context.after(() => {
-    process.env.PATH = originalPath;
-    rmSync(artifactRoot, { recursive: true, force: true });
-  });
-
-  process.env.PATH = artifactRoot;
-  assert.throws(
-    () => npmView("satelle", "version"),
-    (error) =>
-      error instanceof CandidatePublicationError &&
-      error.code === "candidate-registry-read-failed" &&
-      /npm view satelle/.test(error.message),
-  );
-
-  const distTags = { latest: "1.2.2", "rc-v1.2.3": "1.2.3" };
-  assert.equal(candidateTagValue(distTags, "rc-v1.2.3"), "1.2.3");
-  assert.equal(promotionTagValue(distTags, "rc-v1.2.3"), "1.2.3");
-  assert.equal(candidateTagRepairAction(null, "1.2.3"), "repair");
-  assert.equal(candidateTagRepairAction("1.2.3", "1.2.3"), "already_tagged");
-  assert.throws(
-    () => candidateTagRepairAction("1.2.2", "1.2.3"),
-    (error) =>
-      error instanceof CandidatePublicationError &&
-      error.code === "candidate-registry-tag-conflict",
-  );
-
-  const artifactPath = path.join(artifactRoot, "satelle.tgz");
-  writeFileSync(artifactPath, "candidate");
-  assert.equal(resolveArtifactPath(artifactRoot, "satelle.tgz"), realpathSync(artifactPath));
-  assert.throws(
-    () => resolveArtifactPath(artifactRoot, "../outside.tgz"),
-    (error) =>
-      error instanceof CandidatePublicationError && error.code === "candidate-record-invalid",
-  );
-  assert.throws(
-    () => resolveArtifactPath(artifactRoot, ".."),
-    (error) =>
-      error instanceof CandidatePublicationError && error.code === "candidate-record-invalid",
-  );
-  assert.throws(
-    () => resolveArtifactPath(artifactRoot, artifactPath),
-    (error) =>
-      error instanceof CandidatePublicationError && error.code === "candidate-record-invalid",
-  );
-});
-
-test("npm rollback recovery is bound to the matching release tag", (context) => {
-  const root = mkdtempSync(path.join(tmpdir(), "satelle-promotion-recovery-"));
-  context.after(() => rmSync(root, { recursive: true, force: true }));
-  const recordPath = path.join(root, "record.json");
-  const promotionScript = path.join(repositoryRoot, "npm", "scripts", "npm-promotion.cjs");
-  const packageNames = createReleaseContext(repositoryRoot).check().publicationOrder;
-  const signingKey = "test-only-promotion-record-key";
-  writeJson(recordPath, sealPromotionRecord(createPromotionRecord({
-    version: workspaceVersion(),
-    packageNames,
-    previousLatest: Object.fromEntries(packageNames.map((name) => [name, "0.0.9"])),
-  }), signingKey));
-  const recoveryEnvironment = {
-    ...process.env,
-    GITHUB_ACTIONS: "true",
-    GITHUB_EVENT_NAME: "workflow_dispatch",
-    GITHUB_REF: "refs/heads/main",
-    GITHUB_REPOSITORY: "Microck/satelle",
-    SATELLE_RELEASE_RECOVERY: "1",
-    SATELLE_RELEASE_RECOVERY_OPERATION: "rollback",
-    SATELLE_PROMOTION_RECORD_KEY: signingKey,
+  const staged = recordStagedPackage(record, entry.name, stageOutput(entry, record.version, 1));
+  const view = {
+    id: staged.packages[0].stageId,
+    packageName: entry.name,
+    version: staged.version,
+    tag: "latest",
+    shasum: staged.packages[0].shasum,
+    actorType: "trusted automation",
+    status: "awaiting_approval",
   };
-
-  const mismatched = spawnSync(process.execPath, [promotionScript, "abort", recordPath], {
-    encoding: "utf8",
-    env: { ...recoveryEnvironment, SATELLE_RELEASE_RECOVERY_TAG: "v9.9.9" },
-  });
-  assert.equal(mismatched.status, 1);
-  assert.equal(JSON.parse(mismatched.stderr).code, "release-automation-required");
-
-  const matched = spawnSync(process.execPath, [promotionScript, "abort", recordPath], {
-    encoding: "utf8",
-    env: {
-      ...recoveryEnvironment,
-      SATELLE_RELEASE_RECOVERY_TAG: `v${workspaceVersion()}`,
-    },
-  });
-  assert.equal(matched.status, 0, matched.stderr);
-  assert.equal(JSON.parse(matched.stdout).status, "rolling_back");
-  const rollbackCheckpoint = readJson(recordPath);
-  assert.equal(rollbackCheckpoint.schemaVersion, "satelle.npm-promotion.checkpoint.v1");
-  assert.match(rollbackCheckpoint.authentication.value, /^[0-9a-f]{64}$/);
-  assert.equal(rollbackCheckpoint.record.status, "rolling_back");
-});
-
-test("npm promotion recovery requires the exact finalization operation and tag", (context) => {
-  const environmentKeys = [
-    "GITHUB_ACTIONS",
-    "GITHUB_EVENT_NAME",
-    "GITHUB_REF",
-    "GITHUB_REPOSITORY",
-    "SATELLE_RELEASE_RECOVERY",
-    "SATELLE_RELEASE_RECOVERY_OPERATION",
-    "SATELLE_RELEASE_RECOVERY_TAG",
-  ];
-  const originalEnvironment = Object.fromEntries(
-    environmentKeys.map((key) => [key, process.env[key]]),
-  );
-  context.after(() => {
-    for (const [key, value] of Object.entries(originalEnvironment)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  });
-  Object.assign(process.env, {
-    GITHUB_ACTIONS: "true",
-    GITHUB_EVENT_NAME: "workflow_dispatch",
-    GITHUB_REF: "refs/heads/main",
-    GITHUB_REPOSITORY: "Microck/satelle",
-    SATELLE_RELEASE_RECOVERY: "1",
-    SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-finalize",
-    SATELLE_RELEASE_RECOVERY_TAG: "v1.2.3",
-  });
-
-  assert.doesNotThrow(() =>
-    requireReleaseAutomation("1.2.3", { recoveryOperation: "candidate-finalize" }),
-  );
-  for (const invalidEnvironment of [
-    { SATELLE_RELEASE_RECOVERY_OPERATION: "rollback" },
-    { SATELLE_RELEASE_RECOVERY_TAG: "v9.9.9" },
-    { GITHUB_REPOSITORY: "someone/satelle" },
-  ]) {
-    Object.assign(process.env, {
-      GITHUB_REPOSITORY: "Microck/satelle",
-      SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-finalize",
-      SATELLE_RELEASE_RECOVERY_TAG: "v1.2.3",
-      ...invalidEnvironment,
-    });
-    assert.throws(
-      () => requireReleaseAutomation("1.2.3", { recoveryOperation: "candidate-finalize" }),
-      (error) => error instanceof PromotionError && error.code === "release-automation-required",
-    );
-  }
-});
-
-test("registry mutation helpers reject local developer execution", () => {
-  for (const script of [
-    "npm-candidate-publication.cjs",
-    "npm-promotion.cjs",
-  ]) {
-    const child = spawnSync(
-      process.execPath,
-      [path.join(repositoryRoot, "npm", "scripts", script), "create", workspaceVersion()],
-      {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          GITHUB_ACTIONS: "false",
-          GITHUB_REF: "",
-          GITHUB_REPOSITORY: "",
-        },
-      },
-    );
-    assert.equal(child.status, 1, script);
-    assert.equal(JSON.parse(child.stderr).code, "release-automation-required");
-  }
-
-  const wrongRecoveryBranch = spawnSync(
-    process.execPath,
-    [
-      path.join(repositoryRoot, "npm", "scripts", "npm-candidate-publication.cjs"),
-      "create",
-      workspaceVersion(),
-    ],
-    {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        GITHUB_ACTIONS: "true",
-        GITHUB_EVENT_NAME: "workflow_dispatch",
-        GITHUB_REF: "refs/heads/release-recovery-copy",
-        GITHUB_REPOSITORY: "Microck/satelle",
-        SATELLE_RELEASE_RECOVERY: "1",
-        SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-resume",
-        SATELLE_RELEASE_RECOVERY_TAG: `v${workspaceVersion()}`,
-      },
-    },
-  );
-  assert.equal(wrongRecoveryBranch.status, 1);
-  assert.equal(JSON.parse(wrongRecoveryBranch.stderr).code, "release-automation-required");
-
-  const wrongRecoveryOperation = spawnSync(
-    process.execPath,
-    [
-      path.join(repositoryRoot, "npm", "scripts", "npm-candidate-publication.cjs"),
-      "create",
-      workspaceVersion(),
-    ],
-    {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        GITHUB_ACTIONS: "true",
-        GITHUB_EVENT_NAME: "workflow_dispatch",
-        GITHUB_REF: "refs/heads/main",
-        GITHUB_REPOSITORY: "Microck/satelle",
-        SATELLE_RELEASE_RECOVERY: "1",
-        SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-tag-repair",
-        SATELLE_RELEASE_RECOVERY_TAG: `v${workspaceVersion()}`,
-      },
-    },
-  );
-  assert.equal(wrongRecoveryOperation.status, 1);
-  assert.equal(JSON.parse(wrongRecoveryOperation.stderr).code, "release-automation-required");
-
-  const wrongRecoveryTag = spawnSync(
-    process.execPath,
-    [
-      path.join(repositoryRoot, "npm", "scripts", "npm-candidate-publication.cjs"),
-      "create",
-      workspaceVersion(),
-    ],
-    {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        GITHUB_ACTIONS: "true",
-        GITHUB_EVENT_NAME: "workflow_dispatch",
-        GITHUB_REF: "refs/heads/main",
-        GITHUB_REPOSITORY: "Microck/satelle",
-        SATELLE_RELEASE_RECOVERY: "1",
-        SATELLE_RELEASE_RECOVERY_OPERATION: "candidate-resume",
-        SATELLE_RELEASE_RECOVERY_TAG: "v9.9.9",
-      },
-    },
-  );
-  assert.equal(wrongRecoveryTag.status, 1);
-  assert.equal(JSON.parse(wrongRecoveryTag.stderr).code, "release-automation-required");
-
-  const root = mkdtempSync(path.join(tmpdir(), "satelle-candidate-recovery-auth-"));
-  const manifestPath = path.join(root, "npm-artifacts.json");
-  writeJson(manifestPath, {});
-  try {
-    const child = spawnSync(
-      process.execPath,
-      [
-        path.join(repositoryRoot, "npm", "scripts", "npm-candidate-publication.cjs"),
-        "repair-tags",
-        workspaceVersion(),
-        manifestPath,
-      ],
-      {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          GITHUB_ACTIONS: "false",
-          GITHUB_EVENT_NAME: "",
-          GITHUB_REPOSITORY: "",
-          SATELLE_RELEASE_RECOVERY: "",
-          SATELLE_RELEASE_RECOVERY_TAG: "",
-        },
-      },
-    );
-    assert.equal(child.status, 1);
-    assert.equal(JSON.parse(child.stderr).code, "release-automation-required");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("candidate tag repair revalidates signed tag and draft state before every write", () => {
-  const evidence = {
-    currentTagDigest: "a".repeat(40),
-    currentSourceDigest: "b".repeat(40),
-    isDraft: true,
-    verifiedTagDigest: "a".repeat(40),
-    verifiedSourceDigest: "b".repeat(40),
-  };
-  assert.doesNotThrow(() => assertCandidateRecoveryAuthorization(evidence));
-  for (const invalidEvidence of [
-    { ...evidence, currentTagDigest: "c".repeat(40) },
-    { ...evidence, currentSourceDigest: "c".repeat(40) },
-    { ...evidence, isDraft: false },
+  assert.doesNotThrow(() => assertStageView(staged.packages[0], staged, view));
+  for (const invalid of [
+    { ...view, actorType: "user" },
+    { ...view, status: "validating" },
+    { ...view, tag: "next" },
   ]) {
     assert.throws(
-      () => assertCandidateRecoveryAuthorization(invalidEvidence),
-      (error) =>
-        error instanceof CandidatePublicationError &&
-        error.code === "release-recovery-not-authorized",
+      () => assertStageView(staged.packages[0], staged, invalid),
+      (error) => error instanceof StagedReleaseError && error.code === "npm-stage-review-invalid",
     );
   }
-  assert.match(
-    repairCandidateTags.toString(),
-    /for \(const entry of record\.packages\)[\s\S]*recheckCandidateRecoveryAuthorization\(version\)[\s\S]*execFileSync\([\s\S]*"dist-tag", "add"/,
-  );
 });
 
-test("release workflow gates draft publication on candidate validation and promotion", () => {
+test("release workflow uses staged npm approval as its only publication path", () => {
   const workflow = readFileSync(
     path.join(repositoryRoot, ".github", "workflows", "release.yml"),
     "utf8",
   ).replaceAll("\r\n", "\n");
-  const ciWorkflow = readFileSync(
-    path.join(repositoryRoot, ".github", "workflows", "ci.yml"),
-    "utf8",
-  ).replaceAll("\r\n", "\n");
-  const draftRelease = workflowJob(workflow, "draft-release");
-  const buildRelease = workflowJob(workflow, "build");
-  const collectRelease = workflowJob(workflow, "collect");
-  const buildReleaseExecutable = workflowStep(
-    buildRelease,
-    "Build native release executable",
-  );
-  const buildGnuReleaseExecutable = workflowStep(
-    buildRelease,
-    "Build GNU release executable",
-  );
-  const installGnuToolchain = workflowStep(
-    buildRelease,
-    "Install pinned GNU cross-build toolchain",
-  );
-  const verifyGnuAbiFloor = workflowStep(
-    buildRelease,
-    "Verify GNU ABI floor",
-  );
-  const publishCandidates = workflowJob(workflow, "publish-candidates");
-  const publishCargo = workflowJob(workflow, "publish-cargo");
-  const packageCargo = workflowStep(collectRelease, "Package the crates.io artifact");
-  const cargoPublishStep = workflowStep(
-    publishCargo,
-    "Publish or verify the immutable Cargo version",
-  );
-  const validateRegistryCandidates = workflowJob(workflow, "validate-registry-candidates");
-  const promoteAndPublish = workflowJob(workflow, "promote-and-publish");
-  const authorizeRecoveryTag = workflowJob(workflow, "authorize-recovery-tag");
-  const resumeCandidates = workflowJob(workflow, "resume-candidates");
-  const recoveryDownloadStep = workflowStep(
-    resumeCandidates,
-    "Download the exact signed-tag candidate",
-  );
-  const recoverySignerStep = workflowStep(
-    resumeCandidates,
-    "Install recovery provenance signer",
-  );
-  const recoveryPublishStep = workflowStep(
-    resumeCandidates,
-    "Publish native, scoped, then unscoped candidate packages",
-  );
-  const repairCandidateTags = workflowJob(workflow, "repair-candidate-tags");
-  const rollbackPromotion = workflowJob(workflow, "rollback-promotion");
-  const candidatePublishStep = workflowStep(
-    publishCandidates,
-    "Publish native, scoped, then unscoped candidate packages",
-  );
-  const candidateRepairStep = workflowStep(
-    repairCandidateTags,
-    "Repair candidate dist-tags",
-  );
-  const promotionStep = workflowStep(
-    promoteAndPublish,
-    "Promote latest tags with durable checkpoints",
-  );
-  const finalizationDownloadStep = workflowStep(
-    promoteAndPublish,
-    "Download the exact signed-tag candidate for recovery",
-  );
-  const finalPublishStep = workflowStep(
-    promoteAndPublish,
+  const stageNpm = workflowJob(workflow, "stage-npm");
+  const stageStep = workflowStep(stageNpm, "Stage the complete npm package graph");
+  const authorize = workflowJob(workflow, "authorize-finalization-tag");
+  const verifyPublished = workflowJob(workflow, "verify-published-npm");
+  const validatePublished = workflowJob(workflow, "validate-published-npm");
+  const publishRelease = workflowJob(workflow, "publish-release");
+  const finalStep = workflowStep(
+    publishRelease,
     "Recheck signed tag and publish the GitHub release",
   );
-  const draftReleaseQuery = finalPublishStep.match(
-    /jq -s -e -c --arg tag "\$RELEASE_TAG" \\\n\s+'([\s\S]*?)'\) \|\| \\/,
-  )?.[1];
-  assert.ok(draftReleaseQuery, "draft release query is missing");
-  const mutableDraftQuery = finalPublishStep.match(
-    /mutable_draft_query='([\s\S]*?)'/,
-  )?.[1];
-  assert.ok(mutableDraftQuery, "mutable draft identity query is missing");
-  const resolveDraftRelease = (pages) =>
-    spawnSync(
-      "jq",
-      ["-s", "-e", "-c", "--arg", "tag", "v0.1.2", draftReleaseQuery],
-      {
-        encoding: "utf8",
-        input: pages.map((page) => JSON.stringify(page)).join("\n"),
-      },
-    );
-  const isMutableDraft = (release) =>
-    spawnSync(
-      "jq",
-      [
-        "-e",
-        "--arg",
-        "tag",
-        "v0.1.2",
-        "--argjson",
-        "id",
-        "370072321",
-        mutableDraftQuery,
-      ],
-      { encoding: "utf8", input: JSON.stringify(release) },
-    );
-  const rollbackStep = workflowStep(
-    rollbackPromotion,
-    "Restore prior latest tags in reverse dependency order",
-  );
+  const draftRelease = workflowJob(workflow, "draft-release");
+  const publishCargo = workflowJob(workflow, "publish-cargo");
 
-  assert.match(workflow, /group: .*satelle-npm-release-writer/);
-  assert.equal((buildRelease.match(/^            glibc-version: "2\.17"$/gm) ?? []).length, 2);
-  assert.equal((buildRelease.match(/^            glibc-version: ""$/gm) ?? []).length, 4);
-  assert.match(
-    installGnuToolchain,
-    /if: matrix\.glibc-version != ''/,
-  );
-  assert.match(
-    installGnuToolchain,
-    /rust-cross\/cargo-zigbuild\/releases\/download\/v0\.23\.0/,
-  );
-  assert.match(
-    installGnuToolchain,
-    /ziglang\.org\/download\/0\.15\.2/,
-  );
-  assert.equal(
-    (installGnuToolchain.match(/curl --fail --location --retry 3 --connect-timeout 10 --max-time 300/g) ?? []).length,
-    2,
-  );
-  assert.equal(
-    (installGnuToolchain.match(/timeout 300 tar -xJf/g) ?? []).length,
-    2,
-  );
-  assert.match(
-    installGnuToolchain,
-    /5917d5416884cba0f23c2653016f7f2df2ec04e74eb6b259598fecc066f8c429[\s\S]*c636e4f72b6f40a40ddf0414c8c6056f78b87eea3be0edf01f08d65fa028a373/,
-  );
-  assert.match(
-    installGnuToolchain,
-    /958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f[\s\S]*02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239/,
-  );
-  assert.match(
-    buildGnuReleaseExecutable,
-    /cargo zigbuild --locked --release -p satelle[\s\S]*--target "\$\{\{ matrix\.rust-target \}\}\.\$\{\{ matrix\.glibc-version \}\}"/,
-  );
-  assert.match(
-    verifyGnuAbiFloor,
-    /readelf --version-info[\s\S]*GLIBC_\[0-9\.\]\+[\s\S]*sort -V[\s\S]*matrix\.glibc-version/,
-  );
-  assert.match(
-    buildReleaseExecutable,
-    /RUSTFLAGS: \$\{\{ runner\.os == 'Windows' && '-D warnings -C target-feature=\+crt-static' \|\| '-D warnings' \}\}/,
-  );
-  assert.match(
-    workflowStep(workflowJob(ciWorkflow, "rust"), "Build release binaries"),
-    /RUSTFLAGS: \$\{\{ runner\.os == 'Windows' && '-D warnings -C target-feature=\+crt-static' \|\| '-D warnings' \}\}/,
-  );
-  assert.match(draftRelease, /candidate_pattern=.*npm-candidate-v.*\[0-9\]\+/);
-  assert.match(draftRelease, /promotion_pattern=.*npm-promotion-v.*\[0-9\]\+/);
-  assert.doesNotMatch(draftRelease, /startswith\("npm-(?:candidate|promotion)-"\)/);
-  assert.match(packageCargo, /cargo package --locked -p satelle/);
-  assert.match(packageCargo, /validated\/cargo[\s\S]*sha256sum/);
-  assert.match(publishCargo, /^    needs: \[attest, collect, draft-release\]$/m);
-  assert.match(
-    cargoPublishStep,
-    /git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*sha256sum --check --strict[\s\S]*cargo publish --locked --no-verify -p satelle/,
-  );
-  assert.match(
-    cargoPublishStep,
-    /--user-agent 'OpenAI File Downloader, XaiImageApiFetch\/1\.0'/,
-  );
-  assert.match(cargoPublishStep, /cargo-registry-version-conflict/);
-  assert.match(promoteAndPublish, /needs\.publish-cargo\.result == 'success'/);
-  assert.match(publishCandidates, /^    permissions:\n(?:      .*\n)*      id-token: write$/m);
-  assert.match(publishCandidates, /^    needs: \[attest, collect, draft-release\]$/m);
-  assert.match(publishCandidates, /npm-candidate-publication\.cjs advance/);
-  assert.match(
-    candidatePublishStep,
-    /recheck_release_tag[\s\S]*git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*gh release view[\s\S]*--jq \.isDraft[\s\S]*while [\s\S]*recheck_release_tag[\s\S]*npm-candidate-publication\.cjs advance/,
-  );
-  assert.doesNotMatch(candidatePublishStep, /NODE_AUTH_TOKEN|NPM_DIST_TAG_TOKEN/);
-  assert.match(
-    authorizeRecoveryTag,
-    /^    if: github\.event_name == 'workflow_dispatch' && inputs\.operation != 'diagnostics'$/m,
-  );
-  assert.match(workflow, /^          - candidate-resume$/m);
-  assert.match(workflow, /^          - candidate-finalize$/m);
-  assert.match(workflow, /^      recover_rolled_back:$/m);
-  assert.match(
-    resumeCandidates,
-    /^    if: github\.event_name == 'workflow_dispatch' && inputs\.operation == 'candidate-resume'$/m,
-  );
-  assert.match(resumeCandidates, /^    needs: authorize-recovery-tag$/m);
-  assert.match(resumeCandidates, /^    timeout-minutes: 360$/m);
-  const candidatePublicationConcurrency = /concurrency:\n      group: npm-candidate-publication-\$\{\{ github\.event_name == 'workflow_dispatch' && format\('v\{0\}', inputs\.version\) \|\| github\.ref_name \}\}\n      cancel-in-progress: false/g;
-  assert.equal((workflow.match(candidatePublicationConcurrency) ?? []).length, 2);
-  assert.match(
-    resumeCandidates,
-    /^    permissions:\n      actions: read\n      contents: write\n      id-token: write$/m,
-  );
-  assert.match(resumeCandidates, /ref: \$\{\{ github\.sha \}\}/);
-  assert.match(
-    resumeCandidates,
-    /path: signed-release-source[\s\S]*ref: \$\{\{ needs\.authorize-recovery-tag\.outputs\.source-digest \}\}/,
-  );
-  assert.match(
-    resumeCandidates,
-    /SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: \$\{\{ github\.workspace \}\}\/signed-release-source/,
-  );
-  assert.match(
-    resumeCandidates,
-    /actions\/workflows\/release\.yml\/runs\?event=push&branch=v\$\{RELEASE_VERSION\}/,
-  );
-  assert.match(
-    resumeCandidates,
-    /\.head_sha == \$source_digest[\s\S]*\.status == "completed"[\s\S]*\.conclusion == "failure"/,
-  );
-  assert.match(recoveryDownloadStep, /source_run_count=.*jq -r 'length'/);
-  assert.match(recoveryDownloadStep, /test "\$source_run_count" = 1/);
-  assert.match(recoveryDownloadStep, /gh run download "\$source_run_id"/);
-  assert.match(recoveryDownloadStep, /--name validated-release-candidate/);
-  assert.match(resumeCandidates, /npm-candidate-publication\.cjs reconcile "\$record"/);
-  assert.match(resumeCandidates, /npm-candidate-publication\.cjs advance/);
-  assert.match(recoveryPublishStep, /^        id: publish-recovery$/m);
-  assert.doesNotMatch(candidatePublishStep, /id: publish-recovery/);
-  assert.match(recoverySignerStep, /npm ci --ignore-scripts/);
-  assert.doesNotMatch(publishCandidates, /Install recovery provenance signer/);
-  assert.match(
-    workflowStep(resumeCandidates, "Preserve failed npm recovery record"),
-    /if: failure\(\) && steps\.publish-recovery\.outcome == 'failure'[\s\S]*npm-candidate-publication\.json/,
-  );
-  assert.doesNotMatch(resumeCandidates, /trap 'checkpoint' ERR/);
-  const candidatePublicationScript = readFileSync(
-    path.join(repositoryRoot, "npm", "scripts", "npm-candidate-publication.cjs"),
-    "utf8",
-  );
-  assert.match(candidatePublicationScript, /--provenance-file/);
-  assert.doesNotMatch(resumeCandidates, /NODE_AUTH_TOKEN|NPM_DIST_TAG_TOKEN/);
-  assert.match(authorizeRecoveryTag, /git\/ref\/tags\/v\$RELEASE_VERSION/);
-  assert.match(authorizeRecoveryTag, /verification\.verified == true/);
-  assert.match(authorizeRecoveryTag, /GITHUB_REF.*refs\/heads\/\$default_branch/);
-  assert.match(authorizeRecoveryTag, /GITHUB_SHA.*\$default_head/);
-  assert.match(authorizeRecoveryTag, /compare\/\$\{source_digest\}\.\.\.\$\{default_head\}/);
-  assert.match(authorizeRecoveryTag, /commits\/\$source_digest\/pulls/);
-  assert.doesNotMatch(authorizeRecoveryTag, /actions\/checkout|NODE_AUTH_TOKEN|NPM_DIST_TAG_TOKEN/);
-  assert.match(
-    repairCandidateTags,
-    /^    if: github\.event_name == 'workflow_dispatch' && inputs\.operation == 'candidate-tag-repair'$/m,
-  );
-  assert.match(repairCandidateTags, /^    needs: authorize-recovery-tag$/m);
-  assert.match(
-    repairCandidateTags,
-    /ref: \$\{\{ needs\.authorize-recovery-tag\.outputs\.source-digest \}\}/,
-  );
-  assert.match(repairCandidateTags, /gh release view .*--json isDraft --jq \.isDraft/);
-  assert.match(repairCandidateTags, /gh release download .*--pattern npm-artifacts\.json/s);
-  assert.match(
-    candidateRepairStep,
-    /^          NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_DIST_TAG_TOKEN \}\}$/m,
-  );
-  assert.match(candidateRepairStep, /npm-candidate-publication\.cjs repair-tags/);
-  assert.match(candidateRepairStep, /git rev-parse HEAD/);
-  assert.match(candidateRepairStep, /VERIFIED_TAG_DIGEST/);
-  assert.match(
-    validateRegistryCandidates,
-    /^    needs: \[authorize-recovery-tag, collect, publish-candidates\]$/m,
-  );
-  assert.match(validateRegistryCandidates, /inputs\.operation == 'candidate-finalize'/);
-  assert.match(validateRegistryCandidates, /needs\.authorize-recovery-tag\.result == 'success'/);
-  assert.match(
-    validateRegistryCandidates,
-    /@microck\/satelle satelle[\s\S]*for manager in npm pnpm bun/,
-  );
-  assert.match(
-    validateRegistryCandidates,
-    /pnpm --dir "\$install_root" add --ignore-scripts "\$package_spec"/,
-  );
-  assert.match(
-    validateRegistryCandidates,
-    /bun add --cwd "\$install_root" --ignore-scripts "\$package_spec"/,
-  );
-  assert.doesNotMatch(validateRegistryCandidates, /bun --cwd .* add/);
-  assert.doesNotMatch(validateRegistryCandidates, /minimum-release-age/);
-  assert.match(
-    promoteAndPublish,
-    /^    needs: \[attest, authorize-recovery-tag, collect, draft-release, publish-cargo, validate-registry-candidates\]$/m,
-  );
-  assert.match(promoteAndPublish, /inputs\.operation == 'candidate-finalize'/);
-  assert.match(promoteAndPublish, /needs\.authorize-recovery-tag\.result == 'success'/);
-  assert.match(promoteAndPublish, /SATELLE_RELEASE_RECOVERY_OPERATION: candidate-finalize/);
-  assert.match(promoteAndPublish, /SATELLE_RELEASE_RECOVERY_TAG: \$\{\{ startsWith\(github\.ref/);
-  assert.match(
-    promoteAndPublish,
-    /path: signed-release-source[\s\S]*ref: \$\{\{ needs\.authorize-recovery-tag\.outputs\.source-digest \}\}/,
-  );
-  assert.match(
-    promoteAndPublish,
-    /SATELLE_RELEASE_RECOVERY_SOURCE_ROOT: \$\{\{ github\.workspace \}\}\/signed-release-source/,
-  );
-  assert.match(
-    promoteAndPublish,
-    /EXPECTED_SOURCE_DIGEST: \$\{\{ startsWith\(github\.ref, 'refs\/tags\/v'\) && needs\.attest\.outputs\.source-digest \|\| needs\.authorize-recovery-tag\.outputs\.source-digest \}\}/,
-  );
-  assert.match(
-    promoteAndPublish,
-    /EXPECTED_TAG_DIGEST: \$\{\{ startsWith\(github\.ref, 'refs\/tags\/v'\) && needs\.attest\.outputs\.tag-digest \|\| needs\.authorize-recovery-tag\.outputs\.tag-digest \}\}/,
-  );
-  assert.match(finalizationDownloadStep, /actions\/workflows\/release\.yml\/runs\?event=push&branch=\$\{tag\}/);
-  assert.match(finalizationDownloadStep, /test "\$source_run_count" = 1/);
-  assert.match(finalizationDownloadStep, /gh run download "\$source_run_id"/);
-  assert.match(finalizationDownloadStep, /--name validated-release-candidate/);
-  assert.match(
-    promotionStep,
-    /recheck_release_tag[\s\S]*git\/ref\/tags\/\$RELEASE_TAG[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*gh release view[\s\S]*--jq \.isDraft[\s\S]*recheck_release_tag[\s\S]*npm-promotion\.cjs advance/,
-  );
-  assert.match(
-    promotionStep,
-    /gh api --paginate "repos\/\$GITHUB_REPOSITORY\/releases\?per_page=100"/,
-  );
-  assert.match(
-    promotionStep,
-    /checkpoint\(\) \{\n\s+recheck_release_tag\n[\s\S]*gh release upload "\$RELEASE_TAG"/,
-  );
-  assert.match(
-    promotionStep,
-    /recheck_release_tag\n\s+record_status=[\s\S]*npm-promotion\.cjs restart "\$record" --allow-rolled-back[\s\S]*checkpoint/,
-  );
-  assert.match(
-    promotionStep,
-    /ALLOW_ROLLED_BACK_RECOVERY[\s\S]*rolled-back promotion requires explicit recovery authorization/,
-  );
+  assert.match(workflow, /^          - stage-finalize$/m);
   assert.doesNotMatch(
-    promotionStep,
-    /select\(\.draft == true\).*npm-promotion-/,
+    workflow,
+    /publish-candidates:|validate-registry-candidates:|promote-and-publish:|candidate-resume|candidate-tag-repair|npm-promotion|npm-candidate-publication|NPM_DIST_TAG_TOKEN|NPM_PROMOTION_RECORD_KEY|rc-v/,
   );
-  assert.match(
-    promotionStep,
-    /^          NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_DIST_TAG_TOKEN \}\}$/m,
-  );
-  assert.match(
-    promotionStep,
-    /^          SATELLE_PROMOTION_RECORD_KEY: \$\{\{ secrets\.NPM_PROMOTION_RECORD_KEY \}\}$/m,
-  );
-  assert.match(
-    promoteAndPublish,
-    /npm-promotion\.cjs advance[\s\S]*npm-promotion\.cjs verify-complete[\s\S]*Recheck signed tag and publish the GitHub release[\s\S]*git\/ref\/tags\/\$RELEASE_TAG[\s\S]*publication_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=true/,
-  );
-  assert.match(
-    finalPublishStep,
-    /candidate_pattern=.*npm-candidate-v.*\[0-9\]\+.*promotion_pattern=.*npm-promotion-v.*\[0-9\]\+/s,
-  );
-  assert.match(
-    finalPublishStep,
-    /gh api --paginate \\\n\s+"repos\/\$GITHUB_REPOSITORY\/releases\?per_page=100"[\s\S]*jq -s -e -c --arg tag "\$RELEASE_TAG"[\s\S]*\.tag_name == \$tag and \.draft == true and \.immutable == false/,
-  );
-  assert.doesNotMatch(finalPublishStep, /releases\/tags\/\$RELEASE_TAG/);
-  assert.match(finalPublishStep, /repos\/\$GITHUB_REPOSITORY\/releases\/\$release_id/);
-  const matchingDraft = {
-    id: 370072321,
-    tag_name: "v0.1.2",
-    draft: true,
-    immutable: false,
-  };
-  for (const pages of [
-    [[matchingDraft]],
-    [[{ ...matchingDraft, tag_name: "v0.1.1" }], [matchingDraft]],
-  ]) {
-    const resolved = resolveDraftRelease(pages);
-    assert.equal(resolved.status, 0, resolved.stderr);
-    assert.deepEqual(JSON.parse(resolved.stdout), matchingDraft);
-  }
-  for (const pages of [
-    [[{ ...matchingDraft, draft: false }]],
-    [[matchingDraft], [{ ...matchingDraft, id: matchingDraft.id + 1 }]],
-  ]) {
-    assert.notEqual(resolveDraftRelease(pages).status, 0);
-  }
-  assert.equal(isMutableDraft(matchingDraft).status, 0);
-  for (const release of [
-    { ...matchingDraft, id: matchingDraft.id + 1 },
-    { ...matchingDraft, tag_name: "v0.1.1" },
-    { ...matchingDraft, draft: false },
-    { ...matchingDraft, immutable: true },
-  ]) {
-    assert.notEqual(isMutableDraft(release).status, 0);
-  }
-  assert.match(
-    finalPublishStep,
-    /gh api[\s\S]*releases\/assets\/\$asset_id[\s\S]*sha256sum --check[\s\S]*npm-promotion\.cjs audit-records[\s\S]*npm-promotion\.cjs verify-complete/,
-  );
-  assert.match(
-    finalPublishStep,
-    /recheck_release_tag\n\s+while read -r asset_id; do[\s\S]*--method DELETE[\s\S]*release asset set changed during final verification[\s\S]*publication_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=true/,
-  );
-  assert.match(
-    finalPublishStep,
-    /RELEASE_POLICY_TOKEN: \$\{\{ secrets\.RELEASE_POLICY_TOKEN \}\}[\s\S]*GH_TOKEN="\$RELEASE_POLICY_TOKEN" gh api[\s\S]*immutable-releases/,
-  );
-  assert.match(
-    finalPublishStep,
-    /publication_state[\s\S]*\.draft == false and \.immutable == true[\s\S]*\.draft == false and \.immutable == false[\s\S]*recheck_release_tag[\s\S]*rollback_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=true[\s\S]*\.draft == true/,
-  );
-  assert.match(
-    finalPublishStep,
-    /for attempt in \$\(seq 1 10\); do[\s\S]*publication_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=false[\s\S]*publication_state=\$\(gh api[\s\S]*releases\/\$release_id[\s\S]*\.draft == true and \.immutable == false[\s\S]*sleep 1/,
-  );
-  assert.match(
-    finalPublishStep,
-    /for attempt in \$\(seq 1 10\); do[\s\S]*rollback_state=\$\(gh api[\s\S]*--method PATCH[\s\S]*-F draft=true[\s\S]*rollback_state=\$\(gh api[\s\S]*releases\/\$release_id[\s\S]*\.draft == false and \.immutable == false[\s\S]*sleep 1/,
-  );
-  assert.match(
-    finalPublishStep,
-    /recheck_release_tag\(\)[\s\S]*retry_transient[\s\S]*return 1[\s\S]*for attempt in \$\(seq 1 10\); do[\s\S]*if ! recheck_release_tag retry_transient[\s\S]*sleep 1[\s\S]*continue/,
-  );
-  assert.match(
-    finalPublishStep,
-    /publication_state=\n\s+for attempt in \$\(seq 1 10\); do\n\s+if ! recheck_release_tag retry_transient[\s\S]*release publication tag could not be rechecked[\s\S]*draft_state=\$\(gh api[\s\S]*releases\/\$release_id[\s\S]*mutable_draft_query[\s\S]*draft release identity changed before publication[\s\S]*--method PATCH/,
-  );
-  assert.match(
-    rollbackPromotion,
-    /npm-promotion\.cjs abort[\s\S]*npm-promotion\.cjs advance/,
-  );
-  assert.match(
-    rollbackStep,
-    /recheck_recovery_authorization[\s\S]*git\/ref\/tags\/\$tag[\s\S]*git\/tags\/\$VERIFIED_TAG_DIGEST[\s\S]*gh release view[\s\S]*--jq \.isDraft[\s\S]*while [\s\S]*recheck_recovery_authorization[\s\S]*npm-promotion\.cjs advance/,
-  );
-  assert.match(
-    rollbackPromotion,
-    /gh api --paginate "repos\/\$GITHUB_REPOSITORY\/releases\?per_page=100"/,
-  );
-  assert.match(rollbackPromotion, /^    needs: authorize-recovery-tag$/m);
-  assert.match(rollbackPromotion, /SATELLE_RELEASE_RECOVERY_OPERATION: rollback/);
-  assert.match(
-    rollbackPromotion,
-    /^          SATELLE_PROMOTION_RECORD_KEY: \$\{\{ secrets\.NPM_PROMOTION_RECORD_KEY \}\}$/m,
-  );
-  assert.equal(
-    (workflow.match(/select\(\.draft == true\).*startswith\("npm-promotion-"\)/g) ?? [])
-      .length,
-    1,
-  );
-  assert.match(
-    rollbackPromotion,
-    /ref: \$\{\{ needs\.authorize-recovery-tag\.outputs\.source-digest \}\}/,
-  );
-  assert.equal((workflow.match(/asset_ids="\$RUNNER_TEMP\/[^"]+"/g) ?? []).length, 2);
-  assert.equal((workflow.match(/after_sequence=/g) ?? []).length, 4);
-  assert.equal((workflow.match(/sequence did not advance/g) ?? []).length, 4);
-  assert.match(workflow, /SATELLE_RELEASE_RECOVERY_TAG: v\$\{\{ inputs\.version \}\}/);
+  assert.match(stageNpm, /^    needs: \[attest, collect, draft-release, publish-cargo\]$/m);
+  assert.match(stageNpm, /^    permissions:\n      contents: write\n      id-token: write$/m);
+  assert.match(stageNpm, /npm install --global npm@11\.15\.0/);
+  assert.match(stageStep, /recheck_release_tag[\s\S]*while package=.*npm-staged-release\.cjs next/);
+  assert.match(stageStep, /gh release view[\s\S]*\.assets \| any\(\.name == \$name\)[\s\S]*gh release download/);
+  assert.doesNotMatch(stageStep, /gh release download[\s\S]*\|\| true/);
+  assert.match(stageStep, /npm stage publish "validated\/npm\/\$artifact"/);
+  assert.match(stageStep, /--tag latest[\s\S]*--access public[\s\S]*--provenance[\s\S]*--json/);
+  assert.match(stageStep, /npm-staged-release\.cjs record[\s\S]*gh release upload/);
+  assert.doesNotMatch(stageNpm, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
+  assert.match(draftRelease, /stage_pattern="\^npm-stages-v/);
+  assert.match(authorize, /verification\.verified == true/);
+  assert.match(authorize, /release finalization must be dispatched from the default branch/);
+  assert.match(verifyPublished, /npm view "\$package_spec" dist\.integrity/);
+  assert.match(validatePublished, /npm audit signatures --prefix "\$install_root"/);
+  assert.equal((validatePublished.match(/runner: (?:ubuntu|macos|windows)/g) ?? []).length, 6);
+  assert.match(publishCargo, /cargo publish --locked --no-verify -p satelle/);
+  assert.match(publishRelease, /validated-release-candidate/);
+  assert.match(finalStep, /validated\/cargo\/\*/);
+  assert.match(finalStep, /npm-stages-v\$\{RELEASE_VERSION\}\.json/);
+  assert.match(finalStep, /repos\/\$GITHUB_REPOSITORY\/immutable-releases/);
+  assert.match(finalStep, /-F draft=false[\s\S]*-f make_latest=true/);
+  assert.match(finalStep, /rollback_state=[\s\S]*-F draft=true/);
 });
