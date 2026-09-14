@@ -652,6 +652,10 @@ fn failure(error: &SatelleError) -> ApiFailure {
         // Process interruption is a Controller-local process-exit contract.
         // If it crosses the Host boundary, expose no extra API surface.
         | ErrorCode::Interrupted
+        // Relay policy and capability failures are Controller preflight
+        // results. The Host never admits their prospective Turn.
+        | ErrorCode::NativeActionRelayNotSupported
+        | ErrorCode::NativeActionPolicyConflict
         // Log targeting and follow recovery are also Controller-local. The
         // Host API exposes finite pages, not the CLI's polling lifecycle.
         | ErrorCode::LogsTargetRequired

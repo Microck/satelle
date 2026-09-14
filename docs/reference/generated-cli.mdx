@@ -57,6 +57,7 @@ Commands:
   self
   run
   steer
+  action
   queue
   status
   stop
@@ -514,6 +515,8 @@ Options:
           Enable YOLO for this Turn with approval policy never and sandbox policy danger-full-access; native app or operating-system prompts remain human decisions
       --no-yolo
           Disable YOLO mode for this command
+      --relay-native-actions
+          Relay supported native Computer Use action requests for explicit allow or deny decisions
       --events <EVENTS>
           [default: auto] [possible values: auto, human, json, none]
       --prompt-file <PROMPT_FILE>
@@ -588,6 +591,8 @@ Options:
           Enable YOLO for this Turn with approval policy never and sandbox policy danger-full-access; native app or operating-system prompts remain human decisions
       --no-yolo
           Disable YOLO mode for this command
+      --relay-native-actions
+          Relay supported native Computer Use action requests for explicit allow or deny decisions
       --events <EVENTS>
           [default: auto] [possible values: auto, human, json, none]
       --prompt-file <PROMPT_FILE>
@@ -616,6 +621,23 @@ Options:
           Alias for --format json
   -h, --help
           Print help
+```
+
+## `satelle action`
+
+```text
+Usage: satelle action [OPTIONS] <COMMAND>
+
+Commands:
+  respond  Answer a detached native action request
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
 ```
 
 ## `satelle queue`
@@ -1073,6 +1095,26 @@ Options:
       --format <FORMAT>            [possible values: human, json, compact-json, toon, markdown]
       --json                       Alias for --format json
   -h, --help                       Print help
+```
+
+## `satelle action respond`
+
+```text
+Answer a detached native action request
+
+Usage: satelle action respond [OPTIONS] <ACTION_REQUEST_ID>
+
+Arguments:
+  <ACTION_REQUEST_ID>
+
+Options:
+      --allow
+      --no-color               Disable colored human output
+      --deny
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
 ```
 
 ## `satelle queue status`

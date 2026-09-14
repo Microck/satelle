@@ -226,6 +226,7 @@ impl Command {
                     EventOutput::None
                 },
             ),
+            Self::Action { .. } => (OutputArgs::default(), EventOutput::None),
             Self::Queue { command } => match command {
                 super::QueueCommand::Status(command) => (command.output_args, EventOutput::None),
                 super::QueueCommand::Cancel(command) => (command.output_args, EventOutput::None),

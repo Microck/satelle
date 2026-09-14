@@ -1434,12 +1434,12 @@
 - public MVP release is blocked until the README, license, security policy, version-matched docs and bundled skills, security and legal review, release dry run or manual runbook rehearsal, signed protected tag checks, archive checksum and attestation checks, npm registry visibility and clean-install checks, every Controller suite, and every macOS and Windows Computer Use Host suite pass @spec @phase3 @mvp @release-gate @verification @implemented
 
 ## phase-4-full-scope
-- phase 4 implements every fact tagged both spec and later in dependency order while preserving the public identifier, authority, safety, and compatibility contracts established by MVP @spec @phase4 @later
-- later queueing, recording, raw diagnostics, config composition, package expansion, telemetry, and multi-user features do not weaken MVP consent, isolation, redaction, or Host identity boundaries @spec @phase4 @later
+- phase 4 implements every fact tagged both spec and later in dependency order while preserving the public identifier, authority, safety, and compatibility contracts established by MVP @spec @phase4 @later @implemented
+- later queueing, recording, raw diagnostics, config composition, package expansion, telemetry, and multi-user features do not weaken MVP consent, isolation, redaction, or Host identity boundaries @spec @phase4 @later @implemented
 - phase 4A completes operational foundations: Config Includes, config repair, storage migration, credential helpers, Trusted Profile expiration, CLI-Host compatibility, explicit Host version selection, package repair, remote images, advanced output contracts, and mutual TLS @spec @phase4 @implemented
 - phase 4B completes sensitive observability only after shared redaction, retention, manifest, consent, and audit conformance: diagnostic bundles, Raw Diagnostic Exports, recording, Platform-Native Log Sinks, and telemetry @spec @phase4 @implemented
 - phase 4C completes durable queueing before the Multi-User Broker and proves restart recovery, cancellation, Principal reauthorization, isolation, and per-binding lease behavior before multi-user release @spec @phase4 @implemented
-- phase 4D completes Automation Workflows, ecosystem distribution expansion, and native action relay only after their versioned command, schema, capability, security, and acceptance contracts pass without weakening earlier phase gates @spec @phase4 @later
+- phase 4D completes Automation Workflows, ecosystem distribution expansion, and native action relay only after their versioned command, schema, capability, security, and acceptance contracts pass without weakening earlier phase gates @spec @phase4 @later @implemented
 
 # sessions
 
@@ -1988,14 +1988,14 @@
 - satelle MVP does not implement Satelle-owned confirmation prompts for individual native Computer Use actions after a prompt turn starts @spec @mvp @implemented
 - satelle surfaces detected native Codex Computer Use app approvals, operating-system permission prompts, administrator authentication prompts, security prompts, and sensitive-action prompts as action_required events or manual-action-required blockers instead of replacing them with Satelle confirmations @spec @mvp @implemented
 - satelle does not auto-answer native Codex Computer Use app approvals, operating-system permission prompts, administrator authentication prompts, security prompts, or sensitive-action prompts unless Codex exposes the specific prompt as a documented app-server approval callback that Satelle is allowed to answer @spec @mvp @implemented
-- satelle only adds Satelle-owned native action confirmation relay after MVP as an opt-in feature guarded by an explicit per-command flag and only when Codex exposes stable native Computer Use action events and accept or deny callbacks @spec @later
-- satelle later run and steer use --relay-native-actions as the exact per-command native action confirmation relay opt-in @spec @later
-- --relay-native-actions fails before Turn start with typed native-action-relay-not-supported when the Codex adapter does not advertise stable action request plus accept and deny callbacks @spec @later
-- every relayed native action request receives an ra_ identifier followed by a canonical lowercase UUIDv7 and emits an action_required event containing that id, a bounded redacted action summary, expiry, Session id, and Turn id without screenshots or raw desktop content @spec @contract @later
-- an attached interactive run or steer may answer the currently displayed action request with an explicit allow or deny choice, and the default choice is deny @spec @later
-- satelle action respond <action_request_id> --allow and satelle action respond <action_request_id> --deny are the exact detached response commands and require control scope for the owning Session @spec @later
-- an unanswered relayed action request expires after 5 minutes or when its Turn becomes terminal, whichever occurs first, and Satelle sends deny when the upstream callback remains available @spec @later
-- --relay-native-actions is mutually exclusive with YOLO mode, reports a typed native-action-policy-conflict for that combination, and is never implied by --yes @spec @later
+- satelle only adds Satelle-owned native action confirmation relay after MVP as an opt-in feature guarded by an explicit per-command flag and only when Codex exposes stable native Computer Use action events and accept or deny callbacks @spec @later @phase4 @implemented
+- satelle later run and steer use --relay-native-actions as the exact per-command native action confirmation relay opt-in @spec @later @phase4 @implemented
+- --relay-native-actions fails before Turn start with typed native-action-relay-not-supported when the Codex adapter does not advertise stable action request plus accept and deny callbacks @spec @later @phase4 @implemented
+- every relayed native action request receives an ra_ identifier followed by a canonical lowercase UUIDv7 and emits an action_required event containing that id, a bounded redacted action summary, expiry, Session id, and Turn id without screenshots or raw desktop content @spec @contract @later @phase4 @implemented
+- an attached interactive run or steer may answer the currently displayed action request with an explicit allow or deny choice, and the default choice is deny @spec @later @phase4 @implemented
+- satelle action respond <action_request_id> --allow and satelle action respond <action_request_id> --deny are the exact detached response commands and require control scope for the owning Session @spec @later @phase4 @implemented
+- an unanswered relayed action request expires after 5 minutes or when its Turn becomes terminal, whichever occurs first, and Satelle sends deny when the upstream callback remains available @spec @later @phase4 @implemented
+- --relay-native-actions is mutually exclusive with YOLO mode, reports a typed native-action-policy-conflict for that combination, and is never implied by --yes @spec @later @phase4 @implemented
 - satelle run and steer support an explicit YOLO option for users who want Codex-controlled approvals to be auto-accepted @implemented @mvp
 - satelle YOLO mode is disabled by default and must be selected by a command option, user-level configuration policy, or user-level profile policy @spec @mvp @implemented
 - satelle YOLO mode does not ask for an additional Satelle confirmation prompt after the user explicitly selects the mode @spec @mvp @implemented

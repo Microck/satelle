@@ -1391,6 +1391,7 @@ async fn capabilities(
         env!("CARGO_PKG_VERSION").to_string(),
         state.capabilities.codex_runtime(),
         state.capabilities.native_computer_use(),
+        state.capabilities.native_action_relay(),
         state.capabilities.provider_computer_use(),
         state.capabilities.image_attachments(),
         state.limits,

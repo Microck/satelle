@@ -102,6 +102,7 @@ impl DaemonRuntimeStatus {
 pub struct DaemonRuntimeCapabilities {
     codex_runtime: bool,
     native_computer_use: bool,
+    native_action_relay: bool,
     provider_computer_use: bool,
     image_attachments: bool,
     codex_update_evidence: crate::core::host_update::CodexUpdateEvidence,
@@ -604,6 +605,12 @@ impl DaemonRuntimeCapabilities {
         self.native_computer_use
     }
 
+    /// True only when the Codex adapter exposes stable native action request,
+    /// accept, and deny callbacks. Generic command approvals do not qualify.
+    pub const fn native_action_relay(&self) -> bool {
+        self.native_action_relay
+    }
+
     pub const fn provider_computer_use(&self) -> bool {
         self.provider_computer_use
     }
@@ -804,6 +811,7 @@ impl HostService {
             HostMode::TestFake { image_attachments } => Ok(DaemonRuntimeCapabilities {
                 codex_runtime: false,
                 native_computer_use: false,
+                native_action_relay: false,
                 provider_computer_use: false,
                 image_attachments: *image_attachments,
                 codex_update_evidence: crate::core::host_update::CodexUpdateEvidence {
@@ -2293,6 +2301,7 @@ fn production_capabilities(
     DaemonRuntimeCapabilities {
         codex_runtime,
         native_computer_use,
+        native_action_relay: false,
         provider_computer_use: false,
         image_attachments: snapshot.image_attachments_supported(),
         codex_update_evidence: production_codex_update_evidence(snapshot),

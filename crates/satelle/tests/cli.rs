@@ -5947,6 +5947,78 @@ fn run_human_output_identifies_active_yolo_mode_when_not_quiet() {
 }
 
 #[test]
+fn native_action_relay_rejects_yolo_then_unsupported_adapters_before_turn_start() {
+    let state = state_dir();
+
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "run",
+            "--host",
+            "local-demo",
+            "--relay-native-actions",
+            "--yolo",
+            "--json",
+            "Check",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            r#""code": "native-action-policy-conflict""#,
+        ));
+
+    let unsupported = satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args([
+            "run",
+            "--host",
+            "local-demo",
+            "--relay-native-actions",
+            "--no-yolo",
+            "--events",
+            "json",
+            "Check",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&unsupported.stderr)
+            .contains(r#""code": "native-action-relay-not-supported""#)
+    );
+    let events = serde_json::Deserializer::from_slice(&unsupported.stdout)
+        .into_iter::<Value>()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("relay preflight output is NDJSON");
+    assert!(events.iter().any(|event| event["type"] == "command_failed"));
+    assert!(events.iter().all(|event| event["session_id"].is_null()));
+    assert!(events.iter().all(|event| event["turn_id"].is_null()));
+}
+
+#[test]
+fn native_action_response_validates_its_id_before_reporting_adapter_support() {
+    let state = state_dir();
+    let action_request_id = "ra_01890a5d-ac96-7b7c-8f89-37c3d0a66f10";
+
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["action", "respond", action_request_id, "--deny"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "native-action-relay-not-supported",
+        ));
+
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["action", "respond", "ra_not-a-uuid", "--allow"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid-usage"));
+}
+
+#[test]
 fn doctor_missing_host_returns_typed_host_not_found() {
     let state = state_dir();
     satelle()

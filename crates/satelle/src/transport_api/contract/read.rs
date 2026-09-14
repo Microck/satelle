@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 define_schema_token!(LiveSchema, "satelle.live.v1");
-define_schema_token!(CapabilitiesSchemaV6, "satelle.capabilities.v6");
+define_schema_token!(CapabilitiesSchemaV7, "satelle.capabilities.v7");
 define_schema_token!(
     MaintenanceUpdateEvidenceSchema,
     "satelle.maintenance.update-evidence.v1"
@@ -187,6 +187,7 @@ struct Platform {
 struct RuntimeCapabilities {
     codex_runtime: bool,
     native_computer_use: bool,
+    native_action_relay: bool,
     provider_computer_use: bool,
 }
 
@@ -280,7 +281,7 @@ impl EffectiveLimits {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilitiesResponse {
-    schema_version: CapabilitiesSchemaV6,
+    schema_version: CapabilitiesSchemaV7,
     request_id: RequestId,
     host_identity: String,
     daemon_version: String,
@@ -301,6 +302,7 @@ impl CapabilitiesResponse {
         daemon_version: String,
         codex_runtime: bool,
         native_computer_use: bool,
+        native_action_relay: bool,
         provider_computer_use: bool,
         image_attachments: bool,
         limits: EffectiveLimits,
@@ -316,7 +318,7 @@ impl CapabilitiesResponse {
             }
         };
         Self {
-            schema_version: CapabilitiesSchemaV6,
+            schema_version: CapabilitiesSchemaV7,
             request_id,
             host_identity,
             daemon_version,
@@ -356,6 +358,7 @@ impl CapabilitiesResponse {
             runtime_capabilities: RuntimeCapabilities {
                 codex_runtime,
                 native_computer_use,
+                native_action_relay,
                 provider_computer_use,
             },
             minimum_host_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -417,6 +420,10 @@ impl CapabilitiesResponse {
 
     pub fn supported_attachment_media_types(&self) -> &[String] {
         &self.supported_attachment_media_types
+    }
+
+    pub const fn native_action_relay(&self) -> bool {
+        self.runtime_capabilities.native_action_relay
     }
 }
 

@@ -73,7 +73,8 @@ pub use events::{
     SatelleEventBody, SatelleEventError,
 };
 pub use ids::{
-    IdParseError, QUEUE_REQUEST_ID_PATTERN, QueueRequestId, SESSION_ID_PATTERN, SessionId, TurnId,
+    ACTION_REQUEST_ID_PATTERN, ActionRequestId, IdParseError, QUEUE_REQUEST_ID_PATTERN,
+    QueueRequestId, SESSION_ID_PATTERN, SessionId, TurnId,
 };
 pub use profiles::{ProfileField, ProfileSelectionSource, SelectedProfile};
 pub use secret_file_path::{
@@ -5491,6 +5492,8 @@ pub enum ErrorCode {
     NativeReadinessTimeout,
     YoloNotSupported,
     YoloBlockedByNativeApproval,
+    NativeActionRelayNotSupported,
+    NativeActionPolicyConflict,
     ProviderSmokeTestTimeout,
     UnsupportedProviderComputerUse,
     ExperimentalProviderOptInRequired,
@@ -5675,6 +5678,8 @@ impl ErrorCode {
             Self::NativeReadinessTimeout => "native-readiness-timeout",
             Self::YoloNotSupported => "yolo-not-supported",
             Self::YoloBlockedByNativeApproval => "yolo-blocked-by-native-approval",
+            Self::NativeActionRelayNotSupported => "native-action-relay-not-supported",
+            Self::NativeActionPolicyConflict => "native-action-policy-conflict",
             Self::ProviderSmokeTestTimeout => "provider-smoke-test-timeout",
             Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
             Self::ExperimentalProviderOptInRequired => "experimental-provider-opt-in-required",
@@ -5746,6 +5751,7 @@ impl ErrorCode {
             | Self::ScopeSelectionConflict
             | Self::PromptSourceConflict
             | Self::IdempotencyKeyConflict
+            | Self::NativeActionPolicyConflict
             | Self::EventsWithDetach
             | Self::InterruptModeConflict
             | Self::OutputModeConflict
@@ -5887,6 +5893,7 @@ impl ErrorCode {
             | Self::NativeReadinessTimeout
             | Self::YoloNotSupported
             | Self::YoloBlockedByNativeApproval
+            | Self::NativeActionRelayNotSupported
             | Self::ProviderSmokeTestTimeout
             | Self::UnsupportedProviderComputerUse
             | Self::ExperimentalProviderNotValidated
@@ -6064,6 +6071,32 @@ impl SatelleError {
             message: "YOLO mode cannot bypass a native Computer Use approval".to_string(),
             recovery_command: Some(
                 "grant the required native approval, then rerun the command".to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn native_action_relay_not_supported() -> Self {
+        Self {
+            code: ErrorCode::NativeActionRelayNotSupported,
+            message: "the Codex adapter does not expose stable native Computer Use action requests with accept and deny callbacks"
+                .to_string(),
+            recovery_command: Some(
+                "update Codex and the Satelle Host, or rerun without --relay-native-actions"
+                    .to_string(),
+            ),
+            source_detail: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    pub fn native_action_policy_conflict() -> Self {
+        Self {
+            code: ErrorCode::NativeActionPolicyConflict,
+            message: "native action relay and YOLO mode cannot be enabled together".to_string(),
+            recovery_command: Some(
+                "rerun with --no-yolo or without --relay-native-actions".to_string(),
             ),
             source_detail: None,
             details: BTreeMap::new(),
