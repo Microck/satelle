@@ -126,6 +126,7 @@ pub(crate) enum CodexSessionTerminal {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CodexFailedTurnKind {
     Other,
+    Classified(&'static str),
 }
 
 pub(crate) struct TimedCodexSessionRun {
@@ -1374,11 +1375,45 @@ impl<'a> SessionExchange<'a> {
     }
 }
 
-fn failed_turn_kind(_turn: &Map<String, Value>) -> CodexFailedTurnKind {
-    // Generic Codex HTTP and response-stream failures describe upstream
-    // provider transport. They do not prove that the browser failed to reach
-    // Satelle's local Provider Probe Surface.
-    CodexFailedTurnKind::Other
+fn failed_turn_kind(turn: &Map<String, Value>) -> CodexFailedTurnKind {
+    // Codex error messages and additional details can contain provider text.
+    // Project only the protocol's closed error class into durable state.
+    let Some(info) = turn
+        .get("error")
+        .and_then(Value::as_object)
+        .and_then(|error| error.get("codexErrorInfo"))
+    else {
+        return CodexFailedTurnKind::Other;
+    };
+    let kind = match info {
+        Value::String(kind) => kind.as_str(),
+        Value::Object(kind) if kind.len() == 1 => {
+            kind.keys().next().map(String::as_str).unwrap_or_default()
+        }
+        _ => return CodexFailedTurnKind::Other,
+    };
+    let reason = match kind {
+        "contextWindowExceeded" => "codex_context_window_exceeded",
+        "sessionBudgetExceeded" => "codex_session_budget_exceeded",
+        "usageLimitExceeded" => "codex_usage_limit_exceeded",
+        "rateLimitExceeded" => "codex_rate_limit_exceeded",
+        "serverOverloaded" => "codex_server_overloaded",
+        "cyberPolicy" => "codex_cyber_policy",
+        "misalignmentPolicyViolation" => "codex_misalignment_policy_violation",
+        "internalServerError" => "codex_internal_server_error",
+        "unauthorized" => "codex_unauthorized",
+        "badRequest" => "codex_bad_request",
+        "threadRollbackFailed" => "codex_thread_rollback_failed",
+        "sandboxError" => "codex_sandbox_error",
+        "other" => "codex_other",
+        "httpConnectionFailed" => "codex_http_connection_failed",
+        "responseStreamConnectionFailed" => "codex_response_stream_connection_failed",
+        "responseStreamDisconnected" => "codex_response_stream_disconnected",
+        "responseTooManyFailedAttempts" => "codex_response_too_many_failed_attempts",
+        "activeTurnNotSteerable" => "codex_active_turn_not_steerable",
+        _ => return CodexFailedTurnKind::Other,
+    };
+    CodexFailedTurnKind::Classified(reason)
 }
 
 impl CodexExchange for SessionExchange<'_> {

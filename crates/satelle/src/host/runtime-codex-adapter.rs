@@ -886,9 +886,7 @@ impl ProductionComputerUseAdapter {
         match classify_provider_probe_run(run)? {
             CodexSessionTerminal::Completed => {}
             CodexSessionTerminal::Interrupted
-            | CodexSessionTerminal::Failed(
-                crate::host::codex_session::CodexFailedTurnKind::Other,
-            )
+            | CodexSessionTerminal::Failed(_)
             | CodexSessionTerminal::StoppedByControl => {
                 return Err(mark_probe_dispatch_possible(
                     provider_smoke_session_failure(CodexSessionError::ResponseError),
@@ -1938,15 +1936,11 @@ fn classify_native_probe_failure_before_action_wait(
         {
             Some(native_smoke_session_failure(*failure))
         }
-        Ok(CodexSessionTerminal::Failed(
-            crate::host::codex_session::CodexFailedTurnKind::Other,
-        )) if run.cancellation.is_none() => {
+        Ok(CodexSessionTerminal::Failed(_)) if run.cancellation.is_none() => {
             Some(native_smoke_failure("native_readiness_session_failed"))
         }
         Ok(CodexSessionTerminal::Completed | CodexSessionTerminal::Interrupted)
-        | Ok(CodexSessionTerminal::Failed(
-            crate::host::codex_session::CodexFailedTurnKind::Other,
-        ))
+        | Ok(CodexSessionTerminal::Failed(_))
         | Ok(CodexSessionTerminal::StoppedByControl)
         | Err(_) => None,
     }
@@ -2829,6 +2823,9 @@ fn terminal_result(
             CodexSessionTerminal::Interrupted
             | CodexSessionTerminal::Failed(crate::host::codex_session::CodexFailedTurnKind::Other),
         ) => Ok(ExecuteResult::new(TurnTransition::Failed, Vec::new())),
+        Ok(CodexSessionTerminal::Failed(
+            crate::host::codex_session::CodexFailedTurnKind::Classified(reason),
+        )) => Ok(ExecuteResult::terminal_failure(adapter_failure(reason))),
         Ok(CodexSessionTerminal::StoppedByControl) => Ok(ExecuteResult::stopped_by_control()),
         // A cleanup failure is never an ordinary terminal outcome. Even when
         // no turn was dispatched, the daemon has not proven that its private
@@ -2889,7 +2886,7 @@ fn finish_timed_turn_execution(
         result @ Ok(
             CodexSessionTerminal::Completed
             | CodexSessionTerminal::Interrupted
-            | CodexSessionTerminal::Failed(crate::host::codex_session::CodexFailedTurnKind::Other),
+            | CodexSessionTerminal::Failed(_),
         ) => terminal_result(result),
         Ok(CodexSessionTerminal::StoppedByControl) | Err(_)
             if matches!(
@@ -4572,6 +4569,18 @@ mod tests {
 
     #[test]
     fn failure_ownership_only_requires_recovery_after_turn_dispatch() {
+        let classified = terminal_result(Ok(CodexSessionTerminal::Failed(
+            crate::host::codex_session::CodexFailedTurnKind::Classified(
+                "codex_session_budget_exceeded",
+            ),
+        )))
+        .unwrap();
+        assert_eq!(classified.transition(), Some(TurnTransition::Failed));
+        assert_eq!(
+            classified.terminal_error().unwrap().details["reason"],
+            "codex_session_budget_exceeded"
+        );
+
         let before_dispatch = terminal_result(Err(CodexSessionFailure::after_exchange(
             CodexSessionError::Timeout,
             false,
