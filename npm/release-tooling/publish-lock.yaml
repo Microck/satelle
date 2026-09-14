@@ -1,5 +1,5 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle-cli:\n    type: patch\n---\n\n## Windows bootstrap maintenance and slow-daemon startup\n\nAdmit the managed-setup action shapes in bootstrap maintenance so full setup\nno longer fails at maintenance begin. Report bootstrap-busy when the Windows\nlock holder exits with the busy code, and wait out the daemon's own readiness\nbudgets before declaring a slow Windows daemon unreachable.\n"
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Windows bootstrap maintenance and slow-daemon startup\n\nAdmit the managed-setup action shapes in bootstrap maintenance so full setup\nno longer fails at maintenance begin. Report bootstrap-busy when the Windows\nlock holder exits with the busy code, and wait out the daemon's own readiness\nbudgets before declaring a slow Windows daemon unreachable.\n"
     filename: 2026-09-11-windows-bootstrap-maintenance.md
     v: 0.0.0
 core:packages:
@@ -9,15 +9,7 @@ core:packages:
     updated: false
   - changelogIds:
       - 2026-09-11-windows-bootstrap-maintenance.md
-    id: cargo:satelle-cli
-    updated: true
-  - id: cargo:satelle-core
-    updated: true
-  - id: cargo:satelle-host
-    updated: true
-  - id: cargo:satelle-test-contract
-    updated: true
-  - id: cargo:satelle-transport
+    id: cargo:satelle
     updated: true
 npm:packages:
   - id: npm:satelle-repository
