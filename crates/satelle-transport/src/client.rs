@@ -36,6 +36,10 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 const DIRECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// A stop can reconcile a persisted Codex turn for up to two minutes before it
+// can prove that the desktop is released. Leave transport slack for that
+// bounded read so a successful stop is not reported as host-unreachable.
+const STOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const PROVIDER_SECRET_PROVISIONING_PATH: &str = "/v1/setup/provider-secret";
 const PROVIDER_BINDING_ALIAS_ENCODE_SET: &AsciiSet =
     &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b'\\');
@@ -895,10 +899,14 @@ impl DaemonClient {
             request = request.header("Satelle-Expected-Turn-Id", expected_turn_id.as_str());
         }
         self.send_authenticated(
-            request.json(&StopRequest::new()),
+            self.stop_request(request).json(&StopRequest::new()),
             request_id,
             StatusCode::OK,
         )
+    }
+
+    fn stop_request(&self, request: RequestBuilder) -> RequestBuilder {
+        request.timeout(STOP_REQUEST_TIMEOUT)
     }
 
     fn mutation_request(
@@ -1991,6 +1999,29 @@ mod tests {
             .build()
             .expect("build provider validation request");
         assert_eq!(validation_request.timeout(), Some(&admission_timeout));
+    }
+
+    #[test]
+    fn stop_timeout_allows_persisted_turn_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback endpoint");
+        let address = listener.local_addr().expect("read loopback endpoint");
+        let client = DaemonClient::loopback_with_timeout(
+            address,
+            ApiBearerToken::generate().expect("generate token"),
+            "host-stop-timeout",
+            Duration::from_secs(30),
+        )
+        .expect("construct bounded loopback client");
+        let (request, _) = client
+            .mutation_request("/v1/sessions/session/stop", "stop-timeout-test")
+            .expect("construct stop request");
+        let request = client
+            .stop_request(request)
+            .json(&StopRequest::new())
+            .build()
+            .expect("build stop request");
+
+        assert_eq!(request.timeout(), Some(&STOP_REQUEST_TIMEOUT));
     }
 
     #[test]
