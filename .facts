@@ -79,7 +79,7 @@
 - a Satelle MCP Server is a local stdio JSON-RPC bridge exposing selected Satelle control surfaces as tools for AI Clients @spec @mvp @implemented
 - a Satelle AI Client Install Target is a supported AI client configuration destination that can be updated to call Satelle through MCP @spec @mvp @implemented
 - a Satelle Agent Skill Bundle is a versioned set of Satelle-owned SKILL.md guides for AI agents setting up, using, and recovering Satelle @spec @mvp @implemented
-- a Satelle Automation Workflow is a user-requested batch, watch, notify, or REPL flow that coordinates Satelle commands without changing underlying authority and safety rules @spec @later
+- a Satelle Automation Workflow is a user-requested batch, watch, notify, or REPL flow that coordinates Satelle commands without changing underlying authority and safety rules @spec @phase4 @implemented
 - label: a Satelle Command History Entry is a local redacted record of one Satelle command invocation, outcome, duration, target, and stable command family
   command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
   tags: [spec, mvp, implemented, ci]
@@ -167,9 +167,9 @@
 - breaking machine-readable result changes require a new schema_version @spec @contract @mvp @implemented
 
 ## automation
-- satelle later exposes an interactive REPL for repeated run, steer, status, logs, doctor, and config inspection against one selected context @spec @later
-- satelle repl is the exact Automation Workflow command and requires an interactive terminal @spec @later
-- satelle later REPL export writes a redacted local transcript of commands, structured outputs, and stable session identifiers without including raw prompts unless the user explicitly requests prompt inclusion @spec @later
+- satelle exposes an interactive REPL for repeated run, steer, status, logs, doctor, and config inspection against one selected context @spec @phase4 @implemented
+- satelle repl is the exact Automation Workflow command and requires an interactive terminal @spec @phase4 @implemented
+- satelle REPL export writes a redacted local transcript of commands, structured outputs, and stable session identifiers without including raw prompts unless the user explicitly requests prompt inclusion @spec @phase4 @implemented
 - satelle exposes batch automation for running multiple Satelle operations with bounded concurrency, rate limits, per-item outcomes, and a final aggregate summary @spec @phase4 @implemented
 - satelle batch --input <path|-> is the exact batch command and reads one satelle.batch.request.v1 JSON object per input line from a file or standard input @spec @contract @phase4 @implemented
 - satelle batch emits one satelle.batch.result.v1 JSON record per input item followed by one satelle.batch.summary.v1 record, preserving input order for result records even when execution completes out of order @spec @contract @phase4 @implemented
@@ -1615,7 +1615,7 @@
 - label: satelle records local redacted command history for setup, repair, run, steer, status, stop, logs, doctor, host, config, and MCP installer commands when local state storage is available
   command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
   tags: [spec, mvp, implemented, ci]
-- satelle later extends local redacted command history to batch, watch, notify, and REPL Automation Workflows @spec @later
+- satelle extends local redacted command history to batch, watch, notify, and REPL Automation Workflows @spec @phase4 @implemented
 - label: satelle local command history stores command family, selected host, selected profile, session id when present, started_at, duration_ms, outcome status, typed error code, and Satelle CLI version without storing raw provider secrets, raw prompts, screenshots, or transcripts by default
   command: cargo test --locked -p satelle-cli --features test-support --test command-history records_redacted_command_metadata_and_typed_outcomes -- --exact
   tags: [spec, mvp, implemented, ci]

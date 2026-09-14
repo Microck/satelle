@@ -23,6 +23,7 @@ public Satelle result and event schema sources. CI rejects hand-edited or stale 
 | `HOST_UPDATE_PLAIN_SCHEMA_VERSION` | `crates/satelle-cli/src/output.rs` | `satelle.host.update.plain.v1` |
 | `LogEntrySchema` | `crates/satelle-host/src/log-page.rs` | `satelle.logs.entry.v2` |
 | `NOTIFY_WEBHOOK_SCHEMA_VERSION` | `crates/satelle-cli/src/automation.rs` | `satelle.notify.webhook.v1` |
+| `REPL_TRANSCRIPT_SCHEMA_VERSION` | `crates/satelle-cli/src/automation.rs` | `satelle.repl.transcript.v1` |
 | `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.run.v2` |
 | `SetupSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.setup.v2` |
 | `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.status.v2` |
@@ -41,6 +42,7 @@ Usage: satelle [OPTIONS] <COMMAND>
 
 Commands:
   batch        Execute versioned NDJSON command requests with bounded concurrency
+  repl         Run repeated Satelle commands against one selected Host
   watch        Emit versioned NDJSON records when selected Satelle state changes
   notify       Deliver selected Satelle state changes to a user-owned webhook
   completions
@@ -118,6 +120,24 @@ Options:
       --profile <NAME>             Apply a named user-level configuration profile
       --error-format <FORMAT>      Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
   -h, --help                       Print help
+```
+
+## `satelle repl`
+
+```text
+Run repeated Satelle commands against one selected Host
+
+Usage: satelle repl [OPTIONS]
+
+Options:
+      --host <HOST>            Select the Host used by every command in this REPL
+      --no-color               Disable colored human output
+      --export <PATH>          Write one redacted versioned NDJSON record per executed command
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --include-prompts        Preserve inline run and steer prompts in the exported transcript
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
 ```
 
 ## `satelle watch`

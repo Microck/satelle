@@ -69,6 +69,14 @@ records to a user-configured HTTPS endpoint with at most three delivery
 attempts. Add `--dry-run` to print `satelle.notify.webhook.v1` payloads without
 resolving authorization or making a request.
 
+`satelle repl --host <alias>` opens an interactive terminal for repeated `run`,
+`steer`, `status`, `logs`, `doctor`, `config check`, and `config explain`
+commands against one resolved Host and profile. Add `--export <path>` to create
+an owner-only `satelle.repl.transcript.v1` NDJSON transcript. Path-bearing
+arguments are always redacted; inline prompts are redacted unless
+`--include-prompts` is set. Ctrl-C interrupts the active child and returns to
+the prompt.
+
 ## Output formats
 
 Commands with a final result accept `--format human|json|compact-json|toon|markdown`.
