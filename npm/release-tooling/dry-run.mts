@@ -13,9 +13,11 @@ import { tegami } from "tegami";
 import { cargo } from "tegami/plugins/cargo";
 import tegamiPackage from "tegami/package.json" with { type: "json" };
 import type { TegamiPlugin } from "tegami";
+import releaseTooling from "../scripts/release.cjs";
 
 const toolRoot = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(toolRoot, "../..");
+const { readWorkspaceVersion } = releaseTooling;
 
 function cargoInventory(capture: string[]): TegamiPlugin {
   return {
@@ -58,8 +60,14 @@ const repositoryPaper = tegami({
   plugins: [cargo({ bumpDep: () => false }), cargoInventory(discoveredCargoPackages)],
 });
 await repositoryPaper.draft();
-if (discoveredCargoPackages.length === 0) {
-  throw new Error("Tegami Cargo plugin did not discover the Satelle workspace packages");
+const expectedCargoPackage = `cargo:satelle@${readWorkspaceVersion(repositoryRoot)}`;
+if (
+  discoveredCargoPackages.length !== 1 ||
+  discoveredCargoPackages[0] !== expectedCargoPackage
+) {
+  throw new Error(
+    `Tegami Cargo plugin must discover only ${expectedCargoPackage}; found ${discoveredCargoPackages.join(", ")}`,
+  );
 }
 
 const fixtureRoot = mkdtempSync(path.join(tmpdir(), "satelle-tegami-dry-run-"));

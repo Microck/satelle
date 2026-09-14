@@ -1,0 +1,765 @@
+use super::{
+    ApiFailure, DaemonState, DaemonTlsConfig, api_error_response, auth, request_id_or_new,
+};
+use crate::transport::contract::{ApiErrorCategory, ApiErrorCode};
+use axum::extract::connect_info::{ConnectInfo, Connected};
+use axum::extract::{Request, State};
+use axum::http::header::CONNECTION;
+use axum::http::{HeaderValue, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
+use axum::serve::IncomingStream;
+use axum::serve::Listener;
+use sha2::{Digest, Sha256};
+use std::future::Future;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::time::Sleep;
+use tokio_rustls::Accept;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
+
+const REJECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(super) struct LimitedTcpListener {
+    inner: TcpListener,
+    permits: Arc<Semaphore>,
+    rejection_permits: Arc<Semaphore>,
+    activity: ConnectionActivity,
+    tls_config: Option<watch::Receiver<DaemonTlsConfig>>,
+}
+
+impl LimitedTcpListener {
+    pub(super) fn new(inner: TcpListener, max_connections: usize) -> Self {
+        Self {
+            inner,
+            permits: Arc::new(Semaphore::new(max_connections)),
+            // One reserved response slot prevents connection floods from
+            // creating unbounded Hyper tasks while still giving an ordinary
+            // over-capacity caller a typed response.
+            rejection_permits: Arc::new(Semaphore::new(1)),
+            activity: ConnectionActivity::default(),
+            tls_config: None,
+        }
+    }
+
+    pub(super) fn with_tls(
+        inner: TcpListener,
+        max_connections: usize,
+        server_config: watch::Receiver<DaemonTlsConfig>,
+    ) -> Self {
+        let mut listener = Self::new(inner, max_connections);
+        listener.tls_config = Some(server_config);
+        listener
+    }
+
+    pub(super) fn activity(&self) -> ConnectionActivity {
+        self.activity.clone()
+    }
+
+    async fn acquire_admission(&self) -> ConnectionAdmission {
+        if let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() {
+            return ConnectionAdmission::Admitted { _permit: permit };
+        }
+        if let Ok(permit) = Arc::clone(&self.rejection_permits).try_acquire_owned() {
+            return ConnectionAdmission::Rejected { _permit: permit };
+        }
+        // Keep this one accepted socket outside Hyper until either normal
+        // capacity or the single typed-rejection lane becomes available.
+        // The kernel backlog remains the outer bound for later connections.
+        tokio::select! {
+            permit = Arc::clone(&self.permits).acquire_owned() => {
+                ConnectionAdmission::Admitted {
+                    _permit: permit.expect("the connection semaphore is never closed"),
+                }
+            }
+            permit = Arc::clone(&self.rejection_permits).acquire_owned() => {
+                ConnectionAdmission::Rejected {
+                    _permit: permit.expect("the rejection semaphore is never closed"),
+                }
+            }
+        }
+    }
+}
+
+impl Listener for LimitedTcpListener {
+    type Io = PermitIo;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, address)) => {
+                    // Snapshot at TCP acceptance, before capacity admission can
+                    // wait. A connection already accepted under one TLS
+                    // configuration must not switch certificates while queued.
+                    let tls_snapshot = self.tls_config.as_ref().map(|receiver| {
+                        let mut changes = receiver.clone();
+                        let config = changes.borrow_and_update().clone();
+                        (config, changes)
+                    });
+                    // Tests and idle-shutdown tracking may observe this signal.
+                    // Publish it only after the accepted socket's TLS identity
+                    // is fixed so observers cannot race the snapshot.
+                    let activity = self.activity.connect();
+                    let admission = self.acquire_admission().await;
+                    let _ = stream.set_nodelay(true);
+                    let mut trust_reload: Option<TrustReload> = None;
+                    let stream = match tls_snapshot {
+                        // Hyper polls each handshake in its own bounded
+                        // connection task. The deadline prevents silent peers
+                        // from retaining every admission permit indefinitely.
+                        Some((config, mut changes)) => {
+                            let required = config.requires_client_certificate;
+                            trust_reload = Some(Box::pin(async move {
+                                while changes.changed().await.is_ok() {
+                                    if required
+                                        || changes.borrow_and_update().requires_client_certificate
+                                    {
+                                        return;
+                                    }
+                                }
+                                std::future::pending::<()>().await;
+                            }));
+                            TransportIo::TlsHandshake {
+                                handshake: Box::pin(
+                                    TlsAcceptor::from(config.server).accept(stream),
+                                ),
+                                deadline: Box::pin(tokio::time::sleep(TLS_HANDSHAKE_TIMEOUT)),
+                                client_fingerprint: required.then(|| Arc::new(OnceLock::new())),
+                            }
+                        }
+                        None => TransportIo::Plain(stream),
+                    };
+                    let mut io = PermitIo::new(stream, admission, activity);
+                    io.trust_reload = trust_reload;
+                    return (io, address);
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+pub(super) struct PermitIo {
+    stream: TransportIo,
+    admission: ConnectionAdmission,
+    _activity: ConnectedClient,
+    rejection_deadline: Option<Pin<Box<Sleep>>>,
+    start_rejection_deadline_after_handshake: bool,
+    client_fingerprint: Option<Arc<OnceLock<[u8; 32]>>>,
+    trust_reload: Option<TrustReload>,
+}
+
+type TrustReload = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+enum TransportIo {
+    Plain(TcpStream),
+    TlsHandshake {
+        handshake: Pin<Box<Accept<TcpStream>>>,
+        deadline: Pin<Box<Sleep>>,
+        client_fingerprint: Option<Arc<OnceLock<[u8; 32]>>>,
+    },
+    Tls(Box<TlsStream<TcpStream>>),
+    TlsFailed {
+        kind: io::ErrorKind,
+        message: String,
+    },
+}
+
+impl TransportIo {
+    const fn handshake_pending(&self) -> bool {
+        matches!(self, Self::TlsHandshake { .. })
+    }
+
+    fn poll_handshake(&mut self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Self::TlsFailed { kind, message } = self {
+            return Poll::Ready(Err(io::Error::new(*kind, message.clone())));
+        }
+        let Self::TlsHandshake {
+            handshake,
+            deadline,
+            client_fingerprint,
+        } = self
+        else {
+            return Poll::Ready(Ok(()));
+        };
+        match handshake.as_mut().poll(context) {
+            Poll::Ready(Ok(stream)) => {
+                if let Some(fingerprint) = client_fingerprint {
+                    // Rustls has verified this leaf and its proof of key
+                    // possession. Request headers never populate this value.
+                    let leaf = &stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .expect("required client authentication supplies a certificate")[0];
+                    let _ = fingerprint.set(Sha256::digest(leaf.as_ref()).into());
+                }
+                *self = Self::Tls(Box::new(stream));
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                let kind = error.kind();
+                let message = error.to_string();
+                *self = Self::TlsFailed {
+                    kind,
+                    message: message.clone(),
+                };
+                Poll::Ready(Err(io::Error::new(kind, message)))
+            }
+            Poll::Pending if deadline.as_mut().poll(context).is_ready() => {
+                let kind = io::ErrorKind::TimedOut;
+                let message = "TLS handshake did not complete before the deadline".to_string();
+                *self = Self::TlsFailed {
+                    kind,
+                    message: message.clone(),
+                };
+                Poll::Ready(Err(io::Error::new(kind, message)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+enum ConnectionAdmission {
+    Admitted { _permit: OwnedSemaphorePermit },
+    Rejected { _permit: OwnedSemaphorePermit },
+}
+
+impl PermitIo {
+    fn new(stream: TransportIo, admission: ConnectionAdmission, activity: ConnectedClient) -> Self {
+        let rejected = !admission.admitted();
+        let start_rejection_deadline_after_handshake = rejected && stream.handshake_pending();
+        let rejection_deadline = (rejected && !start_rejection_deadline_after_handshake)
+            .then(|| Box::pin(tokio::time::sleep(REJECTION_IDLE_TIMEOUT)));
+        let client_fingerprint = match &stream {
+            TransportIo::TlsHandshake {
+                client_fingerprint, ..
+            } => client_fingerprint.clone(),
+            _ => None,
+        };
+        Self {
+            stream,
+            admission,
+            _activity: activity,
+            rejection_deadline,
+            start_rejection_deadline_after_handshake,
+            client_fingerprint,
+            trust_reload: None,
+        }
+    }
+
+    const fn admitted(&self) -> bool {
+        self.admission.admitted()
+    }
+
+    fn poll_handshake(&mut self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self
+            .trust_reload
+            .as_mut()
+            .is_some_and(|reload| reload.as_mut().poll(context).is_ready())
+        {
+            self.trust_reload = None;
+            self.stream = TransportIo::TlsFailed {
+                kind: io::ErrorKind::ConnectionAborted,
+                message:
+                    "TLS client trust changed; reconnect to authenticate with the current policy"
+                        .to_string(),
+            };
+        }
+        match self.stream.poll_handshake(context) {
+            Poll::Ready(Ok(())) => {
+                if self.start_rejection_deadline_after_handshake {
+                    self.start_rejection_deadline_after_handshake = false;
+                    self.rejection_deadline =
+                        Some(Box::pin(tokio::time::sleep(REJECTION_IDLE_TIMEOUT)));
+                }
+                Poll::Ready(Ok(()))
+            }
+            outcome => outcome,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(super) struct ConnectionActivity {
+    state: Arc<Mutex<ConnectionActivityState>>,
+}
+
+impl ConnectionActivity {
+    fn connect(&self) -> ConnectedClient {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.connected += 1;
+        state.generation = state.generation.wrapping_add(1);
+        ConnectedClient {
+            activity: self.clone(),
+        }
+    }
+
+    pub(super) fn snapshot(&self) -> (usize, u64) {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        (state.connected, state.generation)
+    }
+}
+
+#[derive(Default)]
+struct ConnectionActivityState {
+    connected: usize,
+    generation: u64,
+}
+
+pub(super) struct ConnectedClient {
+    activity: ConnectionActivity,
+}
+
+impl Drop for ConnectedClient {
+    fn drop(&mut self) {
+        let mut state = self
+            .activity
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.connected -= 1;
+        state.generation = state.generation.wrapping_add(1);
+    }
+}
+
+impl ConnectionAdmission {
+    const fn admitted(&self) -> bool {
+        matches!(self, Self::Admitted { .. })
+    }
+}
+
+impl AsyncRead for PermitIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_handshake(context) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        if this
+            .rejection_deadline
+            .as_mut()
+            .is_some_and(|deadline| deadline.as_mut().poll(context).is_ready())
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "over-capacity connection did not send an HTTP request before the deadline",
+            )));
+        }
+        match &mut this.stream {
+            TransportIo::Plain(stream) => Pin::new(stream).poll_read(context, buffer),
+            TransportIo::Tls(stream) => Pin::new(stream.as_mut()).poll_read(context, buffer),
+            TransportIo::TlsHandshake { .. } | TransportIo::TlsFailed { .. } => {
+                unreachable!("a completed TLS handshake changes state")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ConnectionContext {
+    peer_address: SocketAddr,
+    admitted: bool,
+    client_fingerprint: Option<Arc<OnceLock<[u8; 32]>>>,
+}
+
+impl ConnectionContext {
+    pub(super) const fn peer_ip(&self) -> IpAddr {
+        self.peer_address.ip()
+    }
+
+    pub(super) fn client_fingerprint(&self) -> Option<[u8; 32]> {
+        self.client_fingerprint
+            .as_ref()
+            .and_then(|fingerprint| fingerprint.get().copied())
+    }
+}
+
+impl Connected<IncomingStream<'_, LimitedTcpListener>> for ConnectionContext {
+    fn connect_info(stream: IncomingStream<'_, LimitedTcpListener>) -> Self {
+        Self {
+            peer_address: *stream.remote_addr(),
+            admitted: stream.io().admitted(),
+            client_fingerprint: stream.io().client_fingerprint.clone(),
+        }
+    }
+}
+
+pub(super) async fn enforce_capacity(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let admitted = request
+        .extensions()
+        .get::<ConnectInfo<ConnectionContext>>()
+        .is_some_and(|connection| connection.0.admitted);
+    if admitted {
+        return next.run(request).await;
+    }
+
+    // Capacity rejection runs before authentication. Echo Host Identity only
+    // when a protected request already carries the exact pin, so a legitimate
+    // DaemonClient can validate the error without disclosing identity to an
+    // unpinned caller or weakening mismatch detection.
+    let host_identity = (request.uri().path() != "/v1/live"
+        && auth::expected_host_identity_matches(request.headers(), &state.host_identity))
+    .then(|| state.host_identity.clone());
+    let mut response = api_error_response(
+        request_id_or_new(request.headers()),
+        host_identity,
+        ApiFailure {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ApiErrorCode::CapacityExceeded,
+            category: ApiErrorCategory::Capacity,
+            retryable: true,
+            message: "the Host Daemon HTTP connection capacity is occupied",
+            details: None,
+        },
+    );
+    // The over-capacity connection has no permit. Closing it after the typed
+    // response prevents idle keep-alive sockets from bypassing the limit.
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    response
+}
+
+impl AsyncWrite for PermitIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let this = self.get_mut();
+        match this.poll_handshake(context) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        match &mut this.stream {
+            TransportIo::Plain(stream) => Pin::new(stream).poll_write(context, buffer),
+            TransportIo::Tls(stream) => Pin::new(stream.as_mut()).poll_write(context, buffer),
+            TransportIo::TlsHandshake { .. } | TransportIo::TlsFailed { .. } => {
+                unreachable!("a completed TLS handshake changes state")
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = self.get_mut();
+        match this.poll_handshake(context) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        match &mut this.stream {
+            TransportIo::Plain(stream) => Pin::new(stream).poll_flush(context),
+            TransportIo::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(context),
+            TransportIo::TlsHandshake { .. } | TransportIo::TlsFailed { .. } => {
+                unreachable!("a completed TLS handshake changes state")
+            }
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        let this = self.get_mut();
+        match this.poll_handshake(context) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        match &mut this.stream {
+            TransportIo::Plain(stream) => Pin::new(stream).poll_shutdown(context),
+            TransportIo::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(context),
+            TransportIo::TlsHandshake { .. } | TransportIo::TlsFailed { .. } => {
+                unreachable!("a completed TLS handshake changes state")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::DaemonTlsConfig;
+    use super::*;
+    use rustls::pki_types::ServerName;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsConnector;
+
+    fn tls_receiver(tls: DaemonTlsConfig) -> watch::Receiver<DaemonTlsConfig> {
+        let (_, receiver) = watch::channel(tls);
+        receiver
+    }
+
+    #[tokio::test]
+    async fn idle_rejected_connection_releases_its_bounded_response_lane() {
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let mut listener = LimitedTcpListener::new(listener, 0);
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let _client = client.expect("open idle over-capacity connection");
+        let (mut rejected, _) = accepted;
+        let mut byte = [0_u8; 1];
+
+        let error = tokio::time::timeout(
+            REJECTION_IDLE_TIMEOUT + Duration::from_secs(1),
+            rejected.read(&mut byte),
+        )
+        .await
+        .expect("rejected connection must have a finite pre-request deadline")
+        .expect_err("idle rejected connection must time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(rejected);
+
+        let (next_client, (next_rejected, _)) =
+            tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(TcpStream::connect(address), listener.accept())
+            })
+            .await
+            .expect("the next connection must acquire the released rejection lane");
+        let _next_client = next_client.expect("open next over-capacity connection");
+        assert!(!next_rejected.admitted());
+    }
+
+    #[tokio::test]
+    async fn tls_rejection_timeout_begins_after_the_handshake() {
+        let certified = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate direct transport certificate");
+        let tls = DaemonTlsConfig::from_pem(
+            certified.cert.pem().as_bytes(),
+            certified.signing_key.serialize_pem().as_bytes(),
+            None,
+        )
+        .expect("build validated TLS configuration");
+        let client_config = crate::transport::transport_tls::websocket_tls_config(
+            Some(certified.cert.pem().as_bytes()),
+            None,
+        )
+        .unwrap_or_else(|_| panic!("build trusted TLS client configuration"));
+        let connector = TlsConnector::from(client_config);
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let mut listener = LimitedTcpListener::with_tls(listener, 0, tls_receiver(tls));
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let client = client.expect("open over-capacity TLS connection");
+        let (mut rejected, _) = accepted;
+        assert!(!rejected.admitted());
+
+        let server_read = tokio::spawn(async move {
+            let mut byte = [0_u8; 1];
+            let count = rejected.read(&mut byte).await?;
+            Ok::<_, io::Error>((rejected, byte, count))
+        });
+        tokio::time::sleep(REJECTION_IDLE_TIMEOUT + Duration::from_millis(100)).await;
+
+        let server_name = ServerName::try_from("localhost").expect("valid test server name");
+        let mut client = connector
+            .connect(server_name, client)
+            .await
+            .expect("TLS handshake may use the full handshake deadline");
+        client
+            .write_all(b"x")
+            .await
+            .expect("send the first post-handshake request byte");
+        let (rejected, byte, count) = tokio::time::timeout(Duration::from_secs(1), server_read)
+            .await
+            .expect("post-handshake request byte must retain its own deadline")
+            .expect("join rejected connection reader")
+            .expect("read post-handshake request byte");
+
+        assert_eq!(count, 1);
+        assert_eq!(byte, [b'x']);
+        drop(rejected);
+    }
+
+    #[tokio::test]
+    async fn accepted_connection_snapshots_tls_before_waiting_for_admission() {
+        let initial = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate initial direct transport certificate");
+        let replacement = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate replacement direct transport certificate");
+        let initial_tls = DaemonTlsConfig::from_pem(
+            initial.cert.pem().as_bytes(),
+            initial.signing_key.serialize_pem().as_bytes(),
+            None,
+        )
+        .expect("build initial TLS configuration");
+        let replacement_tls = DaemonTlsConfig::from_pem(
+            replacement.cert.pem().as_bytes(),
+            replacement.signing_key.serialize_pem().as_bytes(),
+            None,
+        )
+        .expect("build replacement TLS configuration");
+        let client_config = crate::transport::transport_tls::websocket_tls_config(
+            Some(initial.cert.pem().as_bytes()),
+            None,
+        )
+        .unwrap_or_else(|_| panic!("build client trusting the initial certificate"));
+        let connector = TlsConnector::from(client_config);
+        let (tls_sender, tls_receiver) = watch::channel(initial_tls);
+        let tcp_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind test listener");
+        let address = tcp_listener
+            .local_addr()
+            .expect("read test listener address");
+        let mut listener = LimitedTcpListener::with_tls(tcp_listener, 1, tls_receiver);
+        let activity = listener.activity();
+        let admission_permit = Arc::clone(&listener.permits)
+            .acquire_owned()
+            .await
+            .expect("occupy normal admission lane");
+        let rejection_permit = Arc::clone(&listener.rejection_permits)
+            .acquire_owned()
+            .await
+            .expect("occupy typed-rejection lane");
+        let accept_task = tokio::spawn(async move { listener.accept().await });
+        let client = TcpStream::connect(address)
+            .await
+            .expect("open queued TLS connection");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while activity.snapshot().0 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener must accept the TCP connection before TLS reload");
+        tls_sender
+            .send(replacement_tls)
+            .expect("publish replacement TLS configuration");
+        drop(admission_permit);
+
+        let (mut server, _) = accept_task.await.expect("join queued accept task");
+        assert!(server.admitted());
+        let server_read = tokio::spawn(async move {
+            let mut byte = [0_u8; 1];
+            server.read_exact(&mut byte).await?;
+            Ok::<_, io::Error>(byte)
+        });
+        let server_name = ServerName::try_from("localhost").expect("valid test server name");
+        let mut client = connector
+            .connect(server_name, client)
+            .await
+            .expect("accepted connection retains the initial TLS configuration");
+        client
+            .write_all(b"x")
+            .await
+            .expect("write through queued TLS connection");
+        assert_eq!(
+            server_read
+                .await
+                .expect("join queued server reader")
+                .expect("read queued TLS byte"),
+            [b'x']
+        );
+        drop(rejection_permit);
+    }
+
+    #[tokio::test]
+    async fn idle_tls_handshake_releases_its_admission_permit() {
+        let certified = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate direct transport certificate");
+        let tls = DaemonTlsConfig::from_pem(
+            certified.cert.pem().as_bytes(),
+            certified.signing_key.serialize_pem().as_bytes(),
+            None,
+        )
+        .expect("build validated TLS configuration");
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let mut listener = LimitedTcpListener::with_tls(listener, 1, tls_receiver(tls));
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let _client = client.expect("open idle TLS connection");
+        let (mut stalled, _) = accepted;
+        let mut byte = [0_u8; 1];
+
+        let error = tokio::time::timeout(Duration::from_secs(6), stalled.read(&mut byte))
+            .await
+            .expect("an incomplete TLS handshake must have a finite deadline")
+            .expect_err("an incomplete TLS handshake must time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let repeated_error = stalled
+            .write_all(b"x")
+            .await
+            .expect_err("a timed-out handshake must remain terminal");
+        assert_eq!(repeated_error.kind(), io::ErrorKind::TimedOut);
+        drop(stalled);
+
+        let (next_client, (next_admitted, _)) =
+            tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(TcpStream::connect(address), listener.accept())
+            })
+            .await
+            .expect("the next connection must acquire the released admission permit");
+        let _next_client = next_client.expect("open next TLS connection");
+        assert!(next_admitted.admitted());
+    }
+
+    #[tokio::test]
+    async fn malformed_tls_handshake_remains_terminal_for_later_io() {
+        let certified = rcgen::generate_simple_self_signed(["localhost".to_string()])
+            .expect("generate direct transport certificate");
+        let tls = DaemonTlsConfig::from_pem(
+            certified.cert.pem().as_bytes(),
+            certified.signing_key.serialize_pem().as_bytes(),
+            None,
+        )
+        .expect("build validated TLS configuration");
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let mut listener = LimitedTcpListener::with_tls(listener, 1, tls_receiver(tls));
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let mut client = client.expect("open malformed TLS connection");
+        let (mut server, _) = accepted;
+        client
+            .write_all(b"not a TLS client hello")
+            .await
+            .expect("send malformed handshake bytes");
+
+        let mut byte = [0_u8; 1];
+        server
+            .read(&mut byte)
+            .await
+            .expect_err("malformed TLS handshake must fail");
+        server
+            .write_all(b"x")
+            .await
+            .expect_err("a malformed handshake must remain terminal");
+    }
+}

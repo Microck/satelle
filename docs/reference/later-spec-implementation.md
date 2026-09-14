@@ -1,0 +1,588 @@
+---
+title: Later spec implementation
+description: Delivery and verification of the phase 4 requirements.
+---
+
+The `.facts` sheet is the contract. This page tracks delivery blocks for the
+318 requirements marked `@later` at the start of phase 4, based on `08aba611`.
+Requirements stay marked `@later` until their implementation and verification
+are complete. Completed requirements retain `@phase4` and gain `@implemented`.
+
+Each block is reviewed in a pull request targeting `feat/later-specs`. After
+those pull requests merge, the integration branch gets a final pull request to
+`main`. Compilation and test builds run in Box; local work keeps source only.
+
+| Block | Scope | Status |
+| --- | --- | --- |
+| Configuration composition and consent | Explicit includes, source attribution, Trusted Profile expiration | Merged in PR #218 |
+| Host credential sources | Executable helpers with bounded JSON protocol, Host home expansion | Merged in PR #219 |
+| Config repair | Deterministic local repair with backups and explicit consent | Merged in PR #220 |
+| Host update scripting | Stable target records through `host update --plain` | Merged in PR #221 |
+| Remote image attachments | Host file resolution with bounded validation and no retention | Merged in PR #222 |
+| Host versions | CLI/Host compatibility and explicit versions | Merged in PR #223 |
+| Host storage | Safe path-set migration | Merged in PR #236 |
+| API token lifecycle | Durable issuance, rotation, revocation, and one-time secret replies | Merged in PR #224 |
+| Transport authentication | Mutual TLS | Merged in PR #228 |
+| Native package repair | Launcher repair through the detected installation owner | Merged in PR #225 |
+| Output formats | Lossless final results and fixed-column CSV | Merged in PR #226 |
+| Support bundle history | Bounded, redacted Host setup-ledger summaries | Merged in PR #238 |
+| Sensitive diagnostics | Shared export consent, redaction, manifest, staging, audit | Merged in PR #239 |
+| Platform-native log sinks | Optional redacted mirrors with typed Doctor health | Merged in PR #241 |
+| Setup and repair subprocess exports | Selected bounded SSH output for one consented invocation | Merged in PR #242 |
+| Desktop snapshot export | Current native desktop capture with consent, redaction, and audit metadata | Merged in PR #243 |
+| Opt-in telemetry | Independent Controller and Host OTLP/HTTP export with private bounded queues | Merged in PR #244 |
+| Recording | Per-Turn recording modes and export policy | Merged in PR #245 |
+| Durable admission | Queue storage, cancellation, expiry, reauthorization, restart recovery | Merged in PR #247 |
+| Multiple desktop bindings | Broker authorization, isolation, per-binding leases and readiness | Merged in PR #252 |
+| Automation | Batch, watch, webhook notifications, REPL, command history | Batch merged in PR #256; watch and notify merged in PR #257; REPL merged in PR #259 |
+| Distribution and native action relay | Cargo package, conditional ecosystem publishing, capability-gated action confirmation | Cargo package merged in PR #261; staged npm publishing merged in PR #262; guarded relay contract implemented in PR #263 |
+
+Package repository submissions, staged npm publishing, and native action relay
+retain the prerequisites declared in `.facts`. A missing external capability
+or approval is a blocker, never proof of implementation.
+
+## Native action relay contract
+
+Satelle exposes `--relay-native-actions` on `run` and `steer`, the canonical
+`ra_` UUIDv7 identifier type, and the exact detached response command. The
+effective YOLO policy is checked first and produces
+`native-action-policy-conflict`. `--yes` does not enable the relay.
+
+Host capabilities v7 carries a dedicated `native_action_relay` verdict through
+local and direct transports. The production Codex adapter advertises false
+because the stable app-server protocol has generic command, file, and
+permission approvals but no native Computer Use action request with stable
+accept and deny callbacks. Opted-in commands therefore return
+`native-action-relay-not-supported` before creating a Session or Turn. Satelle
+does not substitute generic approvals, app-selection elicitation, terminal UI
+scraping, or undocumented desktop automation.
+
+The dormant contract is fixed for the first adapter that can truthfully
+advertise support: bounded redacted `action_required` events, explicit attached
+allow or deny with deny as the default, control-scoped detached responses,
+five-minute or terminal-Turn expiry, and an upstream deny on expiry while the
+callback remains available. No action store or callback path exists while the
+capability is false.
+
+## Batch automation contract
+
+`satelle batch --input <path|->` reads one JSON object per line. Each object has
+this closed shape:
+
+```json
+{"schema_version":"satelle.batch.request.v1","request_id":"check-office","arguments":["doctor","--host","office"]}
+```
+
+`arguments` starts with a normal Satelle command. Batch supplies compact JSON
+output and JSON errors. A request cannot override those output selectors or
+start another batch, watch, notify, or REPL workflow. Each command runs in a
+separate Satelle process with standard input closed. Existing config, profile,
+Trusted Profile, consent, provider, Host admission, API rate, YOLO, and native
+readiness checks still apply.
+
+The command runs four items at a time by default. `--concurrency` accepts 1
+through 16. Results always follow input order and use
+`satelle.batch.result.v1`, even when workers finish in another order. The last
+line is one `satelle.batch.summary.v1` record. A partial failure returns process
+status 1 after writing every item result and the summary. Request objects and
+raw prompt arguments are never copied into output records.
+
+## Interactive REPL contract
+
+`satelle repl --host <alias>` opens one terminal-only Automation Workflow for
+repeated `run`, `steer`, `status`, `logs`, `doctor`, `config check`, and
+`config explain` commands. Lines use shell-style quoting and omit the `satelle`
+executable name. `help` lists the accepted commands; `exit`, `quit`, or end of
+input closes the REPL. Each command inherits the REPL's resolved Host, global
+profile, color choice, and normal authority, consent, admission, and safety
+checks. Per-line Host, profile, output, repair, all-Host, and nested automation
+overrides are rejected. Ctrl-C interrupts an active child command and returns
+to the REPL prompt.
+
+`--export <path>` creates a new owner-only NDJSON transcript and never replaces
+an existing path. Each `satelle.repl.transcript.v1` record contains the redacted
+command, selected Host, process status, duration, structured output and errors,
+and deduplicated stable Session identifiers. Inline run and steer prompts and
+path-bearing prompt, image, remote-image, and diagnostic arguments are redacted.
+`--include-prompts` preserves inline prompts and is accepted only with
+`--export`. Terminal output stays live. A stream larger than the 8 MiB capture
+limit produces a typed transcript error for that command, then the REPL
+continues.
+
+## Watch and webhook notification contract
+
+`satelle watch <sessions|logs|doctor|host>` polls one selected context and
+emits `satelle.watch.change.v1` NDJSON. The first successful snapshot is a
+change. Later polls emit only when the structured state differs. `--interval`
+accepts 250ms through 60s. `--reconnect-attempts` accepts 1 through 100 and
+counts consecutive failed polls, resetting after each success. `watch logs`
+also accepts an optional `--session` filter. Doctor comparison ignores probe
+start, finish, and duration fields so observation timing alone is not a change.
+
+`satelle notify --watch <sessions|logs|doctor|host> --webhook <alias>` uses the
+same change detector and posts each change in a `satelle.notify.webhook.v1`
+payload. Delivery makes at most three HTTPS attempts. A failed watch budget or
+webhook delivery returns a typed error. `--dry-run` writes the exact redacted
+payload as NDJSON and neither resolves authorization nor contacts the endpoint.
+
+Notifier aliases live only in user configuration. Each alias has an absolute
+HTTPS endpoint with no inline credentials, query, or fragment, plus optional
+bearer authorization from an environment or absolute owner-only file Secret
+Source. Project configuration cannot define or redirect aliases. Internal
+polls do not create their own command-history or telemetry entries; the outer
+watch or notify workflow remains the recorded operation.
+
+## Opt-in telemetry decisions
+
+- Controller policy lives in the top-level user `telemetry` table. Each Host
+  policy lives in its user-owned Host Binding and is propagated into local,
+  SSH, launchd, or Windows service startup. Project configuration and profiles
+  cannot define either policy.
+- OTLP/HTTP export accepts an HTTPS origin, with loopback HTTP for a local
+  collector. It sends JSON traces and metrics to the standard `/v1/traces` and
+  `/v1/metrics` paths. Optional bearer authorization resolves from an
+  environment or owner-only file Secret Source on the emitter.
+- Records contain timing, outcome, typed error, retry, queue-depth, and optional
+  process resource values. Resource attributes contain only Satelle version,
+  component, platform class, and an optional deployment label.
+- Each component has an owner-private queue capped at 10 MiB and 24 hours.
+  Capture and delivery run outside command and Host request completion. Disable
+  clears unsent records without collector contact.
+- `satelle telemetry status` inspects the Controller. `--host <alias>` reads the
+  authenticated Host status.
+
+## Durable admission queue decisions
+
+- Queueing is disabled unless the selected user-owned Host or profile enables
+  it, or one `run` or `steer` command passes `--queue`. Project configuration,
+  setup defaults, consent flags, and transport defaults cannot enable it.
+- The Host owns FIFO order per Host Identity and Desktop Binding. Enqueueing a
+  run creates no Session, Turn, or upstream work. Enqueueing a steer retains
+  the existing Session identity without starting a Turn.
+- Private prompt and attachment payloads live outside SQLite under the Host's
+  sensitive-state boundary. SQLite stores durable queue metadata, request
+  identity, token id and credential revision, state revisions, and safe failure
+  details.
+- Admission rechecks the token revision and scope, Host and Desktop Binding,
+  current queue policy, maintenance and Control Leases, Session state, native
+  readiness, provider support, YOLO policy, and execution policy.
+- Cancellation, expiry, admission, validation failure, and startup recovery
+  remove private payloads. Position changes and terminal outcomes use durable
+  state revisions, normalized logs, and the closed queue event set.
+- `queue status` and `queue cancel` use the public `rq_` identity. Protocol v22
+  and `satelle.api.v12` carry queue opt-in and the strict status and cancellation
+  response contracts.
+
+## Multiple desktop binding decisions
+
+- User-level Host configuration owns a map of Desktop Binding aliases. Each
+  binding carries one OS user, desktop selector preferences, provider bindings,
+  and provider Secret Sources. Project configuration cannot define or select a
+  Desktop Binding.
+- `run` and snapshot capture accept `--desktop-binding <alias>`. `steer` accepts
+  the same option and otherwise inherits the Session binding. A Host with more
+  than one binding rejects an unselected run with
+  `desktop-binding-ambiguous`.
+- API credentials carry an explicit set of Desktop Binding grants. Session,
+  event, artifact, log, provider authorization, secret provisioning, and queue
+  operations enforce those grants before returning binding-owned state.
+- Sessions, queue leases, provider authorization, provider secrets, Codex home
+  directories, work directories, readiness state, logs, and audit records all
+  carry the Desktop Binding identity. Log filtering happens before pagination.
+- A daemon can execute independent turns for different bindings at the same
+  time. It still allows only one active native execution per binding.
+- The native adapter accepts the daemon account's own OS user. A different OS
+  user fails with `desktop-binding-secure-handoff-unsupported` until the target
+  platform and native runtime provide a secure handoff.
+- Protocol version 22 and `satelle.api.v12` require the selected binding on Turn
+  requests. `satelle.session.v2`, `satelle.logs.entry.v2`, and
+  `satelle.api-token.issue.v2` expose the new binding contracts without an old
+  request fallback.
+
+## Turn recording decisions
+
+Box passed workspace format and Clippy, the complete Rust workspace, all 115
+npm checks, and the production documentation build.
+
+- `run` and `steer` accept `--record events|transcript|screenshots|video` for
+  one attached prospective Turn. `--record-retention` accepts a finite duration
+  through 30 days. The Host default is 24 hours.
+- The Controller reads the live Host policy, resolved recording root, expiry,
+  redaction version, and risk categories before asking for consent. Consent is
+  interactive, defaults to no, applies once, and cannot come from `--yes`, YOLO,
+  configuration, a profile, an environment variable, or an output flag.
+- User-owned Host configuration sets `recording.allowed_modes`,
+  `recording.default_retention`, and `recording.max_retention`. A user profile
+  may only narrow those modes and durations. Recording is disabled by default.
+- Event and transcript files apply the shared text redactor before the Host
+  writes them. Screenshot and video modes warn that visible pixels cannot be
+  redacted. Pixel capture is available on macOS and Windows Hosts.
+- Screenshots are private PNG files captured at Turn boundaries. Video is a
+  private one-frame-per-second Motion PNG AVI. Recording files and their
+  manifest stay under the Host's OS-native recording root.
+- Storage schema 22 records the Principal, Session, Turn, mode, artifact path,
+  timestamp, type, SHA-256 digest, size, expiry, and retention state. SQLite
+  never stores prompts, transcripts, screenshots, video frames, or artifact
+  bytes. Startup removes abandoned and expired recording directories.
+- Attached output reports the manifest path, every artifact path, expiry, and
+  cleanup command. Remote Controllers retrieve the completed manifest through
+  the authenticated `diagnostics:sensitive` contract after terminal status.
+  Protocol v22 and `satelle.api.v12` define this recording request boundary.
+
+## Raw protocol diagnostic decisions
+
+- `run` and `steer` accept `--raw-protocol --output <path>` for one prospective
+  Turn. Capture starts only after explicit interactive consent or the exact
+  `--no-input --yes` noninteractive form.
+- The Host captures only Codex app-server JSON for that Turn. It redacts known
+  provider secrets, authorization data, secret references, and schema-marked
+  fields before records enter the in-memory export.
+- Capture is limited to 8 MiB per Turn and eight pending exports per Host.
+  Capture failure never changes Turn execution or its durable outcome.
+- Download and acknowledgement require control plus `diagnostics:sensitive`
+  authority and the Principal that created the capture. Raw records never enter
+  SQLite, logs, status, events, support bundles, or idempotency receipts.
+- The Host retains a completed artifact for ten minutes, discards it on restart,
+  and records only bounded audit metadata. The audit distinguishes Host
+  preparation from Controller-confirmed local publication.
+- The Controller writes one new owner-only local file without replacement,
+  verifies its exact bytes, then acknowledges success. Failure reports the
+  staging path, cleanup command, and whether raw material may remain.
+
+## Desktop snapshot decisions
+
+Box passed workspace format, check, and Clippy; the complete Rust suites;
+all 115 npm checks; and 64 documentation examples. The Rust verification
+included 600 CLI unit tests, 175 CLI integration tests, 777 Host tests, 233
+core tests, 120 transport library tests, and 155 HTTP transport tests.
+
+- `desktop snapshot --host <alias> --output <path>` resolves one trusted Host,
+  Desktop Binding, and current native desktop session before it requests
+  consent. Ambiguous and unavailable targets use closed typed errors.
+- Consent is always interactive and applies to one invocation. The warning
+  names the output path, PNG format, storage effect, metadata redaction policy,
+  and visual content that can remain. `--yes` cannot imply this consent.
+- The Host checks native capture readiness, takes the Desktop Binding's Control
+  Lease, captures the current visible desktop, validates PNG structure and CRCs,
+  and removes ancillary metadata before transfer.
+- The Windows Host captures in memory. The macOS Host uses a private temporary
+  directory and deletes it after preparation or failure. The Controller writes
+  through a private sibling staging file and never replaces an existing path.
+- The manifest binds the artifact to its Host Identity, Desktop Binding,
+  desktop session, redaction policy, risk categories, creation time, format,
+  and byte count. The direct client verifies the pinned Host Identity again.
+- SQLite stores only bounded lifecycle and manifest metadata. Pixels,
+  thumbnails, OCR text, prompts, transcripts, and artifact bytes never enter
+  SQLite, logs, status, events, support bundles, readiness caches, or ledgers.
+
+## Platform-native log sink decisions
+
+- A user-owned Host Binding enables the mirror with `platform_log_sink = true`.
+  Project configuration cannot enable it. On-demand SSH launch arguments and
+  persistent launchd and Windows service definitions carry the complete
+  setting to the Host.
+- The closed Windows service configuration is now `satelle.host-service.v7`.
+  It requires the native sink setting. Incomplete or older service files fail
+  validation and setup rewrites the canonical file.
+- Each committed SQLite log entry is formatted once as the existing redacted
+  operator-log summary. The same line goes to the operator log file and to
+  journald, Windows Event Log, or macOS unified logging.
+- The native sink is best effort. A failed write advances the mirror cursor,
+  leaves SQLite and the daemon running, and reports a typed informational
+  `config.platform_log_sink.degraded` Doctor finding. A later successful write
+  clears the degraded health.
+- The operating system owns native log retention and queries. Native logging
+  does not change SQLite retention, operator-log rotation, `satelle logs`,
+  status, recovery, or support bundles.
+
+## Host storage migration contract decisions
+
+Box passed workspace Clippy, the complete Rust suites, all 115 npm checks, and
+the production documentation build. The Rust suites included 596 CLI tests, 763
+Host tests, 229 core tests, 174 transport library tests, and 151 HTTP transport
+tests. Three independent simplification reviews removed repeated transport and
+planning work without changing the migration contract.
+
+- `host storage migrate --to` selects one absolute storage root. Its `state`
+  and `logs` children replace the selected Host Binding's daemon paths after
+  validation. Configuration, cache, and provider installation paths stay put.
+- Local Hosts use local filesystem authority. Remote Hosts require a trusted
+  SSH management binding. Direct-only Hosts report the missing management path.
+- The Host takes an exclusive maintenance lease before the Controller stops the
+  service. The lease rejects new run and steer admission without displacing an
+  active Turn.
+- The migration uses a SQLite-consistent backup, copies into an inactive
+  destination, verifies file hashes and Host Identity, then switches the service
+  only after every staged check passes.
+- The Controller backs up the owning user configuration and records each
+  authenticated phase with a durable operation identity. Activation failures
+  enter the recorded rollback path and retain explicit recovery commands.
+- A successful migration preserves and fences the source as a rollback copy.
+  `host storage source cleanup` deletes only the recorded unchanged source files and
+  can resume after a partial cleanup.
+
+## Mutual TLS contract decisions
+
+Box passed the full Rust workspace test suites. The final rerun passed workspace
+Clippy, 594 CLI unit tests, 23 configuration integration tests, and all 59
+documentation examples. Inline simplification review completed with one
+comment clarification and no unused code. PR #228 passed Rust and npm checks
+on Linux, macOS, and Windows, plus documentation and release validation.
+
+- Direct HTTPS and WSS share one validated client certificate and key loaded
+  from user-owned absolute file references. Bearer scopes and Host Identity
+  checks remain authoritative for application operations.
+- Host listeners require an explicit client CA when mTLS is enabled. Optional
+  CRLs require valid signatures, expiry, and chain coverage. No network CRL
+  fetching or unknown-revocation fallback is used.
+- The existing secure TLS watcher reloads the complete material set. A valid
+  mTLS replacement closes existing connections; an invalid candidate retains
+  the current policy and produces a typed diagnostic.
+- Storage schema 18 adds bounded authentication audit metadata. Each protected
+  mTLS request commits its verified fingerprint and bearer Principal metadata
+  before dispatch. The SQLite log retention setting also governs these records.
+
+## Configuration contract decisions
+
+The first 24 requirements passed the complete Rust suites and Clippy on Linux,
+macOS, and Windows, plus npm checks and the documentation build. Box verified
+220 core tests and 36 targeted configuration integration tests.
+
+- `include` is an array of explicit TOML file paths. Each file uses the schema
+  and authority of its containing source, user or project.
+- Includes run in list order before the including file. Host Bindings and
+  Trusted Profiles retain the existing complete replacement semantics.
+- Includes remain inside the top-level config file's directory tree. Project
+  includes stay inside the discovered `.satelle` directory.
+- Every included file is validated, even when a later file replaces its values.
+- `expires_at` is an optional RFC 3339 UTC string on a user-owned Trusted
+  Profile. Omission does not create an expiry. An expired profile supplies no
+  mutation consent; explicit command consent or an interactive confirmation is
+  still available.
+
+## Credential helper contract decisions
+
+The next 36 requirements passed the complete Rust test suites and Clippy on
+Linux, macOS, and Windows. npm and documentation checks passed. Box also
+verified helper success and failure responses, deadlines, descendant cleanup,
+authorized runtime resolution, configuration inspection, and home-path handling.
+
+- `kind = "executable-helper"` uses `argv`, optional `timeout` (default `10s`),
+  and optional `environment` entries. The executable must be an absolute path
+  on the Host. Arguments are literal; shell launchers and inline commands are
+  invalid. The Host validates its platform grammar before execution.
+- Stdin contains one object with `schema_version = 1`, `operation = "resolve"`,
+  `provider_alias`, `resolved_provider`, and `host_alias`. Stdin closes after
+  this request. Neither prompts nor existing credentials enter the request.
+- Stdout contains exactly one object with `schema_version = 1`. A successful
+  response has `status = "success"` and a nonempty `secret` string. A failure
+  has `status = "error"` or `"interaction_required"` and a nonempty `code`.
+  Unknown fields, NULs, non-UTF-8 output, and output over 64 KiB are rejected.
+- The helper receives no terminal. Satelle discards stderr and does not answer
+  prompts. The timeout covers the process and its pipes; Satelle terminates
+  the helper process group when it finishes or reaches the deadline.
+- The inherited environment consists of `HOME`, `USERPROFILE`, `SystemRoot`,
+  `WINDIR`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, and `LC_ALL` when present. Explicit
+  entries contain literal non-secret settings. No full environment inheritance,
+  PATH lookup, interpolation, or project-provided entries are supported.
+- Config inspection never executes helpers. Explain output always redacts
+  executable identity, every argument, environment key names, and environment
+  values, including with `--show-secret-references`; it reports the effective
+  timeout. Helper output and response error codes are never copied to logs.
+
+## Host home path contract decisions
+
+- Provider File descriptors accept absolute paths, bare `~`, and `~/...`.
+  Windows Hosts also accept `~\...`. Other relative paths, named-user forms,
+  misplaced home-expansion components, environment substitutions, and command
+  substitutions fail. Embedded tildes in filenames, including Windows short
+  names, remain literal characters.
+- Expansion uses the resolving process account's OS home, before the Host
+  validates its native absolute-path grammar or opens the file. The expanded
+  absolute path is the effective file reference in the Host binding, including
+  stored authorizations and provisioning destinations. The configured shorthand
+  remains input and does not change the account that resolves it.
+- POSIX resolution reads the effective user's account record. Windows uses
+  the process account's known Profile folder. `HOME`, `USERPROFILE`, Satelle
+  path overrides, SSH login settings, and `desktop_user` do not select this home.
+- Config check validates syntax only. Config explain reveals an expanded
+  reference only with `--show-secret-references` for a local on-demand Host.
+  Other Hosts report `normalization_status = "remote_home_not_checked"`.
+- Typed failures include `config_file`, `toml_path`, `host`,
+  `secret_source_kind`, `resolver_os`, and `supported_forms` under `details`.
+  A field is null when its source location or resolver is not known at that
+  boundary. Failure messages never contain the secret-file path or contents.
+
+## Config repair contract decisions
+
+The next 21 requirements passed the complete Rust suites and Clippy on Linux,
+macOS, and Windows, plus npm, documentation, and release validation. Box verified
+229 core tests, 45 configuration integration tests, the interactive repair test,
+workspace Clippy, and the generated documentation contract.
+
+- `satelle config repair` selects the local user configuration file by default.
+  `--file <path>` explicitly selects a loaded user or project configuration file,
+  including an explicit include. No other file is edited.
+- Repairs convert schema key spelling to its exact accepted lowercase,
+  underscore form, for example `default-host` to `default_host`. A repair must
+  have exactly one accepted spelling and no existing destination key. Repairs
+  preserve values and comments. They never guess values, remove fields, or fix
+  arbitrary misspellings through a fuzzy match.
+- Each invocation validates the entire prospective configuration through the
+  normal loader before offering a mutation. Other diagnostics require manual
+  action. A dry-run is a redacted report, never a reusable apply plan.
+- `--dry-run` reports the selected file, diagnostics, planned write, private
+  backup path, original and repaired digests, restore command, and redacted
+  unified diff of canonical JSON with the config-explain redaction policy. It
+  creates no files or command-history entries. Comments remain in the edited
+  TOML file but do not enter the preview.
+- A mutation needs `--yes`, one final interactive confirmation, or a matching
+  user-owned Trusted Profile with `config_repair` consent. Trusted Profiles
+  apply only when every edit lies inside the explicitly selected Host Binding;
+  they cannot authorize root, profile, or trust-policy edits.
+- The command creates and verifies a byte-for-byte backup under the Controller
+  state directory before replacing the selected file. It checks that the source
+  still matches the preview, then uses the existing atomic config writer while
+  preserving permissions. Any failure retains the backup and restore command.
+
+## Host update scripting decisions
+
+The next 16 requirements passed the complete Rust suites and Clippy on Linux,
+macOS, and Windows, plus npm, documentation, and release validation. Box
+verified the Host update, CLI integration, and output contract tests.
+
+- `host update --plain` emits UTF-8, LF-terminated, tab-separated records with
+  the fixed `satelle.host.update.plain.v1` schema and eleven fields.
+- Backslashes, tabs, line feeds, and carriage returns are escaped. Optional
+  values use `-`; booleans use `true` and `false`.
+- Records retain each target's outcome and confirmed changes when another
+  target fails. Prompts and diagnostics stay on stderr.
+- Plain output shares the existing consent and exit-status policy. It cannot
+  combine with `--json` or an explicit `--format`; `--quiet` retains records.
+
+## Remote image contract decisions
+
+Box passed 9 attachment tests, 267 transport tests, 585 CLI unit tests, and
+19 focused CLI integration tests. Workspace Clippy and documentation checks
+also passed. PR #222 passed Rust and npm checks on Linux, macOS, and Windows,
+plus documentation and release installation checks on all six targets.
+
+- `run` and `steer` accept repeatable `--remote-image <HOST_PATH>` after resolving
+  the selected Host. The option requires SSH or Direct transport.
+- Paths use absolute native Host syntax. The Controller neither interprets nor
+  opens them. The Host applies bounded regular-file reads before admission.
+- Uploads and Host paths share the current tagged attachment list in
+  `satelle.api.v12` and protocol version 22. No older request shape is accepted.
+- The keyed operation identity includes the path reference. A replay or
+  cancellation resolves from durable admission state without reopening files.
+- Remote files share the upload limits and private staging lifecycle. Cleanup
+  removes generated files and never removes the operator's source image.
+
+## Host version compatibility decisions
+
+Box passed 231 core tests, 589 CLI unit tests, 19 focused CLI integration
+tests, and 65 release-packaging tests. Workspace Clippy and documentation
+checks passed. PR #223 passed Rust and npm checks on Linux, macOS, and
+Windows, documentation validation, and installation checks on all six release
+targets.
+
+- `host update --component host --version <version>` selects a stable release.
+  The option cannot combine with Codex updates or `--component all`.
+- The default target remains the invoking CLI release. Explicit selection can
+  move forward or backward within the same major/minor series, with an exact
+  protocol and storage schema match and a satisfied minimum CLI version.
+- A release asset named `satelle-compatibility.json` carries these compatibility
+  fields. The existing checksum and signed release attestation checks cover it.
+  Missing or invalid metadata blocks explicit selection.
+- Protocol negotiation accepts the one supported version. Capability discovery
+  gates optional features. Upgrade the CLI first when a release requires it.
+- The existing artifact verifier, replacement handshake, and pinned recovery
+  identity also apply to selected releases. There is no automatic downgrade or
+  storage downgrade, and no update channel.
+
+## API token lifecycle decisions
+
+Box passed 231 core tests, 753 Host tests, 271 transport tests, workspace
+Clippy, and 65 release-packaging tests. Generated documentation checks and the
+complete documentation site build passed. PR #224 passed Rust and npm checks
+on Linux, macOS, and Windows, documentation validation, and release installation
+checks on all six targets. Its existing Windows log-cursor test passed on rerun.
+
+- Durable admin credentials issue, rotate, and revoke individual tokens through
+  the general token-management routes. SSH bootstrap credentials retain the
+  separate pending setup flow.
+- Rotation preserves token identity, Principal identity, scopes, and expiry.
+  The previous verifier stops authenticating before the replacement is returned.
+- Each mutation and its non-secret idempotency outcome commit in one storage
+  transaction. Replays return original metadata, including after restart.
+- Issuance and rotation return a raw secret once. A successful duplicate returns
+  `token-secret-not-replayable`; revocation replays its original successful result.
+- Schema 17 preserves existing provider-secret journals and checks foreign keys
+  before committing the migration. A failed integrity check rolls back the
+  schema change.
+
+
+## Native package repair decisions
+
+Box passed the native launcher and real npm, pnpm, and Bun repair tests,
+including package restoration, dry-run behavior, and validation failures. All
+66 release-packaging tests and generated documentation checks passed. PR #225
+passed Rust and npm checks on Linux, macOS, and Windows, documentation validation,
+and release installation checks on all six targets. Its existing macOS oversized
+request test passed on rerun.
+
+- `satelle native repair` runs in the JavaScript launcher before native binary
+  resolution. It repairs the current platform package at the exact launcher
+  version through the proven installation owner, npm, pnpm, or Bun.
+- `--dry-run` reports the owner, installation root, and exact command without
+  changing files. Apply preserves local versus global scope and disables install
+  scripts. Local repair records the exact platform package as optional.
+- Missing or ambiguous ownership fails with `native-repair-owner-unknown` and
+  recovery guidance. The launcher never guesses an owner or downloads binaries.
+- Success requires the ordinary package resolver and version check, matching
+  platform metadata, a bounded regular executable inside the package, and a
+  matching `SHA256SUMS` entry. A package-manager exit alone is insufficient.
+- Package assembly, prepack checks, and release archive validation bind the
+  checksum to the same executable bytes that passed target validation.
+
+## Output format decisions
+
+Box passed all 592 active CLI unit tests, 10 output-contract tests, the pinned
+TOON reference check, workspace Clippy, and 58 documentation examples. PR #226
+passed Rust and npm checks on Linux, macOS, and Windows, documentation validation,
+and release installation checks on all six targets. The inline simplification review preserved
+the existing streaming JSON writer and error diagnostics; no new dead code
+remains.
+
+- Public commands with one final result accept compact JSON, TOON, and Markdown
+  through the existing `--format` selector. The format is carried to the final
+  presentation boundary; event streams and private subprocess protocols retain
+  their existing record shapes.
+- Compact JSON serializes the same report without indentation. Markdown wraps
+  the complete pretty JSON report in a fenced block, preserving nested values.
+- TOON follows the 4.1 specification, with two-space indentation, comma
+  delimiters, escaped C0 controls, and exact 64-bit integers. Its local encoder
+  does not change JSON serialization features or persistent payload ordering.
+  Shared fixtures compare the Rust encoder with the pinned upstream JavaScript
+  reference, including nested tables, strings, controls, and empty containers.
+- Only `skills list` exposes CSV. Its four-column contract repeats the schema
+  and bundle versions on every row and retains every skill name and description.
+- All structured formats share JSON's consent, event, error, and exit policy.
+  Command-specific parsers reject unsupported formats before loading config.
+
+## Setup and repair raw subprocess diagnostics
+
+`setup` and `repair` accept `--raw-subprocess-output --output <path>` for one
+invocation. Noninteractive use also requires `--no-input --yes`. The warning
+and consent happen before Satelle installs the capture guard.
+
+The export contains bounded stdout from selected input-free SSH probes and
+fenced mutations, stable command identifiers, timestamps, exit status, and
+redaction metadata. Satelle excludes token-bearing subprocesses, provider
+traffic, prompts, transcripts, screenshots, and recordings. Invalid UTF-8 or
+an artifact over 8 MiB fails closed without publishing a partial file.
+
+The Host records actor, command scope, categories, size, and outcome in the
+shared raw diagnostic audit table. Raw bytes stay in invocation memory and a
+private local staging file. Normal logs, setup history, status, Doctor,
+Operator Log Files, caches, and support bundles never receive them.

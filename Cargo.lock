@@ -383,9 +383,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cipher",
@@ -519,16 +519,6 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
  "memchr",
-]
-
-[[package]]
-name = "command-group"
-version = "5.0.1"
-dependencies = [
- "async-trait",
- "nix",
- "tokio",
- "winapi",
 ]
 
 [[package]]
@@ -1055,9 +1045,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2447,40 +2437,51 @@ dependencies = [
 ]
 
 [[package]]
-name = "satelle-cli"
+name = "satelle"
 version = "0.1.11"
 dependencies = [
  "assert_cmd",
+ "async-trait",
+ "axum",
  "base64",
  "clap",
  "clap_complete",
  "cliclack",
- "command-group",
  "console",
+ "core-foundation",
+ "directories",
  "flate2",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hmac",
+ "hpke",
+ "http-body-util",
  "hyper",
  "jsonschema",
  "libc",
+ "nix",
  "notify",
+ "percent-encoding",
  "predicates",
  "rcgen",
  "reqwest",
  "rmcp",
  "rusqlite",
  "rustix",
- "satelle-core",
- "satelle-host",
- "satelle-test-contract",
- "satelle-transport",
+ "rustls",
+ "rustls-platform-verifier",
  "self-replace",
  "serde",
  "serde_json",
  "sha2",
+ "shlex",
+ "subtle",
  "tar",
  "tempfile",
  "thiserror",
  "time",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "toml",
  "toml_edit",
@@ -2488,104 +2489,11 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "winapi",
  "windows-sys 0.61.2",
- "zeroize",
- "zip",
-]
-
-[[package]]
-name = "satelle-core"
-version = "0.1.11"
-dependencies = [
- "directories",
- "libc",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "time",
- "toml",
- "url",
- "uuid",
- "windows-sys 0.61.2",
- "zeroize",
-]
-
-[[package]]
-name = "satelle-host"
-version = "0.1.11"
-dependencies = [
- "base64",
- "command-group",
- "core-foundation",
- "directories",
- "flate2",
- "getrandom 0.4.3",
- "hmac",
- "libc",
- "reqwest",
- "rusqlite",
- "rustix",
- "satelle-core",
- "satelle-test-contract",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tar",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "toml",
- "tracing",
- "url",
- "uuid",
- "windows-sys 0.61.2",
- "zeroize",
-]
-
-[[package]]
-name = "satelle-test-contract"
-version = "0.1.11"
-dependencies = [
- "notify",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "satelle-transport"
-version = "0.1.11"
-dependencies = [
- "axum",
- "base64",
- "futures-util",
- "hpke",
- "http-body-util",
- "percent-encoding",
- "rcgen",
- "reqwest",
- "rusqlite",
- "rustls",
- "rustls-platform-verifier",
- "satelle-core",
- "satelle-host",
- "satelle-test-contract",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "time",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tracing",
- "uuid",
  "x509-parser",
  "zeroize",
+ "zip",
 ]
 
 [[package]]
