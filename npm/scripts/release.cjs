@@ -32,7 +32,7 @@ const defaultRepositoryRoot = path.resolve(__dirname, "../..");
 const maximumNativeBinaryBytes = 512 * 1024 * 1024;
 const maximumNpmArtifactBytes = 512 * 1024 * 1024;
 const maximumNativeReleaseArchiveBytes = maximumNpmArtifactBytes;
-const launcherSmokeTimeoutMilliseconds = 9_000;
+const launcherExecutionTimeoutMilliseconds = 30_000;
 const defaultNpmCommandTimeoutMilliseconds = 300_000;
 const defaultTarCommandTimeoutMilliseconds = 60_000;
 const defaultNativeArchiveValidationTimeoutMilliseconds = 60_000;
@@ -60,6 +60,14 @@ class ReleaseError extends Error {
 
 function fail(code, message) {
   throw new ReleaseError(code, message);
+}
+
+function childExitSummary(child) {
+  return [
+    `status=${child.status ?? "none"}`,
+    `signal=${child.signal ?? "none"}`,
+    `error=${child.error?.code ?? "none"}`,
+  ].join(", ");
 }
 
 function readJson(filePath) {
@@ -2218,9 +2226,9 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
       );
       installPackedLauncherDependencies(smokeRoot);
       // Package installation has the independently configured npm command bound.
-      // This deadline covers only the four required launcher executions.
+      // Each of the four fixed launcher executions gets the same bounded window,
+      // so one cold native launch cannot consume the next launcher's budget.
       afterLauncherInstall?.();
-      const smokeDeadline = Date.now() + launcherSmokeTimeoutMilliseconds;
 
       const launcherPaths = topLevelPackages.map((packageName) => ({
         packageName,
@@ -2238,7 +2246,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           encoding: "utf8",
           env: { ...process.env, npm_config_user_agent: "npm/release-validation" },
           killSignal: "SIGKILL",
-          timeout: Math.max(1, smokeDeadline - Date.now()),
+          timeout: launcherExecutionTimeoutMilliseconds,
         });
         const validResult = expectedTarget
           ? child.status === 0 && child.stdout === `satelle ${version}\n` && child.stderr === ""
@@ -2248,7 +2256,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         if (!validResult) {
           fail(
             "release-executable-mismatch",
-            `${packageName} packed executable does not preserve native launch behavior`,
+            `${packageName} packed executable does not preserve native launch behavior (${childExitSummary(child)})`,
           );
         }
       }
@@ -2266,7 +2274,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           encoding: "utf8",
           env: { ...process.env, npm_config_user_agent: "npm/release-validation" },
           killSignal: "SIGKILL",
-          timeout: Math.max(1, smokeDeadline - Date.now()),
+          timeout: launcherExecutionTimeoutMilliseconds,
         });
         const expectedError = expectedTarget
           ? "satelle: native-binary-package-missing:"
@@ -2278,7 +2286,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         ) {
           fail(
             "release-executable-mismatch",
-            `${packageName} packed executable does not preserve launcher behavior`,
+            `${packageName} packed executable does not preserve launcher behavior (${childExitSummary(child)})`,
           );
         }
       }
