@@ -360,9 +360,15 @@ pub(super) fn configure_control_plane_probe_command(
 pub(crate) fn installed_read_only_app_server_command(
     deadline: Instant,
 ) -> Result<Command, SatelleError> {
-    let runtime = crate::codex_install::admit_managed_codex_for_current_process()?;
     // Recovery must read the exact receipt-recorded home that execution used.
-    let [mcp_command, app_server_command] = computer_use_runtime_commands(&runtime, deadline)?;
+    #[cfg(not(target_os = "macos"))]
+    let [mcp_command, app_server_command] =
+        crate::codex_install::admit_managed_codex_command_batch_for_current_process()?;
+    #[cfg(target_os = "macos")]
+    let [mcp_command, app_server_command] = {
+        let runtime = crate::codex_install::admit_managed_codex_for_current_process()?;
+        computer_use_runtime_commands(&runtime, deadline)?
+    };
     read_only_app_server_command(mcp_command, app_server_command, deadline)
 }
 
