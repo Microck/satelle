@@ -25,10 +25,10 @@ pub(crate) use control_plane::{
 mod control_plane_tests;
 
 const VERSION_OUTPUT_LIMIT: u64 = 129;
-// A cold Windows app process can take several seconds to answer while WAA or
-// another desktop reset is closing applications. Keep the probe bounded while
-// allowing that valid runtime to publish its real capability snapshot.
-pub(crate) const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+// A cold Windows app process can take tens of seconds to answer while WAA or
+// another desktop reset is closing applications. Match the managed-install
+// probe budget so the same valid runtime can publish its capability snapshot.
+pub(crate) const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const APP_POLICY_MESSAGE_LIMIT: usize = 128;
 const APP_POLICY_LINE_LIMIT: u64 = 2 * 1024 * 1024;
