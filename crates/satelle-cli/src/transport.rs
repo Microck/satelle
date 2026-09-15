@@ -9472,7 +9472,15 @@ fn optional_local_daemon_endpoint(
     path: &Path,
 ) -> Result<Option<LocalDaemonEndpoint>, SatelleError> {
     match fs::symlink_metadata(path) {
-        Ok(_) => read_local_daemon_endpoint(path).map(Some),
+        Ok(_) => match read_local_daemon_endpoint(path) {
+            Ok(endpoint) => Ok(Some(endpoint)),
+            // A daemon can remove its endpoint after the first metadata check.
+            // Reclassify only a path now proven absent; unsafe files stay errors.
+            Err(_) if matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound) => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(local_daemon_artifact_error(
             path,
