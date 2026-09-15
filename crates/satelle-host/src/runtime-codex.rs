@@ -1080,7 +1080,7 @@ fn provision_windows_computer_use(
         .installed
         .iter()
         .find(|plugin| plugin.plugin_id == COMPUTER_USE_PLUGIN_ID && plugin.installed);
-    if let Some(plugin) = installed_plugin {
+    let install_plugin = if let Some(plugin) = installed_plugin {
         if plugin.marketplace_name != "openai-bundled"
             || !plugin.enabled
             || plugin
@@ -1098,12 +1098,29 @@ fn provision_windows_computer_use(
             "windows",
             &trusted_computer_use_plugin_root,
         ) {
-            return Err(mark_provision_changed(
-                codex_isolation_error("computer_use_plugin_source_untrusted"),
-                changed,
-            ));
+            // Codex can retain an installed plugin from an older bundled
+            // marketplace snapshot after the signed AppX source changes.
+            // Remove that stale install before selecting the verified source.
+            let mut plugin_remove_command = runtime
+                .command()
+                .map_err(|error| mark_provision_changed(error, changed))?;
+            plugin_remove_command.args(["plugin", "remove", COMPUTER_USE_PLUGIN_ID, "--json"]);
+            bounded_mutation_command_output(
+                plugin_remove_command,
+                deadline,
+                "computer_use_plugin_remove_unavailable",
+                "computer_use_plugin_remove_failed",
+            )
+            .map_err(|error| mark_provision_changed(error, true))?;
+            changed = true;
+            true
+        } else {
+            false
         }
     } else {
+        true
+    };
+    if install_plugin {
         let mut plugin_add_command = runtime
             .command()
             .map_err(|error| mark_provision_changed(error, changed))?;
