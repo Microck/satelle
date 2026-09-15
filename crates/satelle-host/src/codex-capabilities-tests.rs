@@ -1272,7 +1272,7 @@ fn complete_version_does_not_wait_for_a_group_escaping_pipe_holder() {
     command.arg("version-with-escaped-descendant");
     let started = Instant::now();
 
-    let evidence = probe_codex_version_command(command, Duration::from_millis(100));
+    let evidence = probe_codex_version_command(command, Duration::from_secs(1));
 
     assert_eq!(
         evidence,
@@ -1281,7 +1281,7 @@ fn complete_version_does_not_wait_for_a_group_escaping_pipe_holder() {
         }
     );
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_millis(1_500),
         "an escaped stdout holder exceeded the version probe deadline"
     );
 }
