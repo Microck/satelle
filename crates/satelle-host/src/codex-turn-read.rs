@@ -1,27 +1,26 @@
 use super::{
-    CodexExchange, CodexSessionError, CodexTurnStatus, ProtocolWriter, ReadEvent, required_object,
-    required_string, validate_initialize,
+    CodexExchange, CodexSessionError, CodexThreadStatus, ProtocolWriter, ReadEvent,
+    required_object, required_string, validate_initialize,
 };
 use serde_json::{Map, Value, json};
 use std::sync::mpsc;
 use std::time::Instant;
 
 /// A read-only app-server exchange used to reconcile durable Turn ownership
-/// after a daemon restart. It accepts only the exact persisted thread and Turn
-/// identities so unrelated history can never release the desktop lease.
+/// after a daemon restart. Paginated Codex threads reject the legacy
+/// `includeTurns` history path. Thread status can prove that no upstream runtime
+/// owns the thread, while an active status cannot identify its current Turn.
 pub(super) struct TurnReadExchange<'a> {
     thread_ref: &'a str,
-    turn_ref: &'a str,
     deadline: Instant,
     responses: [bool; 3],
-    status: Option<CodexTurnStatus>,
+    status: Option<CodexThreadStatus>,
 }
 
 impl<'a> TurnReadExchange<'a> {
-    pub(super) const fn new(thread_ref: &'a str, turn_ref: &'a str, deadline: Instant) -> Self {
+    pub(super) const fn new(thread_ref: &'a str, deadline: Instant) -> Self {
         Self {
             thread_ref,
-            turn_ref,
             deadline,
             responses: [false; 3],
             status: None,
@@ -105,26 +104,21 @@ impl<'a> TurnReadExchange<'a> {
             .get("turns")
             .and_then(Value::as_array)
             .ok_or(CodexSessionError::MalformedMessage)?;
-        let mut matching_status = None;
-        for turn in turns {
-            let turn = turn
-                .as_object()
-                .ok_or(CodexSessionError::MalformedMessage)?;
-            if required_string(turn, "id")? != self.turn_ref {
-                continue;
-            }
-            if matching_status.is_some() {
-                return Err(CodexSessionError::ConflictingIdentity);
-            }
-            matching_status = Some(parse_status(required_string(turn, "status")?)?);
+        if !turns.is_empty() {
+            return Err(CodexSessionError::MalformedMessage);
         }
-        self.status = Some(matching_status.ok_or(CodexSessionError::ConflictingIdentity)?);
+        let status = required_object(thread, "status")?;
+        self.status = Some(match required_string(status, "type")? {
+            "active" => CodexThreadStatus::Active,
+            "notLoaded" | "idle" | "systemError" => CodexThreadStatus::Inactive,
+            _ => return Err(CodexSessionError::MalformedMessage),
+        });
         Ok(())
     }
 }
 
 impl CodexExchange for TurnReadExchange<'_> {
-    type Output = CodexTurnStatus;
+    type Output = CodexThreadStatus;
 
     fn run(
         &mut self,
@@ -149,22 +143,12 @@ impl CodexExchange for TurnReadExchange<'_> {
         writer.write(&json!({
             "id": 2,
             "method": "thread/read",
-            "params": {"threadId": self.thread_ref, "includeTurns": true}
+            "params": {"threadId": self.thread_ref, "includeTurns": false}
         }))?;
         while !self.responses[2] {
             self.consume_next(writer, receiver)?;
         }
         self.status.ok_or(CodexSessionError::MalformedMessage)
-    }
-}
-
-fn parse_status(status: &str) -> Result<CodexTurnStatus, CodexSessionError> {
-    match status {
-        "inProgress" => Ok(CodexTurnStatus::InProgress),
-        "completed" => Ok(CodexTurnStatus::Completed),
-        "interrupted" => Ok(CodexTurnStatus::Interrupted),
-        "failed" => Ok(CodexTurnStatus::Failed),
-        _ => Err(CodexSessionError::MalformedMessage),
     }
 }
 

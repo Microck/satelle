@@ -8,8 +8,8 @@ use super::adapter::{
 };
 use crate::codex_session::{
     CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
-    CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexTurnReadRequest,
-    CodexTurnStatus, TimedCodexSessionRun, read_codex_turn,
+    CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexThreadStatus,
+    CodexTurnReadRequest, TimedCodexSessionRun, read_codex_turn,
     run_codex_session_with_native_action_completion, run_codex_session_with_timeout_cancellation,
 };
 use crate::provider_auth::{
@@ -939,10 +939,13 @@ impl ProductionComputerUseAdapter {
             .map(|execution| execution.control.clone()))
     }
 
-    fn read_persisted_turn(&self, subject: AdapterSubject<'_>) -> Option<CodexTurnStatus> {
+    fn read_persisted_turn(&self, subject: AdapterSubject<'_>) -> Option<CodexThreadStatus> {
         // No transport or protocol failure proves ownership inactive. Collapse
         // every uncertain read to None so callers retain the Control Lease.
-        let (Some(thread_ref), Some(turn_ref)) =
+        // An inactive thread disproves ownership only for a Turn whose exact
+        // upstream identity was committed before the restart. An active thread
+        // cannot identify which Turn it owns, so it remains outcome-unknown.
+        let (Some(thread_ref), Some(_turn_ref)) =
             (subject.upstream_thread_ref(), subject.upstream_turn_ref())
         else {
             return None;
@@ -960,7 +963,6 @@ impl ProductionComputerUseAdapter {
             CodexTurnReadRequest {
                 working_directory: &working_directory,
                 thread_ref,
-                turn_ref,
                 deadline,
             },
         )
@@ -970,8 +972,8 @@ impl ProductionComputerUseAdapter {
     fn read_readiness_probe_turn(
         &self,
         subject: &crate::storage::ProbeRecoverySubject,
-    ) -> Option<CodexTurnStatus> {
-        let (Some(thread_ref), Some(turn_ref)) =
+    ) -> Option<CodexThreadStatus> {
+        let (Some(thread_ref), Some(_turn_ref)) =
             (subject.upstream_thread_ref(), subject.upstream_turn_ref())
         else {
             return None;
@@ -989,7 +991,6 @@ impl ProductionComputerUseAdapter {
             CodexTurnReadRequest {
                 working_directory: &working_directory,
                 thread_ref,
-                turn_ref,
                 deadline,
             },
         )
@@ -2509,10 +2510,8 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
         subject: &crate::storage::ProbeRecoverySubject,
     ) -> RecoveryObservation {
         match self.read_readiness_probe_turn(subject) {
-            Some(CodexTurnStatus::InProgress) => RecoveryObservation::Running,
-            Some(
-                CodexTurnStatus::Completed | CodexTurnStatus::Interrupted | CodexTurnStatus::Failed,
-            ) => RecoveryObservation::Completed,
+            Some(CodexThreadStatus::Active) => RecoveryObservation::Unknown,
+            Some(CodexThreadStatus::Inactive) => RecoveryObservation::Failed,
             None => RecoveryObservation::Unknown,
         }
     }
@@ -2521,7 +2520,7 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
 fn stop_observation(
     turn_state: TurnState,
     has_upstream_references: bool,
-    status: Option<CodexTurnStatus>,
+    status: Option<CodexThreadStatus>,
 ) -> StopObservation {
     // The worker must durably enter Running before calling execute, so a
     // Starting Turn with no private references cannot have reached Codex.
@@ -2530,10 +2529,8 @@ fn stop_observation(
         return StopObservation::UpstreamInactiveConfirmed;
     }
     match status {
-        Some(CodexTurnStatus::InProgress) => StopObservation::UpstreamStillActive,
-        Some(
-            CodexTurnStatus::Completed | CodexTurnStatus::Interrupted | CodexTurnStatus::Failed,
-        ) => StopObservation::UpstreamInactiveConfirmed,
+        Some(CodexThreadStatus::Active) => StopObservation::OutcomeUnknown,
+        Some(CodexThreadStatus::Inactive) => StopObservation::UpstreamInactiveConfirmed,
         None => StopObservation::OutcomeUnknown,
     }
 }
@@ -2547,11 +2544,10 @@ fn stop_observation_from_detail(error: &SatelleError, field: &str) -> StopObserv
     }
 }
 
-fn recovery_observation(status: Option<CodexTurnStatus>) -> RecoveryObservation {
+fn recovery_observation(status: Option<CodexThreadStatus>) -> RecoveryObservation {
     match status {
-        Some(CodexTurnStatus::InProgress) => RecoveryObservation::Running,
-        Some(CodexTurnStatus::Completed) => RecoveryObservation::Completed,
-        Some(CodexTurnStatus::Interrupted | CodexTurnStatus::Failed) => RecoveryObservation::Failed,
+        Some(CodexThreadStatus::Active) => RecoveryObservation::Unknown,
+        Some(CodexThreadStatus::Inactive) => RecoveryObservation::Failed,
         None => RecoveryObservation::Unknown,
     }
 }
@@ -4227,33 +4223,25 @@ mod tests {
     #[test]
     fn durable_turn_status_has_closed_stop_and_recovery_meanings() {
         assert_eq!(
-            stop_observation(TurnState::Running, true, Some(CodexTurnStatus::InProgress)),
-            StopObservation::UpstreamStillActive
+            stop_observation(TurnState::Running, true, Some(CodexThreadStatus::Active)),
+            StopObservation::OutcomeUnknown
         );
         assert_eq!(
-            recovery_observation(Some(CodexTurnStatus::InProgress)),
-            RecoveryObservation::Running
+            recovery_observation(Some(CodexThreadStatus::Active)),
+            RecoveryObservation::Unknown
         );
         assert_eq!(
-            recovery_observation(Some(CodexTurnStatus::Completed)),
-            RecoveryObservation::Completed
+            stop_observation(
+                TurnState::RecoveryPending,
+                true,
+                Some(CodexThreadStatus::Inactive),
+            ),
+            StopObservation::UpstreamInactiveConfirmed
         );
-        for terminal in [
-            CodexTurnStatus::Completed,
-            CodexTurnStatus::Interrupted,
-            CodexTurnStatus::Failed,
-        ] {
-            assert_eq!(
-                stop_observation(TurnState::RecoveryPending, true, Some(terminal)),
-                StopObservation::UpstreamInactiveConfirmed
-            );
-        }
-        for failed in [CodexTurnStatus::Interrupted, CodexTurnStatus::Failed] {
-            assert_eq!(
-                recovery_observation(Some(failed)),
-                RecoveryObservation::Failed
-            );
-        }
+        assert_eq!(
+            recovery_observation(Some(CodexThreadStatus::Inactive)),
+            RecoveryObservation::Failed
+        );
         assert_eq!(
             stop_observation(TurnState::Starting, false, None),
             StopObservation::UpstreamInactiveConfirmed
