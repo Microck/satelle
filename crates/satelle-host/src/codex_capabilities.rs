@@ -700,22 +700,6 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
         };
     }
 
-    let Ok(runtime) = crate::codex_install::admit_managed_codex_for_current_process() else {
-        return Phase0Discovery {
-            evidence: Phase0CapabilityEvidence {
-                codex_version: CodexVersionEvidence::Missing,
-                host_platform,
-                capabilities: CapabilityMatrix::unproven(),
-            },
-            control_plane_admission: control_plane::ControlPlaneAdmission::unavailable(
-                ControlPlaneFailureReason::RuntimeMissing,
-            ),
-            budget_failure: None,
-        };
-    };
-    // Phase 0 is one atomic runtime probe. Verify the managed binary once for
-    // every child command instead of re-hashing the same large executable at
-    // each sequential stage.
     let Ok(
         [
             version_command,
@@ -725,16 +709,16 @@ pub(crate) fn discover_phase0(probe_timeout: Option<Duration>) -> Phase0Discover
             policy_mcp_command,
             policy_app_server_command,
         ],
-    ) = runtime.commands()
+    ) = crate::codex_install::admit_managed_codex_command_batch_for_current_process()
     else {
         return Phase0Discovery {
             evidence: Phase0CapabilityEvidence {
-                codex_version: CodexVersionEvidence::Unavailable,
+                codex_version: CodexVersionEvidence::Missing,
                 host_platform,
                 capabilities: CapabilityMatrix::unproven(),
             },
             control_plane_admission: control_plane::ControlPlaneAdmission::unavailable(
-                ControlPlaneFailureReason::VersionUnavailable,
+                ControlPlaneFailureReason::RuntimeMissing,
             ),
             budget_failure: None,
         };

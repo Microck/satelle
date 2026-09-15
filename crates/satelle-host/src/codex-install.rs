@@ -132,6 +132,7 @@ impl VerifiedCodexRuntime {
 
     /// Verifies the immutable runtime once immediately before constructing an
     /// atomic batch of child commands that belong to the same probe.
+    #[cfg(any(not(target_os = "macos"), test))]
     pub(crate) fn commands<const COUNT: usize>(&self) -> Result<[Command; COUNT], SatelleError> {
         verify_runtime_identity(
             &self.codex_home,
@@ -139,11 +140,15 @@ impl VerifiedCodexRuntime {
             &self.binary_path,
             &self.binary_sha256,
         )?;
-        Ok(std::array::from_fn(|_| {
+        Ok(self.command_batch())
+    }
+
+    fn command_batch<const COUNT: usize>(&self) -> [Command; COUNT] {
+        std::array::from_fn(|_| {
             let mut command = Command::new(&self.binary_path);
             command.env("CODEX_HOME", &self.codex_home);
             command
-        }))
+        })
     }
 }
 
@@ -165,6 +170,15 @@ pub(crate) fn admit_managed_codex_for_current_process() -> Result<VerifiedCodexR
         std::env::current_dir().map_err(|_| invalid_receipt("current_directory_unavailable"))?;
     let paths = resolve_path_set(&current_directory)?;
     admit_managed_codex(&paths)
+}
+
+/// Admits the current managed runtime and constructs one atomic child-command
+/// batch from that fresh verification. Retained runtimes must use `commands`
+/// so they recheck identity immediately before a later batch.
+pub(crate) fn admit_managed_codex_command_batch_for_current_process<const COUNT: usize>()
+-> Result<[Command; COUNT], SatelleError> {
+    let runtime = admit_managed_codex_for_current_process()?;
+    Ok(runtime.command_batch())
 }
 
 fn managed_codex_home(user_home: Option<&Path>) -> Result<PathBuf, SatelleError> {
@@ -910,6 +924,7 @@ fn verify_binary_identity(
     Ok(binary_path)
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn verify_runtime_identity(
     codex_home: &Path,
     package_root: &Path,
