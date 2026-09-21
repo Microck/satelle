@@ -1841,6 +1841,7 @@
 - satelle host storage backup cleanup --host <alias> is the explicit command for deleting older eligible migration backups after a dry-run plan and mutation consent @spec @mvp @implemented
 - satelle destructive store reset is available only through an explicit host maintenance command @spec @mvp @implemented
 - satelle host store reset deletes metadata only by default and does not delete recordings unless the user explicitly requests recording deletion @spec @mvp @implemented
+- explicit offline store reset discards abandoned operation metadata without marking those operations terminal; the operator must first stop external Computer Use processes, the filesystem ownership lock rejects a running Host, and a durable handoff records reset completion in the replacement database @spec @mvp @implemented
 - satelle does not use ad hoc JSON files as the canonical store for session metadata, readiness cache, provider smoke results, or log summaries @spec @mvp @implemented
 - satelle storage remains local to the remote host unless the user explicitly exports diagnostics or recordings @spec @mvp @implemented
 
