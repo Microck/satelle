@@ -132,7 +132,7 @@ impl VerifiedCodexRuntime {
 
     /// Verifies the immutable runtime once immediately before constructing an
     /// atomic batch of child commands that belong to the same probe.
-    #[cfg(any(not(target_os = "macos"), test))]
+    #[cfg(any(windows, test))]
     pub(crate) fn commands<const COUNT: usize>(&self) -> Result<[Command; COUNT], SatelleError> {
         verify_runtime_identity(
             &self.codex_home,
@@ -177,8 +177,18 @@ pub(crate) fn admit_managed_codex_for_current_process() -> Result<VerifiedCodexR
 /// so they recheck identity immediately before a later batch.
 pub(crate) fn admit_managed_codex_command_batch_for_current_process<const COUNT: usize>()
 -> Result<[Command; COUNT], SatelleError> {
+    let (_, commands) = admit_managed_codex_with_command_batch_for_current_process()?;
+    Ok(commands)
+}
+
+/// Keeps the freshly admitted runtime with its atomic command batch when the
+/// caller also needs receipt-recorded paths. This avoids hashing the immutable
+/// runtime again before the first commands created from that admission.
+pub(crate) fn admit_managed_codex_with_command_batch_for_current_process<const COUNT: usize>()
+-> Result<(VerifiedCodexRuntime, [Command; COUNT]), SatelleError> {
     let runtime = admit_managed_codex_for_current_process()?;
-    Ok(runtime.command_batch())
+    let commands = runtime.command_batch();
+    Ok((runtime, commands))
 }
 
 fn managed_codex_home(user_home: Option<&Path>) -> Result<PathBuf, SatelleError> {
@@ -924,7 +934,7 @@ fn verify_binary_identity(
     Ok(binary_path)
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(windows, test))]
 fn verify_runtime_identity(
     codex_home: &Path,
     package_root: &Path,
