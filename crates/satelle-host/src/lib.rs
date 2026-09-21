@@ -1152,15 +1152,11 @@ mod bootstrap_maintenance_tests {
             ),
         ] {
             let state = TestStateDir::new().expect("create corrupt storage state");
+            let (store, _) = storage::Storage::open(state.path()).expect("create private store");
+            drop(store);
             let database = state.path().join("satelle.sqlite3");
             std::fs::write(&database, b"not a SQLite database")
                 .expect("write corrupt database fixture");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
-                    .expect("keep the corrupt fixture owner-only");
-            }
 
             HostService::start_offline_storage_maintenance(
                 state.path(),
@@ -1183,15 +1179,13 @@ mod bootstrap_maintenance_tests {
     #[test]
     fn corrupt_store_reset_imports_the_handoff_into_the_new_sqlite_ledger() {
         let state = TestStateDir::new().expect("create corrupt reset state");
+        // Corrupt an existing private store so reset exercises content recovery
+        // without relying on a normal database open to repair the fixture ACL.
+        let (store, _) = storage::Storage::open(state.path()).expect("create private store");
+        drop(store);
         let database = state.path().join("satelle.sqlite3");
         std::fs::write(&database, b"not a SQLite database")
             .expect("write corrupt database fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
-                .expect("keep the corrupt fixture owner-only");
-        }
         let operation_id = "corrupt-store-reset-completion";
         HostService::start_offline_storage_maintenance(
             state.path(),
