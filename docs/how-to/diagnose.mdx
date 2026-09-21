@@ -48,3 +48,20 @@ Before sharing logs, redact Host aliases, usernames, addresses, tailnet names,
 Session identifiers, local paths, prompts, transcripts, and desktop content.
 Never share bearer tokens, provider secrets, private keys, or authorization
 headers. Follow the repository security policy for suspected vulnerabilities.
+
+## Reset an offline Host store
+
+After stopping the Host, an explicitly approved `satelle host store reset`
+can discard metadata even when an abandoned operation still holds a database
+lease. Reset takes the exclusive filesystem ownership lock before deleting
+anything, so a running Host still blocks it. Recordings remain unless
+`--delete-recordings` is also approved.
+
+Reset records its start in a durable file outside SQLite. On success it imports
+the completed operation into the replacement database. If reset fails before
+that database exists, the durable failure record remains available for retry.
+Reset does not report the abandoned operation as completed or stop its external
+processes. Stop those processes before resetting the store. When their state
+cannot be established, reboot the machine before reset. Normal restart and
+timeout recovery still retain uncertain leases; reset is an explicit deletion
+of the stored history.
