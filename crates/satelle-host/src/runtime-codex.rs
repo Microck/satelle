@@ -395,25 +395,51 @@ pub(super) fn read_only_app_server_command(
 
 pub(crate) fn installed_computer_use_app_server()
 -> Result<VerifiedComputerUseAppServer, SatelleError> {
-    let runtime = crate::codex_install::admit_managed_codex_for_current_process()?;
-    verified_app_server_command(&runtime)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (runtime, commands) =
+            crate::codex_install::admit_managed_codex_with_command_batch_for_current_process()?;
+        let isolation_deadline = Instant::now()
+            .checked_add(NATIVE_ISOLATION_TIMEOUT)
+            .ok_or_else(|| codex_isolation_error("inventory_deadline_invalid"))?;
+        verified_computer_use_app_server_with_commands(&runtime, commands, isolation_deadline)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let runtime = crate::codex_install::admit_managed_codex_for_current_process()?;
+        verified_app_server_command(&runtime)
+    }
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn verified_app_server_command(
     runtime: &crate::codex_install::VerifiedCodexRuntime,
 ) -> Result<VerifiedComputerUseAppServer, SatelleError> {
     verified_computer_use_app_server(runtime)
 }
 
+#[cfg(target_os = "macos")]
 fn verified_computer_use_app_server(
     runtime: &crate::codex_install::VerifiedCodexRuntime,
 ) -> Result<VerifiedComputerUseAppServer, SatelleError> {
     let isolation_deadline = Instant::now()
         .checked_add(NATIVE_ISOLATION_TIMEOUT)
         .ok_or_else(|| codex_isolation_error("inventory_deadline_invalid"))?;
-    let computer_use_codex_home = runtime.codex_home();
     let [plugin_command, mcp_command, app_server_command] =
         computer_use_runtime_commands(runtime, isolation_deadline)?;
+    verified_computer_use_app_server_with_commands(
+        runtime,
+        [plugin_command, mcp_command, app_server_command],
+        isolation_deadline,
+    )
+}
+
+fn verified_computer_use_app_server_with_commands(
+    runtime: &crate::codex_install::VerifiedCodexRuntime,
+    [plugin_command, mcp_command, app_server_command]: [Command; 3],
+    isolation_deadline: Instant,
+) -> Result<VerifiedComputerUseAppServer, SatelleError> {
+    let computer_use_codex_home = runtime.codex_home();
     let (mut isolation, trusted_native_bridge_root, isolation_deadline) =
         configured_codex_isolation(
             computer_use_codex_home,
@@ -1192,27 +1218,19 @@ fn mark_provision_changed(mut error: SatelleError, changed: bool) -> SatelleErro
     error
 }
 
+#[cfg(target_os = "macos")]
 fn computer_use_runtime_commands<const COUNT: usize>(
     runtime: &crate::codex_install::VerifiedCodexRuntime,
     deadline: Instant,
 ) -> Result<[Command; COUNT], SatelleError> {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = runtime;
-        // The signed macOS Computer Use service authenticates the node_repl
-        // process and its Codex ancestor as one desktop release family. A
-        // separately installed standalone Codex binary is signed by OpenAI,
-        // but the service rejects that mixed ancestry before the first ping.
-        let binary = authenticate_macos_codex_app(deadline)?;
-        Ok(std::array::from_fn(|_| {
-            macos_codex_app_command(&binary, runtime.codex_home())
-        }))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = deadline;
-        runtime.commands()
-    }
+    // The signed macOS Computer Use service authenticates the node_repl
+    // process and its Codex ancestor as one desktop release family. A
+    // separately installed standalone Codex binary is signed by OpenAI,
+    // but the service rejects that mixed ancestry before the first ping.
+    let binary = authenticate_macos_codex_app(deadline)?;
+    Ok(std::array::from_fn(|_| {
+        macos_codex_app_command(&binary, runtime.codex_home())
+    }))
 }
 
 pub(super) fn bounded_inventory_command_output(
