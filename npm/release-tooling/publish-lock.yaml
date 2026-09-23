@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle-cli:\n    type: patch\n---\n\n## Windows bootstrap maintenance and slow-daemon startup\n\nAdmit the managed-setup action shapes in bootstrap maintenance so full setup\nno longer fails at maintenance begin. Report bootstrap-busy when the Windows\nlock holder exits with the busy code, and wait out the daemon's own readiness\nbudgets before declaring a slow Windows daemon unreachable.\n"
-    filename: 2026-09-11-windows-bootstrap-maintenance.md
+  - content: "---\npackages:\n  cargo:satelle-cli:\n    type: patch\n---\n\n## Native readiness and durable recovery\n\nMake Windows native readiness checks and managed Codex startup tolerate slow\nversion probes, transient failures, and stale Computer Use plugin sources.\nRecover admitted operations after transport loss, preserve failure classes,\nand allow offline reset of abandoned operation metadata.\n"
+    filename: 2026-09-23-native-readiness-recovery.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - 2026-09-11-windows-bootstrap-maintenance.md
+      - 2026-09-23-native-readiness-recovery.md
     id: cargo:satelle-cli
     updated: true
   - id: cargo:satelle-core
