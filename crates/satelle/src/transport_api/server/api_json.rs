@@ -6,7 +6,7 @@ use axum::extract::{FromRequest, Request};
 use axum::http::HeaderMap;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
-use http_body_util::{BodyExt as _, LengthLimitError, Limited};
+use http_body_util::BodyExt as _;
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
@@ -146,23 +146,54 @@ pub(super) enum BoundedBodyError {
 }
 
 /// Collects data and trailers together so security checks cannot lose fields
-/// that arrive after the final body chunk.
+/// that arrive after the final body chunk. After crossing the accepted limit,
+/// discard at most one additional limit of data so a finite client upload can
+/// finish and receive the typed rejection without growing retained memory.
 pub(super) async fn read_bounded_body(
-    body: Body,
+    mut body: Body,
     limit: usize,
 ) -> Result<BoundedBody, BoundedBodyError> {
-    let collected = Limited::new(body, limit).collect().await.map_err(|error| {
-        if error.downcast_ref::<LengthLimitError>().is_some() {
-            BoundedBodyError::TooLarge
-        } else {
-            BoundedBodyError::Read
+    let drain_limit = limit.saturating_mul(2);
+    let mut bytes = Vec::with_capacity(limit);
+    let mut trailers = None;
+    let mut received = 0_usize;
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| {
+            if received > limit {
+                BoundedBodyError::TooLarge
+            } else {
+                BoundedBodyError::Read
+            }
+        })?;
+        match frame.into_data() {
+            Ok(data) => {
+                received = received
+                    .checked_add(data.len())
+                    .ok_or(BoundedBodyError::TooLarge)?;
+                if received > drain_limit {
+                    return Err(BoundedBodyError::TooLarge);
+                }
+                if received <= limit {
+                    bytes.extend_from_slice(&data);
+                }
+            }
+            Err(frame) => {
+                if let Ok(received_trailers) = frame.into_trailers() {
+                    trailers = Some(received_trailers);
+                }
+            }
         }
-    })?;
-    let trailers = collected.trailers().cloned();
-    Ok(BoundedBody {
-        bytes: collected.to_bytes(),
-        trailers,
-    })
+    }
+
+    if received > limit {
+        Err(BoundedBodyError::TooLarge)
+    } else {
+        Ok(BoundedBody {
+            bytes: Bytes::from(bytes),
+            trailers,
+        })
+    }
 }
 
 /// Parses JSON without losing an earlier value behind a duplicate object key.
@@ -336,4 +367,23 @@ fn internal_context_error() -> Response {
             details: None,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::stream;
+
+    #[tokio::test]
+    async fn post_limit_body_error_preserves_the_size_failure() {
+        let body = Body::from_stream(stream::iter([
+            Ok(Bytes::from_static(b"over")),
+            Err(std::io::Error::other("client disconnected")),
+        ]));
+
+        assert!(matches!(
+            read_bounded_body(body, 3).await,
+            Err(BoundedBodyError::TooLarge)
+        ));
+    }
 }

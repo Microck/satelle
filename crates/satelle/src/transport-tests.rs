@@ -4548,6 +4548,16 @@ fn injected_interrupt_after_local_run_admission_confirms_stop_before_exit_130() 
     assert_eq!(failure.phase(), TurnAdmissionPhase::Admitted);
     assert_eq!(failure.error().code, ErrorCode::Interrupted);
     assert_eq!(failure.error().exit_code(), 130);
+    assert_eq!(failure.events()[0].event_type(), EventType::ActionRequired);
+    assert_eq!(
+        failure
+            .events()
+            .iter()
+            .filter(|event| event.event_type() == EventType::ActionRequired)
+            .count(),
+        1,
+        "interruption must retain the published event exactly once"
+    );
     assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 1);
     let (session_id, _) = failure
         .durable_handles()

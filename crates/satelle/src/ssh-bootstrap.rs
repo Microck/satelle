@@ -714,6 +714,7 @@ impl SshBootstrapLock {
         #[cfg(all(test, unix))]
         if self.lose_next_mutation_start_response {
             self.lose_next_mutation_start_response = false;
+            self.exchange_failed.store(true, Ordering::SeqCst);
             return Err(SshBootstrapError::BootstrapLockLost);
         }
         exchange?;
@@ -832,6 +833,9 @@ impl SshBootstrapLock {
     }
 
     fn exchange_lock_line(&mut self, challenge: String) -> Result<(), SshBootstrapError> {
+        if self.exchange_failed.load(Ordering::SeqCst) {
+            return Err(SshBootstrapError::BootstrapLockLost);
+        }
         if self
             .child
             .try_wait()
@@ -858,18 +862,24 @@ impl SshBootstrapLock {
             .lock()
             .map_err(|_| SshBootstrapError::BootstrapLockLost)?;
         let stdin = stdin.as_mut().ok_or(SshBootstrapError::BootstrapLockLost)?;
-        writeln!(stdin, "{challenge}")
-            .and_then(|()| stdin.flush())
-            .map_err(SshBootstrapError::BootstrapLockProtocol)?;
-        match self.response_receiver.recv_timeout(PROCESS_TIMEOUT) {
-            Ok(response) if response == challenge => {
-                #[cfg(all(test, unix))]
-                self.exchanged_lock_lines.push(challenge);
-                Ok(())
+        let result = (|| {
+            writeln!(stdin, "{challenge}")
+                .and_then(|()| stdin.flush())
+                .map_err(SshBootstrapError::BootstrapLockProtocol)?;
+            match self.response_receiver.recv_timeout(PROCESS_TIMEOUT) {
+                Ok(response) if response == challenge => {
+                    #[cfg(all(test, unix))]
+                    self.exchanged_lock_lines.push(challenge);
+                    Ok(())
+                }
+                Ok(_) => Err(SshBootstrapError::InvalidBootstrapLockResponse),
+                Err(_) => Err(SshBootstrapError::BootstrapLockLost),
             }
-            Ok(_) => Err(SshBootstrapError::InvalidBootstrapLockResponse),
-            Err(_) => Err(SshBootstrapError::BootstrapLockLost),
+        })();
+        if result.is_err() {
+            self.exchange_failed.store(true, Ordering::SeqCst);
         }
+        result
     }
 }
 

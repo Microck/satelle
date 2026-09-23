@@ -133,9 +133,9 @@ fn main() {
         let request = receive(&mut input, &log);
         assert!(request.contains(r#""method":"thread/read""#));
         assert!(request.contains(r#""threadId":"thread-1""#));
-        assert!(request.contains(r#""includeTurns":true"#));
+        assert!(request.contains(r#""includeTurns":false"#));
         let status = scenario.strip_prefix("read-").unwrap();
-        send(&mut output, &format!(r#"{{"id":2,"result":{{"thread":{{"id":"thread-1","turns":[{{"id":"turn-1","status":"{status}"}}]}}}}}}"#));
+        send(&mut output, &format!(r#"{{"id":2,"result":{{"thread":{{"id":"thread-1","status":{{"type":"{status}"}},"turns":[]}}}}}}"#));
         hang();
     }
     let thread_request = receive(&mut input, &log);
@@ -1663,12 +1663,12 @@ fn native_action_completion_requests_correlated_upstream_cancellation() {
 }
 
 #[test]
-fn restart_observation_reads_only_the_matching_persisted_turn() {
+fn restart_observation_uses_the_persisted_threads_active_runtime_status() {
     for (status, expected) in [
-        ("inProgress", CodexTurnStatus::InProgress),
-        ("completed", CodexTurnStatus::Completed),
-        ("interrupted", CodexTurnStatus::Interrupted),
-        ("failed", CodexTurnStatus::Failed),
+        ("active", CodexThreadStatus::Active),
+        ("notLoaded", CodexThreadStatus::Inactive),
+        ("idle", CodexThreadStatus::Inactive),
+        ("systemError", CodexThreadStatus::Inactive),
     ] {
         let fixture = compile_fixture();
         let directory = tempfile::tempdir().expect("read scenario directory");
@@ -1694,7 +1694,6 @@ fn restart_observation_reads_only_the_matching_persisted_turn() {
             CodexTurnReadRequest {
                 working_directory: directory.path(),
                 thread_ref: "thread-1",
-                turn_ref: "turn-1",
                 deadline: Instant::now() + Duration::from_secs(3),
             },
         );

@@ -10168,9 +10168,17 @@ fn read_local_daemon_endpoint(path: &Path) -> Result<LocalDaemonEndpoint, Satell
 fn optional_local_daemon_endpoint(
     path: &Path,
 ) -> Result<Option<LocalDaemonEndpoint>, SatelleError> {
-    let Some(encoded) = satelle::core::read_optional_owner_only_secret_config_file(path)
-        .map_err(|error| local_daemon_artifact_error(path, error))?
-    else {
+    let encoded = match satelle::core::read_optional_owner_only_secret_config_file(path) {
+        Ok(encoded) => encoded,
+        // The Host can remove its endpoint between the metadata check and read.
+        // Only a path now proven absent is safe to treat as no endpoint.
+        Err(_) if matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(local_daemon_artifact_error(path, error)),
+    };
+    let Some(encoded) = encoded else {
         return Ok(None);
     };
     let endpoint = serde_json::from_str::<LocalDaemonEndpoint>(&encoded)

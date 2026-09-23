@@ -1136,12 +1136,17 @@ mod bootstrap_maintenance_tests {
             "reset-host-store",
         )
         .expect("record verified reset failure");
-        let failed = HostService::production_for_offline_storage(failed_state.path())
-            .load_setup_run("storage-reset-ledger-failure")
-            .expect("load failed reset ledger")
-            .expect("failed reset ledger exists");
-        assert_eq!(SetupRunStatus::Failed, failed.status());
-        assert_eq!(SetupActionStatus::Failed, failed.actions()[0].status());
+        assert!(
+            !failed_state.path().join("satelle.sqlite3").exists(),
+            "a failed reset must not open the discarded ledger"
+        );
+        HostService::start_offline_storage_maintenance(
+            failed_state.path(),
+            "storage-reset-after-failure",
+            "reset-host-store",
+            "Reset Host metadata",
+        )
+        .expect("a terminal failure handoff permits a new authorized reset");
     }
 
     #[test]
@@ -1159,15 +1164,11 @@ mod bootstrap_maintenance_tests {
             ),
         ] {
             let state = TestStateDir::new().expect("create corrupt storage state");
+            let (store, _) = storage::Storage::open(state.path()).expect("create private store");
+            drop(store);
             let database = state.path().join("satelle.sqlite3");
             std::fs::write(&database, b"not a SQLite database")
                 .expect("write corrupt database fixture");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
-                    .expect("keep the corrupt fixture owner-only");
-            }
 
             HostService::start_offline_storage_maintenance(
                 state.path(),
@@ -1190,15 +1191,13 @@ mod bootstrap_maintenance_tests {
     #[test]
     fn corrupt_store_reset_imports_the_handoff_into_the_new_sqlite_ledger() {
         let state = TestStateDir::new().expect("create corrupt reset state");
+        // Corrupt an existing private store so reset exercises content recovery
+        // without relying on a normal database open to repair the fixture ACL.
+        let (store, _) = storage::Storage::open(state.path()).expect("create private store");
+        drop(store);
         let database = state.path().join("satelle.sqlite3");
         std::fs::write(&database, b"not a SQLite database")
             .expect("write corrupt database fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
-                .expect("keep the corrupt fixture owner-only");
-        }
         let operation_id = "corrupt-store-reset-completion";
         HostService::start_offline_storage_maintenance(
             state.path(),
@@ -1233,6 +1232,68 @@ mod bootstrap_maintenance_tests {
                 .exists(),
             "SQLite is authoritative after the handoff is imported"
         );
+    }
+
+    #[test]
+    fn offline_reset_replaces_an_abandoned_native_probe_lease() {
+        let state = TestStateDir::new().expect("create abandoned probe store");
+        let (store, _) = storage::Storage::open(state.path()).expect("open store");
+        let host = store.host_identity().expect("load host identity");
+        store
+            .connection_for_test()
+            .execute(
+                "INSERT INTO control_leases (
+                host_identity_ref, desktop_binding_ref, operation_id,
+                owner_process_id, owner_process_start_ref, owner_boot_identity_ref,
+                acquired_at, heartbeat_at, lease_state, owner_kind, native_probe_ref
+             ) VALUES (?1, 'desktop-native', 'probe-operation', 1, 'old-process',
+                       'old-boot', ?2, ?2, 'recovery_pending', 'native_probe', 'probe-ref')",
+                rusqlite::params![host.as_str(), "2026-07-16T00:00:00Z"],
+            )
+            .expect("persist an abandoned native probe lease");
+        drop(store);
+
+        HostService::start_offline_storage_maintenance(
+            state.path(),
+            "failed-reset",
+            "reset-host-store",
+            "Reset Host metadata",
+        )
+        .expect("record reset while the abandoned lease remains");
+        HostService::record_failed_offline_storage_maintenance(
+            state.path(),
+            "failed-reset",
+            "reset-host-store",
+        )
+        .expect("retain reset failure without acquiring the abandoned lease");
+
+        let operation_id = "reset-abandoned-probe";
+        HostService::start_offline_storage_maintenance(
+            state.path(),
+            operation_id,
+            "reset-host-store",
+            "Reset Host metadata",
+        )
+        .expect("record reset independently of abandoned database leases");
+        HostService::reset_store_metadata_offline(
+            state.path(),
+            false,
+            "satelle host store reset --no-input --yes",
+        )
+        .expect("reset the offline store");
+        HostService::record_completed_offline_storage_maintenance(
+            state.path(),
+            operation_id,
+            "reset-host-store",
+            "Reset Host metadata",
+        )
+        .expect("import completion into the replacement store");
+        let service = HostService::production_for_offline_storage(state.path());
+        let completed = service
+            .load_setup_run(operation_id)
+            .expect("load reset record")
+            .expect("reset was recorded");
+        assert_eq!(SetupRunStatus::Completed, completed.status());
     }
 
     #[test]
@@ -1302,6 +1363,13 @@ mod bootstrap_maintenance_tests {
         let recording = recordings.join("recording.webm");
         std::fs::write(&recording, b"recording").expect("write recording fixture");
 
+        HostService::start_offline_storage_maintenance(
+            state.path(),
+            "reset-live-owner",
+            "reset-host-store",
+            "Reset Host metadata",
+        )
+        .expect("persist intent before checking mutation ownership");
         let error = HostService::reset_store_metadata_offline(
             state.path(),
             true,
@@ -2617,6 +2685,12 @@ impl HostService {
             started_at,
         )
         .map_err(runtime::storage_failure)?;
+        // Reset replaces the ledger, including abandoned leases. Its durable
+        // handoff owns the operation until the replacement store can record
+        // completion; the destructive step requires exclusive filesystem ownership.
+        if action_id == "reset-host-store" {
+            return Ok(());
+        }
         let service = Self::production_for_offline_storage(state_root);
         let ledger_start = (|| {
             let mut operation = service.begin_setup_run(&plan)?;
@@ -2627,7 +2701,7 @@ impl HostService {
         match ledger_start {
             Ok(()) => Ok(()),
             // The durable handoff record is authoritative only until the
-            // repaired or reset SQLite store can accept the canonical ledger
+            // repaired SQLite store can accept the canonical ledger
             // entry. Other conflicts still stop before filesystem mutation.
             Err(error) if error.code == crate::core::ErrorCode::StorageIntegrityFailed => Ok(()),
             Err(error) => {
@@ -2649,6 +2723,11 @@ impl HostService {
     ) -> Result<(), SatelleError> {
         storage::mark_offline_storage_maintenance_failed(state_root, operation_id, action_id)
             .map_err(runtime::storage_failure)?;
+        // A failed reset retains its terminal handoff without admitting work
+        // into the database it could not replace.
+        if action_id == "reset-host-store" {
+            return Ok(());
+        }
         let service = Self::production_for_offline_storage(state_root);
         let existing = service
             .load_setup_run(operation_id)?

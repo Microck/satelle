@@ -135,17 +135,14 @@ pub(crate) struct TimedCodexSessionRun {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CodexTurnStatus {
-    InProgress,
-    Completed,
-    Interrupted,
-    Failed,
+pub(crate) enum CodexThreadStatus {
+    Active,
+    Inactive,
 }
 
 pub(crate) struct CodexTurnReadRequest<'a> {
     pub(crate) working_directory: &'a Path,
     pub(crate) thread_ref: &'a str,
-    pub(crate) turn_ref: &'a str,
     pub(crate) deadline: Instant,
 }
 
@@ -535,17 +532,13 @@ fn run_timed_codex_session(
 pub(crate) fn read_codex_turn(
     command: Command,
     request: CodexTurnReadRequest<'_>,
-) -> Result<CodexTurnStatus, CodexSessionFailure> {
+) -> Result<CodexThreadStatus, CodexSessionFailure> {
     if Instant::now() >= request.deadline {
         return Err(CodexSessionFailure::before_turn_dispatch(
             CodexSessionError::Timeout,
         ));
     }
-    let mut exchange = codex_turn_read::TurnReadExchange::new(
-        request.thread_ref,
-        request.turn_ref,
-        request.deadline,
-    );
+    let mut exchange = codex_turn_read::TurnReadExchange::new(request.thread_ref, request.deadline);
     run_exchange(
         command.into(),
         request.working_directory,

@@ -28,10 +28,6 @@ const BASELINE_CODEX_VERSION: &str = "0.144.0";
 const BASELINE_CODEX_RELEASE_TAG: &str = "rust-v0.144.0";
 const BASELINE_CHECKSUMS_SHA256: &str =
     "b651a02c474412bfc47707d3b12597f67ebaaf40665d81fe26a77488410302c1";
-// The first launch of a freshly extracted Codex binary can include Windows
-// Defender inspection. Keep the install probe bounded while allowing that
-// cold start to complete on a slower guest.
-const MANAGED_INSTALL_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CHECKSUMS_BYTES: u64 = 64 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
@@ -136,6 +132,7 @@ impl VerifiedCodexRuntime {
 
     /// Verifies the immutable runtime once immediately before constructing an
     /// atomic batch of child commands that belong to the same probe.
+    #[cfg(any(windows, test))]
     pub(crate) fn commands<const COUNT: usize>(&self) -> Result<[Command; COUNT], SatelleError> {
         verify_runtime_identity(
             &self.codex_home,
@@ -143,11 +140,15 @@ impl VerifiedCodexRuntime {
             &self.binary_path,
             &self.binary_sha256,
         )?;
-        Ok(std::array::from_fn(|_| {
+        Ok(self.command_batch())
+    }
+
+    fn command_batch<const COUNT: usize>(&self) -> [Command; COUNT] {
+        std::array::from_fn(|_| {
             let mut command = Command::new(&self.binary_path);
             command.env("CODEX_HOME", &self.codex_home);
             command
-        }))
+        })
     }
 }
 
@@ -169,6 +170,25 @@ pub(crate) fn admit_managed_codex_for_current_process() -> Result<VerifiedCodexR
         std::env::current_dir().map_err(|_| invalid_receipt("current_directory_unavailable"))?;
     let paths = resolve_path_set(&current_directory)?;
     admit_managed_codex(&paths)
+}
+
+/// Admits the current managed runtime and constructs one atomic child-command
+/// batch from that fresh verification. Retained runtimes must use `commands`
+/// so they recheck identity immediately before a later batch.
+pub(crate) fn admit_managed_codex_command_batch_for_current_process<const COUNT: usize>()
+-> Result<[Command; COUNT], SatelleError> {
+    let (_, commands) = admit_managed_codex_with_command_batch_for_current_process()?;
+    Ok(commands)
+}
+
+/// Keeps the freshly admitted runtime with its atomic command batch when the
+/// caller also needs receipt-recorded paths. This avoids hashing the immutable
+/// runtime again before the first commands created from that admission.
+pub(crate) fn admit_managed_codex_with_command_batch_for_current_process<const COUNT: usize>()
+-> Result<(VerifiedCodexRuntime, [Command; COUNT]), SatelleError> {
+    let runtime = admit_managed_codex_for_current_process()?;
+    let commands = runtime.command_batch();
+    Ok((runtime, commands))
 }
 
 fn managed_codex_home(user_home: Option<&Path>) -> Result<PathBuf, SatelleError> {
@@ -733,7 +753,7 @@ fn verify_installed_version(binary_path: &Path, codex_home: &Path) -> Result<(),
             .expect("the pinned baseline Codex version is valid");
     let evidence = crate::host::codex_capabilities::probe_codex_version_command(
         command,
-        MANAGED_INSTALL_VERSION_PROBE_TIMEOUT,
+        crate::host::codex_capabilities::VERSION_PROBE_TIMEOUT,
     );
     if !matches!(
         evidence,
@@ -915,6 +935,7 @@ fn verify_binary_identity(
     Ok(binary_path)
 }
 
+#[cfg(any(windows, test))]
 fn verify_runtime_identity(
     codex_home: &Path,
     package_root: &Path,
