@@ -16,7 +16,8 @@ jobs:
   npm:
     name: npm distribution (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    # macOS package-manager probes can exceed ten minutes on cold runners.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

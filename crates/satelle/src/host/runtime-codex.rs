@@ -366,7 +366,7 @@ pub(crate) fn installed_read_only_app_server_command(
         crate::host::codex_install::admit_managed_codex_command_batch_for_current_process()?;
     #[cfg(target_os = "macos")]
     let [mcp_command, app_server_command] = {
-        let runtime = crate::codex_install::admit_managed_codex_for_current_process()?;
+        let runtime = crate::host::codex_install::admit_managed_codex_for_current_process()?;
         computer_use_runtime_commands(&runtime, deadline)?
     };
     read_only_app_server_command(mcp_command, app_server_command, deadline)
@@ -407,7 +407,7 @@ pub(crate) fn installed_computer_use_app_server()
     }
     #[cfg(target_os = "macos")]
     {
-        let runtime = crate::codex_install::admit_managed_codex_for_current_process()?;
+        let runtime = crate::host::codex_install::admit_managed_codex_for_current_process()?;
         verified_app_server_command(&runtime)
     }
 }

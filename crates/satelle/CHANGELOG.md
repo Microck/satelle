@@ -1,3 +1,13 @@
+## satelle@0.1.12
+
+### Native readiness and durable recovery
+
+Make Windows native readiness checks and managed Codex startup tolerate slow
+version probes, transient failures, and stale Computer Use plugin sources.
+
+Recover admitted operations after transport loss, preserve failure classes,
+and allow offline reset of abandoned operation metadata.
+
 ## satelle@0.1.11
 
 ### Windows bootstrap maintenance and slow-daemon startup
