@@ -1,0 +1,5307 @@
+use super::adapter::{
+    AdapterPreflight, AdapterReadiness, AdapterSubject, ComputerUseAdapter, EvidenceError,
+    ExecuteRequest, ExecuteResult, NativeProbeResult, NativeReadinessCheck,
+    NativeReadinessCheckKind, NativeReadinessCheckStatus, ProviderComputerUseIntent,
+    ProviderSmokeEvidence, ProviderSmokeFailureEvidence, ProviderSmokeResult, ProviderSmokeSource,
+    ReadinessCacheKey, ReadinessEvidence, ReadinessObservationState, ReadinessProbeDriver,
+    ReadinessSource, RecoveryObservation,
+};
+use crate::core::session::{
+    ApprovalPolicy, DesktopBindingRef, DesktopTarget, EffectiveModelRef, ExecutionPolicy,
+    ExperimentalFeatureChoices, FeatureChoice, ProviderBindingRef, SandboxPolicy,
+    SessionStateRevision, StopObservation, TimeoutPolicy, TurnExecutionMode, TurnState,
+    TurnStateRevision, TurnTransition,
+};
+use crate::core::{
+    ControlPlaneOperation, DesktopSelectionPolicy, ErrorCode, EventSource, EventSubject, EventType,
+    ProviderBindingAuthorization, ProviderBindingSource, ResolvedProviderBinding, SatelleError,
+    SatelleEventBody, SessionId, TurnId, resolve_desktop_session_for,
+};
+use crate::host::codex_session::{
+    CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
+    CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexThreadStatus,
+    CodexTurnReadRequest, TimedCodexSessionRun, read_codex_turn,
+    run_codex_session_with_native_action_completion, run_codex_session_with_timeout_cancellation,
+};
+use crate::host::provider_auth::{
+    ProviderAuthResolutionError, ProviderSmokeCredentialFingerprinter, ResolvedProviderSecret,
+    resolve_provider_secret,
+};
+use crate::host::{DEFAULT_MODEL_BINDING, DEFAULT_PROVIDER_BINDING, READINESS_CANCELLATION_GRACE};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::process::Command;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use time::format_description::well_known::Rfc3339;
+
+const NATIVE_ADAPTER: &str = "codex-native-computer-use";
+const PROVIDER_CHILD_ID: &str = "satelle_runtime";
+const DEFAULT_PROVIDER_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(60);
+// Recovery can release ownership only after a conclusive upstream read. Give
+// the managed app-server the same cold-start budget as blocking resolution.
+const PERSISTED_TURN_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn native_approval_event(
+    host: &str,
+    session_id: &SessionId,
+    turn_id: &TurnId,
+    session_state_revision: SessionStateRevision,
+    turn_state_revision: TurnStateRevision,
+) -> SatelleEventBody {
+    SatelleEventBody::new(
+        EventType::ActionRequired,
+        EventSource::CodexAdapter,
+        time::OffsetDateTime::now_utc(),
+        host,
+        Some(EventSubject::Turn {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            session_state_revision,
+            turn_state_revision,
+        }),
+        "native Codex approval requires manual action",
+        json!({
+            "kind": "native_codex_approval",
+            "status": "manual_action_required",
+            "decision": "declined",
+        }),
+    )
+    .expect("normalized native approval state produces a valid safe event")
+}
+
+#[derive(Debug)]
+struct ProviderSmokeAttemptFailure {
+    evidence: Option<ProviderSmokeFailureEvidence>,
+    error: Box<SatelleError>,
+}
+
+struct NativeSmokeFailure {
+    reason: &'static str,
+    error: Box<SatelleError>,
+    dispatch_possible: bool,
+}
+
+struct ProviderProbePersistence<'a> {
+    host: &'a str,
+    cancellation: Option<&'a super::request::AdmissionCancellation>,
+    persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
+    persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
+    provider_secret: Option<ResolvedProviderSecret>,
+}
+
+struct ProviderPreflightContext<'a> {
+    cached_provider: Option<ProviderSmokeResult>,
+    provider_intent: &'a ProviderComputerUseIntent,
+    allowed_app_ids: &'a BTreeSet<String>,
+}
+
+struct ProviderSmokeInvocation<'a> {
+    key: &'a ReadinessCacheKey,
+    binding: &'a ResolvedProviderBinding,
+    allowed_app_ids: &'a BTreeSet<String>,
+    provider_secret: Option<ResolvedProviderSecret>,
+    provider_credential_fingerprint: &'a str,
+    source: ProviderSmokeSource,
+    timeout_override: Option<Duration>,
+}
+
+#[derive(Debug)]
+struct PreparedProviderAdmission {
+    evidence: Option<ProviderSmokeEvidence>,
+    provider_secret: Option<ResolvedProviderSecret>,
+}
+
+fn supported_execution_version(
+    snapshot: &crate::host::ProductionCapabilitySnapshot,
+) -> Result<crate::host::codex_capabilities::CodexVersion, SatelleError> {
+    let version = match snapshot.evidence.codex_version {
+        crate::host::codex_capabilities::CodexVersionEvidence::Detected { version }
+            if crate::host::codex_capabilities::supports_codex_version(version) =>
+        {
+            version
+        }
+        _ => return Err(crate::host::execution_blocker(&snapshot.verdict)),
+    };
+    if !snapshot
+        .evidence
+        .host_platform
+        .supports_native_computer_use()
+    {
+        return Err(crate::host::execution_blocker(&snapshot.verdict));
+    }
+    // The operation-specific control-plane gate runs before this check, and
+    // RuntimeEngine::preflight owns the exact live Host readiness key. Requiring
+    // the aggregate Phase 0 verdict here would make the first live probe
+    // impossible because that verdict intentionally starts with live proof
+    // unobserved.
+    Ok(version)
+}
+
+/// The production adapter owns the private Codex app-server boundary. Native
+/// execution remains gated by preflight evidence; no caller can reach execute
+/// merely because the protocol session itself is implemented.
+#[derive(Clone)]
+pub(crate) struct ProductionComputerUseAdapter {
+    snapshot: Arc<RwLock<crate::host::ProductionCapabilitySnapshot>>,
+    working_directory: Result<PathBuf, SatelleError>,
+    active_executions: Arc<Mutex<BTreeMap<String, ActiveCodexExecution>>>,
+    native_readiness_timeout: Duration,
+    native_readiness_ttl: time::Duration,
+    provider_smoke_timeout: Duration,
+    provider_smoke_success_ttl: time::Duration,
+    provider_smoke_failure_ttl: time::Duration,
+    desktop_bindings: BTreeMap<String, DesktopSelectionPolicy>,
+    provider_smoke_fingerprinter: ProviderSmokeCredentialFingerprinter,
+}
+
+pub(crate) struct ProductionAdapterPolicy {
+    pub(crate) native_readiness_timeout: Duration,
+    pub(crate) native_readiness_ttl: time::Duration,
+    pub(crate) provider_smoke_timeout: Duration,
+    pub(crate) provider_smoke_success_ttl: time::Duration,
+    pub(crate) provider_smoke_failure_ttl: time::Duration,
+    pub(crate) desktop_bindings: BTreeMap<String, DesktopSelectionPolicy>,
+}
+
+#[derive(Clone)]
+struct ActiveCodexExecution {
+    session_id: crate::core::SessionId,
+    turn_id: crate::core::TurnId,
+    control: CodexSessionControl,
+}
+
+struct ActiveExecutionGuard {
+    registry: Arc<Mutex<BTreeMap<String, ActiveCodexExecution>>>,
+    desktop_binding: String,
+    session_id: crate::core::SessionId,
+    turn_id: crate::core::TurnId,
+}
+
+impl Drop for ActiveExecutionGuard {
+    fn drop(&mut self) {
+        let Ok(mut active) = self.registry.lock() else {
+            return;
+        };
+        if active.get(&self.desktop_binding).is_some_and(|execution| {
+            execution.session_id == self.session_id && execution.turn_id == self.turn_id
+        }) {
+            active.remove(&self.desktop_binding);
+        }
+    }
+}
+
+impl ProductionComputerUseAdapter {
+    #[cfg(test)]
+    pub(crate) fn new(
+        snapshot: Arc<RwLock<crate::host::ProductionCapabilitySnapshot>>,
+        working_directory: Result<PathBuf, SatelleError>,
+    ) -> Self {
+        Self {
+            snapshot,
+            working_directory,
+            active_executions: Arc::new(Mutex::new(BTreeMap::new())),
+            native_readiness_timeout: crate::host::DEFAULT_NATIVE_READINESS_TIMEOUT,
+            native_readiness_ttl: crate::host::DEFAULT_NATIVE_READINESS_TTL,
+            provider_smoke_timeout: Duration::from_secs(120),
+            provider_smoke_success_ttl: crate::host::DEFAULT_PROVIDER_SMOKE_SUCCESS_TTL,
+            provider_smoke_failure_ttl: crate::host::DEFAULT_PROVIDER_SMOKE_FAILURE_TTL,
+            desktop_bindings: BTreeMap::from([(
+                "local-demo-desktop-v1".to_string(),
+                DesktopSelectionPolicy {
+                    desktop_user: None,
+                    preference: None,
+                    native_selector: None,
+                },
+            )]),
+            provider_smoke_fingerprinter: ProviderSmokeCredentialFingerprinter::for_test(
+                [0x5a; 32],
+            ),
+        }
+    }
+
+    pub(crate) fn with_readiness_policy(
+        snapshot: Arc<RwLock<crate::host::ProductionCapabilitySnapshot>>,
+        working_directory: Result<PathBuf, SatelleError>,
+        policy: ProductionAdapterPolicy,
+    ) -> Self {
+        Self {
+            snapshot,
+            working_directory,
+            active_executions: Arc::new(Mutex::new(BTreeMap::new())),
+            native_readiness_timeout: policy.native_readiness_timeout,
+            native_readiness_ttl: policy.native_readiness_ttl,
+            provider_smoke_timeout: policy.provider_smoke_timeout,
+            provider_smoke_success_ttl: policy.provider_smoke_success_ttl,
+            provider_smoke_failure_ttl: policy.provider_smoke_failure_ttl,
+            desktop_bindings: policy.desktop_bindings,
+            provider_smoke_fingerprinter: ProviderSmokeCredentialFingerprinter::default(),
+        }
+    }
+
+    pub(crate) fn provider_smoke_fingerprinter(&self) -> ProviderSmokeCredentialFingerprinter {
+        self.provider_smoke_fingerprinter.clone()
+    }
+
+    fn provider_smoke_credential_fingerprint(
+        &self,
+        binding_digest: &str,
+        secret: Option<&ResolvedProviderSecret>,
+    ) -> Result<String, SatelleError> {
+        self.provider_smoke_fingerprinter
+            .fingerprint(binding_digest, secret)
+            .ok_or_else(|| adapter_failure("provider_smoke_hmac_key_unavailable"))
+    }
+
+    fn resolve_provider_binding(
+        &self,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ResolvedProviderBinding, SatelleError> {
+        let requested_pair = match (provider_intent.model(), provider_intent.provider()) {
+            (Some(model), Some(provider)) => Some((model.as_str(), provider.as_str())),
+            (None, None) => None,
+            _ => return Err(model_provider_binding_missing(provider_intent)),
+        };
+        let resolved = match requested_pair {
+            Some((model_alias, provider_alias)) => {
+                let Some(resolved) = provider_intent.resolved_provider_binding() else {
+                    return Err(model_provider_binding_missing(provider_intent));
+                };
+                if resolved.requested_model_alias() != model_alias
+                    || resolved.requested_provider_alias() != provider_alias
+                    || resolved.model().trim().is_empty()
+                    || resolved.model_provider().trim().is_empty()
+                    || !resolved.has_valid_binding_digest()
+                {
+                    return Err(model_provider_binding_missing(provider_intent));
+                }
+                resolved.clone()
+            }
+            None => {
+                let deadline = Instant::now()
+                    .checked_add(DEFAULT_PROVIDER_RESOLUTION_TIMEOUT)
+                    .ok_or_else(codex_effective_defaults_unavailable)?;
+                let app_server =
+                    crate::host::codex_capabilities::installed_read_only_app_server_command(
+                        deadline,
+                    )?;
+                let defaults =
+                    crate::host::codex_capabilities::probe_effective_codex_defaults(app_server)
+                        .map_err(|_| codex_effective_defaults_unavailable())?;
+                ResolvedProviderBinding::from_authorization(
+                    ProviderBindingAuthorization::new(
+                        DEFAULT_MODEL_BINDING,
+                        DEFAULT_PROVIDER_BINDING,
+                        defaults.model(),
+                        defaults.model_provider(),
+                    ),
+                    ProviderBindingSource::HostOwned,
+                )
+                .with_value_origins(
+                    defaults.model_origin().provider_value_origin(),
+                    defaults.model_provider_origin().provider_value_origin(),
+                )
+            }
+        };
+        let experimental_provider_computer_use = resolved.experimental_provider_computer_use()
+            || provider_intent.experimental_provider_computer_use();
+        let resolved =
+            resolved.with_experimental_provider_computer_use(experimental_provider_computer_use);
+        self.require_experimental_provider_opt_in(&resolved)?;
+        Ok(resolved)
+    }
+
+    fn require_experimental_provider_opt_in(
+        &self,
+        binding: &ResolvedProviderBinding,
+    ) -> Result<(), SatelleError> {
+        if (binding.model_provider().eq_ignore_ascii_case("openai") && binding.endpoint().is_none())
+            || binding.experimental_provider_computer_use()
+        {
+            return Ok(());
+        }
+        Err(experimental_provider_opt_in_required(binding))
+    }
+
+    fn native_readiness_key(
+        &self,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<(ReadinessCacheKey, ResolvedProviderBinding, BTreeSet<String>), SatelleError> {
+        let snapshot = crate::host::read_production_snapshot(&self.snapshot)?;
+        snapshot
+            .control_plane_admission
+            .admit(ControlPlaneOperation::Run)?;
+        let version = supported_execution_version(&snapshot)?;
+        let app_policy_surface = snapshot.evidence.capabilities.approval_observation.surface;
+        drop(snapshot);
+        let verified_app_server =
+            crate::host::codex_capabilities::installed_computer_use_app_server()?;
+        let plugin_version = verified_app_server.plugin_version().to_string();
+        let native_runtime_version = verified_app_server.native_runtime_version().to_string();
+
+        let (desktop_binding, desktop_selection) =
+            self.selected_desktop_binding(provider_intent)?;
+        let desktops = crate::host::desktop_sessions::discover()?;
+        let platform = crate::host::codex_capabilities::HostPlatform::current().as_str();
+        self.require_secure_desktop_handoff(&desktop_binding, desktop_selection)?;
+        let desktop = resolve_desktop_session_for(platform, &desktops, desktop_selection)?;
+        let allowed_app_ids =
+            crate::host::codex_capabilities::configured_computer_use_allowed_app_ids();
+        let observations = native_prerequisite_observations(
+            platform,
+            desktop,
+            app_policy_surface,
+            &allowed_app_ids,
+        );
+        let resolved_binding = self.resolve_provider_binding(provider_intent)?;
+        let effective_model = EffectiveModelRef::new(resolved_binding.model())
+            .map_err(|_| adapter_failure("model_binding_invalid"))?;
+        let provider_binding = ProviderBindingRef::new(resolved_binding.model_provider())
+            .map_err(|_| adapter_failure("provider_binding_invalid"))?;
+        let provider_smoke_required = provider_intent.model().is_some()
+            || provider_intent.provider().is_some()
+            || !resolved_binding
+                .model_provider()
+                .eq_ignore_ascii_case("openai")
+            || resolved_binding.endpoint().is_some();
+        let execution_policy = ExecutionPolicy::new(
+            effective_model,
+            provider_binding,
+            DesktopTarget::new(desktop_binding.clone(), desktop.session_id.clone()),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            host_turn_timeout_ceiling()?,
+            ExperimentalFeatureChoices::new(
+                FeatureChoice::Enabled,
+                if provider_smoke_required {
+                    FeatureChoice::Enabled
+                } else {
+                    FeatureChoice::Disabled
+                },
+            ),
+        );
+        let codex_version = version.to_string();
+        let key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            desktop_binding,
+            execution_policy,
+            codex_version,
+            native_runtime_version,
+            Some(plugin_version),
+            readiness_fingerprint(
+                "os-permission",
+                platform,
+                &desktop.session_id,
+                observations.os_permission_state,
+                &observations.os_fingerprint_material,
+            ),
+            readiness_fingerprint(
+                "app-approval",
+                platform,
+                &desktop.session_id,
+                observations.app_approval_state,
+                &observations.app_fingerprint_material,
+            ),
+            observations.os_permission_state,
+            observations.app_approval_state,
+        )
+        .map(|key| key.with_provider_binding(&resolved_binding))
+        .map_err(|_| adapter_failure("readiness_key_invalid"))?;
+        Ok((key, resolved_binding, allowed_app_ids))
+    }
+
+    fn readiness_from_evidence(
+        &self,
+        key: &ReadinessCacheKey,
+        binding: &ResolvedProviderBinding,
+        evidence: ReadinessEvidence,
+        persistence: &mut ProviderProbePersistence<'_>,
+        provider: ProviderPreflightContext<'_>,
+    ) -> AdapterPreflight {
+        let admitted_allowed_app_ids = provider.allowed_app_ids.to_owned();
+        match self.run_required_provider_smoke(key, binding, persistence, provider) {
+            Ok(prepared_provider) => {
+                let PreparedProviderAdmission {
+                    evidence: provider_smoke_evidence,
+                    provider_secret,
+                } = prepared_provider;
+                let source = evidence.source();
+                native_readiness_from_evidence(
+                    key,
+                    binding.clone(),
+                    evidence,
+                    admitted_allowed_app_ids,
+                    provider_smoke_evidence,
+                    source,
+                )
+                .map_err(|_| adapter_failure("readiness_evidence_invalid"))
+                .map(|readiness| readiness.with_resolved_provider_secret(provider_secret))
+                .map_or_else(AdapterPreflight::UncachedFailure, AdapterPreflight::Ready)
+            }
+            Err(failure) => {
+                let ProviderSmokeAttemptFailure {
+                    evidence: provider_failure_evidence,
+                    error,
+                } = *failure;
+                match provider_failure_evidence {
+                    Some(failure) => AdapterPreflight::ProviderFailed {
+                        key: key.clone(),
+                        readiness: evidence,
+                        failure,
+                        error: *error,
+                    },
+                    None => AdapterPreflight::UncachedFailure(*error),
+                }
+            }
+        }
+    }
+
+    fn live_native_preflight(
+        &self,
+        key: ReadinessCacheKey,
+        binding: ResolvedProviderBinding,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        persistence: &mut ProviderProbePersistence<'_>,
+        allowed_app_ids: &BTreeSet<String>,
+    ) -> AdapterPreflight {
+        let observed_at = time::OffsetDateTime::now_utc();
+        let Some(expires_at) = observed_at.checked_add(self.native_readiness_ttl) else {
+            return AdapterPreflight::UncachedFailure(adapter_failure("readiness_ttl_invalid"));
+        };
+        let evidence = match key.evidence(
+            format!("native-readiness-{}", crate::core::SessionId::new()),
+            observed_at,
+            expires_at,
+        ) {
+            Ok(evidence) => evidence,
+            Err(_) => {
+                return AdapterPreflight::UncachedFailure(adapter_failure(
+                    "readiness_evidence_invalid",
+                ));
+            }
+        };
+        if let Some(error) = native_observation_blocker(&key) {
+            return AdapterPreflight::Failed {
+                key,
+                evidence,
+                reason: "native_readiness_manual_action_required",
+                error,
+                dispatch_possible: false,
+            };
+        }
+        let mut persist_thread_ref = |_value: &str| Ok(());
+        let mut persist_turn_ref = |_value: &str| Ok(());
+        tracing::debug!(
+            adapter = NATIVE_ADAPTER,
+            "starting native Computer Use readiness smoke test"
+        );
+        match self.run_native_smoke(
+            persistence.cancellation,
+            &mut persist_thread_ref,
+            &mut persist_turn_ref,
+            allowed_app_ids,
+            &key,
+        ) {
+            Ok(()) => self.readiness_from_evidence(
+                &key,
+                &binding,
+                evidence,
+                persistence,
+                ProviderPreflightContext {
+                    cached_provider,
+                    provider_intent,
+                    allowed_app_ids,
+                },
+            ),
+            Err(failure) => AdapterPreflight::Failed {
+                key,
+                evidence,
+                reason: failure.reason,
+                error: mark_probe_dispatch_possible(*failure.error, failure.dispatch_possible),
+                dispatch_possible: failure.dispatch_possible,
+            },
+        }
+    }
+
+    fn run_native_smoke(
+        &self,
+        cancellation: Option<&super::request::AdmissionCancellation>,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        allowed_app_ids: &BTreeSet<String>,
+        key: &ReadinessCacheKey,
+    ) -> Result<(), NativeSmokeFailure> {
+        let deadline = cancellation
+            .and_then(super::request::AdmissionCancellation::deadline)
+            .map_or_else(
+                || Instant::now().checked_add(self.native_readiness_timeout),
+                Some,
+            )
+            .ok_or_else(|| native_smoke_failure("native_readiness_timeout_invalid"))?;
+        let runtime_paths = self
+            .working_directory
+            .as_ref()
+            .map_err(|_| native_smoke_failure("working_directory_unavailable"))
+            .and_then(|path| {
+                prepare_binding_runtime_paths(
+                    path,
+                    key.execution_policy().desktop_target().binding(),
+                )
+                .map_err(|_| native_smoke_failure("working_directory_unavailable"))
+            })?;
+        let verified_app_server =
+            crate::host::codex_capabilities::installed_computer_use_app_server().map_err(
+                |error| NativeSmokeFailure {
+                    reason: "managed_codex_receipt_invalid",
+                    error: Box::new(error),
+                    dispatch_possible: false,
+                },
+            )?;
+        if let Some(reason) = native_component_identity_error(
+            key.native_runtime_version(),
+            key.plugin_version(),
+            verified_app_server.native_runtime_version(),
+            verified_app_server.plugin_version(),
+        ) {
+            return Err(native_smoke_failure(reason));
+        }
+        let native_action_evidence = verified_app_server.native_action_evidence();
+        let target = NativeActionTarget::spawn(
+            deadline,
+            cancellation,
+            native_action_evidence.clone(),
+            key.execution_policy().desktop_target().session_id(),
+        )
+        .map_err(native_smoke_failure)?;
+        let prompt = native_readiness_prompt(
+            target.page_url(),
+            &verified_app_server.native_action_path,
+            allowed_app_ids,
+            &native_action_evidence,
+        )
+        .map_err(native_smoke_failure)?;
+        let expected_mcp_server_name = verified_app_server.native_mcp_server_name.clone();
+        let run = run_codex_session_with_native_action_completion(
+            command_for_binding(
+                verified_app_server.into_command(),
+                &runtime_paths.codex_home,
+            ),
+            CodexSessionRequest {
+                working_directory: &runtime_paths.working_directory,
+                prompt: &prompt,
+                existing_thread_ref: None,
+                model: None,
+                model_provider: None,
+                provider_endpoint: None,
+                provider_secret: None,
+                execution_mode: TurnExecutionMode::Standard,
+                approval_policy: CodexApprovalPolicy::OnRequest,
+                sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+                deadline,
+                persist_thread_ref,
+                persist_turn_ref,
+                observe_native_approval: None,
+                native_action_evidence: None,
+                expected_mcp_server_name: &expected_mcp_server_name,
+                computer_use_allowed_app_ids: allowed_app_ids,
+                control: None,
+                goal_set_supported: false,
+                image_input_mode: crate::host::codex_capabilities::CodexImageInputMode::Unsupported,
+                attachments: &[],
+                raw_protocol_capture: None,
+                recording_capture: None,
+            },
+            native_action_evidence.clone(),
+            READINESS_CANCELLATION_GRACE,
+            cancellation.cloned(),
+        );
+        // A pre-dispatch failure or rejected turn cannot drive the action
+        // surface. Report it now instead of masking it behind the action-page
+        // deadline, which can be several minutes. Other post-dispatch errors
+        // still wait because a confirmed native callback can outlive process
+        // shutdown.
+        if let Some(failure) = classify_native_probe_failure_before_action_wait(&run) {
+            return Err(failure);
+        }
+        let action_result = target.wait_for_success();
+        if action_result.is_ok() && !native_action_evidence.completed() {
+            return Err(native_smoke_failure(
+                "native_readiness_action_evidence_unavailable",
+            ));
+        }
+        classify_native_probe_completion(run, action_result)
+    }
+
+    fn run_required_provider_smoke(
+        &self,
+        key: &ReadinessCacheKey,
+        binding: &ResolvedProviderBinding,
+        persistence: &mut ProviderProbePersistence<'_>,
+        provider: ProviderPreflightContext<'_>,
+    ) -> Result<PreparedProviderAdmission, Box<ProviderSmokeAttemptFailure>> {
+        let ProviderPreflightContext {
+            cached_provider,
+            provider_intent,
+            allowed_app_ids,
+        } = provider;
+        let candidate_secret_supplied = persistence.provider_secret.is_some();
+        let provider_secret = match persistence.provider_secret.take() {
+            Some(secret) => Some(secret),
+            None => resolve_provider_child_secret(binding, persistence.host).map_err(|error| {
+                Box::new(ProviderSmokeAttemptFailure {
+                    evidence: None,
+                    error: Box::new(error),
+                })
+            })?,
+        };
+        if key
+            .execution_policy()
+            .experimental_features()
+            .provider_computer_use()
+            != FeatureChoice::Enabled
+        {
+            return Ok(PreparedProviderAdmission {
+                evidence: None,
+                provider_secret,
+            });
+        }
+        let provider_credential_fingerprint = self
+            .provider_smoke_credential_fingerprint(
+                binding.binding_digest(),
+                provider_secret.as_ref(),
+            )
+            .map_err(|error| {
+                Box::new(ProviderSmokeAttemptFailure {
+                    evidence: None,
+                    error: Box::new(error),
+                })
+            })?;
+        match matching_provider_cache(cached_provider, &provider_credential_fingerprint) {
+            Some(ProviderSmokeResult::Passed(evidence)) => {
+                return Ok(PreparedProviderAdmission {
+                    evidence: Some(evidence),
+                    provider_secret,
+                });
+            }
+            Some(ProviderSmokeResult::Failed(failure)) => {
+                return Err(Box::new(ProviderSmokeAttemptFailure {
+                    evidence: None,
+                    error: Box::new(provider_smoke_error_from_failure(&failure)),
+                }));
+            }
+            None => {}
+        }
+
+        let source = if provider_intent.refresh() {
+            ProviderSmokeSource::Refresh
+        } else {
+            ProviderSmokeSource::Live
+        };
+        let provider_smoke_evidence = self
+            .run_live_provider_smoke(
+                ProviderSmokeInvocation {
+                    key,
+                    binding,
+                    allowed_app_ids,
+                    provider_secret,
+                    provider_credential_fingerprint: &provider_credential_fingerprint,
+                    source,
+                    timeout_override: provider_intent.provider_smoke_timeout(),
+                },
+                persistence,
+            )
+            .map_err(|error| {
+                let observed_at = time::OffsetDateTime::now_utc();
+                let evidence = observed_at
+                    .checked_add(self.provider_smoke_failure_ttl)
+                    .and_then(|expires_at| {
+                        ProviderSmokeFailureEvidence::new(
+                            format!("provider-smoke-{}", crate::core::SessionId::new()),
+                            key.provider_config_fingerprint(),
+                            &provider_credential_fingerprint,
+                            error.code,
+                            error
+                                .details
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or_else(|| error.code.as_str()),
+                            observed_at,
+                            expires_at,
+                        )
+                        .map(|evidence| evidence.with_source(source))
+                        .ok()
+                    });
+                let error = match evidence.as_ref() {
+                    Some(evidence) => annotate_provider_smoke_error(
+                        error,
+                        evidence.source(),
+                        evidence.observed_at(),
+                        evidence.expires_at(),
+                    ),
+                    None => error,
+                };
+                Box::new(ProviderSmokeAttemptFailure {
+                    evidence,
+                    error: Box::new(error),
+                })
+            })?;
+        let provider_secret = provider_secret_after_live_smoke(
+            binding,
+            persistence.host,
+            &provider_credential_fingerprint,
+            &self.provider_smoke_fingerprinter,
+            candidate_secret_supplied,
+        )
+        .map_err(|error| {
+            Box::new(ProviderSmokeAttemptFailure {
+                evidence: None,
+                error: Box::new(error),
+            })
+        })?;
+        Ok(PreparedProviderAdmission {
+            evidence: Some(provider_smoke_evidence),
+            provider_secret,
+        })
+    }
+
+    fn run_live_provider_smoke(
+        &self,
+        invocation: ProviderSmokeInvocation<'_>,
+        persistence: &mut ProviderProbePersistence<'_>,
+    ) -> Result<ProviderSmokeEvidence, SatelleError> {
+        self.run_live_provider_smoke_with_app_server(invocation, persistence, || {
+            preserve_managed_codex_error(
+                crate::host::codex_capabilities::installed_computer_use_app_server(),
+            )
+        })
+    }
+
+    fn run_live_provider_smoke_with_app_server(
+        &self,
+        invocation: ProviderSmokeInvocation<'_>,
+        persistence: &mut ProviderProbePersistence<'_>,
+        app_server_command: impl FnOnce() -> Result<
+            crate::host::codex_capabilities::VerifiedComputerUseAppServer,
+            SatelleError,
+        >,
+    ) -> Result<ProviderSmokeEvidence, SatelleError> {
+        let ProviderSmokeInvocation {
+            key,
+            binding,
+            allowed_app_ids,
+            provider_secret,
+            provider_credential_fingerprint,
+            source,
+            timeout_override,
+        } = invocation;
+        let timeout = timeout_override.unwrap_or(self.provider_smoke_timeout);
+        let deadline = persistence
+            .cancellation
+            .and_then(super::request::AdmissionCancellation::deadline)
+            .map_or_else(|| Instant::now().checked_add(timeout), Some)
+            .ok_or_else(|| {
+                mark_probe_dispatch_possible(
+                    provider_smoke_failure(
+                        crate::host::provider_probe::ProviderProbeError::TimedOut,
+                    ),
+                    false,
+                )
+            })?;
+        let runtime_paths = self
+            .working_directory
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|path| {
+                prepare_binding_runtime_paths(
+                    path,
+                    key.execution_policy().desktop_target().binding(),
+                )
+            })
+            .map_err(|error| mark_probe_dispatch_possible(error, false))?;
+        let verified_app_server =
+            app_server_command().map_err(|error| mark_probe_dispatch_possible(error, false))?;
+        if let Some(reason) = native_component_identity_error(
+            key.native_runtime_version(),
+            key.plugin_version(),
+            verified_app_server.native_runtime_version(),
+            verified_app_server.plugin_version(),
+        ) {
+            return Err(mark_probe_dispatch_possible(adapter_failure(reason), false));
+        }
+        let native_action_evidence = verified_app_server.native_action_evidence();
+        // Provider smoke uses the native click-and-drag prompt, so it must use
+        // the matching two-action surface and bind the same tool-call evidence.
+        // A drag-only surface has no readiness button and can only time out.
+        let probe = crate::host::provider_probe::ProviderProbeSurface::start_native_with_evidence(
+            deadline,
+            persistence.cancellation.cloned(),
+            native_action_evidence.clone(),
+            key.execution_policy().desktop_target().session_id(),
+        )
+        .map_err(|error| mark_probe_dispatch_possible(provider_smoke_failure(error), false))?;
+        let page_url = probe.page_url().to_string();
+        let prompt = native_readiness_prompt(
+            &page_url,
+            &verified_app_server.native_action_path,
+            allowed_app_ids,
+            &native_action_evidence,
+        )
+        .map_err(|reason| mark_probe_dispatch_possible(adapter_failure(reason), false))?;
+        let expected_mcp_server_name = verified_app_server.native_mcp_server_name.clone();
+        let run = run_codex_session_with_timeout_cancellation(
+            command_for_binding(
+                verified_app_server.into_command(),
+                &runtime_paths.codex_home,
+            ),
+            provider_smoke_session_request(
+                binding,
+                provider_secret,
+                &runtime_paths.working_directory,
+                &prompt,
+                deadline,
+                &expected_mcp_server_name,
+                ProviderSmokeSessionControl {
+                    computer_use_allowed_app_ids: allowed_app_ids,
+                    native_action_evidence: native_action_evidence.clone(),
+                    persist_thread_ref: persistence.persist_thread_ref,
+                    persist_turn_ref: persistence.persist_turn_ref,
+                },
+            ),
+            READINESS_CANCELLATION_GRACE,
+            persistence.cancellation.cloned(),
+        );
+        if native_action_evidence.invalidated() {
+            return Err(mark_probe_dispatch_possible(
+                provider_smoke_failure(
+                    crate::host::provider_probe::ProviderProbeError::InvalidRequest,
+                ),
+                false,
+            ));
+        }
+        match classify_provider_probe_run(run)? {
+            CodexSessionTerminal::Completed => {}
+            CodexSessionTerminal::Interrupted
+            | CodexSessionTerminal::Failed(_)
+            | CodexSessionTerminal::StoppedByControl => {
+                return Err(mark_probe_dispatch_possible(
+                    provider_smoke_session_failure(CodexSessionError::ResponseError),
+                    false,
+                ));
+            }
+        }
+        probe
+            .wait_for_completion()
+            .map_err(|error| mark_probe_dispatch_possible(provider_smoke_failure(error), false))?;
+        if !native_action_evidence.completed() {
+            return Err(mark_probe_dispatch_possible(
+                provider_smoke_failure(
+                    crate::host::provider_probe::ProviderProbeError::InvalidRequest,
+                ),
+                false,
+            ));
+        }
+
+        let observed_at = time::OffsetDateTime::now_utc();
+        let expires_at = observed_at + self.provider_smoke_success_ttl;
+        ProviderSmokeEvidence::new(
+            format!("provider-smoke-{}", crate::core::SessionId::new()),
+            key.provider_config_fingerprint(),
+            provider_credential_fingerprint,
+            observed_at,
+            expires_at,
+        )
+        .map(|evidence| evidence.with_source(source))
+        .map_err(|_| adapter_failure("provider_smoke_evidence_invalid"))
+    }
+
+    fn selected_desktop_binding(
+        &self,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<(DesktopBindingRef, &DesktopSelectionPolicy), SatelleError> {
+        let alias = match provider_intent.desktop_binding() {
+            Some(binding) => binding.clone(),
+            None if self.desktop_bindings.len() == 1 => DesktopBindingRef::new(
+                self.desktop_bindings
+                    .first_key_value()
+                    .expect("one Desktop Binding policy exists")
+                    .0
+                    .clone(),
+            )
+            .map_err(|_| adapter_failure("desktop_binding_invalid"))?,
+            None => {
+                return Err(SatelleError::desktop_binding_ambiguous(
+                    self.desktop_bindings.keys().cloned(),
+                ));
+            }
+        };
+        let policy = self
+            .desktop_bindings
+            .get(alias.as_str())
+            .ok_or_else(|| SatelleError::desktop_binding_not_found(alias.as_str()))?;
+        Ok((alias, policy))
+    }
+
+    fn require_secure_desktop_handoff(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        policy: &DesktopSelectionPolicy,
+    ) -> Result<(), SatelleError> {
+        let Some(desktop_user) = policy.desktop_user.as_deref() else {
+            return Ok(());
+        };
+        let daemon_user = crate::host::desktop_sessions::current_process_user()?;
+        if daemon_user != desktop_user {
+            return Err(SatelleError::desktop_binding_secure_handoff_unsupported(
+                desktop_binding.as_str(),
+                desktop_user,
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_configured_desktop_target(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+    ) -> Result<DesktopTarget, SatelleError> {
+        let desktop_selection = self
+            .desktop_bindings
+            .get(desktop_binding.as_str())
+            .ok_or_else(|| SatelleError::desktop_binding_not_found(desktop_binding.as_str()))?;
+        let desktops = crate::host::desktop_sessions::discover()?;
+        let platform = crate::host::codex_capabilities::HostPlatform::current().as_str();
+        self.require_secure_desktop_handoff(desktop_binding, desktop_selection)?;
+        let desktop = resolve_desktop_session_for(platform, &desktops, desktop_selection)?;
+        Ok(DesktopTarget::new(
+            desktop_binding.clone(),
+            desktop.session_id.clone(),
+        ))
+    }
+
+    fn register_execution(
+        &self,
+        subject: AdapterSubject<'_>,
+        control: CodexSessionControl,
+    ) -> Result<ActiveExecutionGuard, SatelleError> {
+        let mut active = self
+            .active_executions
+            .lock()
+            .map_err(|_| adapter_failure("control_registry_unavailable"))?;
+        let desktop_binding = subject.desktop_binding().as_str().to_string();
+        if active.contains_key(&desktop_binding) {
+            return Err(adapter_failure("desktop_owner_conflict"));
+        }
+        let execution = ActiveCodexExecution {
+            session_id: subject.session_id().clone(),
+            turn_id: subject.turn_id().clone(),
+            control,
+        };
+        let guard = ActiveExecutionGuard {
+            registry: Arc::clone(&self.active_executions),
+            desktop_binding: desktop_binding.clone(),
+            session_id: execution.session_id.clone(),
+            turn_id: execution.turn_id.clone(),
+        };
+        active.insert(desktop_binding, execution);
+        Ok(guard)
+    }
+
+    fn active_control(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<Option<CodexSessionControl>, SatelleError> {
+        let active = self
+            .active_executions
+            .lock()
+            .map_err(|_| adapter_failure("control_registry_unavailable"))?;
+        Ok(active
+            .get(subject.desktop_binding().as_str())
+            .filter(|execution| {
+                execution.session_id == *subject.session_id()
+                    && execution.turn_id == *subject.turn_id()
+            })
+            .map(|execution| execution.control.clone()))
+    }
+
+    fn read_persisted_turn(&self, subject: AdapterSubject<'_>) -> Option<CodexThreadStatus> {
+        // No transport or protocol failure proves ownership inactive. Collapse
+        // every uncertain read to None so callers retain the Control Lease.
+        // An inactive thread disproves ownership only for a Turn whose exact
+        // upstream identity was committed before the restart. An active thread
+        // cannot identify which Turn it owns, so it remains outcome-unknown.
+        let (Some(thread_ref), Some(_turn_ref)) =
+            (subject.upstream_thread_ref(), subject.upstream_turn_ref())
+        else {
+            return None;
+        };
+        let runtime_paths =
+            self.working_directory.as_ref().ok().and_then(|path| {
+                prepare_binding_runtime_paths(path, subject.desktop_binding()).ok()
+            })?;
+        let deadline = Instant::now().checked_add(PERSISTED_TURN_READ_TIMEOUT)?;
+        let mut app_server =
+            crate::host::codex_capabilities::installed_read_only_app_server_command(deadline)
+                .ok()?;
+        app_server.env("CODEX_HOME", &runtime_paths.codex_home);
+        read_codex_turn(
+            app_server,
+            CodexTurnReadRequest {
+                working_directory: &runtime_paths.working_directory,
+                thread_ref,
+                deadline,
+            },
+        )
+        .ok()
+    }
+
+    fn read_readiness_probe_turn(
+        &self,
+        subject: &crate::host::storage::ProbeRecoverySubject,
+    ) -> Option<CodexThreadStatus> {
+        let (Some(thread_ref), Some(_turn_ref)) =
+            (subject.upstream_thread_ref(), subject.upstream_turn_ref())
+        else {
+            return None;
+        };
+        let runtime_paths =
+            self.working_directory.as_ref().ok().and_then(|path| {
+                prepare_binding_runtime_paths(path, subject.desktop_binding()).ok()
+            })?;
+        let deadline = Instant::now().checked_add(PERSISTED_TURN_READ_TIMEOUT)?;
+        let mut app_server =
+            crate::host::codex_capabilities::installed_read_only_app_server_command(deadline)
+                .ok()?;
+        app_server.env("CODEX_HOME", &runtime_paths.codex_home);
+        read_codex_turn(
+            app_server,
+            CodexTurnReadRequest {
+                working_directory: &runtime_paths.working_directory,
+                thread_ref,
+                deadline,
+            },
+        )
+        .ok()
+    }
+
+    fn preflight_terminal_inner(
+        &self,
+        provider_intent: &ProviderComputerUseIntent,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        persistence: &mut ProviderProbePersistence<'_>,
+    ) -> AdapterPreflight {
+        let (key, binding, allowed_app_ids) = match self.native_readiness_key(provider_intent) {
+            Ok(resolved) => resolved,
+            Err(error) => return AdapterPreflight::UncachedFailure(error),
+        };
+        let cached_provider =
+            provider_cache_for_preflight(cached_provider, provider_intent.refresh());
+        let cached = matching_cached_evidence(&key, cached);
+        match cached {
+            Some(evidence) => self.readiness_from_evidence(
+                &key,
+                &binding,
+                evidence,
+                persistence,
+                ProviderPreflightContext {
+                    cached_provider,
+                    provider_intent,
+                    allowed_app_ids: &allowed_app_ids,
+                },
+            ),
+            None => self.live_native_preflight(
+                key,
+                binding,
+                cached_provider,
+                provider_intent,
+                persistence,
+                &allowed_app_ids,
+            ),
+        }
+    }
+}
+
+struct ProviderSmokeSessionControl<'a> {
+    computer_use_allowed_app_ids: &'a BTreeSet<String>,
+    native_action_evidence: crate::host::provider_probe::NativeActionEvidence,
+    persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
+    persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
+}
+
+fn provider_smoke_session_request<'a>(
+    binding: &'a ResolvedProviderBinding,
+    provider_secret: Option<ResolvedProviderSecret>,
+    working_directory: &'a Path,
+    prompt: &'a str,
+    deadline: Instant,
+    expected_mcp_server_name: &'a str,
+    control: ProviderSmokeSessionControl<'a>,
+) -> CodexSessionRequest<'a> {
+    let ProviderSmokeSessionControl {
+        computer_use_allowed_app_ids,
+        native_action_evidence,
+        persist_thread_ref,
+        persist_turn_ref,
+    } = control;
+    CodexSessionRequest {
+        working_directory,
+        prompt,
+        existing_thread_ref: None,
+        model: Some(binding.model()),
+        model_provider: provider_child_model_provider(binding),
+        provider_endpoint: binding.endpoint(),
+        provider_secret,
+        execution_mode: TurnExecutionMode::Standard,
+        approval_policy: CodexApprovalPolicy::OnRequest,
+        sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+        deadline,
+        persist_thread_ref,
+        persist_turn_ref,
+        observe_native_approval: None,
+        native_action_evidence: Some(native_action_evidence),
+        expected_mcp_server_name,
+        computer_use_allowed_app_ids,
+        control: None,
+        goal_set_supported: false,
+        image_input_mode: crate::host::codex_capabilities::CodexImageInputMode::Unsupported,
+        attachments: &[],
+        raw_protocol_capture: None,
+        recording_capture: None,
+    }
+}
+
+fn provider_child_model_provider(binding: &ResolvedProviderBinding) -> Option<&str> {
+    if binding.endpoint().is_some() {
+        Some(PROVIDER_CHILD_ID)
+    } else {
+        provider_override(binding.model_provider())
+    }
+}
+
+pub(crate) fn resolve_provider_child_secret(
+    binding: &ResolvedProviderBinding,
+    host: &str,
+) -> Result<Option<ResolvedProviderSecret>, SatelleError> {
+    let endpoint = binding.endpoint();
+    if let Some(endpoint) = endpoint {
+        validate_provider_endpoint(endpoint)?;
+    }
+    let auth_source = binding.auth_source();
+    if endpoint.is_none()
+        && auth_source.is_some()
+        && !binding.model_provider().eq_ignore_ascii_case("openai")
+    {
+        return Err(provider_secret_resolution_error(
+            "provider_auth_destination_unsupported",
+        ));
+    }
+    match auth_source {
+        None => Ok(None),
+        Some(source) => resolve_provider_secret(
+            source,
+            &crate::host::credential_helper::CredentialHelperRequest::new(
+                binding.requested_provider_alias(),
+                binding.model_provider(),
+                host,
+            ),
+        )
+        .map(Some)
+        .map_err(|error| {
+            let reason = match error {
+                ProviderAuthResolutionError::FilePath(error) => {
+                    return error.diagnostic(None, None, Some(host), Some(std::env::consts::OS));
+                }
+                ProviderAuthResolutionError::InvalidHelperArgv => {
+                    let mut error =
+                        provider_secret_resolution_error("credential_helper_argv_invalid");
+                    error.code = ErrorCode::CredentialHelperArgvInvalid;
+                    return error;
+                }
+                ProviderAuthResolutionError::HelperTimeout => {
+                    let mut error = provider_secret_resolution_error("credential_helper_timeout");
+                    error.code = ErrorCode::CredentialHelperTimeout;
+                    return error;
+                }
+                ProviderAuthResolutionError::UnsupportedKind => "provider_auth_kind_unsupported",
+                ProviderAuthResolutionError::Unresolved => "provider_auth_unresolved",
+            };
+            provider_secret_resolution_error(reason)
+        }),
+    }
+}
+
+fn resolve_execution_provider_secret(
+    binding: &ResolvedProviderBinding,
+    host: &str,
+    preflight_fingerprint: &str,
+    fingerprinter: &ProviderSmokeCredentialFingerprinter,
+) -> Result<Option<ResolvedProviderSecret>, SatelleError> {
+    let provider_secret = resolve_provider_child_secret(binding, host)?;
+    let execution_fingerprint = fingerprinter
+        .fingerprint(binding.binding_digest(), provider_secret.as_ref())
+        .ok_or_else(|| adapter_failure("provider_smoke_hmac_key_unavailable"))?;
+    if execution_fingerprint != preflight_fingerprint {
+        return Err(provider_secret_resolution_error(
+            "provider_auth_changed_during_preflight",
+        ));
+    }
+    Ok(provider_secret)
+}
+
+fn provider_secret_after_live_smoke(
+    binding: &ResolvedProviderBinding,
+    host: &str,
+    preflight_fingerprint: &str,
+    fingerprinter: &ProviderSmokeCredentialFingerprinter,
+    candidate_secret_supplied: bool,
+) -> Result<Option<ResolvedProviderSecret>, SatelleError> {
+    if candidate_secret_supplied {
+        // Setup and repair supply a one-shot candidate by value. The live
+        // smoke owns and zeroizes it; the caller commits the separately held
+        // candidate only after readiness succeeds. Re-resolving here would
+        // incorrectly consult the old or intentionally absent destination.
+        return Ok(None);
+    }
+    resolve_execution_provider_secret(binding, host, preflight_fingerprint, fingerprinter)
+}
+
+pub(crate) fn validate_provider_endpoint(endpoint: &str) -> Result<(), SatelleError> {
+    if endpoint.contains('\\')
+        || endpoint.chars().any(char::is_whitespace)
+        || endpoint.chars().any(char::is_control)
+    {
+        return Err(invalid_provider_endpoint());
+    }
+    let endpoint = url::Url::parse(endpoint).map_err(|_| invalid_provider_endpoint())?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(invalid_provider_endpoint());
+    }
+    Ok(())
+}
+
+fn provider_secret_resolution_error(reason: &'static str) -> SatelleError {
+    SatelleError {
+        code: ErrorCode::ProviderSecretResolutionFailed,
+        message: "the provider Secret Source could not be applied to the private provider child"
+            .to_string(),
+        recovery_command: Some(
+            "configure a supported endpoint and Host-resolved provider Secret Source".to_string(),
+        ),
+        source_detail: None,
+        details: BTreeMap::from([("reason".to_string(), Value::String(reason.to_string()))]),
+    }
+}
+
+fn invalid_provider_endpoint() -> SatelleError {
+    SatelleError {
+        code: ErrorCode::ModelProviderBindingMissing,
+        message: "the provider endpoint is not a safe HTTP or HTTPS endpoint".to_string(),
+        recovery_command: Some(
+            "configure an http or https endpoint without userinfo, query, or fragment".to_string(),
+        ),
+        source_detail: None,
+        details: BTreeMap::from([(
+            "reason".to_string(),
+            Value::String("provider_endpoint_invalid".to_string()),
+        )]),
+    }
+}
+
+fn codex_effective_defaults_unavailable() -> SatelleError {
+    SatelleError {
+        code: ErrorCode::ModelProviderBindingMissing,
+        message: "the Host could not read Codex's effective model and provider defaults"
+            .to_string(),
+        recovery_command: Some(
+            "configure an exact model/provider binding or repair the managed Codex runtime"
+                .to_string(),
+        ),
+        source_detail: None,
+        details: BTreeMap::from([(
+            "reason".to_string(),
+            Value::String("codex_effective_defaults_unavailable".to_string()),
+        )]),
+    }
+}
+
+fn native_readiness_from_evidence(
+    key: &ReadinessCacheKey,
+    binding: ResolvedProviderBinding,
+    evidence: ReadinessEvidence,
+    computer_use_allowed_app_ids: BTreeSet<String>,
+    provider_smoke_evidence: Option<ProviderSmokeEvidence>,
+    source: ReadinessSource,
+) -> Result<AdapterReadiness, EvidenceError> {
+    AdapterReadiness::ready(
+        key.adapter(),
+        "native Computer Use passed the Host action-path smoke test",
+        key.desktop_binding().clone(),
+        key.execution_policy().clone(),
+        evidence,
+        provider_smoke_evidence,
+        Some(binding),
+    )
+    .map(|readiness| {
+        readiness
+            .with_admitted_app_approval(computer_use_allowed_app_ids)
+            .with_source(source)
+    })
+}
+
+struct NativeActionTarget {
+    surface: crate::host::provider_probe::ProviderProbeSurface,
+}
+
+impl NativeActionTarget {
+    fn spawn(
+        deadline: Instant,
+        cancellation: Option<&super::request::AdmissionCancellation>,
+        evidence: crate::host::provider_probe::NativeActionEvidence,
+        desktop_session_id: &str,
+    ) -> Result<Self, &'static str> {
+        let surface = crate::host::provider_probe::ProviderProbeSurface::start_native_with_evidence(
+            deadline,
+            cancellation.cloned(),
+            evidence,
+            desktop_session_id,
+        );
+        surface
+            .map(|surface| Self { surface })
+            .map_err(native_target_error)
+    }
+
+    fn page_url(&self) -> &str {
+        self.surface.page_url()
+    }
+
+    fn wait_for_success(self) -> Result<(), &'static str> {
+        self.surface
+            .wait_for_completion()
+            .map_err(native_target_error)
+    }
+}
+
+fn native_target_error(error: crate::host::provider_probe::ProviderProbeError) -> &'static str {
+    match error {
+        crate::host::provider_probe::ProviderProbeError::TimedOut => "native_readiness_timed_out",
+        crate::host::provider_probe::ProviderProbeError::NativeClickNotObserved => {
+            "native_readiness_click_not_observed"
+        }
+        crate::host::provider_probe::ProviderProbeError::NativeDragNotObserved => {
+            "native_readiness_drag_not_observed"
+        }
+        crate::host::provider_probe::ProviderProbeError::Cancelled => "native_readiness_cancelled",
+        crate::host::provider_probe::ProviderProbeError::Bind(_)
+        | crate::host::provider_probe::ProviderProbeError::Random(_)
+        | crate::host::provider_probe::ProviderProbeError::WorkerSpawn(_) => {
+            "native_readiness_target_unavailable"
+        }
+        #[cfg(windows)]
+        crate::host::provider_probe::ProviderProbeError::NativeWindow(_) => {
+            "native_readiness_target_unavailable"
+        }
+        crate::host::provider_probe::ProviderProbeError::InvalidRequest => {
+            "native_readiness_callback_invalid"
+        }
+        crate::host::provider_probe::ProviderProbeError::Io(_)
+        | crate::host::provider_probe::ProviderProbeError::WorkerStopped => {
+            "native_readiness_target_failed"
+        }
+    }
+}
+
+fn native_component_identity_error(
+    expected_native_runtime_version: &str,
+    expected_plugin_version: Option<&str>,
+    admitted_native_runtime_version: &str,
+    admitted_plugin_version: &str,
+) -> Option<&'static str> {
+    match expected_plugin_version {
+        Some(expected_plugin)
+            if expected_native_runtime_version == admitted_native_runtime_version
+                && expected_plugin == admitted_plugin_version =>
+        {
+            None
+        }
+        Some(_) => Some("native_component_changed_during_preflight"),
+        None => Some("native_component_identity_unavailable"),
+    }
+}
+
+fn javascript_single_quoted(value: &str) -> String {
+    let mut literal = String::with_capacity(value.len() + 2);
+    literal.push('\'');
+    for character in value.chars() {
+        match character {
+            '\'' => literal.push_str("\\'"),
+            '\\' => literal.push_str("\\\\"),
+            '\n' => literal.push_str("\\n"),
+            '\r' => literal.push_str("\\r"),
+            '\t' => literal.push_str("\\t"),
+            character if character.is_control() => {
+                literal.push_str(&format!("\\u{:04x}", u32::from(character)));
+            }
+            character => literal.push(character),
+        }
+    }
+    literal.push('\'');
+    literal
+}
+
+fn node_repl_exec_source(script: &str) -> String {
+    let code = serde_json::to_string(script).expect("a Rust string always serializes as JSON");
+    format!("const r=await tools.mcp__node_repl__js({{code:{code}}});text(JSON.stringify(r))")
+}
+
+fn native_readiness_prompt(
+    page_url: &str,
+    action_path: &crate::host::codex_capabilities::NativeComputerUseActionPath,
+    allowed_app_ids: &BTreeSet<String>,
+    native_action_evidence: &crate::host::provider_probe::NativeActionEvidence,
+) -> Result<String, &'static str> {
+    // Luna reproduces long JavaScript cells more reliably when every string
+    // uses one quoting style. Keep generated values safe without mixing the
+    // double-quoted JSON literal style into the single-quoted probe script.
+    let page_url = javascript_single_quoted(page_url);
+    match action_path {
+        crate::host::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl => {
+            // Bind current app authority before the exact script enters the
+            // prompt. The callback then carries this single checked invariant.
+            if !allowed_app_ids.contains("satelle.exe") {
+                return Err("native_app_approval_unavailable");
+            }
+            // The native probe has a fixed captured-window layout. Coordinate input keeps
+            // this generated cell short enough for the model to copy verbatim,
+            // while the private callback remains the authority for both events.
+            let script = "globalThis.sky??=(await import('@oai/sky')).sky;var w=(await sky.list_windows()).find(x=>x.app.toLowerCase().endsWith('satelle.exe')&&x.title==='Satelle native readiness probe'),g=w=>sky.get_window_state({window:w,include_screenshot:true,include_text:true}),s=await g(w);await sky.click({window:s.window,x:190,y:173,screenshotId:s.screenshots[0].id});s=await g(s.window);await sky.drag({window:s.window,from_x:238,from_y:356,to_x:578,to_y:406,screenshotId:s.screenshots[0].id})".to_string();
+            // The `exec` tool yields after roughly ten seconds and reports a
+            // background cell instead of a result. On slow hosts the readiness
+            // script outlives that window, and a model that obeys "no other
+            // tool calls" then ends the Turn before the nested node_repl item
+            // completes, so the exact-call evidence never lands even though
+            // the click and drag reached the loopback target. Allow only the
+            // `wait` call that drains that cell; `wait` is a top-level tool, not
+            // an MCP item, so it cannot invalidate the evidence observer.
+            native_action_evidence.expect_script_for_app(&script, "satelle.exe");
+            let exec_source = node_repl_exec_source(&script);
+            Ok(format!(
+                "Use the installed official Computer Use plugin immediately. Call the top-level `exec` tool exactly once with this exact JavaScript source: `{exec_source}`. Copy the source verbatim without expanding or replacing any operation. That source calls the nested `mcp__node_repl__js` tool exactly once with the complete readiness script as the exact `code` argument. The tools are already available; do not call `tool_search` or inspect the tool inventory. Make no other discovery or tool calls. The Satelle-owned window independently reports both native events to a private loopback capability. Use only the authenticated sky Computer Use API. Do not use shell, separate file tools, browser automation, or network tools. Do not print the app list or inspect unrelated apps. Do not inspect Object.keys or probe API shapes. Do not read documentation. If the `exec` result reports that the script is still running with a cell ID instead of a terminal result, call the top-level `wait` tool with that `cell_id` and `yield_time_ms` of 10000, repeating only until the cell returns a terminal result. That `wait` call is the only other tool call permitted. Stop immediately after the `exec` tool call reaches a terminal result."
+            ))
+        }
+        crate::host::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
+            // Keep the same authorization boundary on both native platforms.
+            if !allowed_app_ids.contains("com.apple.Safari") {
+                return Err("native_app_approval_unavailable");
+            }
+            let script = format!(
+                "globalThis.sky ??= (await import('@oai/sky')).sky; var state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); await sky.press_key({{ app: 'Safari', key: 'super+n' }}); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var addressLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('text field') && line.includes('ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD')); var addressMatch = addressLine && addressLine.trim().match(/^([0-9]+)/); if (!addressMatch) throw new Error('Safari address field missing'); await sky.set_value({{ app: 'Safari', element_index: Number(addressMatch[1]), value: {page_url} }}); await sky.press_key({{ app: 'Safari', key: 'Return' }}); var buttonMatch = null; for (var attempt = 0; attempt < 8 && !buttonMatch; attempt++) {{ await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1000 : 500)); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var buttonLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); }} if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({{ app: 'Safari', element_index: Number(buttonMatch[1]) }}); await sky.drag({{ app: 'Safari', from_x: 100, from_y: 320, to_x: 600, to_y: 425 }}); await sky.press_key({{ app: 'Safari', key: 'super+w' }}); nodeRepl.write('Native click and drag actions dispatched');"
+            );
+            native_action_evidence.expect_script_for_app(&script, "com.apple.Safari");
+            let exec_source = node_repl_exec_source(&script);
+            Ok(format!(
+                "Use the installed official Computer Use plugin immediately. Call the top-level `exec` tool exactly once with this exact JavaScript source: `{exec_source}`. That source calls the nested `mcp__node_repl__js` tool exactly once with the complete readiness script as the exact `code` argument. The tools are already available; do not call `tool_search` or inspect the tool inventory. Make no other discovery or tool calls. The private loopback target independently verifies both native events. It rejects a missing click or drag. The target has a fixed 1024 by 678 readiness surface, so the app-window drag coordinates are part of this probe contract. Use only the authenticated sky Computer Use API. Do not use shell, file, generic browser automation, or other network tools. Do not print the app list or inspect unrelated apps. Do not read documentation. If the `exec` result reports that the script is still running with a cell ID instead of a terminal result, call the top-level `wait` tool with that `cell_id` and `yield_time_ms` of 10000, repeating only until the cell returns a terminal result. That `wait` call is the only other tool call permitted. Stop immediately after the `exec` tool call reaches a terminal result."
+            ))
+        }
+    }
+}
+
+fn native_computer_use_prompt(
+    user_prompt: &str,
+    action_path: &crate::host::codex_capabilities::NativeComputerUseActionPath,
+) -> String {
+    // The isolated MCP server exposes a generic JavaScript kernel. Name the
+    // trusted Sky entry point on every Turn so the model does not mistake the
+    // sandboxed shell for a desktop-control surface.
+    let api = match action_path {
+        crate::host::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl => {
+            "Use only the supported Windows window API: `list_apps()`, `launch_app({app})`, `list_windows()`, `get_window_state({window, include_screenshot, include_text})`, `activate_window({window})`, `click({window, element_index})` or screenshot coordinates, `set_value({window, element_index, value})`, `type_text({window, text})`, `press_key({window, key})`, `scroll(...)`, and `drag(...)`. Select a canonical app id from `list_apps()`. Every action must use a current `window` object returned by `list_apps()` or `list_windows()`; after `launch_app`, list again to obtain its window. Refresh `get_window_state` after each UI transition. Method names are snake_case."
+        }
+        crate::host::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
+            "Use only the supported macOS window API: `list_apps()`, `get_app_state({app, disableDiff: true})`, `click({app, element_index})` or app-window coordinates, `set_value({app, element_index, value})`, `type_text({app, text})`, `press_key({app, key})`, `scroll(...)`, `drag(...)`, `paste(...)`, and `select_text(...)`. Select a canonical app id from `list_apps()` and pass it as `app` to every action. Refresh `get_app_state` after each UI transition. Method names are snake_case."
+        }
+    };
+    format!(
+        "Use the installed official Computer Use integration for every desktop-app interaction. Call the top-level `exec` tool for each persistent JavaScript cell. Inside each `exec` cell, call `await tools.mcp__node_repl__js({{code: ...}})` exactly once and pass that cell's JavaScript source in `code`. Begin the first native cell with `globalThis.sky ??= (await import('@oai/sky')).sky;`. {api} The tools are already available. Do not call `tool_search`, inspect the tool inventory, inspect object keys or prototypes, read API documentation, or make other discovery calls. Do not use shell commands, AppleScript, generic browser automation, or another integration for desktop interaction. Complete this user request: {user_prompt}"
+    )
+}
+
+struct NativePrerequisiteObservations {
+    os_permission_state: ReadinessObservationState,
+    app_approval_state: ReadinessObservationState,
+    os_fingerprint_material: String,
+    app_fingerprint_material: String,
+}
+
+fn native_prerequisite_observations(
+    platform: &str,
+    desktop: &crate::core::DesktopSessionRecord,
+    app_policy_surface: crate::host::codex_capabilities::EvidenceSurface,
+    allowed_app_ids: &BTreeSet<String>,
+) -> NativePrerequisiteObservations {
+    let os_permission_state = if platform == "windows" {
+        // Desktop resolution already proved this exact session is active,
+        // visible, and has one unambiguous console/remote ownership mode.
+        ReadinessObservationState::Granted
+    } else {
+        // macOS preflight APIs describe the calling Host process, not the
+        // managed Codex process that drives the desktop. Reporting that value
+        // as Codex permission would create a false grant or false denial.
+        ReadinessObservationState::Unknown
+    };
+    NativePrerequisiteObservations {
+        os_permission_state,
+        app_approval_state: ReadinessObservationState::Unknown,
+        os_fingerprint_material: format!(
+            "{}:{}:{}:{}",
+            desktop.state, desktop.session_kind, desktop.is_console, desktop.is_remote
+        ),
+        app_fingerprint_material: app_policy_fingerprint_material(
+            platform,
+            app_policy_surface,
+            allowed_app_ids,
+        ),
+    }
+}
+
+fn app_policy_fingerprint_material(
+    platform: &str,
+    observed: crate::host::codex_capabilities::EvidenceSurface,
+    allowed_app_ids: &BTreeSet<String>,
+) -> String {
+    if !matches!(platform, "windows" | "macos") {
+        return "app_policy:not_observable".to_string();
+    }
+    let classified = match observed {
+        crate::host::codex_capabilities::EvidenceSurface::Stable => "stable",
+        crate::host::codex_capabilities::EvidenceSurface::Absent => "absent",
+        crate::host::codex_capabilities::EvidenceSurface::Incomplete => "incomplete",
+        crate::host::codex_capabilities::EvidenceSurface::Private if platform == "macos" => {
+            "private"
+        }
+        _ => "incomplete",
+    };
+    let mut digest = Sha256::new();
+    digest.update(b"satelle-computer-use-allowed-apps-v1\0");
+    for app_id in allowed_app_ids {
+        digest.update(app_id.as_bytes());
+        digest.update([0]);
+    }
+    let allowed_apps_digest = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{platform}_app_policy:{classified}:{allowed_apps_digest}")
+}
+
+fn app_approval_fingerprint_for_policy(
+    platform: &str,
+    observed: crate::host::codex_capabilities::EvidenceSurface,
+    allowed_app_ids: &BTreeSet<String>,
+    execution_policy: &ExecutionPolicy,
+) -> String {
+    readiness_fingerprint(
+        "app-approval",
+        platform,
+        execution_policy.desktop_target().session_id(),
+        ReadinessObservationState::Unknown,
+        &app_policy_fingerprint_material(platform, observed, allowed_app_ids),
+    )
+}
+
+fn readiness_fingerprint(
+    domain: &str,
+    platform: &str,
+    desktop: &str,
+    state: ReadinessObservationState,
+    observation: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"satelle-native-readiness-v2\0");
+    digest.update(domain.as_bytes());
+    digest.update([0]);
+    digest.update(platform.as_bytes());
+    digest.update([0]);
+    digest.update(desktop.as_bytes());
+    digest.update([0]);
+    digest.update(state.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(observation.as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn model_override(value: &str) -> Option<&str> {
+    (value != DEFAULT_MODEL_BINDING).then_some(value)
+}
+
+fn provider_override(value: &str) -> Option<&str> {
+    (value != DEFAULT_PROVIDER_BINDING).then_some(value)
+}
+
+fn provider_cache_for_preflight(
+    cached: Option<ProviderSmokeResult>,
+    refresh: bool,
+) -> Option<ProviderSmokeResult> {
+    if refresh { None } else { cached }
+}
+
+fn matching_provider_cache(
+    cached: Option<ProviderSmokeResult>,
+    provider_credential_fingerprint: &str,
+) -> Option<ProviderSmokeResult> {
+    cached.filter(|result| {
+        result.provider_credential_fingerprint() == provider_credential_fingerprint
+    })
+}
+
+fn matching_cached_evidence(
+    key: &ReadinessCacheKey,
+    cached: Option<ReadinessEvidence>,
+) -> Option<ReadinessEvidence> {
+    cached.filter(|evidence| !key_has_denied_observation(key) && key.matches_evidence(evidence))
+}
+
+fn native_readiness_failure(reason: &'static str) -> SatelleError {
+    let mut details = std::collections::BTreeMap::new();
+    details.insert("reason".to_string(), Value::String(reason.to_string()));
+    details.insert(
+        "native_readiness".to_string(),
+        serde_json::json!({
+            "source": "live",
+            "status": NativeReadinessCheckStatus::Failed.as_str(),
+            "checks": [
+                readiness_check(
+                    NativeReadinessCheckKind::CodexRuntime,
+                    NativeReadinessCheckStatus::Passed,
+                    "codex_runtime_available",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::Authentication,
+                    NativeReadinessCheckStatus::Passed,
+                    "authentication_available",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::NativeComputerUse,
+                    NativeReadinessCheckStatus::Passed,
+                    "native_computer_use_available",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::OsPermissions,
+                    NativeReadinessCheckStatus::NotEvaluated,
+                    "live_proof_not_completed",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::AppApproval,
+                    NativeReadinessCheckStatus::NotEvaluated,
+                    "live_proof_not_completed",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::ControlPlane,
+                    NativeReadinessCheckStatus::Passed,
+                    "control_plane_admitted",
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::PointerClick,
+                    NativeReadinessCheckStatus::Failed,
+                    reason,
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::PointerDrag,
+                    NativeReadinessCheckStatus::Failed,
+                    reason,
+                ),
+                readiness_check(
+                    NativeReadinessCheckKind::FileManagement,
+                    NativeReadinessCheckStatus::NotEvaluated,
+                    "not_required_for_prompt_admission",
+                ),
+            ],
+        }),
+    );
+    SatelleError {
+        code: ErrorCode::ComputerUseNotReady,
+        message: "native Computer Use did not pass the Host action-path smoke test".to_string(),
+        recovery_command: Some("satelle doctor --scope computer-use --refresh --json".to_string()),
+        source_detail: None,
+        details,
+    }
+}
+
+fn native_readiness_manual_action_failure(
+    os_permission_state: ReadinessObservationState,
+    app_approval_state: ReadinessObservationState,
+) -> SatelleError {
+    let os_status = observation_check_status(os_permission_state);
+    let app_status = observation_check_status(app_approval_state);
+    let checks = serde_json::json!([
+        readiness_check(
+            NativeReadinessCheckKind::CodexRuntime,
+            NativeReadinessCheckStatus::Passed,
+            "codex_runtime_available",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::Authentication,
+            NativeReadinessCheckStatus::Passed,
+            "authentication_available",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::NativeComputerUse,
+            NativeReadinessCheckStatus::Passed,
+            "native_computer_use_available",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::OsPermissions,
+            os_status.0,
+            os_status.1
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::AppApproval,
+            app_status.0,
+            app_status.1
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::ControlPlane,
+            NativeReadinessCheckStatus::Passed,
+            "control_plane_admitted",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::PointerClick,
+            NativeReadinessCheckStatus::NotEvaluated,
+            "blocked_by_prerequisite",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::PointerDrag,
+            NativeReadinessCheckStatus::NotEvaluated,
+            "blocked_by_prerequisite",
+        ),
+        readiness_check(
+            NativeReadinessCheckKind::FileManagement,
+            NativeReadinessCheckStatus::NotEvaluated,
+            "not_required_for_prompt_admission",
+        ),
+    ]);
+    let mut details = std::collections::BTreeMap::new();
+    details.insert(
+        "reason".to_string(),
+        Value::String("native_readiness_manual_action_required".to_string()),
+    );
+    details.insert(
+        "native_readiness".to_string(),
+        serde_json::json!({
+            "source": "live",
+            "status": NativeReadinessCheckStatus::ManualActionRequired.as_str(),
+            "checks": checks,
+        }),
+    );
+    SatelleError {
+        code: ErrorCode::ComputerUseNotReady,
+        message: "native Computer Use requires a manual permission or app approval change"
+            .to_string(),
+        recovery_command: Some("satelle doctor --scope computer-use --refresh --json".to_string()),
+        source_detail: None,
+        details,
+    }
+}
+
+fn key_has_denied_observation(key: &ReadinessCacheKey) -> bool {
+    key.os_permission_state() == ReadinessObservationState::Denied
+        || key.app_approval_state() == ReadinessObservationState::Denied
+}
+
+fn native_observation_blocker(key: &ReadinessCacheKey) -> Option<SatelleError> {
+    key_has_denied_observation(key).then(|| {
+        if key.execution_policy().approval_policy() == ApprovalPolicy::Never
+            && key.execution_policy().sandbox_policy() == SandboxPolicy::DangerFullAccess
+        {
+            SatelleError::yolo_blocked_by_native_approval()
+        } else {
+            native_readiness_manual_action_failure(
+                key.os_permission_state(),
+                key.app_approval_state(),
+            )
+        }
+    })
+}
+
+fn denied_native_probe_result(
+    key: &ReadinessCacheKey,
+    evidence: &ReadinessEvidence,
+) -> Option<NativeProbeResult> {
+    native_observation_blocker(key).map(|error| NativeProbeResult::Failed {
+        evidence: evidence.clone(),
+        reason: "native_readiness_manual_action_required",
+        error,
+        dispatch_possible: false,
+    })
+}
+
+fn observation_check_status(
+    state: ReadinessObservationState,
+) -> (NativeReadinessCheckStatus, &'static str) {
+    match state {
+        ReadinessObservationState::Granted => {
+            (NativeReadinessCheckStatus::Passed, "observation_granted")
+        }
+        ReadinessObservationState::Denied => (
+            NativeReadinessCheckStatus::ManualActionRequired,
+            "observation_denied",
+        ),
+        ReadinessObservationState::Unknown => (
+            NativeReadinessCheckStatus::NotEvaluated,
+            "observation_unknown",
+        ),
+    }
+}
+
+fn readiness_check(
+    kind: NativeReadinessCheckKind,
+    status: NativeReadinessCheckStatus,
+    reason: &'static str,
+) -> Value {
+    let check = NativeReadinessCheck::new(kind, status, reason);
+    serde_json::json!({
+        "kind": check.kind().as_str(),
+        "status": check.status().as_str(),
+        "reason": check.reason(),
+    })
+}
+
+fn native_smoke_failure(reason: &'static str) -> NativeSmokeFailure {
+    NativeSmokeFailure {
+        reason,
+        error: Box::new(native_readiness_failure(reason)),
+        dispatch_possible: false,
+    }
+}
+
+fn native_smoke_session_failure(failure: CodexSessionFailure) -> NativeSmokeFailure {
+    let reason = match failure.error() {
+        CodexSessionError::Spawn => "native_readiness_spawn_failed",
+        CodexSessionError::Write => "native_readiness_write_failed",
+        CodexSessionError::MalformedMessage => "native_readiness_malformed_message",
+        CodexSessionError::OversizedMessage => "native_readiness_oversized_message",
+        CodexSessionError::UnexpectedResponse => "native_readiness_unexpected_response",
+        CodexSessionError::DuplicateResponse => "native_readiness_duplicate_response",
+        CodexSessionError::ResponseError => "native_readiness_response_error",
+        CodexSessionError::YoloNotSupported => "native_readiness_yolo_not_supported",
+        CodexSessionError::ConflictingIdentity => "native_readiness_conflicting_identity",
+        CodexSessionError::PrematureExit => "native_readiness_premature_exit",
+        CodexSessionError::Timeout => "native_readiness_timed_out",
+        CodexSessionError::Persistence => "native_readiness_persistence_failed",
+        CodexSessionError::Containment => "native_readiness_containment_failed",
+        CodexSessionError::Control => "native_readiness_control_failed",
+        CodexSessionError::NativeActionUnavailable => "native_readiness_native_action_unavailable",
+    };
+    NativeSmokeFailure {
+        reason,
+        error: Box::new(native_readiness_failure(reason)),
+        dispatch_possible: failure.turn_dispatch_attempted(),
+    }
+}
+
+fn classify_native_probe_run(
+    run: crate::host::codex_session::TimedCodexSessionRun,
+) -> Result<CodexSessionTerminal, NativeSmokeFailure> {
+    if let Err(failure) = &run.result
+        && !failure.turn_dispatch_attempted()
+    {
+        return Err(native_smoke_session_failure(*failure));
+    }
+    if let Some(observation) = run.cancellation {
+        return Err(native_readiness_timeout_after_cancellation(observation));
+    }
+    run.result.map_err(native_smoke_session_failure)
+}
+
+fn classify_native_probe_failure_before_action_wait(
+    run: &crate::host::codex_session::TimedCodexSessionRun,
+) -> Option<NativeSmokeFailure> {
+    match &run.result {
+        Err(failure)
+            if !failure.turn_dispatch_attempted()
+                || failure.error() == CodexSessionError::ResponseError =>
+        {
+            Some(native_smoke_session_failure(*failure))
+        }
+        Ok(CodexSessionTerminal::Failed(_)) if run.cancellation.is_none() => {
+            Some(native_smoke_failure("native_readiness_session_failed"))
+        }
+        Ok(CodexSessionTerminal::Completed | CodexSessionTerminal::Interrupted)
+        | Ok(CodexSessionTerminal::Failed(_))
+        | Ok(CodexSessionTerminal::StoppedByControl)
+        | Err(_) => None,
+    }
+}
+
+fn classify_native_probe_completion(
+    run: crate::host::codex_session::TimedCodexSessionRun,
+    action_result: Result<(), &'static str>,
+) -> Result<(), NativeSmokeFailure> {
+    if let Some(failure) = classify_native_probe_failure_before_action_wait(&run) {
+        return Err(failure);
+    }
+    if action_result.is_ok()
+        && matches!(
+            run.cancellation,
+            Some(
+                StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed
+            )
+        )
+    {
+        return Ok(());
+    }
+
+    let terminal = classify_native_probe_run(run)?;
+    if terminal != CodexSessionTerminal::Completed {
+        return Err(native_smoke_failure("native_readiness_session_failed"));
+    }
+    action_result.map_err(native_smoke_failure)
+}
+
+fn native_readiness_timeout_after_cancellation(observation: StopObservation) -> NativeSmokeFailure {
+    let reason = "native_readiness_timed_out";
+    let mut error = SatelleError::native_readiness_timeout();
+    error
+        .details
+        .insert("reason".to_string(), Value::String(reason.to_string()));
+    let cancellation = match observation {
+        StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed => {
+            "confirmed"
+        }
+        StopObservation::UpstreamStillActive => "upstream_still_active",
+        StopObservation::OutcomeUnknown => "outcome_unknown",
+    };
+    error.details.insert(
+        "native_readiness_cancellation".to_string(),
+        Value::String(cancellation.to_string()),
+    );
+    NativeSmokeFailure {
+        reason,
+        error: Box::new(error),
+        dispatch_possible: true,
+    }
+}
+
+fn mark_probe_dispatch_possible(mut error: SatelleError, possible: bool) -> SatelleError {
+    error
+        .details
+        .insert("probe_dispatch_possible".to_string(), Value::Bool(possible));
+    error
+}
+
+fn probe_dispatch_possible(error: &SatelleError) -> bool {
+    error
+        .details
+        .get("probe_dispatch_possible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn probe_cancellation_observation(
+    dispatch_possible: bool,
+    error: &SatelleError,
+    cancellation_detail: &str,
+) -> StopObservation {
+    if dispatch_possible {
+        stop_observation_from_detail(error, cancellation_detail)
+    } else {
+        StopObservation::UpstreamInactiveConfirmed
+    }
+}
+
+fn preflight_cancellation_observation(result: &AdapterPreflight) -> StopObservation {
+    match result {
+        AdapterPreflight::ProviderFailed { error, .. }
+        | AdapterPreflight::UncachedFailure(error) => probe_cancellation_observation(
+            probe_dispatch_possible(error),
+            error,
+            "provider_smoke_cancellation",
+        ),
+        AdapterPreflight::Failed {
+            error,
+            dispatch_possible,
+            ..
+        } => probe_cancellation_observation(
+            *dispatch_possible,
+            error,
+            "native_readiness_cancellation",
+        ),
+        AdapterPreflight::Cancelled(observation) => *observation,
+        AdapterPreflight::Ready(_) => StopObservation::UpstreamInactiveConfirmed,
+    }
+}
+
+fn provider_smoke_session_failure(error: CodexSessionError) -> SatelleError {
+    if error == CodexSessionError::YoloNotSupported {
+        return SatelleError::yolo_not_supported();
+    }
+    let (code, reason) = match error {
+        CodexSessionError::Timeout => (
+            ErrorCode::ProviderSmokeTestTimeout,
+            "provider_smoke_test_timed_out",
+        ),
+        CodexSessionError::ResponseError => (
+            ErrorCode::ExperimentalProviderNotValidated,
+            "experimental_provider_not_validated",
+        ),
+        CodexSessionError::YoloNotSupported => unreachable!(),
+        CodexSessionError::Spawn => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_spawn_failed",
+        ),
+        CodexSessionError::Write => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_write_failed",
+        ),
+        CodexSessionError::MalformedMessage => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_malformed_message",
+        ),
+        CodexSessionError::OversizedMessage => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_oversized_message",
+        ),
+        CodexSessionError::UnexpectedResponse => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_unexpected_response",
+        ),
+        CodexSessionError::DuplicateResponse => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_duplicate_response",
+        ),
+        CodexSessionError::ConflictingIdentity => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_conflicting_identity",
+        ),
+        CodexSessionError::PrematureExit => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_premature_exit",
+        ),
+        CodexSessionError::Persistence => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_persistence_failed",
+        ),
+        CodexSessionError::Containment => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_containment_failed",
+        ),
+        CodexSessionError::Control => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_control_failed",
+        ),
+        CodexSessionError::NativeActionUnavailable => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_native_action_unavailable",
+        ),
+    };
+    provider_smoke_error(code, reason)
+}
+
+fn provider_probe_session_failure(failure: CodexSessionFailure) -> SatelleError {
+    mark_probe_dispatch_possible(
+        provider_smoke_session_failure(failure.error()),
+        failure.turn_dispatch_attempted(),
+    )
+}
+
+fn classify_provider_probe_run(
+    run: crate::host::codex_session::TimedCodexSessionRun,
+) -> Result<CodexSessionTerminal, SatelleError> {
+    if let Err(failure) = &run.result
+        && !failure.turn_dispatch_attempted()
+    {
+        return Err(provider_probe_session_failure(*failure));
+    }
+    if let Some(observation) = run.cancellation {
+        return Err(provider_smoke_timeout_after_cancellation(observation));
+    }
+    run.result.map_err(provider_probe_session_failure)
+}
+
+fn provider_smoke_timeout_after_cancellation(observation: StopObservation) -> SatelleError {
+    let mut error = provider_smoke_session_failure(CodexSessionError::Timeout);
+    let cancellation = match observation {
+        StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed => {
+            "confirmed"
+        }
+        StopObservation::UpstreamStillActive => "upstream_still_active",
+        StopObservation::OutcomeUnknown => "outcome_unknown",
+    };
+    error.details.insert(
+        "provider_smoke_cancellation".to_string(),
+        Value::String(cancellation.to_string()),
+    );
+    mark_probe_dispatch_possible(error, true)
+}
+
+fn provider_smoke_failure(error: crate::host::provider_probe::ProviderProbeError) -> SatelleError {
+    let (code, reason) = match error {
+        crate::host::provider_probe::ProviderProbeError::TimedOut => (
+            ErrorCode::ProviderSmokeTestTimeout,
+            "provider_smoke_test_timed_out",
+        ),
+        crate::host::provider_probe::ProviderProbeError::InvalidRequest => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_callback_invalid",
+        ),
+        crate::host::provider_probe::ProviderProbeError::NativeClickNotObserved
+        | crate::host::provider_probe::ProviderProbeError::NativeDragNotObserved => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_callback_incomplete",
+        ),
+        crate::host::provider_probe::ProviderProbeError::Cancelled => {
+            (ErrorCode::ComputerUseNotReady, "provider_smoke_cancelled")
+        }
+        #[cfg(windows)]
+        crate::host::provider_probe::ProviderProbeError::NativeWindow(_) => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_surface_unavailable",
+        ),
+        crate::host::provider_probe::ProviderProbeError::Bind(_)
+        | crate::host::provider_probe::ProviderProbeError::Random(_)
+        | crate::host::provider_probe::ProviderProbeError::Io(_)
+        | crate::host::provider_probe::ProviderProbeError::WorkerSpawn(_)
+        | crate::host::provider_probe::ProviderProbeError::WorkerStopped => (
+            ErrorCode::ComputerUseNotReady,
+            "provider_smoke_surface_unavailable",
+        ),
+    };
+    provider_smoke_error(code, reason)
+}
+
+fn model_provider_binding_missing(provider_intent: &ProviderComputerUseIntent) -> SatelleError {
+    let mut details = BTreeMap::new();
+    if let Some(model) = provider_intent.model() {
+        details.insert(
+            "requested_model_alias".to_string(),
+            Value::String(model.as_str().to_string()),
+        );
+    }
+    if let Some(provider) = provider_intent.provider() {
+        details.insert(
+            "requested_provider_alias".to_string(),
+            Value::String(provider.as_str().to_string()),
+        );
+    }
+    SatelleError {
+        code: ErrorCode::ModelProviderBindingMissing,
+        message: "the requested model and provider aliases have no exact Host binding".to_string(),
+        recovery_command: Some(
+            "configure the exact model/provider pair on the selected Host".to_string(),
+        ),
+        source_detail: None,
+        details,
+    }
+}
+
+fn experimental_provider_opt_in_required(binding: &ResolvedProviderBinding) -> SatelleError {
+    SatelleError {
+        code: ErrorCode::ExperimentalProviderOptInRequired,
+        message: "non-OpenAI provider Computer Use requires explicit opt-in".to_string(),
+        recovery_command: Some(
+            "enable experimental provider Computer Use for this provider or command".to_string(),
+        ),
+        source_detail: None,
+        details: BTreeMap::from([(
+            "requested_provider_alias".to_string(),
+            Value::String(binding.requested_provider_alias().to_string()),
+        )]),
+    }
+}
+
+fn provider_smoke_error(code: ErrorCode, reason: &str) -> SatelleError {
+    let mut details = std::collections::BTreeMap::new();
+    details.insert("reason".to_string(), Value::String(reason.to_string()));
+    SatelleError {
+        code,
+        message: "the selected provider did not pass the live Computer Use smoke test".to_string(),
+        recovery_command: Some(
+            "rerun the original satelle run or steer command with --refresh-provider-smoke-test"
+                .to_string(),
+        ),
+        source_detail: None,
+        details,
+    }
+}
+
+fn provider_smoke_error_from_failure(failure: &ProviderSmokeFailureEvidence) -> SatelleError {
+    annotate_provider_smoke_error(
+        provider_smoke_error(failure.error_code(), failure.failure_reason()),
+        failure.source(),
+        failure.observed_at(),
+        failure.expires_at(),
+    )
+}
+
+fn annotate_provider_smoke_error(
+    mut error: SatelleError,
+    source: ProviderSmokeSource,
+    observed_at: time::OffsetDateTime,
+    expires_at: time::OffsetDateTime,
+) -> SatelleError {
+    let age_ms = (time::OffsetDateTime::now_utc() - observed_at)
+        .whole_milliseconds()
+        .clamp(0, i128::from(u64::MAX)) as u64;
+    error.details.extend([
+        (
+            "provider_smoke_status".to_string(),
+            Value::String("failed".to_string()),
+        ),
+        (
+            "provider_smoke_source".to_string(),
+            Value::String(source.as_str().to_string()),
+        ),
+        (
+            "provider_smoke_observed_at".to_string(),
+            Value::String(
+                observed_at
+                    .format(&Rfc3339)
+                    .expect("provider evidence timestamp is RFC 3339 representable"),
+            ),
+        ),
+        (
+            "provider_smoke_expires_at".to_string(),
+            Value::String(
+                expires_at
+                    .format(&Rfc3339)
+                    .expect("provider evidence expiry is RFC 3339 representable"),
+            ),
+        ),
+        ("provider_smoke_age_ms".to_string(), Value::from(age_ms)),
+    ]);
+    error
+}
+
+impl ComputerUseAdapter for ProductionComputerUseAdapter {
+    fn admit_operation(&self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
+        let snapshot = crate::host::read_production_snapshot(&self.snapshot)?;
+        // Preserve the operation-specific control-plane diagnosis before the
+        // broader native execution verdict. Stop and status intentionally end
+        // here so recovery remains available after execution readiness is lost.
+        snapshot.control_plane_admission.admit(operation)?;
+        if matches!(
+            operation,
+            ControlPlaneOperation::Run | ControlPlaneOperation::Steer
+        ) {
+            supported_execution_version(&snapshot)?;
+        }
+        Ok(())
+    }
+
+    fn requires_upstream_thread_for_follow_up(&self) -> bool {
+        true
+    }
+
+    fn resolve_provider_binding(
+        &self,
+        _host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<ResolvedProviderBinding, SatelleError> {
+        ProductionComputerUseAdapter::resolve_provider_binding(self, provider_intent)
+    }
+
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.preflight_terminal(host, None, None, provider_intent)
+            .into_result()
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        self.native_readiness_key(provider_intent)
+            .map(|(key, _, _)| Some(key))
+    }
+
+    fn preflight_terminal(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> AdapterPreflight {
+        let mut persist_thread_ref = |_value: &str| Ok(());
+        let mut persist_turn_ref = |_value: &str| Ok(());
+        let mut persistence = ProviderProbePersistence {
+            host,
+            cancellation: None,
+            persist_thread_ref: &mut persist_thread_ref,
+            persist_turn_ref: &mut persist_turn_ref,
+            provider_secret: None,
+        };
+        self.preflight_terminal_inner(provider_intent, cached, cached_provider, &mut persistence)
+    }
+
+    fn execute(&self, mut request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        let provider_secret = request.take_resolved_provider_secret();
+        if let (Some(capture), Some(secret)) =
+            (request.raw_protocol_capture(), provider_secret.as_ref())
+        {
+            secret.expose_to_provider(|value| capture.add_known_secret(value));
+        }
+        if let (Some(capture), Some(secret)) =
+            (request.recording_capture(), provider_secret.as_ref())
+        {
+            secret.expose_to_provider(|value| capture.add_known_secret(value));
+        }
+        let policy = request.execution_policy();
+        let binding = request
+            .resolved_provider_binding()
+            .ok_or_else(codex_effective_defaults_unavailable)?;
+        dispatch_with_configured_desktop_target(
+            policy,
+            || self.resolve_configured_desktop_target(policy.desktop_target().binding()),
+            || {
+                let approval_policy = codex_approval_policy(policy.approval_policy())?;
+                let sandbox_policy = codex_sandbox_policy(policy.sandbox_policy());
+                let timeout = Duration::from_secs(u64::from(policy.timeout_policy().seconds()));
+                let deadline = Instant::now()
+                    .checked_add(timeout)
+                    .ok_or_else(|| adapter_failure("timeout_unrepresentable"))?;
+                let cancellation_deadline = deadline
+                    .checked_add(READINESS_CANCELLATION_GRACE)
+                    .unwrap_or(deadline);
+                let runtime_paths = self
+                    .working_directory
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|path| {
+                        prepare_binding_runtime_paths(path, policy.desktop_target().binding())
+                    })?;
+                let control = CodexSessionControl::new(cancellation_deadline);
+                let _active_execution =
+                    self.register_execution(request.subject(), control.clone())?;
+                tracing::debug!(
+                    session_id = %request.subject().session_id(),
+                    turn_id = %request.subject().turn_id(),
+                    "starting Codex native Computer Use execution"
+                );
+
+                // Preserve the original storage failure outside the protocol layer so
+                // a private-reference conflict is not misclassified as transport I/O.
+                let persistence_error = RefCell::new(None);
+                let mut persist_thread_ref = |value: &str| {
+                    request.persist_upstream_thread_ref(value).map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+                };
+                let mut persist_turn_ref = |value: &str| {
+                    request.persist_upstream_turn_ref(value).map_err(|error| {
+                        *persistence_error.borrow_mut() = Some(error);
+                    })
+                };
+                let mut native_approval_published = false;
+                let mut observe_native_approval = || {
+                    if native_approval_published {
+                        return;
+                    }
+                    native_approval_published = true;
+                    let subject = request.subject();
+                    request.publish_live_event(native_approval_event(
+                        subject.host_identity().as_str(),
+                        subject.session_id(),
+                        subject.turn_id(),
+                        request.committed_session_revision(),
+                        request.committed_turn_revision(),
+                    ));
+                };
+                let snapshot = crate::host::read_production_snapshot(&self.snapshot)?;
+                let goal_set_supported = snapshot.goal_set_supported();
+                let image_input_mode = snapshot.image_input_mode();
+                if !request.attachments().is_empty()
+                    && matches!(
+                        image_input_mode,
+                        crate::host::codex_capabilities::CodexImageInputMode::Unsupported
+                    )
+                {
+                    return Err(SatelleError::invalid_usage(
+                        "the selected Codex protocol does not support image input",
+                    ));
+                }
+                let model_provider = provider_child_model_provider(binding);
+                let allowed_app_ids =
+                    crate::host::codex_capabilities::configured_computer_use_allowed_app_ids();
+                let current_app_approval_fingerprint = app_approval_fingerprint_for_policy(
+                    crate::host::codex_capabilities::HostPlatform::current().as_str(),
+                    snapshot.evidence.capabilities.approval_observation.surface,
+                    &allowed_app_ids,
+                    request.execution_policy(),
+                );
+                let admitted_app_approval = request
+                    .admitted_app_approval()
+                    .ok_or_else(|| adapter_failure("app_approval_missing_after_admission"))?;
+                if current_app_approval_fingerprint != admitted_app_approval.fingerprint() {
+                    return Err(adapter_failure("app_approval_changed_after_admission"));
+                }
+                let verified_app_server = preserve_managed_codex_error(
+                    crate::host::codex_capabilities::installed_computer_use_app_server(),
+                )?;
+                let expected_mcp_server_name = verified_app_server.native_mcp_server_name.clone();
+                let prompt = native_computer_use_prompt(
+                    request.prompt(),
+                    &verified_app_server.native_action_path,
+                );
+                let run = run_codex_session_with_timeout_cancellation(
+                    command_for_binding(
+                        verified_app_server.into_command(),
+                        &runtime_paths.codex_home,
+                    ),
+                    CodexSessionRequest {
+                        working_directory: &runtime_paths.working_directory,
+                        prompt: &prompt,
+                        existing_thread_ref: request.upstream_thread_ref(),
+                        model: model_override(policy.effective_model().as_str()),
+                        model_provider,
+                        provider_endpoint: binding.endpoint(),
+                        provider_secret,
+                        execution_mode: request.execution_mode(),
+                        approval_policy,
+                        sandbox_policy,
+                        deadline,
+                        persist_thread_ref: &mut persist_thread_ref,
+                        persist_turn_ref: &mut persist_turn_ref,
+                        observe_native_approval: Some(&mut observe_native_approval),
+                        native_action_evidence: None,
+                        expected_mcp_server_name: &expected_mcp_server_name,
+                        computer_use_allowed_app_ids: admitted_app_approval.allowed_app_ids(),
+                        control: Some(control),
+                        goal_set_supported,
+                        image_input_mode,
+                        attachments: request.attachments(),
+                        raw_protocol_capture: request.raw_protocol_capture().cloned(),
+                        recording_capture: request.recording_capture().cloned(),
+                    },
+                    READINESS_CANCELLATION_GRACE,
+                    None,
+                );
+                finish_timed_turn_execution(run, persistence_error.into_inner())
+            },
+        )
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        if let Some(control) = self.active_control(subject)? {
+            return Ok(control.interrupt());
+        }
+        Ok(stop_observation(
+            subject.turn_state(),
+            subject.has_upstream_references(),
+            self.read_persisted_turn(subject),
+        ))
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        Ok(recovery_observation(self.read_persisted_turn(subject)))
+    }
+
+    fn stop_committed(
+        &self,
+        desktop_binding: &DesktopBindingRef,
+        session_id: &crate::core::SessionId,
+        turn_id: &crate::core::TurnId,
+    ) {
+        let control = self.active_executions.lock().ok().and_then(|mut active| {
+            let execution = active.get(desktop_binding.as_str())?;
+            if execution.session_id != *session_id || execution.turn_id != *turn_id {
+                return None;
+            }
+            active
+                .remove(desktop_binding.as_str())
+                .map(|execution| execution.control)
+        });
+        if let Some(control) = control {
+            control.stop_committed();
+        }
+    }
+}
+
+impl ReadinessProbeDriver for ProductionComputerUseAdapter {
+    fn readiness_probe_timeouts(&self) -> (Duration, Duration) {
+        (self.native_readiness_timeout, self.provider_smoke_timeout)
+    }
+
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        cancellation: &super::request::AdmissionCancellation,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> NativeProbeResult {
+        let observed_at = time::OffsetDateTime::now_utc();
+        let Some(expires_at) = observed_at.checked_add(self.native_readiness_ttl) else {
+            return NativeProbeResult::UncachedFailure(adapter_failure("readiness_ttl_invalid"));
+        };
+        let evidence = match key.evidence(
+            format!("native-readiness-{}", crate::core::SessionId::new()),
+            observed_at,
+            expires_at,
+        ) {
+            Ok(evidence) => evidence,
+            Err(_) => {
+                return NativeProbeResult::UncachedFailure(adapter_failure(
+                    "readiness_evidence_invalid",
+                ));
+            }
+        };
+        if let Some(result) = denied_native_probe_result(key, &evidence) {
+            return result;
+        }
+        let allowed_app_ids =
+            crate::host::codex_capabilities::configured_computer_use_allowed_app_ids();
+        let platform = crate::host::codex_capabilities::HostPlatform::current().as_str();
+        let app_policy_surface = crate::host::read_production_snapshot(&self.snapshot)
+            .map(|snapshot| snapshot.evidence.capabilities.approval_observation.surface);
+        let current_fingerprint = app_policy_surface.map(|surface| {
+            readiness_fingerprint(
+                "app-approval",
+                platform,
+                key.desktop_session_ref(),
+                key.app_approval_state(),
+                &app_policy_fingerprint_material(platform, surface, &allowed_app_ids),
+            )
+        });
+        if !matches!(
+            current_fingerprint.as_deref(),
+            Ok(fingerprint) if fingerprint == key.app_approval_fingerprint()
+        ) {
+            return NativeProbeResult::UncachedFailure(adapter_failure(
+                "readiness_app_policy_changed",
+            ));
+        }
+        match self.run_native_smoke(
+            Some(cancellation),
+            persist_thread_ref,
+            persist_turn_ref,
+            &allowed_app_ids,
+            key,
+        ) {
+            Ok(()) => NativeProbeResult::Passed(evidence),
+            Err(failure) if cancellation.is_requested_or_expired() => {
+                let observation = probe_cancellation_observation(
+                    failure.dispatch_possible,
+                    &failure.error,
+                    "native_readiness_cancellation",
+                );
+                NativeProbeResult::Cancelled(observation)
+            }
+            Err(failure) => NativeProbeResult::Failed {
+                evidence,
+                reason: failure.reason,
+                error: *failure.error,
+                dispatch_possible: failure.dispatch_possible,
+            },
+        }
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        provider_secret: Option<ResolvedProviderSecret>,
+        cancellation: &super::request::AdmissionCancellation,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        let mut persistence = ProviderProbePersistence {
+            host,
+            cancellation: Some(cancellation),
+            persist_thread_ref,
+            persist_turn_ref,
+            provider_secret,
+        };
+        let result = self.preflight_terminal_inner(
+            provider_intent,
+            cached,
+            cached_provider,
+            &mut persistence,
+        );
+        if cancellation.is_requested() {
+            AdapterPreflight::Cancelled(preflight_cancellation_observation(&result))
+        } else {
+            result
+        }
+    }
+
+    fn observe_readiness_probe(
+        &self,
+        subject: &crate::host::storage::ProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        match self.read_readiness_probe_turn(subject) {
+            Some(CodexThreadStatus::Active) => RecoveryObservation::Unknown,
+            Some(CodexThreadStatus::Inactive) => RecoveryObservation::Failed,
+            None => RecoveryObservation::Unknown,
+        }
+    }
+}
+
+fn stop_observation(
+    turn_state: TurnState,
+    has_upstream_references: bool,
+    status: Option<CodexThreadStatus>,
+) -> StopObservation {
+    // The worker must durably enter Running before calling execute, so a
+    // Starting Turn with no private references cannot have reached Codex.
+    // Running and recovery_pending remain ambiguous without exact evidence.
+    if turn_state == TurnState::Starting && !has_upstream_references {
+        return StopObservation::UpstreamInactiveConfirmed;
+    }
+    match status {
+        Some(CodexThreadStatus::Active) => StopObservation::OutcomeUnknown,
+        Some(CodexThreadStatus::Inactive) => StopObservation::UpstreamInactiveConfirmed,
+        None => StopObservation::OutcomeUnknown,
+    }
+}
+
+fn stop_observation_from_detail(error: &SatelleError, field: &str) -> StopObservation {
+    match error.details.get(field).and_then(Value::as_str) {
+        Some("confirmed") => StopObservation::CancellationConfirmed,
+        Some("upstream_still_active") => StopObservation::UpstreamStillActive,
+        Some("outcome_unknown") | None => StopObservation::OutcomeUnknown,
+        Some(_) => StopObservation::OutcomeUnknown,
+    }
+}
+
+fn recovery_observation(status: Option<CodexThreadStatus>) -> RecoveryObservation {
+    match status {
+        Some(CodexThreadStatus::Active) => RecoveryObservation::Unknown,
+        Some(CodexThreadStatus::Inactive) => RecoveryObservation::Failed,
+        None => RecoveryObservation::Unknown,
+    }
+}
+
+struct BindingRuntimePaths {
+    working_directory: PathBuf,
+    codex_home: PathBuf,
+}
+
+fn prepare_binding_runtime_paths(
+    root: &Path,
+    desktop_binding: &DesktopBindingRef,
+) -> Result<BindingRuntimePaths, SatelleError> {
+    let root = prepare_working_directory(root)?;
+    let binding_root = prepare_working_directory(&root.join(desktop_binding.as_str()))?;
+    Ok(BindingRuntimePaths {
+        working_directory: prepare_working_directory(&binding_root.join("work"))?,
+        codex_home: prepare_working_directory(&binding_root.join("codex-home"))?,
+    })
+}
+
+fn command_for_binding(
+    mut command: crate::host::codex_session::CodexCommand,
+    codex_home: &Path,
+) -> crate::host::codex_session::CodexCommand {
+    command.command.env("CODEX_HOME", codex_home);
+    command
+}
+
+fn prepare_working_directory(path: &Path) -> Result<PathBuf, SatelleError> {
+    if !path.is_absolute()
+        || path.ancestors().any(|ancestor| {
+            std::fs::symlink_metadata(ancestor.join(".git")).is_ok()
+                || std::fs::symlink_metadata(ancestor.join(".satelle/config.toml")).is_ok()
+        })
+    {
+        return Err(adapter_failure("unsafe_working_directory"));
+    }
+
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
+    let created = match builder.create(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => return Err(adapter_failure("working_directory_unavailable")),
+    };
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| adapter_failure("working_directory_unavailable"))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(adapter_failure("unsafe_working_directory"));
+    }
+
+    // Resolve configured parent links before enforcing the project boundary.
+    // Returning this canonical path also prevents the child from traversing a
+    // different ancestor chain than the one inspected here.
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| adapter_failure("working_directory_unavailable"))?;
+    if canonical.ancestors().any(|ancestor| {
+        std::fs::symlink_metadata(ancestor.join(".git")).is_ok()
+            || std::fs::symlink_metadata(ancestor.join(".satelle/config.toml")).is_ok()
+    }) {
+        if created {
+            let _ = std::fs::remove_dir(path);
+        }
+        return Err(adapter_failure("unsafe_working_directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(adapter_failure("unsafe_working_directory"));
+        }
+    }
+    Ok(canonical)
+}
+
+fn codex_approval_policy(policy: ApprovalPolicy) -> Result<CodexApprovalPolicy, SatelleError> {
+    match policy {
+        ApprovalPolicy::Untrusted => Ok(CodexApprovalPolicy::Untrusted),
+        ApprovalPolicy::OnRequest => Ok(CodexApprovalPolicy::OnRequest),
+        ApprovalPolicy::Never => Ok(CodexApprovalPolicy::Never),
+        ApprovalPolicy::OnFailure => Err(adapter_failure("approval_policy_unsupported")),
+    }
+}
+
+fn codex_sandbox_policy(policy: SandboxPolicy) -> CodexSandboxPolicy {
+    match policy {
+        SandboxPolicy::ReadOnly => CodexSandboxPolicy::ReadOnly,
+        SandboxPolicy::WorkspaceWrite => CodexSandboxPolicy::WorkspaceWrite,
+        SandboxPolicy::DangerFullAccess => CodexSandboxPolicy::DangerFullAccess,
+    }
+}
+
+fn dispatch_with_configured_desktop_target<T>(
+    policy: &ExecutionPolicy,
+    resolve_configured: impl FnOnce() -> Result<DesktopTarget, SatelleError>,
+    dispatch: impl FnOnce() -> Result<T, SatelleError>,
+) -> Result<T, SatelleError> {
+    let configured = resolve_configured()?;
+    if policy.desktop_target() != &configured {
+        return Err(SatelleError::desktop_session_unavailable(Some(
+            policy.desktop_target().binding().as_str(),
+        )));
+    }
+    dispatch()
+}
+
+fn terminal_result(
+    result: Result<CodexSessionTerminal, CodexSessionFailure>,
+) -> Result<ExecuteResult, SatelleError> {
+    match result {
+        Ok(CodexSessionTerminal::Completed) => {
+            Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
+        }
+        // A matching terminal interruption proves that upstream execution no
+        // longer owns the desktop. The normal stop path wins its own CAS race;
+        // an unsolicited interruption is a truthful failed execution.
+        Ok(
+            CodexSessionTerminal::Interrupted
+            | CodexSessionTerminal::Failed(crate::host::codex_session::CodexFailedTurnKind::Other),
+        ) => Ok(ExecuteResult::new(TurnTransition::Failed, Vec::new())),
+        Ok(CodexSessionTerminal::Failed(
+            crate::host::codex_session::CodexFailedTurnKind::Classified(reason),
+        )) => Ok(ExecuteResult::terminal_failure(adapter_failure(reason))),
+        Ok(CodexSessionTerminal::StoppedByControl) => Ok(ExecuteResult::stopped_by_control()),
+        // A cleanup failure is never an ordinary terminal outcome. Even when
+        // no turn was dispatched, the daemon has not proven that its private
+        // app-server process group stopped.
+        Err(failure) if failure.error() == CodexSessionError::Containment => {
+            Err(session_failure(CodexSessionError::Containment))
+        }
+        // Before turn/start is written, there is no possible upstream desktop
+        // owner to recover. Commit a terminal failure instead of leaking a
+        // recovery_pending Turn that no upstream execution can reconcile.
+        Err(failure) if !failure.turn_dispatch_attempted() => {
+            Ok(ExecuteResult::new(TurnTransition::Failed, Vec::new()))
+        }
+        // Codex reported `turn/completed` without one successful correlated
+        // native tool item. Upstream is terminal, so nothing owns the desktop
+        // and recovery could only relabel the missing evidence as success.
+        // Commit a typed terminal failure that keeps the evidence reason.
+        Err(failure) if failure.error() == CodexSessionError::NativeActionUnavailable => {
+            Ok(ExecuteResult::terminal_failure(session_failure(
+                CodexSessionError::NativeActionUnavailable,
+            )))
+        }
+        Err(failure) => Err(session_failure(failure.error())),
+    }
+}
+
+fn finish_execution(
+    result: Result<CodexSessionTerminal, CodexSessionFailure>,
+    persistence_error: Option<SatelleError>,
+) -> Result<ExecuteResult, SatelleError> {
+    if let (Err(failure), Some(error)) = (result, persistence_error)
+        && failure.turn_dispatch_attempted()
+    {
+        return Err(error);
+    }
+    terminal_result(result)
+}
+
+fn finish_timed_turn_execution(
+    run: TimedCodexSessionRun,
+    persistence_error: Option<SatelleError>,
+) -> Result<ExecuteResult, SatelleError> {
+    let Some(cancellation) = run.cancellation else {
+        return finish_execution(run.result, persistence_error);
+    };
+    if let (Err(failure), Some(error)) = (&run.result, persistence_error)
+        && failure.turn_dispatch_attempted()
+    {
+        return Err(error);
+    }
+    if matches!(
+        &run.result,
+        Err(failure) if failure.error() == CodexSessionError::Containment
+    ) {
+        return Err(session_failure(CodexSessionError::Containment));
+    }
+    match run.result {
+        result @ Ok(
+            CodexSessionTerminal::Completed
+            | CodexSessionTerminal::Interrupted
+            | CodexSessionTerminal::Failed(_),
+        ) => terminal_result(result),
+        Ok(CodexSessionTerminal::StoppedByControl) | Err(_)
+            if matches!(
+                cancellation,
+                StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed
+            ) =>
+        {
+            Ok(ExecuteResult::terminal_failure(session_failure(
+                CodexSessionError::Timeout,
+            )))
+        }
+        Ok(CodexSessionTerminal::StoppedByControl) | Err(_) => {
+            Err(session_failure(CodexSessionError::Timeout))
+        }
+    }
+}
+
+fn session_failure(error: CodexSessionError) -> SatelleError {
+    if error == CodexSessionError::YoloNotSupported {
+        return SatelleError::yolo_not_supported();
+    }
+    let reason = match error {
+        CodexSessionError::Spawn => "spawn_failed",
+        CodexSessionError::Write => "write_failed",
+        CodexSessionError::MalformedMessage => "malformed_message",
+        CodexSessionError::OversizedMessage => "oversized_message",
+        CodexSessionError::UnexpectedResponse => "unexpected_response",
+        CodexSessionError::DuplicateResponse => "duplicate_response",
+        CodexSessionError::ResponseError => "response_error",
+        CodexSessionError::YoloNotSupported => unreachable!(),
+        CodexSessionError::ConflictingIdentity => "conflicting_identity",
+        CodexSessionError::PrematureExit => "premature_exit",
+        CodexSessionError::Timeout => "timeout",
+        CodexSessionError::Persistence => "persistence_failed",
+        CodexSessionError::Containment => "containment_failed",
+        CodexSessionError::Control => "control_failed",
+        CodexSessionError::NativeActionUnavailable => "native_action_unavailable",
+    };
+    adapter_failure(reason)
+}
+
+fn adapter_failure(reason: &'static str) -> SatelleError {
+    let mut details = std::collections::BTreeMap::new();
+    details.insert("reason".to_string(), Value::String(reason.to_string()));
+    SatelleError {
+        code: ErrorCode::RemoteExecution,
+        message: "the private Codex app-server execution failed".to_string(),
+        recovery_command: None,
+        source_detail: None,
+        details,
+    }
+}
+
+fn preserve_managed_codex_error(
+    command: Result<crate::host::codex_capabilities::VerifiedComputerUseAppServer, SatelleError>,
+) -> Result<crate::host::codex_capabilities::VerifiedComputerUseAppServer, SatelleError> {
+    command
+}
+
+fn host_turn_timeout_ceiling() -> Result<TimeoutPolicy, SatelleError> {
+    TimeoutPolicy::bounded_seconds((crate::core::MAX_TURN_EXECUTION_TIMEOUT_MS / 1_000) as u32)
+        .map_err(|_| adapter_failure("timeout_policy_invalid"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_provider_resolution_allows_a_cold_managed_control_plane() {
+        assert!(
+            DEFAULT_PROVIDER_RESOLUTION_TIMEOUT >= Duration::from_secs(60),
+            "default resolution must include serialized inventory and app-server startup"
+        );
+    }
+
+    #[test]
+    fn persisted_turn_recovery_allows_a_cold_managed_control_plane() {
+        assert!(
+            PERSISTED_TURN_READ_TIMEOUT >= Duration::from_secs(120),
+            "recovery must outlive cold app-server startup before retaining ownership as unknown"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn native_adapter_rejects_cross_user_control_without_a_secure_handoff() {
+        let snapshot = Arc::new(RwLock::new(
+            crate::host::ProductionCapabilitySnapshot::collect(None),
+        ));
+        let adapter = ProductionComputerUseAdapter::new(snapshot, Ok(PathBuf::from(".")));
+        let current_user = crate::host::desktop_sessions::current_process_user()
+            .expect("the test host resolves its process user");
+        let policy = DesktopSelectionPolicy {
+            desktop_user: Some(format!("{current_user}-other")),
+            preference: None,
+            native_selector: None,
+        };
+        let binding = DesktopBindingRef::new("other-user").unwrap();
+
+        assert_eq!(
+            adapter
+                .require_secure_desktop_handoff(&binding, &policy)
+                .expect_err("the native adapter exposes no cross-user handoff")
+                .code,
+            ErrorCode::DesktopBindingSecureHandoffUnsupported
+        );
+    }
+
+    #[test]
+    fn desktop_bindings_receive_separate_work_and_codex_home_paths() {
+        let state = crate::host::TestStateDir::new().expect("temporary state directory");
+        let root = std::fs::canonicalize(state.path()).expect("canonical state directory");
+        let alice = prepare_binding_runtime_paths(&root, &DesktopBindingRef::new("alice").unwrap())
+            .expect("prepare Alice's runtime paths");
+        let bob = prepare_binding_runtime_paths(&root, &DesktopBindingRef::new("bob").unwrap())
+            .expect("prepare Bob's runtime paths");
+
+        assert_ne!(alice.working_directory, bob.working_directory);
+        assert_ne!(alice.codex_home, bob.codex_home);
+        assert!(alice.working_directory.starts_with(root.join("alice")));
+        assert!(bob.codex_home.starts_with(root.join("bob")));
+    }
+
+    #[test]
+    fn native_approval_event_contains_only_normalized_manual_action_state() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+
+        let session_state_revision = SessionStateRevision::new(7).unwrap();
+        let turn_state_revision = TurnStateRevision::new(3).unwrap();
+        let event = native_approval_event(
+            "host-a",
+            &session_id,
+            &turn_id,
+            session_state_revision,
+            turn_state_revision,
+        );
+
+        assert_eq!(event.event_type(), EventType::ActionRequired);
+        assert_eq!(event.source(), EventSource::CodexAdapter);
+        assert_eq!(event.host(), "host-a");
+        assert_eq!(event.session_id(), Some(&session_id));
+        assert_eq!(event.turn_id(), Some(&turn_id));
+        assert_eq!(
+            event.state_subject(),
+            Some(&crate::core::EventStateSubject::Turn {
+                session_state_revision,
+                turn_state_revision,
+            })
+        );
+        assert_eq!(
+            event.data(),
+            &json!({
+                "kind": "native_codex_approval",
+                "status": "manual_action_required",
+                "decision": "declined",
+            })
+        );
+    }
+
+    struct ScopedEnvironmentVariable(String);
+
+    impl Drop for ScopedEnvironmentVariable {
+        fn drop(&mut self) {
+            // SAFETY: each test uses a UUID-qualified variable it alone owns.
+            unsafe {
+                std::env::remove_var(&self.0);
+            }
+        }
+    }
+
+    fn execution_policy_for(desktop_binding: &str, desktop_session_id: &str) -> ExecutionPolicy {
+        ExecutionPolicy::new(
+            EffectiveModelRef::new(DEFAULT_MODEL_BINDING).unwrap(),
+            ProviderBindingRef::new(DEFAULT_PROVIDER_BINDING).unwrap(),
+            DesktopTarget::new(
+                DesktopBindingRef::new(desktop_binding).unwrap(),
+                desktop_session_id,
+            ),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Disabled),
+        )
+    }
+
+    fn native_readiness_test_key(
+        desktop_session_id: &str,
+        os_permission_state: ReadinessObservationState,
+        app_approval_state: ReadinessObservationState,
+    ) -> ReadinessCacheKey {
+        native_readiness_test_key_with_policy(
+            desktop_session_id,
+            os_permission_state,
+            app_approval_state,
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+        )
+    }
+
+    fn native_readiness_test_key_with_policy(
+        desktop_session_id: &str,
+        os_permission_state: ReadinessObservationState,
+        app_approval_state: ReadinessObservationState,
+        approval_policy: ApprovalPolicy,
+        sandbox_policy: SandboxPolicy,
+    ) -> ReadinessCacheKey {
+        let desktop_binding = DesktopBindingRef::new("readiness-test-desktop").unwrap();
+        let mut policy = execution_policy_for(desktop_binding.as_str(), desktop_session_id);
+        policy = ExecutionPolicy::new(
+            policy.effective_model().clone(),
+            policy.provider_binding().clone(),
+            policy.desktop_target().clone(),
+            approval_policy,
+            sandbox_policy,
+            policy.timeout_policy(),
+            policy.experimental_features(),
+        );
+        ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            desktop_binding.clone(),
+            policy,
+            "0.144.0",
+            "codex-native-0.144.0",
+            None::<String>,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            os_permission_state,
+            app_approval_state,
+        )
+        .unwrap()
+    }
+
+    fn resolved_provider_binding_for_test(
+        model_alias: &str,
+        provider_alias: &str,
+    ) -> ResolvedProviderBinding {
+        ResolvedProviderBinding::from_authorization(
+            crate::core::ProviderBindingAuthorization::new(
+                model_alias,
+                provider_alias,
+                model_alias,
+                provider_alias,
+            )
+            .with_experimental_provider_computer_use(true),
+            crate::core::ProviderBindingSource::HostOwned,
+        )
+    }
+
+    #[test]
+    fn credential_helper_receives_the_authorized_provider_and_target_host() {
+        let (_directory, helper) = crate::host::credential_helper::tests::helper("success", "10s");
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new("model-alias", "provider-alias", "model", "openai")
+                .with_auth_source(crate::core::ProviderSecretSource::ExecutableHelper(helper)),
+            ProviderBindingSource::HostOwned,
+        );
+        let secret = resolve_provider_child_secret(&binding, "host-alias")
+            .expect("the Host resolver sends the authorized binding and Host alias")
+            .expect("the helper returned a credential");
+        assert!(secret.expose_to_provider(|value| value == "test-provider-secret"));
+
+        let (_directory, helper) = crate::host::credential_helper::tests::helper("sleep", "200ms");
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new("model-alias", "provider-alias", "model", "openai")
+                .with_auth_source(crate::core::ProviderSecretSource::ExecutableHelper(helper)),
+            ProviderBindingSource::HostOwned,
+        );
+        let error = resolve_provider_child_secret(&binding, "host-alias").unwrap_err();
+        assert_eq!(error.code, ErrorCode::CredentialHelperTimeout);
+        assert_eq!(error.details["reason"], "credential_helper_timeout");
+    }
+
+    #[test]
+    fn provider_credential_rotation_cannot_cross_preflight_execution_boundary() {
+        let environment = ScopedEnvironmentVariable(format!(
+            "SATELLE_PROVIDER_ROTATION_TEST_{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        // SAFETY: the UUID-qualified name is owned only by this test.
+        unsafe {
+            std::env::set_var(&environment.0, "preflight-provider-secret");
+        }
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new(
+                "rotation-model",
+                "rotation-provider",
+                "rotation-model",
+                "openai",
+            )
+            .with_auth_source(crate::core::ProviderSecretSource::Environment {
+                variable: environment.0.clone(),
+            }),
+            ProviderBindingSource::HostOwned,
+        );
+        let smoked_secret = resolve_provider_child_secret(&binding, "test-host")
+            .expect("resolve the credential used by smoke");
+        let fingerprinter = ProviderSmokeCredentialFingerprinter::for_test([0x5a; 32]);
+        let preflight_fingerprint = fingerprinter
+            .fingerprint(binding.binding_digest(), smoked_secret.as_ref())
+            .unwrap();
+        drop(smoked_secret);
+
+        // SAFETY: the UUID-qualified name is owned only by this test.
+        unsafe {
+            std::env::set_var(&environment.0, "rotated-provider-secret");
+        }
+        let rotation_error = resolve_execution_provider_secret(
+            &binding,
+            "test-host",
+            &preflight_fingerprint,
+            &fingerprinter,
+        )
+        .expect_err("rotation after smoke must fail before admission");
+        assert_eq!(
+            rotation_error.code,
+            ErrorCode::ProviderSecretResolutionFailed
+        );
+        assert_eq!(
+            rotation_error.details["reason"],
+            "provider_auth_changed_during_preflight"
+        );
+
+        // A credential accepted by preflight is staged by value. Later source
+        // rotation cannot replace the bytes consumed by execution.
+        unsafe {
+            std::env::set_var(&environment.0, "preflight-provider-secret");
+        }
+        let provider_secret = resolve_execution_provider_secret(
+            &binding,
+            "test-host",
+            &preflight_fingerprint,
+            &fingerprinter,
+        )
+        .expect("an unchanged credential remains admissible");
+        let prepared_secret =
+            crate::host::runtime::adapter::PreparedProviderSecret::new(provider_secret);
+        unsafe {
+            std::env::set_var(&environment.0, "post-admission-provider-secret");
+        }
+        let staged_secret = prepared_secret
+            .take()
+            .expect("the binding has a provider credential");
+        assert!(
+            staged_secret.expose_to_provider(|secret| { secret == "preflight-provider-secret" })
+        );
+    }
+
+    #[test]
+    fn staged_candidate_live_smoke_succeeds_without_destination_secret() {
+        let environment = ScopedEnvironmentVariable(format!(
+            "SATELLE_PROVIDER_CANDIDATE_MISSING_TEST_{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new(
+                "candidate-model",
+                "candidate-provider",
+                "candidate-model",
+                "openai",
+            )
+            .with_auth_source(crate::core::ProviderSecretSource::Environment {
+                variable: environment.0.clone(),
+            }),
+            ProviderBindingSource::HostOwned,
+        );
+        let candidate = Some(ResolvedProviderSecret::for_test(
+            "replacement-provider-secret",
+        ));
+        let fingerprinter = ProviderSmokeCredentialFingerprinter::for_test([0x5a; 32]);
+        let candidate_fingerprint = fingerprinter
+            .fingerprint(binding.binding_digest(), candidate.as_ref())
+            .unwrap();
+        let working_directory = tempfile::tempdir().expect("provider smoke working directory");
+        let mut persist_thread_ref = |_value: &str| Ok(());
+        let mut persist_turn_ref = |_value: &str| Ok(());
+        let allowed_app_ids = BTreeSet::new();
+        let request = provider_smoke_session_request(
+            &binding,
+            candidate,
+            working_directory.path(),
+            "candidate live smoke",
+            Instant::now() + Duration::from_secs(10),
+            "computer-use",
+            ProviderSmokeSessionControl {
+                computer_use_allowed_app_ids: &allowed_app_ids,
+                native_action_evidence: crate::host::provider_probe::NativeActionEvidence::new(),
+                persist_thread_ref: &mut persist_thread_ref,
+                persist_turn_ref: &mut persist_turn_ref,
+            },
+        );
+        assert!(
+            request
+                .provider_secret
+                .as_ref()
+                .is_some_and(|secret| secret
+                    .expose_to_provider(|value| value == "replacement-provider-secret")),
+            "the live smoke request must own the staged candidate"
+        );
+        drop(request);
+
+        assert!(
+            resolve_provider_child_secret(&binding, "test-host").is_err(),
+            "the destination is intentionally absent before candidate commit"
+        );
+        let prepared = provider_secret_after_live_smoke(
+            &binding,
+            "test-host",
+            &candidate_fingerprint,
+            &fingerprinter,
+            true,
+        )
+        .expect("candidate evidence must not re-resolve the absent destination");
+        assert!(prepared.is_none());
+    }
+
+    #[test]
+    fn staged_candidate_rotation_skips_post_smoke_reresolution_but_normal_admission_does_not() {
+        let environment = ScopedEnvironmentVariable(format!(
+            "SATELLE_PROVIDER_CANDIDATE_ROTATION_TEST_{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        unsafe {
+            std::env::set_var(&environment.0, "preflight-provider-secret");
+        }
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new(
+                "rotation-model",
+                "rotation-provider",
+                "rotation-model",
+                "openai",
+            )
+            .with_auth_source(crate::core::ProviderSecretSource::Environment {
+                variable: environment.0.clone(),
+            }),
+            ProviderBindingSource::HostOwned,
+        );
+        let smoked_secret = resolve_provider_child_secret(&binding, "test-host")
+            .expect("resolve the preflight credential");
+        let fingerprinter = ProviderSmokeCredentialFingerprinter::for_test([0x5a; 32]);
+        let preflight_fingerprint = fingerprinter
+            .fingerprint(binding.binding_digest(), smoked_secret.as_ref())
+            .unwrap();
+        drop(smoked_secret);
+
+        unsafe {
+            std::env::set_var(&environment.0, "rotated-destination-secret");
+        }
+        let candidate_prepared = provider_secret_after_live_smoke(
+            &binding,
+            "test-host",
+            &preflight_fingerprint,
+            &fingerprinter,
+            true,
+        )
+        .expect("a consumed candidate must not consult the rotated destination");
+        assert!(candidate_prepared.is_none());
+
+        let normal_error = provider_secret_after_live_smoke(
+            &binding,
+            "test-host",
+            &preflight_fingerprint,
+            &fingerprinter,
+            false,
+        )
+        .expect_err("normal admission must re-resolve and detect rotation");
+        assert_eq!(
+            normal_error.details["reason"],
+            "provider_auth_changed_during_preflight"
+        );
+    }
+
+    #[test]
+    fn endpointless_custom_provider_auth_source_is_rejected() {
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new(
+                "custom-model",
+                "custom-provider",
+                "custom-model",
+                "custom-provider",
+            )
+            .with_auth_source(crate::core::ProviderSecretSource::Environment {
+                variable: "SATELLE_CUSTOM_PROVIDER_SECRET".to_string(),
+            })
+            .with_experimental_provider_computer_use(true),
+            ProviderBindingSource::HostOwned,
+        );
+
+        let error = resolve_provider_child_secret(&binding, "test-host")
+            .expect_err("endpoint-less custom-provider credentials must fail closed");
+        assert_eq!(
+            error.details["reason"],
+            "provider_auth_destination_unsupported"
+        );
+    }
+
+    #[test]
+    fn resolved_provider_binding_constructs_exact_provider_child_request() {
+        let binding = ResolvedProviderBinding::from_authorization(
+            crate::core::ProviderBindingAuthorization::new(
+                "requested-visual-model",
+                "requested-provider",
+                "provider-concrete-model",
+                "provider-concrete-id",
+            )
+            .with_endpoint("https://provider.invalid/v1")
+            .with_auth_source(crate::core::ProviderSecretSource::Environment {
+                variable: "SATELLE_PROVIDER_API_KEY".to_string(),
+            }),
+            crate::core::ProviderBindingSource::UserConfig,
+        );
+        let working_directory = tempfile::tempdir().expect("child working directory");
+        let prompt = "PRIVATE_PROVIDER_SMOKE_PROMPT";
+        let mut persist_thread_ref = |_value: &str| Ok(());
+        let mut persist_turn_ref = |_value: &str| Ok(());
+        let allowed_app_ids = BTreeSet::new();
+
+        let request = provider_smoke_session_request(
+            &binding,
+            Some(ResolvedProviderSecret::for_test(
+                "PRIVATE_PROVIDER_SECRET_CANARY",
+            )),
+            working_directory.path(),
+            prompt,
+            Instant::now() + Duration::from_secs(10),
+            "computer-use",
+            ProviderSmokeSessionControl {
+                computer_use_allowed_app_ids: &allowed_app_ids,
+                native_action_evidence: crate::host::provider_probe::NativeActionEvidence::new(),
+                persist_thread_ref: &mut persist_thread_ref,
+                persist_turn_ref: &mut persist_turn_ref,
+            },
+        );
+
+        assert_eq!(request.model, Some("provider-concrete-model"));
+        assert_eq!(request.model_provider, Some(PROVIDER_CHILD_ID));
+        assert_eq!(
+            request.provider_endpoint,
+            Some("https://provider.invalid/v1")
+        );
+        assert!(
+            request.provider_secret.is_some(),
+            "the opaque resolved secret must remain owned by this child request"
+        );
+        assert_eq!(request.working_directory, working_directory.path());
+        assert_eq!(request.prompt, prompt);
+    }
+
+    #[test]
+    fn provider_endpoint_accepts_only_safe_http_and_https_urls() {
+        for endpoint in ["http://127.0.0.1:8317/v1", "https://provider.invalid/v1"] {
+            validate_provider_endpoint(endpoint).expect("safe provider endpoint");
+        }
+        for endpoint in [
+            "ftp://provider.invalid/v1",
+            "https://user@provider.invalid/v1",
+            "https://user:password@provider.invalid/v1",
+            "https://provider.invalid/v1?token=PRIVATE_QUERY_CANARY",
+            "https://provider.invalid/v1#PRIVATE_FRAGMENT_CANARY",
+            "https://:443/v1",
+            "https://provider.invalid:not-a-port/v1",
+            "https://provider.invalid:65536/v1",
+        ] {
+            let error = validate_provider_endpoint(endpoint).expect_err("unsafe provider endpoint");
+            assert_eq!(error.code, ErrorCode::ModelProviderBindingMissing);
+            assert_eq!(error.details["reason"], "provider_endpoint_invalid");
+            let serialized = serde_json::to_string(&error).expect("serialize endpoint failure");
+            assert!(!serialized.contains("PRIVATE_QUERY_CANARY"));
+            assert!(!serialized.contains("PRIVATE_FRAGMENT_CANARY"));
+        }
+    }
+
+    #[test]
+    fn configured_desktop_mismatch_is_rejected_before_codex_dispatch() {
+        let dispatch_attempted = std::cell::Cell::new(false);
+        let error = dispatch_with_configured_desktop_target(
+            &execution_policy_for("admitted-desktop", "admitted-session"),
+            || {
+                Ok(DesktopTarget::new(
+                    DesktopBindingRef::new("configured-desktop").unwrap(),
+                    "configured-session",
+                ))
+            },
+            || {
+                dispatch_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a changed Desktop Binding must block Codex dispatch");
+
+        assert_eq!(error.code, ErrorCode::DesktopSessionUnavailable);
+        assert_eq!(error.details["desktop_user"], "admitted-desktop");
+        assert!(
+            !dispatch_attempted.get(),
+            "Desktop Binding enforcement must run before Codex dispatch"
+        );
+    }
+
+    #[test]
+    fn configured_desktop_session_mismatch_is_rejected_before_codex_dispatch() {
+        let dispatch_attempted = std::cell::Cell::new(false);
+        let error = dispatch_with_configured_desktop_target(
+            &execution_policy_for("configured-desktop", "admitted-session"),
+            || {
+                Ok(DesktopTarget::new(
+                    DesktopBindingRef::new("configured-desktop").unwrap(),
+                    "different-session",
+                ))
+            },
+            || {
+                dispatch_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a changed Desktop Session must block Codex dispatch");
+
+        assert_eq!(error.code, ErrorCode::DesktopSessionUnavailable);
+        assert_eq!(error.details["desktop_user"], "configured-desktop");
+        assert!(
+            !dispatch_attempted.get(),
+            "Desktop Session enforcement must run before Codex dispatch"
+        );
+    }
+
+    #[test]
+    fn exact_configured_desktop_target_dispatches() {
+        let dispatch_attempted = std::cell::Cell::new(false);
+        dispatch_with_configured_desktop_target(
+            &execution_policy_for("configured-desktop", "configured-session"),
+            || {
+                Ok(DesktopTarget::new(
+                    DesktopBindingRef::new("configured-desktop").unwrap(),
+                    "configured-session",
+                ))
+            },
+            || {
+                dispatch_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect("an unchanged Desktop Target must dispatch");
+
+        assert!(dispatch_attempted.get());
+    }
+
+    #[test]
+    fn production_adapter_preserves_managed_codex_integrity_errors() {
+        let integrity_error = SatelleError {
+            code: ErrorCode::StorageIntegrityFailed,
+            message: "managed Codex integrity failed".to_string(),
+            recovery_command: None,
+            source_detail: None,
+            details: std::collections::BTreeMap::from([(
+                "reason".to_string(),
+                Value::String("immutable_binary_digest_mismatch".to_string()),
+            )]),
+        };
+
+        let propagated = preserve_managed_codex_error(Err(integrity_error))
+            .expect_err("the adapter must not replace an integrity error");
+
+        assert_eq!(propagated.code, ErrorCode::StorageIntegrityFailed);
+        assert_eq!(
+            propagated.details["reason"],
+            Value::String("immutable_binary_digest_mismatch".to_string())
+        );
+    }
+
+    #[test]
+    fn production_host_timeout_ceiling_allows_resolved_limits_through_24_hours() {
+        assert_eq!(host_turn_timeout_ceiling().unwrap().seconds(), 24 * 60 * 60);
+    }
+
+    #[test]
+    fn native_probe_pre_dispatch_result_wins_simultaneous_watchdog_cancellation() {
+        let failure = classify_native_probe_run(crate::host::codex_session::TimedCodexSessionRun {
+            result: Err(CodexSessionFailure::before_turn_dispatch_for_test(
+                CodexSessionError::Persistence,
+            )),
+            cancellation: Some(StopObservation::OutcomeUnknown),
+        })
+        .expect_err("known pre-dispatch failure must win the watchdog race");
+
+        assert_eq!(failure.reason, "native_readiness_persistence_failed");
+        assert!(!failure.dispatch_possible);
+    }
+
+    #[test]
+    fn native_session_failure_is_classified_before_waiting_for_the_action_surface() {
+        let run = crate::host::codex_session::TimedCodexSessionRun {
+            result: Err(CodexSessionFailure::after_exchange(
+                CodexSessionError::ResponseError,
+                true,
+            )),
+            cancellation: None,
+        };
+
+        let failure = classify_native_probe_failure_before_action_wait(&run)
+            .expect("a terminal session failure cannot produce native readiness");
+
+        assert_eq!(failure.reason, "native_readiness_response_error");
+        assert_eq!(
+            failure.error.details["reason"],
+            "native_readiness_response_error"
+        );
+        assert!(failure.dispatch_possible);
+    }
+
+    #[test]
+    fn postdispatch_shutdown_failure_still_waits_for_a_confirmed_native_callback() {
+        let run = crate::host::codex_session::TimedCodexSessionRun {
+            result: Err(CodexSessionFailure::after_exchange(
+                CodexSessionError::Containment,
+                true,
+            )),
+            cancellation: Some(StopObservation::CancellationConfirmed),
+        };
+
+        assert!(classify_native_probe_failure_before_action_wait(&run).is_none());
+        assert!(classify_native_probe_completion(run, Ok(())).is_ok());
+    }
+
+    #[test]
+    fn failed_turn_is_classified_before_waiting_for_the_action_surface() {
+        let run = crate::host::codex_session::TimedCodexSessionRun {
+            result: Ok(CodexSessionTerminal::Failed(
+                crate::host::codex_session::CodexFailedTurnKind::Other,
+            )),
+            cancellation: None,
+        };
+
+        let failure = classify_native_probe_failure_before_action_wait(&run)
+            .expect("a failed turn cannot produce native readiness");
+
+        assert_eq!(failure.reason, "native_readiness_session_failed");
+        assert!(!failure.dispatch_possible);
+    }
+
+    #[test]
+    fn failed_turn_after_confirmed_cancellation_still_accepts_a_native_callback() {
+        let run = crate::host::codex_session::TimedCodexSessionRun {
+            result: Ok(CodexSessionTerminal::Failed(
+                crate::host::codex_session::CodexFailedTurnKind::Other,
+            )),
+            cancellation: Some(StopObservation::CancellationConfirmed),
+        };
+
+        assert!(classify_native_probe_failure_before_action_wait(&run).is_none());
+        assert!(classify_native_probe_completion(run, Ok(())).is_ok());
+    }
+
+    #[test]
+    fn native_callbacks_survive_confirmed_deadline_cancellation() {
+        let outcome = classify_native_probe_completion(
+            crate::host::codex_session::TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::Interrupted),
+                cancellation: Some(StopObservation::CancellationConfirmed),
+            },
+            Ok(()),
+        );
+
+        assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn native_callbacks_do_not_hide_an_unconfirmed_upstream_turn() {
+        let failure = classify_native_probe_completion(
+            crate::host::codex_session::TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::Interrupted),
+                cancellation: Some(StopObservation::OutcomeUnknown),
+            },
+            Ok(()),
+        )
+        .expect_err("unknown upstream state must block readiness");
+
+        assert_eq!(failure.reason, "native_readiness_timed_out");
+        assert_eq!(
+            failure.error.details["native_readiness_cancellation"],
+            "outcome_unknown"
+        );
+    }
+
+    #[test]
+    fn provider_probe_pre_dispatch_result_wins_simultaneous_watchdog_cancellation() {
+        let failure =
+            classify_provider_probe_run(crate::host::codex_session::TimedCodexSessionRun {
+                result: Err(CodexSessionFailure::before_turn_dispatch_for_test(
+                    CodexSessionError::Persistence,
+                )),
+                cancellation: Some(StopObservation::OutcomeUnknown),
+            })
+            .expect_err("known pre-dispatch failure must win the watchdog race");
+
+        assert_eq!(
+            failure.details["probe_dispatch_possible"],
+            serde_json::Value::Bool(false)
+        );
+        assert!(
+            !failure.details.contains_key("provider_smoke_cancellation"),
+            "the unconfirmed watchdog observation must not replace terminal startup evidence"
+        );
+    }
+
+    #[test]
+    fn control_plane_failure_precedes_live_preflight_for_run_and_steer() {
+        let evidence = crate::host::codex_capabilities::Phase0CapabilityEvidence {
+            codex_version: crate::host::codex_capabilities::CodexVersionEvidence::Detected {
+                version: crate::host::codex_capabilities::MINIMUM_CODEX_VERSION,
+            },
+            host_platform: crate::host::codex_capabilities::HostPlatform::Windows,
+            capabilities: crate::host::codex_capabilities::CapabilityMatrix::unproven(),
+        };
+        let snapshot = Arc::new(RwLock::new(crate::host::ProductionCapabilitySnapshot {
+            evidence,
+            verdict: crate::host::evaluate_phase0_support(evidence),
+            control_plane_admission:
+                crate::host::codex_capabilities::ControlPlaneAdmission::unavailable(
+                    crate::core::ControlPlaneFailureReason::HandshakeUnavailable,
+                ),
+            budget_failure: None,
+            started_at: "2026-07-17T00:00:00Z".to_string(),
+            finished_at: "2026-07-17T00:00:01Z".to_string(),
+            duration_ms: 1_000,
+        }));
+        let adapter = ProductionComputerUseAdapter::new(
+            Arc::clone(&snapshot),
+            Ok(tempfile::tempdir().unwrap().path().join("codex-work")),
+        );
+
+        for operation in [ControlPlaneOperation::Run, ControlPlaneOperation::Steer] {
+            let error = adapter
+                .admit_operation(operation)
+                .expect_err("control-plane admission must precede native readiness");
+            assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
+            assert_eq!(error.details["operation"], operation.as_str());
+        }
+        for operation in [ControlPlaneOperation::Stop, ControlPlaneOperation::Status] {
+            let error = adapter
+                .admit_operation(operation)
+                .expect_err("recovery operations must retain control-plane admission");
+            assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
+            assert_eq!(error.details["operation"], operation.as_str());
+        }
+
+        snapshot.write().unwrap().control_plane_admission =
+            crate::host::codex_capabilities::ControlPlaneAdmission::not_applicable();
+        for operation in [ControlPlaneOperation::Run, ControlPlaneOperation::Steer] {
+            adapter
+                .admit_operation(operation)
+                .expect("live readiness preflight, not static admission, owns the first proof");
+        }
+        for operation in [ControlPlaneOperation::Stop, ControlPlaneOperation::Status] {
+            adapter
+                .admit_operation(operation)
+                .expect("recovery operations must remain available without execution readiness");
+        }
+    }
+
+    #[test]
+    fn every_supported_policy_has_one_exact_protocol_mapping() {
+        assert_eq!(model_override(DEFAULT_MODEL_BINDING), None);
+        assert_eq!(model_override("explicit-model"), Some("explicit-model"));
+        assert_eq!(provider_override(DEFAULT_PROVIDER_BINDING), None);
+        assert_eq!(
+            provider_override("explicit-provider"),
+            Some("explicit-provider")
+        );
+        assert_eq!(
+            codex_approval_policy(ApprovalPolicy::Untrusted).unwrap(),
+            CodexApprovalPolicy::Untrusted
+        );
+        assert_eq!(
+            codex_approval_policy(ApprovalPolicy::OnRequest).unwrap(),
+            CodexApprovalPolicy::OnRequest
+        );
+        assert_eq!(
+            codex_approval_policy(ApprovalPolicy::Never).unwrap(),
+            CodexApprovalPolicy::Never
+        );
+        let unsupported = codex_approval_policy(ApprovalPolicy::OnFailure).unwrap_err();
+        assert_eq!(unsupported.code, ErrorCode::RemoteExecution);
+        assert_eq!(
+            unsupported.details["reason"],
+            Value::String("approval_policy_unsupported".to_string())
+        );
+
+        assert_eq!(
+            codex_sandbox_policy(SandboxPolicy::ReadOnly),
+            CodexSandboxPolicy::ReadOnly
+        );
+        assert_eq!(
+            codex_sandbox_policy(SandboxPolicy::WorkspaceWrite),
+            CodexSandboxPolicy::WorkspaceWrite
+        );
+        assert_eq!(
+            codex_sandbox_policy(SandboxPolicy::DangerFullAccess),
+            CodexSandboxPolicy::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn provider_smoke_timeout_and_experimental_validation_failure_remain_distinct() {
+        let timeout = provider_smoke_session_failure(CodexSessionError::Timeout);
+        assert_eq!(timeout.code, ErrorCode::ProviderSmokeTestTimeout);
+        let not_validated = provider_smoke_session_failure(CodexSessionError::ResponseError);
+        assert_eq!(
+            not_validated.code,
+            ErrorCode::ExperimentalProviderNotValidated
+        );
+        for failure in [&timeout, &not_validated] {
+            assert_eq!(
+                failure.recovery_command.as_deref(),
+                Some(
+                    "rerun the original satelle run or steer command with --refresh-provider-smoke-test"
+                )
+            );
+        }
+        for local_failure in [
+            CodexSessionError::Spawn,
+            CodexSessionError::Write,
+            CodexSessionError::MalformedMessage,
+            CodexSessionError::OversizedMessage,
+            CodexSessionError::UnexpectedResponse,
+            CodexSessionError::DuplicateResponse,
+            CodexSessionError::ConflictingIdentity,
+            CodexSessionError::PrematureExit,
+            CodexSessionError::Persistence,
+            CodexSessionError::Containment,
+            CodexSessionError::Control,
+        ] {
+            assert_eq!(
+                provider_smoke_session_failure(local_failure).code,
+                ErrorCode::ComputerUseNotReady
+            );
+        }
+    }
+
+    #[test]
+    fn native_readiness_timeout_is_typed_for_every_cancellation_outcome() {
+        for (observation, expected_cancellation) in [
+            (StopObservation::CancellationConfirmed, "confirmed"),
+            (StopObservation::UpstreamInactiveConfirmed, "confirmed"),
+            (
+                StopObservation::UpstreamStillActive,
+                "upstream_still_active",
+            ),
+            (StopObservation::OutcomeUnknown, "outcome_unknown"),
+        ] {
+            let failure = native_readiness_timeout_after_cancellation(observation);
+            assert_eq!(failure.error.code, ErrorCode::NativeReadinessTimeout);
+            assert_eq!(failure.reason, "native_readiness_timed_out");
+            assert_eq!(
+                failure.error.details["reason"],
+                "native_readiness_timed_out"
+            );
+            assert_eq!(
+                failure.error.details["native_readiness_cancellation"],
+                expected_cancellation
+            );
+        }
+    }
+
+    #[test]
+    fn probe_cancellation_distinguishes_prelaunch_and_postdispatch_failures() {
+        let native_prelaunch = native_smoke_session_failure(CodexSessionFailure::after_exchange(
+            CodexSessionError::Spawn,
+            false,
+        ));
+        assert_eq!(
+            probe_cancellation_observation(
+                native_prelaunch.dispatch_possible,
+                &native_prelaunch.error,
+                "native_readiness_cancellation",
+            ),
+            StopObservation::UpstreamInactiveConfirmed
+        );
+
+        let native_postdispatch = native_smoke_session_failure(
+            CodexSessionFailure::after_exchange(CodexSessionError::Write, true),
+        );
+        assert_eq!(
+            probe_cancellation_observation(
+                native_postdispatch.dispatch_possible,
+                &native_postdispatch.error,
+                "native_readiness_cancellation",
+            ),
+            StopObservation::OutcomeUnknown
+        );
+
+        let provider_prelaunch = provider_probe_session_failure(
+            CodexSessionFailure::after_exchange(CodexSessionError::Spawn, false),
+        );
+        assert_eq!(
+            probe_cancellation_observation(
+                probe_dispatch_possible(&provider_prelaunch),
+                &provider_prelaunch,
+                "provider_smoke_cancellation",
+            ),
+            StopObservation::UpstreamInactiveConfirmed
+        );
+
+        let provider_postdispatch = provider_probe_session_failure(
+            CodexSessionFailure::after_exchange(CodexSessionError::Write, true),
+        );
+        assert_eq!(
+            probe_cancellation_observation(
+                probe_dispatch_possible(&provider_postdispatch),
+                &provider_postdispatch,
+                "provider_smoke_cancellation",
+            ),
+            StopObservation::OutcomeUnknown
+        );
+
+        let native_cancelled_before_dispatch =
+            native_readiness_timeout_after_cancellation(StopObservation::UpstreamInactiveConfirmed);
+        assert_eq!(
+            probe_cancellation_observation(
+                native_cancelled_before_dispatch.dispatch_possible,
+                &native_cancelled_before_dispatch.error,
+                "native_readiness_cancellation",
+            ),
+            StopObservation::CancellationConfirmed
+        );
+        let native_cancelled_after_dispatch =
+            native_readiness_timeout_after_cancellation(StopObservation::OutcomeUnknown);
+        assert_eq!(
+            probe_cancellation_observation(
+                native_cancelled_after_dispatch.dispatch_possible,
+                &native_cancelled_after_dispatch.error,
+                "native_readiness_cancellation",
+            ),
+            StopObservation::OutcomeUnknown
+        );
+
+        let provider_cancelled_before_dispatch =
+            provider_smoke_timeout_after_cancellation(StopObservation::UpstreamInactiveConfirmed);
+        assert_eq!(
+            probe_cancellation_observation(
+                probe_dispatch_possible(&provider_cancelled_before_dispatch),
+                &provider_cancelled_before_dispatch,
+                "provider_smoke_cancellation",
+            ),
+            StopObservation::CancellationConfirmed
+        );
+        let provider_cancelled_after_dispatch =
+            provider_smoke_timeout_after_cancellation(StopObservation::OutcomeUnknown);
+        assert_eq!(
+            probe_cancellation_observation(
+                probe_dispatch_possible(&provider_cancelled_after_dispatch),
+                &provider_cancelled_after_dispatch,
+                "provider_smoke_cancellation",
+            ),
+            StopObservation::OutcomeUnknown
+        );
+    }
+
+    #[test]
+    fn cancelled_native_preflight_uses_native_terminal_detail() {
+        let desktop_binding = DesktopBindingRef::new("desktop-native-cancellation").unwrap();
+        let policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("model-native-cancellation").unwrap(),
+            ProviderBindingRef::new("provider-native-cancellation").unwrap(),
+            DesktopTarget::new(desktop_binding.clone(), "native-cancellation-session"),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+        );
+        let key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            desktop_binding,
+            policy,
+            "0.144.0",
+            "codex-native-0.144.0",
+            Some("test-plugin-1"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ReadinessObservationState::Unknown,
+            ReadinessObservationState::Unknown,
+        )
+        .unwrap();
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let evidence = key
+            .evidence(
+                "native-readiness-cancelled",
+                observed_at,
+                observed_at + time::Duration::hours(24),
+            )
+            .unwrap();
+        let failure =
+            native_readiness_timeout_after_cancellation(StopObservation::CancellationConfirmed);
+        let result = AdapterPreflight::Failed {
+            key,
+            evidence,
+            reason: failure.reason,
+            error: mark_probe_dispatch_possible(*failure.error, failure.dispatch_possible),
+            dispatch_possible: failure.dispatch_possible,
+        };
+
+        assert_eq!(
+            preflight_cancellation_observation(&result),
+            StopObservation::CancellationConfirmed
+        );
+    }
+
+    #[test]
+    fn matching_provider_smoke_results_skip_or_block_without_a_live_probe() {
+        let adapter = ProductionComputerUseAdapter::new(
+            Arc::new(RwLock::new(
+                crate::host::ProductionCapabilitySnapshot::collect(None),
+            )),
+            Ok(tempfile::tempdir().unwrap().path().join("codex-work")),
+        );
+        let desktop_binding = DesktopBindingRef::new("desktop-provider-cache").unwrap();
+        let policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("model-provider-cache").unwrap(),
+            ProviderBindingRef::new("provider-cache").unwrap(),
+            DesktopTarget::new(desktop_binding.clone(), "provider-cache-session"),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+        );
+        let key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            desktop_binding,
+            policy,
+            "0.144.0",
+            "codex-native-0.144.0",
+            None::<String>,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ReadinessObservationState::Unknown,
+            ReadinessObservationState::Unknown,
+        )
+        .unwrap();
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new(
+                "vision",
+                "open_ai",
+                "model-provider-cache",
+                "provider-provider-cache",
+            )
+            .with_endpoint("https://provider-a.example/v1")
+            .with_auth_source(crate::core::ProviderSecretSource::Environment {
+                variable: "PROVIDER_A_TOKEN".to_string(),
+            }),
+            ProviderBindingSource::HostOwned,
+        );
+        let changed_endpoint = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new(
+                "vision",
+                "open_ai",
+                "model-provider-cache",
+                "provider-provider-cache",
+            )
+            .with_endpoint("https://provider-b.example/v1")
+            .with_auth_source(crate::core::ProviderSecretSource::Environment {
+                variable: "PROVIDER_A_TOKEN".to_string(),
+            }),
+            ProviderBindingSource::HostOwned,
+        );
+        assert_ne!(
+            key.clone()
+                .with_provider_binding(&binding)
+                .provider_config_fingerprint(),
+            key.clone()
+                .with_provider_binding(&changed_endpoint)
+                .provider_config_fingerprint(),
+            "endpoint changes must invalidate provider smoke evidence"
+        );
+        let changed_plugin_key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            key.desktop_binding().clone(),
+            key.execution_policy().clone(),
+            key.codex_version(),
+            key.native_runtime_version(),
+            Some("2.0.0"),
+            key.os_permission_fingerprint(),
+            key.app_approval_fingerprint(),
+            key.os_permission_state(),
+            key.app_approval_state(),
+        )
+        .unwrap();
+        assert_ne!(
+            key.clone()
+                .with_provider_binding(&binding)
+                .provider_config_fingerprint(),
+            changed_plugin_key
+                .with_provider_binding(&binding)
+                .provider_config_fingerprint(),
+            "desktop plugin updates must invalidate provider smoke evidence"
+        );
+        let changed_bridge_key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            key.desktop_binding().clone(),
+            key.execution_policy().clone(),
+            key.codex_version(),
+            "sha256-updated-native-bridge",
+            key.plugin_version(),
+            key.os_permission_fingerprint(),
+            key.app_approval_fingerprint(),
+            key.os_permission_state(),
+            key.app_approval_state(),
+        )
+        .unwrap();
+        assert_ne!(
+            key.clone()
+                .with_provider_binding(&binding)
+                .provider_config_fingerprint(),
+            changed_bridge_key
+                .with_provider_binding(&binding)
+                .provider_config_fingerprint(),
+            "authenticated native bridge updates must invalidate provider smoke evidence"
+        );
+        let observed_at = time::OffsetDateTime::now_utc();
+        let mut persist_thread_ref = |_value: &str| Ok(());
+        let mut persist_turn_ref = |_value: &str| Ok(());
+        let mut persistence = ProviderProbePersistence {
+            host: "test-host",
+            cancellation: None,
+            persist_thread_ref: &mut persist_thread_ref,
+            persist_turn_ref: &mut persist_turn_ref,
+            provider_secret: None,
+        };
+        let provider_intent = ProviderComputerUseIntent::new(None, None, false);
+        let allowed_app_ids = BTreeSet::new();
+        let binding = resolved_provider_binding_for_test("model-provider-cache", "provider-cache");
+        let provider_credential_fingerprint =
+            crate::host::provider_auth::provider_smoke_credential_fingerprint_for_test(
+                binding.binding_digest(),
+                None,
+            );
+        let provider = ProviderSmokeEvidence::new(
+            "provider-smoke-cached",
+            key.provider_config_fingerprint(),
+            &provider_credential_fingerprint,
+            observed_at,
+            observed_at + time::Duration::hours(24),
+        )
+        .unwrap()
+        .with_source(ProviderSmokeSource::Cache);
+
+        let prepared = adapter
+            .run_required_provider_smoke(
+                &key,
+                &binding,
+                &mut persistence,
+                ProviderPreflightContext {
+                    cached_provider: Some(ProviderSmokeResult::Passed(provider.clone())),
+                    provider_intent: &provider_intent,
+                    allowed_app_ids: &allowed_app_ids,
+                },
+            )
+            .unwrap();
+        assert_eq!(prepared.evidence, Some(provider.clone()));
+
+        let provider_failure = ProviderSmokeFailureEvidence::new(
+            "provider-smoke-failed",
+            key.provider_config_fingerprint(),
+            &provider_credential_fingerprint,
+            ErrorCode::UnsupportedProviderComputerUse,
+            "provider_smoke_provider_rejected",
+            observed_at,
+            observed_at + adapter.provider_smoke_failure_ttl,
+        )
+        .unwrap()
+        .with_source(ProviderSmokeSource::Cache);
+        let cached_failure = adapter
+            .run_required_provider_smoke(
+                &key,
+                &binding,
+                &mut persistence,
+                ProviderPreflightContext {
+                    cached_provider: Some(ProviderSmokeResult::Failed(provider_failure.clone())),
+                    provider_intent: &provider_intent,
+                    allowed_app_ids: &allowed_app_ids,
+                },
+            )
+            .expect_err("a cached provider failure remains a preflight blocker");
+        assert!(cached_failure.evidence.is_none());
+        assert_eq!(
+            cached_failure.error.code,
+            ErrorCode::UnsupportedProviderComputerUse
+        );
+        assert_eq!(
+            cached_failure.error.details["provider_smoke_source"],
+            "cache"
+        );
+        assert_eq!(
+            cached_failure.error.details["provider_smoke_status"],
+            "failed"
+        );
+        assert!(cached_failure.error.details["provider_smoke_observed_at"].is_string());
+        assert!(cached_failure.error.details["provider_smoke_expires_at"].is_string());
+        assert!(cached_failure.error.details["provider_smoke_age_ms"].is_u64());
+
+        let rotated_credential_fingerprint =
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        assert!(
+            matching_provider_cache(
+                Some(ProviderSmokeResult::Passed(provider.clone())),
+                rotated_credential_fingerprint,
+            )
+            .is_none(),
+            "a rotated credential must turn a cached pass into a live-smoke miss"
+        );
+        assert!(
+            matching_provider_cache(
+                Some(ProviderSmokeResult::Failed(provider_failure.clone())),
+                rotated_credential_fingerprint,
+            )
+            .is_none(),
+            "a rotated credential must turn a cached failure into a live-smoke miss"
+        );
+
+        let refreshed_pass = ProviderSmokeResult::Passed(
+            ProviderSmokeEvidence::new(
+                "provider-smoke-refresh-pass",
+                key.provider_config_fingerprint(),
+                &provider_credential_fingerprint,
+                observed_at,
+                observed_at + time::Duration::hours(24),
+            )
+            .unwrap(),
+        );
+        assert!(provider_cache_for_preflight(Some(refreshed_pass), true).is_none());
+        assert!(
+            provider_cache_for_preflight(
+                Some(ProviderSmokeResult::Failed(provider_failure)),
+                true,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_component_identity_changes_fail_closed_before_dispatch() {
+        assert_eq!(
+            native_component_identity_error("bridge-b", None, "bridge-b", "2.0.0"),
+            Some("native_component_identity_unavailable")
+        );
+        assert_eq!(
+            native_component_identity_error("bridge-a", Some("2.0.0"), "bridge-b", "2.0.0"),
+            Some("native_component_changed_during_preflight")
+        );
+        assert_eq!(
+            native_component_identity_error("bridge-b", Some("1.0.0"), "bridge-b", "2.0.0"),
+            Some("native_component_changed_during_preflight")
+        );
+        assert_eq!(
+            native_component_identity_error("bridge-b", Some("2.0.0"), "bridge-b", "2.0.0"),
+            None
+        );
+    }
+
+    #[test]
+    fn live_provider_probe_requires_exact_native_callbacks_before_cacheable_evidence() {
+        let fixture = crate::host::codex_session::tests::compile_fixture();
+        let working_directory = tempfile::tempdir().expect("provider probe working directory");
+        let adapter = ProductionComputerUseAdapter::new(
+            Arc::new(RwLock::new(
+                crate::host::ProductionCapabilitySnapshot::collect(None),
+            )),
+            Ok(working_directory.path().join("codex-work")),
+        );
+        let desktop_binding = DesktopBindingRef::new("desktop-live-provider-probe").unwrap();
+        #[cfg(windows)]
+        let desktop_session_id =
+            crate::host::windows_native_probe::current_process_desktop_session_id();
+        #[cfg(not(windows))]
+        let desktop_session_id = "provider-probe-session".to_string();
+        let policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("visual-provider-model").unwrap(),
+            ProviderBindingRef::new("responses-provider").unwrap(),
+            DesktopTarget::new(desktop_binding.clone(), desktop_session_id),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).unwrap(),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+        );
+        let binding = ResolvedProviderBinding::from_authorization(
+            ProviderBindingAuthorization::new(
+                "vision",
+                "responses",
+                "visual-provider-model",
+                "responses-provider",
+            )
+            .with_endpoint("https://responses-proxy.invalid/v1"),
+            ProviderBindingSource::HostOwned,
+        );
+        let key = ReadinessCacheKey::new(
+            NATIVE_ADAPTER,
+            desktop_binding,
+            policy,
+            "0.144.0",
+            "cdhash-test-bridge-1",
+            Some("test-plugin-1"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ReadinessObservationState::Unknown,
+            ReadinessObservationState::Unknown,
+        )
+        .unwrap()
+        .with_provider_binding(&binding);
+        let provider_credential_fingerprint =
+            crate::host::provider_auth::provider_smoke_credential_fingerprint_for_test(
+                binding.binding_digest(),
+                None,
+            );
+
+        for (scenario, expected_failure) in [
+            ("provider-probe-responses", None),
+            (
+                "provider-probe-text-only",
+                Some((
+                    ErrorCode::ComputerUseNotReady,
+                    "provider_smoke_native_action_unavailable",
+                )),
+            ),
+            (
+                "provider-probe-invalidated-after-callbacks",
+                Some((
+                    ErrorCode::ComputerUseNotReady,
+                    "provider_smoke_callback_invalid",
+                )),
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("provider probe scenario directory");
+            let protocol_log = directory.path().join("requests.jsonl");
+            let args_log = directory.path().join("args");
+            let cwd_log = directory.path().join("cwd");
+            let thread_marker = directory.path().join("thread");
+            let turn_marker = directory.path().join("turn");
+            let descendant_marker = directory.path().join("descendant");
+            let mut command = Command::new(fixture.executable());
+            command
+                .env("SATELLE_FIXTURE_SCENARIO", scenario)
+                .env("SATELLE_FIXTURE_LOG", &protocol_log)
+                .env("SATELLE_FIXTURE_ARGS_LOG", &args_log)
+                .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log)
+                .env("SATELLE_THREAD_MARKER", &thread_marker)
+                .env("SATELLE_TURN_MARKER", &turn_marker)
+                .env("SATELLE_DESCENDANT_MARKER", &descendant_marker);
+            let mut persist_thread_ref =
+                |_value: &str| std::fs::write(&thread_marker, b"thread").map_err(|_| ());
+            let mut persist_turn_ref =
+                |_value: &str| std::fs::write(&turn_marker, b"turn").map_err(|_| ());
+            let mut persistence = ProviderProbePersistence {
+                host: "test-host",
+                cancellation: None,
+                persist_thread_ref: &mut persist_thread_ref,
+                persist_turn_ref: &mut persist_turn_ref,
+                provider_secret: None,
+            };
+            let allowed_app_ids = BTreeSet::from(["com.apple.Safari".to_string()]);
+            let outcome = adapter.run_live_provider_smoke_with_app_server(
+                ProviderSmokeInvocation {
+                    key: &key,
+                    binding: &binding,
+                    allowed_app_ids: &allowed_app_ids,
+                    provider_secret: None,
+                    provider_credential_fingerprint: &provider_credential_fingerprint,
+                    source: ProviderSmokeSource::Live,
+                    timeout_override: Some(Duration::from_secs(2)),
+                },
+                &mut persistence,
+                || {
+                    Ok(
+                        crate::host::codex_capabilities::VerifiedComputerUseAppServer::for_test(
+                            command,
+                        ),
+                    )
+                },
+            );
+            if let Some((expected_code, expected_reason)) = expected_failure {
+                let error = outcome.expect_err("invalid provider smoke evidence must fail closed");
+                assert_eq!(error.code, expected_code);
+                assert_eq!(error.details["reason"], expected_reason);
+                let protocol =
+                    std::fs::read_to_string(&protocol_log).expect("provider protocol log");
+                assert!(protocol.contains(r#""method":"turn/start""#));
+            } else {
+                let evidence = outcome.expect("the exact click and drag callbacks should pass");
+                assert_eq!(evidence.source(), ProviderSmokeSource::Live);
+                assert_eq!(
+                    evidence.provider_config_fingerprint(),
+                    key.provider_config_fingerprint()
+                );
+                let protocol =
+                    std::fs::read_to_string(&protocol_log).expect("provider protocol log");
+                assert!(protocol.contains("http://127.0.0.1:"));
+                assert!(protocol.contains("Call the top-level `exec` tool exactly once"));
+                assert!(protocol.contains("await tools.mcp__node_repl__js({code:"));
+                assert!(protocol.contains("exact `code` argument"));
+                assert!(protocol.contains("import('@oai/sky')"));
+                let args = std::fs::read_to_string(&args_log).expect("provider child args");
+                assert!(
+                    args.lines()
+                        .any(|arg| arg == "model_providers.satelle_runtime.wire_api=\"responses\"")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_mapping_releases_known_terminal_ownership() {
+        assert_eq!(
+            terminal_result(Ok(CodexSessionTerminal::Completed))
+                .unwrap()
+                .transition(),
+            Some(TurnTransition::Completed)
+        );
+        for terminal in [
+            CodexSessionTerminal::Interrupted,
+            CodexSessionTerminal::Failed(crate::host::codex_session::CodexFailedTurnKind::Other),
+        ] {
+            assert_eq!(
+                terminal_result(Ok(terminal)).unwrap().transition(),
+                Some(TurnTransition::Failed)
+            );
+        }
+        assert!(
+            terminal_result(Ok(CodexSessionTerminal::StoppedByControl))
+                .unwrap()
+                .transition()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn completed_turn_without_native_evidence_is_a_typed_terminal_failure() {
+        let result = terminal_result(Err(CodexSessionFailure::after_exchange(
+            CodexSessionError::NativeActionUnavailable,
+            true,
+        )))
+        .expect("an upstream-terminal Turn must not become recovery_pending");
+        assert_eq!(result.transition(), Some(TurnTransition::Failed));
+        let error = result
+            .terminal_error()
+            .expect("the missing evidence reason must stay typed");
+        assert_eq!(error.code, ErrorCode::RemoteExecution);
+        assert_eq!(
+            error.details["reason"],
+            serde_json::json!("native_action_unavailable")
+        );
+    }
+
+    #[test]
+    fn timed_turn_preserves_terminal_results_and_returns_confirmed_timeout_error() {
+        let confirmed = finish_timed_turn_execution(
+            TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::StoppedByControl),
+                cancellation: Some(StopObservation::UpstreamInactiveConfirmed),
+            },
+            None,
+        )
+        .expect("confirmed timeout cancellation is terminal");
+        assert_eq!(confirmed.transition(), Some(TurnTransition::Failed));
+        let timeout = confirmed
+            .terminal_error()
+            .expect("confirmed deadline cancellation must remain typed");
+        assert_eq!(timeout.code, ErrorCode::RemoteExecution);
+        assert_eq!(timeout.details["reason"], serde_json::json!("timeout"));
+
+        let completed = finish_timed_turn_execution(
+            TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::Completed),
+                cancellation: Some(StopObservation::CancellationConfirmed),
+            },
+            None,
+        )
+        .expect("a definitive completion wins the cancellation race");
+        assert_eq!(completed.transition(), Some(TurnTransition::Completed));
+        assert!(completed.terminal_error().is_none());
+
+        let error = match finish_timed_turn_execution(
+            TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::StoppedByControl),
+                cancellation: Some(StopObservation::OutcomeUnknown),
+            },
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unconfirmed timeout cancellation must enter recovery"),
+        };
+        assert_eq!(error.details["reason"], serde_json::json!("timeout"));
+    }
+
+    #[test]
+    fn durable_turn_status_has_closed_stop_and_recovery_meanings() {
+        assert_eq!(
+            stop_observation(TurnState::Running, true, Some(CodexThreadStatus::Active)),
+            StopObservation::OutcomeUnknown
+        );
+        assert_eq!(
+            recovery_observation(Some(CodexThreadStatus::Active)),
+            RecoveryObservation::Unknown
+        );
+        assert_eq!(
+            stop_observation(
+                TurnState::RecoveryPending,
+                true,
+                Some(CodexThreadStatus::Inactive),
+            ),
+            StopObservation::UpstreamInactiveConfirmed
+        );
+        assert_eq!(
+            recovery_observation(Some(CodexThreadStatus::Inactive)),
+            RecoveryObservation::Failed
+        );
+        assert_eq!(
+            stop_observation(TurnState::Starting, false, None),
+            StopObservation::UpstreamInactiveConfirmed
+        );
+        assert_eq!(
+            stop_observation(TurnState::Running, false, None),
+            StopObservation::OutcomeUnknown
+        );
+        assert_eq!(
+            stop_observation(TurnState::RecoveryPending, false, None),
+            StopObservation::OutcomeUnknown
+        );
+        assert_eq!(recovery_observation(None), RecoveryObservation::Unknown);
+    }
+
+    #[test]
+    fn durable_stop_synchronously_releases_the_active_registry_entry() {
+        let adapter = ProductionComputerUseAdapter::new(
+            Arc::new(RwLock::new(
+                crate::host::ProductionCapabilitySnapshot::collect(None),
+            )),
+            Ok(tempfile::tempdir().unwrap().path().join("codex-work")),
+        );
+        let session_id = crate::core::SessionId::new();
+        let turn_id = crate::core::TurnId::new();
+        let desktop_binding = DesktopBindingRef::new("local-demo-desktop-v1").unwrap();
+        let control = CodexSessionControl::new(Instant::now() + Duration::from_secs(1));
+        adapter.active_executions.lock().unwrap().insert(
+            "local-demo-desktop-v1".to_string(),
+            ActiveCodexExecution {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                control,
+            },
+        );
+
+        adapter.stop_committed(&desktop_binding, &session_id, &turn_id);
+
+        assert!(adapter.active_executions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn original_persistence_failure_wins_over_the_protocol_wrapper() {
+        let original = SatelleError::invalid_usage("PRIVATE_PERSISTENCE_ERROR_CANARY");
+        let returned = match finish_execution(
+            Err(CodexSessionFailure::after_exchange(
+                CodexSessionError::Persistence,
+                true,
+            )),
+            Some(original.clone()),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a persistence failure must win over protocol completion"),
+        };
+        assert_eq!(
+            serde_json::to_value(returned).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+    }
+
+    #[test]
+    fn failure_ownership_only_requires_recovery_after_turn_dispatch() {
+        let classified = terminal_result(Ok(CodexSessionTerminal::Failed(
+            crate::host::codex_session::CodexFailedTurnKind::Classified(
+                "codex_session_budget_exceeded",
+            ),
+        )))
+        .unwrap();
+        assert_eq!(classified.transition(), Some(TurnTransition::Failed));
+        assert_eq!(
+            classified.terminal_error().unwrap().details["reason"],
+            "codex_session_budget_exceeded"
+        );
+
+        let before_dispatch = terminal_result(Err(CodexSessionFailure::after_exchange(
+            CodexSessionError::Timeout,
+            false,
+        )))
+        .unwrap();
+        assert_eq!(before_dispatch.transition(), Some(TurnTransition::Failed));
+
+        let after_dispatch = match terminal_result(Err(CodexSessionFailure::after_exchange(
+            CodexSessionError::Timeout,
+            true,
+        ))) {
+            Err(error) => error,
+            Ok(_) => panic!("an uncertain dispatched turn must require recovery"),
+        };
+        assert_eq!(after_dispatch.code, ErrorCode::RemoteExecution);
+        assert_eq!(after_dispatch.details["reason"], "timeout");
+
+        let uncontained_before_dispatch = match terminal_result(Err(
+            CodexSessionFailure::after_exchange(CodexSessionError::Containment, false),
+        )) {
+            Err(error) => error,
+            Ok(_) => panic!("an uncontained process group must surface as an error"),
+        };
+        assert_eq!(
+            uncontained_before_dispatch.details["reason"],
+            "containment_failed"
+        );
+
+        let original = SatelleError::invalid_usage("PRIVATE_THREAD_PERSISTENCE_CANARY");
+        let persisted_before_dispatch = finish_execution(
+            Err(CodexSessionFailure::after_exchange(
+                CodexSessionError::Persistence,
+                false,
+            )),
+            Some(original),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted_before_dispatch.transition(),
+            Some(TurnTransition::Failed)
+        );
+    }
+
+    #[test]
+    fn readiness_failures_use_codex_dispatch_attempt_consistently() {
+        for attempted in [false, true] {
+            let failure =
+                CodexSessionFailure::after_exchange(CodexSessionError::PrematureExit, attempted);
+            assert_eq!(
+                native_smoke_session_failure(failure).dispatch_possible,
+                attempted
+            );
+            assert_eq!(
+                probe_dispatch_possible(&provider_probe_session_failure(failure)),
+                attempted
+            );
+        }
+
+        assert!(
+            !native_smoke_failure("native_readiness_action_not_observed").dispatch_possible,
+            "terminal native smoke evidence must not retain possible upstream dispatch"
+        );
+        let terminal_provider = mark_probe_dispatch_possible(
+            provider_smoke_session_failure(CodexSessionError::ResponseError),
+            false,
+        );
+        assert!(!probe_dispatch_possible(&terminal_provider));
+    }
+
+    #[test]
+    fn native_readiness_preserves_closed_codex_failure_reasons() {
+        for (error, expected_reason) in [
+            (CodexSessionError::Spawn, "native_readiness_spawn_failed"),
+            (CodexSessionError::Write, "native_readiness_write_failed"),
+            (
+                CodexSessionError::MalformedMessage,
+                "native_readiness_malformed_message",
+            ),
+            (
+                CodexSessionError::OversizedMessage,
+                "native_readiness_oversized_message",
+            ),
+            (
+                CodexSessionError::UnexpectedResponse,
+                "native_readiness_unexpected_response",
+            ),
+            (
+                CodexSessionError::DuplicateResponse,
+                "native_readiness_duplicate_response",
+            ),
+            (
+                CodexSessionError::ResponseError,
+                "native_readiness_response_error",
+            ),
+            (
+                CodexSessionError::YoloNotSupported,
+                "native_readiness_yolo_not_supported",
+            ),
+            (
+                CodexSessionError::ConflictingIdentity,
+                "native_readiness_conflicting_identity",
+            ),
+            (
+                CodexSessionError::PrematureExit,
+                "native_readiness_premature_exit",
+            ),
+            (CodexSessionError::Timeout, "native_readiness_timed_out"),
+            (
+                CodexSessionError::Persistence,
+                "native_readiness_persistence_failed",
+            ),
+            (
+                CodexSessionError::Containment,
+                "native_readiness_containment_failed",
+            ),
+            (
+                CodexSessionError::Control,
+                "native_readiness_control_failed",
+            ),
+            (
+                CodexSessionError::NativeActionUnavailable,
+                "native_readiness_native_action_unavailable",
+            ),
+        ] {
+            let failure =
+                native_smoke_session_failure(CodexSessionFailure::after_exchange(error, true));
+            assert_eq!(failure.reason, expected_reason);
+            assert_eq!(failure.error.details["reason"], expected_reason);
+        }
+    }
+
+    #[test]
+    fn app_server_working_directory_is_private_and_outside_projects() {
+        let state = tempfile::tempdir().unwrap();
+        let working = state.path().join("codex-app-server-work");
+        assert_eq!(
+            prepare_working_directory(&working).unwrap(),
+            std::fs::canonicalize(&working).unwrap()
+        );
+
+        let metadata = std::fs::symlink_metadata(&working).unwrap();
+        assert!(metadata.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        }
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        let nested = project.path().join("state/codex-app-server-work");
+        let error = prepare_working_directory(&nested).unwrap_err();
+        assert_eq!(error.details["reason"], "unsafe_working_directory");
+        assert!(!nested.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_working_directory_rejects_links_and_shared_access() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let state = tempfile::tempdir().unwrap();
+        let shared = state.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let shared_error = prepare_working_directory(&shared).unwrap_err();
+        assert_eq!(shared_error.details["reason"], "unsafe_working_directory");
+
+        let target = state.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let linked = state.path().join("linked");
+        symlink(&target, &linked).unwrap();
+        let link_error = prepare_working_directory(&linked).unwrap_err();
+        assert_eq!(link_error.details["reason"], "unsafe_working_directory");
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        let real_state = project.path().join("hidden-state");
+        std::fs::create_dir(&real_state).unwrap();
+        let aliases = tempfile::tempdir().unwrap();
+        let project_alias = aliases.path().join("hidden-project");
+        symlink(&real_state, &project_alias).unwrap();
+        let hidden_working = project_alias.join("codex-app-server-work");
+        let hidden_error = prepare_working_directory(&hidden_working).unwrap_err();
+        assert_eq!(hidden_error.details["reason"], "unsafe_working_directory");
+        assert!(!real_state.join("codex-app-server-work").exists());
+    }
+
+    #[test]
+    fn protocol_failures_expose_only_closed_sanitized_reasons() {
+        for error in [
+            CodexSessionError::Spawn,
+            CodexSessionError::Write,
+            CodexSessionError::MalformedMessage,
+            CodexSessionError::OversizedMessage,
+            CodexSessionError::UnexpectedResponse,
+            CodexSessionError::DuplicateResponse,
+            CodexSessionError::ResponseError,
+            CodexSessionError::ConflictingIdentity,
+            CodexSessionError::PrematureExit,
+            CodexSessionError::Timeout,
+            CodexSessionError::Persistence,
+            CodexSessionError::Containment,
+            CodexSessionError::Control,
+        ] {
+            let public = session_failure(error);
+            assert_eq!(public.code, ErrorCode::RemoteExecution);
+            assert_eq!(public.details.len(), 1);
+            assert!(public.details["reason"].is_string());
+            let serialized = serde_json::to_string(&public).unwrap();
+            assert!(!serialized.contains("PRIVATE_RAW_PROTOCOL_CANARY"));
+        }
+    }
+
+    #[test]
+    fn javascript_single_quoted_escapes_generated_values() {
+        assert_eq!(
+            javascript_single_quoted("a'b\\c\n\r\t"),
+            "'a\\'b\\\\c\\n\\r\\t'"
+        );
+    }
+
+    #[test]
+    fn native_readiness_prompt_uses_only_the_verified_plugin_and_satelle_surface() {
+        let action_path =
+            crate::host::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl;
+        let evidence = crate::host::provider_probe::NativeActionEvidence::new();
+        let prompt = native_readiness_prompt(
+            "http://127.0.0.1:12345/probe/private-capability",
+            &action_path,
+            &BTreeSet::from(["satelle.exe".to_string()]),
+            &evidence,
+        )
+        .expect("the authenticated Windows node_repl path should form a nested plugin call");
+        assert!(prompt.contains("Use the installed official Computer Use plugin immediately"));
+        assert!(prompt.contains("Call the top-level `exec` tool exactly once"));
+        assert!(prompt.contains("await tools.mcp__node_repl__js({code:"));
+        assert!(prompt.contains("exact JavaScript source"));
+        assert!(prompt.contains("do not call `tool_search`"));
+        assert!(prompt.contains("import('@oai/sky')"));
+        assert!(!prompt.contains("registerHooks"));
+        assert!(!prompt.contains("clientModuleUrl"));
+        assert!(!prompt.contains("readFile"));
+        assert!(!prompt.contains("createHash"));
+        assert!(!prompt.contains("data:text"));
+        assert!(!prompt.contains("http://127.0.0.1:12345/probe/private-capability"));
+        assert!(prompt.contains("sky.list_windows()"));
+        assert!(!prompt.contains("sky.list_apps()"));
+        assert!(prompt.contains("x.app.toLowerCase().endsWith('satelle.exe')"));
+        assert!(!prompt.contains("MSEdge"));
+        assert!(prompt.contains("Satelle native readiness probe"));
+        // Keep each fresh window binding and its screenshot ID. Input methods
+        // activate the selected target automatically.
+        assert!(!prompt.contains("sky.get_window({"));
+        assert!(!prompt.contains("sky.activate_window"));
+        assert!(!prompt.contains("sky.type_text"));
+        assert!(prompt.contains("sky.get_window_state({window:w"));
+        assert!(!prompt.contains("accessibility.tree"));
+        assert!(prompt.contains("sky.click({window:s.window,x:190,y:173"));
+        assert!(
+            prompt.contains("sky.drag({window:s.window,from_x:238,from_y:356,to_x:578,to_y:406")
+        );
+        assert!(prompt.contains("screenshotId:s.screenshots[0].id"));
+        let click = prompt
+            .find("await sky.click({window:s.window")
+            .expect("the probe must click the fixed readiness control");
+        let refreshed_state = prompt[click..]
+            .find("s=await g(s.window)")
+            .map(|offset| click + offset)
+            .expect("the probe must refresh screenshot state after the click");
+        let drag = prompt
+            .find("await sky.drag({window:s.window")
+            .expect("the probe must drag on the readiness surface");
+        assert!(click < refreshed_state);
+        assert!(refreshed_state < drag);
+        assert!(prompt.contains("Make no other discovery or tool calls"));
+        assert!(prompt.contains("call the top-level `wait` tool with that `cell_id`"));
+        assert!(prompt.contains("only other tool call permitted"));
+        assert!(prompt.contains("complete readiness script as the exact `code` argument"));
+        assert!(prompt.contains("Copy the source verbatim"));
+        assert!(!prompt.contains("functions.exec"));
+        assert!(!prompt.contains("captureScreenshot"));
+        assert!(!prompt.contains("Click event observed"));
+        assert!(!prompt.contains("Drag event observed"));
+        assert!(prompt.contains(
+            "Do not use shell, separate file tools, browser automation, or network tools"
+        ));
+        let (authorized_script, authorized_app_id) = evidence
+            .expected_authorization()
+            .expect("the exact script must retain its checked app authority");
+        assert_eq!(authorized_app_id, "satelle.exe");
+        assert!(authorized_script.len() <= 512);
+    }
+
+    #[test]
+    fn native_readiness_prompt_requires_current_app_authority() {
+        let action_path =
+            crate::host::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl;
+        let evidence = crate::host::provider_probe::NativeActionEvidence::new();
+
+        assert_eq!(
+            native_readiness_prompt(
+                "http://127.0.0.1:12345/probe/private-capability",
+                &action_path,
+                &BTreeSet::new(),
+                &evidence,
+            ),
+            Err("native_app_approval_unavailable")
+        );
+        assert_eq!(
+            native_readiness_prompt(
+                "http://127.0.0.1:12345/probe/private-capability",
+                &action_path,
+                &BTreeSet::from(["MSEdge".to_string()]),
+                &evidence,
+            ),
+            Err("native_app_approval_unavailable")
+        );
+        assert!(evidence.expected_authorization().is_none());
+    }
+
+    #[test]
+    fn mismatched_cached_native_evidence_becomes_one_live_branch_miss() {
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let current = native_readiness_test_key(
+            "current-session",
+            ReadinessObservationState::Granted,
+            ReadinessObservationState::Unknown,
+        );
+        let stale = native_readiness_test_key(
+            "stale-session",
+            ReadinessObservationState::Granted,
+            ReadinessObservationState::Unknown,
+        );
+        let stale_evidence = stale
+            .evidence(
+                "stale-readiness",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap();
+
+        assert!(matching_cached_evidence(&current, Some(stale_evidence)).is_none());
+        let live_evidence = current
+            .evidence(
+                "live-readiness",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap();
+        let live = native_readiness_from_evidence(
+            &current,
+            resolved_provider_binding_for_test("model-readiness", "provider-readiness"),
+            live_evidence,
+            BTreeSet::new(),
+            None,
+            ReadinessSource::Live,
+        )
+        .unwrap();
+        assert_eq!(live.source(), ReadinessSource::Live);
+
+        let matching_evidence = current
+            .evidence(
+                "current-readiness",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap()
+            .with_source(ReadinessSource::Cache);
+        let matching_evidence = matching_cached_evidence(&current, Some(matching_evidence))
+            .expect("an exact cache hit must remain on the single cached branch");
+        let cached = native_readiness_from_evidence(
+            &current,
+            resolved_provider_binding_for_test("model-readiness", "provider-readiness"),
+            matching_evidence,
+            BTreeSet::new(),
+            None,
+            ReadinessSource::Cache,
+        )
+        .unwrap();
+        assert_eq!(cached.source(), ReadinessSource::Cache);
+    }
+
+    #[test]
+    fn denied_observation_keeps_the_exact_key_and_retained_failure_evidence() {
+        let key = native_readiness_test_key(
+            "denied-session",
+            ReadinessObservationState::Denied,
+            ReadinessObservationState::Unknown,
+        );
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let evidence = key
+            .evidence(
+                "denied-readiness",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap();
+
+        let result = denied_native_probe_result(&key, &evidence)
+            .expect("a denied observation must become a retained live failure");
+        let NativeProbeResult::Failed {
+            evidence: retained,
+            reason,
+            error,
+            dispatch_possible,
+        } = result
+        else {
+            panic!("denied readiness must not dispatch or become uncached");
+        };
+        assert!(retained == evidence);
+        assert_eq!(reason, "native_readiness_manual_action_required");
+        assert!(!dispatch_possible);
+        assert_eq!(
+            error.details["native_readiness"]["status"],
+            "manual_action_required"
+        );
+    }
+
+    #[test]
+    fn denied_native_observation_is_typed_when_yolo_cannot_bypass_it() {
+        let key = native_readiness_test_key_with_policy(
+            "denied-yolo-session",
+            ReadinessObservationState::Granted,
+            ReadinessObservationState::Denied,
+            ApprovalPolicy::Never,
+            SandboxPolicy::DangerFullAccess,
+        );
+        let observed_at = time::OffsetDateTime::UNIX_EPOCH;
+        let evidence = key
+            .evidence(
+                "denied-yolo-readiness",
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .unwrap();
+
+        let NativeProbeResult::Failed { error, .. } =
+            denied_native_probe_result(&key, &evidence).expect("denied YOLO readiness must fail")
+        else {
+            panic!("denied YOLO readiness must remain a retained failure");
+        };
+        assert_eq!(error.code, ErrorCode::YoloBlockedByNativeApproval);
+    }
+
+    #[test]
+    fn yolo_session_failures_keep_exact_public_error_codes() {
+        assert_eq!(
+            session_failure(CodexSessionError::YoloNotSupported).code,
+            ErrorCode::YoloNotSupported
+        );
+        assert_eq!(
+            provider_smoke_session_failure(CodexSessionError::YoloNotSupported).code,
+            ErrorCode::YoloNotSupported
+        );
+    }
+
+    #[test]
+    fn windows_app_policy_fingerprint_uses_only_the_existing_closed_surface() {
+        use crate::host::codex_capabilities::EvidenceSurface;
+
+        let desktop = crate::core::DesktopSessionRecord {
+            session_id: "PRIVATE_SESSION_ID_CANARY".to_string(),
+            desktop_user: "operator".to_string(),
+            state: "active".to_string(),
+            session_kind: "visible_desktop".to_string(),
+            is_console: true,
+            is_remote: false,
+            display_summary: "PRIVATE_DISPLAY_CANARY".to_string(),
+            portable_selectors: vec!["active".to_string(), "console".to_string()],
+            native_selectors: vec!["PRIVATE_NATIVE_SELECTOR_CANARY".to_string()],
+            selected_by_current_config: true,
+        };
+        let allowed_app_ids = BTreeSet::from(["fixture-paint.exe".to_string()]);
+        let stable = native_prerequisite_observations(
+            "windows",
+            &desktop,
+            EvidenceSurface::Stable,
+            &allowed_app_ids,
+        );
+        let absent = native_prerequisite_observations(
+            "windows",
+            &desktop,
+            EvidenceSurface::Absent,
+            &allowed_app_ids,
+        );
+        let incomplete = native_prerequisite_observations(
+            "windows",
+            &desktop,
+            EvidenceSurface::Incomplete,
+            &allowed_app_ids,
+        );
+        let private = native_prerequisite_observations(
+            "windows",
+            &desktop,
+            EvidenceSurface::Private,
+            &allowed_app_ids,
+        );
+
+        assert!(
+            stable
+                .app_fingerprint_material
+                .starts_with("windows_app_policy:stable:")
+        );
+        assert!(
+            absent
+                .app_fingerprint_material
+                .starts_with("windows_app_policy:absent:")
+        );
+        assert!(
+            incomplete
+                .app_fingerprint_material
+                .starts_with("windows_app_policy:incomplete:")
+        );
+        assert_eq!(
+            private.app_fingerprint_material,
+            incomplete.app_fingerprint_material
+        );
+        let changed_allowed_app_ids = BTreeSet::from(["fixture-notepad.exe".to_string()]);
+        let changed = native_prerequisite_observations(
+            "windows",
+            &desktop,
+            EvidenceSurface::Stable,
+            &changed_allowed_app_ids,
+        );
+        assert_ne!(
+            stable.app_fingerprint_material,
+            changed.app_fingerprint_material
+        );
+        for material in [
+            &stable.app_fingerprint_material,
+            &absent.app_fingerprint_material,
+            &incomplete.app_fingerprint_material,
+            &changed.app_fingerprint_material,
+        ] {
+            assert!(!material.contains("PRIVATE_"));
+            assert!(!material.contains("fixture-"));
+        }
+        let fingerprint = |material: &str| {
+            readiness_fingerprint(
+                "app-approval",
+                "windows",
+                &desktop.session_id,
+                ReadinessObservationState::Unknown,
+                material,
+            )
+        };
+        assert_ne!(
+            fingerprint(&stable.app_fingerprint_material),
+            fingerprint(&absent.app_fingerprint_material)
+        );
+        assert_ne!(
+            fingerprint(&absent.app_fingerprint_material),
+            fingerprint(&incomplete.app_fingerprint_material)
+        );
+        let policy = execution_policy_for("operator", &desktop.session_id);
+        assert_eq!(
+            app_approval_fingerprint_for_policy(
+                "windows",
+                EvidenceSurface::Stable,
+                &allowed_app_ids,
+                &policy,
+            ),
+            fingerprint(&stable.app_fingerprint_material)
+        );
+        assert_ne!(
+            app_approval_fingerprint_for_policy(
+                "windows",
+                EvidenceSurface::Stable,
+                &changed_allowed_app_ids,
+                &policy,
+            ),
+            fingerprint(&stable.app_fingerprint_material)
+        );
+    }
+
+    #[test]
+    fn macos_app_policy_fingerprint_changes_with_the_ephemeral_approval_set() {
+        use crate::host::codex_capabilities::EvidenceSurface;
+
+        let desktop = crate::core::DesktopSessionRecord {
+            session_id: "PRIVATE_SESSION_ID_CANARY".to_string(),
+            desktop_user: "operator".to_string(),
+            state: "active".to_string(),
+            session_kind: "visible_desktop".to_string(),
+            is_console: true,
+            is_remote: false,
+            display_summary: "PRIVATE_DISPLAY_CANARY".to_string(),
+            portable_selectors: vec!["active".to_string(), "console".to_string()],
+            native_selectors: vec!["PRIVATE_NATIVE_SELECTOR_CANARY".to_string()],
+            selected_by_current_config: true,
+        };
+        let safari = native_prerequisite_observations(
+            "macos",
+            &desktop,
+            EvidenceSurface::Private,
+            &BTreeSet::from(["com.apple.Safari".to_string()]),
+        );
+        let terminal = native_prerequisite_observations(
+            "macos",
+            &desktop,
+            EvidenceSurface::Private,
+            &BTreeSet::from(["com.apple.Terminal".to_string()]),
+        );
+
+        assert_ne!(
+            safari.app_fingerprint_material,
+            terminal.app_fingerprint_material
+        );
+        assert!(
+            safari
+                .app_fingerprint_material
+                .starts_with("macos_app_policy:private:")
+        );
+        assert!(!safari.app_fingerprint_material.contains("com.apple"));
+    }
+
+    #[test]
+    fn native_readiness_prompt_names_both_required_actions_and_private_target() {
+        let action_path =
+            crate::host::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl;
+        let evidence = crate::host::provider_probe::NativeActionEvidence::new();
+        let prompt = native_readiness_prompt(
+            "http://127.0.0.1:12345/probe/readiness-nonce",
+            &action_path,
+            &BTreeSet::from(["satelle.exe".to_string()]),
+            &evidence,
+        )
+        .expect("the authenticated Windows node_repl path should form a nested plugin call");
+
+        assert!(prompt.contains("private"));
+        assert!(prompt.contains("click"));
+        assert!(prompt.contains("drag"));
+        assert!(!prompt.contains("readiness-nonce"));
+        assert_eq!(prompt.matches("sky.list_windows()").count(), 1);
+        assert!(prompt.contains("sky.click({window:s.window,x:190,y:173"));
+        assert!(
+            prompt.contains("sky.drag({window:s.window,from_x:238,from_y:356,to_x:578,to_y:406")
+        );
+        assert!(prompt.contains("screenshotId:s.screenshots[0].id"));
+        assert!(!prompt.contains("accessibility.tree"));
+        assert!(!prompt.contains("setTimeout"));
+    }
+
+    #[test]
+    fn native_readiness_prompt_uses_the_validated_macos_node_repl_namespace() {
+        let evidence = crate::host::provider_probe::NativeActionEvidence::new();
+        let prompt = native_readiness_prompt(
+            "http://127.0.0.1:12345/probe/readiness-nonce",
+            &crate::host::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl,
+            &BTreeSet::from(["com.apple.Safari".to_string()]),
+            &evidence,
+        )
+        .expect("the macOS node_repl path does not require a client file URL");
+
+        assert!(prompt.contains("await tools.mcp__node_repl__js({code:"));
+        assert!(prompt.contains("Call the top-level `exec` tool exactly once"));
+        assert!(prompt.contains("do not call `tool_search`"));
+        assert!(prompt.contains("Make no other discovery or tool calls"));
+        assert!(prompt.contains("call the top-level `wait` tool with that `cell_id`"));
+        assert!(prompt.contains("only other tool call permitted"));
+        assert!(!prompt.contains("functions.exec"));
+        assert!(prompt.contains("import('@oai/sky')"));
+        let initial_state = prompt
+            .find("get_app_state({ app: 'Safari', disableDiff: true })")
+            .expect("the prompt must read current Safari state");
+        let new_window = prompt
+            .find("sky.press_key({ app: 'Safari', key: 'super+n' })")
+            .expect("the prompt must open a temporary Safari window");
+        let temporary_window_state = prompt[new_window..]
+            .find("get_app_state({ app: 'Safari', disableDiff: true })")
+            .map(|offset| new_window + offset)
+            .expect("the prompt must refresh state for the temporary window");
+        assert!(initial_state < new_window);
+        assert!(new_window < temporary_window_state);
+        assert!(prompt.contains("get_app_state({ app: 'Safari', disableDiff: true })"));
+        assert!(prompt.contains("ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"));
+        assert!(
+            !prompt
+                .contains("sky.click({ app: 'Safari', element_index: Number(addressMatch[1]) })")
+        );
+        assert!(prompt.contains("sky.set_value({ app: 'Safari', element_index:"));
+        assert!(prompt.contains("sky.press_key({ app: 'Safari', key: 'Return' })"));
+        assert!(prompt.contains("attempt < 8"));
+        assert!(prompt.contains("sky.click({ app: 'Safari', element_index:"));
+        assert!(!prompt.contains("finalState.text.includes"));
+        assert!(!prompt.contains("native events missing"));
+        assert!(prompt.contains("Native click and drag actions dispatched"));
+        assert!(prompt.contains("from_x: 100, from_y: 320, to_x: 600, to_y: 425"));
+        assert!(prompt.contains("sky.press_key({ app: 'Safari', key: 'super+w' })"));
+        assert!(prompt.contains("independently verifies both native events"));
+        assert!(prompt.contains("Do not read documentation"));
+        assert!(!prompt.contains("mcp__computer_use"));
+        assert!(!prompt.contains("Helium"));
+        assert!(!prompt.contains("Control_L"));
+    }
+
+    #[test]
+    fn native_turn_prompt_binds_desktop_work_to_the_isolated_sky_tool() {
+        let prompt = native_computer_use_prompt(
+            "Use Calculator to multiply 6 by 7 and leave the visible result at 42.",
+            &crate::host::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl,
+        );
+
+        assert!(prompt.contains("top-level `exec` tool"));
+        assert!(prompt.contains("tools.mcp__node_repl__js({code:"));
+        assert!(prompt.contains("Do not call `tool_search`"));
+        assert!(prompt.contains("inspect the tool inventory"));
+        assert!(prompt.contains("import('@oai/sky')"));
+        assert!(prompt.contains("list_apps()"));
+        assert!(prompt.contains("launch_app({app})"));
+        assert!(prompt.contains("get_window_state({window"));
+        assert!(prompt.contains("Every action must use a current `window` object"));
+        assert!(prompt.contains("Method names are snake_case"));
+        assert!(prompt.contains("inspect object keys or prototypes"));
+        assert!(prompt.contains("Do not use shell commands"));
+        assert!(
+            prompt
+                .contains("Use Calculator to multiply 6 by 7 and leave the visible result at 42.")
+        );
+    }
+
+    #[test]
+    fn native_macos_turn_prompt_names_the_supported_app_api() {
+        let prompt = native_computer_use_prompt(
+            "Open TextEdit and type a short note.",
+            &crate::host::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl,
+        );
+
+        assert!(prompt.contains("get_app_state({app, disableDiff: true})"));
+        assert!(prompt.contains("Select a canonical app id from `list_apps()`"));
+        assert!(prompt.contains("pass it as `app` to every action"));
+        assert!(!prompt.contains("launch_app({app})"));
+    }
+}

@@ -1,0 +1,466 @@
+use super::{RequestId, define_schema_token};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+define_schema_token!(ErrorSchema, "satelle.error.v1");
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiErrorCode {
+    AuthenticationFailed,
+    AuthorizationInsufficientScope,
+    HostIdentityMismatch,
+    InvalidRequest,
+    UnsupportedSchema,
+    UnsupportedContentType,
+    PayloadTooLarge,
+    IdempotencyKeyConflict,
+    ApiTokenNotFound,
+    ApiTokenStateConflict,
+    TokenSecretNotReplayable,
+    SessionNotFound,
+    SetupLedgerUnavailable,
+    LogsCursorExpired,
+    HostUnreachable,
+    HostBusy,
+    QueueDisabled,
+    QueueFull,
+    QueueRequestNotFound,
+    QueueAlreadyAdmitted,
+    QueuedPrincipalNoLongerAuthorized,
+    StoreInUse,
+    StateConflict,
+    StopNotConfirmed,
+    IncompatibleProtocol,
+    IncompatibleControlPlane,
+    ComputerUseNotReady,
+    YoloNotSupported,
+    YoloBlockedByNativeApproval,
+    DesktopBindingRequired,
+    DesktopBindingAmbiguous,
+    DesktopBindingNotFound,
+    DesktopBindingUnauthorized,
+    DesktopBindingSecureHandoffUnsupported,
+    DesktopSessionUnavailable,
+    DesktopSessionAmbiguous,
+    DesktopSessionPreferenceUnmatched,
+    DesktopSessionConsoleUnavailable,
+    DesktopSessionNativeSelectorWrongPlatform,
+    DesktopSessionNativeSelectorUnmatched,
+    NativeReadinessTimeout,
+    ProviderSmokeTestTimeout,
+    UnsupportedProviderComputerUse,
+    ExperimentalProviderOptInRequired,
+    ModelProviderBindingMissing,
+    ProjectProviderSelectionNotAllowed,
+    ProviderSecretSourceRequired,
+    ProviderSecretProvisioningRequired,
+    ProviderSecretOverwriteRequired,
+    ProviderSecretResolutionFailed,
+    CredentialHelperTimeout,
+    CredentialHelperArgvInvalid,
+    SecretFileTildeFormUnsupported,
+    SecretFileHomeUnavailable,
+    ExperimentalProviderNotValidated,
+    RawDiagnosticsRedactionFailed,
+    RawDiagnosticsStagingFailed,
+    RawDiagnosticsExportFailed,
+    DesktopSnapshotPermissionRequired,
+    DesktopSnapshotRedactionFailed,
+    DesktopSnapshotExportFailed,
+    StorageBusy,
+    StorageIntegrityFailed,
+    StorageMigrationSourceInvalid,
+    StorageMigrationDestinationInvalid,
+    StorageMigrationPathsOverlap,
+    StorageMigrationDestinationNotEmpty,
+    SetupPartiallyApplied,
+    RemoteExecutionFailed,
+    CapacityExceeded,
+    RateLimited,
+    RouteNotFound,
+    MethodNotAllowed,
+    InternalError,
+}
+
+impl ApiErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthenticationFailed => "authentication-failed",
+            Self::AuthorizationInsufficientScope => "authorization-insufficient-scope",
+            Self::HostIdentityMismatch => "host-identity-mismatch",
+            Self::InvalidRequest => "invalid-request",
+            Self::UnsupportedSchema => "unsupported-schema",
+            Self::UnsupportedContentType => "unsupported-content-type",
+            Self::PayloadTooLarge => "payload-too-large",
+            Self::IdempotencyKeyConflict => "idempotency-key-conflict",
+            Self::ApiTokenNotFound => "api-token-not-found",
+            Self::ApiTokenStateConflict => "api-token-state-conflict",
+            Self::TokenSecretNotReplayable => "token-secret-not-replayable",
+            Self::SessionNotFound => "session-not-found",
+            Self::SetupLedgerUnavailable => "setup-ledger-unavailable",
+            Self::LogsCursorExpired => "logs-cursor-expired",
+            Self::HostUnreachable => "host-unreachable",
+            Self::HostBusy => "host-busy",
+            Self::QueueDisabled => "queue-disabled",
+            Self::QueueFull => "queue-full",
+            Self::QueueRequestNotFound => "queue-request-not-found",
+            Self::QueueAlreadyAdmitted => "queue-already-admitted",
+            Self::QueuedPrincipalNoLongerAuthorized => "queued-principal-no-longer-authorized",
+            Self::StoreInUse => "store-in-use",
+            Self::StateConflict => "state-conflict",
+            Self::StopNotConfirmed => "stop-not-confirmed",
+            Self::IncompatibleProtocol => "incompatible-protocol",
+            Self::IncompatibleControlPlane => "incompatible-control-plane",
+            Self::ComputerUseNotReady => "computer-use-not-ready",
+            Self::YoloNotSupported => "yolo-not-supported",
+            Self::YoloBlockedByNativeApproval => "yolo-blocked-by-native-approval",
+            Self::DesktopBindingRequired => "desktop-binding-required",
+            Self::DesktopBindingAmbiguous => "desktop-binding-ambiguous",
+            Self::DesktopBindingNotFound => "desktop-binding-not-found",
+            Self::DesktopBindingUnauthorized => "desktop-binding-unauthorized",
+            Self::DesktopBindingSecureHandoffUnsupported => {
+                "desktop-binding-secure-handoff-unsupported"
+            }
+            Self::DesktopSessionUnavailable => "desktop-session-unavailable",
+            Self::DesktopSessionAmbiguous => "desktop-session-ambiguous",
+            Self::DesktopSessionPreferenceUnmatched => "desktop-session-preference-unmatched",
+            Self::DesktopSessionConsoleUnavailable => "desktop-session-console-unavailable",
+            Self::DesktopSessionNativeSelectorWrongPlatform => {
+                "desktop-session-native-selector-wrong-platform"
+            }
+            Self::DesktopSessionNativeSelectorUnmatched => {
+                "desktop-session-native-selector-unmatched"
+            }
+            Self::NativeReadinessTimeout => "native-readiness-timeout",
+            Self::ProviderSmokeTestTimeout => "provider-smoke-test-timeout",
+            Self::UnsupportedProviderComputerUse => "unsupported-provider-computer-use",
+            Self::ExperimentalProviderOptInRequired => "experimental-provider-opt-in-required",
+            Self::ModelProviderBindingMissing => "model-provider-binding-missing",
+            Self::ProjectProviderSelectionNotAllowed => "project-provider-selection-not-allowed",
+            Self::ProviderSecretSourceRequired => "provider-secret-source-required",
+            Self::ProviderSecretProvisioningRequired => "provider-secret-provisioning-required",
+            Self::ProviderSecretOverwriteRequired => "provider-secret-overwrite-required",
+            Self::ProviderSecretResolutionFailed => "provider-secret-resolution-failed",
+            Self::CredentialHelperTimeout => "credential-helper-timeout",
+            Self::CredentialHelperArgvInvalid => "credential-helper-argv-invalid",
+            Self::SecretFileTildeFormUnsupported => "secret-file-tilde-form-unsupported",
+            Self::SecretFileHomeUnavailable => "secret-file-home-unavailable",
+            Self::ExperimentalProviderNotValidated => "experimental-provider-not-validated",
+            Self::RawDiagnosticsRedactionFailed => "raw-diagnostics-redaction-failed",
+            Self::RawDiagnosticsStagingFailed => "raw-diagnostics-staging-failed",
+            Self::RawDiagnosticsExportFailed => "raw-diagnostics-export-failed",
+            Self::DesktopSnapshotPermissionRequired => "desktop-snapshot-permission-required",
+            Self::DesktopSnapshotRedactionFailed => "desktop-snapshot-redaction-failed",
+            Self::DesktopSnapshotExportFailed => "desktop-snapshot-export-failed",
+            Self::StorageBusy => "storage-busy",
+            Self::StorageIntegrityFailed => "storage-integrity-failed",
+            Self::StorageMigrationSourceInvalid => "storage-migration-source-invalid",
+            Self::StorageMigrationDestinationInvalid => "storage-migration-destination-invalid",
+            Self::StorageMigrationPathsOverlap => "storage-migration-paths-overlap",
+            Self::StorageMigrationDestinationNotEmpty => "storage-migration-destination-not-empty",
+            Self::SetupPartiallyApplied => "setup-partially-applied",
+            Self::RemoteExecutionFailed => "remote-execution-failed",
+            Self::CapacityExceeded => "capacity-exceeded",
+            Self::RateLimited => "rate-limited",
+            Self::RouteNotFound => "route-not-found",
+            Self::MethodNotAllowed => "method-not-allowed",
+            Self::InternalError => "internal-error",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn incompatible_control_plane_code_has_exact_public_token() {
+        assert_eq!(
+            ApiErrorCode::IncompatibleControlPlane.as_str(),
+            "incompatible-control-plane"
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::IncompatibleControlPlane).unwrap(),
+            json!("incompatible-control-plane")
+        );
+    }
+
+    #[test]
+    fn yolo_codes_have_exact_public_tokens() {
+        assert_eq!(
+            ApiErrorCode::YoloNotSupported.as_str(),
+            "yolo-not-supported"
+        );
+        assert_eq!(
+            ApiErrorCode::YoloBlockedByNativeApproval.as_str(),
+            "yolo-blocked-by-native-approval"
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::YoloNotSupported).unwrap(),
+            json!("yolo-not-supported")
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::YoloBlockedByNativeApproval).unwrap(),
+            json!("yolo-blocked-by-native-approval")
+        );
+    }
+
+    #[test]
+    fn provider_smoke_codes_have_exact_public_tokens() {
+        for (code, token) in [
+            (
+                ApiErrorCode::ProviderSmokeTestTimeout,
+                "provider-smoke-test-timeout",
+            ),
+            (
+                ApiErrorCode::UnsupportedProviderComputerUse,
+                "unsupported-provider-computer-use",
+            ),
+            (
+                ApiErrorCode::ExperimentalProviderOptInRequired,
+                "experimental-provider-opt-in-required",
+            ),
+            (
+                ApiErrorCode::ModelProviderBindingMissing,
+                "model-provider-binding-missing",
+            ),
+            (
+                ApiErrorCode::ProjectProviderSelectionNotAllowed,
+                "project-provider-selection-not-allowed",
+            ),
+            (
+                ApiErrorCode::CredentialHelperArgvInvalid,
+                "credential-helper-argv-invalid",
+            ),
+            (
+                ApiErrorCode::CredentialHelperTimeout,
+                "credential-helper-timeout",
+            ),
+            (
+                ApiErrorCode::SecretFileTildeFormUnsupported,
+                "secret-file-tilde-form-unsupported",
+            ),
+            (
+                ApiErrorCode::SecretFileHomeUnavailable,
+                "secret-file-home-unavailable",
+            ),
+            (
+                ApiErrorCode::ProviderSecretResolutionFailed,
+                "provider-secret-resolution-failed",
+            ),
+            (
+                ApiErrorCode::ProviderSecretSourceRequired,
+                "provider-secret-source-required",
+            ),
+            (
+                ApiErrorCode::ProviderSecretProvisioningRequired,
+                "provider-secret-provisioning-required",
+            ),
+            (
+                ApiErrorCode::ProviderSecretOverwriteRequired,
+                "provider-secret-overwrite-required",
+            ),
+            (
+                ApiErrorCode::ExperimentalProviderNotValidated,
+                "experimental-provider-not-validated",
+            ),
+        ] {
+            assert_eq!(code.as_str(), token);
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(token));
+        }
+    }
+
+    #[test]
+    fn native_readiness_timeout_has_exact_public_token() {
+        assert_eq!(
+            ApiErrorCode::NativeReadinessTimeout.as_str(),
+            "native-readiness-timeout"
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::NativeReadinessTimeout).unwrap(),
+            json!("native-readiness-timeout")
+        );
+    }
+
+    #[test]
+    fn desktop_selection_codes_have_exact_public_tokens() {
+        for (code, token) in [
+            (
+                ApiErrorCode::DesktopBindingRequired,
+                "desktop-binding-required",
+            ),
+            (
+                ApiErrorCode::DesktopSessionUnavailable,
+                "desktop-session-unavailable",
+            ),
+            (
+                ApiErrorCode::DesktopSessionAmbiguous,
+                "desktop-session-ambiguous",
+            ),
+            (
+                ApiErrorCode::DesktopSessionPreferenceUnmatched,
+                "desktop-session-preference-unmatched",
+            ),
+            (
+                ApiErrorCode::DesktopSessionConsoleUnavailable,
+                "desktop-session-console-unavailable",
+            ),
+            (
+                ApiErrorCode::DesktopSessionNativeSelectorWrongPlatform,
+                "desktop-session-native-selector-wrong-platform",
+            ),
+            (
+                ApiErrorCode::DesktopSessionNativeSelectorUnmatched,
+                "desktop-session-native-selector-unmatched",
+            ),
+        ] {
+            assert_eq!(code.as_str(), token);
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(token));
+        }
+    }
+
+    #[test]
+    fn storage_busy_code_has_exact_public_token() {
+        assert_eq!(ApiErrorCode::StorageBusy.as_str(), "storage-busy");
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::StorageBusy).unwrap(),
+            json!("storage-busy")
+        );
+    }
+
+    #[test]
+    fn storage_conflict_codes_have_exact_public_tokens() {
+        for (code, token) in [
+            (ApiErrorCode::StoreInUse, "store-in-use"),
+            (ApiErrorCode::StateConflict, "state-conflict"),
+        ] {
+            assert_eq!(code.as_str(), token);
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(token));
+        }
+    }
+
+    #[test]
+    fn stop_not_confirmed_has_exact_public_token() {
+        assert_eq!(
+            ApiErrorCode::StopNotConfirmed.as_str(),
+            "stop-not-confirmed"
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::StopNotConfirmed).unwrap(),
+            json!("stop-not-confirmed")
+        );
+    }
+
+    #[test]
+    fn api_error_requires_nullable_fields() {
+        let error = ApiError::new(
+            RequestId::new(),
+            None,
+            ApiErrorCode::InvalidRequest,
+            ApiErrorCategory::InvalidRequest,
+            false,
+            "the request is invalid",
+            None,
+        );
+        let wire = serde_json::to_value(error).expect("serialize API error");
+        serde_json::from_value::<ApiError>(wire.clone())
+            .expect("decode complete serialized API error");
+
+        for field in ["host_identity", "details", "docs_url"] {
+            assert_eq!(
+                wire.get(field),
+                Some(&serde_json::Value::Null),
+                "serialization must emit {field} as explicit null"
+            );
+            let mut missing = wire.clone();
+            let removed = missing
+                .as_object_mut()
+                .expect("API error is an object")
+                .remove(field);
+            assert_eq!(removed, Some(serde_json::Value::Null));
+            assert!(
+                serde_json::from_value::<ApiError>(missing).is_err(),
+                "missing {field} must be rejected"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ApiErrorCategory {
+    Authentication,
+    Authorization,
+    Conflict,
+    Compatibility,
+    InvalidRequest,
+    Readiness,
+    Storage,
+    RemoteExecution,
+    Capacity,
+    RateLimit,
+    NotFound,
+    Internal,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiError {
+    schema_version: ErrorSchema,
+    request_id: RequestId,
+    #[serde(deserialize_with = "Option::deserialize")]
+    host_identity: Option<String>,
+    code: ApiErrorCode,
+    category: ApiErrorCategory,
+    retryable: bool,
+    message: String,
+    #[serde(deserialize_with = "Option::deserialize")]
+    details: Option<Value>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    docs_url: Option<String>,
+    suggested_commands: Vec<String>,
+}
+
+impl ApiError {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: Option<String>,
+        code: ApiErrorCode,
+        category: ApiErrorCategory,
+        retryable: bool,
+        message: impl Into<String>,
+        details: Option<Value>,
+    ) -> Self {
+        Self {
+            schema_version: ErrorSchema,
+            request_id,
+            host_identity,
+            code,
+            category,
+            retryable,
+            message: message.into(),
+            details,
+            docs_url: None,
+            suggested_commands: Vec::new(),
+        }
+    }
+
+    pub const fn code(&self) -> ApiErrorCode {
+        self.code
+    }
+
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn host_identity(&self) -> Option<&str> {
+        self.host_identity.as_deref()
+    }
+
+    pub const fn details(&self) -> Option<&Value> {
+        self.details.as_ref()
+    }
+}

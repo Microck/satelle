@@ -1,5 +1,5 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle-cli:\n    type: patch\n---\n\n## Native readiness and durable recovery\n\nMake Windows native readiness checks and managed Codex startup tolerate slow\nversion probes, transient failures, and stale Computer Use plugin sources.\nRecover admitted operations after transport loss, preserve failure classes,\nand allow offline reset of abandoned operation metadata.\n"
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Native readiness and durable recovery\n\nMake Windows native readiness checks and managed Codex startup tolerate slow\nversion probes, transient failures, and stale Computer Use plugin sources.\nRecover admitted operations after transport loss, preserve failure classes,\nand allow offline reset of abandoned operation metadata.\n"
     filename: 2026-09-23-native-readiness-recovery.md
     v: 0.0.0
 core:packages:
@@ -9,15 +9,7 @@ core:packages:
     updated: false
   - changelogIds:
       - 2026-09-23-native-readiness-recovery.md
-    id: cargo:satelle-cli
-    updated: true
-  - id: cargo:satelle-core
-    updated: true
-  - id: cargo:satelle-host
-    updated: true
-  - id: cargo:satelle-test-contract
-    updated: true
-  - id: cargo:satelle-transport
+    id: cargo:satelle
     updated: true
 npm:packages:
   - id: npm:satelle-repository

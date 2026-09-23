@@ -18,7 +18,8 @@
     "prepack": "node ../scripts/verify-native-package.cjs"
   },
   "files": [
-    "bin/satelle.exe"
+    "bin/satelle.exe",
+    "SHA256SUMS"
   ],
   "publishConfig": {
     "access": "public",

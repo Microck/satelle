@@ -16,7 +16,8 @@ jobs:
   npm:
     name: npm distribution (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    # macOS package-manager probes can exceed ten minutes on cold runners.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -104,7 +105,7 @@ jobs:
         run: cargo build --workspace --release --locked
 
       - name: Smoke-test release binary contracts
-        run: cargo test --locked -p satelle-cli --test release-binary-contract release_binary_satisfies_offline_contract -- --exact --ignored
+        run: cargo test --locked -p satelle --test release-binary-contract release_binary_satisfies_offline_contract -- --exact --ignored
 
   # Fast merge gate: ubuntu-only Rust checks. Required for PR merge.
   # The full cross-platform matrix (above) runs but does not block merging.

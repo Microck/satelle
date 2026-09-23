@@ -4,25 +4,34 @@ description: Binary-derived command help and public schema versions for Satelle 
 ---
 
 This page describes **Satelle 0.1.12**. The documentation contract regenerates
-the command sections from `satelle --help` and derives schema identifiers from
+the command sections from native binary and JavaScript launcher help and derives schema identifiers from
 public Satelle result and event schema sources. CI rejects hand-edited or stale output.
 
 ## Public schema versions
 
 | Public schema source | Production source | Serialized schema version |
 | --- | --- | --- |
-| `DoctorEventSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.doctor.events.v1` |
-| `DoctorSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.doctor.v1` |
-| `ERROR_SCHEMA_VERSION` | `crates/satelle-cli/src/error-output.rs` | `satelle.error.v1` |
-| `EVENT_SCHEMA_VERSION` | `crates/satelle-core/src/events.rs` | `satelle.events.v2` |
-| `HostSessionsSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.host.sessions.v1` |
-| `LogEntrySchema` | `crates/satelle-host/src/log-page.rs` | `satelle.logs.entry.v1` |
-| `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.run.v2` |
-| `SetupSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.setup.v2` |
-| `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.status.v2` |
-| `SessionResultSchemaVersion` | `crates/satelle-cli/src/output.rs` | `satelle.steer.v2` |
-| `StopSchemaVersion` | `crates/satelle-core/src/lib.rs` | `satelle.stop.v1` |
-| `SUPPORT_BUNDLE_SCHEMA_VERSION` | `crates/satelle-cli/src/support.rs` | `satelle.support.bundle.v1` |
+| `BATCH_REQUEST_SCHEMA_VERSION` | `crates/satelle/src/automation.rs` | `satelle.batch.request.v1` |
+| `BATCH_RESULT_SCHEMA_VERSION` | `crates/satelle/src/automation.rs` | `satelle.batch.result.v1` |
+| `BATCH_SUMMARY_SCHEMA_VERSION` | `crates/satelle/src/automation.rs` | `satelle.batch.summary.v1` |
+| `CONFIG_REPAIR_SCHEMA_VERSION` | `crates/satelle/src/output.rs` | `satelle.config.repair.v1` |
+| `DoctorEventSchemaVersion` | `crates/satelle/src/core/mod.rs` | `satelle.doctor.events.v1` |
+| `DoctorSchemaVersion` | `crates/satelle/src/core/mod.rs` | `satelle.doctor.v1` |
+| `ERROR_SCHEMA_VERSION` | `crates/satelle/src/error-output.rs` | `satelle.error.v1` |
+| `EVENT_SCHEMA_VERSION` | `crates/satelle/src/core/events.rs` | `satelle.events.v2` |
+| `HostSessionsSchemaVersion` | `crates/satelle/src/core/mod.rs` | `satelle.host.sessions.v1` |
+| `HOST_UPDATE_PLAIN_SCHEMA_VERSION` | `crates/satelle/src/output.rs` | `satelle.host.update.plain.v1` |
+| `LogEntrySchema` | `crates/satelle/src/host/log-page.rs` | `satelle.logs.entry.v2` |
+| `NOTIFY_WEBHOOK_SCHEMA_VERSION` | `crates/satelle/src/automation.rs` | `satelle.notify.webhook.v1` |
+| `REPL_TRANSCRIPT_SCHEMA_VERSION` | `crates/satelle/src/automation.rs` | `satelle.repl.transcript.v1` |
+| `SessionResultSchemaVersion` | `crates/satelle/src/output.rs` | `satelle.run.v2` |
+| `SetupSchemaVersion` | `crates/satelle/src/core/mod.rs` | `satelle.setup.v2` |
+| `SessionResultSchemaVersion` | `crates/satelle/src/output.rs` | `satelle.status.v2` |
+| `SessionResultSchemaVersion` | `crates/satelle/src/output.rs` | `satelle.steer.v2` |
+| `StopSchemaVersion` | `crates/satelle/src/core/mod.rs` | `satelle.stop.v1` |
+| `SUPPORT_BUNDLE_SCHEMA_VERSION` | `crates/satelle/src/support.rs` | `satelle.support.bundle.v1` |
+| `TELEMETRY_STATUS_SCHEMA_VERSION` | `crates/satelle/src/core/telemetry.rs` | `satelle.telemetry.status.v1` |
+| `WATCH_CHANGE_SCHEMA_VERSION` | `crates/satelle/src/automation.rs` | `satelle.watch.change.v1` |
 
 ## `satelle`
 
@@ -32,6 +41,10 @@ Satelle sends command uplinks to a visible remote host and returns telemetry fro
 Usage: satelle [OPTIONS] <COMMAND>
 
 Commands:
+  batch        Execute versioned NDJSON command requests with bounded concurrency
+  repl         Run repeated Satelle commands against one selected Host
+  watch        Emit versioned NDJSON records when selected Satelle state changes
+  notify       Deliver selected Satelle state changes to a user-owned webhook
   completions
   setup
   repair
@@ -39,9 +52,13 @@ Commands:
   config
   paths
   host
+  desktop
+  telemetry    Inspect opt-in Controller or Host telemetry state
   self
   run
   steer
+  action
+  queue
   status
   stop
   session
@@ -74,6 +91,119 @@ Options:
 
   -V, --version
           Print version
+```
+
+## `satelle native repair`
+
+```text
+Usage: satelle native repair [--dry-run]
+
+Reinstall the exact native package through its package manager.
+Local repair records an exact optional dependency in the owning project.
+
+  --dry-run   Show the owner and repair command without changing files
+  --no-color  Use plain output
+  -h, --help  Show this help
+```
+
+## `satelle batch`
+
+```text
+Execute versioned NDJSON command requests with bounded concurrency
+
+Usage: satelle batch [OPTIONS] --input <PATH_OR_DASH>
+
+Options:
+      --input <PATH_OR_DASH>       NDJSON request file, or - for standard input
+      --no-color                   Disable colored human output
+      --concurrency <CONCURRENCY>  Maximum commands executed at once [default: 4]
+      --log-verbosity <LEVEL>      Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>             Apply a named user-level configuration profile
+      --error-format <FORMAT>      Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                       Print help
+```
+
+## `satelle repl`
+
+```text
+Run repeated Satelle commands against one selected Host
+
+Usage: satelle repl [OPTIONS]
+
+Options:
+      --host <HOST>            Select the Host used by every command in this REPL
+      --no-color               Disable colored human output
+      --export <PATH>          Write one redacted versioned NDJSON record per executed command
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --include-prompts        Preserve inline run and steer prompts in the exported transcript
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle watch`
+
+```text
+Emit versioned NDJSON records when selected Satelle state changes
+
+Usage: satelle watch [OPTIONS] <TARGET>
+
+Arguments:
+  <TARGET>  [possible values: sessions, logs, doctor, host]
+
+Options:
+      --host <HOST>
+          Read state from this configured Host
+      --no-color
+          Disable colored human output
+      --log-verbosity <LEVEL>
+          Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --session <SESSION>
+          Include only log entries for this Session
+      --interval <INTERVAL>
+          Delay between successful polls, such as 500ms or 2s [default: 2s]
+      --profile <NAME>
+          Apply a named user-level configuration profile
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --reconnect-attempts <RECONNECT_ATTEMPTS>
+          Consecutive failed polls allowed before the watch stops [default: 8]
+  -h, --help
+          Print help
+```
+
+## `satelle notify`
+
+```text
+Deliver selected Satelle state changes to a user-owned webhook
+
+Usage: satelle notify [OPTIONS] --watch <WATCH> --webhook <WEBHOOK>
+
+Options:
+      --no-color
+          Disable colored human output
+      --watch <WATCH>
+          Satelle state category to watch [possible values: sessions, logs, doctor, host]
+      --log-verbosity <LEVEL>
+          Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --webhook <WEBHOOK>
+          User-level webhook notifier alias
+      --host <HOST>
+          Read state from this configured Host
+      --profile <NAME>
+          Apply a named user-level configuration profile
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --session <SESSION>
+          Include only log entries for this Session
+      --interval <INTERVAL>
+          Delay between successful polls, such as 500ms or 2s [default: 2s]
+      --reconnect-attempts <RECONNECT_ATTEMPTS>
+          Consecutive failed polls allowed before the notification watch stops [default: 8]
+      --dry-run
+          Print webhook payloads without making network requests
+  -h, --help
+          Print help
 ```
 
 ## `satelle completions`
@@ -159,8 +289,14 @@ Options:
       --expected-host-id <HOST_ID>
           Require this exact Host identity during first-time SSH trust
 
+      --raw-subprocess-output
+          Capture selected redacted setup subprocess output for this invocation
+
+      --output <PATH>
+          Write the raw diagnostic artifact to this local path
+
       --format <FORMAT>
-          [possible values: human, json]
+          [possible values: human, json, compact-json, toon, markdown]
 
       --json
           Alias for --format json
@@ -189,7 +325,9 @@ Options:
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes                    Accept ordinary repair mutations without an interactive confirmation
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --raw-subprocess-output  Capture selected redacted repair subprocess output for this invocation
+      --output <PATH>          Write the raw diagnostic artifact to this local path
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -215,7 +353,7 @@ Options:
       --yes
       --no-input
       --quiet
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -228,6 +366,7 @@ Usage: satelle config [OPTIONS] <COMMAND>
 Commands:
   check
   explain
+  repair
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -246,7 +385,7 @@ Usage: satelle paths [OPTIONS]
 Options:
       --host <HOST>
       --no-color               Disable colored human output
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --json                   Alias for --format json
       --profile <NAME>         Apply a named user-level configuration profile
@@ -271,6 +410,42 @@ Commands:
   storage
   store
   help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle desktop`
+
+```text
+Usage: satelle desktop [OPTIONS] <COMMAND>
+
+Commands:
+  snapshot
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle telemetry`
+
+```text
+Inspect opt-in Controller or Host telemetry state
+
+Usage: satelle telemetry [OPTIONS] <COMMAND>
+
+Commands:
+  status  Report policy, endpoint origin, queue use, delivery outcome, and exclusions
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
       --no-color               Disable colored human output
@@ -310,18 +485,22 @@ Options:
 
       --no-color
           Disable colored human output
+      --desktop-binding <ALIAS>
+
       --log-verbosity <LEVEL>
           Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --model <ALIAS>
           Model alias; must resolve with the effective provider alias as one exact Host Provider Binding pair
       --profile <NAME>
           Apply a named user-level configuration profile
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --provider <ALIAS>
           Provider alias; must resolve with the effective model alias as one exact Host Provider Binding pair
       --detach
 
-      --error-format <FORMAT>
-          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --queue
+          Persist this Turn until the Host can admit it
       --detach-on-interrupt
           Leave an admitted Turn running when the attached command is interrupted
       --quiet
@@ -336,16 +515,32 @@ Options:
           Enable YOLO for this Turn with approval policy never and sandbox policy danger-full-access; native app or operating-system prompts remain human decisions
       --no-yolo
           Disable YOLO mode for this command
+      --relay-native-actions
+          Relay supported native Computer Use action requests for explicit allow or deny decisions
       --events <EVENTS>
           [default: auto] [possible values: auto, human, json, none]
       --prompt-file <PROMPT_FILE>
           Read prompt text from a local file; recommended for sensitive prompt input
       --image <LOCAL_PATH>
           Attach a local PNG or JPEG image (maximum 2, 5 MiB each, 10 MiB total); accepted media types depend on Host capabilities
+      --remote-image <HOST_PATH>
+          Attach an absolute PNG or JPEG path on the selected remote Host; shares the limits of --image
       --timeout <DURATION>
           Shorten this Turn's execution timeout (for example 30s, 5m, or 1h; maximum 24h)
+      --raw-protocol
+          Capture this prospective Turn's redacted Codex app-server JSON protocol
+      --output <PATH>
+          Write the raw diagnostic artifact to this local path
+      --no-input
+          Disable raw diagnostic consent input
+      --yes
+          Confirm this invocation's raw diagnostic warning in noninteractive mode
+      --record <MODE>
+          Record this prospective Turn as events, transcript, screenshots, or video [possible values: events, transcript, screenshots, video]
+      --record-retention <DURATION>
+          Retain this recording for a duration such as 30m, 24h, or 7d
       --format <FORMAT>
-          [possible values: human, json]
+          [possible values: human, json, compact-json, toon, markdown]
       --json
           Alias for --format json
   -h, --help
@@ -366,18 +561,22 @@ Options:
 
       --no-color
           Disable colored human output
+      --desktop-binding <ALIAS>
+
       --log-verbosity <LEVEL>
           Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --model <ALIAS>
           Model alias; must resolve with the effective provider alias as one exact Host Provider Binding pair
       --profile <NAME>
           Apply a named user-level configuration profile
+      --error-format <FORMAT>
+          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --provider <ALIAS>
           Provider alias; must resolve with the effective model alias as one exact Host Provider Binding pair
       --detach
 
-      --error-format <FORMAT>
-          Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --queue
+          Persist this Turn until the Host can admit it
       --detach-on-interrupt
           Leave an admitted Turn running when the attached command is interrupted
       --quiet
@@ -392,20 +591,71 @@ Options:
           Enable YOLO for this Turn with approval policy never and sandbox policy danger-full-access; native app or operating-system prompts remain human decisions
       --no-yolo
           Disable YOLO mode for this command
+      --relay-native-actions
+          Relay supported native Computer Use action requests for explicit allow or deny decisions
       --events <EVENTS>
           [default: auto] [possible values: auto, human, json, none]
       --prompt-file <PROMPT_FILE>
           Read prompt text from a local file; recommended for sensitive prompt input
       --image <LOCAL_PATH>
           Attach a local PNG or JPEG image (maximum 2, 5 MiB each, 10 MiB total); accepted media types depend on Host capabilities
+      --remote-image <HOST_PATH>
+          Attach an absolute PNG or JPEG path on the selected remote Host; shares the limits of --image
       --timeout <DURATION>
           Shorten this Turn's execution timeout (for example 30s, 5m, or 1h; maximum 24h)
+      --raw-protocol
+          Capture this prospective Turn's redacted Codex app-server JSON protocol
+      --output <PATH>
+          Write the raw diagnostic artifact to this local path
+      --no-input
+          Disable raw diagnostic consent input
+      --yes
+          Confirm this invocation's raw diagnostic warning in noninteractive mode
+      --record <MODE>
+          Record this prospective Turn as events, transcript, screenshots, or video [possible values: events, transcript, screenshots, video]
+      --record-retention <DURATION>
+          Retain this recording for a duration such as 30m, 24h, or 7d
       --format <FORMAT>
-          [possible values: human, json]
+          [possible values: human, json, compact-json, toon, markdown]
       --json
           Alias for --format json
   -h, --help
           Print help
+```
+
+## `satelle action`
+
+```text
+Usage: satelle action [OPTIONS] <COMMAND>
+
+Commands:
+  respond  Answer a detached native action request
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle queue`
+
+```text
+Usage: satelle queue [OPTIONS] <COMMAND>
+
+Commands:
+  status  Read the durable state of one queued Turn
+  cancel  Cancel one queued Turn before admission
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
 ```
 
 ## `satelle status`
@@ -419,7 +669,7 @@ Arguments:
 Options:
       --host <HOST>
       --no-color               Disable colored human output
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --json                   Alias for --format json
       --profile <NAME>         Apply a named user-level configuration profile
@@ -438,7 +688,7 @@ Arguments:
 Options:
       --host <HOST>
       --no-color               Disable colored human output
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --json                   Alias for --format json
       --profile <NAME>         Apply a named user-level configuration profile
@@ -551,7 +801,7 @@ Options:
       --no-color               Disable colored human output
       --all
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --json                   Alias for --format json
@@ -568,11 +818,31 @@ Options:
       --no-color                Disable colored human output
       --log-verbosity <LEVEL>   Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --show-secret-references
-      --format <FORMAT>         [possible values: human, json]
+      --format <FORMAT>         [possible values: human, json, compact-json, toon, markdown]
       --profile <NAME>          Apply a named user-level configuration profile
       --error-format <FORMAT>   Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --json                    Alias for --format json
   -h, --help                    Print help
+```
+
+## `satelle config repair`
+
+```text
+Usage: satelle config repair [OPTIONS]
+
+Options:
+      --file <FILE>            Select one loaded local configuration file; project files require this flag
+      --no-color               Disable colored human output
+      --host <HOST>            Scope Trusted Profile consent to edits inside this Host Binding
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --dry-run
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --yes                    Accept the displayed local configuration edits and private backup
+      --no-input
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
+      --json                   Alias for --format json
+  -h, --help                   Print help
 ```
 
 ## `satelle host start`
@@ -588,8 +858,10 @@ Options:
       --profile <NAME>         Apply a named user-level configuration profile
       --tls-key <PATH>         Owner-only PEM private key matching --tls-cert
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --tls-client-ca <PATH>   Require client certificates signed by this PEM CA bundle
+      --tls-client-crl <PATH>  Signed client revocation lists, including a current list for each issuing CA
       --foreground
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -611,7 +883,7 @@ Options:
       --error-format <FORMAT>       Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes                         Apply trust without an interactive confirmation
       --no-input                    Reject any path that would prompt for input
-      --format <FORMAT>             [possible values: human, json]
+      --format <FORMAT>             [possible values: human, json, compact-json, toon, markdown]
       --json                        Alias for --format json
   -h, --help                        Print help
 ```
@@ -624,7 +896,7 @@ Usage: satelle host status [OPTIONS]
 Options:
       --host <HOST>
       --no-color               Disable colored human output
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --json                   Alias for --format json
       --profile <NAME>         Apply a named user-level configuration profile
@@ -645,7 +917,7 @@ Options:
       --no-input
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -663,7 +935,7 @@ Options:
       --no-input
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -678,14 +950,16 @@ Options:
       --no-color               Disable colored human output
       --component <COMPONENT>
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
-      --all-remotes
       --profile <NAME>         Apply a named user-level configuration profile
-      --dry-run
+      --version <VERSION>      Select a compatible stable Host release; requires --component host
+      --all-remotes
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --dry-run
       --yes
       --no-input
       --quiet                  Suppress non-error human plan and progress output; use --json for stable automation data
-      --format <FORMAT>        [possible values: human, json]
+      --plain                  Emit fixed tab-separated target records; use --json for the complete report
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -698,7 +972,7 @@ Usage: satelle host cleanup [OPTIONS]
 Options:
       --host <HOST>
       --no-color               Disable colored human output
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --json                   Alias for --format json
       --profile <NAME>         Apply a named user-level configuration profile
@@ -716,7 +990,7 @@ Options:
       --no-color               Disable colored human output
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
       --no-bootstrap
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --json                   Alias for --format json
@@ -730,9 +1004,11 @@ Usage: satelle host storage [OPTIONS] <COMMAND>
 
 Commands:
   migrate
+  complete  Confirm a staged migration after a lost completion response
+  source
   restore
   backup
-  help     Print this message or the help of the given subcommand(s)
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
       --no-color               Disable colored human output
@@ -759,6 +1035,43 @@ Options:
   -h, --help                   Print help
 ```
 
+## `satelle desktop snapshot`
+
+```text
+Usage: satelle desktop snapshot [OPTIONS] --host <HOST> --output <PATH>
+
+Options:
+      --host <HOST>
+      --no-color                 Disable colored human output
+      --desktop-binding <ALIAS>
+      --log-verbosity <LEVEL>    Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --output <PATH>
+      --profile <NAME>           Apply a named user-level configuration profile
+      --error-format <FORMAT>    Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --no-input
+      --format <FORMAT>          [possible values: human, json, compact-json, toon, markdown]
+      --json                     Alias for --format json
+  -h, --help                     Print help
+```
+
+## `satelle telemetry status`
+
+```text
+Report policy, endpoint origin, queue use, delivery outcome, and exclusions
+
+Usage: satelle telemetry status [OPTIONS]
+
+Options:
+      --host <HOST>            Inspect one Host instead of the local Controller
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --json                   Alias for --format json
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
 ## `satelle self update`
 
 ```text
@@ -779,9 +1092,71 @@ Options:
       --no-input
       --yes
       --quiet                      Suppress non-error human remote-update output; use --json for stable automation data
-      --format <FORMAT>            [possible values: human, json]
+      --format <FORMAT>            [possible values: human, json, compact-json, toon, markdown]
       --json                       Alias for --format json
   -h, --help                       Print help
+```
+
+## `satelle action respond`
+
+```text
+Answer a detached native action request
+
+Usage: satelle action respond [OPTIONS] <ACTION_REQUEST_ID>
+
+Arguments:
+  <ACTION_REQUEST_ID>
+
+Options:
+      --allow
+      --no-color               Disable colored human output
+      --deny
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle queue status`
+
+```text
+Read the durable state of one queued Turn
+
+Usage: satelle queue status [OPTIONS] <QUEUE_REQUEST_ID>
+
+Arguments:
+  <QUEUE_REQUEST_ID>
+
+Options:
+      --host <HOST>
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --json                   Alias for --format json
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
+```
+
+## `satelle queue cancel`
+
+```text
+Cancel one queued Turn before admission
+
+Usage: satelle queue cancel [OPTIONS] <QUEUE_REQUEST_ID>
+
+Arguments:
+  <QUEUE_REQUEST_ID>
+
+Options:
+      --host <HOST>
+      --no-color               Disable colored human output
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --json                   Alias for --format json
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+  -h, --help                   Print help
 ```
 
 ## `satelle session export`
@@ -808,7 +1183,7 @@ Options:
 Usage: satelle skills list [OPTIONS]
 
 Options:
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown, csv]
       --no-color               Disable colored human output
       --json                   Alias for --format json
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
@@ -826,7 +1201,7 @@ Arguments:
   <NAME>
 
 Options:
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --no-color               Disable colored human output
       --json                   Alias for --format json
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
@@ -844,7 +1219,7 @@ Arguments:
   <NAME>
 
 Options:
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --no-color               Disable colored human output
       --json                   Alias for --format json
       --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
@@ -883,7 +1258,7 @@ Options:
       --satelle-path <SATELLE_PATH>
       --dry-run
       --enable-mutations             Configure the MCP server with explicitly enabled mutating tools
-      --format <FORMAT>              [possible values: human, json]
+      --format <FORMAT>              [possible values: human, json, compact-json, toon, markdown]
       --json                         Alias for --format json
   -h, --help                         Print help
 ```
@@ -904,7 +1279,7 @@ Options:
       --profile <NAME>         Apply a named user-level configuration profile
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -912,7 +1287,7 @@ Options:
 ## `satelle host storage migrate`
 
 ```text
-Usage: satelle host storage migrate [OPTIONS]
+Usage: satelle host storage migrate [OPTIONS] --to <TO>
 
 Options:
       --host <HOST>
@@ -924,8 +1299,45 @@ Options:
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
+  -h, --help                   Print help
+```
+
+## `satelle host storage complete`
+
+```text
+Confirm a staged migration after a lost completion response
+
+Usage: satelle host storage complete [OPTIONS] --host <HOST> --operation-id <OPERATION_ID>
+
+Options:
+      --host <HOST>
+      --no-color                     Disable colored human output
+      --log-verbosity <LEVEL>        Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --operation-id <OPERATION_ID>
+      --profile <NAME>               Apply a named user-level configuration profile
+      --yes
+      --error-format <FORMAT>        Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --format <FORMAT>              [possible values: human, json, compact-json, toon, markdown]
+      --json                         Alias for --format json
+  -h, --help                         Print help
+```
+
+## `satelle host storage source`
+
+```text
+Usage: satelle host storage source [OPTIONS] <COMMAND>
+
+Commands:
+  cleanup
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --no-color               Disable colored human output
+      --log-verbosity <LEVEL>  Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --profile <NAME>         Apply a named user-level configuration profile
+      --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
   -h, --help                   Print help
 ```
 
@@ -944,7 +1356,7 @@ Options:
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
@@ -981,9 +1393,29 @@ Options:
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --yes
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
+```
+
+## `satelle host storage source cleanup`
+
+```text
+Usage: satelle host storage source cleanup [OPTIONS] --host <HOST> --operation-id <OPERATION_ID>
+
+Options:
+      --host <HOST>
+      --no-color                     Disable colored human output
+      --log-verbosity <LEVEL>        Set diagnostic log verbosity: off, info, debug, or trace [possible values: off, info, debug, trace]
+      --operation-id <OPERATION_ID>
+      --dry-run
+      --profile <NAME>               Apply a named user-level configuration profile
+      --error-format <FORMAT>        Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
+      --yes
+      --no-input
+      --format <FORMAT>              [possible values: human, json, compact-json, toon, markdown]
+      --json                         Alias for --format json
+  -h, --help                         Print help
 ```
 
 ## `satelle host storage backup cleanup`
@@ -1000,7 +1432,7 @@ Options:
       --yes
       --error-format <FORMAT>  Format diagnostics as human-readable text or JSON [env: SATELLE_ERROR_FORMAT=] [possible values: human, json]
       --no-input
-      --format <FORMAT>        [possible values: human, json]
+      --format <FORMAT>        [possible values: human, json, compact-json, toon, markdown]
       --json                   Alias for --format json
   -h, --help                   Print help
 ```
