@@ -1,3 +1,17 @@
+## satelle-cli@0.1.13
+
+### Native setup and recovery
+
+Count only installed Computer Use plugins during readiness checks, including
+plugins exposed by remote sources.
+
+Preserve managed setup failures for recovery and install Satelle's Codex package
+under private Host state while continuing to use the existing Codex home for
+authentication.
+
+Validate macOS bridge runtime values directly. Leave Host metadata absent after
+an offline store reset so first SSH trust can enroll the stopped Host again.
+
 ## satelle-cli@0.1.12
 
 ### Native readiness and durable recovery
