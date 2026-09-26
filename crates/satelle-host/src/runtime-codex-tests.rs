@@ -1211,6 +1211,13 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
     let plugins = serde_json::to_vec(&json!({
         "installed": [
             {
+                "pluginId": "calendar@openai-curated-remote",
+                "marketplaceName": "openai-curated-remote",
+                "installed": true,
+                "enabled": true,
+                "source": { "source": "remote", "id": "calendar" }
+            },
+            {
                 "pluginId": "browser@openai-bundled",
                 "marketplaceName": "openai-bundled",
                 "installed": true,
@@ -1444,16 +1451,26 @@ fn isolation_rejects_malformed_or_redirected_computer_use_plugins() {
     }]))
     .expect("serialize MCP fixture");
 
-    for (version, path, expected_reason) in [
+    for (version, source, expected_reason) in [
         (
             "26..99999",
-            "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use",
+            json!({"source": "local", "path": "C:\\Users\\operator\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled\\plugins\\computer-use"}),
             "computer_use_plugin_not_ready",
         ),
         (
             "26.803.41515",
-            "C:\\Users\\operator\\Downloads\\computer-use",
+            json!({"source": "local", "path": "C:\\Users\\operator\\Downloads\\computer-use"}),
             "computer_use_plugin_source_untrusted",
+        ),
+        (
+            "26.803.41515",
+            json!({"source": "remote", "id": "computer-use"}),
+            "computer_use_plugin_source_untrusted",
+        ),
+        (
+            "26.803.41515",
+            json!({"source": "local"}),
+            "plugin_inventory_malformed",
         ),
     ] {
         let plugins = serde_json::to_vec(&json!({
@@ -1463,7 +1480,7 @@ fn isolation_rejects_malformed_or_redirected_computer_use_plugins() {
                 "installed": true,
                 "enabled": true,
                 "version": version,
-                "source": {"source": "local", "path": path}
+                "source": source
             }]
         }))
         .expect("serialize plugin fixture");

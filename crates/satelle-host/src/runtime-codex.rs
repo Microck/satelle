@@ -698,9 +698,10 @@ struct InstalledPlugin {
 }
 
 #[derive(Deserialize)]
-struct InstalledPluginSource {
-    source: String,
-    path: PathBuf,
+#[serde(tag = "source", rename_all = "lowercase")]
+enum InstalledPluginSource {
+    Local { path: PathBuf },
+    Remote,
 }
 
 #[derive(Deserialize)]
@@ -1570,18 +1571,12 @@ fn computer_use_plugin_source_is_trusted(
     platform: &str,
     trusted_computer_use_plugin_root: &Path,
 ) -> bool {
-    if plugin.source.source != "local"
-        || !path_is_absolute_for_platform(&plugin.source.path, platform)
-    {
+    let InstalledPluginSource::Local { path } = &plugin.source else {
         return false;
-    }
-
-    matches!(platform, "windows" | "macos")
-        && same_path_for_platform(
-            &plugin.source.path,
-            trusted_computer_use_plugin_root,
-            platform,
-        )
+    };
+    path_is_absolute_for_platform(path, platform)
+        && matches!(platform, "windows" | "macos")
+        && same_path_for_platform(path, trusted_computer_use_plugin_root, platform)
 }
 
 fn official_computer_use_plugin_root(
