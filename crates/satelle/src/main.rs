@@ -10881,7 +10881,8 @@ fn start_host_daemon_with(
         .enable_all()
         .build()
         .map_err(|error| daemon_process_failure("runtime-create-failed", error.to_string()))?;
-    runtime.block_on(async move {
+    let endpoint_launch = local_daemon_launch.clone();
+    let result = runtime.block_on(async move {
         let mut server_config =
             DaemonServerConfig::loopback(bind_addr).with_api_rate_limits(api_rate_limits);
         if local_daemon_launch.is_some() {
@@ -10952,16 +10953,20 @@ fn start_host_daemon_with(
             server_wait.await.map_err(daemon_server_failure)
         };
         state_release_task.abort();
-        if let Some(launch) = local_daemon_launch.as_ref() {
-            transport::remove_local_daemon_endpoint(launch);
-        }
         emit_daemon_process_notice(if result.is_ok() {
             DaemonProcessNotice::Shutdown
         } else {
             DaemonProcessNotice::Fatal
         });
         result
-    })
+    });
+    // Endpoint disappearance lets migration start the replacement Host. Keep it
+    // published until the runtime has dropped every task that can own SQLite.
+    drop(runtime);
+    if let Some(launch) = endpoint_launch.as_ref() {
+        transport::remove_local_daemon_endpoint(launch);
+    }
+    result
 }
 
 #[cfg(test)]

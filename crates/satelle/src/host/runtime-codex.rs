@@ -701,9 +701,10 @@ struct InstalledPlugin {
 }
 
 #[derive(Deserialize)]
-struct InstalledPluginSource {
-    source: String,
-    path: PathBuf,
+#[serde(tag = "source", rename_all = "lowercase")]
+enum InstalledPluginSource {
+    Local { path: PathBuf },
+    Remote,
 }
 
 #[derive(Deserialize)]
@@ -732,7 +733,9 @@ fn configured_codex_isolation(
     mut mcp_command: Command,
     deadline: Instant,
 ) -> Result<(CodexIsolationPlan, PathBuf, Instant), SatelleError> {
-    plugin_command.args(["plugin", "list", "--available", "--json"]);
+    // Only installed plugins affect isolation. Expanding the marketplace catalog
+    // can exceed the bounded output budget with entries that are never consumed.
+    plugin_command.args(["plugin", "list", "--json"]);
     let plugin_output = bounded_inventory_command_output(
         plugin_command,
         deadline,
@@ -1093,7 +1096,7 @@ fn provision_windows_computer_use(
     let mut plugin_inventory_command = runtime
         .command()
         .map_err(|error| mark_provision_changed(error, changed))?;
-    plugin_inventory_command.args(["plugin", "list", "--available", "--json"]);
+    plugin_inventory_command.args(["plugin", "list", "--json"]);
     let plugin_inventory = bounded_inventory_command_output(
         plugin_inventory_command,
         deadline,
@@ -1571,18 +1574,12 @@ fn computer_use_plugin_source_is_trusted(
     platform: &str,
     trusted_computer_use_plugin_root: &Path,
 ) -> bool {
-    if plugin.source.source != "local"
-        || !path_is_absolute_for_platform(&plugin.source.path, platform)
-    {
+    let InstalledPluginSource::Local { path } = &plugin.source else {
         return false;
-    }
-
-    matches!(platform, "windows" | "macos")
-        && same_path_for_platform(
-            &plugin.source.path,
-            trusted_computer_use_plugin_root,
-            platform,
-        )
+    };
+    path_is_absolute_for_platform(path, platform)
+        && matches!(platform, "windows" | "macos")
+        && same_path_for_platform(path, trusted_computer_use_plugin_root, platform)
 }
 
 fn official_computer_use_plugin_root(
@@ -2642,6 +2639,9 @@ pub(super) fn trusted_macos_node_repl_env(
     codex_home: &Path,
     trusted_root: &Path,
 ) -> Option<BTreeMap<String, String>> {
+    let tinysky_enabled = reported_env
+        .get("BROWSER_USE_TINYSKY_ENABLED")
+        .filter(|value| matches!(value.as_str(), "0" | "1"))?;
     let app_version = reported_env
         .get("BROWSER_USE_CODEX_APP_VERSION")
         .map(String::as_str)
@@ -2671,7 +2671,7 @@ pub(super) fn trusted_macos_node_repl_env(
         return None;
     }
 
-    let expected_reported_env = BTreeMap::from([
+    let expected_runtime_env = BTreeMap::from([
         (
             "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS".to_string(),
             "1000".to_string(),
@@ -2684,10 +2684,7 @@ pub(super) fn trusted_macos_node_repl_env(
             "NODE_REPL_TRUSTED_CODE_PATHS".to_string(),
             format!("{codex_home}:{node_modules}"),
         ),
-        (
-            "NODE_REPL_NODE_MODULE_DIRS".to_string(),
-            node_modules,
-        ),
+        ("NODE_REPL_NODE_MODULE_DIRS".to_string(), node_modules),
         (
             "NODE_REPL_NODE_PATH".to_string(),
             format!("{trusted_root}/bin/node"),
@@ -2696,21 +2693,11 @@ pub(super) fn trusted_macos_node_repl_env(
             "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
             "chrome,iab".to_string(),
         ),
-        ("BROWSER_USE_TINYSKY_ENABLED".to_string(), "0".to_string()),
+        (
+            "BROWSER_USE_TINYSKY_ENABLED".to_string(),
+            tinysky_enabled.clone(),
+        ),
         ("CODEX_HOME".to_string(), codex_home.to_string()),
-        (
-            "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER".to_string(),
-            "Control the in-app browser in conjunction with the Browser Plugin.".to_string(),
-        ),
-        (
-            "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME".to_string(),
-            "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative."
-                .to_string(),
-        ),
-        (
-            "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE".to_string(),
-            "Control desktop apps on macOS through Computer Use.".to_string(),
-        ),
         (
             "BROWSER_USE_CODEX_APP_BUILD_FLAVOR".to_string(),
             "prod".to_string(),
@@ -2721,13 +2708,22 @@ pub(super) fn trusted_macos_node_repl_env(
         ),
         ("SKY_CUA_SERVICE_PATH".to_string(), computer_use_service),
     ]);
-    let mut reported_without_services = reported_env.clone();
-    reported_without_services.remove("NODE_REPL_TRUSTED_SERVICES");
-    if reported_without_services != expected_reported_env {
+    let mut reported_runtime_env = reported_env.clone();
+    reported_runtime_env.remove("NODE_REPL_TRUSTED_SERVICES");
+    // Upstream display instructions are not runtime authority. Keep them out
+    // of Satelle's isolated native execution environment.
+    for key in [
+        "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER",
+        "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME",
+        "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE",
+    ] {
+        reported_runtime_env.remove(key);
+    }
+    if reported_runtime_env != expected_runtime_env {
         return None;
     }
 
-    let mut admitted_env = expected_reported_env;
+    let mut admitted_env = expected_runtime_env;
     admitted_env.insert(
         "NODE_REPL_TRUSTED_SERVICES".to_string(),
         r#"{"sky":"@oai/sky/service"}"#.to_string(),

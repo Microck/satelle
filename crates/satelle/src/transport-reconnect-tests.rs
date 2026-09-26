@@ -99,45 +99,47 @@ impl DropHttpConnections {
         let (serving_sender, serving) = mpsc::channel();
         let (shutdown, shutdown_receiver) = mpsc::channel();
         let thread = thread::spawn(move || {
-            // Drop the requested attempts, but retain the final connection while replacing this
-            // listener. This keeps the retry deterministic: the client cannot observe a
-            // connection-refused gap between the transient listener and the real daemon.
-            let mut accepted = 0_usize;
-            let final_connection = loop {
-                match listener.accept() {
-                    Ok((connection, _)) => {
-                        accepted += 1;
-                        if accepted == connections_to_drop {
-                            break connection;
-                        }
-                    }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                        match shutdown_receiver.try_recv() {
-                            Ok(()) | Err(TryRecvError::Disconnected) => return,
-                            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(5)),
-                        }
-                    }
-                    Err(error) => panic!("accept transient HTTP connection: {error}"),
-                }
-            };
-            drop(listener);
-
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("construct transient HTTP runtime");
             runtime.block_on(async move {
-                let server = DaemonServer::bind(service, DaemonServerConfig::loopback(address))
+                // Keep the public listener bound across the failure and recovery. Closing it
+                // before binding a replacement lets fast retries hit connection refused.
+                let server = DaemonServer::bind(
+                    service,
+                    DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                )
                     .await
-                    .expect("start real HTTP daemon after transient failure");
-                drop(final_connection);
-                serving_sender
-                    .send(())
-                    .expect("report transient HTTP daemon readiness");
-                tokio::task::spawn_blocking(move || shutdown_receiver.recv())
-                    .await
-                    .expect("join transient HTTP shutdown waiter")
-                    .expect("receive transient HTTP shutdown");
+                    .expect("start real HTTP daemon behind transient listener");
+                let backend = server.local_addr();
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("adopt transient HTTP listener");
+                let shutdown = tokio::task::spawn_blocking(move || shutdown_receiver.recv());
+                tokio::pin!(shutdown);
+                let mut dropped = 0_usize;
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (mut connection, _) = accepted.expect("accept transient HTTP connection");
+                            if dropped < connections_to_drop {
+                                dropped += 1;
+                                drop(connection);
+                                if dropped == connections_to_drop {
+                                    serving_sender.send(()).expect("report transient HTTP recovery");
+                                }
+                                continue;
+                            }
+                            tokio::spawn(async move {
+                                let mut upstream = tokio::net::TcpStream::connect(backend)
+                                    .await
+                                    .expect("connect real HTTP daemon");
+                                let _ = tokio::io::copy_bidirectional(&mut connection, &mut upstream).await;
+                            });
+                        }
+                        _ = &mut shutdown => break,
+                    }
+                }
                 server
                     .shutdown()
                     .await

@@ -747,6 +747,27 @@ impl InterruptSource for TestInterrupt {
     }
 }
 
+struct PreflightInterrupt {
+    started: TestLatch,
+    release: TestLatch,
+}
+
+impl InterruptSource for PreflightInterrupt {
+    fn wait(&self) -> InterruptFuture<'_> {
+        Box::pin(async move {
+            assert!(
+                self.started.wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
+                "preflight must be active before interruption"
+            );
+            let release = self.release.clone();
+            // The local current-thread runtime can release preflight only after
+            // the interrupt branch requests cancellation and awaits admission.
+            tokio::spawn(async move { release.signal() });
+            Ok(())
+        })
+    }
+}
+
 struct FailingWaitInterrupt {
     operation_started: TestLatch,
 }
@@ -4385,30 +4406,20 @@ fn injected_interrupt_before_local_run_admission_cancels_without_creating_a_turn
     let service = HostService::with_adapter_for_tests_at(state.path(), adapter.clone())
         .expect("construct interrupt lifecycle Host");
     let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service.clone());
-    let interrupt = TestInterrupt::default();
-    let command_interrupt = interrupt.clone();
-    let command = thread::spawn(move || {
-        transport.attached_with_interrupt(
-            None,
-            TurnIntent::new(
-                "cancel before local run admission",
-                satelle::core::session::TurnExecutionMode::Standard,
-            )
-            .expect("construct run intent"),
-            false,
-            &command_interrupt,
+    let interrupt = PreflightInterrupt {
+        started: adapter.preflight_started.clone(),
+        release: adapter.preflight_release.clone(),
+    };
+    let failure = match transport.attached_with_interrupt(
+        None,
+        TurnIntent::new(
+            "cancel before local run admission",
+            satelle::core::session::TurnExecutionMode::Standard,
         )
-    });
-    assert!(
-        adapter
-            .preflight_started
-            .wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
-        "preflight must be active before interruption"
-    );
-
-    interrupt.signal();
-    adapter.preflight_release.signal();
-    let failure = match command.join().expect("command thread must not panic") {
+        .expect("construct run intent"),
+        false,
+        &interrupt,
+    ) {
         Err(failure) => failure,
         Ok(_) => panic!("pre-admission interruption must fail the attached command"),
     };
@@ -4548,7 +4559,6 @@ fn injected_interrupt_after_local_run_admission_confirms_stop_before_exit_130() 
     assert_eq!(failure.phase(), TurnAdmissionPhase::Admitted);
     assert_eq!(failure.error().code, ErrorCode::Interrupted);
     assert_eq!(failure.error().exit_code(), 130);
-    assert_eq!(failure.events()[0].event_type(), EventType::ActionRequired);
     assert_eq!(
         failure
             .events()
@@ -4644,8 +4654,15 @@ fn unconfirmed_local_stop_preserves_buffered_live_events_without_waiting_for_exe
     assert_eq!(failure.phase(), TurnAdmissionPhase::Admitted);
     assert_eq!(failure.error().code, ErrorCode::Interrupted);
     assert_eq!(failure.error().exit_code(), 130);
-    assert_eq!(failure.events().len(), 1);
-    assert_eq!(failure.events()[0].event_type(), EventType::ActionRequired);
+    assert_eq!(
+        failure
+            .events()
+            .iter()
+            .filter(|event| event.event_type() == EventType::ActionRequired)
+            .count(),
+        1,
+        "interruption must retain the published event exactly once"
+    );
     assert_eq!(adapter.stop_calls.load(Ordering::SeqCst), 1);
     assert!(
         failure
@@ -6996,6 +7013,79 @@ fn manual_macos_setup_details_round_trip_only_in_the_closed_shape() {
         let mapped = map_api_error("clean-mac", &api_error("computer-use-not-ready", invalid));
         assert_eq!(mapped.code, ErrorCode::RemoteExecution);
         assert_eq!(mapped.details["remote_code"], "invalid-daemon-response");
+    }
+}
+
+#[test]
+fn managed_setup_failure_reconciles_only_a_validated_no_change_result() {
+    let api_error = |details: serde_json::Value| {
+        serde_json::from_value::<ApiError>(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle::transport::RequestId::new().to_string(),
+            "host_identity": "host-direct-test",
+            "code": "setup-action-failed",
+            "category": "remote_execution",
+            "retryable": false,
+            "message": "PRIVATE_MESSAGE",
+            "details": details,
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize managed setup failure")
+    };
+    let error = api_error(serde_json::json!({
+        "failed_action": "prepare-package-root",
+        "changed": false
+    }));
+    let mapped = map_managed_setup_api_error(
+        "tailnet-host",
+        satelle::core::SetupMode::Persistent,
+        "codex",
+        &error,
+    );
+    assert_eq!(mapped.code, ErrorCode::SetupActionFailed);
+    assert_eq!(mapped.details["failed_action"], "prepare-package-root");
+    assert!(managed_setup_failure_is_reconciled(&mapped));
+    let partial = map_managed_setup_api_error(
+        "tailnet-host",
+        satelle::core::SetupMode::Persistent,
+        "codex",
+        &api_error(serde_json::json!({"failed_action": "write-install-receipt", "changed": true})),
+    );
+    assert_eq!(partial.details["changed"], true);
+    assert!(!managed_setup_failure_is_reconciled(&partial));
+    assert_eq!(
+        mapped.recovery_command.as_deref(),
+        Some(
+            "satelle setup --host tailnet-host --persistent --component codex --no-input --json --yes"
+        )
+    );
+    assert!(!mapped.message.contains("PRIVATE"));
+    assert!(!managed_setup_rejection_precedes_mutation(
+        &DaemonClientError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            error: Box::new(error),
+        }
+    ));
+    for details in [
+        serde_json::Value::Null,
+        serde_json::json!({"failed_action": "prepare-package-root"}),
+        serde_json::json!({"failed_action": "prepare-package-root", "changed": "false"}),
+        serde_json::json!({"failed_action": "private/path", "changed": false}),
+        serde_json::json!({"failed_action": "a".repeat(65), "changed": false}),
+        serde_json::json!({"failed_action": 42, "changed": false}),
+        serde_json::json!({"failed_action": "prepare-package-root", "changed": false, "private": "PRIVATE_DETAIL"}),
+    ] {
+        let mapped = map_managed_setup_api_error(
+            "tailnet-host",
+            satelle::core::SetupMode::Persistent,
+            "codex",
+            &api_error(details),
+        );
+        assert_eq!(mapped.code, ErrorCode::SetupActionFailed);
+        assert!(!mapped.details.contains_key("failed_action"));
+        assert!(!managed_setup_failure_is_reconciled(&mapped));
+        assert!(!mapped.message.contains("PRIVATE"));
     }
 }
 

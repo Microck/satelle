@@ -620,11 +620,11 @@ impl ProductionComputerUseAdapter {
             READINESS_CANCELLATION_GRACE,
             cancellation.cloned(),
         );
-        // A pre-dispatch failure or rejected turn cannot drive the action
-        // surface. Report it now instead of masking it behind the action-page
-        // deadline, which can be several minutes. Other post-dispatch errors
-        // still wait because a confirmed native callback can outlive process
-        // shutdown.
+        // A pre-dispatch failure, rejected turn, or completed turn without a
+        // successful native tool cannot drive the action surface. Report it
+        // now instead of masking it behind the action-page deadline, which
+        // can be several minutes. Other post-dispatch errors still wait
+        // because a confirmed native callback can outlive process shutdown.
         if let Some(failure) = classify_native_probe_failure_before_action_wait(&run) {
             return Err(failure);
         }
@@ -1933,7 +1933,10 @@ fn classify_native_probe_failure_before_action_wait(
     match &run.result {
         Err(failure)
             if !failure.turn_dispatch_attempted()
-                || failure.error() == CodexSessionError::ResponseError =>
+                || matches!(
+                    failure.error(),
+                    CodexSessionError::ResponseError | CodexSessionError::NativeActionUnavailable
+                ) =>
         {
             Some(native_smoke_session_failure(*failure))
         }
@@ -3589,6 +3592,23 @@ mod tests {
             failure.error.details["reason"],
             "native_readiness_response_error"
         );
+        assert!(failure.dispatch_possible);
+    }
+
+    #[test]
+    fn completed_turn_without_a_successful_native_tool_does_not_wait_for_callbacks() {
+        let run = crate::host::codex_session::TimedCodexSessionRun {
+            result: Err(CodexSessionFailure::after_exchange(
+                CodexSessionError::NativeActionUnavailable,
+                true,
+            )),
+            cancellation: None,
+        };
+
+        let failure = classify_native_probe_failure_before_action_wait(&run)
+            .expect("a completed turn without a successful tool cannot produce native proof");
+
+        assert_eq!(failure.reason, "native_readiness_native_action_unavailable");
         assert!(failure.dispatch_possible);
     }
 

@@ -1061,6 +1061,7 @@
 - a computer-use-not-ready error with reason native_readiness_native_action_unavailable is retryable because the native action can become available after the user completes the required system action @spec @contract @mvp @implemented
 - satelle machine-readable error output is stable enough for AI clients and scripts to branch on code, category, retryable, and suggested_commands without parsing human text @spec @mvp @implemented
 - satelle JSON errors include a stable code, a human message, optional structured details, and actionable recovery guidance when the recovery path is known @implemented @mvp
+- Host-managed Codex installation failures cross the authenticated API as setup-action-failed with a bounded lowercase-hyphen failed_action token and a boolean changed result; the Controller preserves those details and the exact setup recovery selection, completes maintenance for a confirmed no-change result, and retains the mutation fence for partial or uncertain results without exposing raw installer diagnostics @spec @contract @mvp @implemented
 - satelle human error messages state the user-visible outcome first, explain the known cause, identify preserved state when relevant, and provide the next recovery step @spec @mvp @implemented
 - satelle does not use generic failure messages when a specific failed host, transport, Codex, Computer Use, provider, config, or session check is known @spec @mvp @implemented
 - satelle separates user-facing error messages from diagnostic implementation details and exposes low-level details only when they help the user or agent act @spec @mvp @implemented
@@ -1891,7 +1892,7 @@
 - satelle host storage backup cleanup --host <alias> is the explicit command for deleting older eligible migration backups after a dry-run plan and mutation consent @spec @mvp @implemented
 - satelle destructive store reset is available only through an explicit host maintenance command @spec @mvp @implemented
 - satelle host store reset deletes metadata only by default and does not delete recordings unless the user explicitly requests recording deletion @spec @mvp @implemented
-- explicit offline store reset discards abandoned operation metadata without marking those operations terminal; the operator must first stop external Computer Use processes, the filesystem ownership lock rejects a running Host, and a durable handoff records reset completion in the replacement database @spec @mvp @implemented
+- explicit offline store reset discards abandoned operation metadata without marking those operations terminal; the operator must first stop external Computer Use processes, the filesystem ownership lock rejects a running Host, and a durable filesystem handoff closes reset completion without recreating SQLite so the stopped Host can be enrolled again @spec @mvp @implemented
 - satelle does not use ad hoc JSON files as the canonical store for session metadata, readiness cache, provider smoke results, or log summaries @spec @mvp @implemented
 - satelle storage remains local to the remote host unless the user explicitly exports diagnostics or recordings @spec @mvp @implemented
 
@@ -2097,6 +2098,9 @@
 ## capabilities
 - satelle reports Codex runtime availability, native Computer Use availability, and model-provider compatibility as separate host capabilities @spec @mvp @implemented
 - satelle validates native Computer Use with a host-side action-path smoke test instead of only checking that a plugin or feature flag exists @spec @mvp @implemented
+- native Computer Use isolation and setup inventory installed Codex plugins only; uninstalled marketplace catalog entries are not admission evidence and must not consume the bounded inventory output budget @spec @contract @mvp @implemented
+- native Computer Use inventory accepts installed local and remote plugin source variants while admitting Computer Use only from the verified local source; unrelated remote plugins require no filesystem path and remain disabled during native execution @spec @contract @mvp @implemented
+- macOS native bridge admission validates TinySky as a boolean and excludes the three upstream use-case instruction fields from the launched environment; executable, code-path, service-path, service-binding, signature, and unexpected-environment checks remain enforced @spec @contract @mvp @implemented
 - satelle MVP readiness requires native Codex Computer Use to be installed, enabled, and passing the host-side smoke test @spec @mvp @implemented
 - the Host Daemon caches every terminal native Computer Use Readiness Result @spec @mvp @implemented
 - a matching successful native Computer Use Readiness Result no older than 5 minutes is sufficient for native readiness during prompt preflight unless an invalidation condition applies @spec @mvp @implemented
@@ -2129,6 +2133,9 @@
   tags: [spec, mvp, implemented, ci]
 - label: when timed-out native readiness probe cancellation cannot be confirmed, Satelle records outcome_unknown diagnostics, keeps the Control Lease recovery_pending, and blocks conflicting Turn or probe admission until reconciliation succeeds
   command: cargo test --locked -p satelle --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
+  tags: [spec, mvp, implemented, ci]
+- label: a completed Codex probe turn without a successful native tool fails readiness immediately instead of waiting for an action callback that cannot be proven
+  command: cargo test --locked -p satelle --features test-support --lib host::runtime::codex_adapter::tests::completed_turn_without_a_successful_native_tool_does_not_wait_for_callbacks -- --exact
   tags: [spec, mvp, implemented, ci]
 - label: satelle does not allow prompt execution or remote-control flows on hosts that fail native Codex Computer Use readiness
   command: cargo test --locked -p satelle --lib tests::unsupported_or_unproven_production_execution_is_blocked_before_admission -- --exact
@@ -2199,6 +2206,7 @@
 - satelle detects when native Codex Computer Use is unavailable on a configured remote host and reports the missing capability to the user @mvp @implemented
 - satelle offers assisted installation for missing Codex or native Codex Computer Use prerequisites but requires explicit user confirmation before running remote install commands @mvp @implemented
 - satelle run, steer, and status do not install Codex, Computer Use plugins, OS permissions, or app approvals as side effects @implemented @mvp
+- managed Codex setup installs downloaded runtimes in the owner-only codex/releases directory beneath the canonical Satelle state root, requires receipt admission to use that same versioned package root, reuses the current user Codex home for authentication, and never claims or changes desktop-installer package directories @spec @contract @mvp @implemented
 - satelle doctor reports missing Codex runtime, Computer Use plugin, OS permissions, app approvals, authentication, unsupported operating system, and unsupported region as separate readiness blockers when those blockers can be detected @mvp @implemented
 - satelle provides an explicit host setup or repair command for guided Codex and native Computer Use prerequisite setup on supported hosts @mvp @implemented
 - satelle setup in an interactive terminal is an applying onboarding flow by default instead of a preview-only command @mvp @implemented
@@ -2477,6 +2485,8 @@
 - label: Host Daemon restart tests prove recovery_pending reconciliation before replacement Turn admission
   command: cargo test --locked -p satelle --lib storage::tests::lifecycle::restart_marks_active_turn_recovery_pending_and_retains_lease -- --exact && cargo test --locked -p satelle --lib runtime::tests::new_admission_reconciles_restart_work_without_blocking_reads -- --exact && cargo test --locked -p satelle --lib runtime::tests::unknown_restart_work_blocks_new_admission_until_stop_resolves_it -- --exact
   tags: [spec, verification, mvp, implemented, ci]
+- local pre-admission interruption tests keep preflight blocked until the current-thread interrupt handler requests cancellation, without timing sleeps or weakened admission assertions @spec @verification @mvp @implemented
+- local post-admission interruption tests retain the one adapter-published ActionRequired event even when provider preflight events precede it @spec @verification @mvp @implemented
 - setup, repair, Host update, self-update remotes, and doctor fix have no-mutation dry-run tests @spec @verification @mvp @implemented
 - storage migration and config repair have no-mutation dry-run tests @spec @verification @phase4 @implemented
 - a canary secret and canary prompt are absent from every normal log, error, event, setup ledger, status result, and public API response @spec @verification @mvp @implemented
