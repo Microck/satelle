@@ -2099,6 +2099,7 @@
 - satelle provider smoke tests ask Codex native Computer Use to read the probe nonce, perform a harmless visible action, and submit the expected result through the probe surface @spec @mvp @implemented
 - satelle Host Daemon verifies provider smoke test success from probe surface callbacks or daemon-observed state instead of trusting the model's final message text @mvp @implemented
 - satelle provider smoke tests may use a browser as the probe target only when native Computer Use is operating that browser as an approved desktop target rather than relying solely on the Codex Browser plugin @mvp @implemented
+- satelle macOS native readiness targets com.apple.Safari by bundle identifier, reads its state to activate Computer Use, and then opens its temporary probe window @spec @mvp @implemented
 - satelle provider smoke tests distinguish selected provider or model failure from native Computer Use readiness failures such as missing OS permissions, app approval prompts, locked desktop state, or inability to open the probe target @mvp @implemented
 - satelle provider smoke tests report manual-action-required only for an authoritative Host OS permission or app approval denial and do not infer target-access failure from an unobserved probe action or callback @spec @mvp @implemented
 - satelle provider smoke tests time out, close or retire the probe surface, and clean up probe session state after completion or failure @spec @mvp @implemented

@@ -1391,7 +1391,7 @@ fn native_readiness_prompt(
                 return Err("native_app_approval_unavailable");
             }
             let script = format!(
-                "globalThis.sky ??= (await import('@oai/sky')).sky; var state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); await sky.press_key({{ app: 'Safari', key: 'super+n' }}); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var addressLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('text field') && line.includes('ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD')); var addressMatch = addressLine && addressLine.trim().match(/^([0-9]+)/); if (!addressMatch) throw new Error('Safari address field missing'); await sky.set_value({{ app: 'Safari', element_index: Number(addressMatch[1]), value: {page_url} }}); await sky.press_key({{ app: 'Safari', key: 'Return' }}); var buttonMatch = null; for (var attempt = 0; attempt < 8 && !buttonMatch; attempt++) {{ await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1000 : 500)); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var buttonLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); }} if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({{ app: 'Safari', element_index: Number(buttonMatch[1]) }}); await sky.drag({{ app: 'Safari', from_x: 100, from_y: 320, to_x: 600, to_y: 425 }}); await sky.press_key({{ app: 'Safari', key: 'super+w' }}); nodeRepl.write('Native click and drag actions dispatched');"
+                "globalThis.sky ??= (await import('@oai/sky')).sky; var state = await sky.get_app_state({{ app: 'com.apple.Safari', disableDiff: true }}); await sky.press_key({{ app: 'com.apple.Safari', key: 'super+n' }}); state = await sky.get_app_state({{ app: 'com.apple.Safari', disableDiff: true }}); var addressLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('text field') && line.includes('ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD')); var addressMatch = addressLine && addressLine.trim().match(/^([0-9]+)/); if (!addressMatch) throw new Error('Safari address field missing'); await sky.set_value({{ app: 'com.apple.Safari', element_index: Number(addressMatch[1]), value: {page_url} }}); await sky.press_key({{ app: 'com.apple.Safari', key: 'Return' }}); var buttonMatch = null; for (var attempt = 0; attempt < 8 && !buttonMatch; attempt++) {{ await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1000 : 500)); state = await sky.get_app_state({{ app: 'com.apple.Safari', disableDiff: true }}); var buttonLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); }} if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({{ app: 'com.apple.Safari', element_index: Number(buttonMatch[1]) }}); await sky.drag({{ app: 'com.apple.Safari', from_x: 100, from_y: 320, to_x: 600, to_y: 425 }}); await sky.press_key({{ app: 'com.apple.Safari', key: 'super+w' }}); nodeRepl.write('Native click and drag actions dispatched');"
             );
             native_action_evidence.expect_script_for_app(&script, "com.apple.Safari");
             let exec_source = node_repl_exec_source(&script);
@@ -4971,33 +4971,32 @@ mod tests {
         assert!(prompt.contains("only other tool call permitted"));
         assert!(!prompt.contains("functions.exec"));
         assert!(prompt.contains("import('@oai/sky')"));
-        let initial_state = prompt
-            .find("get_app_state({ app: 'Safari', disableDiff: true })")
-            .expect("the prompt must read current Safari state");
         let new_window = prompt
-            .find("sky.press_key({ app: 'Safari', key: 'super+n' })")
+            .find("sky.press_key({ app: 'com.apple.Safari', key: 'super+n' })")
             .expect("the prompt must open a temporary Safari window");
+        let initial_state = prompt
+            .find("sky.get_app_state({ app: 'com.apple.Safari', disableDiff: true })")
+            .expect("the prompt must activate Computer Use for Safari");
         let temporary_window_state = prompt[new_window..]
-            .find("get_app_state({ app: 'Safari', disableDiff: true })")
+            .find("sky.get_app_state({ app: 'com.apple.Safari', disableDiff: true })")
             .map(|offset| new_window + offset)
-            .expect("the prompt must refresh state for the temporary window");
+            .expect("the prompt must refresh the temporary window state");
         assert!(initial_state < new_window);
         assert!(new_window < temporary_window_state);
-        assert!(prompt.contains("get_app_state({ app: 'Safari', disableDiff: true })"));
+        assert!(prompt.contains("get_app_state({ app: 'com.apple.Safari', disableDiff: true })"));
         assert!(prompt.contains("ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"));
-        assert!(
-            !prompt
-                .contains("sky.click({ app: 'Safari', element_index: Number(addressMatch[1]) })")
-        );
-        assert!(prompt.contains("sky.set_value({ app: 'Safari', element_index:"));
-        assert!(prompt.contains("sky.press_key({ app: 'Safari', key: 'Return' })"));
+        assert!(!prompt.contains(
+            "sky.click({ app: 'com.apple.Safari', element_index: Number(addressMatch[1]) })"
+        ));
+        assert!(prompt.contains("sky.set_value({ app: 'com.apple.Safari', element_index:"));
+        assert!(prompt.contains("sky.press_key({ app: 'com.apple.Safari', key: 'Return' })"));
         assert!(prompt.contains("attempt < 8"));
-        assert!(prompt.contains("sky.click({ app: 'Safari', element_index:"));
+        assert!(prompt.contains("sky.click({ app: 'com.apple.Safari', element_index:"));
         assert!(!prompt.contains("finalState.text.includes"));
         assert!(!prompt.contains("native events missing"));
         assert!(prompt.contains("Native click and drag actions dispatched"));
         assert!(prompt.contains("from_x: 100, from_y: 320, to_x: 600, to_y: 425"));
-        assert!(prompt.contains("sky.press_key({ app: 'Safari', key: 'super+w' })"));
+        assert!(prompt.contains("sky.press_key({ app: 'com.apple.Safari', key: 'super+w' })"));
         assert!(prompt.contains("independently verifies both native events"));
         assert!(prompt.contains("Do not read documentation"));
         assert!(!prompt.contains("mcp__computer_use"));
