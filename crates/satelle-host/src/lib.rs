@@ -1177,7 +1177,7 @@ mod bootstrap_maintenance_tests {
     }
 
     #[test]
-    fn corrupt_store_reset_imports_the_handoff_into_the_new_sqlite_ledger() {
+    fn corrupt_store_reset_completes_without_recreating_sqlite() {
         let state = TestStateDir::new().expect("create corrupt reset state");
         // Corrupt an existing private store so reset exercises content recovery
         // without relying on a normal database open to repair the fixture ACL.
@@ -1206,19 +1206,18 @@ mod bootstrap_maintenance_tests {
             "reset-host-store",
             "Reset Host metadata",
         )
-        .expect("import the completed handoff into the replacement store");
+        .expect("close the completed filesystem handoff");
 
-        let completed = HostService::production_for_offline_storage(state.path())
-            .load_setup_run(operation_id)
-            .expect("load replacement setup ledger")
-            .expect("replacement ledger contains the reset operation");
-        assert_eq!(SetupRunStatus::Completed, completed.status());
+        assert!(
+            !database.exists(),
+            "reset leaves no Host identity in SQLite"
+        );
         assert!(
             !state
                 .path()
                 .join(".satelle-offline-storage-maintenance-v1")
                 .exists(),
-            "SQLite is authoritative after the handoff is imported"
+            "the completed handoff is retired without recreating SQLite"
         );
     }
 
@@ -1275,13 +1274,11 @@ mod bootstrap_maintenance_tests {
             "reset-host-store",
             "Reset Host metadata",
         )
-        .expect("import completion into the replacement store");
-        let service = HostService::production_for_offline_storage(state.path());
-        let completed = service
-            .load_setup_run(operation_id)
-            .expect("load reset record")
-            .expect("reset was recorded");
-        assert_eq!(SetupRunStatus::Completed, completed.status());
+        .expect("close the reset handoff");
+        assert!(
+            !state.path().join("satelle.sqlite3").exists(),
+            "reset leaves no abandoned probe lease or Host identity"
+        );
     }
 
     #[test]
@@ -2220,6 +2217,20 @@ impl HostService {
         action_id: &str,
         action_label: &str,
     ) -> Result<(), SatelleError> {
+        // Reset removes the Host identity with its SQLite store. Complete its
+        // durable filesystem handoff without reopening SQLite, so first SSH
+        // trust can enroll the stopped Host as fresh state.
+        if action_id == "reset-host-store" {
+            storage::finish_offline_storage_maintenance(
+                state_root,
+                operation_id,
+                action_id,
+                Some(action_label),
+                false,
+            )
+            .map_err(runtime::storage_failure)?;
+            return Ok(());
+        }
         let service = Self::production_for_offline_storage(state_root);
         if let Some(existing) = service.load_setup_run(operation_id)? {
             if existing.operation_kind() != SetupOperationKind::StorageMigration
@@ -2297,8 +2308,8 @@ impl HostService {
     }
 
     /// Persists an offline storage action before its first filesystem
-    /// mutation. Restore and reset can replace this store; their successful
-    /// activation writes the terminal record under the same operation id.
+    /// mutation. Restore records completion in the activated store. Reset
+    /// completes only in the filesystem handoff because it removes the store.
     pub fn start_offline_storage_maintenance(
         state_root: &std::path::Path,
         operation_id: &str,
@@ -2321,9 +2332,9 @@ impl HostService {
             started_at,
         )
         .map_err(runtime::storage_failure)?;
-        // Reset replaces the ledger, including abandoned leases. Its durable
-        // handoff owns the operation until the replacement store can record
-        // completion; the destructive step requires exclusive filesystem ownership.
+        // Reset discards the ledger, including abandoned leases. The durable
+        // handoff owns the operation until its filesystem completion, and the
+        // destructive step requires exclusive filesystem ownership.
         if action_id == "reset-host-store" {
             return Ok(());
         }

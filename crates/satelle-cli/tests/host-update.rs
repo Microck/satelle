@@ -313,7 +313,17 @@ fn store_reset_dry_run_is_a_noop_and_apply_preserves_recordings_by_default() {
     );
     assert_eq!(report["result"]["recordings_deleted"], false);
     assert!(recording.exists());
-    assert!(state.path().join("satelle.sqlite3").exists());
+    assert!(
+        !state.path().join("satelle.sqlite3").exists(),
+        "reset must leave the Host state fresh for SSH enrollment"
+    );
+    assert!(
+        !state
+            .path()
+            .join(".satelle-offline-storage-maintenance-v1")
+            .exists(),
+        "the successful reset must retire its filesystem handoff"
+    );
 }
 
 #[test]
