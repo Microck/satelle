@@ -2076,6 +2076,9 @@
 - label: when timed-out native readiness probe cancellation cannot be confirmed, Satelle records outcome_unknown diagnostics, keeps the Control Lease recovery_pending, and blocks conflicting Turn or probe admission until reconciliation succeeds
   command: cargo test --locked -p satelle-host --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
   tags: [spec, mvp, implemented, ci]
+- label: a completed Codex probe turn without a successful native tool fails readiness immediately instead of waiting for an action callback that cannot be proven
+  command: cargo test --locked -p satelle-host --lib runtime::codex_adapter::tests::completed_turn_without_a_successful_native_tool_does_not_wait_for_callbacks -- --exact
+  tags: [spec, mvp, implemented, ci]
 - label: satelle does not allow prompt execution or remote-control flows on hosts that fail native Codex Computer Use readiness
   command: cargo test --locked -p satelle-host --lib tests::unsupported_or_unproven_production_execution_is_blocked_before_admission -- --exact
   tags: [spec, mvp, implemented, ci]
