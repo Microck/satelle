@@ -729,7 +729,9 @@ fn configured_codex_isolation(
     mut mcp_command: Command,
     deadline: Instant,
 ) -> Result<(CodexIsolationPlan, PathBuf, Instant), SatelleError> {
-    plugin_command.args(["plugin", "list", "--available", "--json"]);
+    // Only installed plugins affect isolation. Expanding the marketplace catalog
+    // can exceed the bounded output budget with entries that are never consumed.
+    plugin_command.args(["plugin", "list", "--json"]);
     let plugin_output = bounded_inventory_command_output(
         plugin_command,
         deadline,
@@ -1090,7 +1092,7 @@ fn provision_windows_computer_use(
     let mut plugin_inventory_command = runtime
         .command()
         .map_err(|error| mark_provision_changed(error, changed))?;
-    plugin_inventory_command.args(["plugin", "list", "--available", "--json"]);
+    plugin_inventory_command.args(["plugin", "list", "--json"]);
     let plugin_inventory = bounded_inventory_command_output(
         plugin_inventory_command,
         deadline,
