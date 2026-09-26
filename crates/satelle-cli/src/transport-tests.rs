@@ -687,6 +687,27 @@ impl InterruptSource for TestInterrupt {
     }
 }
 
+struct PreflightInterrupt {
+    started: TestLatch,
+    release: TestLatch,
+}
+
+impl InterruptSource for PreflightInterrupt {
+    fn wait(&self) -> InterruptFuture<'_> {
+        Box::pin(async move {
+            assert!(
+                self.started.wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
+                "preflight must be active before interruption"
+            );
+            let release = self.release.clone();
+            // LocalTransport uses a current-thread runtime. This task can only run
+            // after the interrupt branch requests cancellation and awaits admission.
+            tokio::spawn(async move { release.signal() });
+            Ok(())
+        })
+    }
+}
+
 struct FailingWaitInterrupt {
     operation_started: TestLatch,
 }
@@ -4310,30 +4331,20 @@ fn injected_interrupt_before_local_run_admission_cancels_without_creating_a_turn
     let service = HostService::with_adapter_for_tests_at(state.path(), adapter.clone())
         .expect("construct interrupt lifecycle Host");
     let transport = LocalTransport::new(LOCAL_DEMO_HOST.to_string(), service.clone());
-    let interrupt = TestInterrupt::default();
-    let command_interrupt = interrupt.clone();
-    let command = thread::spawn(move || {
-        transport.attached_with_interrupt(
-            None,
-            TurnIntent::new(
-                "cancel before local run admission",
-                satelle_core::session::TurnExecutionMode::Standard,
-            )
-            .expect("construct run intent"),
-            false,
-            &command_interrupt,
+    let interrupt = PreflightInterrupt {
+        started: adapter.preflight_started.clone(),
+        release: adapter.preflight_release.clone(),
+    };
+    let failure = match transport.attached_with_interrupt(
+        None,
+        TurnIntent::new(
+            "cancel before local run admission",
+            satelle_core::session::TurnExecutionMode::Standard,
         )
-    });
-    assert!(
-        adapter
-            .preflight_started
-            .wait_for(INTERRUPT_TEST_COORDINATION_TIMEOUT),
-        "preflight must be active before interruption"
-    );
-
-    interrupt.signal();
-    adapter.preflight_release.signal();
-    let failure = match command.join().expect("command thread must not panic") {
+        .expect("construct run intent"),
+        false,
+        &interrupt,
+    ) {
         Err(failure) => failure,
         Ok(_) => panic!("pre-admission interruption must fail the attached command"),
     };

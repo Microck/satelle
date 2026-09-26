@@ -2432,6 +2432,7 @@
 - label: Host Daemon restart tests prove recovery_pending reconciliation before replacement Turn admission
   command: cargo test --locked -p satelle-host --lib storage::tests::lifecycle::restart_marks_active_turn_recovery_pending_and_retains_lease -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::new_admission_reconciles_restart_work_without_blocking_reads -- --exact && cargo test --locked -p satelle-host --lib runtime::tests::unknown_restart_work_blocks_new_admission_until_stop_resolves_it -- --exact
   tags: [spec, verification, mvp, implemented, ci]
+- local pre-admission interruption tests keep preflight blocked until the current-thread interrupt handler requests cancellation, without timing sleeps or weakened admission assertions @spec @verification @mvp @implemented
 - setup, repair, Host update, self-update remotes, and doctor fix have no-mutation dry-run tests @spec @verification @mvp @implemented
 - later storage migration and config repair have no-mutation dry-run tests @spec @verification @later
 - a canary secret and canary prompt are absent from every normal log, error, event, setup ledger, status result, and public API response @spec @verification @mvp @implemented
