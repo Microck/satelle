@@ -1499,26 +1499,61 @@ fn isolation_rejects_malformed_or_redirected_computer_use_plugins() {
 }
 
 #[test]
-fn macos_sky_service_path_is_derived_from_the_current_codex_home() {
-    let admitted = trusted_macos_node_repl_env(
-        &macos_native_bridge_env(),
-        Path::new("/Users/operator/.codex"),
-        Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
-    )
-    .expect("the official signed service path under the current Codex home must be admitted");
+fn macos_sky_environment_preserves_runtime_values_and_discards_instructions() {
+    for flag in ["0", "1"] {
+        for instruction in [None, Some(""), Some("untrusted instruction text")] {
+            let mut reported = macos_native_bridge_env();
+            reported.insert("BROWSER_USE_TINYSKY_ENABLED".to_string(), flag.to_string());
+            for key in [
+                "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER",
+                "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME",
+                "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE",
+            ] {
+                if let Some(instruction) = instruction {
+                    reported.insert(key.to_string(), instruction.to_string());
+                } else {
+                    reported.remove(key);
+                }
+            }
+            let admitted = trusted_macos_node_repl_env(
+                &reported,
+                Path::new("/Users/operator/.codex"),
+                Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+            )
+            .expect(
+                "the official signed service path under the current Codex home must be admitted",
+            );
 
-    assert_eq!(
-        admitted["SKY_CUA_SERVICE_PATH"],
-        "/Users/operator/.codex/computer-use/Codex Computer Use.app"
-    );
+            assert_eq!(
+                admitted["SKY_CUA_SERVICE_PATH"],
+                "/Users/operator/.codex/computer-use/Codex Computer Use.app"
+            );
+            assert_eq!(admitted["BROWSER_USE_TINYSKY_ENABLED"], flag);
+            assert_eq!(
+                admitted["NODE_REPL_TRUSTED_SERVICES"],
+                r#"{"sky":"@oai/sky/service"}"#
+            );
+            assert!(
+                !admitted
+                    .keys()
+                    .any(|key| key.starts_with("NODE_REPL_INSTRUCTIONS_"))
+            );
+        }
+    }
 }
 
 #[test]
 fn macos_sky_service_path_rejects_missing_redirected_or_extra_values() {
     type EnvironmentMutation = fn(&mut BTreeMap<String, String>);
-    let mutations: [(&str, EnvironmentMutation); 3] = [
+    let mutations: [(&str, EnvironmentMutation); 4] = [
         ("missing", |env| {
             env.remove("SKY_CUA_SERVICE_PATH");
+        }),
+        ("invalid boolean", |env| {
+            env.insert(
+                "BROWSER_USE_TINYSKY_ENABLED".to_string(),
+                "true".to_string(),
+            );
         }),
         ("redirected", |env| {
             env.insert(
