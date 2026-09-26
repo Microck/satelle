@@ -2041,6 +2041,7 @@
 - satelle validates native Computer Use with a host-side action-path smoke test instead of only checking that a plugin or feature flag exists @spec @mvp @implemented
 - native Computer Use isolation and setup inventory installed Codex plugins only; uninstalled marketplace catalog entries are not admission evidence and must not consume the bounded inventory output budget @spec @contract @mvp @implemented
 - native Computer Use inventory accepts installed local and remote plugin source variants while admitting Computer Use only from the verified local source; unrelated remote plugins require no filesystem path and remain disabled during native execution @spec @contract @mvp @implemented
+- macOS native bridge admission validates TinySky as a boolean and excludes the three upstream use-case instruction fields from the launched environment; executable, code-path, service-path, service-binding, signature, and unexpected-environment checks remain enforced @spec @contract @mvp @implemented
 - satelle MVP readiness requires native Codex Computer Use to be installed, enabled, and passing the host-side smoke test @spec @mvp @implemented
 - the Host Daemon caches every terminal native Computer Use Readiness Result @spec @mvp @implemented
 - a matching successful native Computer Use Readiness Result no older than 5 minutes is sufficient for native readiness during prompt preflight unless an invalidation condition applies @spec @mvp @implemented
