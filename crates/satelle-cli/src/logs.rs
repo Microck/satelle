@@ -524,6 +524,8 @@ fn run_follow_operation<T: Send + 'static>(
     timeout: Option<StdDuration>,
     operation: impl FnOnce() -> Result<T, SatelleError> + Send + 'static,
 ) -> Result<FollowOperation<T>, SatelleError> {
+    // Include thread startup and scheduler delay in the caller's I/O budget.
+    let receive_deadline = timeout.map(|timeout| Instant::now() + timeout);
     let (completed, completion) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("satelle-log-follow-io".to_string())
@@ -536,7 +538,6 @@ fn run_follow_operation<T: Send + 'static>(
                 Some(error.to_string()),
             )
         })?;
-    let receive_deadline = timeout.map(|timeout| Instant::now() + timeout);
     loop {
         if runtime.interrupted() {
             return Err(SatelleError::interrupted_attached_command());
