@@ -2956,14 +2956,18 @@ fn apply_remote_managed_setup(
             if api_code == ApiErrorCode::ComputerUseNotReady {
                 return Err(map_api_error(alias, api_error));
             }
-            return Err(SatelleError::remote_managed_setup_error(
+            let mapped = map_managed_setup_api_error(
                 alias,
                 setup_mode,
                 action
                     .setup_component()
                     .expect("only managed setup actions reach the managed endpoint"),
-                api_code.as_str(),
-            ));
+                api_error,
+            );
+            if managed_setup_failure_is_reconciled(&mapped) {
+                commit_verified_bootstrap_mutation(alias, bootstrap_lock)?;
+            }
+            return Err(mapped);
         }
         Err(error) => return Err(direct_transport_error(alias, error)),
     };
@@ -8963,6 +8967,55 @@ fn is_closed_macos_manual_computer_use_error(error: &ApiError) -> bool {
             == Some("manual_action_required")
         && details.get("reason").and_then(serde_json::Value::as_str)
             == Some("macos_native_computer_use_prerequisite_missing")
+}
+
+fn map_managed_setup_api_error(
+    host: &str,
+    setup_mode: satelle_core::SetupMode,
+    component: &str,
+    error: &ApiError,
+) -> SatelleError {
+    let mut mapped = SatelleError::remote_managed_setup_error(
+        host,
+        setup_mode,
+        component,
+        error.code().as_str(),
+    );
+    if error.code() == ApiErrorCode::SetupActionFailed {
+        mapped.code = ErrorCode::SetupActionFailed;
+        mapped.message = "the Host could not complete the managed setup action".to_string();
+        // Keep the public step, never the upstream message or source diagnostics.
+        if let Some(details) = error.details().and_then(serde_json::Value::as_object)
+            && details.len() == 2
+            && let Some(action) = details
+                .get("failed_action")
+                .and_then(serde_json::Value::as_str)
+            && let Some(changed) = details.get("changed").and_then(serde_json::Value::as_bool)
+            && !action.is_empty()
+            && action.len() <= 64
+            && action
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+        {
+            mapped
+                .details
+                .insert("failed_action".to_string(), action.into());
+            mapped.details.insert("changed".to_string(), changed.into());
+            mapped.message = format!("managed setup step '{action}' failed on the Host");
+        }
+    }
+    mapped
+}
+
+// Only a validated no-change result can release the mutation fence. A failed
+// HTTP exchange or an incomplete rollback still requires reconciliation.
+fn managed_setup_failure_is_reconciled(error: &SatelleError) -> bool {
+    error.code == ErrorCode::SetupActionFailed
+        && error
+            .details
+            .get("changed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
 }
 
 fn managed_setup_rejection_precedes_mutation(error: &DaemonClientError) -> bool {
