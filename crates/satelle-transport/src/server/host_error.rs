@@ -157,6 +157,21 @@ fn failure(error: &SatelleError) -> ApiFailure {
             message: "the requested Satelle Session does not exist",
             details: None,
         },
+        ErrorCode::SetupActionFailed => ApiFailure {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: ApiErrorCode::SetupActionFailed,
+            category: ApiErrorCategory::RemoteExecution,
+            retryable: false,
+            message: "the Host could not complete the managed setup action",
+            details: error.details.get("failed_action").and_then(|value| {
+                let action = value.as_str()?;
+                let changed = error.details.get("changed")?.as_bool()?;
+                (!action.is_empty()
+                    && action.len() <= 64
+                    && action.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'-'))
+                .then(|| serde_json::json!({ "failed_action": action, "changed": changed }))
+            }),
+        },
         ErrorCode::SetupLedgerUnavailable => ApiFailure {
             status: StatusCode::NOT_FOUND,
             code: ApiErrorCode::SetupLedgerUnavailable,
@@ -435,9 +450,7 @@ fn failure(error: &SatelleError) -> ApiFailure {
         | ErrorCode::HostUpdatePostcheckFailed
         | ErrorCode::NoRemoteHostSelected
         | ErrorCode::RemoteUpdatePartialFailure
-        // Setup action and partial-application failures are Controller-local
-        // execution results.
-        | ErrorCode::SetupActionFailed
+        // Aggregate partial-application failures are Controller-local results.
         | ErrorCode::SetupPartiallyApplied
         // Process interruption is a Controller-local process-exit contract.
         // If it crosses the Host boundary, expose no extra API surface.
@@ -636,6 +649,50 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn managed_setup_failure_preserves_only_the_public_step() {
+        let mut error = SatelleError {
+            code: ErrorCode::SetupActionFailed,
+            message: "PRIVATE_MESSAGE".to_string(),
+            recovery_command: Some("PRIVATE_COMMAND".to_string()),
+            source_detail: Some("PRIVATE_SOURCE".to_string()),
+            details: BTreeMap::from([
+                ("failed_action".to_string(), json!("prepare-package-root")),
+                ("changed".to_string(), json!(false)),
+                ("private".to_string(), json!("PRIVATE_DETAIL")),
+            ]),
+        };
+        let mapped = failure(&error);
+        assert_eq!(mapped.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mapped.code, ApiErrorCode::SetupActionFailed);
+        assert_eq!(mapped.category, ApiErrorCategory::RemoteExecution);
+        assert!(!mapped.retryable);
+        assert_eq!(
+            mapped.details,
+            Some(json!({"failed_action": "prepare-package-root", "changed": false}))
+        );
+        assert!(!mapped.message.contains("PRIVATE"));
+        error.details.insert("changed".to_string(), json!(true));
+        assert_eq!(
+            failure(&error).details,
+            Some(json!({
+                "failed_action": "prepare-package-root", "changed": true
+            }))
+        );
+        error.details.insert("changed".to_string(), json!("false"));
+        assert_eq!(failure(&error).details, None);
+        error.details.insert("changed".to_string(), json!(false));
+        for action in [
+            json!(""),
+            json!("private/path"),
+            json!("a".repeat(65)),
+            json!(42),
+        ] {
+            error.details.insert("failed_action".to_string(), action);
+            assert_eq!(failure(&error).details, None);
+        }
+    }
 
     #[test]
     fn computer_use_not_ready_exposes_only_a_closed_reason_token() {

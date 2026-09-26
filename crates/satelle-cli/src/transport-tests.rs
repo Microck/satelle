@@ -6850,6 +6850,77 @@ fn manual_macos_setup_details_round_trip_only_in_the_closed_shape() {
 }
 
 #[test]
+fn managed_setup_failure_reconciles_only_a_validated_no_change_result() {
+    let api_error = |details: serde_json::Value| {
+        serde_json::from_value::<ApiError>(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle_transport::RequestId::new().to_string(),
+            "host_identity": "host-direct-test",
+            "code": "setup-action-failed",
+            "category": "remote_execution",
+            "retryable": false,
+            "message": "PRIVATE_MESSAGE",
+            "details": details,
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize managed setup failure")
+    };
+    let error =
+        api_error(serde_json::json!({"failed_action": "prepare-package-root", "changed": false}));
+    let mapped = map_managed_setup_api_error(
+        "tailnet-host",
+        satelle_core::SetupMode::Persistent,
+        "codex",
+        &error,
+    );
+    assert_eq!(mapped.code, ErrorCode::SetupActionFailed);
+    assert_eq!(mapped.details["failed_action"], "prepare-package-root");
+    assert!(managed_setup_failure_is_reconciled(&mapped));
+    let partial = map_managed_setup_api_error(
+        "tailnet-host",
+        satelle_core::SetupMode::Persistent,
+        "codex",
+        &api_error(serde_json::json!({"failed_action": "write-install-receipt", "changed": true})),
+    );
+    assert_eq!(partial.details["changed"], true);
+    assert!(!managed_setup_failure_is_reconciled(&partial));
+    assert_eq!(
+        mapped.recovery_command.as_deref(),
+        Some(
+            "satelle setup --host tailnet-host --persistent --component codex --no-input --json --yes"
+        )
+    );
+    assert!(!mapped.message.contains("PRIVATE"));
+    assert!(!managed_setup_rejection_precedes_mutation(
+        &DaemonClientError::Api {
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            error: Box::new(error),
+        }
+    ));
+    for details in [
+        serde_json::Value::Null,
+        serde_json::json!({"failed_action": "prepare-package-root"}),
+        serde_json::json!({"failed_action": "prepare-package-root", "changed": "false"}),
+        serde_json::json!({"failed_action": "private/path", "changed": false}),
+        serde_json::json!({"failed_action": "a".repeat(65), "changed": false}),
+        serde_json::json!({"failed_action": 42, "changed": false}),
+        serde_json::json!({"failed_action": "prepare-package-root", "changed": false, "private": "PRIVATE_DETAIL"}),
+    ] {
+        let mapped = map_managed_setup_api_error(
+            "tailnet-host",
+            satelle_core::SetupMode::Persistent,
+            "codex",
+            &api_error(details),
+        );
+        assert_eq!(mapped.code, ErrorCode::SetupActionFailed);
+        assert!(!mapped.details.contains_key("failed_action"));
+        assert!(!managed_setup_failure_is_reconciled(&mapped));
+        assert!(!mapped.message.contains("PRIVATE"));
+    }
+}
+
+#[test]
 fn managed_setup_api_failures_rerun_the_exact_failed_setup_selection() {
     for (mode, component) in [
         (satelle_core::SetupMode::Persistent, "codex"),
