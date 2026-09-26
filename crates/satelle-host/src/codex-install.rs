@@ -226,18 +226,10 @@ pub(crate) fn install_baseline_managed_codex(
             .as_ref()
             .map(directories::BaseDirs::home_dir),
     )?;
-    let packages_root = codex_home.join("packages");
-    let standalone_root = packages_root.join("standalone");
-    let releases_root = standalone_root.join("releases");
-    // Keep the signed standalone package beside the current user's existing
-    // authentication and provider state. The receipt still pins the exact
-    // package and home used by every child process.
-    open_or_create_user_or_administrator_controlled_directory(&codex_home)
-        .map_err(|error| install_error("prepare-codex-home", error))?;
-    for directory in [&packages_root, &standalone_root, &releases_root] {
-        open_or_create_owner_only_directory(directory)
-            .map_err(|error| install_error("prepare-package-root", error))?;
-    }
+    // Satelle owns its downloaded packages; the desktop installer independently
+    // owns ~/.codex/packages. Authentication still uses the existing Codex home,
+    // and the receipt pins both that home and Satelle's exact immutable binary.
+    let releases_root = prepare_managed_codex_directories(&canonical_state_root, &codex_home)?;
     let package_root = releases_root.join(format!("{BASELINE_CODEX_VERSION}-{target}"));
     recover_interrupted_install(
         &intent_path,
@@ -374,6 +366,21 @@ pub(crate) fn install_baseline_managed_codex(
         &intent_path,
         target,
     )
+}
+
+fn prepare_managed_codex_directories(
+    state_root: &Path,
+    codex_home: &Path,
+) -> Result<PathBuf, SatelleError> {
+    open_or_create_user_or_administrator_controlled_directory(codex_home)
+        .map_err(|error| install_error("prepare-codex-home", error))?;
+    let mut directory = state_root.to_path_buf();
+    for component in ["codex", "releases"] {
+        directory.push(component);
+        open_or_create_owner_only_directory(&directory)
+            .map_err(|error| install_error("prepare-package-root", error))?;
+    }
+    Ok(directory)
 }
 
 fn recover_interrupted_install(
@@ -800,10 +807,7 @@ fn admit_managed_codex_from_state_root_for_target(
     validate_receipt_metadata(&receipt, expected_target)?;
     let codex_home = canonical_directory(&receipt.codex_home, "codex_home_invalid")?;
     let releases_root = canonical_directory(
-        &codex_home
-            .join("packages")
-            .join("standalone")
-            .join("releases"),
+        &state_root.join("codex").join("releases"),
         "releases_root_invalid",
     )?;
     let package_root = canonical_directory(
@@ -1215,6 +1219,30 @@ mod tests {
         root
     }
 
+    #[test]
+    fn setup_owns_private_packages_without_claiming_desktop_installs() {
+        let root = owner_only_tempdir("temporary installation roots");
+        let canonical_root = fs::canonicalize(root.path()).unwrap();
+        let state_root = canonical_root.join("state");
+        let codex_home = canonical_root.join("codex-home");
+        drop(open_or_create_owner_only_directory(&state_root).unwrap());
+        drop(open_or_create_owner_only_directory(&codex_home).unwrap());
+        let versioned_leaf = format!("{BASELINE_CODEX_VERSION}-{FIXTURE_TARGET}");
+        let desktop_package = codex_home
+            .join("packages/standalone/releases")
+            .join(&versioned_leaf);
+        fs::create_dir_all(&desktop_package).unwrap();
+        let desktop_binary = desktop_package.join(BINARY_NAME);
+        fs::write(&desktop_binary, b"desktop-owned runtime").unwrap();
+
+        let releases = prepare_managed_codex_directories(&state_root, &codex_home).unwrap();
+        assert_eq!(releases, state_root.join("codex/releases"));
+        assert!(!releases.join(&versioned_leaf).exists());
+        drop(open_owner_only_directory(&state_root.join("codex")).unwrap());
+        drop(open_owner_only_directory(&releases).unwrap());
+        assert_eq!(fs::read(&desktop_binary).unwrap(), b"desktop-owned runtime");
+    }
+
     impl ReceiptFixture {
         fn new() -> Self {
             let root = owner_only_tempdir("temporary receipt root");
@@ -1222,16 +1250,9 @@ mod tests {
                 fs::canonicalize(root.path()).expect("canonical temporary receipt root");
             let state_root = canonical_root.join("state");
             let codex_home = canonical_root.join("codex-home");
-            let packages_root = codex_home.join("packages");
-            let standalone_root = packages_root.join("standalone");
-            let releases_root = standalone_root.join("releases");
-            for directory in [
-                &state_root,
-                &codex_home,
-                &packages_root,
-                &standalone_root,
-                &releases_root,
-            ] {
+            let packages_root = state_root.join("codex");
+            let releases_root = packages_root.join("releases");
+            for directory in [&state_root, &codex_home, &packages_root, &releases_root] {
                 open_or_create_owner_only_directory(directory)
                     .expect("create secure managed Codex directory");
             }
@@ -1647,9 +1668,8 @@ mod tests {
         let version = "0.145.0";
         let release_tag = "rust-v0.145.0";
         let package_root = fixture
-            .codex_home
-            .join("packages")
-            .join("standalone")
+            .state_root
+            .join("codex")
             .join("releases")
             .join(format!("{version}-{FIXTURE_TARGET}"));
         let binary_path = package_root.join("bin").join(BINARY_NAME);
@@ -1709,11 +1729,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let mut fixture = ReceiptFixture::new();
-        let current = fixture
-            .codex_home
-            .join("packages")
-            .join("standalone")
-            .join("current");
+        let current = fixture.state_root.join("codex").join("current");
         symlink(&fixture.package_root, &current).expect("create mutable alias");
         fixture
             .receipt_object_mut()
@@ -1759,9 +1775,8 @@ mod tests {
     fn receipt_admission_requires_exact_versioned_package_and_binary_locations() {
         let mut wrong_package = ReceiptFixture::new();
         let alias_root = wrong_package
-            .codex_home
-            .join("packages")
-            .join("standalone")
+            .state_root
+            .join("codex")
             .join("releases")
             .join("another-package");
         let alias_binary = alias_root.join("bin").join(BINARY_NAME);
