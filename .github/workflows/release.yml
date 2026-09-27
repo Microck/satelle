@@ -752,14 +752,20 @@ jobs:
             cargo_publish_error cargo-package-digest-mismatch "validated Cargo package checksum failed"
           registry="$RUNNER_TEMP/registry.crate"
           download="https://crates.io/api/v1/crates/satelle/${RELEASE_VERSION}/download"
+          # Version metadata distinguishes absence from a registry failure.
+          # Missing archive objects can return 403 from the backing storage.
           status=$(curl --silent --show-error --location \
             --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
-            --output "$registry" \
+            --output "$RUNNER_TEMP/registry-version.json" \
             --write-out '%{http_code}' \
-            "$download") || \
+            "https://crates.io/api/v1/crates/satelle/${RELEASE_VERSION}") || \
             cargo_publish_error cargo-registry-unavailable "crates.io version lookup failed"
           case "$status" in
             200)
+              curl --fail --silent --show-error --location \
+                --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+                --output "$registry" "$download" || \
+                cargo_publish_error cargo-registry-unavailable "existing Cargo package download failed"
               cmp --silent "$expected" "$registry" || \
                 cargo_publish_error cargo-registry-version-conflict "crates.io already has different package bytes for this version"
               ;;
