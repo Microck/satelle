@@ -69,6 +69,13 @@ authority for readiness.
 | Excluded upstream transport | `ws://` because Codex documents it as experimental and unsupported |
 | Not selected for Phase 0 | Unix-socket control transport; it is unnecessary for the first adapter |
 
+Managed Codex setup resolves the latest stable official OpenAI release on every
+invocation and upgrades an older managed installation. It verifies the release
+asset digests and checksum manifest before publishing the package. A failed
+download or validation preserves the installed runtime. Running a task does not
+trigger a download. Previous immutable packages remain on disk because active
+Sessions may still use them; setup does not garbage-collect these packages.
+
 `0.144.0` is the supported floor, not a version pin. Satelle may admit a newer
 owner-authorized official standalone release only after that runtime exposes
 the required stable schema, completes the private app-server handshake, and

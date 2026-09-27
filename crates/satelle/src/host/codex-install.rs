@@ -25,9 +25,10 @@ const INSTALL_INTENT_FILE_NAME: &str = "codex-install-intent.json";
 const INSTALL_INTENT_SCHEMA: &str = "satelle.codex-install-intent.v1";
 const RECEIPT_MANAGER: &str = "satelle";
 const BASELINE_CODEX_VERSION: &str = "0.144.0";
+#[cfg(test)]
 const BASELINE_CODEX_RELEASE_TAG: &str = "rust-v0.144.0";
-const BASELINE_CHECKSUMS_SHA256: &str =
-    "b651a02c474412bfc47707d3b12597f67ebaaf40665d81fe26a77488410302c1";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+const MAX_RELEASE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CHECKSUMS_BYTES: u64 = 64 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
@@ -197,24 +198,122 @@ fn managed_codex_home(user_home: Option<&Path>) -> Result<PathBuf, SatelleError>
         .ok_or_else(|| install_error("prepare-codex-home", "current user home is unavailable"))
 }
 
-/// Acquires the independently attested baseline package and publishes its
-/// receipt only after the immutable binary passes the live version probe.
-/// An occupied but inadmissible receipt or package is never overwritten.
-pub(crate) fn install_baseline_managed_codex(
+#[derive(Deserialize)]
+struct OfficialCodexRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<OfficialCodexAsset>,
+}
+
+#[derive(Deserialize)]
+struct OfficialCodexAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
+}
+
+struct SelectedCodexRelease {
+    version: String,
+    tag: String,
+    artifact_url: String,
+    artifact_sha256: String,
+    checksums_url: String,
+    checksums_sha256: String,
+}
+
+fn select_latest_release(bytes: &[u8], target: &str) -> Result<SelectedCodexRelease, SatelleError> {
+    let release: OfficialCodexRelease = serde_json::from_slice(bytes)
+        .map_err(|error| install_error("resolve-latest-codex", error))?;
+    let version = release
+        .tag_name
+        .strip_prefix("rust-v")
+        .and_then(crate::host::codex_capabilities::CodexVersion::parse)
+        .filter(|version| crate::host::codex_capabilities::supports_codex_version(*version))
+        .ok_or_else(|| {
+            install_error(
+                "resolve-latest-codex",
+                "the latest release has no supported stable version",
+            )
+        })?;
+    if release.draft
+        || release.prerelease
+        || release.tag_name != format!("rust-v{version}")
+        || !SUPPORTED_TARGETS.contains(&target)
+    {
+        return Err(install_error(
+            "resolve-latest-codex",
+            "the latest release is not a supported official stable release",
+        ));
+    }
+    let asset = |name: &str| -> Result<(String, String), SatelleError> {
+        let mut matches = release.assets.iter().filter(|asset| asset.name == name);
+        let asset = matches.next().ok_or_else(|| {
+            install_error(
+                "resolve-latest-codex",
+                format!("release asset {name} is missing"),
+            )
+        })?;
+        let expected_url = format!(
+            "https://github.com/openai/codex/releases/download/{}/{name}",
+            release.tag_name
+        );
+        let digest = asset
+            .digest
+            .as_deref()
+            .and_then(|digest| digest.strip_prefix("sha256:"))
+            .filter(|digest| is_sha256(digest));
+        if matches.next().is_some()
+            || asset.browser_download_url != expected_url
+            || digest.is_none()
+        {
+            return Err(install_error(
+                "resolve-latest-codex",
+                format!("release asset {name} has invalid provenance or digest"),
+            ));
+        }
+        Ok((
+            expected_url,
+            digest.expect("digest was checked").to_ascii_lowercase(),
+        ))
+    };
+    let (artifact_url, artifact_sha256) = asset(&format!("codex-package-{target}.tar.gz"))?;
+    let (checksums_url, checksums_sha256) = asset("codex-package_SHA256SUMS")?;
+    Ok(SelectedCodexRelease {
+        version: version.to_string(),
+        tag: release.tag_name,
+        artifact_url,
+        artifact_sha256,
+        checksums_url,
+        checksums_sha256,
+    })
+}
+
+/// Installs the latest official stable release, or upgrades an admitted managed
+/// runtime. The existing receipt remains selected until verification succeeds.
+pub(crate) fn install_latest_managed_codex(
     state_root: &Path,
 ) -> Result<ManagedCodexInstallOutcome, SatelleError> {
     let target = current_target()?;
     let receipt_path = state_root.join(RECEIPT_FILE_NAME);
     let intent_path = state_root.join(INSTALL_INTENT_FILE_NAME);
-    match fs::symlink_metadata(&receipt_path) {
-        Ok(_) => {
-            admit_managed_codex_from_state_root_for_target(state_root, target)?;
-            remove_install_intent(&intent_path, state_root);
-            return Ok(ManagedCodexInstallOutcome::AlreadyInstalled);
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+    let installed = match fs::symlink_metadata(&receipt_path) {
+        Ok(_) => Some(admit_managed_codex_from_state_root_for_target(
+            state_root, target,
+        )?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(install_error("inspect-install-receipt", error)),
-    }
+    };
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(180))
+        .user_agent(format!("satelle/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|error| install_error("prepare-download", error))?;
+    let release = select_latest_release(
+        &download_bounded(&client, LATEST_RELEASE_URL, MAX_RELEASE_BYTES)?,
+        target,
+    )?;
 
     open_or_create_owner_only_directory(state_root)
         .map_err(|error| install_error("prepare-state-root", error))?;
@@ -230,14 +329,14 @@ pub(crate) fn install_baseline_managed_codex(
     // owns ~/.codex/packages. Authentication still uses the existing Codex home,
     // and the receipt pins both that home and Satelle's exact immutable binary.
     let releases_root = prepare_managed_codex_directories(&canonical_state_root, &codex_home)?;
-    let package_root = releases_root.join(format!("{BASELINE_CODEX_VERSION}-{target}"));
-    recover_interrupted_install(
-        &intent_path,
-        &canonical_state_root,
-        &releases_root,
-        &package_root,
-        target,
-    )?;
+    let package_root = releases_root.join(format!("{}-{target}", release.version));
+    recover_interrupted_install(&intent_path, &canonical_state_root, &releases_root, target)?;
+    if installed
+        .as_ref()
+        .is_some_and(|runtime| same_path_identity(&runtime.package_root, &package_root))
+    {
+        return Ok(ManagedCodexInstallOutcome::AlreadyInstalled);
+    }
     match fs::symlink_metadata(&package_root) {
         Ok(_) => {
             return Err(install_error(
@@ -250,25 +349,13 @@ pub(crate) fn install_baseline_managed_codex(
     }
 
     let artifact_name = format!("codex-package-{target}.tar.gz");
-    let artifact_url = format!(
-        "https://github.com/openai/codex/releases/download/{BASELINE_CODEX_RELEASE_TAG}/{artifact_name}"
-    );
-    let checksums_url = format!(
-        "https://github.com/openai/codex/releases/download/{BASELINE_CODEX_RELEASE_TAG}/codex-package_SHA256SUMS"
-    );
-    let expected_artifact_sha256 = baseline_artifact_sha256(target)
-        .ok_or_else(|| install_error("select-codex-package", "unsupported Host target"))?;
-    let client = Client::builder()
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(180))
-        .user_agent(format!("satelle/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|error| install_error("prepare-download", error))?;
-    let checksums = download_bounded(&client, &checksums_url, MAX_CHECKSUMS_BYTES)?;
-    if sha256_bytes(&checksums) != BASELINE_CHECKSUMS_SHA256 {
+    let artifact_url = release.artifact_url;
+    let expected_artifact_sha256 = release.artifact_sha256.as_str();
+    let checksums = download_bounded(&client, &release.checksums_url, MAX_CHECKSUMS_BYTES)?;
+    if sha256_bytes(&checksums) != release.checksums_sha256 {
         return Err(install_error(
             "verify-codex-checksums",
-            "the official checksum manifest did not match Satelle's trust anchor",
+            "the official checksum manifest did not match the official release metadata",
         ));
     }
     let checksums_text = std::str::from_utf8(&checksums)
@@ -278,7 +365,7 @@ pub(crate) fn install_baseline_managed_codex(
     if !manifest_digest.eq_ignore_ascii_case(expected_artifact_sha256) {
         return Err(install_error(
             "verify-codex-checksums",
-            "the package checksum disagrees with Satelle's trust anchor",
+            "the package checksum disagrees with the official release metadata",
         ));
     }
 
@@ -291,11 +378,11 @@ pub(crate) fn install_baseline_managed_codex(
     }
 
     let transaction_id = uuid::Uuid::now_v7();
-    let staging_leaf = managed_codex_staging_leaf(target, transaction_id);
+    let staging_leaf = managed_codex_staging_leaf(&release.version, target, transaction_id);
     let staging_root = releases_root.join(&staging_leaf);
     let intent_text = serde_json::to_string_pretty(&ManagedCodexInstallIntent {
         schema: INSTALL_INTENT_SCHEMA.to_string(),
-        version: BASELINE_CODEX_VERSION.to_string(),
+        version: release.version.clone(),
         target: target.to_string(),
         transaction_id: transaction_id.hyphenated().to_string(),
     })
@@ -306,7 +393,7 @@ pub(crate) fn install_baseline_managed_codex(
         rollback_staged_install(&staging_root, &intent_path, &canonical_state_root);
         return Err(install_error("stage-codex-package", error));
     }
-    let staged = extract_and_validate_package(&artifact, &staging_root, target);
+    let staged = extract_and_validate_package(&artifact, &staging_root, target, &release.version);
     if let Err(error) = staged {
         rollback_staged_install(&staging_root, &intent_path, &canonical_state_root);
         return Err(error);
@@ -315,7 +402,7 @@ pub(crate) fn install_baseline_managed_codex(
         let staged_binary_path = staging_root
             .join("bin")
             .join(binary_name_for_target(target));
-        verify_installed_version(&staged_binary_path, &codex_home)?;
+        verify_installed_version(&staged_binary_path, &codex_home, &release.version)?;
         let binary_sha256 = sha256_file(&staged_binary_path)
             .map_err(|error| install_error("verify-installed-codex", error))?;
         let canonical_codex_home = fs::canonicalize(&codex_home)
@@ -336,9 +423,9 @@ pub(crate) fn install_baseline_managed_codex(
         serde_json::to_string_pretty(&ManagedCodexReceipt {
             schema: RECEIPT_SCHEMA.to_string(),
             manager: RECEIPT_MANAGER.to_string(),
-            version: BASELINE_CODEX_VERSION.to_string(),
+            version: release.version.clone(),
             target: target.to_string(),
-            release_tag: BASELINE_CODEX_RELEASE_TAG.to_string(),
+            release_tag: release.tag,
             artifact_url,
             artifact_sha256: expected_artifact_sha256.to_string(),
             codex_home: canonical_codex_home,
@@ -387,7 +474,6 @@ fn recover_interrupted_install(
     intent_path: &Path,
     state_root: &Path,
     releases_root: &Path,
-    package_root: &Path,
     target: &str,
 ) -> Result<(), SatelleError> {
     match fs::symlink_metadata(intent_path) {
@@ -401,11 +487,11 @@ fn recover_interrupted_install(
         .map_err(|error| install_error("validate-install-intent", error))?;
     let transaction_id = uuid::Uuid::parse_str(&intent.transaction_id)
         .map_err(|error| install_error("validate-install-intent", error))?;
-    let expected_leaf = managed_codex_staging_leaf(target, transaction_id);
-    if intent.schema != INSTALL_INTENT_SCHEMA
-        || intent.version != BASELINE_CODEX_VERSION
-        || intent.target != target
-    {
+    let version = crate::host::codex_capabilities::CodexVersion::parse(&intent.version)
+        .filter(|version| version.to_string() == intent.version)
+        .ok_or_else(|| install_error("validate-install-intent", "invalid release version"))?;
+    let expected_leaf = managed_codex_staging_leaf(&version.to_string(), target, transaction_id);
+    if intent.schema != INSTALL_INTENT_SCHEMA || intent.target != target {
         return Err(install_error(
             "validate-install-intent",
             "the interrupted install intent does not match this managed transaction",
@@ -413,7 +499,20 @@ fn recover_interrupted_install(
     }
 
     remove_install_directory(&releases_root.join(expected_leaf))?;
-    remove_install_directory(package_root)?;
+    let package_root = releases_root.join(format!("{}-{target}", intent.version));
+    // A crash after receipt publication must never remove the admitted runtime.
+    let receipt_path = state_root.join(RECEIPT_FILE_NAME);
+    let is_current = match fs::symlink_metadata(&receipt_path) {
+        Ok(_) => same_path_identity(
+            &admit_managed_codex_from_state_root_for_target(state_root, target)?.package_root,
+            &package_root,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(install_error("recover-install", error)),
+    };
+    if !is_current {
+        remove_install_directory(&package_root)?;
+    }
     fs::remove_file(intent_path).map_err(|error| install_error("clear-install-intent", error))?;
     let directory = open_or_create_owner_only_directory(state_root)
         .map_err(|error| install_error("clear-install-intent", error))?;
@@ -421,11 +520,8 @@ fn recover_interrupted_install(
         .map_err(|error| install_error("clear-install-intent", error))
 }
 
-fn managed_codex_staging_leaf(target: &str, transaction_id: uuid::Uuid) -> String {
-    format!(
-        ".{BASELINE_CODEX_VERSION}-{target}.{}.tmp",
-        transaction_id.hyphenated()
-    )
+fn managed_codex_staging_leaf(version: &str, target: &str, transaction_id: uuid::Uuid) -> String {
+    format!(".{version}-{target}.{}.tmp", transaction_id.hyphenated())
 }
 
 fn remove_install_directory(path: &Path) -> Result<(), SatelleError> {
@@ -463,10 +559,8 @@ fn rollback_staged_install(staging_root: &Path, intent_path: &Path, state_root: 
     }
 }
 
-// Everything that can validate the package itself runs while it is still
-// action-owned staging state. This narrow post-publish transaction either
-// leaves both the immutable package and receipt admissible or removes the
-// package so the exact same setup action can retry.
+// Publish and admit the immutable package before replacing the receipt. A
+// failure before receipt publication removes only the candidate package.
 fn complete_published_install(
     staging_root: &Path,
     package_root: &Path,
@@ -494,24 +588,41 @@ fn complete_published_install(
             canonical_state_root,
         ));
     }
-    if let Err(error) = persist_new_owner_only_secret_file(receipt_path, receipt_text) {
+    // Validate the published package before atomically selecting it. The old
+    // receipt and package stay usable throughout download and verification.
+    let publish_receipt = (|| {
+        let receipt = serde_json::from_str(receipt_text)
+            .map_err(|error| install_error("write-install-receipt", error))?;
+        admit_managed_codex_receipt(canonical_state_root, target, receipt)?;
+        let staging_path =
+            receipt_path.with_file_name(format!(".codex-receipt-{}.tmp", uuid::Uuid::now_v7()));
+        persist_new_owner_only_secret_file(&staging_path, receipt_text)
+            .map_err(|error| install_error("write-install-receipt", error))?;
+        // TempPath uses an atomic replacing rename on both Unix and Windows.
+        let staged = tempfile::TempPath::try_from_path(staging_path)
+            .map_err(|error| install_error("write-install-receipt", error))?;
+        staged
+            .persist(receipt_path)
+            .map_err(|error| install_error("write-install-receipt", error))?;
+        Ok::<(), SatelleError>(())
+    })();
+    if let Err(error) = publish_receipt {
         return Err(rollback_published_install_and_clear_intent(
             package_root,
             None,
-            install_error("write-install-receipt", error),
-            intent_path,
-            canonical_state_root,
-        ));
-    }
-    if let Err(error) = admit_managed_codex_from_state_root_for_target(canonical_state_root, target)
-    {
-        return Err(rollback_published_install_and_clear_intent(
-            package_root,
-            Some(receipt_path),
             error,
             intent_path,
             canonical_state_root,
         ));
+    }
+    // The receipt now owns the new package. A durability error cannot roll it
+    // back by deleting that package or destroying the previous receipt.
+    if let Err(error) = open_or_create_owner_only_directory(canonical_state_root)
+        .and_then(|directory| sync_owner_only_directory(canonical_state_root, &directory))
+    {
+        let mut error = install_error("sync-install-receipt", error);
+        error.details.insert("changed".to_string(), json!(true));
+        return Err(error);
     }
     remove_install_intent(intent_path, canonical_state_root);
     Ok(ManagedCodexInstallOutcome::Installed)
@@ -604,6 +715,7 @@ fn extract_and_validate_package(
     artifact: &[u8],
     destination: &Path,
     expected_target: &str,
+    expected_version: &str,
 ) -> Result<(), SatelleError> {
     drop(
         open_or_create_owner_only_directory(destination)
@@ -682,7 +794,7 @@ fn extract_and_validate_package(
             .map_err(|error| install_error("extract-codex-package", error))?;
     }
 
-    validate_package_manifest(destination, expected_target)
+    validate_package_manifest(destination, expected_target, expected_version)
 }
 
 fn ensure_owner_only_archive_directories(
@@ -709,6 +821,7 @@ fn ensure_owner_only_archive_directories(
 fn validate_package_manifest(
     package_root: &Path,
     expected_target: &str,
+    expected_version: &str,
 ) -> Result<(), SatelleError> {
     let manifest_path = package_root.join("codex-package.json");
     let manifest_bytes =
@@ -717,7 +830,7 @@ fn validate_package_manifest(
         .map_err(|error| install_error("verify-codex-package", error))?;
     let expected_entrypoint = format!("bin/{}", binary_name_for_target(expected_target));
     if manifest.layout_version != 1
-        || manifest.version != BASELINE_CODEX_VERSION
+        || manifest.version != expected_version
         || manifest.target != expected_target
         || manifest.variant != "codex"
         || manifest.entrypoint != expected_entrypoint
@@ -752,12 +865,15 @@ fn safe_archive_path(path: &Path) -> bool {
         && !path.to_string_lossy().contains('\\')
 }
 
-fn verify_installed_version(binary_path: &Path, codex_home: &Path) -> Result<(), SatelleError> {
+fn verify_installed_version(
+    binary_path: &Path,
+    codex_home: &Path,
+    expected_version: &str,
+) -> Result<(), SatelleError> {
     let mut command = std::process::Command::new(binary_path);
     command.arg("--version").env("CODEX_HOME", codex_home);
-    let expected_version =
-        crate::host::codex_capabilities::CodexVersion::parse(BASELINE_CODEX_VERSION)
-            .expect("the pinned baseline Codex version is valid");
+    let expected_version = crate::host::codex_capabilities::CodexVersion::parse(expected_version)
+        .expect("the selected release version was validated");
     let evidence = crate::host::codex_capabilities::probe_codex_version_command(
         command,
         crate::host::codex_capabilities::VERSION_PROBE_TIMEOUT,
@@ -805,6 +921,14 @@ fn admit_managed_codex_from_state_root_for_target(
     let receipt: ManagedCodexReceipt = serde_json::from_str(receipt_text.as_str())
         .map_err(|_| invalid_receipt("receipt_schema_invalid"))?;
 
+    admit_managed_codex_receipt(state_root, expected_target, receipt)
+}
+
+fn admit_managed_codex_receipt(
+    state_root: &Path,
+    expected_target: &str,
+    receipt: ManagedCodexReceipt,
+) -> Result<VerifiedCodexRuntime, SatelleError> {
     validate_receipt_metadata(&receipt, expected_target)?;
     let codex_home = canonical_directory(&receipt.codex_home, "codex_home_invalid")?;
     let releases_root = canonical_directory(
@@ -1331,6 +1455,116 @@ mod tests {
         }
     }
 
+    fn release_metadata() -> Value {
+        let tag = "rust-v0.157.1";
+        json!({
+            "tag_name": tag, "draft": false, "prerelease": false,
+            "assets": ([format!("codex-package-{FIXTURE_TARGET}.tar.gz"), "codex-package_SHA256SUMS".to_string()]
+                .into_iter().map(|name| json!({
+                    "browser_download_url": format!("https://github.com/openai/codex/releases/download/{tag}/{name}"),
+                    "name": name, "digest": format!("sha256:{}", "a".repeat(64)),
+                })).collect::<Vec<_>>())
+        })
+    }
+
+    #[test]
+    fn latest_release_requires_stable_version_and_verified_official_assets() {
+        let metadata = release_metadata();
+        let selected =
+            select_latest_release(&serde_json::to_vec(&metadata).unwrap(), FIXTURE_TARGET).unwrap();
+        assert_eq!(selected.version, "0.157.1");
+        for invalid in [
+            ("/draft", json!(true)),
+            ("/prerelease", json!(true)),
+            ("/tag_name", json!("rust-v0.157.1-alpha.1")),
+            ("/tag_name", json!("rust-v0.143.0")),
+            ("/assets/0/digest", Value::Null),
+            ("/assets/1/digest", json!("sha256:bad")),
+            (
+                "/assets/0/browser_download_url",
+                json!("https://example.com/codex.tar.gz"),
+            ),
+        ] {
+            let mut invalid_metadata = metadata.clone();
+            *invalid_metadata.pointer_mut(invalid.0).unwrap() = invalid.1;
+            assert!(
+                select_latest_release(
+                    &serde_json::to_vec(&invalid_metadata).unwrap(),
+                    FIXTURE_TARGET
+                )
+                .is_err(),
+                "{}",
+                invalid.0
+            );
+        }
+        let mut missing_asset = metadata.clone();
+        missing_asset["assets"].as_array_mut().unwrap().pop();
+        assert!(
+            select_latest_release(&serde_json::to_vec(&missing_asset).unwrap(), FIXTURE_TARGET)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn upgrade_replaces_receipt_only_after_new_package_is_admissible() {
+        for valid in [false, true] {
+            let fixture = ReceiptFixture::new();
+            let previous_receipt = fs::read(&fixture.receipt_path).unwrap();
+            let releases_root = fixture.package_root.parent().unwrap();
+            let next_package = releases_root.join(format!("0.157.1-{FIXTURE_TARGET}"));
+            let staging = releases_root.join("upgrade-staging");
+            open_or_create_owner_only_directory(&staging).unwrap();
+            fs::create_dir(staging.join("bin")).unwrap();
+            fs::copy(&fixture.binary_path, staging.join("bin").join(BINARY_NAME)).unwrap();
+            let mut next = fixture.receipt.clone();
+            next["version"] = json!("0.157.1");
+            next["release_tag"] = json!("rust-v0.157.1");
+            next["artifact_url"] = json!(format!(
+                "https://github.com/openai/codex/releases/download/rust-v0.157.1/codex-package-{FIXTURE_TARGET}.tar.gz"
+            ));
+            next["immutable_package_root"] = json!(next_package);
+            next["immutable_binary_path"] = json!(next_package.join("bin").join(BINARY_NAME));
+            if !valid {
+                next["immutable_binary_sha256"] = json!("0".repeat(64));
+            }
+            let intent_path = fixture.state_root.join(INSTALL_INTENT_FILE_NAME);
+            let outcome = complete_published_install(
+                &staging,
+                &next_package,
+                &fixture.receipt_path,
+                &serde_json::to_string(&next).unwrap(),
+                &fixture.state_root,
+                &intent_path,
+                FIXTURE_TARGET,
+            );
+            assert_eq!(outcome.is_ok(), valid);
+            let admitted =
+                admit_managed_codex_from_state_root_for_target(&fixture.state_root, FIXTURE_TARGET)
+                    .unwrap();
+            assert!(fixture.binary_path.exists());
+            if valid {
+                assert_eq!(admitted.package_root, next_package);
+                // Recovery after the receipt commit keeps the newly selected runtime.
+                persist_new_owner_only_secret_file(&intent_path, &json!({
+                    "schema": INSTALL_INTENT_SCHEMA, "version": "0.157.1", "target": FIXTURE_TARGET,
+                    "transaction_id": uuid::Uuid::now_v7().to_string(),
+                }).to_string()).unwrap();
+                recover_interrupted_install(
+                    &intent_path,
+                    &fixture.state_root,
+                    releases_root,
+                    FIXTURE_TARGET,
+                )
+                .unwrap();
+                assert!(next_package.exists());
+            } else {
+                assert_eq!(fs::read(&fixture.receipt_path).unwrap(), previous_receipt);
+                assert_eq!(admitted.package_root, fixture.package_root);
+                assert!(!next_package.exists());
+            }
+        }
+    }
+
     #[test]
     fn post_publish_failure_removes_the_slot_and_allows_an_exact_rerun() {
         let mut fixture = ReceiptFixture::new();
@@ -1342,6 +1576,11 @@ mod tests {
             .state_root
             .join("missing-parent")
             .join("receipt.json");
+        fs::write(
+            fixture.state_root.join("missing-parent"),
+            b"not a directory",
+        )
+        .expect("block receipt parent creation");
         let intent_path = fixture.state_root.join(INSTALL_INTENT_FILE_NAME);
 
         let error = complete_published_install(
@@ -1391,8 +1630,11 @@ mod tests {
         })
         .expect("serialize intent");
         persist_new_owner_only_secret_file(&intent_path, &intent).expect("persist intent");
-        let staging_root =
-            releases_root.join(managed_codex_staging_leaf(FIXTURE_TARGET, transaction_id));
+        let staging_root = releases_root.join(managed_codex_staging_leaf(
+            BASELINE_CODEX_VERSION,
+            FIXTURE_TARGET,
+            transaction_id,
+        ));
         fs::create_dir(&staging_root).expect("create interrupted staging directory");
         fs::write(staging_root.join("partial-package"), b"partial package")
             .expect("write interrupted staging content");
@@ -1401,7 +1643,6 @@ mod tests {
             &intent_path,
             &fixture.state_root,
             releases_root,
-            &fixture.package_root,
             FIXTURE_TARGET,
         )
         .expect("recover exact interrupted install");
@@ -1412,7 +1653,6 @@ mod tests {
             &intent_path,
             &fixture.state_root,
             releases_root,
-            &fixture.package_root,
             FIXTURE_TARGET,
         )
         .expect("recovery is idempotent");
@@ -1437,7 +1677,6 @@ mod tests {
                 &intent_path,
                 &fixture.state_root,
                 fixture.package_root.parent().expect("releases root"),
-                &fixture.package_root,
                 FIXTURE_TARGET,
             )
             .is_err()
@@ -1488,6 +1727,7 @@ mod tests {
             &package_artifact(FIXTURE_TARGET, false),
             &destination,
             FIXTURE_TARGET,
+            BASELINE_CODEX_VERSION,
         )
         .expect("extract exact package");
         drop(open_owner_only_directory(&destination).expect("owner-only package root"));
@@ -1591,6 +1831,7 @@ mod tests {
             &package_artifact(FIXTURE_TARGET, true),
             linked_root.path(),
             FIXTURE_TARGET,
+            BASELINE_CODEX_VERSION,
         )
         .expect_err("reject linked entrypoint");
         assert_eq!(linked.code, ErrorCode::SetupActionFailed);
@@ -1600,6 +1841,7 @@ mod tests {
             &package_artifact(FIXTURE_OTHER_TARGET, false),
             wrong_target_root.path(),
             FIXTURE_TARGET,
+            BASELINE_CODEX_VERSION,
         )
         .expect_err("reject wrong manifest target");
     }
