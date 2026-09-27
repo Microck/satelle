@@ -1,3 +1,11 @@
+## satelle@0.1.15
+
+### Installation
+
+Publish the Cargo package correctly when no previous version exists on crates.io.
+This release includes the managed Codex updates and Host automation prepared for
+0.1.14, whose publication stopped before any registry package was published.
+
 ## satelle@0.1.14
 
 ### Managed Codex updates

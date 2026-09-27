@@ -51,6 +51,12 @@ archive during pull request validation. The signed-tag workflow publishes the
 validated version and compares an existing crates.io version byte-for-byte on a
 retry. A local developer command must not publish it.
 
+The workflow checks the crates.io version metadata endpoint before publication.
+A metadata 404 permits first publication; other errors stop the release. The
+archive download endpoint cannot establish absence because its storage service
+can return 403 for a version that does not exist. Existing versions still require
+a successful archive download and an exact match with the validated package.
+
 Crates.io ownership is limited to the release-maintainer team. Add or remove an
 owner only through a reviewed repository administration change. The Actions
 secret `CARGO_REGISTRY_TOKEN` holds a crates.io token scoped to publishing this
