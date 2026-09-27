@@ -1,3 +1,27 @@
+## satelle@0.1.14
+
+### Managed Codex updates
+
+Install or upgrade to the latest stable official Codex during managed setup.
+Verify release digests and the installed binary before selecting the new runtime,
+and preserve the working installation when an update fails.
+
+Report unsuccessful native Computer Use readiness actions promptly instead of
+waiting for the probe deadline. Improve daemon reconnect and log-follow recovery.
+
+### Automation and Host management
+
+Add batch, watch, notification and interactive REPL workflows, durable turn queues,
+multi-user desktop selection, explicit image attachments and consented recordings.
+Manage API tokens and Host credential sources, and support configuration includes
+and expiring trusted profiles.
+
+### Installation and diagnostics
+
+Make the Satelle executable available as a single Cargo package. Add optional
+mutual TLS, OpenTelemetry and native log sinks, desktop snapshot export, and
+support bundles with explicit consent for raw diagnostics.
+
 ## satelle@0.1.13
 
 ### Native setup and recovery

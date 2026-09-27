@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Native readiness and durable recovery\n\nMake Windows native readiness checks and managed Codex startup tolerate slow\nversion probes, transient failures, and stale Computer Use plugin sources.\nRecover admitted operations after transport loss, preserve failure classes,\nand allow offline reset of abandoned operation metadata.\n"
-    filename: 2026-09-23-native-readiness-recovery.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Managed Codex updates\n\nInstall or upgrade to the latest stable official Codex during managed setup.\nVerify release digests and the installed binary before selecting the new runtime,\nand preserve the working installation when an update fails.\n\nReport unsuccessful native Computer Use readiness actions promptly instead of\nwaiting for the probe deadline. Improve daemon reconnect and log-follow recovery.\n\n## Automation and Host management\n\nAdd batch, watch, notification and interactive REPL workflows, durable turn queues,\nmulti-user desktop selection, explicit image attachments and consented recordings.\nManage API tokens and Host credential sources, and support configuration includes\nand expiring trusted profiles.\n\n## Installation and diagnostics\n\nMake the Satelle executable available as a single Cargo package. Add optional\nmutual TLS, OpenTelemetry and native log sinks, desktop snapshot export, and\nsupport bundles with explicit consent for raw diagnostics.\n"
+    filename: 2026-09-27-managed-codex-and-host-automation.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - 2026-09-23-native-readiness-recovery.md
+      - 2026-09-27-managed-codex-and-host-automation.md
     id: cargo:satelle
     updated: true
 npm:packages:

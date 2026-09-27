@@ -2438,7 +2438,7 @@ dependencies = [
 
 [[package]]
 name = "satelle"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -2497,7 +2497,6 @@ dependencies = [
 ]
 
 [[package]]
-
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
