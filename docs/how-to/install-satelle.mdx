@@ -13,7 +13,7 @@ Install Rust 1.97.0, then build the single native executable from the repository
 root:
 
 ```sh
-cargo build --release --locked -p satelle-cli
+cargo build --release --locked -p satelle
 ```
 
 The result is `target/release/satelle` on Unix-like systems and
@@ -69,6 +69,26 @@ All eight npm package identities are available from the public npm registry.
 The launcher selects its version-matched native optional dependency. Ordinary
 execution uses that installed local binary and does not fetch a replacement.
 
+### Repair the native package
+
+If the optional native package is missing or damaged, use the npm launcher:
+
+```sh
+satelle native repair --dry-run
+satelle native repair
+```
+
+Repair installs the launcher's exact version for the current platform through
+the detected npm, pnpm, or Bun installation owner. Local repair records the
+native package as an exact optional dependency in the owning project's manifest
+and lockfile. Global repair keeps the global installation scope. Package
+lifecycle scripts do not run.
+
+Success means the package version, platform metadata, executable path and
+permissions, and packaged `SHA256SUMS` digest all passed verification. An unknown
+or ambiguous installation owner requires the verified direct native release
+installation described below. Normal commands never run repair implicitly.
+
 ## Use a non-npm method
 
 Satelle defines these first-party non-npm installation methods:
@@ -92,7 +112,23 @@ Install it on Windows with PowerShell 7.4 or newer:
 pwsh -NoProfile -Command "& ([scriptblock]::Create((Invoke-RestMethod https://satelle.micr.dev/install.ps1)))"
 ```
 
-Direct archives are available from the [latest GitHub release](https://github.com/Microck/satelle/releases/latest).
+Direct archives are available from the
+[latest GitHub release](https://github.com/Microck/satelle/releases/latest).
+
+Official repository work follows measured demand and a named maintainer, not a
+bulk submission checklist. WinGet and Scoop Main are first because their
+manifests can use Satelle's existing versioned Windows archives and checksums.
+
+Homebrew core follows only after Satelle has a source-build formula that passes
+Homebrew-supported macOS CI, disables self-update, and meets Homebrew's
+stability and notability rules. Chocolatey follows WinGet and Scoop Main only
+after its moderation, validator, checksum, install, uninstall, and
+maintainer-response obligations have an owner.
+
+AUR, Debian and RPM repositories, Nixpkgs, and MacPorts require clear user
+demand or an ecosystem maintainer who commits to their source-build, review,
+update-lag, and support duties. None of these external submissions is a Satelle
+release blocker.
 
 ## Use the installation owner's lifecycle
 

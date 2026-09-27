@@ -31,9 +31,10 @@ They do not grant wildcard, all-host, project-host, or future-command
 authority. Selecting a normal profile does not select a same-name Trusted
 Profile unless that user-owned profile names it explicitly.
 
-Trusted Profile schema and consent enforcement are implemented. A grant remains
-active until the user edits or removes it and has no automatic expiry in this
-release. Review the exact Host and command-family scope before selecting one.
+An optional user-owned `expires_at` UTC timestamp limits a grant's lifetime.
+Without it, the grant remains active until the user edits or removes it.
+Expired grants supply no consent. Review the exact Host, command-family scope,
+and expiry before selecting one.
 See the [configuration reference](/docs/reference/configuration#named-profiles)
 for the canonical TOML shape.
 

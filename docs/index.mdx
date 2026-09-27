@@ -20,7 +20,7 @@ against the matching executable and public domain types in CI.
 The shortest supported path uses a local Host on macOS or Windows:
 
 ```sh
-cargo build --release --locked -p satelle-cli
+cargo build --release --locked -p satelle
 ./target/release/satelle setup --host local-demo --dry-run
 ./target/release/satelle doctor --host local-demo --scope computer-use --refresh
 ./target/release/satelle run --host local-demo "Open the browser"

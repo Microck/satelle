@@ -13,11 +13,11 @@ import './readiness.css';
  * place of its own. Everything the terminal prints comes from two places in
  * the product:
  *
- *   - the doctor branch of crates/satelle-cli/src/main.rs prints `Host:`,
+ *   - the doctor branch of crates/satelle/src/main.rs prints `Host:`,
  *     `Status:`, `Ready:`, `Scopes:`, then print_doctor_findings prints
  *     `[<severity>] <summary> (<fixability>)` and one indented
  *     `  evidence: <text>` line per evidence entry.
- *   - project_native_refresh in crates/satelle-host/src/lib.rs builds the one
+ *   - project_native_refresh in crates/satelle/src/host/mod.rs builds the one
  *     finding the `computer-use` scope can carry, and its evidence. It retains
  *     no other finding in that scope, which is why one run prints one finding.
  *
@@ -27,7 +27,7 @@ import './readiness.css';
  * The blocked summary is the message on native_readiness_manual_action_failure,
  * which is raised exactly when the os_permissions or app_approval observation
  * comes back denied. Those are the os-permission-required and
- * app-approval-required blockers in crates/satelle-core/src/doctor.rs.
+ * app-approval-required blockers in crates/satelle/src/core/doctor.rs.
  */
 
 const HOST_ALIAS = 'win-11-lab';

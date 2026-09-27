@@ -1,0 +1,775 @@
+use super::*;
+use satelle::core::session::{
+    ApprovalPolicy, DesktopTarget, EffectiveModelRef, ExecutionPolicy, ExperimentalFeatureChoices,
+    FeatureChoice, ProviderBindingRef, SandboxPolicy, SessionActivity, StopObservation,
+    TimeoutPolicy, TurnState, TurnTransition,
+};
+use satelle::host::{
+    AdapterReadiness, AdapterSubject, ComputerUseAdapter, ExecuteRequest, ExecuteResult,
+    ProviderComputerUseIntent, ProviderSmokeEvidence, ReadinessEvidence, RecoveryObservation,
+};
+use satelle::test_contract::assert_privacy_canaries_absent;
+use satelle::transport::{ProviderBindingDeletionRequest, SessionResponse, TurnRequest};
+use std::sync::Condvar;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::test]
+async fn provider_secret_raw_wire_rejects_identity_content_type_and_duplicate_metadata_safely() {
+    let running = RunningServer::start(ApiScopes::ADMIN).await;
+    let authorization = bearer(&running.token);
+    let secret_canary = "PRIVATE_PROVIDER_SECRET_RAW_WIRE_CANARY";
+    let metadata = serde_json::to_string(
+        &satelle::transport::ProviderSecretProvisioningMetadata::new(
+            "local-demo-desktop-v1",
+            satelle::core::ProviderBindingAuthorization::new(
+                "vision", "open_ai", "gpt-5.6", "openai",
+            ),
+            false,
+        ),
+    )
+    .expect("encode provider secret metadata");
+
+    for (expected_host, content_type, metadata_headers, status, code) in [
+        (
+            "unexpected-host",
+            "application/vnd.satelle.provider-secret-upload+json",
+            format!("Satelle-Provider-Secret-Metadata: {metadata}\r\n"),
+            409,
+            "host-identity-mismatch",
+        ),
+        (
+            running.host_identity.as_str(),
+            "application/json",
+            format!("Satelle-Provider-Secret-Metadata: {metadata}\r\n"),
+            415,
+            "unsupported-content-type",
+        ),
+        (
+            running.host_identity.as_str(),
+            "application/vnd.satelle.provider-secret-upload+json",
+            format!(
+                "Satelle-Provider-Secret-Metadata: {metadata}\r\nSatelle-Provider-Secret-Metadata: {metadata}\r\n"
+            ),
+            400,
+            "invalid-request",
+        ),
+    ] {
+        let mut request = format!(
+        "POST /v1/setup/provider-secret HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {expected_host}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: provider-secret-raw-wire\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{metadata_headers}Connection: close\r\n\r\n",
+            RequestId::new(),
+            secret_canary.len(),
+        )
+        .into_bytes();
+        request.extend_from_slice(secret_canary.as_bytes());
+        let response = raw_request(running.server.local_addr(), &request).await;
+        assert_raw_api_error(&response, status, code);
+        assert!(!String::from_utf8_lossy(&response).contains(secret_canary));
+    }
+}
+
+#[tokio::test]
+async fn chunked_oversize_body_returns_typed_413_without_admission() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let authorization = bearer(&running.token);
+    let body = format!(
+        r#"{{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"{}"}}"#,
+        "x".repeat(1_048_576)
+    );
+    let payload_bytes = body.len();
+    let head = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: raw-chunked-limit\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload_bytes:x}\r\n",
+        running.host_identity,
+        RequestId::new(),
+    );
+    let mut request = Vec::with_capacity(head.len() + payload_bytes + 16);
+    request.extend_from_slice(head.as_bytes());
+    request.extend_from_slice(body.as_bytes());
+    request.extend_from_slice(b"\r\n0\r\n\r\n");
+
+    let response = raw_request(running.server.local_addr(), &request).await;
+    assert_raw_api_error(&response, 413, "payload-too-large");
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn unauthenticated_attachment_sized_body_is_rejected_before_body_admission() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let body = format!(
+        r#"{{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"{}"}}"#,
+        "x".repeat(1_048_576)
+    );
+    let head = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body.as_bytes());
+
+    let mut stream = TcpStream::connect(running.server.local_addr())
+        .await
+        .expect("connect raw HTTP client");
+    let write_error = stream.write_all(&request).await.err();
+    let mut response = Vec::new();
+    let read_error = stream.read_to_end(&mut response).await.err();
+    let early_close = write_error.as_ref().or(read_error.as_ref());
+
+    if let Some(error) = early_close {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+            ),
+            "unexpected raw HTTP I/O failure: {error}"
+        );
+    } else {
+        assert_raw_api_error(&response, 401, "authentication-failed");
+    }
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+}
+
+#[test]
+fn chunked_non_empty_attachments_return_typed_413_without_admission() {
+    run_with_trace_capture(chunked_attachment_limit_and_log_privacy);
+}
+
+async fn chunked_attachment_limit_and_log_privacy(trace_capture: TraceCapture) {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let authorization = bearer(&running.token);
+    let body_canary = "PRIVATE_CHUNKED_BODY_CANARY";
+    let attachment_name = "PRIVATE_CHUNKED_ATTACHMENT_NAME_CANARY";
+    let attachment_bytes = "PRIVATE_CHUNKED_ATTACHMENT_BYTES_CANARY";
+    let body = format!(
+        r#"{{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":7,"execution_mode":"standard","body_canary":"{body_canary}","attachments":[{{"name":"{attachment_name}","content":"{attachment_bytes}"}}]}}"#
+    );
+    let body = body.as_bytes();
+    let split = body.len() / 2;
+    let request_id = RequestId::new();
+    let request_head = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {authorization}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: attachment-limit-chunked\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{split:x}\r\n",
+        running.host_identity, request_id,
+    );
+    let mut request = request_head.into_bytes();
+    request.extend_from_slice(&body[..split]);
+    request.extend_from_slice(format!("\r\n{:x}\r\n", body.len() - split).as_bytes());
+    request.extend_from_slice(&body[split..]);
+    request.extend_from_slice(b"\r\n0\r\n\r\n");
+
+    let response = raw_request(running.server.local_addr(), &request).await;
+    assert_raw_attachment_limit_error(&response, &running.host_identity);
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+    let traces = trace_capture.bytes();
+    assert_captured_host_admission_dispatch(&traces);
+    assert_privacy_canaries_absent(
+        "Host Daemon tracing sink after chunked request",
+        &traces,
+        &[
+            body_canary,
+            attachment_name,
+            attachment_bytes,
+            authorization
+                .strip_prefix("Bearer ")
+                .expect("raw-wire Authorization fixture uses Bearer authentication"),
+            authorization.as_str(),
+        ],
+    );
+
+    // The public Host log page remains separate durable audit evidence.
+    assert_raw_returned_host_logs_exclude(
+        &running,
+        &[
+            body_canary,
+            attachment_name,
+            attachment_bytes,
+            authorization
+                .strip_prefix("Bearer ")
+                .expect("raw-wire Authorization fixture uses Bearer authentication"),
+            authorization.as_str(),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duplicate_singleton_headers_fail_closed_without_admission() {
+    duplicate_header_case(DuplicateHeader::Authorization, 401, "authentication-failed").await;
+    duplicate_header_case(DuplicateHeader::IdempotencyKey, 400, "invalid-request").await;
+    duplicate_header_case(
+        DuplicateHeader::ContentType,
+        415,
+        "unsupported-content-type",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn bearer_tokens_in_http_trailers_are_rejected_without_admission() {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let token = running.token.expose();
+    let live_request = format!(
+        "GET /v1/live HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        token.as_str()
+    );
+    let response = raw_request(running.server.local_addr(), live_request.as_bytes()).await;
+    assert_raw_api_error(&response, 400, "invalid-request");
+
+    let body =
+        br#"{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"safe","execution_mode":"standard"}"#;
+    let mutation_request = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: trailer-carrier\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        bearer(&running.token),
+        running.host_identity,
+        RequestId::new(),
+        body.len(),
+        String::from_utf8_lossy(body),
+        token.as_str(),
+    );
+    let response = raw_request(running.server.local_addr(), mutation_request.as_bytes()).await;
+    assert_raw_api_error(&response, 400, "invalid-request");
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read session count")
+            .session_count(),
+        0
+    );
+
+    let admin = RunningServer::start(ApiScopes::ADMIN).await;
+    let deletion_body = serde_json::to_string(&ProviderBindingDeletionRequest::new(
+        "local-demo-desktop-v1",
+    ))
+    .expect("encode provider binding deletion request");
+    let deletion_request = format!(
+        "DELETE /v1/setup/provider-bindings/openai/review HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: provider-delete-trailer\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nTrailer: X-Api-Token\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\nX-Api-Token: {}\r\n\r\n",
+        bearer(&admin.token),
+        admin.host_identity,
+        RequestId::new(),
+        deletion_body.len(),
+        deletion_body,
+        admin.token.expose().as_str(),
+    );
+    let response = raw_request(admin.server.local_addr(), deletion_request.as_bytes()).await;
+    assert_raw_api_error(&response, 400, "invalid-request");
+
+    let retry = admin
+        .protected_request(
+            reqwest::Method::DELETE,
+            "/v1/setup/provider-bindings/openai/review",
+        )
+        .header("Satelle-Protocol-Version", "22")
+        .header("Idempotency-Key", "provider-delete-trailer")
+        .json(&ProviderBindingDeletionRequest::new(
+            "local-demo-desktop-v1",
+        ))
+        .send()
+        .await
+        .expect("reuse the rejected trailer idempotency key");
+    assert_eq!(retry.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn stalled_upload_cannot_hold_daemon_shutdown_open_forever() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    let initialized = service.initialize_daemon().expect("initialize Host state");
+    let token = ApiBearerToken::generate().expect("generate API token");
+    service
+        .register_api_token(&token, "principal-shutdown", ApiScopes::CONTROL, None)
+        .expect("register API token");
+    let server = DaemonServer::bind(
+        service,
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .with_shutdown_grace(Duration::from_millis(50)),
+    )
+    .await
+    .expect("bind daemon server");
+    let address = server.local_addr();
+    let mut held = TcpStream::connect(address)
+        .await
+        .expect("open stalled request connection");
+    let partial = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: stalled-shutdown\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{",
+        bearer(&token),
+        initialized.host_identity(),
+        RequestId::new(),
+    );
+    held.write_all(partial.as_bytes())
+        .await
+        .expect("write partial request");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let error = tokio::time::timeout(Duration::from_secs(1), server.shutdown())
+        .await
+        .expect("shutdown must be bounded")
+        .expect_err("stalled request must exhaust the graceful deadline");
+    assert_eq!(error.code(), "shutdown-timeout");
+    assert!(TcpStream::connect(address).await.is_err());
+    drop(held);
+}
+
+#[tokio::test]
+async fn dropped_admission_response_is_recovered_without_stopping_or_duplicate_turns() {
+    const IDEMPOTENCY_KEY: &str = "01890a5d-ac96-7b7c-8f89-37c3d0a66f10";
+
+    let state = TestStateDir::new().expect("temporary state directory");
+    let admission = AdmissionBarrier::default();
+    let _admission_guard = AdmissionReleaseGuard(admission.clone());
+    let service = HostService::with_adapter_for_tests_at(
+        state.path(),
+        ControlledAdmissionAdapter {
+            admission: admission.clone(),
+        },
+    )
+    .expect("construct controlled Host service");
+    let initialized = service.initialize_daemon().expect("initialize Host state");
+    let host_identity = initialized.host_identity().to_string();
+    let token = ApiBearerToken::generate().expect("generate API token");
+    service
+        .register_api_token(
+            &token,
+            "principal-dropped-response",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register API token");
+    let server = DaemonServer::bind(
+        service.clone(),
+        DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await
+    .expect("bind daemon server");
+    let running = RunningServer {
+        _state: state,
+        service,
+        server,
+        token,
+        host_identity,
+    };
+    let request = TurnRequest::new("PRIVATE_DROPPED_RESPONSE_CANARY")
+        .with_desktop_binding("local-demo-desktop-v1");
+    let body = serde_json::to_vec(&request).expect("encode admission request");
+    let head = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nAuthorization: {}\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nIdempotency-Key: {IDEMPOTENCY_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bearer(&running.token),
+        running.host_identity,
+        RequestId::new(),
+        body.len(),
+    );
+    let mut stream = TcpStream::connect(running.server.local_addr())
+        .await
+        .expect("connect raw admission client");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("write admission head");
+    stream.write_all(&body).await.expect("write admission body");
+    stream
+        .flush()
+        .await
+        .expect("flush complete admission request");
+    let admission_wait = admission.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || admission_wait.wait_until_entered()),
+    )
+    .await
+    .expect("POST admission must enter its blocked preflight")
+    .expect("preflight barrier waiter must not panic");
+    let pending = running
+        .service
+        .initialize_daemon()
+        .expect("read daemon state while admission is blocked");
+    assert_eq!(
+        pending.session_count(),
+        0,
+        "blocked preflight proves durable admission has not completed"
+    );
+    let mut response_probe = [0_u8; 1];
+    let pending_read = stream.try_read(&mut response_probe);
+    assert!(
+        pending_read
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
+        "the HTTP response must still be pending at the disconnect barrier: {pending_read:?}"
+    );
+    drop(stream);
+    admission.release();
+
+    let replay: SessionResponse = running
+        .mutation("/v1/sessions", IDEMPOTENCY_KEY)
+        .json(&request)
+        .send()
+        .await
+        .expect("replay admission after losing its response")
+        .json()
+        .await
+        .expect("decode replayed admission");
+    assert_eq!(replay.session().turns().len(), 1);
+    let session_id = replay.session().session_id().clone();
+    let turn_id = replay.session().turns()[0].turn_id().clone();
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let session = running
+                .service
+                .status(&session_id)
+                .expect("read authoritative Session state");
+            if matches!(session.activity(), SessionActivity::Idle) {
+                break session;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the admitted Turn must eventually finish");
+    assert_eq!(terminal.turns().len(), 1);
+    assert_eq!(terminal.turns()[0].turn_id(), &turn_id);
+    assert_ne!(terminal.turns()[0].state(), TurnState::Stopped);
+    assert_eq!(
+        admission.preflight_calls(),
+        1,
+        "the disconnected request and exact replay must share one admission"
+    );
+    assert_eq!(
+        admission.execute_calls(),
+        1,
+        "the exact replay must not dispatch a duplicate Turn"
+    );
+    assert_eq!(
+        admission.stop_calls(),
+        0,
+        "disconnecting a pending admission response must not attempt a stop"
+    );
+
+    let recovered_response = running
+        .request(&format!("/v1/sessions/{session_id}"))
+        .send()
+        .await
+        .expect("read Session after reconnect");
+    let recovered_status = recovered_response.status();
+    let recovered_body = recovered_response
+        .bytes()
+        .await
+        .expect("read reconnected Session body");
+    assert_eq!(
+        recovered_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&recovered_body)
+    );
+    let recovered: SessionResponse =
+        serde_json::from_slice(&recovered_body).expect("decode reconnected Session");
+    assert_eq!(recovered.session(), &terminal);
+    assert_eq!(
+        running
+            .service
+            .initialize_daemon()
+            .expect("read final daemon state")
+            .session_count(),
+        1
+    );
+}
+
+#[derive(Clone, Default)]
+struct AdmissionBarrier {
+    entered: Arc<(Mutex<bool>, Condvar)>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    preflight_calls: Arc<AtomicUsize>,
+    execute_calls: Arc<AtomicUsize>,
+    stop_calls: Arc<AtomicUsize>,
+}
+
+impl AdmissionBarrier {
+    fn block_preflight(&self) {
+        self.preflight_calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let (lock, changed) = &*self.entered;
+        *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        changed.notify_all();
+        let (lock, changed) = &*self.release;
+        let mut released = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        while !*released {
+            released = changed
+                .wait(released)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        let (lock, changed) = &*self.entered;
+        let mut entered = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        while !*entered {
+            entered = changed
+                .wait(entered)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        let (lock, changed) = &*self.release;
+        *lock.lock().unwrap_or_else(|poison| poison.into_inner()) = true;
+        changed.notify_all();
+    }
+
+    fn preflight_calls(&self) -> usize {
+        self.preflight_calls.load(AtomicOrdering::SeqCst)
+    }
+
+    fn execute_calls(&self) -> usize {
+        self.execute_calls.load(AtomicOrdering::SeqCst)
+    }
+
+    fn stop_calls(&self) -> usize {
+        self.stop_calls.load(AtomicOrdering::SeqCst)
+    }
+}
+
+struct AdmissionReleaseGuard(AdmissionBarrier);
+
+impl Drop for AdmissionReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[derive(Clone)]
+struct ControlledAdmissionAdapter {
+    admission: AdmissionBarrier,
+}
+
+impl ComputerUseAdapter for ControlledAdmissionAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, satelle::core::SatelleError> {
+        self.admission.block_preflight();
+        let desktop_binding = provider_intent
+            .desktop_binding()
+            .cloned()
+            .expect("broker admission always selects a Desktop Binding before preflight");
+        let execution_policy = ExecutionPolicy::new(
+            EffectiveModelRef::new("raw-wire-controlled-model").expect("valid model binding"),
+            ProviderBindingRef::new("raw-wire-controlled-provider")
+                .expect("valid provider binding"),
+            DesktopTarget::new(
+                desktop_binding.clone(),
+                "raw-wire-controlled-desktop-session",
+            ),
+            ApprovalPolicy::OnRequest,
+            SandboxPolicy::WorkspaceWrite,
+            TimeoutPolicy::bounded_seconds(120).expect("valid timeout policy"),
+            ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+        );
+        let observed_at = time::OffsetDateTime::now_utc();
+        let readiness_key = satelle::host::ReadinessCacheKey::new(
+            "raw-wire-controlled",
+            desktop_binding.clone(),
+            execution_policy.clone(),
+            "raw-wire-controlled-codex",
+            "raw-wire-controlled-runtime",
+            Some("raw-wire-controlled-plugin"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            satelle::host::ReadinessObservationState::Unknown,
+            satelle::host::ReadinessObservationState::Unknown,
+        )
+        .expect("valid readiness cache key");
+        let evidence = ReadinessEvidence::new(
+            &readiness_key,
+            format!("raw-wire-readiness-{}", satelle::core::SessionId::new()),
+            observed_at,
+            observed_at + time::Duration::minutes(5),
+        )
+        .expect("valid readiness evidence");
+        let provider_evidence = ProviderSmokeEvidence::new(
+            format!("raw-wire-provider-{}", satelle::core::SessionId::new()),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            observed_at,
+            observed_at + time::Duration::hours(24),
+        )
+        .expect("valid provider evidence");
+        let resolved_binding = satelle::core::ResolvedProviderBinding::from_authorization(
+            satelle::core::ProviderBindingAuthorization::new(
+                "raw-wire-model",
+                "raw-wire-provider",
+                "raw-wire-model",
+                "raw-wire-provider",
+            ),
+            satelle::core::ProviderBindingSource::HostOwned,
+        );
+        AdapterReadiness::ready(
+            "raw-wire-controlled",
+            "controlled adapter is ready",
+            desktop_binding,
+            execution_policy,
+            evidence,
+            Some(provider_evidence),
+            Some(resolved_binding),
+        )
+        .map_err(|error| satelle::core::SatelleError::invalid_usage(error.to_string()))
+    }
+
+    fn execute(
+        &self,
+        _request: ExecuteRequest<'_>,
+    ) -> Result<ExecuteResult, satelle::core::SatelleError> {
+        self.admission
+            .execute_calls
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
+    }
+
+    fn observe_stop(
+        &self,
+        _subject: AdapterSubject<'_>,
+    ) -> Result<StopObservation, satelle::core::SatelleError> {
+        self.admission
+            .stop_calls
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(StopObservation::UpstreamInactiveConfirmed)
+    }
+
+    fn observe_recovery(
+        &self,
+        _subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, satelle::core::SatelleError> {
+        Ok(RecoveryObservation::Unknown)
+    }
+}
+
+pub(super) async fn raw_request(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(address)
+        .await
+        .expect("connect raw HTTP client");
+    stream.write_all(request).await.expect("write raw request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read raw response");
+    response
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DuplicateHeader {
+    Authorization,
+    IdempotencyKey,
+    ContentType,
+}
+
+async fn duplicate_header_case(header: DuplicateHeader, status: u16, code: &str) {
+    let running = RunningServer::start(ApiScopes::CONTROL).await;
+    let authorization = bearer(&running.token);
+    let body = br#"{"schema_version":"satelle.api.v12","desktop_binding":"local-demo-desktop-v1","model_from_project":false,"provider_from_project":false,"prompt":"PRIVATE_RAW_HEADER_CANARY","execution_mode":"standard"}"#;
+    let duplicated = match header {
+        DuplicateHeader::Authorization => format!(
+            "Authorization: {authorization}\r\nAuthorization: {authorization}\r\nIdempotency-Key: duplicate-auth\r\nContent-Type: application/json\r\n"
+        ),
+        DuplicateHeader::IdempotencyKey => format!(
+            "Authorization: {authorization}\r\nIdempotency-Key: first-key\r\nIdempotency-Key: second-key\r\nContent-Type: application/json\r\n"
+        ),
+        DuplicateHeader::ContentType => format!(
+            "Authorization: {authorization}\r\nIdempotency-Key: duplicate-content-type\r\nContent-Type: application/json\r\nContent-Type: application/json\r\n"
+        ),
+    };
+    let mut request = format!(
+        "POST /v1/sessions HTTP/1.1\r\nHost: localhost\r\nSatelle-Expected-Host-Identity: {}\r\nSatelle-Request-Id: {}\r\nSatelle-Protocol-Version: 22\r\nContent-Length: {}\r\n{duplicated}Connection: close\r\n\r\n",
+        running.host_identity,
+        RequestId::new(),
+        body.len(),
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    let response = raw_request(running.server.local_addr(), &request).await;
+    let session_count = running
+        .service
+        .initialize_daemon()
+        .expect("read session count")
+        .session_count();
+    assert!(
+        !response.is_empty(),
+        "duplicate {header:?} header closed without HTTP"
+    );
+    assert_raw_api_error(&response, status, code);
+    assert_eq!(session_count, 0);
+}
+
+pub(super) fn assert_raw_api_error(response: &[u8], status: u16, code: &str) {
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("raw response has header terminator");
+    let headers = String::from_utf8_lossy(&response[..separator]);
+    assert!(
+        headers.starts_with(&format!("HTTP/1.1 {status} ")),
+        "{headers}"
+    );
+    let body: ApiError =
+        serde_json::from_slice(&response[separator + 4..]).expect("decode raw API error");
+    assert_eq!(body.code().as_str(), code);
+}
+
+fn assert_raw_attachment_limit_error(response: &[u8], host_identity: &str) {
+    assert_raw_api_error(response, 413, "payload-too-large");
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("raw response has header terminator");
+    let body: Value =
+        serde_json::from_slice(&response[separator + 4..]).expect("decode raw attachment error");
+    assert_eq!(body["schema_version"], "satelle.error.v1");
+    assert_eq!(body["host_identity"], host_identity);
+    assert_eq!(body["code"], "payload-too-large");
+    assert_eq!(body["category"], "capacity");
+    assert_eq!(body["retryable"], false);
+    assert_eq!(
+        body["message"],
+        "the request exceeds the advertised attachment limit"
+    );
+    assert_eq!(body["details"], Value::Null);
+    assert_eq!(body["docs_url"], Value::Null);
+    assert_eq!(body["suggested_commands"], serde_json::json!([]));
+}
+
+async fn assert_raw_returned_host_logs_exclude(running: &RunningServer, canaries: &[&str]) {
+    let response = running
+        .request("/v1/logs?mode=tail&limit=200&minimum_severity=info")
+        .send()
+        .await
+        .expect("read Host logs after raw-wire request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .bytes()
+        .await
+        .expect("read Host log page after raw-wire request");
+    assert_privacy_canaries_absent(
+        "returned Host logs after raw-wire request",
+        &bytes,
+        canaries,
+    );
+}

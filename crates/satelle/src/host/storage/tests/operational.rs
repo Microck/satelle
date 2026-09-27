@@ -1,0 +1,3502 @@
+use super::*;
+use crate::host::runtime::{NativeProbeResult, ReadinessObservationState, ReadinessSource};
+use crate::host::storage::{
+    LeaseOwner, MaintenanceLeaseCapability, SetupActionPlan, SetupOperationKind, SetupRunPlan,
+    SetupRunStatus,
+};
+use crate::host::{
+    EvidenceError, ProviderSmokeEvidence, ProviderSmokeFailureEvidence, ProviderSmokeResult,
+    ReadinessCacheKey, ReadinessEvidence,
+};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+
+fn test_desktop_binding() -> crate::core::session::DesktopBindingRef {
+    crate::core::session::DesktopBindingRef::new("desktop-test")
+        .expect("valid test Desktop Binding")
+}
+
+fn rebuild_logs_as_v15_fixture(connection: &Connection) {
+    // Migration metadata is not a historical fixture. Restore the exact
+    // predecessor table so migration 16 proves its real ALTER/COPY boundary.
+    connection
+        .execute_batch(
+            "DROP INDEX logs_by_cursor;
+             DROP INDEX logs_by_session_cursor;
+             DROP INDEX logs_by_recorded_at_cursor;
+             ALTER TABLE logs RENAME TO logs_v16_fixture;
+
+             CREATE TABLE logs (
+                 log_cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+                 recorded_at TEXT NOT NULL,
+                 recorded_at_unix_nanos INTEGER NOT NULL,
+                 source TEXT NOT NULL CHECK (source IN ('host_daemon', 'storage', 'codex_adapter')),
+                 severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error')),
+                 event_kind TEXT NOT NULL CHECK (event_kind IN (
+                     'session_started', 'follow_up_started', 'turn_state_committed',
+                     'stop_confirmed', 'stop_not_confirmed', 'restart_recovery_pending',
+                     'store_opened'
+                 )),
+                 session_id TEXT REFERENCES sessions(session_id) ON DELETE SET NULL,
+                 turn_id TEXT REFERENCES turns(turn_id) ON DELETE SET NULL,
+                 session_state_revision TEXT,
+                 turn_state_revision TEXT,
+                 redacted INTEGER NOT NULL DEFAULT 1 CHECK (redacted = 1),
+                 CHECK (
+                     (event_kind = 'store_opened'
+                      AND session_id IS NULL AND turn_id IS NULL
+                      AND session_state_revision IS NULL AND turn_state_revision IS NULL)
+                     OR
+                     (event_kind != 'store_opened'
+                      AND session_id IS NOT NULL AND turn_id IS NOT NULL
+                      AND session_state_revision IS NOT NULL AND turn_state_revision IS NOT NULL)
+                 )
+             ) STRICT;
+
+             INSERT INTO logs (
+                 log_cursor, recorded_at, recorded_at_unix_nanos, source, severity,
+                 event_kind, session_id, turn_id, session_state_revision,
+                 turn_state_revision, redacted
+             ) SELECT
+                 log_cursor, recorded_at, recorded_at_unix_nanos, source, severity,
+                 event_kind, session_id, turn_id, session_state_revision,
+                 turn_state_revision, redacted
+             FROM logs_v16_fixture;
+             DROP TABLE logs_v16_fixture;
+             CREATE INDEX logs_by_cursor ON logs(log_cursor);
+             CREATE INDEX logs_by_session_cursor ON logs(session_id, log_cursor);
+             CREATE INDEX logs_by_recorded_at_cursor ON logs(recorded_at_unix_nanos, log_cursor);",
+        )
+        .expect("restore the exact version fifteen logs schema");
+}
+
+fn begin_maintenance(
+    storage: &mut Storage,
+    operation_id: &str,
+    desktop_binding: Option<&str>,
+    acquired_at: OffsetDateTime,
+) -> MaintenanceLeaseCapability {
+    let plan = SetupRunPlan::new(
+        operation_id,
+        SetupOperationKind::Repair,
+        desktop_binding.map(|binding| DesktopBindingRef::new(binding).unwrap()),
+        acquired_at,
+        vec![SetupActionPlan::new("repair-runtime", "Repair runtime", false).unwrap()],
+    )
+    .unwrap();
+    storage
+        .begin_setup_run(&plan, lease_owner(operation_id, acquired_at))
+        .expect("setup admission atomically acquires maintenance ownership")
+}
+
+fn rebuild_idempotency_records_as_pre_v11_fixture(connection: &Connection) {
+    // Lowering migration metadata alone leaves the future table shape in place.
+    // A historical fixture must restore the exact predecessor schema that
+    // migration 11 receives from real version 1 through version 10 stores.
+    connection
+        .execute_batch(
+            "DROP TABLE provider_secret_provisioning_journal;
+
+            CREATE TABLE idempotency_records_pre_v11_fixture (
+                principal_ref TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK (operation IN ('run', 'steer', 'stop')),
+                idempotency_key TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL
+                    CHECK (
+                        length(request_digest) = 64
+                        AND request_digest NOT GLOB '*[^0-9a-f]*'
+                    ),
+                digest_schema_version INTEGER NOT NULL CHECK (digest_schema_version > 0),
+                hmac_key_version INTEGER NOT NULL CHECK (hmac_key_version > 0),
+                status TEXT NOT NULL CHECK (status IN ('in_progress', 'terminal')),
+                durable_outcome TEXT NOT NULL CHECK (durable_outcome IN (
+                    'v1.turn.starting',
+                    'v1.turn.running',
+                    'v1.turn.recovery_pending',
+                    'v1.turn.completed',
+                    'v1.turn.blocked',
+                    'v1.turn.failed',
+                    'v1.turn.stopped',
+                    'v1.stop.pending',
+                    'v1.stop.stopped_from_starting',
+                    'v1.stop.stopped_from_running',
+                    'v1.stop.stopped_from_recovery_pending',
+                    'v1.stop.already_completed',
+                    'v1.stop.already_blocked',
+                    'v1.stop.already_failed',
+                    'v1.stop.already_stopped',
+                    'v1.stop.not_confirmed_active_changed',
+                    'v1.stop.not_confirmed_active_unchanged',
+                    'v1.stop.not_confirmed_recovery_pending_changed',
+                    'v1.stop.not_confirmed_recovery_pending_unchanged'
+                )),
+                session_id TEXT REFERENCES sessions(session_id) ON DELETE RESTRICT,
+                turn_id TEXT REFERENCES turns(turn_id) ON DELETE RESTRICT,
+                result_session_state_revision TEXT
+                    CHECK (
+                        result_session_state_revision IS NULL
+                        OR (
+                            length(result_session_state_revision) = 16
+                            AND result_session_state_revision NOT GLOB '*[^0-9a-f]*'
+                            AND result_session_state_revision <> '0000000000000000'
+                        )
+                    ),
+                result_session_updated_at TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (hmac_key_version)
+                    REFERENCES idempotency_hmac_keys(key_version) ON DELETE RESTRICT,
+                PRIMARY KEY (principal_ref, operation, idempotency_key),
+                CHECK (
+                    (status = 'in_progress' AND completed_at IS NULL)
+                    OR (status = 'terminal' AND completed_at IS NOT NULL)
+                ),
+                CHECK (
+                    operation = 'stop'
+                    OR (
+                        status = 'in_progress'
+                        AND result_session_state_revision IS NULL
+                        AND result_session_updated_at IS NULL
+                    )
+                    OR (
+                        status = 'terminal'
+                        AND result_session_state_revision IS NOT NULL
+                        AND result_session_updated_at IS NOT NULL
+                    )
+                )
+            ) STRICT;
+
+            INSERT INTO idempotency_records_pre_v11_fixture (
+                principal_ref,
+                operation,
+                idempotency_key,
+                operation_id,
+                request_digest,
+                digest_schema_version,
+                hmac_key_version,
+                status,
+                durable_outcome,
+                session_id,
+                turn_id,
+                result_session_state_revision,
+                result_session_updated_at,
+                created_at,
+                completed_at,
+                expires_at
+            )
+            SELECT
+                principal_ref,
+                operation,
+                idempotency_key,
+                operation_id,
+                request_digest,
+                digest_schema_version,
+                hmac_key_version,
+                status,
+                durable_outcome,
+                session_id,
+                turn_id,
+                result_session_state_revision,
+                result_session_updated_at,
+                created_at,
+                completed_at,
+                expires_at
+            FROM idempotency_records;
+
+            DROP TABLE idempotency_records;
+            ALTER TABLE idempotency_records_pre_v11_fixture
+                RENAME TO idempotency_records;
+
+            CREATE INDEX idempotency_expiry
+                ON idempotency_records(expires_at);",
+        )
+        .expect("restore the exact pre-version-eleven idempotency schema");
+}
+
+fn rebuild_storage_as_version_eleven_fixture(connection: &Connection) {
+    // Lowering migration metadata alone leaves both future table shapes in
+    // place. Recreate the exact schemas that migration 12 receives.
+    connection
+        .execute_batch(
+            "DROP TABLE provider_secret_provisioning_journal;
+            DROP INDEX idempotency_operation_identity;
+            DROP INDEX idempotency_expiry;
+            ALTER TABLE idempotency_records
+                RENAME TO idempotency_records_v12_fixture;
+
+            CREATE TABLE idempotency_records (
+                principal_ref TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK (operation IN (
+                    'run',
+                    'steer',
+                    'stop',
+                    'setup',
+                    'repair',
+                    'host_update',
+                    'storage_migration',
+                    'destructive_maintenance'
+                )),
+                idempotency_key TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL
+                    CHECK (
+                        length(request_digest) = 64
+                        AND request_digest NOT GLOB '*[^0-9a-f]*'
+                    ),
+                digest_schema_version INTEGER NOT NULL CHECK (digest_schema_version > 0),
+                hmac_key_version INTEGER NOT NULL CHECK (hmac_key_version > 0),
+                status TEXT NOT NULL CHECK (status IN ('in_progress', 'terminal')),
+                durable_outcome TEXT NOT NULL CHECK (durable_outcome IN (
+                    'v1.turn.starting',
+                    'v1.turn.running',
+                    'v1.turn.recovery_pending',
+                    'v1.turn.completed',
+                    'v1.turn.blocked',
+                    'v1.turn.failed',
+                    'v1.turn.stopped',
+                    'v1.stop.pending',
+                    'v1.stop.stopped_from_starting',
+                    'v1.stop.stopped_from_running',
+                    'v1.stop.stopped_from_recovery_pending',
+                    'v1.stop.already_completed',
+                    'v1.stop.already_blocked',
+                    'v1.stop.already_failed',
+                    'v1.stop.already_stopped',
+                    'v1.stop.not_confirmed_active_changed',
+                    'v1.stop.not_confirmed_active_unchanged',
+                    'v1.stop.not_confirmed_recovery_pending_changed',
+                    'v1.stop.not_confirmed_recovery_pending_unchanged'
+                )),
+                session_id TEXT REFERENCES sessions(session_id) ON DELETE RESTRICT,
+                turn_id TEXT REFERENCES turns(turn_id) ON DELETE RESTRICT,
+                result_session_state_revision TEXT
+                    CHECK (
+                        result_session_state_revision IS NULL
+                        OR (
+                            length(result_session_state_revision) = 16
+                            AND result_session_state_revision NOT GLOB '*[^0-9a-f]*'
+                            AND result_session_state_revision <> '0000000000000000'
+                        )
+                    ),
+                result_session_updated_at TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (hmac_key_version)
+                    REFERENCES idempotency_hmac_keys(key_version) ON DELETE RESTRICT,
+                PRIMARY KEY (principal_ref, operation, idempotency_key),
+                CHECK (
+                    (status = 'in_progress' AND completed_at IS NULL)
+                    OR (status = 'terminal' AND completed_at IS NOT NULL)
+                ),
+                CHECK (
+                    operation = 'stop'
+                    OR (
+                        status = 'in_progress'
+                        AND result_session_state_revision IS NULL
+                        AND result_session_updated_at IS NULL
+                    )
+                    OR (
+                        status = 'terminal'
+                        AND result_session_state_revision IS NOT NULL
+                        AND result_session_updated_at IS NOT NULL
+                    )
+                )
+            ) STRICT;
+
+            INSERT INTO idempotency_records (
+                principal_ref,
+                operation,
+                idempotency_key,
+                operation_id,
+                request_digest,
+                digest_schema_version,
+                hmac_key_version,
+                status,
+                durable_outcome,
+                session_id,
+                turn_id,
+                result_session_state_revision,
+                result_session_updated_at,
+                created_at,
+                completed_at,
+                expires_at
+            )
+            SELECT
+                principal_ref,
+                operation,
+                idempotency_key,
+                operation_id,
+                request_digest,
+                digest_schema_version,
+                hmac_key_version,
+                status,
+                durable_outcome,
+                session_id,
+                turn_id,
+                result_session_state_revision,
+                result_session_updated_at,
+                created_at,
+                completed_at,
+                expires_at
+            FROM idempotency_records_v12_fixture;
+
+            DROP TABLE idempotency_records_v12_fixture;
+            CREATE INDEX idempotency_expiry
+                ON idempotency_records(expires_at);
+
+            DROP INDEX provider_smoke_reuse;
+            ALTER TABLE provider_smoke_results
+                RENAME TO provider_smoke_results_v12_fixture;
+
+            CREATE TABLE provider_smoke_results (
+                result_id TEXT PRIMARY KEY,
+                host_identity_ref TEXT NOT NULL
+                    REFERENCES daemon_identity(host_identity_ref) ON DELETE CASCADE,
+                desktop_binding_ref TEXT NOT NULL,
+                provider_binding_ref TEXT NOT NULL,
+                effective_model_ref TEXT NOT NULL,
+                codex_version TEXT NOT NULL,
+                native_runtime_version TEXT NOT NULL,
+                provider_config_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK (status IN (
+                        'passed', 'failed', 'timed_out', 'outcome_unknown'
+                    )),
+                failure_code TEXT,
+                failure_reason TEXT,
+                observed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                CHECK (expires_at > observed_at),
+                CHECK (
+                    (status = 'passed'
+                        AND failure_code IS NULL
+                        AND failure_reason IS NULL)
+                    OR (
+                        status IN ('failed', 'timed_out', 'outcome_unknown')
+                        AND failure_code IS NOT NULL
+                        AND failure_reason IS NOT NULL
+                    )
+                )
+            ) STRICT;
+
+            INSERT INTO provider_smoke_results (
+                result_id,
+                host_identity_ref,
+                desktop_binding_ref,
+                provider_binding_ref,
+                effective_model_ref,
+                codex_version,
+                native_runtime_version,
+                provider_config_fingerprint,
+                status,
+                failure_code,
+                failure_reason,
+                observed_at,
+                expires_at
+            )
+            SELECT
+                result_id,
+                host_identity_ref,
+                desktop_binding_ref,
+                provider_binding_ref,
+                effective_model_ref,
+                codex_version,
+                native_runtime_version,
+                provider_config_fingerprint,
+                status,
+                failure_code,
+                failure_reason,
+                observed_at,
+                expires_at
+            FROM provider_smoke_results_v12_fixture;
+
+            DROP TABLE provider_smoke_results_v12_fixture;
+
+            CREATE INDEX provider_smoke_reuse
+            ON provider_smoke_results (
+                host_identity_ref,
+                desktop_binding_ref,
+                provider_binding_ref,
+                effective_model_ref,
+                codex_version,
+                native_runtime_version,
+                provider_config_fingerprint,
+                expires_at
+            );
+
+            DROP TABLE turn_admission_readiness;
+            DROP TABLE authorized_provider_bindings;
+            DROP INDEX logs_by_desktop_binding_cursor;
+            ALTER TABLE logs DROP COLUMN desktop_binding_ref;
+            ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+            DROP TABLE provider_smoke_hmac_key;
+            ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
+            ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
+            DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
+            DROP TABLE desktop_snapshot_audit;
+            DROP TABLE raw_diagnostic_audit;
+            DROP TABLE client_certificate_audit;
+             DROP TABLE turn_admission_queue;
+            DELETE FROM schema_migrations WHERE version IN (12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
+            PRAGMA user_version = 11;",
+        )
+        .expect("restore the exact version eleven storage schema");
+}
+
+#[test]
+fn operational_evidence_schema_is_migrated_atomically_to_current_version() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let connection = storage.connection_for_test();
+
+    assert_eq!(24_i64, pragma_integer(connection, "user_version"));
+    let versions = connection
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        vec![
+            1_i64, 2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 9_i64, 10_i64, 11_i64, 12_i64,
+            13_i64, 14_i64, 15_i64, 16_i64, 17_i64, 18_i64, 19_i64, 20_i64, 21_i64, 22_i64, 23_i64,
+            24_i64,
+        ],
+        versions
+    );
+    let migration_twelve_checksum: String = connection
+        .query_row(
+            "SELECT checksum FROM schema_migrations WHERE version = 12",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!("fnv1a64:a5672c42bd40d2a8", migration_twelve_checksum);
+    for table in [
+        "sessions",
+        "turns",
+        "native_readiness_results",
+        "provider_smoke_results",
+        "setup_runs",
+        "setup_actions",
+        "logs",
+        "authorized_provider_bindings",
+        "provider_secret_provisioning_journal",
+        "turn_admission_readiness",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "missing operational evidence table {table}");
+    }
+    assert!(migration_backups(state.path()).is_empty());
+}
+
+#[test]
+fn version_fifteen_logs_upgrade_preserves_rows_and_normalizes_lifecycle_sources() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open current storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    storage
+        .begin_session(
+            &session,
+            &admission(
+                IdempotentOperation::Run,
+                "migration-log-source",
+                "migration-log-source-request",
+                at(0),
+            ),
+        )
+        .expect("persist a lifecycle Log Entry");
+    let connection = storage.connection_for_test();
+    rebuild_logs_as_v15_fixture(connection);
+    assert_eq!(
+        1,
+        connection
+            .execute(
+                "INSERT INTO logs (
+                recorded_at, recorded_at_unix_nanos, source, severity, event_kind,
+                session_id, turn_id, session_state_revision, turn_state_revision, redacted
+             )
+             SELECT ?1, ?2, 'host_daemon', 'info', 'turn_state_committed',
+                    sessions.session_id, turns.turn_id,
+                    sessions.session_state_revision, turns.turn_state_revision, 1
+             FROM sessions
+             JOIN turns ON turns.session_id = sessions.session_id
+             WHERE sessions.session_id = ?3 AND turns.turn_id = ?4",
+                params![at(1).format(&Rfc3339).unwrap(), 1_i64, SESSION_1, TURN_1,],
+            )
+            .expect("insert a version fifteen lifecycle Log Entry"),
+        "the migration fixture must contain one legacy lifecycle Log Entry",
+    );
+    let lifecycle_cursor = connection.last_insert_rowid();
+    connection
+        .execute(
+            "INSERT INTO logs (
+                recorded_at, recorded_at_unix_nanos, source, severity,
+                event_kind, redacted
+             ) VALUES (?1, ?2, 'storage', 'info', 'store_opened', 1)",
+            params![at(1).format(&Rfc3339).unwrap(), 1_i64],
+        )
+        .expect("insert a version fifteen Log Entry");
+    let preserved_cursor = connection.last_insert_rowid();
+    let legacy_cursor_high_water = connection
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'logs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("load the version fifteen Log cursor high-water mark");
+    connection
+        .execute_batch(
+            "ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP TABLE authorized_provider_bindings;
+             DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
+             DROP TABLE desktop_snapshot_audit;
+             DROP TABLE raw_diagnostic_audit;
+             DROP TABLE client_certificate_audit;
+             DROP TABLE turn_admission_queue;",
+        )
+        .expect("remove later audit tables from the version fifteen fixture");
+    restore_authorized_provider_bindings_v12(connection);
+    connection
+        .execute("DELETE FROM schema_migrations WHERE version >= 16", [])
+        .expect("remove history after version fifteen");
+    connection
+        .pragma_update(None, "user_version", 15)
+        .expect("mark version fifteen source schema");
+    drop(storage);
+
+    let (upgraded, _) = Storage::open(state.path()).expect("upgrade version fifteen storage");
+    assert_eq!(
+        1,
+        migration_backups(state.path()).len(),
+        "the destructive log-table rewrite must retain a rollback backup",
+    );
+    let connection = upgraded.connection_for_test();
+    assert_eq!(24_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(
+        (lifecycle_cursor, "codex_adapter".to_string()),
+        connection
+            .query_row(
+                "SELECT log_cursor, source FROM logs WHERE log_cursor = ?1",
+                [lifecycle_cursor],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load the normalized lifecycle Log Entry")
+    );
+    assert_eq!(
+        (preserved_cursor, "store_opened".to_string()),
+        connection
+            .query_row(
+                "SELECT log_cursor, event_kind FROM logs WHERE log_cursor = ?1",
+                [preserved_cursor],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load the preserved Log Entry")
+    );
+    let post_upgrade_cursor_high_water = connection
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'logs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("load the upgraded Log cursor high-water mark");
+    assert!(post_upgrade_cursor_high_water >= legacy_cursor_high_water);
+    connection
+        .execute(
+            "INSERT INTO logs (
+                recorded_at, recorded_at_unix_nanos, source, severity,
+                event_kind, redacted
+             ) VALUES (?1, ?2, 'storage', 'info', 'store_opened', 1)",
+            params![at(2).format(&Rfc3339).unwrap(), 2_i64],
+        )
+        .expect("append after the version sixteen migration");
+    assert_eq!(
+        post_upgrade_cursor_high_water + 1,
+        connection.last_insert_rowid()
+    );
+}
+
+#[test]
+fn version_eleven_provider_smoke_rows_upgrade_to_credential_scoped_cache() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open current storage");
+    let observed_at = at(1);
+    let expires_at = at(2);
+    let desktop = DesktopBindingRef::new("migration-desktop").unwrap();
+    let policy = ExecutionPolicy::new(
+        EffectiveModelRef::new("computer-use-preview").unwrap(),
+        ProviderBindingRef::new("openai").unwrap(),
+        DesktopTarget::new(desktop.clone(), "migration-session"),
+        ApprovalPolicy::OnRequest,
+        SandboxPolicy::WorkspaceWrite,
+        TimeoutPolicy::bounded_seconds(120).unwrap(),
+        ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+    );
+    let cache_key = ReadinessCacheKey::new(
+        "codex-native-computer-use",
+        desktop.clone(),
+        policy.clone(),
+        "0.144.0",
+        "1.0.0",
+        Some("plugin-1.0.0"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ReadinessObservationState::Unknown,
+        ReadinessObservationState::Unknown,
+    )
+    .unwrap();
+    let readiness =
+        ReadinessEvidence::new(&cache_key, "migration-readiness", observed_at, expires_at).unwrap();
+    let provider = ProviderSmokeEvidence::new(
+        "legacy-provider-smoke",
+        cache_key.provider_config_fingerprint(),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        observed_at,
+        expires_at,
+    )
+    .unwrap();
+    storage
+        .store_preflight_successes(
+            "codex-native-computer-use",
+            &desktop,
+            &policy,
+            &readiness,
+            Some(&provider),
+        )
+        .expect("store a smoke result before reconstructing version eleven");
+
+    rebuild_storage_as_version_eleven_fixture(storage.connection_for_test());
+    drop(storage);
+
+    let mut upgraded = Storage::open_without_restart_recovery(state.path())
+        .expect("upgrade the version eleven store");
+    assert_eq!(
+        24_i64,
+        pragma_integer(upgraded.connection_for_test(), "user_version")
+    );
+    let credential_columns: i64 = upgraded
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*)
+             FROM pragma_table_info('provider_smoke_results')
+             WHERE name = 'provider_credential_fingerprint'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect upgraded provider smoke columns");
+    assert_eq!(1_i64, credential_columns);
+    let legacy_rows: i64 = upgraded
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*)
+             FROM provider_smoke_results
+             WHERE result_id = 'legacy-provider-smoke'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect invalidated legacy provider smoke rows");
+    assert_eq!(
+        0_i64, legacy_rows,
+        "unscoped provider smoke evidence must not survive migration"
+    );
+    assert!(
+        upgraded
+            .load_reusable_provider_smoke(&cache_key, observed_at)
+            .expect("query invalidated legacy provider smoke")
+            .is_none()
+    );
+
+    upgraded
+        .store_preflight_successes(
+            "codex-native-computer-use",
+            &desktop,
+            &policy,
+            &readiness,
+            Some(&provider),
+        )
+        .expect("store credential-scoped evidence after migration");
+    assert_eq!(
+        Some(ProviderSmokeResult::Passed(
+            provider
+                .clone()
+                .with_source(crate::host::ProviderSmokeSource::Cache),
+        )),
+        upgraded
+            .load_reusable_provider_smoke(&cache_key, observed_at)
+            .expect("load credential-scoped evidence after migration")
+    );
+}
+
+#[test]
+fn version_ten_operation_rows_upgrade_without_data_loss_or_foreign_key_damage() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open current storage");
+    let operation_id = "preserved-setup";
+    let plan = SetupRunPlan::new(
+        operation_id,
+        SetupOperationKind::Setup,
+        None,
+        at(1),
+        vec![SetupActionPlan::new("preserved-action", "Preserve action", false).unwrap()],
+    )
+    .unwrap();
+    let _capability = storage
+        .begin_setup_run(&plan, lease_owner(operation_id, at(1)))
+        .expect("persist a version ten setup ledger");
+    storage
+        .connection_for_test()
+        .execute(
+            "INSERT INTO idempotency_records (
+                principal_ref, operation, idempotency_key, operation_id,
+                request_digest, digest_schema_version, hmac_key_version,
+                status, durable_outcome, created_at, expires_at
+             ) VALUES ('preserved-principal', 'run', 'preserved-key',
+                       'preserved-operation', ?1, 1, 1, 'in_progress',
+                       'v1.turn.starting', ?2, ?3)",
+            params![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                at(1).format(&Rfc3339).unwrap(),
+                at(2).format(&Rfc3339).unwrap(),
+            ],
+        )
+        .expect("persist a version ten idempotency record");
+    rebuild_idempotency_records_as_pre_v11_fixture(storage.connection_for_test());
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "DROP TABLE turn_admission_readiness;
+             DROP TABLE authorized_provider_bindings;
+             DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP TABLE provider_smoke_hmac_key;
+             ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
+             ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;",
+        )
+        .expect("remove version twelve provider bindings table");
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
+             DROP TABLE desktop_snapshot_audit;
+             DROP TABLE raw_diagnostic_audit;
+             DROP TABLE client_certificate_audit;
+             DROP TABLE turn_admission_queue;",
+        )
+        .unwrap();
+    storage
+        .connection_for_test()
+        .execute(
+            "DELETE FROM schema_migrations WHERE version IN (11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)",
+            [],
+        )
+        .expect("remove version eleven and twelve history");
+    storage
+        .connection_for_test()
+        .pragma_update(None, "user_version", 10)
+        .expect("mark version ten source schema");
+    drop(storage);
+
+    let upgraded = Storage::open_without_restart_recovery(state.path())
+        .expect("upgrade populated version ten storage");
+    let connection = upgraded.connection_for_test();
+    assert_eq!(24_i64, pragma_integer(connection, "user_version"));
+    assert_eq!(
+        ("run".to_string(), "in_progress".to_string()),
+        connection
+            .query_row(
+                "SELECT operation, status FROM idempotency_records
+                 WHERE principal_ref = 'preserved-principal'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load migrated idempotency record")
+    );
+    assert_eq!(
+        (
+            "setup".to_string(),
+            "preserved-action".to_string(),
+            "planned".to_string(),
+        ),
+        connection
+            .query_row(
+                "SELECT setup_runs.operation_kind, setup_actions.action_id,
+                        setup_actions.status
+                 FROM setup_runs
+                 JOIN setup_actions ON setup_actions.run_id = setup_runs.run_id
+                 WHERE setup_runs.run_id = ?1",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load migrated setup ledger")
+    );
+    let foreign_key_violations = connection
+        .prepare("PRAGMA foreign_key_check")
+        .expect("prepare foreign-key check")
+        .query_map([], |_| Ok(()))
+        .expect("run foreign-key check")
+        .count();
+    assert_eq!(0, foreign_key_violations);
+}
+
+#[test]
+fn durable_operation_vocabularies_are_closed_over_pr04_mutations() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let connection = storage.connection_for_test();
+    let idempotent_operations = [
+        (IdempotentOperation::Run, "run", "v1.turn.starting"),
+        (IdempotentOperation::Steer, "steer", "v1.turn.starting"),
+        (IdempotentOperation::Stop, "stop", "v1.turn.starting"),
+        (IdempotentOperation::Setup, "setup", "v1.turn.starting"),
+        (IdempotentOperation::Repair, "repair", "v1.turn.starting"),
+        (
+            IdempotentOperation::HostUpdate,
+            "host_update",
+            "v1.turn.starting",
+        ),
+        (
+            IdempotentOperation::StorageMigration,
+            "storage_migration",
+            "v1.storage_migration.pending",
+        ),
+        (
+            IdempotentOperation::DestructiveMaintenance,
+            "destructive_maintenance",
+            "v1.turn.starting",
+        ),
+    ];
+    for (operation, token, durable_outcome) in idempotent_operations {
+        assert_eq!(
+            token,
+            crate::host::storage::codec::idempotent_operation_token(operation)
+        );
+        connection
+            .execute(
+                "INSERT INTO idempotency_records (
+                    principal_ref, operation, idempotency_key, operation_id,
+                    request_digest, digest_schema_version, hmac_key_version,
+                    status, durable_outcome, created_at, expires_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1, 1, 'in_progress',
+                           ?8, ?6, ?7)",
+                params![
+                    format!("principal-{token}"),
+                    token,
+                    format!("key-{token}"),
+                    format!("operation-{token}"),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    at(1).format(&Rfc3339).unwrap(),
+                    at(2).format(&Rfc3339).unwrap(),
+                    durable_outcome,
+                ],
+            )
+            .unwrap_or_else(|error| panic!("persist {token}: {error}"));
+    }
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO idempotency_records (
+                    principal_ref, operation, idempotency_key, operation_id,
+                    request_digest, digest_schema_version, hmac_key_version,
+                    status, durable_outcome, created_at, expires_at
+                 ) VALUES ('principal-unknown', 'unknown', 'key-unknown',
+                           'operation-unknown', ?1, 1, 1, 'in_progress',
+                           'v1.turn.starting', ?2, ?3)",
+                params![
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    at(1).format(&Rfc3339).unwrap(),
+                    at(2).format(&Rfc3339).unwrap(),
+                ],
+            )
+            .is_err()
+    );
+
+    for (kind, token) in [
+        (SetupOperationKind::Setup, "setup"),
+        (SetupOperationKind::Repair, "repair"),
+        (SetupOperationKind::HostUpdate, "host_update"),
+        (SetupOperationKind::StorageMigration, "storage_migration"),
+        (SetupOperationKind::ServiceStop, "service_stop"),
+        (SetupOperationKind::ServiceRestart, "service_restart"),
+    ] {
+        let state = TempDir::new().expect("maintenance state directory");
+        let (mut storage, _) = Storage::open(state.path()).expect("open maintenance storage");
+        let operation_id = format!("maintenance-{token}");
+        let plan = SetupRunPlan::new(
+            &operation_id,
+            kind,
+            None,
+            at(1),
+            vec![SetupActionPlan::new("mutate", "Mutate host state", false).unwrap()],
+        )
+        .unwrap();
+        let plan = if kind == SetupOperationKind::HostUpdate {
+            plan.with_host_update_recovery_identity(
+                crate::core::host_update::HostUpdateRecoveryIdentity::new(
+                    "0.1.0",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            )
+            .unwrap()
+        } else {
+            plan
+        };
+        let capability = storage
+            .begin_setup_run(&plan, lease_owner(&operation_id, at(1)))
+            .expect("acquire Maintenance Lease before mutation");
+        let stored = storage
+            .load_setup_run(&operation_id)
+            .unwrap()
+            .expect("load durable maintenance run");
+        assert_eq!(kind, stored.operation_kind());
+        assert_eq!(
+            (token.to_string(), 1_i64, "planned".to_string()),
+            storage
+                .connection_for_test()
+                .query_row(
+                    "SELECT operation_kind,
+                            (SELECT count(*) FROM maintenance_leases
+                             WHERE operation_id = setup_runs.run_id),
+                            (SELECT status FROM setup_actions
+                             WHERE setup_actions.run_id = setup_runs.run_id)
+                     FROM setup_runs WHERE run_id = ?1",
+                    [&operation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        );
+        storage
+            .start_setup_action(&capability, "mutate", at(2))
+            .expect("the acquired capability authorizes the first mutation");
+        assert!(
+            storage
+                .connection_for_test()
+                .execute(
+                    "UPDATE setup_runs SET operation_kind = 'unknown' WHERE run_id = ?1",
+                    [&operation_id],
+                )
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn newer_schema_history_is_rejected_without_downgrade() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open current storage");
+    let future_version = crate::core::host_update::HOST_STORAGE_SCHEMA_VERSION + 1;
+    storage
+        .connection_for_test()
+        .execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at)
+             VALUES (?1, ?2, '2026-07-21T00:00:00Z')",
+            params![
+                future_version,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ],
+        )
+        .expect("insert future migration");
+    storage
+        .connection_for_test()
+        .pragma_update(None, "user_version", future_version)
+        .expect("mark future schema");
+    drop(storage);
+
+    let error = match Storage::open(state.path()) {
+        Ok(_) => panic!("future schema must not be downgraded"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), StorageErrorKind::MigrationIntegrity);
+    let connection = Connection::open(state.path().join(DATABASE_FILE_NAME))
+        .expect("future database remains readable");
+    assert_eq!(pragma_integer(&connection, "user_version"), future_version);
+}
+
+#[test]
+fn version_seven_api_tokens_upgrade_to_explicit_active_state() {
+    let state = TempDir::new().expect("temporary state directory");
+    let existing_token = crate::host::ApiBearerToken::generate().expect("generate existing token");
+    let existing_token_id = existing_token.token_id().to_string();
+    let (mut storage, _) = Storage::open(state.path()).expect("open current storage");
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new(
+                &existing_token,
+                "existing-principal",
+                1,
+                crate::host::ApiScopes::CONTROL,
+                std::collections::BTreeSet::from(["desktop-test".to_string()]),
+                None,
+                at(1),
+            )
+            .expect("construct existing token registration"),
+        )
+        .expect("register existing token");
+    rebuild_idempotency_records_as_pre_v11_fixture(storage.connection_for_test());
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "DROP TABLE turn_admission_readiness;
+             DROP TABLE admission_cancellations;
+             DROP INDEX one_session_per_upstream_goal_ref;
+             ALTER TABLE sessions DROP COLUMN display_name;
+             ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
+             ALTER TABLE api_tokens DROP COLUMN token_state;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
+             DROP TABLE authorized_provider_bindings;
+             DROP TABLE provider_smoke_hmac_key;
+             ALTER TABLE setup_runs DROP COLUMN host_update_target_version;
+             ALTER TABLE setup_runs DROP COLUMN host_update_artifact_digest;
+             DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
+             DROP TABLE desktop_snapshot_audit;
+             DROP TABLE raw_diagnostic_audit;
+             DROP TABLE client_certificate_audit;
+             DROP TABLE turn_admission_queue;
+             DELETE FROM schema_migrations WHERE version IN (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
+             PRAGMA user_version = 7;",
+        )
+        .expect("recreate the version seven token schema");
+    drop(storage);
+
+    let (storage, _) = Storage::open(state.path()).expect("upgrade version seven storage");
+    assert_eq!(
+        24_i64,
+        pragma_integer(storage.connection_for_test(), "user_version")
+    );
+    let token_state: String = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT token_state FROM api_tokens WHERE token_id = ?1",
+            [&existing_token_id],
+            |row| row.get(0),
+        )
+        .expect("read migrated token state");
+    assert_eq!("active", token_state);
+    let principal = storage
+        .authenticate_api_token(&existing_token, at(2))
+        .expect("authenticate migrated token")
+        .expect("the migrated token remains active");
+    assert!(principal.desktop_bindings().is_empty());
+    assert!(!principal.allows_desktop_binding("desktop-test"));
+}
+
+#[test]
+fn native_probe_control_lease_has_a_discriminated_durable_owner() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let host = storage.host_identity().unwrap();
+    let connection = storage.connection_for_test();
+    let acquired_at = "2026-07-16T00:00:00Z";
+
+    connection
+        .execute(
+            "INSERT INTO control_leases (
+                host_identity_ref, desktop_binding_ref, operation_id,
+                owner_process_id, owner_process_start_ref, owner_boot_identity_ref,
+                acquired_at, heartbeat_at, lease_state, owner_kind, native_probe_ref
+             ) VALUES (?1, 'desktop-native', 'probe-operation', 1, 'process-start',
+                       'boot-id', ?2, ?2, 'active', 'native_probe', 'native-private-ref')",
+            rusqlite::params![host.as_str(), acquired_at],
+        )
+        .expect("native probe lease");
+
+    let owner = connection
+        .query_row(
+            "SELECT owner_kind, session_id, turn_id, provider_probe_ref, native_probe_ref
+             FROM control_leases WHERE desktop_binding_ref = 'desktop-native'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            "native_probe".to_string(),
+            None,
+            None,
+            None,
+            "native-private-ref".to_string()
+        ),
+        owner
+    );
+}
+
+#[test]
+fn provider_probe_control_lease_has_a_discriminated_durable_owner() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let host = storage.host_identity().unwrap();
+    let connection = storage.connection_for_test();
+    let acquired_at = "2026-07-16T00:00:00Z";
+
+    connection
+        .execute(
+            "INSERT INTO control_leases (
+                host_identity_ref, desktop_binding_ref, operation_id,
+                owner_process_id, owner_process_start_ref, owner_boot_identity_ref,
+                acquired_at, heartbeat_at, lease_state, owner_kind, provider_probe_ref
+             ) VALUES (?1, 'desktop-provider', 'probe-operation', 1, 'process-start',
+                       'boot-id', ?2, ?2, 'active', 'provider_probe', 'probe-private-ref')",
+            rusqlite::params![host.as_str(), acquired_at],
+        )
+        .expect("provider probe lease");
+
+    let owner = connection
+        .query_row(
+            "SELECT owner_kind, session_id, turn_id, provider_probe_ref
+             FROM control_leases WHERE desktop_binding_ref = 'desktop-provider'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            "provider_probe".to_string(),
+            None,
+            None,
+            "probe-private-ref".to_string()
+        ),
+        owner
+    );
+
+    let invalid = connection.execute(
+        "INSERT INTO control_leases (
+            host_identity_ref, desktop_binding_ref, operation_id,
+            owner_process_id, owner_process_start_ref, owner_boot_identity_ref,
+            acquired_at, heartbeat_at, lease_state, owner_kind, provider_probe_ref, session_id
+         ) VALUES (?1, 'desktop-invalid', 'probe-invalid', 1, 'process-start', 'boot-id',
+                   ?2, ?2, 'active', 'provider_probe', 'probe-invalid-ref', 'session-invalid')",
+        rusqlite::params![host.as_str(), acquired_at],
+    );
+    assert!(
+        invalid.is_err(),
+        "mixed owner fields must violate the schema"
+    );
+}
+
+#[test]
+fn maintenance_lease_conflicts_with_control_and_blocks_other_admission() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(1));
+    storage
+        .begin_session(
+            &session,
+            &admission(
+                IdempotentOperation::Run,
+                "maintenance-conflict",
+                "maintenance-conflict-request",
+                at(1),
+            ),
+        )
+        .expect("admit the existing Turn");
+
+    let error = storage
+        .begin_setup_run(
+            &SetupRunPlan::new(
+                "maintenance-operation",
+                SetupOperationKind::Repair,
+                None,
+                at(2),
+                vec![SetupActionPlan::new("repair-runtime", "Repair runtime", false).unwrap()],
+            )
+            .unwrap(),
+            lease_owner("maintenance-operation", at(2)),
+        )
+        .expect_err("maintenance cannot overlap an existing Control Lease");
+    assert_eq!(StorageErrorKind::LeaseConflict, error.kind());
+
+    storage
+        .commit_lifecycle(
+            &session_id(SESSION_1),
+            &turn_id(TURN_1),
+            ExpectedRevisions::new(
+                SessionStateRevision::initial(),
+                TurnStateRevision::initial(),
+            ),
+            TurnTransition::Completed,
+            at(3),
+        )
+        .expect("release the existing Control Lease");
+    let _capability = begin_maintenance(&mut storage, "maintenance-operation", None, at(4));
+
+    let competing = storage
+        .begin_setup_run(
+            &SetupRunPlan::new(
+                "competing-maintenance",
+                SetupOperationKind::Repair,
+                None,
+                at(5),
+                vec![SetupActionPlan::new("repair-runtime", "Repair runtime", false).unwrap()],
+            )
+            .unwrap(),
+            lease_owner("competing-maintenance", at(5)),
+        )
+        .expect_err("a second maintenance operation must be blocked");
+    assert_eq!(StorageErrorKind::LeaseConflict, competing.kind());
+
+    let blocked_session = initial_session(&storage, SESSION_2, TURN_2, at(5));
+    let blocked_turn = storage
+        .begin_session(
+            &blocked_session,
+            &admission(
+                IdempotentOperation::Run,
+                "blocked-by-maintenance",
+                "blocked-by-maintenance-request",
+                at(5),
+            ),
+        )
+        .expect_err("maintenance must block Turn admission");
+    assert_eq!(StorageErrorKind::LeaseConflict, blocked_turn.kind());
+}
+
+#[test]
+fn maintenance_postcheck_sublease_is_atomic_and_blocks_other_work() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let capability = begin_maintenance(
+        &mut storage,
+        "maintenance-postcheck",
+        Some("maintenance-desktop"),
+        at(1),
+    );
+    let key = readiness_key("maintenance-desktop");
+    storage
+        .start_setup_action(&capability, "repair-runtime", at(2))
+        .unwrap();
+
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "CREATE TRIGGER fail_postcheck_control_insert
+             BEFORE INSERT ON control_leases
+             WHEN NEW.operation_id = 'maintenance-postcheck'
+             BEGIN SELECT RAISE(ABORT, 'forced postcheck acquisition failure'); END;",
+        )
+        .unwrap();
+    storage
+        .begin_maintenance_postcheck(
+            &key,
+            "maintenance-postcheck-probe",
+            "repair-runtime",
+            &capability,
+        )
+        .expect_err("a failed postcheck sublease insert must roll back the transaction");
+    assert_eq!(
+        (1_i64, 0_i64),
+        storage
+            .connection_for_test()
+            .query_row(
+                "SELECT (SELECT count(*) FROM maintenance_leases),
+                        (SELECT count(*) FROM control_leases)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    );
+    storage
+        .connection_for_test()
+        .execute_batch("DROP TRIGGER fail_postcheck_control_insert;")
+        .unwrap();
+
+    storage
+        .begin_maintenance_postcheck(
+            &key,
+            "maintenance-postcheck-probe",
+            "repair-runtime",
+            &capability,
+        )
+        .expect("atomically acquire the postcheck Control sublease");
+
+    let leases = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT maintenance_leases.operation_id, control_leases.operation_id,
+                    control_leases.owner_kind, control_leases.native_probe_ref
+             FROM maintenance_leases
+             JOIN control_leases USING (host_identity_ref)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .expect("read the atomic lease pair");
+    assert_eq!(
+        (
+            "maintenance-postcheck".to_string(),
+            "maintenance-postcheck".to_string(),
+            "native_probe".to_string(),
+            "maintenance-postcheck-probe".to_string(),
+        ),
+        leases
+    );
+
+    let blocked_session = initial_session(&storage, SESSION_1, TURN_1, at(2));
+    let blocked_turn = storage
+        .begin_session(
+            &blocked_session,
+            &admission(
+                IdempotentOperation::Run,
+                "blocked-by-maintenance-postcheck",
+                "blocked-by-maintenance-postcheck-request",
+                at(2),
+            ),
+        )
+        .expect_err("a Turn must not overlap the maintenance postcheck");
+    assert_eq!(StorageErrorKind::LeaseConflict, blocked_turn.kind());
+
+    let ordinary_probe = storage
+        .begin_native_probe(
+            &key,
+            "ordinary-probe",
+            &lease_owner("ordinary-probe", at(2)),
+        )
+        .expect_err("an ordinary probe must not overlap maintenance postcheck");
+    assert_eq!(StorageErrorKind::LeaseConflict, ordinary_probe.kind());
+    let competing = storage
+        .begin_setup_run(
+            &SetupRunPlan::new(
+                "other-maintenance",
+                SetupOperationKind::Repair,
+                None,
+                at(2),
+                vec![SetupActionPlan::new("repair-runtime", "Repair runtime", false).unwrap()],
+            )
+            .unwrap(),
+            lease_owner("other-maintenance", at(2)),
+        )
+        .expect_err("other maintenance must not overlap the postcheck");
+    assert_eq!(StorageErrorKind::LeaseConflict, competing.kind());
+}
+
+#[test]
+fn every_exact_owner_field_and_state_guards_postcheck_acquisition() {
+    for (column, wrong_value) in [
+        ("operation_id", "different-operation"),
+        ("owner_process_id", "424242"),
+        ("owner_process_start_ref", "different-process-start"),
+        ("owner_boot_identity_ref", "different-boot"),
+        ("acquired_at", "1970-01-01T00:00:09Z"),
+        ("lease_state", "recovery_pending"),
+    ] {
+        let state = TempDir::new().expect("temporary state directory");
+        let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+        let operation_id = format!("postcheck-field-{column}");
+        let capability = begin_maintenance(
+            &mut storage,
+            &operation_id,
+            Some("postcheck-field-desktop"),
+            at(1),
+        );
+        storage
+            .start_setup_action(&capability, "repair-runtime", at(2))
+            .unwrap();
+        let key = readiness_key("postcheck-field-desktop");
+        let original = replace_lease_field(&storage, "maintenance_leases", column, wrong_value);
+        assert_eq!(
+            StorageErrorKind::LeaseConflict,
+            storage
+                .begin_maintenance_postcheck(
+                    &key,
+                    "owner-field-probe",
+                    "repair-runtime",
+                    &capability,
+                )
+                .expect_err("one changed owner field must reject sublease acquisition")
+                .kind(),
+            "postcheck acquisition predicate omitted {column}"
+        );
+        replace_lease_field(&storage, "maintenance_leases", column, &original);
+    }
+}
+
+#[test]
+fn each_owner_field_in_each_table_guards_paired_finalization_and_recovery() {
+    for table in ["maintenance_leases", "control_leases"] {
+        for (column, wrong_value) in [
+            ("operation_id", "different-operation"),
+            ("owner_process_id", "424242"),
+            ("owner_process_start_ref", "different-process-start"),
+            ("owner_boot_identity_ref", "different-boot"),
+            ("acquired_at", "1970-01-01T00:00:09Z"),
+            ("lease_state", "recovery_pending"),
+        ] {
+            let finalization_state = TempDir::new().expect("finalization state directory");
+            let (mut finalization, _) =
+                Storage::open(finalization_state.path()).expect("open finalization storage");
+            let finalization_id = format!("finalize-{table}-{column}");
+            let (capability, key, verified) =
+                begin_passed_postcheck(&mut finalization, &finalization_id);
+            replace_lease_field(&finalization, table, column, wrong_value);
+            let before = paired_maintenance_snapshot(&finalization, &finalization_id);
+            assert_eq!(
+                StorageErrorKind::LeaseConflict,
+                finalization
+                    .finish_maintenance_postcheck(
+                        &capability,
+                        "owner-field-probe",
+                        "repair-runtime",
+                        &key,
+                        &verified,
+                    )
+                    .expect_err("one changed pair member must reject finalization")
+                    .kind(),
+                "finalization accepted changed {table}.{column}"
+            );
+            assert_eq!(
+                before,
+                paired_maintenance_snapshot(&finalization, &finalization_id),
+                "rejected finalization changed durable state for {table}.{column}"
+            );
+
+            let recovery_state = TempDir::new().expect("recovery state directory");
+            let (mut recovery, _) =
+                Storage::open(recovery_state.path()).expect("open recovery storage");
+            let recovery_id = format!("recover-{table}-{column}");
+            let (recovery_capability, _key, _verified) =
+                begin_passed_postcheck(&mut recovery, &recovery_id);
+            replace_lease_field(&recovery, table, column, wrong_value);
+            let before = paired_maintenance_snapshot(&recovery, &recovery_id);
+            assert_eq!(
+                StorageErrorKind::StateConflict,
+                recovery
+                    .retain_lease_recovery(recovery_capability.lease_owner())
+                    .expect_err("one changed pair member must reject recovery retention")
+                    .kind(),
+                "recovery accepted changed {table}.{column}"
+            );
+            assert_eq!(
+                before,
+                paired_maintenance_snapshot(&recovery, &recovery_id),
+                "rejected recovery changed durable state for {table}.{column}"
+            );
+        }
+    }
+}
+
+#[test]
+fn each_postcheck_delete_failure_rolls_back_readiness_ledger_and_both_leases() {
+    for table in ["control_leases", "maintenance_leases"] {
+        let state = TempDir::new().expect("temporary state directory");
+        let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+        let operation_id = format!("delete-boundary-{table}");
+        let capability = begin_maintenance(
+            &mut storage,
+            &operation_id,
+            Some("delete-boundary-desktop"),
+            at(1),
+        );
+        storage
+            .start_setup_action(&capability, "repair-runtime", at(2))
+            .unwrap();
+        let key = readiness_key("delete-boundary-desktop");
+        storage
+            .begin_maintenance_postcheck(
+                &key,
+                "delete-boundary-probe",
+                "repair-runtime",
+                &capability,
+            )
+            .unwrap();
+        let evidence = key
+            .evidence("delete-boundary-result", at(3), at(10))
+            .unwrap();
+        let (verified, _) = crate::host::runtime::verify_maintenance_postcheck(
+            NativeProbeResult::Passed(evidence),
+            None,
+        );
+        storage
+            .connection_for_test()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_delete BEFORE DELETE ON {table}
+                 BEGIN SELECT RAISE(ABORT, 'forced delete failure'); END;"
+            ))
+            .unwrap();
+        storage
+            .finish_maintenance_postcheck(
+                &capability,
+                "delete-boundary-probe",
+                "repair-runtime",
+                &key,
+                &verified,
+            )
+            .expect_err("either delete failure must roll back the entire finalization");
+        let run = storage.load_setup_run(&operation_id).unwrap().unwrap();
+        assert_eq!(
+            SetupRunStatus::Running,
+            run.status(),
+            "failed delete of {table}"
+        );
+        assert_eq!(
+            crate::host::storage::SetupActionStatus::Started,
+            run.actions()[0].status(),
+            "failed delete of {table}"
+        );
+        let readiness: i64 = storage
+            .connection_for_test()
+            .query_row("SELECT count(*) FROM native_readiness_results", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(0, readiness, "failed delete of {table}");
+        let leases: i64 = storage
+            .connection_for_test()
+            .query_row(
+                "SELECT (SELECT count(*) FROM maintenance_leases)
+                      + (SELECT count(*) FROM control_leases)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(2, leases, "failed delete of {table}");
+    }
+}
+
+fn replace_lease_field(storage: &Storage, table: &str, column: &str, value: &str) -> String {
+    let original = storage
+        .connection_for_test()
+        .query_row(
+            &format!("SELECT CAST({column} AS TEXT) FROM {table}"),
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    storage
+        .connection_for_test()
+        .execute(&format!("UPDATE {table} SET {column} = ?1"), [value])
+        .unwrap();
+    original
+}
+
+fn begin_passed_postcheck(
+    storage: &mut Storage,
+    operation_id: &str,
+) -> (
+    MaintenanceLeaseCapability,
+    ReadinessCacheKey,
+    crate::host::runtime::VerifiedMaintenancePostcheck,
+) {
+    let capability = begin_maintenance(storage, operation_id, Some("owner-field-desktop"), at(1));
+    storage
+        .start_setup_action(&capability, "repair-runtime", at(2))
+        .unwrap();
+    let key = readiness_key("owner-field-desktop");
+    storage
+        .begin_maintenance_postcheck(&key, "owner-field-probe", "repair-runtime", &capability)
+        .unwrap();
+    let evidence = key.evidence("owner-field-result", at(3), at(10)).unwrap();
+    let (verified, terminal_error) = crate::host::runtime::verify_maintenance_postcheck(
+        NativeProbeResult::Passed(evidence),
+        None,
+    );
+    assert!(terminal_error.is_none());
+    (capability, key, verified)
+}
+
+fn paired_maintenance_snapshot(storage: &Storage, operation_id: &str) -> String {
+    storage
+        .connection_for_test()
+        .query_row(
+            "SELECT printf(
+                '%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q|%Q',
+                setup_runs.status, setup_runs.finished_at,
+                setup_actions.status, setup_actions.finished_at,
+                setup_actions.error_code, setup_actions.recovery_hint,
+                maintenance.operation_id, maintenance.owner_process_id,
+                maintenance.owner_process_start_ref, maintenance.owner_boot_identity_ref,
+                maintenance.acquired_at, maintenance.heartbeat_at, maintenance.lease_state,
+                control.operation_id, control.owner_process_id,
+                control.owner_process_start_ref, control.owner_boot_identity_ref,
+                control.acquired_at, control.heartbeat_at, control.lease_state,
+                (SELECT count(*) FROM native_readiness_results)
+             )
+             FROM setup_runs
+             JOIN setup_actions USING (run_id)
+             JOIN maintenance_leases AS maintenance USING (host_identity_ref)
+             LEFT JOIN control_leases AS control USING (host_identity_ref)
+             WHERE setup_runs.run_id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn heartbeat_refresh_rejects_each_individually_wrong_owner_field_and_state() {
+    for field in [
+        "operation_id",
+        "owner_process_id",
+        "owner_process_start_ref",
+        "owner_boot_identity_ref",
+        "acquired_at",
+        "lease_state",
+    ] {
+        let state = TempDir::new().expect("temporary state directory");
+        let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+        let operation_id = format!("heartbeat-field-{field}");
+        let capability = begin_maintenance(&mut storage, &operation_id, None, at(1));
+        let owner = capability.lease_owner();
+        let wrong_owner = LeaseOwner::new(
+            if field == "operation_id" {
+                "different-operation"
+            } else {
+                owner.operation_id.as_str()
+            },
+            if field == "owner_process_id" {
+                owner.process_id + 1
+            } else {
+                owner.process_id
+            },
+            if field == "owner_process_start_ref" {
+                "different-process-start"
+            } else {
+                owner.process_start_ref.as_str()
+            },
+            if field == "owner_boot_identity_ref" {
+                "different-boot"
+            } else {
+                owner.boot_identity_ref.as_str()
+            },
+            if field == "acquired_at" {
+                at(9)
+            } else {
+                owner.acquired_at
+            },
+        )
+        .unwrap();
+        if field == "lease_state" {
+            storage
+                .connection_for_test()
+                .execute(
+                    "UPDATE maintenance_leases SET lease_state = 'recovery_pending'",
+                    [],
+                )
+                .unwrap();
+        }
+        if field == "lease_state" {
+            assert_eq!(
+                StorageErrorKind::StateConflict,
+                storage
+                    .refresh_lease_heartbeat(&wrong_owner, at(2))
+                    .expect_err("an exact owner cannot refresh recovery ownership")
+                    .kind()
+            );
+        } else {
+            assert_eq!(
+                0,
+                storage
+                    .refresh_lease_heartbeat(&wrong_owner, at(2))
+                    .unwrap(),
+                "heartbeat predicate omitted {field}"
+            );
+            assert_eq!(
+                1,
+                storage
+                    .refresh_lease_heartbeat(capability.lease_owner(), at(2))
+                    .unwrap(),
+                "the exact operation owner refreshes its one maintenance row"
+            );
+        }
+    }
+}
+
+#[test]
+fn paired_heartbeat_refresh_updates_both_rows_or_rolls_back() {
+    for table in ["maintenance_leases", "control_leases"] {
+        for (column, wrong_value) in [
+            ("operation_id", "different-operation"),
+            ("owner_process_id", "424242"),
+            ("owner_process_start_ref", "different-process-start"),
+            ("owner_boot_identity_ref", "different-boot"),
+            ("acquired_at", "1970-01-01T00:00:09Z"),
+            ("lease_state", "recovery_pending"),
+        ] {
+            let state = TempDir::new().expect("temporary state directory");
+            let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+            let operation_id = format!("heartbeat-pair-{table}-{column}");
+            let (capability, _key, _verified) = begin_passed_postcheck(&mut storage, &operation_id);
+            replace_lease_field(&storage, table, column, wrong_value);
+            let before = paired_maintenance_snapshot(&storage, &operation_id);
+
+            assert_eq!(
+                StorageErrorKind::StateConflict,
+                storage
+                    .refresh_lease_heartbeat(capability.lease_owner(), at(2))
+                    .expect_err("one mismatched pair member must reject the whole refresh")
+                    .kind(),
+                "heartbeat refresh accepted changed {table}.{column}"
+            );
+            assert_eq!(
+                before,
+                paired_maintenance_snapshot(&storage, &operation_id),
+                "rejected heartbeat refresh changed {table}.{column}"
+            );
+        }
+    }
+
+    let state = TempDir::new().expect("successful pair state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let operation_id = "heartbeat-pair-success";
+    let (capability, _key, _verified) = begin_passed_postcheck(&mut storage, operation_id);
+    assert_eq!(
+        2,
+        storage
+            .refresh_lease_heartbeat(capability.lease_owner(), at(2))
+            .expect("the exact paired owner refreshes both leases")
+    );
+    let expected_heartbeat = at(2).format(&Rfc3339).unwrap();
+    for table in ["maintenance_leases", "control_leases"] {
+        assert_eq!(
+            1_i64,
+            storage
+                .connection_for_test()
+                .query_row(
+                    &format!(
+                        "SELECT count(*) FROM {table}\n\
+                         WHERE operation_id = ?1 AND heartbeat_at = ?2"
+                    ),
+                    params![operation_id, expected_heartbeat],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            "the successful refresh omitted {table}"
+        );
+    }
+}
+
+#[test]
+fn thirty_second_staleness_never_releases_or_weakens_lease_exclusion() {
+    let control_state = TempDir::new().expect("control state directory");
+    let (mut control, _) = Storage::open(control_state.path()).expect("open control storage");
+    let first = initial_session(&control, SESSION_1, TURN_1, at(0));
+    control
+        .begin_session(
+            &first,
+            &admission(IdempotentOperation::Run, "stale-control", TURN_1, at(0)),
+        )
+        .expect("acquire Control Lease");
+    let control_heartbeat: String = control
+        .connection_for_test()
+        .query_row("SELECT heartbeat_at FROM control_leases", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    for observed_at in [at(29), at(30)] {
+        assert_eq!(
+            LeaseFreshness::Fresh,
+            crate::host::storage::operational::classify_lease_freshness(
+                &control_heartbeat,
+                observed_at
+            )
+            .unwrap()
+        );
+    }
+    assert_eq!(
+        LeaseFreshness::Stale,
+        crate::host::storage::operational::classify_lease_freshness(&control_heartbeat, at(31))
+            .unwrap()
+    );
+    let competing = initial_session(&control, SESSION_2, TURN_2, at(31));
+    assert_eq!(
+        StorageErrorKind::LeaseConflict,
+        control
+            .begin_session(
+                &competing,
+                &admission(
+                    IdempotentOperation::Run,
+                    "stale-control-contender",
+                    TURN_2,
+                    at(31),
+                ),
+            )
+            .expect_err("stale Control ownership still blocks admission")
+            .kind()
+    );
+    assert_eq!(
+        1_i64,
+        control
+            .connection_for_test()
+            .query_row("SELECT count(*) FROM control_leases", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    );
+
+    let maintenance_state = TempDir::new().expect("maintenance state directory");
+    let (mut maintenance, _) =
+        Storage::open(maintenance_state.path()).expect("open maintenance storage");
+    let capability = begin_maintenance(&mut maintenance, "stale-maintenance", None, at(0));
+    let maintenance_heartbeat: String = maintenance
+        .connection_for_test()
+        .query_row("SELECT heartbeat_at FROM maintenance_leases", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        LeaseFreshness::Fresh,
+        crate::host::storage::operational::classify_lease_freshness(&maintenance_heartbeat, at(30),)
+            .unwrap()
+    );
+    assert_eq!(
+        LeaseFreshness::Stale,
+        crate::host::storage::operational::classify_lease_freshness(&maintenance_heartbeat, at(31),)
+            .unwrap()
+    );
+    let competing_plan = SetupRunPlan::new(
+        "stale-maintenance-contender",
+        SetupOperationKind::ServiceRestart,
+        None,
+        at(31),
+        vec![SetupActionPlan::new("restart", "Restart service", false).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(
+        StorageErrorKind::LeaseConflict,
+        maintenance
+            .begin_setup_run(
+                &competing_plan,
+                lease_owner("stale-maintenance-contender", at(31)),
+            )
+            .expect_err("stale Maintenance ownership still blocks mutation")
+            .kind()
+    );
+    assert_eq!(
+        capability.operation_id(),
+        maintenance
+            .connection_for_test()
+            .query_row("SELECT operation_id FROM maintenance_leases", [], |row| row
+                .get::<_, String>(0),)
+            .unwrap()
+    );
+}
+
+#[test]
+fn maintenance_postcheck_finalization_commits_readiness_ledger_and_release_atomically() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let operation_id = "maintenance-final-postcheck";
+    let plan = SetupRunPlan::new(
+        operation_id,
+        SetupOperationKind::Repair,
+        Some(DesktopBindingRef::new("maintenance-desktop").unwrap()),
+        at(1),
+        vec![SetupActionPlan::new("repair-runtime", "Repair runtime", false).unwrap()],
+    )
+    .unwrap();
+    let capability = storage
+        .begin_setup_run(&plan, lease_owner(operation_id, at(1)))
+        .unwrap();
+    storage
+        .start_setup_action(&capability, "repair-runtime", at(2))
+        .unwrap();
+    let key = readiness_key("maintenance-desktop");
+    storage
+        .begin_maintenance_postcheck(
+            &key,
+            "maintenance-final-probe",
+            "repair-runtime",
+            &capability,
+        )
+        .unwrap();
+    let evidence = key
+        .evidence("maintenance-readiness", at(4), at(10))
+        .unwrap();
+    let (verified, terminal_error) = crate::host::runtime::verify_maintenance_postcheck(
+        NativeProbeResult::Passed(evidence),
+        None,
+    );
+    assert!(terminal_error.is_none());
+
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "CREATE TRIGGER fail_maintenance_finalization
+             BEFORE UPDATE OF status ON setup_runs
+             WHEN OLD.run_id = 'maintenance-final-postcheck' AND NEW.status != 'running'
+             BEGIN SELECT RAISE(ABORT, 'forced finalization failure'); END;",
+        )
+        .unwrap();
+    storage
+        .finish_maintenance_postcheck(
+            &capability,
+            "maintenance-final-probe",
+            "repair-runtime",
+            &key,
+            &verified,
+        )
+        .expect_err("a failed final ledger commit must roll back readiness and both releases");
+    assert_eq!(
+        SetupRunStatus::Running,
+        storage
+            .load_setup_run(operation_id)
+            .unwrap()
+            .unwrap()
+            .status()
+    );
+    assert_eq!(
+        crate::host::storage::SetupActionStatus::Started,
+        storage
+            .load_setup_run(operation_id)
+            .unwrap()
+            .unwrap()
+            .actions()[0]
+            .status()
+    );
+    assert_eq!(
+        2_i64,
+        storage
+            .connection_for_test()
+            .query_row(
+                "SELECT (SELECT count(*) FROM maintenance_leases)
+                      + (SELECT count(*) FROM control_leases)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        0_i64,
+        storage
+            .connection_for_test()
+            .query_row("SELECT count(*) FROM native_readiness_results", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    );
+
+    storage
+        .connection_for_test()
+        .execute_batch("DROP TRIGGER fail_maintenance_finalization;")
+        .unwrap();
+    assert_eq!(
+        SetupRunStatus::Completed,
+        storage
+            .finish_maintenance_postcheck(
+                &capability,
+                "maintenance-final-probe",
+                "repair-runtime",
+                &key,
+                &verified,
+            )
+            .expect("commit readiness, final ledger state, and both releases")
+            .expect("passed postcheck is terminal")
+    );
+    let host_identity = storage.host_identity().unwrap();
+    let readiness_identity: (String, String, String, String, String, Option<String>) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT result_id, host_identity_ref, desktop_binding_ref,
+                    adapter_ref, status, failure_reason
+             FROM native_readiness_results",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .expect("successful finalization commits one readiness identity");
+    assert_eq!(
+        (
+            "maintenance-readiness".to_string(),
+            host_identity.to_string(),
+            "maintenance-desktop".to_string(),
+            "codex-native-computer-use".to_string(),
+            "passed".to_string(),
+            None,
+        ),
+        readiness_identity
+    );
+    let readiness_evidence: (String, String, Option<String>, String, String, i64, i64) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT codex_version, native_runtime_version, plugin_version,
+                    os_permission_fingerprint, app_approval_fingerprint,
+                    observed_at, expires_at
+             FROM native_readiness_results",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .expect("successful finalization commits exact readiness evidence");
+    assert_eq!(
+        (
+            "0.144.0".to_string(),
+            "1.0.0".to_string(),
+            None,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            i64::try_from(at(4).unix_timestamp_nanos()).unwrap(),
+            i64::try_from(at(10).unix_timestamp_nanos()).unwrap(),
+        ),
+        readiness_evidence
+    );
+    assert_eq!(
+        0_i64,
+        storage
+            .connection_for_test()
+            .query_row(
+                "SELECT (SELECT count(*) FROM maintenance_leases)
+                      + (SELECT count(*) FROM control_leases)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn failed_maintenance_postcheck_commits_failure_ledger_and_release_atomically() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let operation_id = "maintenance-failed-postcheck";
+    let capability = begin_maintenance(
+        &mut storage,
+        operation_id,
+        Some("failed-maintenance-desktop"),
+        at(1),
+    );
+    storage
+        .start_setup_action(&capability, "repair-runtime", at(2))
+        .unwrap();
+    let key = readiness_key("failed-maintenance-desktop");
+    storage
+        .begin_maintenance_postcheck(
+            &key,
+            "failed-maintenance-probe",
+            "repair-runtime",
+            &capability,
+        )
+        .unwrap();
+    let evidence = key
+        .evidence("maintenance-readiness", at(4), at(10))
+        .unwrap();
+    let (verified, terminal_error) = crate::host::runtime::verify_maintenance_postcheck(
+        NativeProbeResult::Failed {
+            evidence,
+            reason: "readiness postcondition failed",
+            error: crate::core::SatelleError::computer_use_not_ready(),
+            dispatch_possible: false,
+        },
+        None,
+    );
+    assert!(terminal_error.is_some());
+
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "CREATE TRIGGER fail_failed_maintenance_finalization
+             BEFORE UPDATE OF status ON setup_runs
+             WHEN OLD.run_id = 'maintenance-failed-postcheck' AND NEW.status != 'running'
+             BEGIN SELECT RAISE(ABORT, 'forced failed-postcheck finalization failure'); END;",
+        )
+        .unwrap();
+    storage
+        .finish_maintenance_postcheck(
+            &capability,
+            "failed-maintenance-probe",
+            "repair-runtime",
+            &key,
+            &verified,
+        )
+        .expect_err("failed ledger commit rolls back failed readiness and both releases");
+    assert_eq!(
+        2_i64,
+        storage
+            .connection_for_test()
+            .query_row(
+                "SELECT (SELECT count(*) FROM maintenance_leases)
+                      + (SELECT count(*) FROM control_leases)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        0_i64,
+        storage
+            .connection_for_test()
+            .query_row("SELECT count(*) FROM native_readiness_results", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        crate::host::storage::SetupActionStatus::Started,
+        storage
+            .load_setup_run(operation_id)
+            .unwrap()
+            .unwrap()
+            .actions()[0]
+            .status()
+    );
+    storage
+        .connection_for_test()
+        .execute_batch("DROP TRIGGER fail_failed_maintenance_finalization;")
+        .unwrap();
+
+    assert_eq!(
+        Some(SetupRunStatus::Failed),
+        storage
+            .finish_maintenance_postcheck(
+                &capability,
+                "failed-maintenance-probe",
+                "repair-runtime",
+                &key,
+                &verified,
+            )
+            .expect("known failure commits ledger, readiness, and releases")
+    );
+    let (status, failure_reason): (String, Option<String>) = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT status, failure_reason FROM native_readiness_results
+             WHERE desktop_binding_ref = 'failed-maintenance-desktop'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!("failed", status);
+    assert_eq!(
+        Some("readiness postcondition failed".to_string()),
+        failure_reason
+    );
+    assert_eq!(
+        0_i64,
+        storage
+            .connection_for_test()
+            .query_row(
+                "SELECT (SELECT count(*) FROM maintenance_leases)
+                      + (SELECT count(*) FROM control_leases)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn unknown_maintenance_postcheck_preserves_both_leases_for_reconciliation() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let operation_id = "maintenance-unknown-postcheck";
+    let capability = begin_maintenance(
+        &mut storage,
+        operation_id,
+        Some("unknown-maintenance-desktop"),
+        at(1),
+    );
+    storage
+        .start_setup_action(&capability, "repair-runtime", at(2))
+        .unwrap();
+    let key = readiness_key("unknown-maintenance-desktop");
+    storage
+        .begin_maintenance_postcheck(
+            &key,
+            "unknown-maintenance-probe",
+            "repair-runtime",
+            &capability,
+        )
+        .unwrap();
+    let (verified, terminal_error) = crate::host::runtime::verify_maintenance_postcheck(
+        NativeProbeResult::UncachedFailure(crate::core::SatelleError::computer_use_not_ready()),
+        None,
+    );
+    assert!(terminal_error.is_some());
+
+    assert_eq!(
+        None,
+        storage
+            .finish_maintenance_postcheck(
+                &capability,
+                "unknown-maintenance-probe",
+                "repair-runtime",
+                &key,
+                &verified,
+            )
+            .expect("unknown postcheck is durably retained")
+    );
+    assert_eq!(
+        SetupRunStatus::OutcomeUnknown,
+        storage
+            .load_setup_run(operation_id)
+            .unwrap()
+            .unwrap()
+            .status()
+    );
+    let lease_states = storage
+        .connection_for_test()
+        .prepare(
+            "SELECT lease_state FROM maintenance_leases
+             UNION ALL SELECT lease_state FROM control_leases ORDER BY lease_state",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(vec!["recovery_pending", "recovery_pending"], lease_states);
+}
+
+fn lease_owner(operation_id: &str, acquired_at: OffsetDateTime) -> LeaseOwner {
+    LeaseOwner::new(
+        operation_id,
+        std::process::id(),
+        "process-start-maintenance",
+        "boot-identity-maintenance",
+        acquired_at,
+    )
+    .unwrap()
+}
+
+fn readiness_key(desktop_binding: &str) -> ReadinessCacheKey {
+    let desktop = DesktopBindingRef::new(desktop_binding).unwrap();
+    let policy = ExecutionPolicy::new(
+        EffectiveModelRef::new("computer-use-preview").unwrap(),
+        ProviderBindingRef::new("openai").unwrap(),
+        DesktopTarget::new(desktop.clone(), "readiness-key-desktop-session"),
+        ApprovalPolicy::OnRequest,
+        SandboxPolicy::WorkspaceWrite,
+        TimeoutPolicy::bounded_seconds(120).unwrap(),
+        ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+    );
+    ReadinessCacheKey::new(
+        "codex-native-computer-use",
+        desktop,
+        policy,
+        "0.144.0",
+        "1.0.0",
+        None::<String>,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ReadinessObservationState::Unknown,
+        ReadinessObservationState::Unknown,
+    )
+    .unwrap()
+}
+
+#[test]
+fn version_one_store_upgrades_without_replacing_existing_state() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let expected_host = storage.host_identity().unwrap();
+    rebuild_idempotency_records_as_pre_v11_fixture(storage.connection_for_test());
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "DROP TABLE turn_admission_readiness;
+             DROP TABLE admission_cancellations;
+             DROP TABLE setup_actions;
+             DROP TABLE setup_runs;
+             DROP TABLE native_readiness_results;
+             DROP TABLE provider_smoke_results;
+             DROP INDEX one_session_per_upstream_goal_ref;
+             ALTER TABLE sessions DROP COLUMN display_name;
+             ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
+             ALTER TABLE api_tokens DROP COLUMN token_state;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
+             DROP TABLE authorized_provider_bindings;
+             DROP TABLE provider_smoke_hmac_key;
+             DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
+             DROP TABLE desktop_snapshot_audit;
+             DROP TABLE raw_diagnostic_audit;
+             DROP TABLE client_certificate_audit;
+             DROP TABLE turn_admission_queue;
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(storage);
+
+    let (storage, _) = Storage::open(state.path()).expect("upgrade version one storage");
+    assert_eq!(expected_host, storage.host_identity().unwrap());
+    assert_eq!(
+        24_i64,
+        pragma_integer(storage.connection_for_test(), "user_version")
+    );
+
+    let backups = migration_backups(state.path());
+    assert_eq!(1, backups.len());
+    let backup_path = &backups[0];
+    let backup_name = backup_path.file_name().unwrap().to_str().unwrap();
+    let manifest_bytes = fs::read(format!("{}.json", backup_path.display())).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    assert_eq!(1, manifest["manifest_version"]);
+    assert_eq!(backup_name, manifest["backup_file"]);
+    assert_eq!(1, manifest["source_schema_version"]);
+    assert_eq!(env!("CARGO_PKG_VERSION"), manifest["satelle_version"]);
+    assert_eq!(
+        "sqlite3",
+        manifest["restore_compatibility"]["database_format"]
+    );
+    assert_eq!(1, manifest["restore_compatibility"]["schema_version"]);
+    assert_eq!(
+        true,
+        manifest["restore_compatibility"]["explicit_restore_required"]
+    );
+    assert_eq!(
+        file_digest(backup_path),
+        manifest["source_database_digest"].as_str().unwrap()
+    );
+    assert!(
+        !String::from_utf8(manifest_bytes)
+            .unwrap()
+            .contains(expected_host.as_str())
+    );
+    let backup =
+        Connection::open_with_flags(backup_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    assert_eq!(1, pragma_integer(&backup, "user_version"));
+    assert_eq!(
+        "ok",
+        backup
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap()
+    );
+}
+
+#[test]
+fn logically_corrupt_version_one_store_is_rejected_before_migration() {
+    assert_version_one_corruption_rejected_before_migration(
+        "DELETE FROM control_leases;",
+        StorageErrorKind::IntegrityCheckFailed,
+    );
+}
+
+#[test]
+fn corrupt_sensitive_version_one_state_is_rejected_before_migration() {
+    assert_version_one_corruption_rejected_before_migration(
+        "UPDATE idempotency_hmac_keys SET created_at = 'not-a-time' WHERE retired_at IS NULL;",
+        StorageErrorKind::InvalidStoredState,
+    );
+}
+
+fn assert_version_one_corruption_rejected_before_migration(
+    corruption_sql: &str,
+    expected_error: StorageErrorKind,
+) {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let session = initial_session(&storage, SESSION_1, TURN_1, at(0));
+    storage
+        .begin_session(
+            &session,
+            &admission(
+                IdempotentOperation::Run,
+                "run-before-migration",
+                "request-before-migration",
+                at(0),
+            ),
+        )
+        .expect("admit an active Turn");
+    storage
+        .connection_for_test()
+        .execute_batch(corruption_sql)
+        .expect("corrupt version one state");
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "DROP TABLE turn_admission_readiness;
+             DROP TABLE admission_cancellations;
+             DROP TABLE setup_actions;
+             DROP TABLE setup_runs;
+             DROP TABLE native_readiness_results;
+             DROP TABLE provider_smoke_results;
+             DROP INDEX one_session_per_upstream_goal_ref;
+             ALTER TABLE sessions DROP COLUMN display_name;
+             ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
+             ALTER TABLE api_tokens DROP COLUMN token_state;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
+             DROP TABLE provider_secret_provisioning_journal;
+             DROP INDEX idempotency_operation_identity;
+             DROP TABLE authorized_provider_bindings;
+             DROP TABLE provider_smoke_hmac_key;
+             DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
+             DROP TABLE desktop_snapshot_audit;
+             DROP TABLE raw_diagnostic_audit;
+             DROP TABLE client_certificate_audit;
+             DROP TABLE turn_admission_queue;
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
+             PRAGMA user_version = 1;",
+        )
+        .expect("create a logically corrupt version one store");
+    drop(storage);
+
+    let error = match Storage::open(state.path()) {
+        Ok(_) => panic!("a corrupt version one store must fail before migration"),
+        Err(error) => error,
+    };
+    assert_eq!(expected_error, error.kind());
+
+    let connection = Connection::open(state.path().join(DATABASE_FILE_NAME)).unwrap();
+    assert_eq!(1_i64, pragma_integer(&connection, "user_version"));
+    let applied_versions = connection
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(vec![1_i64], applied_versions);
+    for table in [
+        "readiness_successes",
+        "native_readiness_results",
+        "provider_smoke_successes",
+        "provider_smoke_results",
+        "authorized_provider_bindings",
+        "provider_secret_provisioning_journal",
+        "setup_runs",
+        "setup_actions",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !exists,
+            "migration created {table} before rejecting corruption"
+        );
+    }
+}
+
+#[test]
+fn failed_migration_rolls_back_partial_schema_and_preserves_existing_state() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (storage, _) = Storage::open(state.path()).expect("open storage");
+    let expected_host = storage.host_identity().unwrap();
+    storage
+        .connection_for_test()
+        .execute_batch(
+            "DROP TABLE turn_admission_readiness;
+             DROP TABLE admission_cancellations;
+             DROP TABLE setup_actions;
+             DROP TABLE setup_runs;
+             DROP TABLE native_readiness_results;
+             DROP TABLE provider_smoke_results;
+             DROP INDEX one_session_per_upstream_goal_ref;
+             ALTER TABLE sessions DROP COLUMN display_name;
+             ALTER TABLE session_private_refs DROP COLUMN upstream_goal_ref;
+             ALTER TABLE api_tokens DROP COLUMN token_state;
+             ALTER TABLE api_tokens DROP COLUMN desktop_bindings_json;
+             DROP INDEX logs_by_desktop_binding_cursor;
+             ALTER TABLE logs DROP COLUMN desktop_binding_ref;
+             DROP TABLE provider_secret_provisioning_journal;
+             DROP INDEX idempotency_operation_identity;
+             DROP TABLE authorized_provider_bindings;
+             DROP TABLE provider_smoke_hmac_key;
+             DROP TABLE recording_artifacts;
+             DROP INDEX recording_audit_retention;
+             DROP TABLE recording_audit;
+             DROP INDEX control_lease_desktop_snapshot_owner;
+             DROP TABLE desktop_snapshot_audit;
+             DROP TABLE raw_diagnostic_audit;
+             DROP TABLE client_certificate_audit;
+             DROP TABLE turn_admission_queue;
+             DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24);
+             PRAGMA user_version = 1;
+             CREATE TABLE migration_sentinel (value TEXT NOT NULL) STRICT;
+             INSERT INTO migration_sentinel (value) VALUES ('preserve-me');
+             CREATE TRIGGER fail_migration_two_history
+             BEFORE INSERT ON schema_migrations
+             WHEN NEW.version = 2
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced migration failure');
+             END;",
+        )
+        .unwrap();
+    drop(storage);
+
+    let error = match Storage::open(state.path()) {
+        Ok(_) => panic!("a failed migration must not expose a partially migrated store"),
+        Err(error) => error,
+    };
+    assert_eq!(StorageErrorKind::MigrationFailed, error.kind());
+
+    let first_backups = migration_backups(state.path());
+    assert_eq!(1, first_backups.len());
+    let first_backup = first_backups[0].clone();
+    let first_backup_bytes = fs::read(&first_backup).unwrap();
+    let first_manifest_path = PathBuf::from(format!("{}.json", first_backup.display()));
+    let first_manifest_bytes = fs::read(&first_manifest_path).unwrap();
+
+    let repeated_error = match Storage::open(state.path()) {
+        Ok(_) => panic!("the forced migration failure must remain reproducible"),
+        Err(error) => error,
+    };
+    assert_eq!(StorageErrorKind::MigrationFailed, repeated_error.kind());
+    assert_eq!(first_backup_bytes, fs::read(&first_backup).unwrap());
+    assert_eq!(
+        first_manifest_bytes,
+        fs::read(&first_manifest_path).unwrap()
+    );
+    assert_eq!(2, migration_backups(state.path()).len());
+
+    let connection = Connection::open(state.path().join(DATABASE_FILE_NAME)).unwrap();
+    assert_eq!(1_i64, pragma_integer(&connection, "user_version"));
+    let applied_versions = connection
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(vec![1_i64], applied_versions);
+    for table in [
+        "readiness_successes",
+        "native_readiness_results",
+        "provider_smoke_successes",
+        "provider_smoke_results",
+        "authorized_provider_bindings",
+        "provider_secret_provisioning_journal",
+        "setup_runs",
+        "setup_actions",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists, "partial migration table {table} must roll back");
+    }
+    let sentinel: String = connection
+        .query_row("SELECT value FROM migration_sentinel", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!("preserve-me", sentinel);
+    let stored_host: String = connection
+        .query_row("SELECT host_identity_ref FROM daemon_identity", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(expected_host.to_string(), stored_host);
+}
+
+fn migration_backups(state_root: &Path) -> Vec<PathBuf> {
+    let mut backups = fs::read_dir(state_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("satelle.sqlite3.migration-v") && name.ends_with(".backup")
+                })
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    backups
+}
+
+fn file_digest(path: &Path) -> String {
+    let digest = Sha256::digest(fs::read(path).unwrap());
+    format!(
+        "sha256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+#[test]
+fn native_readiness_pass_is_not_reused_for_a_different_exact_desktop_session() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let key = readiness_key("shared-desktop-binding");
+    let evidence = key
+        .evidence("exact-session-pass", at(1), at(6))
+        .expect("construct exact-session readiness evidence");
+    storage
+        .store_preflight_successes(
+            key.adapter(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            &evidence,
+            None,
+        )
+        .expect("persist native readiness pass");
+
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE native_readiness_results
+             SET desktop_session_ref = 'different-exact-desktop-session'
+             WHERE status = 'passed'",
+            [],
+        )
+        .expect("simulate the stored pass belonging to a different exact desktop session");
+
+    assert!(
+        storage
+            .load_reusable_readiness(&key, at(2))
+            .expect("query exact native readiness cache key")
+            .is_none(),
+        "a desktop binding alone must not authorize reuse across exact desktop sessions"
+    );
+}
+
+#[test]
+fn native_readiness_pass_is_invalidated_by_an_observation_state_change() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let key = readiness_key("observation-state-desktop");
+    assert_eq!(
+        ReadinessObservationState::Unknown,
+        key.os_permission_state()
+    );
+    let evidence = key
+        .evidence("observation-state-pass", at(1), at(6))
+        .expect("construct observation-state readiness evidence");
+    storage
+        .store_preflight_successes(
+            key.adapter(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            &evidence,
+            None,
+        )
+        .expect("persist native readiness pass");
+
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE native_readiness_results
+             SET os_permission_state = 'denied'
+             WHERE status = 'passed'",
+            [],
+        )
+        .expect("simulate a detectable OS permission observation change");
+
+    assert!(
+        storage
+            .load_reusable_readiness(&key, at(2))
+            .expect("query exact native readiness cache key")
+            .is_none(),
+        "a detectable observation-state change must invalidate native readiness reuse"
+    );
+}
+
+#[test]
+fn native_readiness_invalidation_removes_only_the_affected_exact_key() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let affected = readiness_key("affected-native-readiness");
+    let unaffected = readiness_key("unaffected-native-readiness");
+    let affected_evidence = affected
+        .evidence("affected-native-result", at(1), at(6))
+        .expect("construct affected readiness evidence");
+    let unaffected_evidence = unaffected
+        .evidence("unaffected-native-result", at(1), at(6))
+        .expect("construct unaffected readiness evidence");
+    let provider = ProviderSmokeEvidence::new(
+        "preserved-provider-result",
+        affected.provider_config_fingerprint(),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        at(1),
+        at(6),
+    )
+    .expect("construct provider evidence");
+    storage
+        .store_preflight_successes(
+            affected.adapter(),
+            affected.desktop_binding(),
+            affected.execution_policy(),
+            &affected_evidence,
+            Some(&provider),
+        )
+        .expect("preseed affected native and provider evidence");
+    storage
+        .store_preflight_successes(
+            unaffected.adapter(),
+            unaffected.desktop_binding(),
+            unaffected.execution_policy(),
+            &unaffected_evidence,
+            None,
+        )
+        .expect("preseed unaffected native evidence");
+
+    assert_eq!(
+        1,
+        storage
+            .invalidate_native_readiness(&affected)
+            .expect("invalidate the exact affected native tuple")
+    );
+    assert!(
+        storage
+            .load_reusable_readiness(&affected, at(2))
+            .expect("query affected native evidence")
+            .is_none()
+    );
+    assert!(
+        storage
+            .load_reusable_readiness(&unaffected, at(2))
+            .expect("query unaffected native evidence")
+            .is_some()
+    );
+    let provider_count: i64 = storage
+        .connection_for_test()
+        .query_row("SELECT count(*) FROM provider_smoke_results", [], |row| {
+            row.get(0)
+        })
+        .expect("count preserved provider evidence");
+    assert_eq!(1, provider_count);
+}
+
+#[test]
+fn host_native_readiness_invalidation_removes_every_native_key_only() {
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let first = readiness_key("first-native-readiness");
+    let second = readiness_key("second-native-readiness");
+    let first_evidence = first
+        .evidence("first-native-result", at(1), at(6))
+        .expect("construct first readiness evidence");
+    let second_evidence = second
+        .evidence("second-native-result", at(1), at(6))
+        .expect("construct second readiness evidence");
+    let provider = ProviderSmokeEvidence::new(
+        "preserved-provider-result",
+        first.provider_config_fingerprint(),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        at(1),
+        at(6),
+    )
+    .expect("construct provider evidence");
+    storage
+        .store_preflight_successes(
+            first.adapter(),
+            first.desktop_binding(),
+            first.execution_policy(),
+            &first_evidence,
+            Some(&provider),
+        )
+        .expect("preseed first native and provider evidence");
+    storage
+        .store_preflight_successes(
+            second.adapter(),
+            second.desktop_binding(),
+            second.execution_policy(),
+            &second_evidence,
+            None,
+        )
+        .expect("preseed second native evidence");
+
+    assert_eq!(
+        2,
+        storage
+            .invalidate_all_native_readiness()
+            .expect("invalidate every native readiness tuple")
+    );
+    assert!(
+        storage
+            .load_reusable_readiness(&first, at(2))
+            .expect("query first native evidence")
+            .is_none()
+    );
+    assert!(
+        storage
+            .load_reusable_readiness(&second, at(2))
+            .expect("query second native evidence")
+            .is_none()
+    );
+    let provider_count: i64 = storage
+        .connection_for_test()
+        .query_row("SELECT count(*) FROM provider_smoke_results", [], |row| {
+            row.get(0)
+        })
+        .expect("count preserved provider evidence");
+    assert_eq!(1, provider_count);
+}
+
+#[test]
+fn readiness_and_provider_results_round_trip_without_raw_evidence() {
+    const PROVIDER_SECRET_CANARY: &str = "PRIVATE_RESOLVED_PROVIDER_SECRET_CANARY";
+
+    let state = TempDir::new().expect("temporary state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let resolved_secret =
+        crate::host::provider_auth::ResolvedProviderSecret::for_test(PROVIDER_SECRET_CANARY);
+    assert!(!format!("{resolved_secret:?}").contains(PROVIDER_SECRET_CANARY));
+    drop(resolved_secret);
+    let observed_at = at(1);
+    // Fixed-width integer timestamps must preserve a valid subsecond window.
+    // Variable-width RFC3339 text would compare these two instants backward.
+    let expires_at = observed_at + time::Duration::milliseconds(100);
+    let desktop = DesktopBindingRef::new("desktop-binding-1").unwrap();
+    let policy = ExecutionPolicy::new(
+        EffectiveModelRef::new("computer-use-preview").unwrap(),
+        ProviderBindingRef::new("openai").unwrap(),
+        DesktopTarget::new(desktop.clone(), "operational-desktop-session"),
+        ApprovalPolicy::OnRequest,
+        SandboxPolicy::WorkspaceWrite,
+        TimeoutPolicy::bounded_seconds(120).unwrap(),
+        ExperimentalFeatureChoices::new(FeatureChoice::Enabled, FeatureChoice::Enabled),
+    );
+    let cache_key = ReadinessCacheKey::new(
+        "codex-native-computer-use",
+        desktop.clone(),
+        policy.clone(),
+        "0.144.0",
+        "1.0.0",
+        Some("plugin-1.0.0"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ReadinessObservationState::Unknown,
+        ReadinessObservationState::Unknown,
+    )
+    .unwrap();
+    let readiness =
+        ReadinessEvidence::new(&cache_key, "readiness-1", observed_at, expires_at).unwrap();
+    let provider = ProviderSmokeEvidence::new(
+        "provider-smoke-1",
+        cache_key.provider_config_fingerprint(),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        observed_at,
+        expires_at,
+    )
+    .unwrap();
+    storage
+        .store_preflight_successes(
+            "codex-native-computer-use",
+            &desktop,
+            &policy,
+            &readiness,
+            Some(&provider),
+        )
+        .expect("store preflight results atomically");
+    storage
+        .store_preflight_successes(
+            "codex-native-computer-use",
+            &desktop,
+            &policy,
+            &readiness,
+            Some(&provider),
+        )
+        .expect("replaying identical evidence is idempotent");
+    let persisted_source_columns: i64 = storage
+        .connection_for_test()
+        .query_row(
+            "SELECT count(*)
+             FROM pragma_table_info('native_readiness_results')
+             WHERE name = 'source'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect persisted native readiness columns");
+    assert_eq!(
+        0, persisted_source_columns,
+        "readiness source is transient provenance and must not be persisted"
+    );
+    assert_eq!(
+        Some(readiness.clone().with_source(ReadinessSource::Cache)),
+        storage
+            .load_reusable_readiness(&cache_key, observed_at)
+            .expect("matching success is reusable before expiry")
+    );
+    assert!(
+        storage
+            .load_reusable_readiness(&cache_key, expires_at)
+            .expect("expiry lookup")
+            .is_none()
+    );
+    assert_eq!(
+        Some(ProviderSmokeResult::Passed(
+            provider
+                .clone()
+                .with_source(crate::host::ProviderSmokeSource::Cache),
+        )),
+        storage
+            .load_reusable_provider_smoke(&cache_key, observed_at)
+            .expect("matching provider smoke is reusable before expiry")
+    );
+    assert!(
+        storage
+            .load_reusable_provider_smoke(&cache_key, expires_at)
+            .expect("provider expiry lookup")
+            .is_none()
+    );
+
+    let second_readiness = cache_key
+        .evidence("readiness-2", observed_at, expires_at)
+        .unwrap();
+    let conflicting_provider = ProviderSmokeEvidence::new(
+        "provider-smoke-1",
+        cache_key.provider_config_fingerprint(),
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        observed_at,
+        expires_at + time::Duration::minutes(1),
+    )
+    .unwrap();
+    let error = storage
+        .store_preflight_successes(
+            "codex-native-computer-use",
+            &desktop,
+            &policy,
+            &second_readiness,
+            Some(&conflicting_provider),
+        )
+        .expect_err("a conflicting provider result must roll back its readiness insert");
+    assert_eq!(StorageErrorKind::StateConflict, error.kind());
+    storage
+        .store_preflight_failure(&cache_key, &second_readiness, "action_not_observed")
+        .expect("store terminal native readiness failure");
+
+    let failure_observed_at = observed_at + time::Duration::seconds(1);
+    let failure_expires_at = failure_observed_at + time::Duration::minutes(10);
+    let failure_readiness = cache_key
+        .evidence(
+            "readiness-provider-failure",
+            failure_observed_at,
+            failure_expires_at,
+        )
+        .unwrap();
+    let provider_failure = ProviderSmokeFailureEvidence::new(
+        "provider-smoke-failure-1",
+        cache_key.provider_config_fingerprint(),
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        crate::core::ErrorCode::UnsupportedProviderComputerUse,
+        "provider_smoke_provider_rejected",
+        failure_observed_at,
+        failure_expires_at,
+    )
+    .unwrap();
+    storage
+        .store_provider_smoke_failure(&cache_key, &failure_readiness, &provider_failure)
+        .expect("store normalized provider failure");
+    assert_eq!(
+        Some(ProviderSmokeResult::Failed(
+            provider_failure
+                .clone()
+                .with_source(crate::host::ProviderSmokeSource::Cache),
+        )),
+        storage
+            .load_reusable_provider_smoke(&cache_key, failure_observed_at)
+            .expect("matching provider failure is reusable before expiry")
+    );
+    assert!(
+        storage
+            .load_reusable_provider_smoke(&cache_key, failure_expires_at)
+            .expect("provider failure expiry lookup")
+            .is_none()
+    );
+    let readiness_count: i64 = storage
+        .connection_for_test()
+        .query_row("SELECT count(*) FROM native_readiness_results", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(3, readiness_count);
+    let statuses = storage
+        .connection_for_test()
+        .prepare("SELECT status FROM native_readiness_results ORDER BY result_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(vec!["passed", "failed", "passed"], statuses);
+    let provider_count: i64 = storage
+        .connection_for_test()
+        .query_row("SELECT count(*) FROM provider_smoke_results", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(1, provider_count);
+    let provider_statuses = storage
+        .connection_for_test()
+        .prepare("SELECT status FROM provider_smoke_results ORDER BY result_id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(vec!["failed"], provider_statuses);
+    assert!(
+        storage
+            .connection_for_test()
+            .execute(
+                "UPDATE provider_smoke_results
+                 SET provider_credential_fingerprint = NULL",
+                [],
+            )
+            .is_err(),
+        "the canonical provider-smoke schema requires a credential fingerprint"
+    );
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE provider_smoke_results
+             SET provider_credential_fingerprint = 'not-a-fingerprint'",
+            [],
+        )
+        .expect("inject a malformed stored credential fingerprint");
+    let malformed = storage
+        .load_reusable_provider_smoke(&cache_key, failure_observed_at)
+        .expect_err("malformed credential fingerprints must fail closed");
+    assert_eq!(StorageErrorKind::InvalidStoredState, malformed.kind());
+    storage.checkpoint_for_test();
+    let bytes = fs::read(state.path().join(DATABASE_FILE_NAME)).unwrap();
+    assert!(!contains_bytes(&bytes, b"raw stdout"));
+    assert!(!contains_bytes(&bytes, b"raw stderr"));
+    assert!(
+        !contains_bytes(&bytes, PROVIDER_SECRET_CANARY.as_bytes()),
+        "resolved provider material must not enter readiness or provider-smoke rows"
+    );
+    for suffix in ["-wal", "-shm"] {
+        let path = state.path().join(format!("{DATABASE_FILE_NAME}{suffix}"));
+        if let Ok(bytes) = fs::read(path) {
+            assert!(
+                !contains_bytes(&bytes, PROVIDER_SECRET_CANARY.as_bytes()),
+                "resolved provider material must not enter SQLite sidecar files"
+            );
+        }
+    }
+}
+
+#[test]
+fn authorized_provider_binding_round_trips_replaces_restarts_and_deletes() {
+    let state = TempDir::new().expect("create state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+
+    let initial = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-initial",
+            "openai",
+        )
+        .with_endpoint("https://provider-one.invalid/v1")
+        .with_auth_source(crate::core::ProviderSecretSource::Environment {
+            variable: "SATELLE_PROVIDER_ONE_TOKEN".to_string(),
+        })
+        .with_allow_project_selection(true)
+        .with_experimental_provider_computer_use(true),
+        crate::core::ProviderBindingSource::UserConfig,
+    );
+    let initial_digest = initial.binding_digest().to_string();
+    let denied_project_selection_digest = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-initial",
+            "openai",
+        )
+        .with_endpoint("https://provider-one.invalid/v1")
+        .with_auth_source(crate::core::ProviderSecretSource::Environment {
+            variable: "SATELLE_PROVIDER_ONE_TOKEN".to_string(),
+        })
+        .with_experimental_provider_computer_use(true),
+        crate::core::ProviderBindingSource::UserConfig,
+    )
+    .binding_digest()
+    .to_string();
+    assert_ne!(
+        initial_digest, denied_project_selection_digest,
+        "exact-binding project consent participates in binding identity"
+    );
+
+    storage
+        .authorize_provider_binding(&test_desktop_binding(), &initial, at(1))
+        .expect("authorize initial provider binding");
+
+    let loaded_initial = storage
+        .load_authorized_provider_binding(
+            &test_desktop_binding(),
+            "review-model",
+            "review-provider",
+        )
+        .expect("load initial provider binding")
+        .expect("initial provider binding exists");
+    assert_eq!(loaded_initial.requested_model_alias(), "review-model");
+    assert_eq!(loaded_initial.requested_provider_alias(), "review-provider");
+    assert_eq!(loaded_initial.model(), "gpt-initial");
+    assert_eq!(loaded_initial.model_provider(), "openai");
+    assert_eq!(
+        loaded_initial.endpoint(),
+        Some("https://provider-one.invalid/v1")
+    );
+    assert_eq!(
+        loaded_initial.auth_source(),
+        Some(&crate::core::ProviderSecretSource::Environment {
+            variable: "SATELLE_PROVIDER_ONE_TOKEN".to_string(),
+        })
+    );
+    assert_eq!(
+        loaded_initial.source(),
+        crate::core::ProviderBindingSource::UserConfig
+    );
+    assert!(loaded_initial.experimental_provider_computer_use());
+    assert!(loaded_initial.allow_project_selection());
+    assert_eq!(loaded_initial.binding_digest(), initial_digest);
+    assert!(loaded_initial.has_valid_binding_digest());
+
+    let replacement = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-replacement",
+            "openai-compatible",
+        )
+        .with_endpoint("https://provider-two.invalid/v1")
+        .with_auth_source(crate::core::ProviderSecretSource::File {
+            path: PathBuf::from("/run/secrets/provider-two"),
+        }),
+        crate::core::ProviderBindingSource::UserConfig,
+    );
+    let replacement_digest = replacement.binding_digest().to_string();
+    assert_ne!(replacement_digest, initial_digest);
+
+    storage
+        .authorize_provider_binding(&test_desktop_binding(), &replacement, at(2))
+        .expect("replace authorized provider binding");
+
+    let loaded_replacement = storage
+        .load_authorized_provider_binding(
+            &test_desktop_binding(),
+            "review-model",
+            "review-provider",
+        )
+        .expect("load replacement provider binding")
+        .expect("replacement provider binding exists");
+    assert_eq!(loaded_replacement.requested_model_alias(), "review-model");
+    assert_eq!(
+        loaded_replacement.requested_provider_alias(),
+        "review-provider"
+    );
+    assert_eq!(loaded_replacement.model(), "gpt-replacement");
+    assert_eq!(loaded_replacement.model_provider(), "openai-compatible");
+    assert_eq!(
+        loaded_replacement.endpoint(),
+        Some("https://provider-two.invalid/v1")
+    );
+    assert_eq!(
+        loaded_replacement.auth_source(),
+        Some(&crate::core::ProviderSecretSource::File {
+            path: PathBuf::from("/run/secrets/provider-two"),
+        })
+    );
+    assert_eq!(
+        loaded_replacement.source(),
+        crate::core::ProviderBindingSource::UserConfig
+    );
+    assert!(!loaded_replacement.experimental_provider_computer_use());
+    assert!(!loaded_replacement.allow_project_selection());
+    assert_eq!(loaded_replacement.binding_digest(), replacement_digest);
+    assert!(loaded_replacement.has_valid_binding_digest());
+
+    drop(storage);
+    let (mut storage, _) = Storage::open(state.path()).expect("reopen storage");
+
+    let loaded_after_restart = storage
+        .load_authorized_provider_binding(
+            &test_desktop_binding(),
+            "review-model",
+            "review-provider",
+        )
+        .expect("load provider binding after restart")
+        .expect("provider binding survives restart");
+    assert_eq!(loaded_after_restart, loaded_replacement);
+    assert_eq!(loaded_after_restart.binding_digest(), replacement_digest);
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding(
+                &test_desktop_binding(),
+                "other-model",
+                "review-provider"
+            )
+            .expect("look up another model alias"),
+        None
+    );
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "other-provider"
+            )
+            .expect("look up another provider alias"),
+        None
+    );
+
+    assert!(
+        storage
+            .delete_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "review-provider"
+            )
+            .expect("delete provider binding")
+    );
+    assert!(
+        !storage
+            .delete_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "review-provider"
+            )
+            .expect("delete absent provider binding")
+    );
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "review-provider"
+            )
+            .expect("load deleted provider binding"),
+        None
+    );
+
+    drop(storage);
+    let (storage, _) = Storage::open(state.path()).expect("reopen storage after deletion");
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "review-provider"
+            )
+            .expect("load deleted provider binding after restart"),
+        None
+    );
+}
+
+#[test]
+fn authorized_provider_bindings_are_namespaced_by_desktop_binding() {
+    let state = TempDir::new().expect("create state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let alice = crate::core::session::DesktopBindingRef::new("alice").unwrap();
+    let bob = crate::core::session::DesktopBindingRef::new("bob").unwrap();
+    let alice_binding = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-alice",
+            "openai",
+        ),
+        crate::core::ProviderBindingSource::UserConfig,
+    );
+    let bob_binding = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-bob",
+            "openai",
+        ),
+        crate::core::ProviderBindingSource::UserConfig,
+    );
+
+    storage
+        .authorize_provider_binding(&alice, &alice_binding, at(1))
+        .expect("authorize Alice's provider binding");
+    storage
+        .authorize_provider_binding(&bob, &bob_binding, at(2))
+        .expect("authorize Bob's provider binding");
+
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding(&alice, "review-model", "review-provider")
+            .unwrap()
+            .unwrap()
+            .model(),
+        "gpt-alice"
+    );
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding(&bob, "review-model", "review-provider")
+            .unwrap()
+            .unwrap()
+            .model(),
+        "gpt-bob"
+    );
+}
+
+#[test]
+fn authorized_provider_binding_tampered_digest_fails_closed() {
+    let state = TempDir::new().expect("create state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let binding = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-authorized",
+            "openai",
+        )
+        .with_auth_source(crate::core::ProviderSecretSource::Environment {
+            variable: "SATELLE_PROVIDER_TOKEN".to_string(),
+        }),
+        crate::core::ProviderBindingSource::UserConfig,
+    );
+
+    storage
+        .authorize_provider_binding(&test_desktop_binding(), &binding, at(1))
+        .expect("authorize provider binding");
+    storage
+        .connection_for_test()
+        .execute(
+            "UPDATE authorized_provider_bindings
+             SET binding_digest = ?1
+             WHERE model_alias = ?2 AND provider_alias = ?3",
+            rusqlite::params!["0".repeat(64), "review-model", "review-provider"],
+        )
+        .expect("tamper with the stored binding digest");
+
+    let error = storage
+        .load_authorized_provider_binding(
+            &test_desktop_binding(),
+            "review-model",
+            "review-provider",
+        )
+        .expect_err("a mismatched stored digest must fail closed");
+    assert_eq!(error.kind(), StorageErrorKind::InvalidStoredState);
+}
+
+#[test]
+fn provider_binding_compare_and_swap_preserves_a_concurrent_replacement() {
+    let state = TempDir::new().expect("create state directory");
+    let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+    let initial = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-initial",
+            "openai",
+        ),
+        crate::core::ProviderBindingSource::UserConfig,
+    );
+    storage
+        .authorize_provider_binding(&test_desktop_binding(), &initial, at(1))
+        .expect("authorize initial provider binding");
+    let concurrent = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-concurrent",
+            "openai",
+        ),
+        crate::core::ProviderBindingSource::UserConfig,
+    );
+    storage
+        .authorize_provider_binding(&test_desktop_binding(), &concurrent, at(2))
+        .expect("commit concurrent provider replacement");
+    let stale = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review-model",
+            "review-provider",
+            "gpt-stale",
+            "openai",
+        ),
+        crate::core::ProviderBindingSource::UserConfig,
+    );
+
+    let error = storage
+        .authorize_provider_binding_if_unchanged(
+            &test_desktop_binding(),
+            &stale,
+            Some(initial.binding_digest()),
+            at(3),
+        )
+        .expect_err("a stale replacement must not overwrite the current binding");
+    assert_eq!(error.kind(), StorageErrorKind::StateConflict);
+    assert_eq!(
+        storage
+            .load_authorized_provider_binding(
+                &test_desktop_binding(),
+                "review-model",
+                "review-provider"
+            )
+            .expect("load current provider binding")
+            .expect("current provider binding exists"),
+        concurrent
+    );
+}
+
+#[test]
+fn operational_fingerprints_reject_non_digest_values() {
+    let key = readiness_key("fingerprint-rejection");
+    let error = ReadinessCacheKey::new(
+        key.adapter(),
+        key.desktop_binding().clone(),
+        key.execution_policy().clone(),
+        "0.144.0",
+        "1.0.0",
+        Some("plugin-1.0.0"),
+        "raw-provider-secret",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        key.os_permission_state(),
+        key.app_approval_state(),
+    )
+    .expect_err("fingerprints must be fixed-size lowercase digests");
+    assert_eq!(EvidenceError::InvalidFingerprint, error);
+}

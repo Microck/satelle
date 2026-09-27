@@ -211,6 +211,12 @@ negotiated capability to enable form elicitation. Satelle keeps
 `experimentalApi` false.
 This capability check does not depend on a Codex or Desktop version.
 
+Satelle therefore advertises `native_action_relay = false` in the Host
+capabilities v7 response. `--relay-native-actions` fails before Turn admission
+with `native-action-relay-not-supported`. The generic approvals above and the
+app-selection elicitation do not satisfy the relay contract because neither is
+a stable native desktop action request with matching accept and deny callbacks.
+
 Therefore Satelle Phase 0 must distinguish two outcomes:
 
 1. A supported Host exposes an operator-visible prompt through a documented or

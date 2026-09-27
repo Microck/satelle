@@ -12,7 +12,7 @@ export type StageId = 'excel' | 'kicad' | 'godot' | 'filing';
 
 /**
  * One committed step of the Turn. `event` is a real Satelle event type from
- * crates/satelle-core/src/events.rs and `message` is what the Controller prints
+ * crates/satelle/src/core/events.rs and `message` is what the Controller prints
  * after it, matching the human event line `eprintln!("{}: {}", type, message)`.
  */
 export type StageStep = {

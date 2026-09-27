@@ -37,7 +37,7 @@ not a disclaimer to bury.
 - Pricing, trials, credits, or an "Open app" button. Satelle is self-hosted.
 - Any capability listed as unimplemented in `README.md`.
 - CLI output that the binary does not actually print. Every terminal frame in
-  every demo is traceable to a `println!` in `crates/satelle-cli` or to
+  every demo is traceable to a `println!` in `crates/satelle` or to
   documented help text. See §7.
 
 ## 2. Color
@@ -363,20 +363,20 @@ sources, all in this repository:
 
 | What | Where |
 | --- | --- |
-| `run`/`steer`/`status` human output | `crates/satelle-cli/src/main.rs` `print_session_human` |
+| `run`/`steer`/`status` human output | `crates/satelle/src/main.rs` `print_session_human` |
 | `stop` human output | same file, the stop branch: `Outcome`, `Previous state`, `Current state`, `Changed`, `Stopped at` |
 | `doctor` human output | same file: `Host`, `Status`, `Ready`, `Scopes`, then `[severity] summary (fixability)` and `  evidence:` |
 | `host sessions` output | same file: `Session`/`User`/`State`/`Kind`/`Display`/`Selected`/`Portable selectors`/`Native selectors` |
 | Turn states | `status_label`: `starting`, `running`, `recovery_pending`, `completed`, `blocked`, `failed`, `stopped` |
-| Event types | `crates/satelle-core/src/events.rs`: `preflight`, `readiness`, `provider_smoke`, `turn_started`, `turn_progress`, `action_required`, `command_failed`, `turn_completed`, `turn_blocked`, `turn_failed`, `turn_stopped` |
+| Event types | `crates/satelle/src/core/events.rs`: `preflight`, `readiness`, `provider_smoke`, `turn_started`, `turn_progress`, `action_required`, `command_failed`, `turn_completed`, `turn_blocked`, `turn_failed`, `turn_stopped` |
 | Event sources | `cli`, `host_daemon`, `codex_adapter` |
 | Human event line | `eprintln!("{}: {}", event_type, message)` |
 | Log sources / levels | `host_daemon`, `storage`, `codex_adapter` / `info`, `warn`, `error` |
 | Log cursor shape | `slc1_%016x` |
-| Session id shape | `rs_` + UUIDv7, lowercase (`crates/satelle-core/src/ids.rs`) |
-| MCP tool names | `crates/satelle-cli/src/mcp/schema.rs`: `config_check`, `config_explain`, `paths`, `status`, `logs`, `doctor`, `host_status`, `host_sessions`, and mutations `run`, `steer`, `stop`, `setup`, `repair`, `host_update`, `host_lifecycle` |
-| Flags | `docs/reference/generated-cli.mdx`, which CI checks against `satelle --help` |
-| Schema versions | `satelle.run.v2`, `satelle.status.v2`, `satelle.steer.v2`, `satelle.stop.v1`, `satelle.doctor.v1`, `satelle.events.v2`, `satelle.logs.entry.v1` |
+| Session id shape | `rs_` + UUIDv7, lowercase (`crates/satelle/src/core/ids.rs`) |
+| MCP tool names | `crates/satelle/src/mcp/schema.rs`: `config_check`, `config_explain`, `paths`, `status`, `logs`, `doctor`, `host_status`, `host_sessions`, and mutations `run`, `steer`, `stop`, `setup`, `repair`, `host_update`, `host_lifecycle` |
+| Flags | `docs/reference/generated-cli.mdx`, which CI checks against native `satelle --help` output and JavaScript launcher help for `satelle native repair` |
+| Schema versions | `satelle.run.v2`, `satelle.status.v2`, `satelle.steer.v2`, `satelle.stop.v1`, `satelle.doctor.v1`, `satelle.events.v2`, `satelle.logs.entry.v2` |
 
 Demo task content comes from an independent computer-use showcase pack (MIT):
 four synthetic desktop workflows in LibreOffice Calc, KiCad, Godot, and

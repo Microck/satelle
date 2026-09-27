@@ -70,6 +70,14 @@ function childExitSummary(child) {
   ].join(", ");
 }
 
+function readWorkspaceVersion(repositoryRoot = defaultRepositoryRoot) {
+  const cargo = readFileSync(path.join(repositoryRoot, "Cargo.toml"), "utf8");
+  const workspacePackage = cargo.match(/\[workspace\.package\]([\s\S]*?)(?:\n\[|$)/);
+  const version = workspacePackage?.[1].match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+  if (!version) fail("release-version-missing", "Cargo workspace version is missing");
+  return version;
+}
+
 function readJson(filePath) {
   return JSON.parse(readFileSync(filePath, "utf8"));
 }
@@ -642,6 +650,10 @@ function inspectNativeReleaseArchive(request, release) {
           `${request.label} does not contain ${selection.expectedName}@${selection.expectedVersion}`,
         );
       }
+    } else if (selection.kind === "checksums") {
+      if (contents.length > 1024) {
+        fail("release-integrity-mismatch", `${request.label} has oversized package checksums`);
+      }
     } else {
       fail("release-archive-invalid", `${request.label} has an unknown selected member check`);
     }
@@ -799,14 +811,6 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
     return path.join(npmRoot, packageDirectory(packageName), "package.json");
   }
 
-  function readWorkspaceVersion() {
-    const cargo = readFileSync(path.join(repositoryRoot, "Cargo.toml"), "utf8");
-    const workspacePackage = cargo.match(/\[workspace\.package\]([\s\S]*?)(?:\n\[|$)/);
-    const version = workspacePackage?.[1].match(/^version\s*=\s*"([^"]+)"/m)?.[1];
-    if (!version) fail("release-version-missing", "Cargo workspace version is missing");
-    return version;
-  }
-
   function validatePublishMetadata(packageName, manifest) {
     if (
       manifest.private === true ||
@@ -913,7 +917,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         !sameJson(manifest.os, [targetMetadata.os]) ||
         !sameJson(manifest.cpu, [targetMetadata.cpu]) ||
         !sameJson(manifest.libc, expectedLibc) ||
-        !sameJson(manifest.files, [targetMetadata.binaryPath]) ||
+        !sameJson(manifest.files, [targetMetadata.binaryPath, "SHA256SUMS"]) ||
         manifest.bin !== undefined ||
         manifest.scripts?.prepack !== "node ../scripts/verify-native-package.cjs"
       ) {
@@ -949,7 +953,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
   }
 
   function validateReleaseState(tag) {
-    const version = readWorkspaceVersion();
+    const version = readWorkspaceVersion(repositoryRoot);
     if (tag !== undefined && tag !== `v${version}`) {
       fail(
         "release-version-mismatch",
@@ -1814,6 +1818,10 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
       const version = expectedVersion(process.env.RELEASE_TAG);
 
       copyFileSync(packageManifestPath(targetMetadata.packageName), path.join(packageRoot, "package.json"));
+      writeFileSync(
+        path.join(packageRoot, "SHA256SUMS"),
+        `${sha256File(packagedBinary)}  ${targetMetadata.binaryPath}\n`,
+      );
       copyFileSync(
         path.join(npmRoot, "scripts", "verify-native-package.cjs"),
         path.join(assemblyRoot, "scripts", "verify-native-package.cjs"),
@@ -1856,6 +1864,26 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         integrity: sha512Integrity(stablePath),
       };
     });
+  }
+
+  function hostReleaseCompatibility(version) {
+    const source = readFileSync(
+      path.join(repositoryRoot, "crates/satelle/src/core/host-update.rs"),
+      "utf8",
+    );
+    const protocol = source.match(/^pub const HOST_PROTOCOL_VERSION: &str = "([0-9]+)";$/m)?.[1];
+    const storage = source.match(/^pub const HOST_STORAGE_SCHEMA_VERSION: i64 = ([0-9]+);$/m)?.[1];
+    const minimumCli = source.match(/^pub const HOST_MINIMUM_CLI_VERSION: &str = "([0-9]+\.[0-9]+\.[0-9]+)";$/m)?.[1];
+    if (!protocol || !storage || !minimumCli || !Number.isSafeInteger(Number(storage))) {
+      fail("release-metadata-invalid", "Host compatibility constants are missing or invalid");
+    }
+    return {
+      schema_version: 1,
+      version,
+      protocol_version: protocol,
+      storage_schema_version: Number(storage),
+      minimum_cli_version: minimumCli,
+    };
   }
 
   function validateNativeReleaseArchives(directory, stagingDirectory) {
@@ -1982,6 +2010,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
                 member: `package/${metadata.binaryPath}`,
                 target: snapshot.target,
               },
+              { kind: "checksums", member: "package/SHA256SUMS" },
             ],
           },
         ];
@@ -1999,6 +2028,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         const expectedNpmMembers = [
           "package/package.json",
           `package/${metadata.binaryPath}`,
+          "package/SHA256SUMS",
         ].sort();
         const actualNpmMembers = npmInventory.members
           .filter(({ type }) => type === "file")
@@ -2031,6 +2061,17 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
             `${snapshot.archive} executable differs from ${snapshot.npmArtifact}`,
           );
         }
+        const checksumsDigest = npmInventory.selections.find(
+          ({ member }) => member === "package/SHA256SUMS",
+        )?.sha256;
+        // The worker hashes the bounded checksum file from the same immutable
+        // snapshot. Comparing its digest binds the exact checksum text too.
+        if (checksumsDigest !== sha256Bytes(Buffer.from(`${npmDigest}  ${metadata.binaryPath}\n`))) {
+          fail(
+            "release-integrity-mismatch",
+            `${snapshot.npmArtifact} checksums differ from its executable`,
+          );
+        }
         return {
           target: snapshot.target,
           archive: snapshot.archive,
@@ -2042,11 +2083,19 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           executableSha256: archiveDigest,
         };
       });
+      // This asset shares the archives' checksum and signed attestation policy.
+      // Its values come from the constants enforced by the Host and transport.
+      const compatibilityName = "satelle-compatibility.json";
+      const compatibilityPath = path.join(githubRoot, compatibilityName);
+      writeFileSync(
+        compatibilityPath,
+        `${JSON.stringify(hostReleaseCompatibility(releaseState.version), null, 2)}\n`,
+        { flag: "wx", mode: 0o400 },
+      );
       const checksums = writeSha256Sums(
         githubRoot,
-        archives.map(({ archive }) => archive),
+        [...archives.map(({ archive }) => archive), compatibilityName],
       );
-      verifySha256Sums(githubRoot, checksums.path);
       chmodSync(checksums.path, 0o400);
       remainingDeadline(deadline, "native release archive validation");
       beforeNativeArchiveFinalSourceValidation?.();
@@ -2074,6 +2123,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
         snapshot.handle = undefined;
         chmodSync(snapshot.snapshotPath, 0o400);
       }
+      verifySha256Sums(githubRoot, checksums.path);
       chmodSync(githubRoot, 0o500);
       complete = true;
       return { version, stagingDirectory: stagingRoot, checksums, archives };
@@ -2100,7 +2150,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
 
   function validateNpmArtifacts(directory, options = {}) {
     if (!directory) fail("release-destination-missing", "release destination is required");
-    const version = expectedVersion(process.env.RELEASE_TAG);
+    const version = expectedVersion(options.releaseTag ?? process.env.RELEASE_TAG);
     const packages = publicationOrder.map((packageName) => {
       const file = npmArtifactName(packageName);
       const artifactPath = path.join(directory, file);
@@ -2313,6 +2363,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
     let packed;
     let packedManifest;
     let packedNativeBinary;
+    let packedNativeChecksums;
     try {
       members = new Set(
         runTar(["-tzf", artifactFileName], { cwd: artifactDirectory, encoding: "utf8" })
@@ -2391,6 +2442,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
       }
       if (
         target &&
+        fileName === matrix[target].binaryPath &&
         matrix[target].os !== "win32" &&
         ![3, 6, 9].every((index) => archiveEntries[0].permissions[index] === "x")
       ) {
@@ -2399,7 +2451,7 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           `${path.basename(artifactPath)} native binary is not executable`,
         );
       }
-      if (target) {
+      if (target && fileName === matrix[target].binaryPath) {
         try {
           packedNativeBinary = runTar(["-xOzf", artifactFileName, archiveName], {
             cwd: artifactDirectory,
@@ -2416,6 +2468,17 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           packedNativeBinary,
           `${path.basename(artifactPath)} member ${fileName}`,
         );
+      }
+      if (target && fileName === "SHA256SUMS") {
+        try {
+          packedNativeChecksums = runTar(["-xOzf", artifactFileName, archiveName], {
+            cwd: artifactDirectory,
+            maxBuffer: 1024,
+            encoding: "utf8",
+          });
+        } catch {
+          fail("release-integrity-mismatch", "native package SHA256SUMS cannot be read");
+        }
       }
       if (topLevelPackages.includes(packageName)) {
         const sourceFile = readFileSync(
@@ -2446,6 +2509,12 @@ function createReleaseContext(repositoryRoot = defaultRepositoryRoot, options = 
           );
         }
       }
+    }
+    if (
+      target &&
+      packedNativeChecksums !== `${sha256Bytes(packedNativeBinary)}  ${matrix[target].binaryPath}\n`
+    ) {
+      fail("release-integrity-mismatch", "native package SHA256SUMS differs from its executable");
     }
     return packedNativeBinary;
   }
@@ -2515,5 +2584,7 @@ if (require.main === module) {
 module.exports = {
   ReleaseError,
   createReleaseContext,
+  readWorkspaceVersion,
+  sha512Integrity,
   zipInflateMaximumOutputLength,
 };

@@ -1,0 +1,496 @@
+{
+  "reference": "@toon-format/toon@4.1.1",
+  "specification": "https://github.com/toon-format/spec/blob/main/SPEC.md",
+  "cases": [
+    {
+      "name": "null",
+      "input": null,
+      "toon": "null"
+    },
+    {
+      "name": "true",
+      "input": true,
+      "toon": "true"
+    },
+    {
+      "name": "false",
+      "input": false,
+      "toon": "false"
+    },
+    {
+      "name": "integer",
+      "input": -42,
+      "toon": "-42"
+    },
+    {
+      "name": "fraction",
+      "input": 1.25,
+      "toon": "1.25"
+    },
+    {
+      "name": "empty string",
+      "input": "",
+      "toon": "\"\""
+    },
+    {
+      "name": "empty object",
+      "input": {},
+      "toon": ""
+    },
+    {
+      "name": "empty array",
+      "input": [],
+      "toon": "[]"
+    },
+    {
+      "name": "plain strings",
+      "input": [
+        "Ada",
+        "hello world",
+        "é🚀中文",
+        "true",
+        "null",
+        "false",
+        "NaN",
+        "Infinity"
+      ],
+      "toon": "[8]: Ada,hello world,é🚀中文,\"true\",\"null\",\"false\",NaN,Infinity"
+    },
+    {
+      "name": "number-like strings",
+      "input": [
+        "0",
+        "42",
+        "05",
+        "+1",
+        "-3.14",
+        "1e-6",
+        "1E+9",
+        "123456789012345678901234567890",
+        "0x10",
+        "1.",
+        "+name"
+      ],
+      "toon": "[11]: \"0\",\"42\",\"05\",\"+1\",\"-3.14\",\"1e-6\",\"1E+9\",\"123456789012345678901234567890\",0x10,1.,+name"
+    },
+    {
+      "name": "quoted strings",
+      "input": [
+        "#comment",
+        "-item",
+        "a,b",
+        "a:b",
+        "[1]",
+        "{key}",
+        "a\"b",
+        "a\\b",
+        " leading",
+        "trailing ",
+        "\t"
+      ],
+      "toon": "[11]: \"#comment\",\"-item\",\"a,b\",\"a:b\",\"[1]\",\"{key}\",\"a\\\"b\",\"a\\\\b\",\" leading\",\"trailing \",\"\\t\""
+    },
+    {
+      "name": "all C0 controls",
+      "input": {
+        "c00": "before\u0000after",
+        "c01": "before\u0001after",
+        "c02": "before\u0002after",
+        "c03": "before\u0003after",
+        "c04": "before\u0004after",
+        "c05": "before\u0005after",
+        "c06": "before\u0006after",
+        "c07": "before\u0007after",
+        "c08": "before\bafter",
+        "c09": "before\tafter",
+        "c10": "before\nafter",
+        "c11": "before\u000bafter",
+        "c12": "before\fafter",
+        "c13": "before\rafter",
+        "c14": "before\u000eafter",
+        "c15": "before\u000fafter",
+        "c16": "before\u0010after",
+        "c17": "before\u0011after",
+        "c18": "before\u0012after",
+        "c19": "before\u0013after",
+        "c20": "before\u0014after",
+        "c21": "before\u0015after",
+        "c22": "before\u0016after",
+        "c23": "before\u0017after",
+        "c24": "before\u0018after",
+        "c25": "before\u0019after",
+        "c26": "before\u001aafter",
+        "c27": "before\u001bafter",
+        "c28": "before\u001cafter",
+        "c29": "before\u001dafter",
+        "c30": "before\u001eafter",
+        "c31": "before\u001fafter"
+      },
+      "toon": "c00: \"before\\u0000after\"\nc01: \"before\\u0001after\"\nc02: \"before\\u0002after\"\nc03: \"before\\u0003after\"\nc04: \"before\\u0004after\"\nc05: \"before\\u0005after\"\nc06: \"before\\u0006after\"\nc07: \"before\\u0007after\"\nc08: \"before\\u0008after\"\nc09: \"before\\tafter\"\nc10: \"before\\nafter\"\nc11: \"before\\u000bafter\"\nc12: \"before\\u000cafter\"\nc13: \"before\\rafter\"\nc14: \"before\\u000eafter\"\nc15: \"before\\u000fafter\"\nc16: \"before\\u0010after\"\nc17: \"before\\u0011after\"\nc18: \"before\\u0012after\"\nc19: \"before\\u0013after\"\nc20: \"before\\u0014after\"\nc21: \"before\\u0015after\"\nc22: \"before\\u0016after\"\nc23: \"before\\u0017after\"\nc24: \"before\\u0018after\"\nc25: \"before\\u0019after\"\nc26: \"before\\u001aafter\"\nc27: \"before\\u001bafter\"\nc28: \"before\\u001cafter\"\nc29: \"before\\u001dafter\"\nc30: \"before\\u001eafter\"\nc31: \"before\\u001fafter\""
+    },
+    {
+      "name": "special keys",
+      "input": {
+        "": "empty",
+        "a\n": "control",
+        "a b": "space",
+        "a\"b": "quote",
+        "a.b": "literal dot",
+        "a:b": "colon",
+        "my-key": "hyphen",
+        "é": "unicode"
+      },
+      "toon": "\"\": empty\n\"a\\n\": control\n\"a b\": space\n\"a\\\"b\": quote\na.b: literal dot\n\"a:b\": colon\n\"my-key\": hyphen\n\"é\": unicode"
+    },
+    {
+      "name": "numeric object key",
+      "input": {
+        "123": "number"
+      },
+      "toon": "\"123\": number"
+    },
+    {
+      "name": "nested objects",
+      "input": {
+        "empty": {},
+        "name": "a",
+        "settings": {
+          "enabled": true,
+          "theme": "dark"
+        }
+      },
+      "toon": "empty:\nname: a\nsettings:\n  enabled: true\n  theme: dark"
+    },
+    {
+      "name": "nested empty arrays",
+      "input": {
+        "items": [],
+        "lists": [
+          [],
+          [
+            1,
+            2
+          ]
+        ],
+        "mixed": [
+          {},
+          [],
+          null
+        ]
+      },
+      "toon": "items: []\nlists[2]:\n  - [0]:\n  - [2]: 1,2\nmixed[3]:\n  -\n  - [0]:\n  - null"
+    },
+    {
+      "name": "flat rows",
+      "input": {
+        "rows": [
+          {
+            "enabled": true,
+            "name": "a,b"
+          },
+          {
+            "enabled": false,
+            "name": "false"
+          }
+        ]
+      },
+      "toon": "rows[2]{enabled,name}:\n  true,\"a,b\"\n  false,\"false\""
+    },
+    {
+      "name": "nested uniform rows",
+      "input": [
+        {
+          "id": 1,
+          "info": {
+            "geo": {
+              "lat": 1.25,
+              "lon": 2.5
+            },
+            "name": "Ada"
+          }
+        },
+        {
+          "id": 2,
+          "info": {
+            "geo": {
+              "lat": 3.75,
+              "lon": 4.25
+            },
+            "name": "Bo"
+          }
+        }
+      ],
+      "toon": "[2]{id,info{geo{lat,lon},name}}:\n  1,1.25,2.5,Ada\n  2,3.75,4.25,Bo"
+    },
+    {
+      "name": "keyed table",
+      "input": {
+        "alice": {
+          "active": true,
+          "score": 1
+        },
+        "bob": {
+          "active": false,
+          "score": 2
+        }
+      },
+      "toon": "[2:]{active,score}:\n  alice: true,1\n  bob: false,2"
+    },
+    {
+      "name": "nested keyed table",
+      "input": {
+        "users": {
+          "alice": {
+            "profile": {
+              "age": 30,
+              "name": "Ada"
+            }
+          },
+          "bob": {
+            "profile": {
+              "age": 40,
+              "name": "Bo"
+            }
+          }
+        }
+      },
+      "toon": "users[2:]{profile{age,name}}:\n  alice: 30,Ada\n  bob: 40,Bo"
+    },
+    {
+      "name": "single keyed entry",
+      "input": {
+        "users": {
+          "alice": {
+            "name": "Ada"
+          }
+        }
+      },
+      "toon": "users:\n  alice:\n    name: Ada"
+    },
+    {
+      "name": "nonuniform rows",
+      "input": [
+        {
+          "a": 1
+        },
+        {
+          "b": 2
+        },
+        {},
+        true
+      ],
+      "toon": "[4]:\n  - a: 1\n  - b: 2\n  -\n  - true"
+    },
+    {
+      "name": "mixed column types",
+      "input": [
+        {
+          "a": null,
+          "b": 1
+        },
+        {
+          "a": {
+            "x": 2
+          },
+          "b": 3
+        }
+      ],
+      "toon": "[2]:\n  - a: null\n    b: 1\n  - a:\n      x: 2\n    b: 3"
+    },
+    {
+      "name": "empty object column",
+      "input": [
+        {
+          "a": {},
+          "b": 1
+        },
+        {
+          "a": {},
+          "b": 2
+        }
+      ],
+      "toon": "[2]:\n  - a:\n    b: 1\n  - a:\n    b: 2"
+    },
+    {
+      "name": "array column",
+      "input": [
+        {
+          "a": [
+            1
+          ],
+          "b": 1
+        },
+        {
+          "a": [
+            2
+          ],
+          "b": 2
+        }
+      ],
+      "toon": "[2]:\n  - a[1]: 1\n    b: 1\n  - a[1]: 2\n    b: 2"
+    },
+    {
+      "name": "nonuniform keyed entries",
+      "input": {
+        "a": {
+          "x": 1
+        },
+        "b": {
+          "y": 2
+        }
+      },
+      "toon": "a:\n  x: 1\nb:\n  y: 2"
+    },
+    {
+      "name": "nested object list field",
+      "input": [
+        {
+          "a": {
+            "x": {
+              "n": 1
+            }
+          },
+          "b": true
+        },
+        null
+      ],
+      "toon": "[2]:\n  - a:\n      x:\n        n: 1\n    b: true\n  - null"
+    },
+    {
+      "name": "first list field table",
+      "input": [
+        {
+          "a": [
+            {
+              "name": "one",
+              "score": 1
+            },
+            {
+              "name": "two",
+              "score": 2
+            }
+          ],
+          "z": "end"
+        },
+        null
+      ],
+      "toon": "[2]:\n  - a[2]{name,score}:\n      one,1\n      two,2\n    z: end\n  - null"
+    },
+    {
+      "name": "first list field keyed table",
+      "input": [
+        {
+          "a": {
+            "one": {
+              "score": 1
+            },
+            "two": {
+              "score": 2
+            }
+          },
+          "z": "end"
+        },
+        null
+      ],
+      "toon": "[2]:\n  - a[2:]{score}:\n      one: 1\n      two: 2\n    z: end\n  - null"
+    },
+    {
+      "name": "first list field nonuniform array",
+      "input": [
+        {
+          "a": [
+            {
+              "x": 1
+            },
+            {}
+          ],
+          "z": "end"
+        },
+        null
+      ],
+      "toon": "[2]:\n  - a[2]:\n      - x: 1\n      -\n    z: end\n  - null"
+    },
+    {
+      "name": "keyless nested arrays",
+      "input": [
+        [
+          {
+            "id": 1
+          },
+          {
+            "id": 2
+          }
+        ],
+        [
+          true,
+          {
+            "x": []
+          }
+        ],
+        []
+      ],
+      "toon": "[3]:\n  - [2]:\n    - id: 1\n    - id: 2\n  - [2]:\n    - true\n    - x: []\n  - [0]:"
+    },
+    {
+      "name": "deeper nested arrays",
+      "input": {
+        "a": [
+          [
+            [
+              {
+                "x": 1
+              },
+              {
+                "x": 2
+              }
+            ]
+          ],
+          [
+            [
+              null
+            ]
+          ],
+          []
+        ]
+      },
+      "toon": "a[3]:\n  - [1]:\n    - [2]:\n      - x: 1\n      - x: 2\n  - [1]:\n    - [1]: null\n  - [0]:"
+    },
+    {
+      "name": "anonymous keyed-eligible object",
+      "input": [
+        {
+          "alice": {
+            "score": 1
+          },
+          "bob": {
+            "score": 2
+          }
+        },
+        null
+      ],
+      "toon": "[2]:\n  - alice:\n      score: 1\n    bob:\n      score: 2\n  - null"
+    },
+    {
+      "name": "escaped header keys",
+      "input": [
+        {
+          "a,b": 1,
+          "c:d": true
+        },
+        {
+          "a,b": 2,
+          "c:d": false
+        }
+      ],
+      "toon": "[2]{\"a,b\",\"c:d\"}:\n  1,true\n  2,false"
+    },
+    {
+      "name": "Markdown content",
+      "input": {
+        "content": "```json\n{}\n```\n~~~~\n# title\n",
+        "path": "C:\\Users\\name\\file"
+      },
+      "toon": "content: \"```json\\n{}\\n```\\n~~~~\\n# title\\n\"\npath: \"C:\\\\Users\\\\name\\\\file\""
+    }
+  ]
+}

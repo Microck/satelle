@@ -1,0 +1,4229 @@
+use super::*;
+use crate::core::session::TurnExecutionMode;
+use crate::core::session::{StopObservation, TurnState, TurnTransition};
+use crate::core::{ErrorCode, SatelleError};
+use crate::host::codex_capabilities::{
+    CapabilityMatrix, CodexVersionEvidence, HostPlatform, MINIMUM_CODEX_VERSION,
+    Phase0CapabilityEvidence,
+};
+use base64::Engine as _;
+use sha2::{Digest as _, Sha256};
+use std::path::PathBuf;
+use std::sync::Condvar;
+use std::time::Duration;
+
+fn local_desktop_binding() -> crate::core::session::DesktopBindingRef {
+    crate::core::session::DesktopBindingRef::new("local-demo-desktop-v1")
+        .expect("valid built-in Desktop Binding")
+}
+
+fn turn_intent(prompt: &str) -> TurnIntent {
+    TurnIntent::new(prompt, TurnExecutionMode::Standard).expect("valid test Turn intent")
+}
+
+fn doctor_selection(scopes: &[&str]) -> DoctorScopeSelection {
+    DoctorScopeSelection::parse(
+        &scopes
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect::<Vec<_>>(),
+    )
+    .expect("valid Doctor test scopes")
+}
+
+fn test_daemon_paths(state: &TestStateDir) -> Result<DaemonResolvedPathSet, SatelleError> {
+    crate::core::resolve_path_set(state.path()).map(|paths| DaemonResolvedPathSet::from(&paths))
+}
+
+#[test]
+fn production_host_reports_the_frozen_service_config_path_set() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let configured_state_root = state.path().join("service-state");
+    let mut config = crate::core::SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .expect("the built-in local Host config exists");
+    config.daemon_state_dir = Some(configured_state_root.clone());
+
+    let service = HostService::production_for_host(&config);
+    let paths = service
+        .daemon_resolved_paths()
+        .expect("production Host paths resolve once during construction");
+
+    assert_eq!(
+        paths.state_root,
+        configured_state_root.display().to_string()
+    );
+    assert_eq!(
+        paths.sqlite_store,
+        configured_state_root
+            .join("satelle.sqlite3")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        paths.recording_root,
+        configured_state_root
+            .join("recordings")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        paths.sources.state_root,
+        crate::core::PathSource::ServiceConfig
+    );
+    assert_eq!(
+        paths.sources.sqlite_store,
+        crate::core::PathSource::ServiceConfig
+    );
+    assert_eq!(
+        paths.sources.recording_root,
+        crate::core::PathSource::ServiceConfig
+    );
+}
+
+#[test]
+fn production_service_reports_the_frozen_service_config_path_set() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let configured_state_root = state.path().join("persistent-service-state");
+    let service = HostService::production_for_service(
+        &DaemonPathOverrides {
+            state_dir: Some(configured_state_root.clone()),
+            ..DaemonPathOverrides::default()
+        },
+        crate::core::daemon_service::PersistentHostStoragePolicy::new(
+            3_600_000,
+            crate::core::DEFAULT_SESSION_METADATA_RETENTION_HOURS,
+            45 * 24,
+            crate::core::DEFAULT_OPERATOR_LOG_RETAINED_FILES,
+        )
+        .expect("valid persistent storage policy"),
+        None,
+        None,
+        crate::core::queue::QueueConfig::default(),
+    )
+    .expect("valid persistent service configuration");
+    let paths = service
+        .daemon_resolved_paths()
+        .expect("persistent service paths resolve once during construction");
+
+    assert_eq!(
+        paths.state_root,
+        configured_state_root.display().to_string()
+    );
+    assert_eq!(
+        paths.sources.state_root,
+        crate::core::PathSource::ServiceConfig
+    );
+    assert_eq!(
+        service.setup_ledger_retention_for_tests(),
+        time::Duration::hours(1)
+    );
+    assert_eq!(
+        service.sqlite_log_retention_for_tests(),
+        time::Duration::days(45)
+    );
+}
+
+struct ReadyTestTransportProbe;
+
+impl ControllerTransportProbe for ReadyTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
+fn ready_transport() -> ReadyTestTransportProbe {
+    ReadyTestTransportProbe
+}
+
+struct DelayedTestTransportProbe;
+
+impl ControllerTransportProbe for DelayedTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        std::thread::sleep(Duration::from_millis(40));
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
+struct PanickingTestTransportProbe;
+
+impl ControllerTransportProbe for PanickingTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        // Give the independent config worker time to publish its terminal row
+        // before this worker exercises the registry's panic boundary.
+        std::thread::sleep(Duration::from_millis(50));
+        panic!("intentional transport panic");
+    }
+}
+
+struct BlockingTestTransportProbe {
+    started: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ControllerTransportProbe for BlockingTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        self.started.send(()).expect("signal transport start");
+        self.release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv()
+            .expect("release blocking transport");
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
+struct RecordingTestTransportProbe {
+    started: std::sync::mpsc::Sender<()>,
+}
+
+impl ControllerTransportProbe for RecordingTestTransportProbe {
+    fn execute(&self, _context: &DoctorProbeExecutionContext) -> ControllerTransportProbeOutcome {
+        self.started.send(()).expect("signal transport start");
+        ControllerTransportProbeOutcome::Observed(DoctorTransportObservation::ready(None))
+    }
+}
+
+#[derive(Clone)]
+struct RecordingTurnExtrasAdapter {
+    observations: Arc<Mutex<Vec<TurnExtrasObservation>>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TurnExtrasObservation {
+    attachments: Vec<AttachmentObservation>,
+    timeout_seconds: u32,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AttachmentObservation {
+    path: PathBuf,
+    media_type: String,
+    size_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+#[cfg(unix)]
+struct SecretBoundaryAdapter;
+
+#[cfg(unix)]
+impl ComputerUseAdapter for SecretBoundaryAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        let binding = provider_intent
+            .resolved_provider_binding()
+            .expect("Host must inject the authoritative provider binding");
+        drop(crate::host::runtime::resolve_provider_child_secret_for_test(binding, host)?);
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg(unix)]
+struct FailedProviderSmokeAdapter;
+
+#[cfg(unix)]
+impl ComputerUseAdapter for FailedProviderSmokeAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        let mut error = SatelleError::computer_use_not_ready();
+        error.details.insert(
+            "provider_smoke_status".to_string(),
+            serde_json::Value::String("failed".to_string()),
+        );
+        Err(error)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[derive(Clone)]
+#[cfg(unix)]
+struct TamperingProviderProvisioningAdapter {
+    staging_path: PathBuf,
+    native_probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+    provider_probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+    tamper_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+impl ComputerUseAdapter for TamperingProviderProvisioningAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.tamper_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Use real filesystem I/O to make the candidate evidence fail closed.
+        // This represents a concurrent local actor rather than mocking the
+        // secure-file implementation.
+        std::fs::write(&self.staging_path, "tampered-staged-secret")
+            .map_err(|_| SatelleError::state_conflict())?;
+        Err(SatelleError::computer_use_not_ready())
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(Some(FakeComputerUseAdapter::readiness_contract()?.2))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[cfg(unix)]
+impl crate::host::runtime::ReadinessProbeDriver for TamperingProviderProvisioningAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> crate::host::runtime::NativeProbeResult {
+        self.native_probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let observed_at = time::OffsetDateTime::now_utc();
+        crate::host::runtime::NativeProbeResult::Passed(
+            key.evidence(
+                format!("native-probe-{}", crate::core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .expect("validated readiness key produces native evidence"),
+        )
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::host::provider_auth::ResolvedProviderSecret>,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        self.provider_probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.preflight_terminal(host, cached, cached_provider, provider_intent)
+    }
+
+    fn observe_readiness_probe(
+        &self,
+        _subject: &crate::host::storage::ProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg(unix)]
+enum ProviderProvisioningProbeOutcome {
+    Ready,
+    UpstreamStillActive,
+    OutcomeUnknown,
+    PersistenceFailure,
+}
+
+#[derive(Clone)]
+#[cfg(unix)]
+struct ClassifiedProviderProvisioningAdapter {
+    outcome: ProviderProvisioningProbeOutcome,
+    native_probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+    provider_probe_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+impl ComputerUseAdapter for ClassifiedProviderProvisioningAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(Some(FakeComputerUseAdapter::readiness_contract()?.2))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[cfg(unix)]
+impl crate::host::runtime::ReadinessProbeDriver for ClassifiedProviderProvisioningAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> crate::host::runtime::NativeProbeResult {
+        self.native_probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let observed_at = time::OffsetDateTime::now_utc();
+        crate::host::runtime::NativeProbeResult::Passed(
+            key.evidence(
+                format!("native-probe-{}", crate::core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .expect("validated readiness key produces native evidence"),
+        )
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::host::provider_auth::ResolvedProviderSecret>,
+        _cancellation: &AdmissionCancellation,
+        persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        self.provider_probe_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.outcome {
+            ProviderProvisioningProbeOutcome::Ready => {
+                self.preflight_terminal(host, cached, cached_provider, provider_intent)
+            }
+            ProviderProvisioningProbeOutcome::UpstreamStillActive => {
+                AdapterPreflight::Cancelled(StopObservation::UpstreamStillActive)
+            }
+            ProviderProvisioningProbeOutcome::OutcomeUnknown => {
+                AdapterPreflight::Cancelled(StopObservation::OutcomeUnknown)
+            }
+            ProviderProvisioningProbeOutcome::PersistenceFailure => {
+                assert!(
+                    persist_thread_ref("").is_err(),
+                    "invalid upstream identity must fail durable persistence"
+                );
+                AdapterPreflight::Cancelled(StopObservation::CancellationConfirmed)
+            }
+        }
+    }
+
+    fn observe_readiness_probe(
+        &self,
+        _subject: &crate::host::storage::ProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
+/// Keeps phase-aware Doctor coverage isolated from the shared fake's deliberate
+/// no-cache behavior, which other admission tests use as part of their setup.
+#[derive(Clone, Copy)]
+struct DoctorRefreshAdapter;
+
+impl ComputerUseAdapter for DoctorRefreshAdapter {
+    fn resolve_provider_binding(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<crate::core::ResolvedProviderBinding, SatelleError> {
+        FakeComputerUseAdapter.resolve_provider_binding(host, provider_intent)
+    }
+
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn readiness_cache_key(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        Ok(Some(FakeComputerUseAdapter::readiness_contract()?.2))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+impl crate::host::runtime::ReadinessProbeDriver for DoctorRefreshAdapter {
+    fn run_native_probe(
+        &self,
+        key: &ReadinessCacheKey,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> crate::host::runtime::NativeProbeResult {
+        let observed_at = time::OffsetDateTime::now_utc();
+        crate::host::runtime::NativeProbeResult::Passed(
+            key.evidence(
+                format!("native-probe-{}", crate::core::SessionId::new()),
+                observed_at,
+                observed_at + time::Duration::minutes(5),
+            )
+            .expect("validated Doctor readiness key produces valid evidence"),
+        )
+    }
+
+    fn preflight_terminal_with_provider_probe(
+        &self,
+        host: &str,
+        cached: Option<ReadinessEvidence>,
+        cached_provider: Option<ProviderSmokeResult>,
+        provider_intent: &ProviderComputerUseIntent,
+        _provider_secret: Option<crate::host::provider_auth::ResolvedProviderSecret>,
+        _cancellation: &AdmissionCancellation,
+        _persist_thread_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+        _persist_turn_ref: &mut dyn FnMut(&str) -> Result<(), ()>,
+    ) -> AdapterPreflight {
+        self.preflight_terminal(host, cached, cached_provider, provider_intent)
+    }
+
+    fn observe_readiness_probe(
+        &self,
+        _subject: &crate::host::storage::ProbeRecoverySubject,
+    ) -> RecoveryObservation {
+        RecoveryObservation::Completed
+    }
+}
+
+#[derive(Clone)]
+struct HostBusyProviderPreflightAdapter {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ComputerUseAdapter for HostBusyProviderPreflightAdapter {
+    fn preflight(
+        &self,
+        _host: &str,
+        _provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(SatelleError::host_busy(
+            LOCAL_DEMO_HOST,
+            &crate::core::SessionId::new(),
+        ))
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+impl ComputerUseAdapter for RecordingTurnExtrasAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        self.observations
+            .lock()
+            .expect("lock observations")
+            .push(TurnExtrasObservation {
+                attachments: request
+                    .attachments()
+                    .iter()
+                    .map(|attachment| AttachmentObservation {
+                        path: attachment.path().to_path_buf(),
+                        media_type: attachment.media_type().to_string(),
+                        size_bytes: attachment.bytes().len(),
+                    })
+                    .collect(),
+                timeout_seconds: request.execution_policy().timeout_policy().seconds(),
+            });
+        Ok(ExecuteResult::new(TurnTransition::Completed, Vec::new()))
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[derive(Clone, Default)]
+struct ProviderPreflightGate {
+    state: Arc<(Mutex<ProviderPreflightGateState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct ProviderPreflightGateState {
+    started: bool,
+    released: bool,
+}
+
+impl ProviderPreflightGate {
+    fn signal_started_and_wait(&self) -> Result<(), SatelleError> {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().expect("provider preflight gate lock");
+        state.started = true;
+        changed.notify_all();
+
+        let (state, _) = changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.released)
+            .expect("provider preflight gate wait");
+        if !state.released {
+            return Err(SatelleError::config_error(
+                "provider preflight test gate timed out",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait_for_started(&self, timeout: Duration) -> bool {
+        let (state, changed) = &*self.state;
+        let state = state.lock().expect("provider preflight gate lock");
+        let (state, _) = changed
+            .wait_timeout_while(state, timeout, |state| !state.started)
+            .expect("provider preflight start wait");
+        state.started
+    }
+
+    fn release(&self) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().expect("provider preflight gate lock");
+        state.released = true;
+        changed.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct ProviderPreflightCounter {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Option<ProviderPreflightGate>,
+}
+
+impl ComputerUseAdapter for ProviderPreflightCounter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(gate) = &self.gate {
+            gate.signal_started_and_wait()?;
+        }
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        FakeComputerUseAdapter.execute(request)
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+fn provider_intent_with_missing_descriptor() -> ProviderComputerUseIntent {
+    ProviderComputerUseIntent::new(
+        Some(
+            crate::core::session::EffectiveModelRef::new("review")
+                .expect("valid requested model alias"),
+        ),
+        Some(
+            crate::core::session::ProviderBindingRef::new("openai")
+                .expect("valid requested provider alias"),
+        ),
+        false,
+    )
+}
+
+fn provider_descriptor_config(auth_source: Option<String>) -> crate::core::HostConfig {
+    let mut config = crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    config.desktop_bindings.insert(
+        "local-demo-desktop-v1".to_string(),
+        crate::core::DesktopBindingConfig {
+            desktop_user: "local-demo-user".to_string(),
+            desktop_session_preference: None,
+            desktop_session_native_selector: None,
+            provider_auth: Default::default(),
+            provider_bindings: Default::default(),
+        },
+    );
+    let desktop = config
+        .desktop_bindings
+        .get_mut("local-demo-desktop-v1")
+        .expect("built-in Desktop Binding");
+    desktop.provider_bindings.insert(
+        "openai".to_string(),
+        std::collections::BTreeMap::from([(
+            "review".to_string(),
+            crate::core::ProviderBindingConfig {
+                model: "provider-model".to_string(),
+                model_provider: "openai".to_string(),
+                endpoint: None,
+                auth_source,
+                allow_project_selection: false,
+            },
+        )]),
+    );
+    config
+}
+
+#[test]
+fn secret_file_home_is_canonical_in_user_and_host_owned_bindings() {
+    let state = TestStateDir::new().expect("temporary Host state");
+    let home = crate::core::resolver_account_home().expect("Host account home");
+    let input = crate::core::ProviderSecretSource::File {
+        path: PathBuf::from("~/satelle-canonical-home-reference/token"),
+    };
+    let expected = crate::core::ProviderSecretSource::File {
+        path: home.join("satelle-canonical-home-reference/token"),
+    };
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), DoctorRefreshAdapter, None);
+    let prepared = service
+        .prepare_provider_binding_authorization(
+            LOCAL_DEMO_HOST,
+            "review",
+            "openai",
+            ProviderBindingAuthorization::new("review", "openai", "provider-model", "openai")
+                .with_auth_source(input.clone()),
+        )
+        .expect("prepare the user binding without opening the secret file");
+    assert_eq!(prepared.auth_source(), Some(&expected));
+    assert!(prepared.has_valid_binding_digest());
+
+    let mut config = provider_descriptor_config(Some("home-file".to_string()));
+    config
+        .desktop_bindings
+        .get_mut("local-demo-desktop-v1")
+        .expect("built-in Desktop Binding")
+        .provider_auth
+        .insert("home-file".to_string(), input);
+    let host_config_state = TestStateDir::new().expect("separate Host-owned config state");
+    let runtime = RuntimeHandle::new_with_provider_policy(
+        Ok(host_config_state.path().to_path_buf()),
+        DoctorRefreshAdapter,
+        crate::host::runtime::RuntimeProviderPolicy::from_host_config(&config),
+    );
+    let resolved = runtime
+        .resolve_provider_binding(LOCAL_DEMO_HOST, &provider_intent_with_missing_descriptor())
+        .expect("resolve the Host-owned config binding");
+    let ProviderBindingResolution::Ready(binding) = resolved else {
+        panic!("the configured File descriptor must be present");
+    };
+    assert_eq!(binding.auth_source(), Some(&expected));
+    assert!(binding.has_valid_binding_digest());
+}
+
+fn service_with_provider_descriptor<A: ComputerUseAdapter>(
+    state_root: PathBuf,
+    adapter: A,
+    auth_source: Option<String>,
+) -> HostService {
+    let config = provider_descriptor_config(auth_source);
+    HostService {
+        runtime: RuntimeHandle::new_with_provider_policy(
+            Ok(state_root),
+            adapter,
+            crate::host::runtime::RuntimeProviderPolicy::from_host_config(&config),
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    }
+}
+
+#[cfg(unix)]
+fn service_with_provider_descriptor_and_readiness_probe<A>(
+    state_root: PathBuf,
+    adapter: A,
+    auth_source: Option<String>,
+) -> HostService
+where
+    A: ComputerUseAdapter + crate::host::runtime::ReadinessProbeDriver + Clone,
+{
+    let config = provider_descriptor_config(auth_source);
+    HostService {
+        runtime: RuntimeHandle::new_with_provider_policy_and_readiness_probe_driver(
+            Ok(state_root),
+            adapter.clone(),
+            adapter,
+            crate::host::runtime::RuntimeProviderPolicy::from_host_config(&config),
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    }
+}
+
+#[cfg(unix)]
+fn provider_file_authorization(path: PathBuf) -> ProviderBindingAuthorization {
+    ProviderBindingAuthorization::new("review", "openai", "provider-model", "openai")
+        .with_auth_source(crate::core::ProviderSecretSource::File { path })
+        .with_experimental_provider_computer_use(true)
+}
+
+#[cfg(unix)]
+fn service_with_classified_provider_probe(
+    state_root: PathBuf,
+    outcome: ProviderProvisioningProbeOutcome,
+) -> (
+    HostService,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let config = crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    let native_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let adapter = ClassifiedProviderProvisioningAdapter {
+        outcome,
+        native_probe_calls: Arc::clone(&native_probe_calls),
+        provider_probe_calls: Arc::clone(&provider_probe_calls),
+    };
+    let service = HostService {
+        runtime: RuntimeHandle::new_with_readiness_probe_driver(
+            Ok(state_root),
+            adapter.clone(),
+            adapter,
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    (service, native_probe_calls, provider_probe_calls)
+}
+
+#[cfg(unix)]
+fn assert_provider_provisioning_recovery_owned(state: &TestStateDir, operation_id: &str) {
+    let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
+        .expect("open Host SQLite state");
+    let (phase, lease_state): (String, String) = connection
+        .query_row(
+            "SELECT journal.phase, lease.lease_state
+             FROM provider_secret_provisioning_journal AS journal
+             JOIN control_leases AS lease
+               ON lease.operation_id = journal.operation_id
+              AND lease.provider_probe_ref = journal.provider_probe_ref
+             WHERE journal.operation_id = ?1",
+            [operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("load retained provider provisioning ownership");
+    assert_eq!(phase, "rollback_pending");
+    assert_eq!(lease_state, "active");
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_post_t0_destination_failure_terminalizes_for_same_daemon_replay() {
+    use std::os::unix::fs::symlink;
+
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    let destination = secret_directory.path().join("provider-token");
+    let unrelated_target = secret_directory.path().join("unrelated-target");
+    std::fs::write(&unrelated_target, "unrelated").expect("write unrelated symlink target");
+    symlink(&unrelated_target, &destination).expect("create unsafe destination symlink");
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), DoctorRefreshAdapter, None);
+    service.initialize_daemon().expect("initialize Host daemon");
+    let identity = RequestIdentity::new("provider-secret-planned-failure", "a".repeat(64));
+    let authorization = provider_file_authorization(destination);
+
+    let first = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            authorization.clone(),
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("unsafe destination must fail after T0");
+    let replay = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            authorization,
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("same-daemon retry must replay the terminal failure");
+
+    assert_ne!(first.code, ErrorCode::StateConflict);
+    assert_eq!(first.code, replay.code);
+    assert_eq!(first.message, replay.message);
+    assert_eq!(first.recovery_command, replay.recovery_command);
+    assert_eq!(first.details, replay.details);
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_provider_secret_requires_typed_overwrite_and_preserves_prior_value() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    let destination = secret_directory.path().join("provider-token");
+    let prior_secret = "prior-provider-secret";
+    std::fs::write(&destination, prior_secret).expect("write prior provider secret");
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+        .expect("make prior provider secret owner-only");
+    let service = service_with_provider_descriptor_and_readiness_probe(
+        state.path().to_path_buf(),
+        DoctorRefreshAdapter,
+        None,
+    );
+    service.initialize_daemon().expect("initialize Host daemon");
+    let identity = RequestIdentity::new("provider-secret-overwrite-required", "c".repeat(64));
+
+    let error = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            provider_file_authorization(destination.clone()),
+            Zeroizing::new("replacement-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("existing destination requires explicit overwrite authority");
+
+    assert_eq!(error.code, ErrorCode::ProviderSecretOverwriteRequired);
+    assert_eq!(
+        std::fs::read_to_string(destination).expect("read preserved prior provider secret"),
+        prior_secret
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn newline_terminated_provider_secrets_can_be_replaced_atomically() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (suffix, prior_secret) in [
+        ("lf", "prior-provider-secret\n"),
+        ("crlf", "prior-provider-secret\r\n"),
+    ] {
+        let state = TestStateDir::new().expect("temporary Host state");
+        let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+        std::fs::set_permissions(
+            secret_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make provider secret directory owner-only");
+        let destination = secret_directory.path().join("provider-token");
+        std::fs::write(&destination, prior_secret).expect("write prior provider secret");
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+            .expect("make prior provider secret owner-only");
+        let (service, _native_probe_calls, provider_probe_calls) =
+            service_with_classified_provider_probe(
+                state.path().to_path_buf(),
+                ProviderProvisioningProbeOutcome::Ready,
+            );
+        service.initialize_daemon().expect("initialize Host daemon");
+        let identity =
+            RequestIdentity::new(format!("provider-secret-newline-{suffix}"), "f".repeat(64));
+
+        let result = service
+            .provision_provider_secret(
+                LOCAL_DEMO_HOST,
+                "local-demo-desktop-v1",
+                provider_file_authorization(destination.clone()),
+                Zeroizing::new("replacement-provider-secret".to_string()),
+                true,
+                &identity,
+            )
+            .expect("replace newline-terminated provider secret");
+
+        assert!(result.overwritten());
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read replacement provider secret"),
+            "replacement-provider-secret"
+        );
+        assert_eq!(
+            provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let residue = std::fs::read_dir(secret_directory.path())
+            .expect("read provider secret directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".staged.") || name.contains(".backup."))
+            .collect::<Vec<_>>();
+        assert!(
+            residue.is_empty(),
+            "unexpected replacement residue: {residue:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_secret_publication_preserves_candidate_terminal_line_endings() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (suffix, candidate) in [
+        ("lf", "replacement-provider-secret\n"),
+        ("crlf", "replacement-provider-secret\r\n"),
+    ] {
+        let state = TestStateDir::new().expect("temporary Host state");
+        let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+        std::fs::set_permissions(
+            secret_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make provider secret directory owner-only");
+        let destination = secret_directory.path().join("provider-token");
+        let (service, _native_probe_calls, provider_probe_calls) =
+            service_with_classified_provider_probe(
+                state.path().to_path_buf(),
+                ProviderProvisioningProbeOutcome::Ready,
+            );
+        service.initialize_daemon().expect("initialize Host daemon");
+        let identity = RequestIdentity::new(
+            format!("provider-secret-candidate-{suffix}"),
+            "e".repeat(64),
+        );
+
+        let result = service
+            .provision_provider_secret(
+                LOCAL_DEMO_HOST,
+                "local-demo-desktop-v1",
+                provider_file_authorization(destination.clone()),
+                Zeroizing::new(candidate.to_string()),
+                false,
+                &identity,
+            )
+            .expect("publish the exact newline-terminated candidate");
+
+        assert!(!result.overwritten());
+        assert_eq!(
+            std::fs::read(&destination).expect("read published provider secret"),
+            candidate.as_bytes()
+        );
+        assert_eq!(
+            provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn typed_unknown_provider_outcomes_retain_recovery_ownership() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (suffix, outcome, expected_cancellation) in [
+        (
+            "upstream-still-active",
+            ProviderProvisioningProbeOutcome::UpstreamStillActive,
+            "upstream_still_active",
+        ),
+        (
+            "outcome-unknown",
+            ProviderProvisioningProbeOutcome::OutcomeUnknown,
+            "outcome_unknown",
+        ),
+        (
+            "persistence-failure",
+            ProviderProvisioningProbeOutcome::PersistenceFailure,
+            "confirmed",
+        ),
+    ] {
+        let state = TestStateDir::new().expect("temporary Host state");
+        let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+        std::fs::set_permissions(
+            secret_directory.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("make provider secret directory owner-only");
+        let destination = secret_directory.path().join("provider-token");
+        let operation_id = format!("provider-secret-{suffix}");
+        let identity = RequestIdentity::new(&operation_id, "d".repeat(64));
+        let (service, native_probe_calls, provider_probe_calls) =
+            service_with_classified_provider_probe(state.path().to_path_buf(), outcome);
+        service.initialize_daemon().expect("initialize Host daemon");
+
+        let failure = service
+            .provision_provider_secret(
+                LOCAL_DEMO_HOST,
+                "local-demo-desktop-v1",
+                provider_file_authorization(destination),
+                Zeroizing::new("candidate-provider-secret".to_string()),
+                false,
+                &identity,
+            )
+            .expect_err("unknown provider outcome must stay recovery-owned");
+        assert_eq!(failure.code, ErrorCode::Interrupted);
+        assert_eq!(
+            failure
+                .details
+                .get("admission_cancellation")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_cancellation),
+        );
+        assert_eq!(
+            native_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+        );
+        assert_eq!(
+            provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+        );
+
+        assert_provider_provisioning_recovery_owned(&state, &operation_id);
+    }
+
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    std::fs::set_permissions(
+        secret_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make provider secret directory owner-only");
+    let destination = secret_directory.path().join("provider-token");
+    let identity = RequestIdentity::new("provider-secret-ready", "e".repeat(64));
+    let (service, native_probe_calls, provider_probe_calls) =
+        service_with_classified_provider_probe(
+            state.path().to_path_buf(),
+            ProviderProvisioningProbeOutcome::Ready,
+        );
+    service.initialize_daemon().expect("initialize Host daemon");
+
+    service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            provider_file_authorization(destination),
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect("clean-state provider secret provisioning must complete");
+    assert_eq!(
+        native_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(
+        provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_staged_rollback_retains_pending_journal_and_active_lease() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = TestStateDir::new().expect("temporary Host state");
+    let secret_directory = tempfile::tempdir().expect("temporary provider secret directory");
+    std::fs::set_permissions(
+        secret_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make provider secret directory owner-only");
+    let destination = secret_directory.path().join("provider-token");
+    let identity = RequestIdentity::new("provider-secret-rollback-pending", "b".repeat(64));
+    let paths = storage::provider_secret_file_paths(&destination, identity.key())
+        .expect("deterministic provider secret paths");
+    let native_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider_probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tamper_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = service_with_provider_descriptor_and_readiness_probe(
+        state.path().to_path_buf(),
+        TamperingProviderProvisioningAdapter {
+            staging_path: paths.staging().to_path_buf(),
+            native_probe_calls: Arc::clone(&native_probe_calls),
+            provider_probe_calls: Arc::clone(&provider_probe_calls),
+            tamper_calls: Arc::clone(&tamper_calls),
+        },
+        None,
+    );
+    service.initialize_daemon().expect("initialize Host daemon");
+    let authorization = provider_file_authorization(destination);
+
+    let failure = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            authorization.clone(),
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("tampered staging must prevent rollback terminalization");
+    assert_eq!(failure.code, ErrorCode::StateConflict);
+    assert_eq!(
+        native_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(
+        provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(tamper_calls.load(std::sync::atomic::Ordering::SeqCst), 1,);
+
+    let connection = rusqlite::Connection::open(state.path().join("satelle.sqlite3"))
+        .expect("open Host SQLite state");
+    let retained_state: (String, String) = connection
+        .query_row(
+            "SELECT journal.phase, lease.lease_state
+             FROM provider_secret_provisioning_journal AS journal
+             JOIN control_leases AS lease
+               ON lease.operation_id = journal.operation_id
+              AND lease.provider_probe_ref = journal.provider_probe_ref
+             WHERE journal.operation_id = ?1",
+            [identity.key()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("load retained provider provisioning ownership");
+    assert_eq!(
+        retained_state,
+        ("rollback_pending".to_string(), "active".to_string()),
+    );
+
+    let retry = service
+        .provision_provider_secret(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            authorization,
+            Zeroizing::new("candidate-provider-secret".to_string()),
+            false,
+            &identity,
+        )
+        .expect_err("pending recovery must not start a second operation");
+    assert_eq!(retry.code, ErrorCode::StateConflict);
+    assert_eq!(
+        native_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(
+        provider_probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(tamper_calls.load(std::sync::atomic::Ordering::SeqCst), 1,);
+    let retry_retained_state: (String, String) = connection
+        .query_row(
+            "SELECT journal.phase, lease.lease_state
+             FROM provider_secret_provisioning_journal AS journal
+             JOIN control_leases AS lease
+               ON lease.operation_id = journal.operation_id
+              AND lease.provider_probe_ref = journal.provider_probe_ref
+             WHERE journal.operation_id = ?1",
+            [identity.key()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("reload retained provider provisioning ownership");
+    assert_eq!(retry_retained_state, retained_state);
+}
+
+fn turn_intent_with_extras(prompt: &str, timeout_seconds: u64) -> TurnIntent {
+    let bytes = b"\x89PNG\r\n\x1a\n";
+    let digest = Sha256::digest(bytes);
+    let sha256 = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    turn_intent(prompt)
+        .with_turn_execution_timeout_ms(Some(timeout_seconds * 1_000))
+        .expect("valid Turn timeout")
+        .with_attachments(vec![AttachmentInput::upload(
+            "image/png",
+            u64::try_from(bytes.len()).expect("image size fits u64"),
+            sha256,
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        )])
+        .expect("valid image attachment")
+}
+
+#[test]
+fn local_host_run_and_steer_forward_attachments_and_host_clamped_timeout() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let service = HostService {
+        runtime: RuntimeHandle::new(
+            Ok(state.path().to_path_buf()),
+            RecordingTurnExtrasAdapter {
+                observations: Arc::clone(&observations),
+            },
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    }
+    .with_turn_execution_timeout_for_tests(5);
+
+    let session = service
+        .run(
+            LOCAL_DEMO_HOST,
+            &turn_intent_with_extras("local run extras", 3),
+        )
+        .expect("run local Turn")
+        .session;
+    service
+        .steer(
+            session.session_id(),
+            &turn_intent_with_extras("local steer extras", 7),
+        )
+        .expect("steer local Turn");
+
+    let observations = observations.lock().expect("lock observations");
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0].timeout_seconds, 3);
+    assert_eq!(observations[1].timeout_seconds, 5);
+    for observation in observations.iter() {
+        assert_eq!(observation.attachments.len(), 1);
+        let attachment = &observation.attachments[0];
+        assert_eq!(attachment.media_type, "image/png");
+        assert_eq!(attachment.size_bytes, 8);
+        assert!(
+            attachment
+                .path
+                .starts_with(state.path().join("attachments"))
+        );
+        assert!(
+            attachment
+                .path
+                .file_name()
+                .expect("staged image path has a file name")
+                .to_string_lossy()
+                .starts_with("satelle-image-")
+        );
+        assert!(
+            !attachment.path.exists(),
+            "terminal run and steer must both delete staged images"
+        );
+    }
+    assert_ne!(
+        observations[0].attachments[0].path, observations[1].attachments[0].path,
+        "run and steer must receive separate generated staging names"
+    );
+}
+
+#[test]
+fn unsupported_image_capability_rejects_direct_run_and_steer_before_admission() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let service = HostService {
+        runtime: RuntimeHandle::new(
+            Ok(state.path().to_path_buf()),
+            RecordingTurnExtrasAdapter {
+                observations: Arc::clone(&observations),
+            },
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: false,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let image_intent = turn_intent_with_extras("unsupported image", 3);
+
+    let run_failure = service
+        .run(LOCAL_DEMO_HOST, &image_intent)
+        .expect_err("attached image run must be rejected");
+    assert!(matches!(
+        run_failure,
+        TurnAdmissionFailure::NotAdmitted(error) if error.code == ErrorCode::InvalidUsage
+    ));
+    let detached_run_error = service
+        .run_detached(LOCAL_DEMO_HOST, &image_intent)
+        .expect_err("detached image run must be rejected");
+    assert_eq!(detached_run_error.code, ErrorCode::InvalidUsage);
+    assert!(
+        !state.path().join("attachments").exists(),
+        "unsupported images must be rejected before the attachment store opens"
+    );
+    assert!(observations.lock().expect("lock observations").is_empty());
+
+    let initial = service
+        .run(LOCAL_DEMO_HOST, &turn_intent("image-free run"))
+        .expect("image-free run remains supported")
+        .session;
+    let steer_failure = service
+        .steer(initial.session_id(), &image_intent)
+        .expect_err("attached image steer must be rejected");
+    assert!(matches!(
+        steer_failure,
+        TurnAdmissionFailure::NotAdmitted(error) if error.code == ErrorCode::InvalidUsage
+    ));
+    let detached_steer_error = service
+        .steer_detached(initial.session_id(), &image_intent)
+        .expect_err("detached image steer must be rejected");
+    assert_eq!(detached_steer_error.code, ErrorCode::InvalidUsage);
+
+    let status = service
+        .status(initial.session_id())
+        .expect("seed Session remains readable");
+    assert_eq!(status.turns().len(), 1);
+    assert_eq!(observations.lock().expect("lock observations").len(), 1);
+}
+
+#[test]
+fn admission_request_timeout_tracks_both_configured_readiness_phases() {
+    let mut config = crate::core::SatelleConfig::defaults()
+        .hosts
+        .remove(LOCAL_DEMO_HOST)
+        .expect("built-in Host config exists");
+    assert_eq!(
+        admission_request_timeout(&config),
+        std::time::Duration::from_secs(250)
+    );
+
+    config.timeouts = Some(crate::core::TimeoutConfig {
+        native_readiness: crate::core::ExplicitDuration::parse("2s"),
+        provider_smoke_test: crate::core::ExplicitDuration::parse("3s"),
+        turn_execution: None,
+    });
+    assert_eq!(
+        admission_request_timeout(&config),
+        std::time::Duration::from_secs(15)
+    );
+}
+
+#[test]
+fn configured_remote_alias_reaches_execution_and_session_keeps_host_identity() {
+    const REMOTE_HOST_ALIAS: &str = "studio-workstation";
+
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+
+    let outcome = service
+        .run(
+            REMOTE_HOST_ALIAS,
+            &turn_intent("exercise configured remote Host routing"),
+        )
+        .expect("the Host Daemon should accept its validated configured alias");
+    assert!(
+        outcome
+            .events
+            .iter()
+            .filter(|event| event.event_type() != crate::core::EventType::ProviderSmoke)
+            .all(|event| event.host() == REMOTE_HOST_ALIAS),
+        "the configured alias must reach adapter execution events"
+    );
+    let public_session = outcome.session;
+    assert_eq!(
+        service
+            .status(public_session.session_id())
+            .expect("the admitted Session should remain publicly readable"),
+        public_session
+    );
+
+    // The Controller-local alias selects this daemon, but durable ownership
+    // remains bound to the daemon's stable Host Identity.
+    drop(service);
+    let (storage, _) = crate::host::storage::Storage::open(state.path())
+        .expect("the authoritative Host store should reopen");
+    let stored_session = storage
+        .load_session(public_session.session_id())
+        .expect("the admitted Session should be readable from storage")
+        .expect("the admitted Session should be durable");
+    assert_eq!(
+        stored_session.host_identity(),
+        &storage
+            .host_identity()
+            .expect("the Host Identity should be durable")
+    );
+    assert_eq!(stored_session.to_public(), public_session);
+}
+
+#[test]
+fn configured_remote_alias_is_accepted_by_host_diagnostics() {
+    const REMOTE_HOST_ALIAS: &str = "studio-workstation";
+
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let doctor = service
+        .doctor(
+            REMOTE_HOST_ALIAS,
+            &doctor_selection(&[]),
+            DoctorOptions::default(),
+        )
+        .expect("doctor should diagnose the already-routed Host alias");
+    assert_eq!(doctor.host, REMOTE_HOST_ALIAS);
+
+    let sessions = service
+        .host_sessions(REMOTE_HOST_ALIAS, false)
+        .expect("desktop Session discovery should accept the routed Host alias");
+    assert_eq!(sessions.host, REMOTE_HOST_ALIAS);
+    assert_eq!(
+        sessions.bootstrap_actions,
+        ["direct studio-workstation Host daemon already reachable"]
+    );
+
+    let setup = service
+        .setup(
+            REMOTE_HOST_ALIAS,
+            true,
+            "full".to_string(),
+            Vec::new(),
+            DaemonPathOverrides::default(),
+        )
+        .expect("setup planning should accept the routed Host alias");
+    assert_eq!(setup.host, REMOTE_HOST_ALIAS);
+}
+
+#[derive(Clone, Copy)]
+struct FailingExecutionAdapter;
+
+impl ComputerUseAdapter for FailingExecutionAdapter {
+    fn preflight(
+        &self,
+        host: &str,
+        provider_intent: &crate::host::ProviderComputerUseIntent,
+    ) -> Result<AdapterReadiness, SatelleError> {
+        FakeComputerUseAdapter.preflight(host, provider_intent)
+    }
+
+    fn execute(&self, _request: ExecuteRequest<'_>) -> Result<ExecuteResult, SatelleError> {
+        Err(SatelleError::host_unreachable(LOCAL_DEMO_HOST))
+    }
+
+    fn observe_stop(&self, subject: AdapterSubject<'_>) -> Result<StopObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_stop(subject)
+    }
+
+    fn observe_recovery(
+        &self,
+        subject: AdapterSubject<'_>,
+    ) -> Result<RecoveryObservation, SatelleError> {
+        FakeComputerUseAdapter.observe_recovery(subject)
+    }
+}
+
+#[test]
+fn unsupported_production_execution_is_blocked_without_state_admission() {
+    let (name, evidence, control_plane_admission) = (
+        "unsupported-linux-host",
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        codex_capabilities::ControlPlaneAdmission::not_applicable(),
+    );
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let mut production_snapshot = capability_snapshot(evidence, 7);
+    production_snapshot.control_plane_admission = control_plane_admission;
+    let snapshot = Arc::new(RwLock::new(production_snapshot));
+    let adapter = ProductionComputerUseAdapter::new(
+        Arc::clone(&snapshot),
+        Ok(state.path().join("codex-app-server-work")),
+    );
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::Production {
+            snapshot,
+            daemon_paths: Box::new(test_daemon_paths(&state)),
+            telemetry: crate::host::telemetry::HostTelemetry::new(
+                None,
+                Ok(state.path().to_path_buf()),
+            ),
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let session_id = SessionId::new();
+
+    let assert_blocked_error = |operation: &str, error: &SatelleError| {
+        assert_eq!(error.code, ErrorCode::ComputerUseNotReady);
+        assert!(
+            error.details.is_empty(),
+            "{name} {operation} must remain a native readiness failure"
+        );
+
+        let serialized =
+            serde_json::to_string(error).expect("closed capability blocker must serialize");
+        assert!(!serialized.contains("PRIVATE_PRODUCTION_PROMPT"));
+        assert!(!serialized.contains("fake"));
+    };
+
+    for (operation, failure) in [
+        (
+            "run",
+            service
+                .run(LOCAL_DEMO_HOST, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
+                .expect_err("attached run must be blocked"),
+        ),
+        (
+            "steer",
+            service
+                .steer(&session_id, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
+                .expect_err("attached steer must be blocked before session lookup"),
+        ),
+    ] {
+        assert!(matches!(failure, TurnAdmissionFailure::NotAdmitted(_)));
+        assert_blocked_error(operation, failure.error());
+    }
+
+    for (operation, error) in [
+        (
+            "run",
+            service
+                .run_detached(LOCAL_DEMO_HOST, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
+                .expect_err("detached run must be blocked"),
+        ),
+        (
+            "steer",
+            service
+                .steer_detached(&session_id, &turn_intent("PRIVATE_PRODUCTION_PROMPT"))
+                .expect_err("detached steer must be blocked before session lookup"),
+        ),
+    ] {
+        assert_blocked_error(operation, &error);
+    }
+
+    let stop_error = service
+        .stop(&session_id)
+        .expect_err("stop should remain available without adapter readiness");
+    assert_eq!(stop_error.code, ErrorCode::SessionNotFound);
+
+    let status_error = service
+        .status(&session_id)
+        .expect_err("read-only status should open storage without adapter readiness");
+    assert_eq!(status_error.code, ErrorCode::SessionNotFound);
+
+    let runtime_status = service
+        .daemon_runtime_status()
+        .expect("blocked production execution must leave runtime status readable");
+    assert_eq!(
+        (
+            runtime_status.session_count(),
+            runtime_status.active_turn_count(),
+            runtime_status.recovery_pending_turn_count(),
+        ),
+        (0, 0, 0),
+        "{name} must not durably admit a Session or Turn"
+    );
+}
+
+#[test]
+fn blocked_control_plane_precedes_capability_and_live_desktop_checks() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let evidence = Phase0CapabilityEvidence {
+        codex_version: CodexVersionEvidence::Detected {
+            version: MINIMUM_CODEX_VERSION,
+        },
+        host_platform: HostPlatform::Windows,
+        capabilities: CapabilityMatrix::unproven(),
+    };
+    let mut production_snapshot = capability_snapshot(evidence, 7);
+    production_snapshot.control_plane_admission =
+        codex_capabilities::ControlPlaneAdmission::unavailable(
+            crate::core::ControlPlaneFailureReason::HandshakeUnavailable,
+        );
+    let adapter = ProductionComputerUseAdapter::new(
+        Arc::new(RwLock::new(production_snapshot)),
+        Ok(state.path().join("codex-app-server-work")),
+    );
+    let intent = turn_intent("PRIVATE_PRODUCTION_PROMPT");
+
+    let error = match adapter.preflight(LOCAL_DEMO_HOST, intent.provider_intent()) {
+        Ok(_) => panic!("a blocked control plane must stop before live readiness"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::IncompatibleControlPlane);
+}
+
+#[test]
+fn attached_adapter_failures_return_exact_durable_run_and_steer_handles() {
+    let run_state = TestStateDir::new().expect("temporary run state directory should exist");
+    let run_service = HostService {
+        runtime: RuntimeHandle::new(Ok(run_state.path().to_path_buf()), FailingExecutionAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let run_failure = run_service
+        .run(
+            LOCAL_DEMO_HOST,
+            &turn_intent("PRIVATE_FAIL_AFTER_RUN_COMMIT"),
+        )
+        .expect_err("the deterministic adapter must fail after run admission");
+    let (run_failure_session, run_turn_id) = match run_failure {
+        TurnAdmissionFailure::Admitted {
+            session, turn_id, ..
+        } => (*session, turn_id),
+        other => panic!("postcommit run failure had the wrong phase: {other:?}"),
+    };
+    let run_session_id = run_failure_session.session_id().clone();
+    let run_status = run_service
+        .status(&run_session_id)
+        .expect("the admitted run must remain readable");
+    let durable_run = run_status
+        .turns()
+        .last()
+        .expect("the admitted run must retain its Turn");
+    assert_eq!(durable_run.turn_id(), &run_turn_id);
+    assert_eq!(durable_run.state(), TurnState::RecoveryPending);
+    assert_eq!(run_failure_session, run_status);
+
+    let steer_state = TestStateDir::new().expect("temporary steer state directory should exist");
+    let seeded = HostService {
+        runtime: RuntimeHandle::new(Ok(steer_state.path().to_path_buf()), FakeComputerUseAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let initial = seeded
+        .run(
+            LOCAL_DEMO_HOST,
+            &turn_intent("PRIVATE_SUCCESSFUL_INITIAL_RUN"),
+        )
+        .expect("the initial run should complete");
+    let steer_session_id = initial.session.session_id().clone();
+    drop(seeded);
+    let steer_service = HostService {
+        runtime: RuntimeHandle::new(
+            Ok(steer_state.path().to_path_buf()),
+            FailingExecutionAdapter,
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let steer_failure = steer_service
+        .steer(
+            &steer_session_id,
+            &turn_intent("PRIVATE_FAIL_AFTER_STEER_COMMIT"),
+        )
+        .expect_err("the deterministic adapter must fail after steer admission");
+    let steer_turn_id = match steer_failure {
+        TurnAdmissionFailure::Admitted {
+            session, turn_id, ..
+        } => {
+            assert_eq!(session.session_id(), &steer_session_id);
+            assert_eq!(session.turns().len(), 2);
+            assert_eq!(
+                session.turns().last().map(|turn| turn.state()),
+                Some(TurnState::RecoveryPending)
+            );
+            turn_id
+        }
+        other => panic!("postcommit steer failure had the wrong phase: {other:?}"),
+    };
+    let steer_status = steer_service
+        .status(&steer_session_id)
+        .expect("the admitted steer must remain readable");
+    assert_eq!(steer_status.turns().len(), 2);
+    let durable_steer = steer_status
+        .turns()
+        .last()
+        .expect("the admitted steer must retain its Turn");
+    assert_eq!(durable_steer.turn_id(), &steer_turn_id);
+    assert_eq!(durable_steer.state(), TurnState::RecoveryPending);
+}
+
+#[test]
+fn refreshed_production_snapshot_updates_admission_surfaces_but_not_desktop_discovery() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let initial = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Windows,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        7,
+    );
+    let snapshot = Arc::new(RwLock::new(initial));
+    let adapter = ProductionComputerUseAdapter::new(
+        Arc::clone(&snapshot),
+        Ok(state.path().join("codex-app-server-work")),
+    );
+    let shared_snapshot = Arc::clone(&snapshot);
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::Production {
+            snapshot,
+            daemon_paths: Box::new(test_daemon_paths(&state)),
+            telemetry: crate::host::telemetry::HostTelemetry::new(
+                None,
+                Ok(state.path().to_path_buf()),
+            ),
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let clone = service.clone();
+
+    let mut refreshed = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Missing,
+            host_platform: HostPlatform::Windows,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        11,
+    );
+    refreshed.control_plane_admission = codex_capabilities::ControlPlaneAdmission::unavailable(
+        crate::core::ControlPlaneFailureReason::RuntimeMissing,
+    );
+    replace_production_snapshot(&shared_snapshot, refreshed)
+        .expect("doctor refresh should atomically replace the shared snapshot");
+
+    let refreshed_error = clone
+        .run(
+            LOCAL_DEMO_HOST,
+            &turn_intent("PRIVATE_AFTER_CONTROL_PLANE_REFRESH"),
+        )
+        .expect_err("the cloned service must use refreshed execution readiness");
+    assert!(matches!(
+        refreshed_error,
+        TurnAdmissionFailure::NotAdmitted(_)
+    ));
+    assert_eq!(
+        refreshed_error.error().code,
+        ErrorCode::IncompatibleControlPlane
+    );
+    let sessions = clone
+        .host_sessions(LOCAL_DEMO_HOST, false)
+        .expect("desktop discovery must remain available for readiness diagnosis");
+    assert_eq!(sessions.schema_version, HostSessionsSchemaVersion::V1);
+    assert_eq!(sessions.host, LOCAL_DEMO_HOST);
+    let doctor = clone
+        .doctor(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["codex"]),
+            DoctorOptions::default(),
+        )
+        .expect("non-refresh doctor must read the refreshed snapshot");
+    assert!(doctor.findings.iter().any(|finding| {
+        finding
+            .evidence
+            .contains(&"reason=missing_codex_runtime".to_string())
+    }));
+}
+
+fn production_doctor_test_service(state: &TestStateDir) -> HostService {
+    let evidence = Phase0CapabilityEvidence {
+        codex_version: CodexVersionEvidence::Detected {
+            version: MINIMUM_CODEX_VERSION,
+        },
+        host_platform: HostPlatform::Linux,
+        capabilities: CapabilityMatrix::unproven(),
+    };
+    let snapshot = Arc::new(RwLock::new(capability_snapshot(evidence, 1)));
+    let adapter = ProductionComputerUseAdapter::new(
+        Arc::clone(&snapshot),
+        Ok(state.path().join("codex-app-server-work")),
+    );
+    HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::Production {
+            snapshot,
+            daemon_paths: Box::new(test_daemon_paths(state)),
+            telemetry: crate::host::telemetry::HostTelemetry::new(
+                None,
+                Ok(state.path().to_path_buf()),
+            ),
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    }
+}
+
+#[test]
+fn fatal_doctor_failure_preserves_independent_terminal_probe_results() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let snapshot = Arc::new(RwLock::new(capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    )));
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FakeComputerUseAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::Production {
+            snapshot,
+            daemon_paths: Box::new(test_daemon_paths(&state)),
+            telemetry: crate::host::telemetry::HostTelemetry::new(
+                None,
+                Ok(state.path().to_path_buf()),
+            ),
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    let intent = ProviderComputerUseIntent::new(
+        Some(
+            crate::core::session::EffectiveModelRef::new("failing-model")
+                .expect("valid model alias"),
+        ),
+        Some(
+            crate::core::session::ProviderBindingRef::new("failing-provider")
+                .expect("valid provider alias"),
+        ),
+        true,
+    )
+    .with_experimental_provider_computer_use(true);
+
+    let failure = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["config", "provider", "transport"]),
+            Arc::new(ready_transport()),
+            DoctorOptions::default(),
+            &intent,
+        )
+        .expect_err("provider binding failure must remain a fatal Doctor outcome");
+
+    assert_eq!(failure.error.code, ErrorCode::ModelProviderBindingMissing);
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| { probe.scope == "config" && probe.status == "passed" })
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| { probe.scope == "transport" && probe.status == "passed" })
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| { probe.scope == "provider" && probe.status == "blocked" })
+    );
+}
+
+#[test]
+fn panicked_doctor_worker_preserves_completed_independent_probe_results() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+
+    let failure = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["config", "transport"]),
+            Arc::new(PanickingTestTransportProbe),
+            DoctorOptions::default(),
+            &ProviderComputerUseIntent::host_default(),
+        )
+        .expect_err("the panicked transport worker must fail Doctor");
+
+    assert_eq!(failure.error.code, ErrorCode::StorageIntegrityFailed);
+    assert_eq!(
+        failure.error.message,
+        "Doctor probe transport panicked inside the owned task registry"
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| probe.scope == "config" && probe.status == "passed"),
+        "the completed independent config row must survive the worker panic"
+    );
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .all(|probe| probe.scope != "transport"),
+        "the panicked probe must not be reported as completed evidence"
+    );
+}
+
+#[test]
+fn unrefreshed_provider_probe_keeps_unobserved_readiness_blocked() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["provider"]),
+            Arc::new(ReadyControllerTransportProbe),
+            DoctorOptions::new(false, Some(Duration::from_millis(100)))
+                .expect("positive timeout is valid"),
+            &ProviderComputerUseIntent::host_default(),
+        )
+        .expect("unrefreshed provider Doctor should return its finding");
+    let provider = report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "provider")
+        .expect("provider result");
+
+    assert_eq!(provider.status, "blocked");
+    assert!(
+        provider.finding_ids.iter().any(|finding_id| {
+            finding_id == "production.provider.provider_readiness_not_observed"
+        })
+    );
+    assert!(!report.ready);
+    assert_eq!(report.summary.repairable_findings, 1);
+    assert_eq!(report.findings[0].fixability, DoctorFixability::Repairable);
+}
+
+#[test]
+fn production_doctor_report_times_the_full_scheduled_invocation() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["transport"]),
+            Arc::new(DelayedTestTransportProbe),
+            DoctorOptions::default(),
+            &ProviderComputerUseIntent::host_default(),
+        )
+        .expect("delayed transport Doctor should return");
+
+    assert_ne!(report.started_at, "2026-07-09T00:00:00Z");
+    assert_ne!(report.finished_at, "2026-07-09T00:00:01Z");
+    assert!(
+        report.duration_ms >= 40,
+        "top-level duration must include the delayed scheduled probe"
+    );
+}
+
+#[test]
+fn non_codex_phase0_findings_do_not_block_the_codex_result() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+    let proven = codex_capabilities::CapabilityEvidence::new(
+        codex_capabilities::EvidenceSurface::Stable,
+        codex_capabilities::LiveProofStatus::Passed,
+    );
+    let mut capabilities = CapabilityMatrix::unproven();
+    capabilities.handshake = proven;
+    capabilities.session_thread_creation = proven;
+    capabilities.turn_start = proven;
+    capabilities.lifecycle_events = proven;
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Windows,
+            capabilities,
+        },
+        1,
+    );
+    let HostMode::Production {
+        snapshot: snapshot_slot,
+        ..
+    } = &service.mode
+    else {
+        unreachable!("the fixture is a production Host")
+    };
+    *snapshot_slot
+        .write()
+        .expect("production snapshot lock should be available") = snapshot;
+
+    let report = service
+        .doctor(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["codex"]),
+            DoctorOptions::default(),
+        )
+        .expect("scope-aware Codex Doctor should return");
+    let codex = report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "codex")
+        .expect("Codex result");
+
+    assert_eq!(codex.status, "passed", "{report:#?}");
+    assert!(codex.finding_ids.is_empty());
+    assert!(report.ready);
+}
+
+#[test]
+fn queued_probe_receives_its_full_timeout_after_resource_admission() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+    let selection = doctor_selection(&["transport"]);
+    let intent = ProviderComputerUseIntent::host_default();
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+    let first_service = service.clone();
+    let first_selection = selection.clone();
+    let first_intent = intent.clone();
+    let (first_result_tx, first_result_rx) = std::sync::mpsc::channel();
+    let first = std::thread::spawn(move || {
+        let report = first_service.doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &first_selection,
+            Arc::new(BlockingTestTransportProbe {
+                started: first_started_tx,
+                release: Mutex::new(release_first_rx),
+            }),
+            DoctorOptions::new(false, Some(Duration::from_secs(6)))
+                .expect("positive timeout is valid"),
+            &first_intent,
+        );
+        first_result_tx
+            .send(report)
+            .expect("send first Doctor result");
+    });
+    first_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first transport started");
+
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
+    let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
+    let second_service = service.clone();
+    let second_selection = selection.clone();
+    let second_intent = intent.clone();
+    let second = std::thread::spawn(move || {
+        let report = second_service.doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &second_selection,
+            Arc::new(BlockingTestTransportProbe {
+                started: second_started_tx,
+                release: Mutex::new(release_second_rx),
+            }),
+            DoctorOptions::new(false, Some(Duration::from_secs(4)))
+                .expect("positive timeout is valid"),
+            &second_intent,
+        );
+        second_result_tx
+            .send(report)
+            .expect("send second Doctor result");
+    });
+
+    assert!(
+        second_result_rx
+            .recv_timeout(Duration::from_millis(1_500))
+            .is_err(),
+        "queue wait must not consume the second probe's own timeout"
+    );
+    release_first_tx
+        .send(())
+        .expect("release the first active transport");
+    first_result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first Doctor completes")
+        .expect("first Doctor succeeds");
+    first.join().expect("join first Doctor");
+    second_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second transport starts after the resource is released");
+    assert!(
+        second_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .is_err(),
+        "the admitted probe must retain its full execution budget"
+    );
+    release_second_tx
+        .send(())
+        .expect("release the second active transport");
+    let second_report = second_result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second Doctor completes")
+        .expect("second Doctor succeeds");
+    second.join().expect("join second Doctor");
+    assert_eq!(
+        second_report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "transport")
+            .expect("second transport result")
+            .status,
+        "passed"
+    );
+}
+
+#[test]
+fn cleanup_only_probe_bounds_later_admission_with_a_typed_failure() {
+    let state = TestStateDir::new().expect("temporary state directory should exist");
+    let service = production_doctor_test_service(&state);
+    let selection = doctor_selection(&["transport"]);
+    let intent = ProviderComputerUseIntent::host_default();
+    let options = DoctorOptions::new(false, Some(Duration::from_millis(100)))
+        .expect("positive timeout is valid");
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+    let first = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &selection,
+            Arc::new(BlockingTestTransportProbe {
+                started: first_started_tx,
+                release: Mutex::new(release_first_rx),
+            }),
+            options,
+            &intent,
+        )
+        .expect("the first Doctor call publishes its typed probe timeout");
+    first_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first transport started");
+    assert_eq!(
+        first
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "transport")
+            .expect("first transport result")
+            .status,
+        "timed_out"
+    );
+
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
+    let second_service = service.clone();
+    let second_selection = doctor_selection(&["config", "transport"]);
+    let second_intent = intent.clone();
+    let second = std::thread::spawn(move || {
+        let report = second_service.doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &second_selection,
+            Arc::new(RecordingTestTransportProbe {
+                started: second_started_tx,
+            }),
+            options,
+            &second_intent,
+        );
+        second_result_tx
+            .send(report)
+            .expect("send blocked Doctor result");
+    });
+    let error = second_result_rx
+        .recv_timeout(Duration::from_millis(250))
+        .expect("cleanup-only ownership must bound later admission")
+        .expect_err("cleanup-only ownership must bound later admission");
+    assert_eq!(error.error.code, ErrorCode::StateConflict);
+    assert!(
+        error
+            .partial_probe_results
+            .iter()
+            .any(|probe| probe.scope == "config" && probe.status == "passed"),
+        "admission failure must preserve completed independent probe rows"
+    );
+    assert!(
+        error
+            .partial_probe_results
+            .iter()
+            .all(|probe| probe.scope != "transport"),
+        "a probe that never started must not appear as completed evidence"
+    );
+    assert!(
+        second_started_rx.try_recv().is_err(),
+        "the blocked probe must not start before cleanup releases its lock"
+    );
+    release_first_tx
+        .send(())
+        .expect("release the cleanup-only transport");
+    second.join().expect("join blocked Doctor");
+}
+
+#[test]
+fn expired_admission_remains_authoritative_when_capacity_becomes_ready() {
+    let now = Instant::now();
+    let admission_deadlines = BTreeMap::from([
+        ("transport".to_string(), now - Duration::from_millis(1)),
+        ("provider".to_string(), now + Duration::from_secs(1)),
+    ]);
+
+    assert_eq!(
+        expired_doctor_admission(&admission_deadlines, now).as_deref(),
+        Some("transport"),
+        "an expired wait must fail before a newly available slot can admit the probe"
+    );
+}
+
+#[test]
+fn same_batch_spawn_failure_preserves_already_published_rows() {
+    let selection = doctor_selection(&["config"]);
+    let mut scheduler = production_doctor_scheduler(
+        production_doctor_probes(
+            selection.scopes(),
+            None,
+            true,
+            (
+                DEFAULT_NATIVE_READINESS_TIMEOUT,
+                DEFAULT_PROVIDER_SMOKE_TEST_TIMEOUT,
+            ),
+            false,
+        ),
+        DoctorOptions::default(),
+    )
+    .expect("valid config scheduler");
+    let started = scheduler.start_ready();
+    assert_eq!(started.len(), 1);
+    let snapshot_slot = RwLock::new(capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    ));
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let mut request_guard = DoctorRequestGuard::new(registry.clone(), request_id);
+    let mut execution = ProductionDoctorExecution::new();
+    let mut records = Vec::new();
+    apply_production_doctor_registry_events(
+        &registry,
+        vec![DoctorRegistryEvent::Completed {
+            completion_order: (Instant::now(), 1),
+            probe_id: "config".to_string(),
+            completion: DoctorProbeCompletion::new(
+                DoctorProbeStatus::Passed,
+                DoctorDependentEvidence::Useful,
+            ),
+            effect: Box::new(ProductionDoctorTaskEffect::None),
+        }],
+        DoctorOptions::default(),
+        &snapshot_slot,
+        &mut execution,
+        &mut scheduler,
+        &mut records,
+    )
+    .expect("same-batch completion reduction");
+
+    let failure = fail_production_doctor_request(
+        runtime::integrity_error("Doctor worker could not start"),
+        &mut request_guard,
+        &mut execution,
+        LOCAL_DEMO_HOST,
+        &selection,
+        DoctorOptions::default(),
+        ProductionDoctorProjection {
+            scheduler: &scheduler,
+            records: &records,
+            snapshot_slot: &snapshot_slot,
+            fatal_context: true,
+        },
+    )
+    .expect_err("post-start infrastructure failure");
+
+    assert!(
+        failure
+            .partial_probe_results
+            .iter()
+            .any(|probe| probe.scope == "config" && probe.status == "passed")
+    );
+}
+
+#[test]
+fn retiring_failed_doctor_request_cancels_and_reaps_remaining_tasks() {
+    let registry = DoctorTaskRegistry::new();
+    let request_id = registry.begin_request();
+    let probe = DoctorProbe {
+        probe_id: "retired-request-probe".to_string(),
+        scope: "transport".to_string(),
+        dependencies: Vec::new(),
+        resource_locks: Default::default(),
+        timeout: Duration::from_secs(2),
+        cache_policy: DoctorProbeCachePolicy::Reuse,
+    };
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+    registry
+        .spawn(request_id, &probe, move |context| {
+            started_tx.send(()).expect("signal probe start");
+            while !context.is_cancelled() {
+                std::thread::yield_now();
+            }
+            ProductionDoctorTaskResult {
+                completion: DoctorProbeCompletion::new(
+                    DoctorProbeStatus::TimedOut,
+                    DoctorDependentEvidence::NotUseful,
+                ),
+                effect: ProductionDoctorTaskEffect::None,
+            }
+        })
+        .expect("spawn cancellable Doctor task");
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("probe starts before request retirement");
+    let completed_probe = DoctorProbe {
+        probe_id: "retired-request-completed-probe".to_string(),
+        ..probe
+    };
+    registry
+        .spawn(request_id, &completed_probe, move |_context| {
+            ProductionDoctorTaskResult {
+                completion: DoctorProbeCompletion::new(
+                    DoctorProbeStatus::Passed,
+                    DoctorDependentEvidence::Useful,
+                ),
+                effect: ProductionDoctorTaskEffect::None,
+            }
+        })
+        .expect("spawn completing Doctor task");
+    let completion_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        registry.advance(Instant::now());
+        if registry.request_state_counts(request_id) == (1, 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < completion_deadline,
+            "completed sibling must publish its buffered event"
+        );
+        std::thread::yield_now();
+    }
+
+    registry.retire_request(request_id);
+
+    assert_eq!(registry.request_state_counts(request_id), (0, 0));
+}
+
+#[test]
+fn production_doctor_uses_blocked_probe_results_and_closed_evidence() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Malformed,
+            host_platform: HostPlatform::Windows,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        17,
+    );
+    let report = production_doctor_report(LOCAL_DEMO_HOST, Some("codex"), &snapshot);
+    let serialized = serde_json::to_string(&report).expect("doctor report should serialize");
+
+    assert!(!report.ready);
+    assert_eq!(report.duration_ms, 17);
+    assert_eq!(report.probe_results[0].duration_ms, 17);
+    assert!(
+        report
+            .probe_results
+            .iter()
+            .all(|probe| probe.status == "blocked")
+    );
+    assert!(report.findings.iter().any(|finding| {
+        finding
+            .evidence
+            .contains(&"reason=malformed_codex_version".to_string())
+    }));
+    assert!(
+        report
+            .findings
+            .iter()
+            .all(|finding| finding.scope == "codex")
+    );
+    assert!(!serialized.contains("fake"));
+    assert!(!serialized.contains("codex-cli"));
+}
+
+#[test]
+fn production_doctor_identifies_the_missing_private_native_execution_path() {
+    let mut capabilities = CapabilityMatrix::unproven();
+    capabilities.handshake = codex_capabilities::CapabilityEvidence::new(
+        codex_capabilities::EvidenceSurface::Stable,
+        codex_capabilities::LiveProofStatus::NotRequired,
+    );
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Windows,
+            capabilities,
+        },
+        19,
+    );
+
+    let report = production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| {
+            finding
+                .evidence
+                .contains(&"reason=native_execution_path_unavailable".to_string())
+        })
+        .expect("doctor must identify an absent native path on the private app-server");
+
+    assert_eq!(finding.scope, "computer-use");
+    assert_eq!(
+        finding.summary,
+        "the private Codex app-server exposes no stable native Computer Use path"
+    );
+    assert_eq!(finding.readiness_impact, "blocked");
+    assert!(!report.ready);
+}
+
+#[test]
+fn production_doctor_filters_requested_scopes_without_relabeling_blockers() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Malformed,
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        23,
+    );
+
+    let transport = production_doctor_report(LOCAL_DEMO_HOST, Some("transport"), &snapshot);
+    assert!(transport.ready);
+    assert_eq!(transport.scopes, ["transport"]);
+    assert!(transport.findings.is_empty());
+    assert_eq!(transport.probe_results[0].status, "passed");
+    assert_eq!(transport.probe_results[0].duration_ms, 0);
+    let blocked_transport = DoctorTransportObservation::blocked(DoctorFinding {
+        finding_id: "transport.selected.failed".to_string(),
+        scope: "transport".to_string(),
+        severity: "error".to_string(),
+        fixability: DoctorFixability::ManualActionRequired,
+        readiness_impact: "blocked".to_string(),
+        summary: "the selected transport failed its live observation".to_string(),
+        evidence: vec!["reason=selected_transport_failed".to_string()],
+        recovery_command: None,
+    });
+    let transport_selection = doctor_selection(&["transport"]);
+    let blocked_transport_report = production_doctor_report_with_selection(
+        LOCAL_DEMO_HOST,
+        &transport_selection,
+        &blocked_transport,
+        DoctorOptions::default(),
+        &snapshot,
+    );
+    assert!(!blocked_transport_report.ready);
+    assert_eq!(blocked_transport_report.probe_results[0].status, "blocked");
+    assert_eq!(
+        blocked_transport_report.findings[0].finding_id,
+        "transport.selected.failed"
+    );
+
+    let provider = production_doctor_report(LOCAL_DEMO_HOST, Some("provider"), &snapshot);
+    assert!(!provider.ready);
+    assert_eq!(provider.scopes, ["provider"]);
+    assert_eq!(provider.findings.len(), 1);
+    assert_eq!(provider.findings[0].scope, "provider");
+
+    let config = production_doctor_report(LOCAL_DEMO_HOST, Some("config"), &snapshot);
+    assert!(config.ready);
+    assert_eq!(config.scopes, ["config"]);
+    assert!(config.findings.is_empty());
+    assert_eq!(config.probe_results[0].status, "passed");
+
+    let codex = production_doctor_report(LOCAL_DEMO_HOST, Some("codex"), &snapshot);
+    assert!(!codex.ready);
+    assert!(codex.findings.is_empty());
+    assert_eq!(codex.probe_results[0].status, "blocked");
+    assert_eq!(codex.probe_results[0].dependency_status, "blocked");
+
+    let computer_use = production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
+    assert!(!computer_use.ready);
+    assert!(
+        computer_use
+            .findings
+            .iter()
+            .all(|finding| finding.scope == "computer-use")
+    );
+    assert!(!computer_use.findings.iter().any(|finding| {
+        finding
+            .evidence
+            .contains(&"reason=malformed_codex_version".to_string())
+    }));
+
+    let all = production_doctor_report(LOCAL_DEMO_HOST, Some("all"), &snapshot);
+    assert!(!all.ready);
+    assert_eq!(
+        all.scopes,
+        ["codex", "computer-use", "config", "provider", "transport"]
+    );
+    assert!(all.findings.iter().all(|finding| finding.scope != "all"));
+}
+
+#[test]
+fn platform_log_failure_adds_one_informational_config_finding() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    );
+    let mut report = production_doctor_report(LOCAL_DEMO_HOST, Some("config"), &snapshot);
+
+    apply_platform_log_sink_finding(&mut report, PlatformLogFailureKind::SinkUnavailable);
+
+    assert!(report.ready);
+    assert_eq!(report.summary.informational_findings, 1);
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(
+        report.findings[0].finding_id,
+        "config.platform_log_sink.degraded"
+    );
+    assert_eq!(
+        report.findings[0].fixability,
+        DoctorFixability::Informational
+    );
+    assert_eq!(report.findings[0].readiness_impact, "ready");
+    assert_eq!(report.findings[0].evidence, ["failure=sink_unavailable"]);
+    assert_eq!(
+        report.probe_results[0].finding_ids,
+        ["config.platform_log_sink.degraded"]
+    );
+}
+
+#[test]
+fn doctor_provider_refresh_updates_cache_without_admitting_prompt_work() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let config = crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    let service = HostService {
+        runtime: RuntimeHandle::new_with_readiness_probe_driver(
+            Ok(state.path().to_path_buf()),
+            DoctorRefreshAdapter,
+            DoctorRefreshAdapter,
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    service
+        .runtime
+        .authorize_provider_binding(
+            &local_desktop_binding(),
+            &crate::core::ResolvedProviderBinding::from_authorization(
+                crate::core::ProviderBindingAuthorization::new(
+                    "provider-doctor-model",
+                    "provider-doctor-binding",
+                    "provider-doctor-model",
+                    "provider-doctor-binding",
+                )
+                .with_auth_source(crate::core::ProviderSecretSource::Environment {
+                    variable: "SATELLE_PROVIDER_DOCTOR_TOKEN".to_string(),
+                })
+                .with_experimental_provider_computer_use(true),
+                crate::core::ProviderBindingSource::UserConfig,
+            ),
+        )
+        .expect("authorize the persisted UserConfig provider binding");
+    let intent = ProviderComputerUseIntent::new(
+        Some(
+            crate::core::session::EffectiveModelRef::new("provider-doctor-model")
+                .expect("valid model"),
+        ),
+        Some(
+            crate::core::session::ProviderBindingRef::new("provider-doctor-binding")
+                .expect("valid provider"),
+        ),
+        true,
+    )
+    .with_experimental_provider_computer_use(true);
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["provider"]),
+            Arc::new(ready_transport()),
+            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5)))
+                .expect("positive timeout"),
+            &intent,
+        )
+        .expect("provider doctor refresh should complete");
+
+    assert!(report.ready);
+    assert!(report.changed);
+    assert_eq!(
+        report.cache_updates,
+        ["native_readiness", "provider_smoke"],
+        "the hidden native prerequisite must report its cache mutation"
+    );
+    assert_eq!(report.probe_results.len(), 1);
+    assert_eq!(report.probe_results[0].probe_id, "provider.smoke.refresh");
+    assert_eq!(report.probe_results[0].cache_status, "refreshed");
+    assert!(
+        report.findings[0]
+            .evidence
+            .contains(&"source=refresh".to_string())
+    );
+    let default_report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&[]),
+            Arc::new(ready_transport()),
+            DoctorOptions::new(true, Some(std::time::Duration::from_secs(5)))
+                .expect("positive timeout"),
+            &intent,
+        )
+        .expect("default all-scope doctor refresh should include provider refresh");
+    assert!(
+        default_report
+            .cache_updates
+            .iter()
+            .any(|update| update == "provider_smoke")
+    );
+    assert!(default_report.probe_results.iter().any(|probe| {
+        probe.probe_id == "provider.smoke.refresh" && probe.cache_status == "refreshed"
+    }));
+    assert_eq!(service.host_status().unwrap().sessions, 0);
+}
+
+#[test]
+fn setup_verification_probes_implicit_provider_defaults_before_reporting_ready() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let config = crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST].clone();
+    let service = HostService {
+        runtime: RuntimeHandle::new_with_readiness_probe_driver(
+            Ok(state.path().to_path_buf()),
+            DoctorRefreshAdapter,
+            DoctorRefreshAdapter,
+        ),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(&config),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+
+    let report = service
+        .verify_setup(LOCAL_DEMO_HOST, &ProviderComputerUseIntent::host_default())
+        .expect("implicit provider defaults must complete live setup verification");
+
+    assert!(report.ready);
+    assert!(
+        report
+            .cache_updates
+            .iter()
+            .any(|update| update == "provider_smoke"),
+        "setup verification must probe a runtime-resolved provider default"
+    );
+    assert!(report.probe_results.iter().any(|probe| {
+        probe.probe_id == "provider.smoke.refresh" && probe.cache_status == "refreshed"
+    }));
+}
+
+#[test]
+fn refresh_projection_preserves_worker_finish_timestamps() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    );
+
+    let mut native_report =
+        production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
+    let native_refresh: Result<ReadinessEvidence, SatelleError> =
+        Err(SatelleError::computer_use_not_ready());
+    apply_native_refresh(
+        &mut native_report,
+        &native_refresh,
+        "2026-07-29T21:00:00Z".to_string(),
+        "2026-07-29T21:00:01Z".to_string(),
+        Duration::from_secs(1),
+        true,
+    );
+    assert_eq!(
+        native_report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "computer-use")
+            .expect("native refresh row")
+            .finished_at,
+        "2026-07-29T21:00:01Z"
+    );
+
+    let mut provider_report =
+        production_doctor_report(LOCAL_DEMO_HOST, Some("provider"), &snapshot);
+    let provider_refresh: Result<AdapterReadiness, SatelleError> =
+        Err(SatelleError::computer_use_not_ready());
+    apply_provider_refresh(
+        &mut provider_report,
+        &provider_refresh,
+        "2026-07-29T21:00:02Z".to_string(),
+        "2026-07-29T21:00:03Z".to_string(),
+        Duration::from_secs(1),
+    );
+    assert_eq!(
+        provider_report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "provider")
+            .expect("provider refresh row")
+            .finished_at,
+        "2026-07-29T21:00:03Z"
+    );
+
+    let mut provider_not_required_report =
+        production_doctor_report(LOCAL_DEMO_HOST, Some("provider"), &snapshot);
+    apply_provider_not_required(
+        &mut provider_not_required_report,
+        "2026-07-29T21:00:04Z".to_string(),
+        "2026-07-29T21:00:05Z".to_string(),
+        Duration::from_secs(1),
+    );
+    let provider_not_required = provider_not_required_report
+        .probe_results
+        .iter()
+        .find(|probe| probe.scope == "provider")
+        .expect("no-smoke provider row");
+    assert_eq!(provider_not_required.started_at, "2026-07-29T21:00:04Z");
+    assert_eq!(provider_not_required.finished_at, "2026-07-29T21:00:05Z");
+    assert_eq!(provider_not_required.duration_ms, 1_000);
+}
+
+#[test]
+fn native_refresh_marks_only_repair_owned_failures_repairable() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Linux,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    );
+
+    for (error, expected) in [
+        (
+            SatelleError::computer_use_not_ready(),
+            DoctorFixability::Repairable,
+        ),
+        (
+            SatelleError::native_readiness_timeout(),
+            DoctorFixability::Blocked,
+        ),
+        (SatelleError::storage_busy(), DoctorFixability::Blocked),
+    ] {
+        let mut report = production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
+        apply_native_refresh(
+            &mut report,
+            &Err(error),
+            "2026-07-29T21:00:00Z".to_string(),
+            "2026-07-29T21:00:01Z".to_string(),
+            Duration::from_secs(1),
+            true,
+        );
+
+        assert_eq!(report.findings[0].fixability, expected);
+    }
+}
+
+#[test]
+fn native_refresh_projects_the_exact_isolation_failure_reason() {
+    let snapshot = capability_snapshot(
+        Phase0CapabilityEvidence {
+            codex_version: CodexVersionEvidence::Detected {
+                version: MINIMUM_CODEX_VERSION,
+            },
+            host_platform: HostPlatform::Macos,
+            capabilities: CapabilityMatrix::unproven(),
+        },
+        1,
+    );
+    let mut error = SatelleError::computer_use_not_ready();
+    error.details.insert(
+        "reason".to_string(),
+        json!("native_bridge_launcher_untrusted"),
+    );
+    let mut report = production_doctor_report(LOCAL_DEMO_HOST, Some("computer-use"), &snapshot);
+
+    apply_native_refresh(
+        &mut report,
+        &Err(error),
+        "2026-08-18T13:00:00Z".to_string(),
+        "2026-08-18T13:00:01Z".to_string(),
+        Duration::from_secs(1),
+        true,
+    );
+
+    assert_eq!(
+        report.findings[0].evidence,
+        [
+            "code=computer-use-not-ready",
+            "reason=native_bridge_launcher_untrusted"
+        ]
+    );
+}
+
+#[test]
+fn endpointless_auth_sources_are_reserved_for_builtin_openai() {
+    let openai = crate::core::ProviderBindingAuthorization::new(
+        "openai-model",
+        "openai-provider",
+        "gpt-test",
+        "openai",
+    )
+    .with_auth_source(crate::core::ProviderSecretSource::Environment {
+        variable: "SATELLE_OPENAI_API_KEY".to_string(),
+    });
+    validate_provider_binding_authorization(&openai)
+        .expect("the built-in OpenAI provider may use a Host auth source");
+
+    let custom = crate::core::ProviderBindingAuthorization::new(
+        "custom-model",
+        "custom-provider",
+        "custom-model",
+        "custom-provider",
+    )
+    .with_auth_source(crate::core::ProviderSecretSource::Environment {
+        variable: "SATELLE_CUSTOM_PROVIDER_API_KEY".to_string(),
+    })
+    .with_experimental_provider_computer_use(true);
+    let error = validate_provider_binding_authorization(&custom)
+        .expect_err("a custom provider auth source requires a custom endpoint");
+    assert!(
+        error
+            .message
+            .contains("supported only for the built-in OpenAI provider")
+    );
+}
+
+#[test]
+fn implicit_codex_default_alias_pair_is_reserved_from_provider_authorization() {
+    let reserved = crate::core::ProviderBindingAuthorization::new(
+        DEFAULT_MODEL_BINDING,
+        DEFAULT_PROVIDER_BINDING,
+        "gpt-test",
+        "openai",
+    );
+    let error = validate_provider_binding_authorization(&reserved)
+        .expect_err("the implicit Codex default pair must not name an exact binding");
+    assert_eq!(error.code, crate::core::ErrorCode::ConfigError);
+    assert!(
+        error
+            .message
+            .contains("reserved for implicit Codex defaults")
+    );
+
+    for (model_alias, provider_alias) in [
+        (DEFAULT_MODEL_BINDING, "openai"),
+        ("review", DEFAULT_PROVIDER_BINDING),
+    ] {
+        validate_provider_binding_authorization(&crate::core::ProviderBindingAuthorization::new(
+            model_alias,
+            provider_alias,
+            "gpt-test",
+            "openai",
+        ))
+        .expect("only the exact implicit default pair is reserved");
+    }
+}
+
+#[test]
+fn production_adapter_accepts_host_authorized_binding_without_resolving_auth() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let host_auth = crate::core::ProviderSecretSource::Environment {
+        variable: "SATELLE_HOST_OWNED_PROVIDER_SECRET_MISSING".to_string(),
+    };
+    let adapter = ProductionComputerUseAdapter::with_readiness_policy(
+        Arc::new(RwLock::new(capability_snapshot(
+            Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Malformed,
+                host_platform: HostPlatform::Linux,
+                capabilities: CapabilityMatrix::unproven(),
+            },
+            0,
+        ))),
+        Ok(state.path().to_path_buf()),
+        crate::host::runtime::ProductionAdapterPolicy {
+            native_readiness_timeout: std::time::Duration::from_secs(1),
+            native_readiness_ttl: time::Duration::minutes(5),
+            provider_smoke_timeout: std::time::Duration::from_secs(1),
+            provider_smoke_success_ttl: time::Duration::hours(24),
+            provider_smoke_failure_ttl: time::Duration::minutes(10),
+            desktop_bindings: std::collections::BTreeMap::from([(
+                "local-demo-desktop-v1".to_string(),
+                crate::core::DesktopSelectionPolicy {
+                    desktop_user: None,
+                    preference: None,
+                    native_selector: None,
+                },
+            )]),
+        },
+    );
+    let binding = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review",
+            "openai",
+            "host-model",
+            "host-provider",
+        )
+        .with_endpoint("https://host-provider.invalid/v1")
+        .with_auth_source(host_auth.clone()),
+        crate::core::ProviderBindingSource::HostOwned,
+    );
+    let intent = ProviderComputerUseIntent::new(
+        Some(
+            crate::core::session::EffectiveModelRef::new("review")
+                .expect("valid requested model alias"),
+        ),
+        Some(
+            crate::core::session::ProviderBindingRef::new("openai")
+                .expect("valid requested provider alias"),
+        ),
+        false,
+    )
+    .with_resolved_provider_binding(binding)
+    .with_experimental_provider_computer_use(true);
+
+    let resolved = ComputerUseAdapter::resolve_provider_binding(&adapter, LOCAL_DEMO_HOST, &intent)
+        .expect("Host-owned binding resolution must not read its missing secret");
+
+    assert_eq!(
+        crate::core::ProviderBindingSource::HostOwned,
+        resolved.source()
+    );
+    assert_eq!("host-model", resolved.model());
+    assert_eq!("host-provider", resolved.model_provider());
+    assert_eq!(
+        Some("https://host-provider.invalid/v1"),
+        resolved.endpoint()
+    );
+    assert_eq!(Some(&host_auth), resolved.auth_source());
+    assert!(resolved.experimental_provider_computer_use());
+}
+
+#[test]
+fn unresolved_host_secret_maps_to_the_typed_public_error_without_descriptor_text() {
+    let variable = format!(
+        "SATELLE_PROVIDER_AUTH_MISSING_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    let binding = crate::core::ResolvedProviderBinding::from_authorization(
+        crate::core::ProviderBindingAuthorization::new(
+            "review",
+            "openai",
+            "host-model",
+            "host-provider",
+        )
+        .with_endpoint("https://host-provider.invalid/v1")
+        .with_auth_source(crate::core::ProviderSecretSource::Environment {
+            variable: variable.clone(),
+        }),
+        crate::core::ProviderBindingSource::HostOwned,
+    );
+
+    let error =
+        crate::host::runtime::resolve_provider_child_secret_for_test(&binding, LOCAL_DEMO_HOST)
+            .expect_err("the missing Host environment secret must fail closed");
+
+    assert_eq!(ErrorCode::ProviderSecretResolutionFailed, error.code);
+    assert_eq!(error.details["reason"], "provider_auth_unresolved");
+    let encoded = serde_json::to_string(&error).expect("serialize typed error");
+    assert!(!encoded.contains(&variable));
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_descriptor_validation_resolves_only_during_target_host_refresh() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = TestStateDir::new().expect("temporary state directory");
+    let secret_directory = tempfile::tempdir().expect("create provider secret directory");
+    std::fs::set_permissions(
+        secret_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make provider secret directory owner-only");
+    let secret_path = secret_directory.path().join("provider-token");
+    let secret_canary = "PRIVATE_PROVIDER_REFRESH_SECRET_CANARY";
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), SecretBoundaryAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    service
+        .runtime
+        .authorize_provider_binding(
+            &local_desktop_binding(),
+            &crate::core::ResolvedProviderBinding::from_authorization(
+                crate::core::ProviderBindingAuthorization::new(
+                    "review",
+                    "openai",
+                    "host-model",
+                    "openai",
+                )
+                .with_endpoint("http://127.0.0.1:9")
+                .with_auth_source(crate::core::ProviderSecretSource::File {
+                    path: secret_path.clone(),
+                })
+                .with_experimental_provider_computer_use(true),
+                crate::core::ProviderBindingSource::UserConfig,
+            ),
+        )
+        .expect("seed the provider descriptor for validation");
+
+    let cached = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            crate::host::ProviderDescriptorValidationOptions::new(
+                crate::core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("cached validation remains observation-only");
+    assert_eq!(
+        cached.validation().outcome(),
+        crate::core::ProviderAuthValidationOutcome::UnresolvedHostSecret
+    );
+    assert_eq!(
+        cached.validation().observation_source(),
+        crate::core::ProviderAuthObservationSource::Live
+    );
+    assert!(!secret_path.exists());
+
+    std::fs::write(&secret_path, secret_canary).expect("write provider secret canary");
+    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+        .expect("make provider secret owner-only");
+    let refreshed = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            crate::host::ProviderDescriptorValidationOptions::new(
+                crate::core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("live validation resolves at the target Host");
+    assert_eq!(
+        refreshed.validation().outcome(),
+        crate::core::ProviderAuthValidationOutcome::Resolved
+    );
+    assert_eq!(
+        refreshed.validation().observation_source(),
+        crate::core::ProviderAuthObservationSource::Live
+    );
+    let public = crate::core::PublicProviderDescriptorValidation::from(&refreshed);
+    let encoded = serde_json::to_string(&public).expect("serialize public validation");
+    assert!(!encoded.contains(secret_canary));
+    assert!(!encoded.contains(secret_path.to_string_lossy().as_ref()));
+
+    let cached_after_pass = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            crate::host::ProviderDescriptorValidationOptions::new(
+                crate::core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("cached validation remains deferred after a live pass");
+    assert_eq!(
+        cached_after_pass.validation().outcome(),
+        crate::core::ProviderAuthValidationOutcome::ConfiguredDeferred
+    );
+    assert_eq!(
+        cached_after_pass.validation().observation_source(),
+        crate::core::ProviderAuthObservationSource::Deferred
+    );
+
+    std::fs::remove_file(&secret_path).expect("remove provider secret");
+    let unresolved = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            crate::host::ProviderDescriptorValidationOptions::new(
+                crate::core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("live validation reports a closed unresolved outcome");
+    assert_eq!(
+        unresolved.validation().outcome(),
+        crate::core::ProviderAuthValidationOutcome::UnresolvedHostSecret
+    );
+    assert_eq!(
+        unresolved.validation().observation_source(),
+        crate::core::ProviderAuthObservationSource::Live
+    );
+    let encoded = serde_json::to_string(&crate::core::PublicProviderDescriptorValidation::from(
+        &unresolved,
+    ))
+    .expect("serialize unresolved public validation");
+    assert!(!encoded.contains(secret_canary));
+    assert!(!encoded.contains(secret_path.to_string_lossy().as_ref()));
+
+    let cached_after_failure = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            crate::host::ProviderDescriptorValidationOptions::new(
+                crate::core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("cached validation remains deferred after a live failure");
+    assert_eq!(
+        cached_after_failure.validation().outcome(),
+        crate::core::ProviderAuthValidationOutcome::UnresolvedHostSecret
+    );
+    assert_eq!(
+        cached_after_failure.validation().observation_source(),
+        crate::core::ProviderAuthObservationSource::Live
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_upstream_validation_returns_only_the_closed_smoke_failed_outcome() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let state = TestStateDir::new().expect("temporary state directory");
+    let secret_directory = tempfile::tempdir().expect("create provider secret directory");
+    std::fs::set_permissions(
+        secret_directory.path(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("make provider secret directory owner-only");
+    let secret_path = secret_directory.path().join("provider-token");
+    std::fs::write(&secret_path, "provider-smoke-token").expect("write provider smoke secret");
+    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+        .expect("make provider smoke secret owner-only");
+    let service = HostService {
+        runtime: RuntimeHandle::new(Ok(state.path().to_path_buf()), FailedProviderSmokeAdapter),
+        operation_capacity: Arc::new(OperationCapacity::default()),
+        turn_execution_timeout: crate::host::configured_turn_execution_timeout(
+            &crate::core::SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ),
+        mode: HostMode::TestFake {
+            image_attachments: true,
+        },
+        bootstrap_auth: None,
+        bootstrap_maintenance: Arc::new(Mutex::new(None)),
+        doctor_tasks: DoctorTaskRegistry::new(),
+    };
+    service
+        .runtime
+        .authorize_provider_binding(
+            &local_desktop_binding(),
+            &crate::core::ResolvedProviderBinding::from_authorization(
+                crate::core::ProviderBindingAuthorization::new(
+                    "review",
+                    "openai",
+                    "host-model",
+                    "openai",
+                )
+                .with_auth_source(crate::core::ProviderSecretSource::File { path: secret_path }),
+                crate::core::ProviderBindingSource::UserConfig,
+            ),
+        )
+        .expect("seed provider binding before failed smoke");
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            crate::host::ProviderDescriptorValidationOptions::new(
+                crate::core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("upstream smoke failure must become a closed validation outcome");
+    assert_eq!(
+        validation.validation().outcome(),
+        crate::core::ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed
+    );
+    assert_eq!(
+        validation.validation().observation_source(),
+        crate::core::ProviderAuthObservationSource::Live
+    );
+    let public = crate::core::PublicProviderDescriptorValidation::from(&validation);
+    let encoded = serde_json::to_value(public).expect("serialize closed validation");
+    assert_eq!(
+        encoded["validation"]["outcome"],
+        crate::core::ProviderAuthValidationOutcome::ProviderComputerUseSmokeTestFailed.as_str()
+    );
+}
+
+#[test]
+fn provider_descriptor_refresh_replays_control_plane_errors_without_reclassifying_them() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        HostBusyProviderPreflightAdapter {
+            calls: Arc::clone(&calls),
+        },
+        None,
+    );
+    service.initialize_daemon().expect("initialize daemon");
+
+    let token = ApiBearerToken::generate().expect("generate token");
+    let principal = service
+        .register_api_token(
+            &token,
+            "provider-validation-host-busy",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register token");
+    let authority = MutationAuthority::new(principal, "provider-validation-host-busy")
+        .expect("construct mutation authority");
+    let options = || {
+        crate::host::ProviderDescriptorValidationOptions::new(
+            crate::core::ProviderAuthValidationMode::RefreshProviderSmoke,
+            false,
+            false,
+            true,
+        )
+    };
+
+    let first = service
+        .validate_provider_descriptor_idempotent(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            options(),
+            &authority,
+        )
+        .expect_err("HostBusy must propagate instead of becoming a provider outcome");
+    let replay = service
+        .validate_provider_descriptor_idempotent(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            options(),
+            &authority,
+        )
+        .expect_err("the exact HostBusy failure must replay");
+
+    assert_eq!(first.code, ErrorCode::HostBusy);
+    assert_eq!(replay.code, ErrorCode::HostBusy);
+    assert_eq!(first.message, replay.message);
+    assert_eq!(first.recovery_command, replay.recovery_command);
+    assert_eq!(first.details, replay.details);
+    assert_eq!(
+        1,
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        "durable failure replay must not repeat preflight"
+    );
+}
+
+#[test]
+fn doctor_provider_and_default_scopes_report_closed_descriptor_status_without_secret_text() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let service = HostService::local_demo_for_tests_at(state.path())
+        .expect("construct deterministic Host service");
+    let variable = format!(
+        "SATELLE_DOCTOR_PROVIDER_SECRET_{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    service
+        .runtime
+        .authorize_provider_binding(
+            &local_desktop_binding(),
+            &crate::core::ResolvedProviderBinding::from_authorization(
+                crate::core::ProviderBindingAuthorization::new(
+                    "review",
+                    "openai",
+                    "provider-doctor-model",
+                    "provider-doctor-binding",
+                )
+                .with_auth_source(crate::core::ProviderSecretSource::Environment {
+                    variable: variable.clone(),
+                })
+                .with_experimental_provider_computer_use(true),
+                crate::core::ProviderBindingSource::UserConfig,
+            ),
+        )
+        .expect("authorize the persisted UserConfig provider binding");
+    let intent = ProviderComputerUseIntent::new(
+        Some(
+            crate::core::session::EffectiveModelRef::new("review")
+                .expect("valid requested model alias"),
+        ),
+        Some(
+            crate::core::session::ProviderBindingRef::new("openai")
+                .expect("valid requested provider alias"),
+        ),
+        false,
+    );
+
+    for scope in [None, Some("provider"), Some("all")] {
+        let scopes = scope.map_or_else(Vec::new, |scope| vec![scope]);
+        let report = service
+            .doctor_with_provider_intent(
+                LOCAL_DEMO_HOST,
+                &doctor_selection(&scopes),
+                Arc::new(ready_transport()),
+                DoctorOptions::new(false, None).expect("default timeout is valid"),
+                &intent,
+            )
+            .expect("read-only doctor should classify its provider descriptor");
+        let evidence = report
+            .findings
+            .iter()
+            .flat_map(|finding| finding.evidence.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(
+            evidence.contains(&"provider_auth_outcome=configured_deferred".to_string()),
+            "doctor must report the closed descriptor outcome"
+        );
+        assert!(
+            evidence.contains(&"provider_auth_observation_source=deferred".to_string()),
+            "doctor must distinguish deferred descriptor inspection from live resolution"
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .expect("serialize doctor report")
+                .contains(&variable),
+            "doctor output must not return environment variable names or secret material"
+        );
+    }
+}
+
+#[test]
+fn named_missing_provider_descriptor_remains_observable_to_cached_validation() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        FakeComputerUseAdapter,
+        Some("missing-provider-token".to_string()),
+    );
+    let intent = provider_intent_with_missing_descriptor();
+
+    let resolution = service
+        .resolve_provider_binding(LOCAL_DEMO_HOST, &intent)
+        .expect("diagnostic binding resolution must preserve a missing descriptor");
+    let ProviderBindingResolution::MissingDescriptor {
+        binding,
+        auth_source_name,
+    } = resolution
+    else {
+        panic!("named missing descriptor must not be reported as ready");
+    };
+    assert_eq!("missing-provider-token", auth_source_name);
+    assert_eq!("provider-model", binding.model());
+    assert_eq!(None, binding.auth_source());
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            crate::host::ProviderDescriptorValidationOptions::new(
+                crate::core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("cached validation must classify the missing descriptor");
+    assert_eq!(
+        crate::core::ProviderAuthValidationOutcome::MissingDescriptor,
+        validation.validation().outcome()
+    );
+    assert_eq!(
+        crate::core::ProviderAuthObservationSource::Deferred,
+        validation.validation().observation_source()
+    );
+}
+
+#[test]
+fn provider_binding_without_auth_source_is_resolved_by_cached_validation() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), FakeComputerUseAdapter, None);
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            crate::host::ProviderDescriptorValidationOptions::new(
+                crate::core::ProviderAuthValidationMode::Cached,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("cached validation must accept a binding that requires no secret");
+    assert_eq!(
+        crate::core::ProviderAuthValidationOutcome::Resolved,
+        validation.validation().outcome()
+    );
+    assert_eq!(
+        crate::core::ProviderAuthObservationSource::Cached,
+        validation.validation().observation_source(),
+        "cached validation must not invoke secret resolution"
+    );
+}
+
+#[test]
+fn provider_binding_without_auth_source_runs_live_refresh_validation() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let service =
+        service_with_provider_descriptor(state.path().to_path_buf(), FakeComputerUseAdapter, None);
+
+    let validation = service
+        .validate_provider_descriptor(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "review",
+            "openai",
+            crate::host::ProviderDescriptorValidationOptions::new(
+                crate::core::ProviderAuthValidationMode::RefreshProviderSmoke,
+                false,
+                false,
+                false,
+            ),
+        )
+        .expect("refresh validation must run the live provider smoke");
+    assert_eq!(
+        crate::core::ProviderAuthValidationOutcome::Resolved,
+        validation.validation().outcome()
+    );
+    assert_eq!(
+        crate::core::ProviderAuthObservationSource::Live,
+        validation.validation().observation_source()
+    );
+}
+
+#[test]
+fn doctor_reports_a_named_missing_provider_descriptor_without_resolving_it() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        FakeComputerUseAdapter,
+        Some("missing-provider-token".to_string()),
+    );
+
+    let report = service
+        .doctor_with_provider_intent(
+            LOCAL_DEMO_HOST,
+            &doctor_selection(&["provider"]),
+            Arc::new(ready_transport()),
+            DoctorOptions::new(false, None).expect("default timeout is valid"),
+            &provider_intent_with_missing_descriptor(),
+        )
+        .expect("doctor must preserve the missing descriptor as diagnostic evidence");
+    let evidence = report
+        .findings
+        .iter()
+        .flat_map(|finding| finding.evidence.iter())
+        .collect::<Vec<_>>();
+    assert!(
+        evidence
+            .iter()
+            .any(|value| value.as_str() == "provider_auth_outcome=missing_descriptor")
+    );
+    assert!(
+        evidence
+            .iter()
+            .any(|value| value.as_str() == "provider_auth_observation_source=deferred")
+    );
+}
+
+#[test]
+fn strict_provider_smoke_rejects_a_missing_descriptor_before_adapter_preflight() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        ProviderPreflightCounter {
+            calls: Arc::clone(&calls),
+            gate: None,
+        },
+        Some("missing-provider-token".to_string()),
+    );
+
+    let error = service
+        .runtime
+        .refresh_provider_smoke(LOCAL_DEMO_HOST, &provider_intent_with_missing_descriptor())
+        .expect_err("strict provider smoke must fail closed");
+    assert_eq!(ErrorCode::ProviderSecretResolutionFailed, error.code);
+    assert_eq!(error.details["auth_source"], "missing-provider-token");
+    assert_eq!(
+        0,
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        "the adapter must not receive preflight for a missing descriptor"
+    );
+}
+
+#[test]
+fn concurrent_provider_binding_authorization_retries_share_one_live_validation() {
+    let state = crate::host::TestStateDir::new().expect("temporary state directory");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = ProviderPreflightGate::default();
+    let service = Arc::new(service_with_provider_descriptor(
+        state.path().to_path_buf(),
+        ProviderPreflightCounter {
+            calls: Arc::clone(&calls),
+            gate: Some(gate.clone()),
+        },
+        None,
+    ));
+    service.initialize_daemon().expect("initialize daemon");
+
+    let token = ApiBearerToken::generate().expect("generate token");
+    let principal = service
+        .register_api_token(
+            &token,
+            "provider-authorization-concurrency",
+            ApiScopes::CONTROL,
+            None,
+        )
+        .expect("register token");
+    let authority =
+        MutationAuthority::new(principal, "provider-authorization-concurrency").expect("authority");
+    let authorization = ProviderBindingAuthorization::new("vision", "open_ai", "gpt-5.6", "openai");
+
+    let leader_service = Arc::clone(&service);
+    let leader_authority = authority.clone();
+    let leader_authorization = authorization.clone();
+    let leader = std::thread::spawn(move || {
+        leader_service.authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "vision",
+            "open_ai",
+            leader_authorization,
+            &leader_authority,
+        )
+    });
+
+    assert!(
+        gate.wait_for_started(Duration::from_secs(5)),
+        "leader validation did not start"
+    );
+
+    let follower_service = Arc::clone(&service);
+    let follower_authority = authority.clone();
+    let follower_authorization = authorization.clone();
+    let follower = std::thread::spawn(move || {
+        follower_service.authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "vision",
+            "open_ai",
+            follower_authorization,
+            &follower_authority,
+        )
+    });
+
+    let follower_registered = service
+        .operation_capacity
+        .wait_for_follower_registration(Duration::from_secs(5));
+    let conflict = service
+        .authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "vision",
+            "open_ai",
+            ProviderBindingAuthorization::new("vision", "open_ai", "gpt-conflict", "openai"),
+            &authority,
+        )
+        .expect_err("changed authorization must conflict");
+    let calls_before_release = calls.load(std::sync::atomic::Ordering::SeqCst);
+    gate.release();
+
+    assert!(follower_registered, "exact retry did not join the leader");
+    assert_eq!(ErrorCode::IdempotencyKeyConflict, conflict.code);
+    assert_eq!(
+        1, calls_before_release,
+        "concurrent requests performed duplicate live validation"
+    );
+
+    let leader_binding = leader
+        .join()
+        .expect("leader thread")
+        .expect("leader authorization");
+    let follower_binding = follower
+        .join()
+        .expect("follower thread")
+        .expect("follower authorization");
+    assert_eq!(
+        leader_binding.binding_digest(),
+        follower_binding.binding_digest()
+    );
+
+    let replay = service
+        .authorize_provider_binding_idempotent(
+            LOCAL_DEMO_HOST,
+            "local-demo-desktop-v1",
+            "vision",
+            "open_ai",
+            authorization,
+            &authority,
+        )
+        .expect("terminal replay");
+    assert_eq!(leader_binding.binding_digest(), replay.binding_digest());
+    assert_eq!(
+        1,
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        "terminal replay repeated live validation"
+    );
+    assert_eq!(
+        Some(leader_binding.binding_digest()),
+        service
+            .runtime
+            .provider_binding_digest(&local_desktop_binding(), "vision", "open_ai")
+            .expect("read persisted provider binding")
+            .as_deref()
+    );
+}
+
+fn capability_snapshot(
+    evidence: Phase0CapabilityEvidence,
+    duration_ms: u64,
+) -> ProductionCapabilitySnapshot {
+    ProductionCapabilitySnapshot {
+        evidence,
+        verdict: evaluate_phase0_support(evidence),
+        control_plane_admission: codex_capabilities::ControlPlaneAdmission::not_applicable(),
+        budget_failure: None,
+        started_at: "2026-07-09T00:00:00Z".to_string(),
+        finished_at: "2026-07-09T00:00:01Z".to_string(),
+        duration_ms,
+    }
+}
+
+#[test]
+fn doctor_native_timeout_without_worker_result_uses_current_execution() {
+    for late_cache_status in [None, Some("refreshed"), Some("refreshed_failed")] {
+        let snapshot = capability_snapshot(
+            Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Detected {
+                    version: MINIMUM_CODEX_VERSION,
+                },
+                host_platform: HostPlatform::Windows,
+                capabilities: CapabilityMatrix::unproven(),
+            },
+            5_432,
+        );
+        let selection = doctor_selection(&["codex", "computer-use"]);
+        let options = DoctorOptions::new(true, None).unwrap();
+        let mut scheduler = production_doctor_scheduler(
+            production_doctor_probes(
+                selection.scopes(),
+                None,
+                false,
+                (Duration::from_secs(120), Duration::from_secs(60)),
+                true,
+            ),
+            options,
+        )
+        .unwrap();
+        scheduler.start_ready();
+        scheduler
+            .finish(
+                "codex",
+                DoctorProbeCompletion::new(
+                    DoctorProbeStatus::Passed,
+                    DoctorDependentEvidence::Useful,
+                ),
+            )
+            .unwrap();
+        scheduler.start_ready();
+        let mut records = vec![DoctorProbeExecutionRecord {
+            probe_id: "codex".into(),
+            status: DoctorProbeStatus::Passed,
+        }];
+        let mut execution = ProductionDoctorExecution::new();
+        execution.snapshot = Some(snapshot.clone());
+        let slot = RwLock::new(snapshot.clone());
+        apply_production_doctor_registry_events(
+            &DoctorTaskRegistry::new(),
+            vec![DoctorRegistryEvent::TimedOut {
+                probe_id: "computer-use".into(),
+            }],
+            options,
+            &slot,
+            &mut execution,
+            &mut scheduler,
+            &mut records,
+        )
+        .unwrap();
+        if let Some(status) = late_cache_status {
+            apply_production_doctor_effect(
+                &mut execution,
+                ProductionDoctorTaskEffect::PersistedCacheUpdate {
+                    cache: "native_readiness",
+                    status,
+                },
+            );
+        }
+        let report = execution
+            .project_report(
+                LOCAL_DEMO_HOST,
+                &selection,
+                options,
+                ProductionDoctorProjection {
+                    scheduler: &scheduler,
+                    records: &records,
+                    snapshot_slot: &slot,
+                    fatal_context: false,
+                },
+            )
+            .unwrap();
+        let native = report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "computer-use")
+            .unwrap();
+        assert_eq!(native.probe_id, "computer-use.native.refresh");
+        assert_eq!(native.status, "timed_out");
+        let timing = scheduler.timing("computer-use").unwrap();
+        assert_eq!(native.started_at, timing.started_at);
+        assert_eq!(native.finished_at, timing.finished_at);
+        assert_eq!(native.duration_ms, timing.duration.as_millis() as u64);
+        assert_ne!(native.started_at, snapshot.started_at);
+        assert_ne!(native.finished_at, snapshot.finished_at);
+        assert_ne!(native.duration_ms, snapshot.duration_ms);
+        assert_eq!(
+            native.cache_status,
+            late_cache_status.unwrap_or("not_updated")
+        );
+        assert_eq!(report.changed, late_cache_status.is_some());
+        assert_eq!(
+            report.cache_updates,
+            if late_cache_status.is_some() {
+                vec!["native_readiness".to_string()]
+            } else {
+                Vec::new()
+            }
+        );
+        assert!(report.findings.iter().any(|finding| {
+            finding
+                .evidence
+                .iter()
+                .any(|entry| entry == "code=native-readiness-timeout")
+        }));
+    }
+}
+
+#[test]
+fn doctor_provider_timeout_preserves_observed_late_cache_outcomes() {
+    for late_cache_status in [None, Some("refreshed"), Some("refreshed_failed")] {
+        let snapshot = capability_snapshot(
+            Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Unavailable,
+                host_platform: HostPlatform::Windows,
+                capabilities: CapabilityMatrix::unproven(),
+            },
+            5_432,
+        );
+        let selection = doctor_selection(&["provider"]);
+        let options = DoctorOptions::new(true, None).unwrap();
+        let mut scheduler = production_doctor_scheduler(
+            production_doctor_probes(
+                selection.scopes(),
+                None,
+                false,
+                (Duration::from_secs(120), Duration::from_secs(60)),
+                true,
+            ),
+            options,
+        )
+        .unwrap();
+        scheduler.start_ready();
+        let mut records = Vec::new();
+        let mut execution = ProductionDoctorExecution::new();
+        execution.snapshot = Some(snapshot.clone());
+        let slot = RwLock::new(snapshot);
+        apply_production_doctor_registry_events(
+            &DoctorTaskRegistry::new(),
+            vec![DoctorRegistryEvent::TimedOut {
+                probe_id: "provider".into(),
+            }],
+            options,
+            &slot,
+            &mut execution,
+            &mut scheduler,
+            &mut records,
+        )
+        .unwrap();
+        if let Some(status) = late_cache_status {
+            apply_production_doctor_effect(
+                &mut execution,
+                ProductionDoctorTaskEffect::PersistedCacheUpdate {
+                    cache: "provider_smoke",
+                    status,
+                },
+            );
+        }
+        let report = execution
+            .project_report(
+                LOCAL_DEMO_HOST,
+                &selection,
+                options,
+                ProductionDoctorProjection {
+                    scheduler: &scheduler,
+                    records: &records,
+                    snapshot_slot: &slot,
+                    fatal_context: false,
+                },
+            )
+            .unwrap();
+        let provider = report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "provider")
+            .unwrap();
+        let timing = scheduler.timing("provider").unwrap();
+        assert_eq!(provider.started_at, timing.started_at);
+        assert_eq!(provider.finished_at, timing.finished_at);
+        assert_eq!(provider.duration_ms, timing.duration.as_millis() as u64);
+        assert_eq!(provider.status, "timed_out");
+        assert_eq!(
+            provider.cache_status,
+            late_cache_status.unwrap_or("not_persisted")
+        );
+        assert_eq!(report.changed, late_cache_status.is_some());
+        assert_eq!(
+            report.cache_updates,
+            if late_cache_status.is_some() {
+                vec!["provider_smoke".to_string()]
+            } else {
+                Vec::new()
+            }
+        );
+    }
+}
+
+#[test]
+fn doctor_phase0_timeout_keeps_attempt_budget_without_a_new_snapshot() {
+    for budget_ms in [None, Some(0), Some(28_987)] {
+        let snapshot = capability_snapshot(
+            Phase0CapabilityEvidence {
+                codex_version: CodexVersionEvidence::Unavailable,
+                host_platform: HostPlatform::Windows,
+                capabilities: CapabilityMatrix::unproven(),
+            },
+            5_432,
+        );
+        let selection = doctor_selection(&["codex", "config"]);
+        let options = DoctorOptions::new(true, None).unwrap();
+        let mut scheduler = production_doctor_scheduler(
+            production_doctor_probes(
+                selection.scopes(),
+                None,
+                false,
+                (Duration::from_secs(120), Duration::from_secs(60)),
+                true,
+            ),
+            options,
+        )
+        .unwrap();
+        scheduler.start_ready();
+        scheduler
+            .finish(
+                "codex",
+                DoctorProbeCompletion::new(
+                    DoctorProbeStatus::TimedOut,
+                    DoctorDependentEvidence::NotUseful,
+                ),
+            )
+            .unwrap();
+        scheduler
+            .finish(
+                "config",
+                DoctorProbeCompletion::new(
+                    DoctorProbeStatus::Passed,
+                    DoctorDependentEvidence::Useful,
+                ),
+            )
+            .unwrap();
+        let records = vec![
+            DoctorProbeExecutionRecord {
+                probe_id: "codex".into(),
+                status: DoctorProbeStatus::TimedOut,
+            },
+            DoctorProbeExecutionRecord {
+                probe_id: "config".into(),
+                status: DoctorProbeStatus::Passed,
+            },
+        ];
+        let mut execution = ProductionDoctorExecution::new();
+        // A late completion contributes no snapshot. The start observation remains.
+        *execution.phase0_budget_ms.lock().unwrap() = budget_ms;
+        let slot = RwLock::new(snapshot.clone());
+        let report = execution
+            .project_report(
+                LOCAL_DEMO_HOST,
+                &selection,
+                options,
+                ProductionDoctorProjection {
+                    scheduler: &scheduler,
+                    records: &records,
+                    snapshot_slot: &slot,
+                    fatal_context: false,
+                },
+            )
+            .unwrap();
+        let codex = report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "codex")
+            .unwrap();
+        assert_eq!(codex.status, "timed_out");
+        assert_eq!(
+            serde_json::to_value(codex)
+                .unwrap()
+                .get("phase0_budget_ms")
+                .cloned(),
+            budget_ms.map(|budget| serde_json::json!(budget))
+        );
+        let timing = scheduler.timing("codex").unwrap();
+        assert_eq!(codex.started_at, timing.started_at);
+        assert_eq!(codex.finished_at, timing.finished_at);
+        assert_eq!(codex.duration_ms, timing.duration.as_millis() as u64);
+        assert_ne!(codex.started_at, snapshot.started_at);
+        assert_ne!(codex.duration_ms, snapshot.duration_ms);
+        let config = report
+            .probe_results
+            .iter()
+            .find(|probe| probe.scope == "config")
+            .unwrap();
+        assert!(
+            serde_json::to_value(config)
+                .unwrap()
+                .get("phase0_budget_ms")
+                .is_none()
+        );
+    }
+}
