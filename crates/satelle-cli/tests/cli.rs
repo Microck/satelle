@@ -9497,7 +9497,9 @@ struct ProviderSecretPtyProcess {
 }
 
 #[cfg(target_os = "linux")]
-const PTY_INTERACTION_TIMEOUT: Duration = Duration::from_secs(30);
+// Doctor can complete several ordered 30-second probes before its first
+// finding. Give interactive tests the full probe chain plus scheduler time.
+const PTY_INTERACTION_TIMEOUT: Duration = Duration::from_secs(150);
 
 #[cfg(target_os = "linux")]
 impl ProviderSecretPtyProcess {

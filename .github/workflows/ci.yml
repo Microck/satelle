@@ -16,7 +16,7 @@ jobs:
   npm:
     name: npm distribution (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
