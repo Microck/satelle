@@ -296,7 +296,7 @@ impl BootstrapMaintenancePlanKind {
                     actions.extend([
                         SetupActionPlan::new(
                             "managed-codex",
-                            "Install and attest the managed Codex runtime",
+                            "Install or update to the latest stable Codex runtime",
                             true,
                         )?,
                         SetupActionPlan::new(
@@ -318,7 +318,7 @@ impl BootstrapMaintenancePlanKind {
                     actions.extend([
                         SetupActionPlan::new(
                             "managed-codex",
-                            "Install and attest the managed Codex runtime",
+                            "Install or update to the latest stable Codex runtime",
                             true,
                         )?,
                         SetupActionPlan::new(
@@ -2991,7 +2991,7 @@ impl HostService {
             }
         };
         match action_id {
-            "managed-codex" => codex_install::install_baseline_managed_codex(Path::new(state_root))
+            "managed-codex" => codex_install::install_latest_managed_codex(Path::new(state_root))
                 .map(|outcome| outcome.changed()),
             "native-computer-use" => {
                 let runtime =
@@ -4527,7 +4527,7 @@ impl HostService {
                 }
                 let paths = daemon_paths.as_ref().as_ref().map_err(Clone::clone)?;
                 let outcome =
-                    codex_install::install_baseline_managed_codex(Path::new(&paths.state_root))?;
+                    codex_install::install_latest_managed_codex(Path::new(&paths.state_root))?;
                 let computer_use_changed = if computer_use_selected {
                     let native_setup = codex_install::admit_managed_codex_from_state_root(
                         Path::new(&paths.state_root),
@@ -7743,7 +7743,8 @@ fn production_setup_report(
     let mut planned_actions = vec!["resolve the configured local host".to_string()];
     if mutation_planned {
         planned_actions.extend([
-            "download the official standalone Codex package and checksum manifest".to_string(),
+            "resolve the latest stable Codex release and download its verified package when needed"
+                .to_string(),
             "verify and publish the immutable Codex package".to_string(),
             "write the owner-only managed Codex installation receipt after a live version check"
                 .to_string(),
