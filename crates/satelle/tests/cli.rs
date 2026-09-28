@@ -580,7 +580,18 @@ fn state_dir() -> CliStateDir {
 #[test]
 fn cli_fixture_releases_daemon_before_removing_state() {
     let state = state_dir();
+    // Keep this daemon alive until fixture cleanup, rather than racing the
+    // test adapter's default 250 ms idle shutdown on a busy runner.
+    let config_file = state.path().join("config.toml");
+    let mut config = satelle::core::SatelleConfig::defaults();
+    config
+        .hosts
+        .get_mut("local-demo")
+        .unwrap()
+        .daemon_idle_timeout = satelle::core::ExplicitDuration::parse("60s");
+    write_user_config(&config_file, toml::to_string(&config).unwrap()).unwrap();
     satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
         .args(["run", "--host", "local-demo", "--json", "Check"])
         .assert()
