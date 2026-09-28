@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Installation\n\nRelease the latest managed Codex setup and Host automation through npm and\nnative archives. This replaces the partially published npm version 0.1.15.\n"
-    filename: 2026-09-28-local-npm-release.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Installation\n\nPublish the current Satelle release through npm and native archives.\n"
+    filename: 2026-09-28-draft-release-access.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - 2026-09-28-local-npm-release.md
+      - 2026-09-28-draft-release-access.md
     id: cargo:satelle
     updated: true
 npm:packages:

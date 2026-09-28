@@ -131,7 +131,12 @@ writes continue to use the job's scoped `GITHUB_TOKEN`.
 ## Local npm publication
 
 The signed-tag workflow creates the draft GitHub release, publishes Cargo, and
-signs each validated npm tarball with GitHub Actions provenance. It uploads the
+signs each validated npm tarball with GitHub Actions provenance. The signing job
+requires `contents: write` because GitHub only exposes draft releases to tokens
+with push access; it rechecks the draft before signing. The final npm verification
+job needs the same permission to download the draft package manifest.
+
+The signing job uploads the
 `npm-publication` Actions artifact containing all eight tarballs, their manifest,
 and one Sigstore bundle per tarball. CI does not reserve npm versions or publish
 npm packages.

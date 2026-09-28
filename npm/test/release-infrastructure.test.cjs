@@ -2696,7 +2696,7 @@ test("release workflow signs npm artifacts for local publication before final ve
     /publish-candidates:|validate-registry-candidates:|promote-and-publish:|candidate-resume|candidate-tag-repair|npm-promotion|npm-candidate-publication|NPM_DIST_TAG_TOKEN|NPM_PROMOTION_RECORD_KEY|rc-v/,
   );
   assert.match(prepareNpm, /^    needs: \[attest, collect, draft-release, publish-cargo\]$/m);
-  assert.match(prepareNpm, /^    permissions:\n      contents: read\n      id-token: write$/m);
+  assert.match(prepareNpm, /^    permissions:\n      contents: write\n      id-token: write$/m);
   assert.match(prepareNpm, /npm install --global npm@11\.15\.0/);
   assert.match(signStep, /recheck_release_tag[\s\S]*validate-npm-artifacts validated\/npm/);
   assert.match(signStep, /createHash\('sha512'\)[\s\S]*npa.toPurl[\s\S]*generateProvenance\(\[subject\], \{\}\)/);
@@ -2707,6 +2707,7 @@ test("release workflow signs npm artifacts for local publication before final ve
   assert.match(draftRelease, /release asset set does not match the validated artifact set/);
   assert.match(authorize, /verification\.verified == true/);
   assert.match(authorize, /release finalization must be dispatched from the default branch/);
+  assert.match(verifyPublished, /^    permissions:\n      contents: write$/m);
   assert.match(verifyPublished, /npm-provenance\.cjs[\s\S]*EXPECTED_SOURCE_DIGEST/);
   assert.match(validatePublished, /npm audit signatures --prefix "\$install_root"/);
   assert.equal((validatePublished.match(/runner: (?:ubuntu|macos|windows)/g) ?? []).length, 6);

@@ -1,3 +1,9 @@
+## satelle@0.1.17
+
+### Installation
+
+Publish the current Satelle release through npm and native archives.
+
 ## satelle@0.1.16
 
 ### Installation
