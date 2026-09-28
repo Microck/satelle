@@ -26,6 +26,11 @@ connection loss does not transfer that authority or erase durable state.
 The public handle is a Satelle `session_id`. Upstream Codex thread identifiers
 remain Host-owned adapter state.
 
+Opening a state store acquires its exclusive ownership lock before inspecting
+SQLite database and sidecar files. A competing opener reports `store-in-use`
+without inspecting files the active Host may replace. After ownership transfers,
+all protected-file checks still run before SQLite opens the database.
+
 ## Desktop control is explicit authority
 
 Use Satelle only on systems and accounts you are authorized to control. An

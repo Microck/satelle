@@ -634,8 +634,10 @@ pub(super) fn open_parts_with_locked_preflight(
     locked_preflight: impl FnOnce(&StateDirectory) -> Result<(), StorageError>,
 ) -> Result<(Connection, OwnershipLock, StateDirectory), StorageError> {
     let state_directory = prepare_state_root(state_root)?;
-    preflight_protected_files(&state_directory)?;
     let ownership_lock = acquire_ownership_lock(&state_directory)?;
+    // The live owner may create, replace, or remove SQLite sidecars. Inspect
+    // them only after ownership transfers; the lock leaf is validated above.
+    preflight_protected_files(&state_directory)?;
     reconcile_restore_activation(state_root, &state_directory)?;
     locked_preflight(&state_directory)?;
     // Pre-create and permission the database through the pinned state
