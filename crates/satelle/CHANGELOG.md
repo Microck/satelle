@@ -1,3 +1,9 @@
+## satelle@0.1.18
+
+### Host startup
+
+Keep setup reachable before a desktop is configured. Managed SSH and persistent daemons now use the Host user's desktop and provider bindings without changing service storage paths.
+
 ## satelle@0.1.17
 
 ### Installation
