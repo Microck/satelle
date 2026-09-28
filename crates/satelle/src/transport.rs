@@ -12111,40 +12111,63 @@ mod bootstrap_ordering_tests {
     #[test]
     fn setup_report_uses_protocol_incompatible_pre_mutation_daemon_observation() {
         let transport = setup_transport_for_report();
-        let observation = transport
-            .current_daemon_observation::<satelle::transport::CapabilitiesResponse>(Err(
-                DaemonClientError::ProtocolResponseMismatch,
-            ))
-            .expect("map an authenticated protocol mismatch to the planning observation");
-
-        assert_eq!(observation.current_version, None);
-        assert!(!observation.protocol_compatible);
-        assert_eq!(observation.validated_host_identity, None);
-
-        let report = transport
-            .setup_report_for_target(RemoteSetupReportInput {
-                dry_run: true,
-                setup_mode: SetupModeSelection::new(
-                    satelle::core::SetupMode::Persistent,
-                    satelle::core::daemon_service::SetupModeSource::SetupFlag,
-                ),
-                target: ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
-                setup_components: vec!["transport".to_string()],
-                daemon_path_overrides: DaemonPathOverrides::default(),
-                outcome: SetupExecutionOutcome {
-                    application: SetupApplication::Planned {
-                        existing_token_file: true,
-                    },
-                    managed_changed: false,
+        let versioned_error = serde_json::from_value(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle::transport::RequestId::new().to_string(),
+            "host_identity": "host-test",
+            "code": "incompatible-protocol",
+            "category": "compatibility",
+            "retryable": false,
+            "message": "the CLI and Host Daemon protocol versions are incompatible",
+            "details": { "daemon_version": "0.0.0" },
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize authenticated protocol error");
+        for (error, expected_version) in [
+            (DaemonClientError::ProtocolResponseMismatch, None),
+            (
+                DaemonClientError::Api {
+                    status: 426_u16.try_into().expect("valid HTTP status"),
+                    error: Box::new(versioned_error),
                 },
-                current_daemon: &observation,
-            })
-            .expect("build setup report");
-        let artifact = report.host_artifact.expect("artifact plan");
-        assert_eq!(
-            artifact.action,
-            satelle::core::daemon_service::DaemonArtifactAction::UpdateProtocolIncompatible
-        );
+                Some("0.0.0"),
+            ),
+        ] {
+            let observation = transport
+                .current_daemon_observation::<satelle::transport::CapabilitiesResponse>(Err(error))
+                .expect("map an authenticated protocol mismatch to the planning observation");
+
+            assert_eq!(observation.current_version.as_deref(), expected_version);
+            assert!(!observation.protocol_compatible);
+            assert_eq!(observation.validated_host_identity, None);
+
+            let report = transport
+                .setup_report_for_target(RemoteSetupReportInput {
+                    dry_run: true,
+                    setup_mode: SetupModeSelection::new(
+                        satelle::core::SetupMode::Persistent,
+                        satelle::core::daemon_service::SetupModeSource::SetupFlag,
+                    ),
+                    target: ssh_bootstrap::RemoteTarget::WindowsX64Msvc,
+                    setup_components: vec!["transport".to_string()],
+                    daemon_path_overrides: DaemonPathOverrides::default(),
+                    outcome: SetupExecutionOutcome {
+                        application: SetupApplication::Planned {
+                            existing_token_file: true,
+                        },
+                        managed_changed: false,
+                    },
+                    current_daemon: &observation,
+                })
+                .expect("build setup report");
+            let artifact = report.host_artifact.expect("artifact plan");
+            assert_eq!(
+                artifact.action,
+                satelle::core::daemon_service::DaemonArtifactAction::UpdateProtocolIncompatible
+            );
+            assert!(!artifact.current_daemon_usable());
+        }
     }
 
     #[test]

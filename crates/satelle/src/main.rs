@@ -5353,7 +5353,7 @@ fn run_setup_inner(
     let current_daemon_available = report
         .host_artifact
         .as_ref()
-        .is_some_and(|artifact| artifact.current_version.is_some());
+        .is_some_and(|artifact| artifact.current_daemon_usable());
     // An empty SSH Host subplan produces no artifact observation. Before any
     // authenticated follow-up, prove that the configured daemon is live instead
     // of treating the absence of Host setup work as proof of availability.
