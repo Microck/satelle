@@ -537,8 +537,68 @@ fn host_start_resolves_bare_tls_filenames_against_the_current_directory() {
         .stderr(predicate::str::contains("TLS configuration is invalid"));
 }
 
-fn state_dir() -> TestStateDir {
-    TestStateDir::new().expect("secure temp state directory should be created")
+// CLI tests launch detached daemons. Release each fixture's daemon before its
+// temporary directory is dropped, so later tests do not inherit its resources.
+struct CliStateDir(TestStateDir);
+
+impl std::ops::Deref for CliStateDir {
+    type Target = TestStateDir;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for CliStateDir {
+    fn drop(&mut self) {
+        if !self.path().join("local-daemon-endpoint.json").exists() {
+            return;
+        }
+        let output = satelle()
+            .env("SATELLE_STATE_DIR", self.path())
+            .env("SATELLE_CACHE_DIR", self.path().join("cache"))
+            .timeout(Duration::from_secs(30))
+            .args(["host", "release-state"])
+            .output();
+        if matches!(&output, Ok(output) if output.status.success()) {
+            return;
+        }
+        // Preserve the original test failure instead of panicking twice during
+        // unwinding. Cleanup failure still fails an otherwise successful test.
+        if std::thread::panicking() {
+            eprintln!("could not release CLI fixture daemon: {output:?}");
+        } else {
+            panic!("could not release CLI fixture daemon: {output:?}");
+        }
+    }
+}
+
+fn state_dir() -> CliStateDir {
+    CliStateDir(TestStateDir::new().expect("secure temp state directory should be created"))
+}
+
+#[test]
+fn cli_fixture_releases_daemon_before_removing_state() {
+    let state = state_dir();
+    satelle()
+        .env("SATELLE_STATE_DIR", state.path())
+        .args(["run", "--host", "local-demo", "--json", "Check"])
+        .assert()
+        .success();
+    let root = state.path().to_path_buf();
+    let endpoint: Value =
+        serde_json::from_slice(&fs::read(root.join("local-daemon-endpoint.json")).unwrap())
+            .unwrap();
+    let address = endpoint["bind"].as_str().unwrap();
+    assert!(std::net::TcpStream::connect(address).is_ok());
+
+    drop(state);
+
+    assert!(
+        !root.exists(),
+        "fixture state must be removable after shutdown"
+    );
+    assert!(std::net::TcpStream::connect(address).is_err());
 }
 
 fn write_user_config(
