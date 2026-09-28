@@ -6,6 +6,14 @@ description: Issue, rotate, and revoke scoped Host Daemon credentials.
 Token management requires a durable bearer token with `admin` scope.
 The temporary SSH bootstrap credential can only use the setup token flow.
 
+## Local controller credential
+
+The Host owner's local controller credential follows the desktop bindings in
+the owner's configuration. Before starting a local daemon, Satelle reconciles
+those grants atomically and advances the credential revision when they change.
+Unchanged grants retain their revision. This owner-local operation cannot revive
+a revoked credential, change its identity or scope, or alter remote credentials.
+
 ## Requests
 
 Send these headers with each mutation:

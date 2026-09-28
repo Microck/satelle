@@ -903,6 +903,15 @@ impl HostService {
         Ok(principal)
     }
 
+    /// Called only by owner-local startup while it owns the state store.
+    /// This operation is deliberately absent from the remote API.
+    pub fn reconcile_local_controller_token(
+        &self,
+        token: &ApiBearerToken,
+    ) -> Result<(), SatelleError> {
+        self.runtime.reconcile_local_controller_token(token)
+    }
+
     pub fn authenticate_api_token(
         &self,
         token: &ApiBearerToken,

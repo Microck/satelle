@@ -855,3 +855,107 @@ fn token(token_id: &str, secret_byte: u8) -> ApiBearerToken {
     ApiBearerToken::parse(&format!("satelle_v1.{token_id}.{encoded}"))
         .expect("fixed test token is valid")
 }
+
+#[test]
+fn local_controller_grants_follow_configuration_and_invalidate_old_revision() {
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let token = crate::host::ApiBearerToken::generate().unwrap();
+    storage
+        .reconcile_local_controller_token(&token, Default::default(), at(0))
+        .unwrap();
+    let original = storage
+        .authenticate_api_token(&token, at(0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.credential_revision(), 1);
+    assert!(original.desktop_bindings().is_empty());
+    let bindings = std::collections::BTreeSet::from(["operator".to_string()]);
+    storage
+        .reconcile_local_controller_token(&token, bindings.clone(), at(1))
+        .unwrap();
+    assert!(!storage.api_principal_is_active(&original, at(1)).unwrap());
+    let updated = storage
+        .authenticate_api_token(&token, at(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.credential_revision(), 2);
+    assert_eq!(updated.desktop_bindings(), &bindings);
+    drop(storage);
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    storage
+        .reconcile_local_controller_token(&token, bindings, at(2))
+        .unwrap();
+    assert_eq!(
+        storage
+            .authenticate_api_token(&token, at(2))
+            .unwrap()
+            .unwrap()
+            .credential_revision(),
+        2
+    );
+    storage
+        .reconcile_local_controller_token(&token, Default::default(), at(3))
+        .unwrap();
+    let removed = storage
+        .authenticate_api_token(&token, at(3))
+        .unwrap()
+        .unwrap();
+    assert_eq!(removed.credential_revision(), 3);
+    assert!(removed.desktop_bindings().is_empty());
+    assert!(!storage.api_principal_is_active(&updated, at(3)).unwrap());
+}
+
+#[test]
+fn local_controller_reconciliation_rejects_remote_and_revoked_credentials() {
+    let state = TempDir::new().unwrap();
+    let (mut storage, _) = Storage::open(state.path()).unwrap();
+    let remote = crate::host::ApiBearerToken::generate().unwrap();
+    storage
+        .register_api_token(
+            ApiTokenRegistration::new(
+                &remote,
+                "remote-controller",
+                1,
+                ApiScopes::ADMIN,
+                Default::default(),
+                None,
+                at(0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        storage
+            .reconcile_local_controller_token(&remote, test_desktop_bindings(), at(1))
+            .unwrap_err()
+            .kind(),
+        StorageErrorKind::IdempotencyConflict
+    );
+    assert!(
+        storage
+            .authenticate_api_token(&remote, at(1))
+            .unwrap()
+            .unwrap()
+            .desktop_bindings()
+            .is_empty()
+    );
+    let local = crate::host::ApiBearerToken::generate().unwrap();
+    storage
+        .reconcile_local_controller_token(&local, Default::default(), at(0))
+        .unwrap();
+    storage.revoke_api_token(local.token_id(), at(1)).unwrap();
+    assert_eq!(
+        storage
+            .reconcile_local_controller_token(&local, test_desktop_bindings(), at(2))
+            .unwrap_err()
+            .kind(),
+        StorageErrorKind::IdempotencyConflict
+    );
+    assert!(
+        storage
+            .authenticate_api_token(&local, at(2))
+            .unwrap()
+            .is_none()
+    );
+}

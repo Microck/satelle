@@ -795,6 +795,53 @@ pub(super) fn register_api_token(
     transaction.commit().map_err(operation_failed)
 }
 
+/// Reconcile only the OS owner's local credential before its daemon starts.
+/// General token registration remains immutable, including remote grants.
+pub(super) fn reconcile_local_controller_token(
+    connection: &mut Connection,
+    token: &ApiBearerToken,
+    desktop_bindings: BTreeSet<String>,
+    at: OffsetDateTime,
+) -> Result<(), StorageError> {
+    let mut registration = ApiTokenRegistration::new(
+        token,
+        "local-controller",
+        1,
+        ApiScopes::ADMIN,
+        desktop_bindings,
+        None,
+        at,
+    )?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(operation_failed)?;
+    if let Some(stored) = load_token(&transaction, token.token_id())?
+        .map(StoredTokenRow::validate)
+        .transpose()?
+    {
+        // Validate the existing identity through the same immutable registration
+        // contract before changing the one owner-controlled field.
+        let requested_bindings = registration.desktop_bindings.clone();
+        registration.desktop_bindings = stored.desktop_bindings.clone();
+        registration.credential_revision = stored.credential_revision;
+        register_api_token_in_connection(&transaction, registration)?;
+        if stored.desktop_bindings != requested_bindings {
+            let revision = stored
+                .credential_revision
+                .checked_add(1)
+                .and_then(|revision| i64::try_from(revision).ok())
+                .ok_or_else(|| StorageError::new(StorageErrorKind::InvalidStoredState))?;
+            transaction.execute(
+                "UPDATE api_tokens SET desktop_bindings_json = ?1, credential_revision = ?2, credential_updated_at = ?3 WHERE token_id = ?4",
+                params![serde_json::to_string(&requested_bindings).map_err(|_| StorageError::new(StorageErrorKind::OperationFailed))?, revision, format_time(at)?, token.token_id()],
+            ).map_err(operation_failed)?;
+        }
+    } else {
+        register_api_token_in_connection(&transaction, registration)?;
+    }
+    transaction.commit().map_err(operation_failed)
+}
+
 fn register_api_token_in_connection(
     connection: &Connection,
     registration: ApiTokenRegistration,

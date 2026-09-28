@@ -1899,6 +1899,15 @@ impl Storage {
         auth::register_api_token(&mut self.connection, registration)
     }
 
+    pub(crate) fn reconcile_local_controller_token(
+        &mut self,
+        token: &ApiBearerToken,
+        desktop_bindings: std::collections::BTreeSet<String>,
+        at: OffsetDateTime,
+    ) -> Result<(), StorageError> {
+        auth::reconcile_local_controller_token(&mut self.connection, token, desktop_bindings, at)
+    }
+
     pub(crate) fn authenticate_api_token(
         &self,
         token: &ApiBearerToken,
