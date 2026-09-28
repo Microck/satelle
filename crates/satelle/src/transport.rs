@@ -2966,7 +2966,7 @@ impl SshSetupTransport {
                 &self.binding.expected_host_identity().to_string(),
                 &self.host_config,
                 host_config,
-                SshBootstrapScope::Admin,
+                satelle::core::SetupMode::Persistent,
                 bootstrap_lock,
             )?;
         let mut execution = RemoteSetupExecution {
@@ -3012,7 +3012,7 @@ impl SshSetupTransport {
                 &self.binding.expected_host_identity().to_string(),
                 &self.host_config,
                 host_config,
-                SshBootstrapScope::Admin,
+                satelle::core::SetupMode::OnDemand,
                 bootstrap_lock,
             )?;
         let mut execution = RemoteOnDemandSetupExecution {
@@ -7120,7 +7120,7 @@ fn stop_persistent_service(
             &expected_host_id,
             &transport.host_config,
             &service_host_config,
-            SshBootstrapScope::Admin,
+            satelle::core::SetupMode::Persistent,
             bootstrap_lock,
         )?;
     begin_service_lifecycle_maintenance(
@@ -9030,7 +9030,7 @@ fn setup_bootstrap_client(
     expected_host_identity: &str,
     previous_host_config: &satelle::core::HostConfig,
     host_config: &satelle::core::HostConfig,
-    bootstrap_scope: SshBootstrapScope,
+    setup_mode: satelle::core::SetupMode,
     bootstrap_lock: &mut ssh_bootstrap::SshBootstrapLock,
 ) -> Result<
     (
@@ -9044,19 +9044,19 @@ fn setup_bootstrap_client(
     let bootstrap_token =
         ApiBearerToken::generate().map_err(|_| SatelleError::host_unreachable(alias))?;
     let raw_bootstrap_token = bootstrap_token.expose();
-    // Setup administration is isolated from the durable daemon. Binding the
-    // foreground bootstrap to an ephemeral remote port lets recovery proceed
-    // even when port 3001 is occupied by a daemon rejecting the durable token.
-    let bootstrap = SshBootstrapProcess::launch_ephemeral(
+    // On-demand setup leaves this daemon serving subsequent commands, so its
+    // listener must use the durable port. Persistent setup uses a temporary
+    // listener until the managed service takes ownership.
+    let bootstrap = SshBootstrapProcess::launch_setup(
         destination,
         &bootstrap_token,
         host_config,
         previous_host_config,
-        bootstrap_scope,
+        setup_mode,
         bootstrap_lock,
     )
     .map_err(|error| map_ssh_daemon_bootstrap_error(alias, error))?;
-    // launch_ephemeral returns only after the fenced process publishes and
+    // launch_setup returns only after the fenced process publishes and
     // validates its ready address. Commit that verified daemon_start before
     // tunnel/client/token work creates a new Controller-loss window.
     commit_verified_bootstrap_mutation(alias, bootstrap_lock)?;

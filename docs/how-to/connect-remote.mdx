@@ -53,6 +53,10 @@ verification fails, setup revokes the pending credential and removes the new
 token file after the Host confirms it inactive. Unactivated pending credentials
 also expire automatically.
 
+On-demand setup binds its daemon to `127.0.0.1:3001`, the same endpoint used by
+later commands and the final authenticated setup check. Persistent-service setup
+uses a temporary port while preparing the managed service.
+
 Later `run` and `steer` commands start the on-demand daemon if none is running,
 without another bootstrap token, and authenticate with the durable token file.
 
