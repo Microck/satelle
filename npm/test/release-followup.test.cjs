@@ -191,38 +191,38 @@ test("release workflow validates six targets and publishes only a fully verified
   assert.doesNotMatch(workflow, /npm publish[^\n]*--dry-run/);
   assert.match(
     workflow,
-    /stage-npm:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[attest, collect, draft-release, publish-cargo\]/,
+    /prepare-npm:\n[\s\S]*?if: startsWith\(github\.ref, 'refs\/tags\/v'\)\n\s+needs: \[attest, collect, draft-release, publish-cargo\]/,
   );
   assert.match(
     workflow,
-    /stage-npm:\n[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?id-token: write/,
+    /prepare-npm:\n[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?id-token: write/,
   );
   assert.match(
     workflow,
-    /Install staged-publishing npm CLI[\s\S]*?npm install --global npm@11\.15\.0[\s\S]*?test "\$\(npm --version\)" = "11\.15\.0"/,
+    /Install pinned npm CLI[\s\S]*?npm install --global npm@11\.15\.0[\s\S]*?test "\$\(npm --version\)" = "11\.15\.0"/,
   );
-  assert.match(workflow, /npm-staged-release\.cjs record/);
-  const stageJob = workflow.match(
-    /^  stage-npm:[\s\S]*?(?=^  authorize-finalization-tag:)/m,
+  assert.match(workflow, /generateProvenance\(\[subject\]/);
+  const prepareJob = workflow.match(
+    /^  prepare-npm:[\s\S]*?(?=^  authorize-finalization-tag:)/m,
   )?.[0];
-  assert.ok(stageJob, "staged npm publication job is missing");
-  assert.doesNotMatch(stageJob, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
+  assert.ok(prepareJob, "npm provenance job is missing");
+  assert.doesNotMatch(prepareJob, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
   assert.match(
-    stageJob,
+    prepareJob,
     /EXPECTED_SOURCE_DIGEST: \$\{\{ needs\.attest\.outputs\.source-digest \}\}/,
   );
   assert.match(
-    stageJob,
+    prepareJob,
     /EXPECTED_TAG_DIGEST: \$\{\{ needs\.attest\.outputs\.tag-digest \}\}/,
   );
   assert.match(
-    stageJob,
-    /recheck_release_tag[\s\S]*git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*gh release view[\s\S]*while package=[\s\S]*npm stage publish/,
+    prepareJob,
+    /recheck_release_tag[\s\S]*git\/ref\/tags\/\$GITHUB_REF_NAME[\s\S]*git\/tags\/\$EXPECTED_TAG_DIGEST[\s\S]*gh release view[\s\S]*generateProvenance\(\[subject\]/,
   );
   assert.match(workflow, /gh release create "\$GITHUB_REF_NAME"[\s\S]*?--draft/);
   assert.match(workflow, /gh release upload "\$GITHUB_REF_NAME"/);
   assert.match(workflow, /release asset set does not match the validated artifact set/);
-  assert.match(workflow, /stage_pattern="\^npm-stages-v/);
+  assert.doesNotMatch(workflow, /npm stage publish|npm-stages-v/);
   assert.match(workflow, /sha256sum --check/);
   assert.match(
     workflow,
