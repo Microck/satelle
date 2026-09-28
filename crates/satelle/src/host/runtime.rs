@@ -4597,6 +4597,17 @@ impl RuntimeHandle {
             .map_err(model::storage_failure)
     }
 
+    pub(crate) fn reconcile_local_controller_token(
+        &self,
+        token: &ApiBearerToken,
+    ) -> Result<(), SatelleError> {
+        let bindings = self.configured_desktop_bindings()?;
+        self.engine()?
+            .lock_storage()?
+            .reconcile_local_controller_token(token, bindings, time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)
+    }
+
     pub(crate) fn authenticate_api_token(
         &self,
         token: &ApiBearerToken,

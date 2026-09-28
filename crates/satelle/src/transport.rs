@@ -10343,10 +10343,9 @@ fn initialize_local_daemon_credentials(
             SecureFileError::UnsafeOrUnavailable,
         )
     })?;
-    // One state store has one local daemon and one controller credential, even
-    // when several Controller aliases select it. Re-registering the same token
-    // under an alias-specific principal is rejected as a conflicting request.
-    service.register_api_token(&token, "local-controller", ApiScopes::ADMIN, None)?;
+    // One state store has one owner-local credential. Its desktop grants follow
+    // local configuration without changing the registration rules for remote tokens.
+    service.reconcile_local_controller_token(&token)?;
     Ok((raw_token, status.host_identity().to_string()))
 }
 
