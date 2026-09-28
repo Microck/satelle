@@ -636,12 +636,29 @@ fn provider_secret_journal_rejects_non_file_sources_and_raw_secret_fields() {
 fn one_process_exclusively_owns_the_store() {
     let state = TempDir::new().expect("temporary state directory");
     let (storage, _) = Storage::open(state.path()).expect("first owner");
+    // Make preflight observably fail while the first owner holds the store.
+    // A competing opener must report contention before inspecting sidecars.
+    let journal = state.path().join("satelle.sqlite3-journal");
+    fs::create_dir(&journal).expect("create a non-file sidecar fixture");
     let error = match Storage::open(state.path()) {
         Ok(_) => panic!("second owner must be rejected"),
         Err(error) => error,
     };
     assert_eq!(StorageErrorKind::StoreInUse, error.kind());
     drop(storage);
+    let error = match Storage::open(state.path()) {
+        Ok(_) => panic!("the next owner must still validate protected files"),
+        Err(error) => error,
+    };
+    // Unix rejects opening a directory read/write; Windows opens a directory
+    // handle and rejects its type during the protected-file check.
+    let rejected_sidecar = if cfg!(windows) {
+        StorageErrorKind::UnsafeStatePath
+    } else {
+        StorageErrorKind::OpenFailed
+    };
+    assert_eq!(rejected_sidecar, error.kind());
+    fs::remove_dir(&journal).expect("remove the invalid sidecar fixture");
     Storage::open(state.path()).expect("lock released with owner");
 }
 
