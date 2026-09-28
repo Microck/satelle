@@ -149,18 +149,100 @@ gh run download RUN_ID --name npm-publication --dir npm-publication
 node npm/scripts/release.cjs validate-npm-artifacts npm-publication
 ```
 
-Publish in manifest order using the maintainer's local npm credentials. For each
-manifest entry, use its file and matching `.sigstore` bundle:
+Publish in manifest order using the maintainer's local npm credentials and the
+`libnpmpublish` API bundled with that npm installation. Its `provenanceFile`
+option accepts the matching CI-generated `.sigstore` file.
 
-```sh
-npm publish npm-publication/ARTIFACT.tgz --ignore-scripts --access public \
-  --tag latest --provenance=false \
-  --provenance-file=npm-publication/ARTIFACT.tgz.sigstore
+Do not combine CLI `--provenance=false` with `--provenance-file`: npm rejects
+both options together, including when the first is false. These packages also
+set `publishConfig.provenance`, so the CLI cannot select the supplied bundle
+without conflicting with automatic provenance generation.
+
+The publishing API accepts the existing tarball bytes without repacking them.
+Load credentials through npm's configuration library and pass only the supplied
+provenance file, not the automatic provenance option. Save this example as
+`publish-local.cjs` beside the validated `npm-publication` directory and run
+`node publish-local.cjs`:
+
+```js
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+const npmRoot = path.join(execFileSync('npm', ['root', '-g'], {
+  encoding: 'utf8',
+}).trim(), 'npm');
+const Config = require(path.join(npmRoot, 'node_modules/@npmcli/config'));
+const { definitions, shorthands, flatten } = require(path.join(
+  npmRoot, 'node_modules/@npmcli/config/lib/definitions',
+));
+const { publish } = require(path.join(npmRoot, 'node_modules/libnpmpublish'));
+const pacote = require(path.join(npmRoot, 'node_modules/pacote'));
+const npmFetch = require(path.join(npmRoot, 'node_modules/npm-registry-fetch'));
+const npa = require(path.join(npmRoot, 'node_modules/npm-package-arg'));
+const assert = require('node:assert/strict');
+
+async function main() {
+  const config = new Config({
+    npmPath: npmRoot, definitions, shorthands, flatten, argv: [],
+  });
+  await config.load();
+  if (!config.validate()) throw new Error('Invalid local npm configuration');
+  const options = {
+    ...config.flat, access: 'public', defaultTag: 'latest', preferOnline: true,
+  };
+  delete options.provenance;
+  const directory = path.resolve('npm-publication');
+  const artifacts = JSON.parse(fs.readFileSync(
+    path.join(directory, 'npm-artifacts.json'), 'utf8',
+  ));
+  // Check every destination before the first registry write.
+  for (const entry of artifacts.packages) {
+    const spec = npa.resolve(entry.package, entry.version);
+    assert.equal(npmFetch.pickRegistry(spec, options), 'https://registry.npmjs.org/');
+  }
+  for (const entry of artifacts.packages) {
+    const spec = npa.resolve(entry.package, entry.version);
+    const endpoint = `${spec.escapedName}/${entry.version}`;
+    let existing;
+    try {
+      existing = await npmFetch.json(endpoint, options);
+    } catch (error) {
+      if (error.code !== 'E404') throw error;
+    }
+    if (existing) {
+      assert.equal(existing.dist.integrity, entry.integrity);
+      continue;
+    }
+    const artifact = path.join(directory, entry.file);
+    const manifest = await pacote.manifest(artifact, {
+      fullmetadata: true, fullReadJson: true,
+    });
+    await publish(manifest, fs.readFileSync(artifact), {
+      ...options, provenanceFile: `${artifact}.sigstore`,
+    });
+    console.log(`Submitted ${entry.package}@${entry.version}; verify public integrity before finalization`);
+  }
+}
+main().catch(error => {
+  console.error({ code: error.code, message: error.message });
+  process.exitCode = 1;
+});
 ```
 
-`--provenance=false` disables generation on the local machine. The supplied
-provenance file retains the signature created by the signed-tag CI run. npm
-verifies its signature, package identity, and tarball digest before publication.
+The supplied file retains the signature created by the signed-tag CI run. npm
+verifies its signature, package identity, and tarball digest before submission.
+A successful submission is not proof of public availability: read each exact
+version from the registry and compare its integrity with the artifact manifest
+before finalizing the release. npm can return HTTP 202 while processing a
+submission, then return 404 for a public read and a staged-version conflict on
+an immediate repeat submission. Preserve the successful submission record and
+poll public availability instead of submitting that version again. Once all
+versions are visible, verify every integrity and provenance attestation before
+finalization. If visibility does not converge, keep the release as a draft and
+preserve the registry responses for investigation. `npm stage list --json` can
+inspect approval-pending versions with an npm version that supports staging;
+absence from that list does not prove a recent submission failed.
+
 The maintainer token must allow package writes. Unattended publication also
 requires the account and package policies to permit that token without 2FA.
 Never copy the token to CI or commit it.
