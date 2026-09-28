@@ -411,33 +411,49 @@ enum BootstrapLaunchMode<'a> {
         initial_identity: InitialHostIdentityCommit<'a>,
         remote_binary: &'a str,
     },
-    Ephemeral {
+    Setup {
         previous_host_config: &'a HostConfig,
+        mode: satelle::core::SetupMode,
     },
 }
 
 impl<'a> BootstrapLaunchMode<'a> {
     const fn bind(self) -> &'static str {
         match self {
-            Self::Durable => "127.0.0.1:3001",
-            Self::Fresh { .. } => "127.0.0.1:0",
-            Self::Ephemeral { .. } => "127.0.0.1:0",
+            Self::Durable
+            | Self::Setup {
+                mode: satelle::core::SetupMode::OnDemand,
+                ..
+            } => "127.0.0.1:3001",
+            Self::Fresh { .. }
+            | Self::Setup {
+                mode: satelle::core::SetupMode::Persistent,
+                ..
+            } => "127.0.0.1:0",
         }
     }
 
     const fn expected_port(self) -> Option<u16> {
         match self {
-            Self::Durable => Some(3001),
-            Self::Fresh { .. } => None,
-            Self::Ephemeral { .. } => None,
+            Self::Durable
+            | Self::Setup {
+                mode: satelle::core::SetupMode::OnDemand,
+                ..
+            } => Some(3001),
+            Self::Fresh { .. }
+            | Self::Setup {
+                mode: satelle::core::SetupMode::Persistent,
+                ..
+            } => None,
         }
     }
 
     const fn release_host_config(self) -> Option<&'a HostConfig> {
         match self {
             Self::Durable | Self::Fresh { .. } => None,
-            Self::Ephemeral {
+            Self::Setup {
                 previous_host_config,
+                ..
             } => Some(previous_host_config),
         }
     }
@@ -447,14 +463,14 @@ impl<'a> BootstrapLaunchMode<'a> {
             Self::Fresh {
                 initial_identity, ..
             } => Some(initial_identity),
-            Self::Durable | Self::Ephemeral { .. } => None,
+            Self::Durable | Self::Setup { .. } => None,
         }
     }
 
     const fn remote_binary(self) -> Option<&'a str> {
         match self {
             Self::Fresh { remote_binary, .. } => Some(remote_binary),
-            Self::Durable | Self::Ephemeral { .. } => None,
+            Self::Durable | Self::Setup { .. } => None,
         }
     }
 }
@@ -941,21 +957,22 @@ impl SshBootstrapProcess {
         )
     }
 
-    pub(super) fn launch_ephemeral(
+    pub(super) fn launch_setup(
         destination: &str,
         token: &ApiBearerToken,
         host_config: &HostConfig,
         previous_host_config: &HostConfig,
-        bootstrap_scope: SshBootstrapScope,
+        mode: satelle::core::SetupMode,
         bootstrap_lock: &mut SshBootstrapLock,
     ) -> Result<Self, SshBootstrapError> {
         Self::launch_bound(
             destination,
             token,
             host_config,
-            bootstrap_scope,
-            BootstrapLaunchMode::Ephemeral {
+            SshBootstrapScope::Admin,
+            BootstrapLaunchMode::Setup {
                 previous_host_config,
+                mode,
             },
             bootstrap_lock,
         )
@@ -10737,6 +10754,41 @@ mod tests {
             Some("127.0.0.1:43123".parse().unwrap())
         );
         assert_eq!(validated_start_address(&ready, Some(3001)), None);
+    }
+
+    #[test]
+    fn setup_listener_matches_the_endpoint_used_after_handoff() {
+        let previous = satelle::core::SatelleConfig::defaults()
+            .hosts
+            .remove("local-demo")
+            .expect("the built-in local Host config exists");
+        let on_demand = BootstrapLaunchMode::Setup {
+            previous_host_config: &previous,
+            mode: satelle::core::SetupMode::OnDemand,
+        };
+        let persistent = BootstrapLaunchMode::Setup {
+            previous_host_config: &previous,
+            mode: satelle::core::SetupMode::Persistent,
+        };
+        assert_eq!(on_demand.bind(), "127.0.0.1:3001");
+        assert_eq!(persistent.bind(), "127.0.0.1:0");
+        let ready = HostStartReady {
+            running: true,
+            bind: "127.0.0.1:43123".to_string(),
+        };
+        assert_eq!(
+            validated_start_address(&ready, on_demand.expected_port()),
+            None
+        );
+        assert!(validated_start_address(&ready, persistent.expected_port()).is_some());
+        assert!(std::ptr::eq(
+            on_demand.release_host_config().unwrap(),
+            &previous
+        ));
+        assert!(std::ptr::eq(
+            persistent.release_host_config().unwrap(),
+            &previous
+        ));
     }
 
     #[test]
