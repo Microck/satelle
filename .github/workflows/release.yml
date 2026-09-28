@@ -794,8 +794,9 @@ jobs:
     needs: [attest, collect, draft-release, publish-cargo]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # GitHub requires push access to read the draft release before signing.
     permissions:
-      contents: read
+      contents: write
       id-token: write
     steps:
       - name: Check out repository
@@ -956,8 +957,9 @@ jobs:
     needs: authorize-finalization-tag
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Downloading draft release assets also requires push access.
     permissions:
-      contents: read
+      contents: write
     steps:
       - name: Check out signed release source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
