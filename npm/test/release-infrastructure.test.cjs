@@ -2672,13 +2672,13 @@ test("npm staged approval requires trusted automation and approval-ready metadat
   }
 });
 
-test("release workflow uses staged npm approval as its only publication path", () => {
+test("release workflow signs npm artifacts for local publication before final verification", () => {
   const workflow = readFileSync(
     path.join(repositoryRoot, ".github", "workflows", "release.yml"),
     "utf8",
   ).replaceAll("\r\n", "\n");
-  const stageNpm = workflowJob(workflow, "stage-npm");
-  const stageStep = workflowStep(stageNpm, "Stage the complete npm package graph");
+  const prepareNpm = workflowJob(workflow, "prepare-npm");
+  const signStep = workflowStep(prepareNpm, "Sign the complete npm package graph");
   const authorize = workflowJob(workflow, "authorize-finalization-tag");
   const verifyPublished = workflowJob(workflow, "verify-published-npm");
   const validatePublished = workflowJob(workflow, "validate-published-npm");
@@ -2690,32 +2690,101 @@ test("release workflow uses staged npm approval as its only publication path", (
   const draftRelease = workflowJob(workflow, "draft-release");
   const publishCargo = workflowJob(workflow, "publish-cargo");
 
-  assert.match(workflow, /^          - stage-finalize$/m);
+  assert.match(workflow, /^          - finalize$/m);
   assert.doesNotMatch(
     workflow,
     /publish-candidates:|validate-registry-candidates:|promote-and-publish:|candidate-resume|candidate-tag-repair|npm-promotion|npm-candidate-publication|NPM_DIST_TAG_TOKEN|NPM_PROMOTION_RECORD_KEY|rc-v/,
   );
-  assert.match(stageNpm, /^    needs: \[attest, collect, draft-release, publish-cargo\]$/m);
-  assert.match(stageNpm, /^    permissions:\n      contents: write\n      id-token: write$/m);
-  assert.match(stageNpm, /npm install --global npm@11\.15\.0/);
-  assert.match(stageStep, /recheck_release_tag[\s\S]*while package=.*npm-staged-release\.cjs next/);
-  assert.match(stageStep, /gh release view[\s\S]*\.assets \| any\(\.name == \$name\)[\s\S]*gh release download/);
-  assert.doesNotMatch(stageStep, /gh release download[\s\S]*\|\| true/);
-  assert.match(stageStep, /npm stage publish "validated\/npm\/\$artifact"/);
-  assert.match(stageStep, /--tag latest[\s\S]*--access public[\s\S]*--provenance[\s\S]*--json/);
-  assert.match(stageStep, /npm-staged-release\.cjs record[\s\S]*gh release upload/);
-  assert.doesNotMatch(stageNpm, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
-  assert.match(draftRelease, /stage_pattern="\^npm-stages-v/);
+  assert.match(prepareNpm, /^    needs: \[attest, collect, draft-release, publish-cargo\]$/m);
+  assert.match(prepareNpm, /^    permissions:\n      contents: read\n      id-token: write$/m);
+  assert.match(prepareNpm, /npm install --global npm@11\.15\.0/);
+  assert.match(signStep, /recheck_release_tag[\s\S]*validate-npm-artifacts validated\/npm/);
+  assert.match(signStep, /createHash\('sha512'\)[\s\S]*npa.toPurl[\s\S]*generateProvenance\(\[subject\], \{\}\)/);
+  assert.match(signStep, /writeFileSync\(`\$\{artifact\}\.sigstore`/);
+  assert.match(prepareNpm, /name: npm-publication[\s\S]*path: validated\/npm\/\*/);
+  assert.doesNotMatch(prepareNpm, /npm (?:stage )?publish/);
+  assert.doesNotMatch(prepareNpm, /NODE_AUTH_TOKEN|NPM_TOKEN|npm_[A-Za-z0-9]{20,}/);
+  assert.match(draftRelease, /release asset set does not match the validated artifact set/);
   assert.match(authorize, /verification\.verified == true/);
   assert.match(authorize, /release finalization must be dispatched from the default branch/);
-  assert.match(verifyPublished, /npm view "\$package_spec" dist\.integrity/);
+  assert.match(verifyPublished, /npm-provenance\.cjs[\s\S]*EXPECTED_SOURCE_DIGEST/);
   assert.match(validatePublished, /npm audit signatures --prefix "\$install_root"/);
   assert.equal((validatePublished.match(/runner: (?:ubuntu|macos|windows)/g) ?? []).length, 6);
   assert.match(publishCargo, /cargo publish --locked --no-verify -p satelle/);
   assert.match(publishRelease, /validated-release-candidate/);
   assert.match(finalStep, /validated\/cargo\/\*/);
-  assert.match(finalStep, /npm-stages-v\$\{RELEASE_VERSION\}\.json/);
+  assert.doesNotMatch(workflow, /npm-stages-v|npm-staged-release\.cjs/);
   assert.match(finalStep, /repos\/\$GITHUB_REPOSITORY\/immutable-releases/);
   assert.match(finalStep, /-F draft=false[\s\S]*-f make_latest=true/);
   assert.match(finalStep, /rollback_state=[\s\S]*-F draft=true/);
+});
+
+// Captured from npm's public Satelle 0.1.15 provenance, not a signing mock.
+test("npm provenance binds registry bytes to the authorized source and workflow", () => {
+  const { assertProvenanceIdentity } = require("../scripts/npm-provenance.cjs");
+  const statement = {
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    {
+      "name": "pkg:npm/%40microck/satelle-darwin-arm64@0.1.15",
+      "digest": {
+        "sha512": "8b6155efc8424d0615e9fe9b4aab4d46f68af97afd9f6acf7efaaa88a8e9c306d8045698085f71ee69821e2c4910cdefd496ab960b3f99ed45d04474622e5581"
+      }
+    }
+  ],
+  "predicateType": "https://slsa.dev/provenance/v1",
+  "predicate": {
+    "buildDefinition": {
+      "buildType": "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1",
+      "externalParameters": {
+        "workflow": {
+          "ref": "refs/tags/v0.1.15",
+          "repository": "https://github.com/Microck/satelle",
+          "path": ".github/workflows/release.yml"
+        }
+      },
+      "internalParameters": {
+        "github": {
+          "event_name": "push",
+          "repository_id": "1293813325",
+          "repository_owner_id": "45483921"
+        }
+      },
+      "resolvedDependencies": [
+        {
+          "uri": "git+https://github.com/Microck/satelle@refs/tags/v0.1.15",
+          "digest": {
+            "gitCommit": "fd5ce6cb566c5e857099c94078545f3e1009d611"
+          }
+        }
+      ]
+    },
+    "runDetails": {
+      "builder": {
+        "id": "https://github.com/actions/runner/github-hosted"
+      },
+      "metadata": {
+        "invocationId": "https://github.com/Microck/satelle/actions/runs/36351057719/attempts/2"
+      }
+    }
+  }
+};
+  const entry = {
+    package: "@microck/satelle-darwin-arm64",
+    integrity: "sha512-" + Buffer.from(statement.subject[0].digest.sha512, "hex").toString("base64"),
+  };
+  const source = "fd5ce6cb566c5e857099c94078545f3e1009d611";
+  assertProvenanceIdentity(statement, entry, "0.1.15", source);
+  for (const alter of [
+    value => { value.subject[0].digest.sha512 = "00".repeat(64); },
+    value => { value.subject[0].name = "pkg:npm/some-other-package@0.1.15"; },
+    value => { value.predicate.buildDefinition.externalParameters.workflow.repository = "https://github.com/other/repo"; },
+    value => { value.predicate.buildDefinition.externalParameters.workflow.path = ".github/workflows/unrelated.yml"; },
+    value => { value.predicate.buildDefinition.externalParameters.workflow.ref = "refs/heads/main"; },
+    value => { value.predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit = "a".repeat(40); },
+  ]) {
+    const changed = structuredClone(statement);
+    alter(changed);
+    assert.throws(() => assertProvenanceIdentity(changed, entry, "0.1.15", source));
+  }
 });

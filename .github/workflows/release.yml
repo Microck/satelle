@@ -18,19 +18,19 @@ on:
   workflow_dispatch:
     inputs:
       operation:
-        description: Non-publishing diagnostic or post-approval finalization
+        description: Non-publishing diagnostic or post-publication finalization
         required: true
         type: choice
         default: diagnostics
         options:
           - diagnostics
-          - stage-finalize
+          - finalize
       version:
         description: Existing release version for recovery
         required: false
         type: string
 concurrency:
-  group: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.operation == 'stage-finalize')) && 'satelle-release-writer' || format('release-candidate-{0}', github.ref) }}
+  group: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.operation == 'finalize')) && 'satelle-release-writer' || format('release-candidate-{0}', github.ref) }}
   cancel-in-progress: false
 
 permissions:
@@ -676,19 +676,11 @@ jobs:
                 tegami-validation.json
             } | LC_ALL=C sort
           )
-          version_pattern=${RELEASE_VERSION//./\\.}
-          stage_pattern="^npm-stages-v${version_pattern}\\.json$"
           actual_assets=$(
             gh release view "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --json assets \
               --jq '.assets[].name' \
-              | while IFS= read -r asset_name; do
-                  if [[ "$asset_name" =~ $stage_pattern ]]; then
-                    continue
-                  fi
-                  printf '%s\n' "$asset_name"
-                done \
               | LC_ALL=C sort
           )
           if [ "$actual_assets" != "$expected_assets" ]; then
@@ -796,14 +788,14 @@ jobs:
               ;;
           esac
 
-  stage-npm:
-    name: Stage npm packages for maintainer approval
+  prepare-npm:
+    name: Sign npm packages for local publication
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [attest, collect, draft-release, publish-cargo]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
       - name: Check out repository
@@ -811,14 +803,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Node.js for npm trusted publishing
+      - name: Install Node.js for npm provenance
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - name: Install staged-publishing npm CLI
+      - name: Install pinned npm CLI
         shell: bash
         run: |
           npm install --global npm@11.15.0
@@ -830,7 +822,7 @@ jobs:
           name: validated-release-candidate
           path: validated
 
-      - name: Stage the complete npm package graph
+      - name: Sign the complete npm package graph
         env:
           EXPECTED_SOURCE_DIGEST: ${{ needs.attest.outputs.source-digest }}
           EXPECTED_TAG_DIGEST: ${{ needs.attest.outputs.tag-digest }}
@@ -859,43 +851,41 @@ jobs:
               release_tag_not_trusted "GitHub release is no longer draft"
           }
 
-          record="$RUNNER_TEMP/npm-stages-v${RELEASE_VERSION}.json"
-          manifest="validated/npm/npm-artifacts.json"
-          release_assets=$(gh release view "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json assets)
-          if printf '%s' "$release_assets" \
-            | jq -e --arg name "$(basename "$record")" \
-              '.assets | any(.name == $name)' >/dev/null
-          then
-            gh release download "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" \
-              --pattern "$(basename "$record")" \
-              --dir "$RUNNER_TEMP"
-            node npm/scripts/npm-staged-release.cjs verify "$record" "$manifest"
-          else
-            node npm/scripts/npm-staged-release.cjs create "$RELEASE_VERSION" "$manifest" "$record"
-            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$record"
-          fi
+          recheck_release_tag
+          node npm/scripts/release.cjs validate-npm-artifacts validated/npm
+          # Use the pinned npm implementation so publication consumes exactly the
+          # same provenance format as npm's own CI publishing path.
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { createHash } = require('node:crypto');
+          const { execFileSync } = require('node:child_process');
+          const npmRoot = path.join(execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim(), 'npm');
+          const { generateProvenance } = require(path.join(npmRoot, 'node_modules/libnpmpublish/lib/provenance.js'));
+          const npa = require(path.join(npmRoot, 'node_modules/npm-package-arg'));
+          const manifest = JSON.parse(fs.readFileSync('validated/npm/npm-artifacts.json', 'utf8'));
+          (async () => {
+            for (const entry of manifest.packages) {
+              const artifact = path.join('validated/npm', entry.file);
+              const digest = createHash('sha512').update(fs.readFileSync(artifact)).digest('hex');
+              const subject = { name: npa.toPurl(npa.resolve(entry.package, entry.version)), digest: { sha512: digest } };
+              const bundle = await generateProvenance([subject], {});
+              fs.writeFileSync(`${artifact}.sigstore`, JSON.stringify(bundle));
+            }
+          })().catch(error => { console.error(error); process.exitCode = 1; });
+          NODE
+          recheck_release_tag
 
-          while package=$(node npm/scripts/npm-staged-release.cjs next "$record") && [ "$package" != null ]; do
-            package_name=$(printf '%s' "$package" | jq -r .name)
-            artifact=$(printf '%s' "$package" | jq -r .file)
-            recheck_release_tag
-            output="$RUNNER_TEMP/npm-stage-output.json"
-            npm stage publish "validated/npm/$artifact" \
-              --tag latest \
-              --access public \
-              --provenance \
-              --json > "$output"
-            node npm/scripts/npm-staged-release.cjs record "$record" "$package_name" "$output"
-            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "$record"
-          done
-          node npm/scripts/npm-staged-release.cjs verify "$record" "$manifest"
+      - name: Upload signed npm publication artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-publication
+          path: validated/npm/*
+          if-no-files-found: error
 
   authorize-finalization-tag:
     name: Authorize signed tag finalization
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'stage-finalize'
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'finalize'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -961,8 +951,8 @@ jobs:
           printf 'tag-digest=%s\n' "$tag_digest" >> "$GITHUB_OUTPUT"
 
   verify-published-npm:
-    name: Verify approved npm package graph
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'stage-finalize'
+    name: Verify published npm package graph
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'finalize'
     needs: authorize-finalization-tag
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -982,34 +972,26 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
-      - name: Require every approved package and provenance attestation
+      - name: Require every published package and provenance attestation
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: v${{ inputs.version }}
           RELEASE_VERSION: ${{ inputs.version }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.authorize-finalization-tag.outputs.source-digest }}
         shell: bash
         run: |
           npm install --global npm@11.15.0
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern npm-artifacts.json \
-            --pattern "npm-stages-v${RELEASE_VERSION}.json" \
             --dir "$RUNNER_TEMP"
-          node npm/scripts/npm-staged-release.cjs verify \
-            "$RUNNER_TEMP/npm-stages-v${RELEASE_VERSION}.json" \
-            "$RUNNER_TEMP/npm-artifacts.json"
-          jq -c '.packages[]' "$RUNNER_TEMP/npm-artifacts.json" \
-            | while IFS= read -r package; do
-                package_name=$(printf '%s' "$package" | jq -r .package)
-                expected_integrity=$(printf '%s' "$package" | jq -r .integrity)
-                package_spec="${package_name}@${RELEASE_VERSION}"
-                test "$(npm view "$package_spec" version --json | jq -r .)" = "$RELEASE_VERSION"
-                test "$(npm view "$package_spec" dist.integrity --json | jq -r .)" = "$expected_integrity"
-              done
+          npm ci --ignore-scripts
+          node npm/scripts/npm-provenance.cjs \
+            "$RUNNER_TEMP/npm-artifacts.json" "$RELEASE_VERSION" "$EXPECTED_SOURCE_DIGEST"
 
   validate-published-npm:
-    name: Validate approved npm packages on ${{ matrix.target }}
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'stage-finalize'
+    name: Validate published npm packages on ${{ matrix.target }}
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'finalize'
     needs: [authorize-finalization-tag, verify-published-npm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -1082,8 +1064,8 @@ jobs:
           done
 
   publish-release:
-    name: Publish the approved GitHub release
-    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'stage-finalize'
+    name: Publish the verified GitHub release
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'finalize'
     needs: [authorize-finalization-tag, validate-published-npm, verify-published-npm]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -1121,14 +1103,6 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --name validated-release-candidate \
             --dir validated
-          mkdir -p validated/npm
-          gh release download "v${RELEASE_VERSION}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "npm-stages-v${RELEASE_VERSION}.json" \
-            --dir validated/npm
-          node npm/scripts/npm-staged-release.cjs verify \
-            "validated/npm/npm-stages-v${RELEASE_VERSION}.json" \
-            validated/npm/npm-artifacts.json
 
       - name: Recheck signed tag and publish the GitHub release
         env:
@@ -1215,7 +1189,6 @@ jobs:
             validated/cargo/*
             validated/github/*
             validated/npm/npm-artifacts.json
-            "validated/npm/npm-stages-v${RELEASE_VERSION}.json"
           )
           for file in "${static_files[@]}"; do
             asset_name=$(basename "$file")
@@ -1239,9 +1212,6 @@ jobs:
 
           (cd "$downloaded" && sha256sum --check "$expected_manifest") || \
             release_asset_invalid "release asset digest does not match the validated candidate"
-          node npm/scripts/npm-staged-release.cjs verify \
-            "$downloaded/npm-stages-v${RELEASE_VERSION}.json" \
-            "$downloaded/npm-artifacts.json"
 
           recheck_release_tag
           LC_ALL=C sort -o "$verified_assets" "$verified_assets"

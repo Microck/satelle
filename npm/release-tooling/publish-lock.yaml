@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Installation\n\nPublish the Cargo package correctly when no previous version exists on crates.io.\nThis release includes the managed Codex updates and Host automation prepared for\n0.1.14, whose publication stopped before any registry package was published.\n"
-    filename: 2026-09-27-first-cargo-publication.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Installation\n\nRelease the latest managed Codex setup and Host automation through npm and\nnative archives. This replaces the partially published npm version 0.1.15.\n"
+    filename: 2026-09-28-local-npm-release.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - 2026-09-27-first-cargo-publication.md
+      - 2026-09-28-local-npm-release.md
     id: cargo:satelle
     updated: true
 npm:packages:

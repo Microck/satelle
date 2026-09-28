@@ -128,90 +128,62 @@ releaser token with repository Administration read permission. The workflow uses
 that token only to read the immutable-release policy before publication. Release
 writes continue to use the job's scoped `GITHUB_TOKEN`.
 
-## Staged npm publication
+## Local npm publication
 
-The signed-tag workflow creates a draft GitHub release only after all six
-archives pass validation and GitHub verifies their artifact attestations. It
-then publishes the Cargo package and stages these npm tarballs through
-[npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) in dependency
-order:
+The signed-tag workflow creates the draft GitHub release, publishes Cargo, and
+signs each validated npm tarball with GitHub Actions provenance. It uploads the
+`npm-publication` Actions artifact containing all eight tarballs, their manifest,
+and one Sigstore bundle per tarball. CI does not reserve npm versions or publish
+npm packages.
 
-1. Six platform-native packages.
-2. `@microck/satelle`.
-3. `satelle`.
-
-The workflow installs Node.js 24 and npm 11.15.0. Before each
-`npm stage publish`, it rechecks the signed tag object, source commit, and draft
-release. Each package uses the immutable staged tag `latest`, `--provenance`,
-and public access. CI stores every returned stage ID, SHA-1 sum, and expected
-SHA-512 integrity in `npm-stages-vX.Y.Z.json` on the draft release. A rerun
-accepts that record only when it matches `npm-artifacts.json` from the signed
-source and continues at the first package without a stage ID.
-
-Configure the trusted publisher for each of the eight npm package identities
-with stage-only permission. Do not grant `npm publish` permission. Short-lived
-OIDC credentials can call `npm stage publish`; npm intentionally blocks those
-credentials from stage view, download, approval, and rejection commands.
-
-## Maintainer review and 2FA approval
-
-Use an interactive maintainer npm account with write access and 2FA. Check out
-the exact signed tag, install Node.js 22.14.0 or newer and npm 11.15.0 or newer,
-then download the stage record and run:
+Download that artifact from the successful signed-tag run. On the exact signed
+source, validate the complete artifact set before the first registry write:
 
 ```sh
-gh release download vX.Y.Z --pattern 'npm-stages-vX.Y.Z.json'
-node npm/scripts/npm-staged-release.cjs approve npm-stages-vX.Y.Z.json
+gh run download RUN_ID --name npm-publication --dir npm-publication
+node npm/scripts/release.cjs validate-npm-artifacts npm-publication
 ```
 
-The command does all review work before the first 2FA prompt. It requires all
-eight stage records to be approval-ready and created by trusted automation. It
-downloads every staged tarball, checks the exact package name, version, `latest`
-tag, metadata, archive contents, dependency graph, and SHA-512 digest against
-the signed source, and confirms that CI requested provenance. Any missing or
-mismatched package stops the whole approval command before one package becomes
-public. After that complete pass, npm prompts for 2FA once per package and
-publishes them in dependency order.
+Publish in manifest order using the maintainer's local npm credentials. For each
+manifest entry, use its file and matching `.sigstore` bundle:
 
-## Post-approval finalization
+```sh
+npm publish npm-publication/ARTIFACT.tgz --ignore-scripts --access public \
+  --tag latest --provenance=false \
+  --provenance-file=npm-publication/ARTIFACT.tgz.sigstore
+```
 
-After all eight approvals finish, dispatch the Release workflow from the
-current default-branch head with operation `stage-finalize` and version
-`X.Y.Z`. The workflow verifies the signed tag and merged release pull request,
-then checks all eight public npm versions and registry integrities. Six native
-runners install both launcher identities with npm, pnpm, and Bun, run
-`satelle --version` and `satelle paths --json`, and use `npm audit signatures`
-to verify registry signatures and provenance attestations.
+`--provenance=false` disables generation on the local machine. The supplied
+provenance file retains the signature created by the signed-tag CI run. npm
+verifies its signature, package identity, and tarball digest before publication.
+The maintainer token must allow package writes. Unattended publication also
+requires the account and package policies to permit that token without 2FA.
+Never copy the token to CI or commit it.
 
-The final job loads the validated artifact bundle from the latest successful
-signed-tag run, checks the exact draft-release asset set and stage record, and
-rechecks the tag before GitHub's immutable publication transition. The Cargo
-publication, npm registry graph, provenance checks, and all six platform lanes
-must pass before the GitHub release becomes public. The repository-wide
-non-cancelling `satelle-release-writer` lock prevents another release from
-staging or finalizing at the same time.
+On retry, skip an already published version only after its registry integrity
+matches the manifest. A mismatch stops publication. Do not rebuild the tarballs.
+
+## Post-publication finalization
+
+After all eight packages are public, dispatch `release.yml` from the default
+branch with operation `finalize` and the release version. It verifies the signed
+tag, release pull request, and all eight registry integrities. It verifies each
+provenance signature against the release workflow identity and checks the signed
+repository, tag, source commit, package identity, and tarball digest.
+Six native runners install both launcher identities with npm, pnpm, and Bun,
+run `satelle --version` and `satelle paths --json`, and audit npm signatures.
+
+The final job loads the validated artifact bundle from the successful signed-tag
+run, checks the exact draft asset set, and publishes the immutable GitHub release.
+Cargo publication and every native validation lane must pass first.
 
 ## External release gates
 
-Repository code cannot prove account and platform state. Before the first
-public release, an authorized maintainer must verify all of these outside the
-checkout:
-
-- The `v*` GitHub tag ruleset is active.
-- Immutable releases are enabled for the repository.
-- Each npm package identity exists and trusts `release.yml` for stage-only OIDC
-  publication.
-- The `satelle` crates.io name is available for the first signed-tag run, or the
-  existing package has byte-identical history and the approved release team as
-  its only owners.
-- `CARGO_REGISTRY_TOKEN` can publish only the `satelle` crate and is stored only
-  as a GitHub Actions secret.
-- At least one human maintainer has write access and 2FA for staged-package
-  approval.
-- CI has no npm token or trusted-publisher permission that can approve or
-  directly publish a package.
-- The security and legal language review covers remote desktop control, YOLO,
-  diagnostics, provider credentials, and user consent.
-- A real tag run creates all eight stages, a maintainer approves them after
-  local review, and `stage-finalize` passes registry integrity, provenance, and
-  six-platform validation before it publishes the GitHub release.
+- The `v*` tag ruleset must be active. Immutable releases are enabled for the repository.
+- The security and legal language review covers remote control, provider
+  credentials, diagnostics, and user consent.
+- `CARGO_REGISTRY_TOKEN` must be scoped to publishing Satelle.
+- Local npm credentials must have write access to all eight package identities.
+- The signed-tag run must create valid npm provenance bundles.
+- Registry integrity, provenance, and six-platform validation must pass before
+  finalizing the GitHub release.

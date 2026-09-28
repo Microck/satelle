@@ -1,3 +1,10 @@
+## satelle@0.1.16
+
+### Installation
+
+Release the latest managed Codex setup and Host automation through npm and
+native archives. This replaces the partially published npm version 0.1.15.
+
 ## satelle@0.1.15
 
 ### Installation
