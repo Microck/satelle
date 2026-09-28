@@ -763,6 +763,40 @@ fn blocked_preflight_opens_authoritative_state_without_admitting_work() {
 }
 
 #[test]
+fn host_default_cache_lookup_requires_one_desktop_without_blocking_startup() {
+    for binding_count in [0, 2] {
+        let state = crate::host::TestStateDir::new().expect("temporary state directory");
+        let mut policy = RuntimeProviderPolicy::default();
+        let binding = policy.desktop_bindings.values().next().unwrap().clone();
+        policy.desktop_bindings.clear();
+        for index in 0..binding_count {
+            policy
+                .desktop_bindings
+                .insert(format!("desktop-{index}"), binding.clone());
+        }
+        let runtime = RuntimeHandle::new_with_provider_policy(
+            Ok(state.path().to_path_buf()),
+            BlockedComputerUseAdapter::new(SatelleError::desktop_binding_ambiguous([])),
+            policy,
+        );
+
+        assert!(
+            !runtime
+                .has_reusable_readiness(LOCAL_DEMO_HOST)
+                .expect("an unselected desktop must not prevent daemon startup")
+        );
+        assert_eq!(runtime.reconcile_and_snapshot().unwrap().session_count(), 0);
+        let failure = runtime
+            .run(RunCommand::attached(LOCAL_DEMO_HOST, "must not execute"))
+            .expect_err("readiness reporting must not bypass Turn admission");
+        assert!(matches!(
+            failure.error().code,
+            ErrorCode::DesktopBindingRequired | ErrorCode::DesktopBindingAmbiguous
+        ));
+    }
+}
+
+#[test]
 fn host_default_cache_lookup_treats_provider_opt_in_as_unavailable() {
     let state = crate::host::TestStateDir::new().expect("temporary state directory should exist");
     let error = SatelleError {

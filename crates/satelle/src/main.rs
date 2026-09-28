@@ -10826,6 +10826,10 @@ fn start_host_daemon_with(
                 .hosts
                 .remove(LOCAL_DEMO_HOST)
                 .expect("the built-in local Host config exists");
+            host_config.desktop_bindings =
+                load_user_host_config(&user_config_path, LOCAL_DEMO_HOST)
+                    .map_err(failure)?
+                    .desktop_bindings;
             host_config.timeouts = forwarded_readiness_timeouts;
             host_config.platform_log_sink = command.platform_log_sink;
             host_config.telemetry = forwarded_telemetry.clone();
@@ -10848,7 +10852,8 @@ fn start_host_daemon_with(
         }
         (None, Some(host), None) => HostService::production_for_host(host),
         (None, None, None)
-            if forwarded_readiness_timeouts.is_some()
+            if durable_ssh_launch
+                || forwarded_readiness_timeouts.is_some()
                 || command.platform_log_sink
                 || forwarded_telemetry.is_some()
                 || forwarded_recording.is_some()
@@ -10858,6 +10863,10 @@ fn start_host_daemon_with(
                 .hosts
                 .remove(LOCAL_DEMO_HOST)
                 .expect("the built-in local Host config exists");
+            host_config.desktop_bindings =
+                load_user_host_config(&user_config_path, LOCAL_DEMO_HOST)
+                    .map_err(failure)?
+                    .desktop_bindings;
             host_config.timeouts = forwarded_readiness_timeouts;
             host_config.platform_log_sink = command.platform_log_sink;
             host_config.telemetry = forwarded_telemetry;

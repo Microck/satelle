@@ -79,6 +79,11 @@ desktop_session_preference = "console"
 Use `only` instead of `console` only when setup must fail rather than select
 another eligible session.
 
+Managed daemons, including SSH bootstrap and persistent services, read these
+bindings from the Host user's `hosts.local-demo` configuration. Project config
+and the Controller's default Host do not select the daemon's desktop. Service
+storage paths and launch policies remain controlled by the managed launch.
+
 ## Configure provider authentication
 
 Store a Secret Source descriptor in user configuration. Do not put the secret
