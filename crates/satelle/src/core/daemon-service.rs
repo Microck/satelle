@@ -326,8 +326,8 @@ impl DaemonArtifactPlan {
             return Err(DaemonArtifactPlanError::InvalidArtifactMetadata);
         }
         let action = match current {
-            Some(current) if current < target => DaemonArtifactAction::UpdateOlder,
             _ if !protocol_compatible => DaemonArtifactAction::UpdateProtocolIncompatible,
+            Some(current) if current < target => DaemonArtifactAction::UpdateOlder,
             None => DaemonArtifactAction::Install,
             Some(_) => DaemonArtifactAction::ReuseCurrent,
         };
@@ -345,6 +345,12 @@ impl DaemonArtifactPlan {
             restart_impact: restart_impact.to_string(),
             action,
         })
+    }
+
+    /// Whether the observed daemon can receive requests before setup changes it.
+    pub fn current_daemon_usable(&self) -> bool {
+        self.current_version.is_some()
+            && self.action != DaemonArtifactAction::UpdateProtocolIncompatible
     }
 }
 
@@ -1431,6 +1437,7 @@ mod tests {
         )
         .expect("missing host is installable");
         assert_eq!(missing.action, DaemonArtifactAction::Install);
+        assert!(!missing.current_daemon_usable());
 
         let older = DaemonArtifactPlan::new(
             Some("0.0.9"),
@@ -1443,6 +1450,23 @@ mod tests {
         )
         .expect("older host is updateable");
         assert_eq!(older.action, DaemonArtifactAction::UpdateOlder);
+        assert!(older.current_daemon_usable());
+
+        let older_incompatible = DaemonArtifactPlan::new(
+            Some("0.0.9"),
+            false,
+            "0.1.0",
+            "darwin-arm64",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/Users/operator/Library/Caches/Satelle/host/v0.1.0/satelle".to_string(),
+            true,
+        )
+        .expect("older protocol-incompatible host is updateable");
+        assert_eq!(
+            older_incompatible.action,
+            DaemonArtifactAction::UpdateProtocolIncompatible
+        );
+        assert!(!older_incompatible.current_daemon_usable());
 
         let incompatible = DaemonArtifactPlan::new(
             Some("0.1.0"),
@@ -1458,6 +1482,7 @@ mod tests {
             incompatible.action,
             DaemonArtifactAction::UpdateProtocolIncompatible
         );
+        assert!(!incompatible.current_daemon_usable());
 
         let unknown_version_incompatible = DaemonArtifactPlan::new(
             None,
@@ -1485,6 +1510,7 @@ mod tests {
         )
         .expect("matching persistent host is reusable");
         assert_eq!(reused_persistent.action, DaemonArtifactAction::ReuseCurrent);
+        assert!(reused_persistent.current_daemon_usable());
         assert_eq!(
             reused_persistent.restart_impact,
             "restart the persistent Host Daemon after service reconciliation"

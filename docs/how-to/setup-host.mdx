@@ -50,6 +50,12 @@ mode and reports the fallback. Desktop and provider setup run through the
 authenticated Host after the daemon is ready; the SSH bootstrap does not apply
 those broader components directly.
 
+When a running SSH Host uses an incompatible protocol, the setup plan reports
+`update_protocol_incompatible`, including when its version is older. Setup
+upgrades that daemon before sending authenticated cache, desktop, or provider
+requests. Reporting a version alone does not prove that the old daemon can
+handle the current protocol.
+
 On Windows, persistent mode registers a per-user Task Scheduler logon task
 for the bootstrap OS account with an interactive-token principal, so the
 daemon runs inside the operator's desktop session with least privilege. An
