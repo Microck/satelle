@@ -1,3 +1,11 @@
+## satelle@0.1.20
+
+### Setup
+
+Keep the Host owner's local credential aligned with configured desktop bindings, so adding a desktop no longer blocks local setup with an idempotency conflict. Credential identity, scope, and revocation checks remain enforced.
+
+Keep the on-demand daemon on port 3001 after setup, so the final readiness check and later commands reach the same daemon.
+
 ## satelle@0.1.19
 
 ### Installation
