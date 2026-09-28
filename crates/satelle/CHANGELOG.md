@@ -1,3 +1,9 @@
+## satelle@0.1.19
+
+### Installation
+
+Publish the current Satelle package set as version 0.1.19. Runtime behavior is unchanged from 0.1.18.
+
 ## satelle@0.1.18
 
 ### Host startup
