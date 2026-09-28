@@ -3460,6 +3460,12 @@ impl HostService {
         config.telemetry = telemetry;
         config.recording = recording;
         config.queue = queue;
+        // Desktop/provider bindings belong to the Host user. Keep service-owned
+        // paths and launch policy above, even if user config names other paths.
+        let paths = Self::resolved_daemon_paths_for_host(&config)?;
+        config.desktop_bindings =
+            crate::core::load_user_host_config(Path::new(&paths.config_file), LOCAL_DEMO_HOST)?
+                .desktop_bindings;
         Ok(Self::production_for_host(&config))
     }
 

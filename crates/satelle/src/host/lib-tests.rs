@@ -86,8 +86,34 @@ fn production_host_reports_the_frozen_service_config_path_set() {
 fn production_service_reports_the_frozen_service_config_path_set() {
     let state = TestStateDir::new().expect("temporary state directory");
     let configured_state_root = state.path().join("persistent-service-state");
+    let user_config = state.path().join("config.toml");
+    {
+        use std::io::Write as _;
+        let mut file = crate::core::open_new_owner_only_file(&user_config).unwrap();
+        let ignored_state =
+            toml::Value::String(state.path().join("ignored-state").display().to_string());
+        file.write_all(
+            format!(
+                r#"
+[hosts.local-demo]
+transport = "local"
+adapter = "codex"
+daemon_state_dir = {ignored_state}
+[hosts.local-demo.desktop_bindings.operator]
+desktop_user = "operator"
+desktop_session_preference = "console"
+[hosts.local-demo.desktop_bindings.operator.provider_bindings.openai.luna]
+model = "gpt-6-luna"
+model_provider = "openai"
+"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    }
     let service = HostService::production_for_service(
         &DaemonPathOverrides {
+            config_file: Some(user_config),
             state_dir: Some(configured_state_root.clone()),
             ..DaemonPathOverrides::default()
         },
@@ -103,6 +129,10 @@ fn production_service_reports_the_frozen_service_config_path_set() {
         crate::core::queue::QueueConfig::default(),
     )
     .expect("valid persistent service configuration");
+    assert_eq!(
+        service.runtime.configured_desktop_bindings().unwrap(),
+        std::collections::BTreeSet::from(["operator".to_string()])
+    );
     let paths = service
         .daemon_resolved_paths()
         .expect("persistent service paths resolve once during construction");

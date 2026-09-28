@@ -2413,6 +2413,11 @@ impl RuntimeEngine {
     }
 
     fn has_reusable_readiness(&self, host: &str) -> Result<bool, SatelleError> {
+        // This host-wide status read has no Turn-selected desktop. An empty or
+        // multi-desktop Host must still start so setup and diagnostics can run.
+        if self.provider_policy.desktop_bindings.len() != 1 {
+            return Ok(false);
+        }
         let intent = ProviderComputerUseIntent::host_default();
         let key = match self.adapter.readiness_cache_key(host, &intent) {
             Ok(Some(key)) => key,

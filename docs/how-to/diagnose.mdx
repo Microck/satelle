@@ -22,6 +22,11 @@ on stderr.
 
 ## Refresh live readiness evidence
 
+The daemon can start before any Desktop Binding is configured. Its host-default
+cached readiness is unavailable when there is no single Desktop Binding to
+select. Setup and diagnostics remain reachable; running a Turn still requires
+an authorized Desktop Binding.
+
 `--refresh` is the explicit cache-mutation boundary. It reruns eligible live
 probes instead of reading the current cached verdict.
 
