@@ -1,3 +1,9 @@
+## satelle@0.1.21
+
+### Installation
+
+Publish the current Satelle package set as version 0.1.21. Runtime behavior is unchanged from 0.1.20.
+
 ## satelle@0.1.20
 
 ### Setup
