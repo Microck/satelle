@@ -242,6 +242,7 @@ fn main() {
         if matches!(
             scenario.as_str(),
             "native-task-success"
+                | "native-task-success-then-denied"
                 | "native-task-failed"
                 | "native-task-failed-then-success"
                 | "native-task-no-approval"
@@ -254,6 +255,7 @@ fn main() {
             let terminal_status = if matches!(
                 scenario.as_str(),
                 "native-task-success"
+                    | "native-task-success-then-denied"
                     | "native-task-no-approval"
                     | "native-task-script-conflict"
                     | "native-task-thread-conflict"
@@ -290,6 +292,11 @@ fn main() {
                 send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"{thread_id}","turnId":"turn-1","item":{retry}}}}}"#));
             }
         }
+    }
+    if scenario == "native-task-success-then-denied" {
+        send(&mut output, &format!(r#"{{"id":"native-app","method":"mcpServer/elicitation/request","params":{{"_meta":{{"connector_id":"computer-use","tool_params":{{"app":"com.apple.finder"}},"tool_params_display":[{{"value":"Finder"}}]}},"message":"Allow Codex to use Finder?","mode":"form","requestedSchema":{{"type":"object","properties":{{}}}},"serverName":"node_repl","threadId":"{thread_id}","turnId":"turn-1"}}}}"#));
+        let approval = receive(&mut input, &log);
+        assert!(approval.contains(r#""action":"decline""#));
     }
     if scenario == "controlled-interrupt" {
         let interrupt = receive(&mut input, &log);
@@ -597,14 +604,14 @@ pub(crate) fn compile_fixture() -> CompiledFixture {
     }
 }
 
-struct ScenarioResult {
-    result: Result<CodexSessionTerminal, CodexSessionError>,
+pub(crate) struct ScenarioResult {
+    pub(crate) result: Result<CodexSessionTerminal, CodexSessionError>,
     session_elapsed: Duration,
     turn_dispatch_attempted: bool,
     requests: Vec<Value>,
     persisted_threads: Vec<String>,
     persisted_turns: Vec<String>,
-    native_approval_requests: usize,
+    pub(crate) native_approval_requests: usize,
     child_working_directory: PathBuf,
     staged_image_path: Option<PathBuf>,
     _fixture: CompiledFixture,
@@ -709,7 +716,7 @@ fn run_yolo_scenario(scenario: &str, timeout: Duration) -> ScenarioResult {
     )
 }
 
-fn run_native_scenario(scenario: &str, timeout: Duration) -> ScenarioResult {
+pub(crate) fn run_native_scenario(scenario: &str, timeout: Duration) -> ScenarioResult {
     run_scenario_with_options(
         scenario,
         None,
