@@ -1785,6 +1785,14 @@ impl ExecuteResult {
         }
     }
 
+    pub(crate) fn terminal_blocker(error: SatelleError) -> Self {
+        Self {
+            outcome: ExecuteOutcome::Terminal(TurnTransition::Blocked),
+            events: Vec::new(),
+            terminal_error: Some(error),
+        }
+    }
+
     pub(crate) fn stopped_by_control() -> Self {
         Self {
             outcome: ExecuteOutcome::StoppedByControl,

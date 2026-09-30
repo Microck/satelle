@@ -2504,7 +2504,11 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                     READINESS_CANCELLATION_GRACE,
                     None,
                 );
-                finish_timed_turn_execution(run, persistence_error.into_inner())
+                finish_native_turn_execution(
+                    run,
+                    persistence_error.into_inner(),
+                    native_approval_published,
+                )
             },
         )
     }
@@ -2869,6 +2873,24 @@ fn finish_execution(
         return Err(error);
     }
     terminal_result(result)
+}
+
+fn finish_native_turn_execution(
+    run: TimedCodexSessionRun,
+    persistence_error: Option<SatelleError>,
+    native_approval_required: bool,
+) -> Result<ExecuteResult, SatelleError> {
+    let result = finish_timed_turn_execution(run, persistence_error)?;
+    // A successful earlier tool is not proof that the later denied action ran.
+    // Resolve execution and cleanup first so a blocker cannot hide failures.
+    if native_approval_required && result.transition() == Some(TurnTransition::Completed) {
+        let mut error = adapter_failure("native_approval_required");
+        error.message =
+            "native computer use requires manual approval before this task can complete"
+                .to_string();
+        return Ok(ExecuteResult::terminal_blocker(error));
+    }
+    Ok(result)
 }
 
 fn finish_timed_turn_execution(
@@ -4451,6 +4473,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn completed_native_tool_then_denied_app_is_a_typed_terminal_blocker() {
+        let run = crate::host::codex_session::tests::run_native_scenario(
+            "native-task-success-then-denied",
+            Duration::from_secs(3),
+        );
+        assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
+        assert_eq!(run.native_approval_requests, 1);
+        let result = finish_native_turn_execution(
+            TimedCodexSessionRun {
+                result: Ok(run.result.unwrap()),
+                cancellation: None,
+            },
+            None,
+            run.native_approval_requests != 0,
+        )
+        .expect("known upstream completion must release execution ownership");
+        assert_eq!(result.transition(), Some(TurnTransition::Blocked));
+        assert_eq!(
+            result.terminal_error().unwrap().details["reason"],
+            json!("native_approval_required")
+        );
+        let failed = finish_native_turn_execution(
+            TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::Failed(CodexFailedTurnKind::Other)),
+                cancellation: None,
+            },
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(failed.transition(), Some(TurnTransition::Failed));
+        let containment = finish_native_turn_execution(
+            TimedCodexSessionRun {
+                result: Err(CodexSessionFailure::after_exchange(
+                    CodexSessionError::Containment,
+                    true,
+                )),
+                cancellation: None,
+            },
+            None,
+            true,
+        );
+        assert_eq!(
+            containment.err().unwrap().details["reason"],
+            json!("containment_failed")
+        );
     }
 
     #[test]
