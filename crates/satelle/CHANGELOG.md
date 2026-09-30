@@ -1,3 +1,9 @@
+## satelle@0.1.24
+
+### Native readiness diagnostics
+
+Report classified Codex turn failures from the native readiness probe instead of hiding them behind a generic session failure.
+
 ## satelle@0.1.23
 
 ### Native Computer Use setup
