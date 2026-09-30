@@ -294,13 +294,22 @@ fn select_latest_release(bytes: &[u8], target: &str) -> Result<SelectedCodexRele
 pub(crate) fn install_latest_managed_codex(
     state_root: &Path,
 ) -> Result<ManagedCodexInstallOutcome, SatelleError> {
-    let target = current_target()?;
+    install_latest_managed_codex_for_target(state_root, current_target()?)
+}
+
+fn install_latest_managed_codex_for_target(
+    state_root: &Path,
+    target: &str,
+) -> Result<ManagedCodexInstallOutcome, SatelleError> {
     let receipt_path = state_root.join(RECEIPT_FILE_NAME);
     let intent_path = state_root.join(INSTALL_INTENT_FILE_NAME);
     let installed = match fs::symlink_metadata(&receipt_path) {
-        Ok(_) => Some(admit_managed_codex_from_state_root_for_target(
-            state_root, target,
-        )?),
+        // Admission only reads the existing receipt and package. A rejection
+        // therefore has a confirmed no-change outcome for the setup fence.
+        Ok(_) => Some(
+            admit_managed_codex_from_state_root_for_target(state_root, target)
+                .map_err(|error| install_error("admit-existing-codex", error))?,
+        ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(install_error("inspect-install-receipt", error)),
     };
@@ -1688,6 +1697,36 @@ mod tests {
     #[test]
     fn managed_install_errors_defer_the_exact_target_recovery_to_the_controller() {
         assert_eq!(install_error("fixture", "failure").recovery_command, None);
+    }
+
+    #[test]
+    fn existing_receipt_rejection_is_a_no_change_setup_failure() {
+        for outside_managed_root in [false, true] {
+            let mut fixture = ReceiptFixture::new();
+            if outside_managed_root {
+                let desktop_package = fixture.codex_home.join("desktop-release");
+                fs::rename(&fixture.package_root, &desktop_package).unwrap();
+                fixture.binary_path = desktop_package.join("bin").join(BINARY_NAME);
+                fixture.receipt["immutable_package_root"] = json!(desktop_package);
+                fixture.receipt["immutable_binary_path"] = json!(fixture.binary_path);
+            } else {
+                fixture.receipt["schema"] = json!("invalid");
+            }
+            fixture.write_receipt();
+            let receipt_before = fs::read(&fixture.receipt_path).unwrap();
+            let binary_before = fs::read(&fixture.binary_path).unwrap();
+
+            let error =
+                install_latest_managed_codex_for_target(&fixture.state_root, FIXTURE_TARGET)
+                    .expect_err("an inadmissible receipt must reject setup before downloading");
+
+            assert_eq!(error.code, ErrorCode::SetupActionFailed);
+            assert_eq!(error.details["failed_action"], "admit-existing-codex");
+            assert_eq!(error.details["changed"], false);
+            assert_eq!(fs::read(&fixture.receipt_path).unwrap(), receipt_before);
+            assert_eq!(fs::read(&fixture.binary_path).unwrap(), binary_before);
+            assert!(!fixture.state_root.join(INSTALL_INTENT_FILE_NAME).exists());
+        }
     }
 
     #[test]
