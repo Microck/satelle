@@ -110,6 +110,25 @@ pub use storage::{
 };
 use zeroize::Zeroizing;
 
+/// Shared by native admission and the binary's authenticated macOS launcher.
+/// Instruction-only fields are deliberately absent; the verified service path
+/// must survive the launcher boundary without inheriting unrelated credentials.
+#[doc(hidden)]
+pub const MACOS_NATIVE_BRIDGE_ENVIRONMENT: [&str; 12] = [
+    "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS",
+    "BROWSER_USE_CODEX_APP_VERSION",
+    "NODE_REPL_TRUSTED_CODE_PATHS",
+    "NODE_REPL_NODE_MODULE_DIRS",
+    "NODE_REPL_NODE_PATH",
+    "BROWSER_USE_AVAILABLE_BACKENDS",
+    "BROWSER_USE_TINYSKY_ENABLED",
+    "CODEX_HOME",
+    "BROWSER_USE_CODEX_APP_BUILD_FLAVOR",
+    "CODEX_CLI_PATH",
+    "SKY_CUA_SERVICE_PATH",
+    "NODE_REPL_TRUSTED_SERVICES",
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskArtifactSet {
     session_id: SessionId,

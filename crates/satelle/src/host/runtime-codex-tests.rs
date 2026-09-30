@@ -1522,6 +1522,17 @@ fn macos_sky_environment_preserves_runtime_values_and_discards_instructions() {
             );
 
             assert_eq!(
+                admitted
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                crate::host::MACOS_NATIVE_BRIDGE_ENVIRONMENT
+                    .into_iter()
+                    .collect(),
+                "every admitted runtime field must cross the authenticated launcher boundary",
+            );
+
+            assert_eq!(
                 admitted["SKY_CUA_SERVICE_PATH"],
                 "/Users/operator/.codex/computer-use/Codex Computer Use.app"
             );

@@ -121,23 +121,8 @@ const STATE_OWNERSHIP_LOCK: &str = "satelle.sqlite3.lock";
 const STATE_RELEASE_TIMEOUT: Duration = Duration::from_secs(20);
 const STATE_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MACOS_NATIVE_BRIDGE_LAUNCHER: &str = "__satelle-launch-macos-native-bridge";
-#[cfg(any(target_os = "macos", test))]
-const MACOS_NATIVE_BRIDGE_ENVIRONMENT: [&str; 14] = [
-    "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS",
-    "BROWSER_USE_CODEX_APP_VERSION",
-    "NODE_REPL_TRUSTED_CODE_PATHS",
-    "NODE_REPL_NODE_MODULE_DIRS",
-    "NODE_REPL_NODE_PATH",
-    "BROWSER_USE_AVAILABLE_BACKENDS",
-    "BROWSER_USE_TINYSKY_ENABLED",
-    "CODEX_HOME",
-    "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER",
-    "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME",
-    "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE",
-    "BROWSER_USE_CODEX_APP_BUILD_FLAVOR",
-    "CODEX_CLI_PATH",
-    "NODE_REPL_TRUSTED_SERVICES",
-];
+#[cfg(target_os = "macos")]
+use satelle::host::MACOS_NATIVE_BRIDGE_ENVIRONMENT;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use zeroize::Zeroizing;
@@ -2120,29 +2105,6 @@ fn process_has_disallowed_bearer_token(args: &[std::ffi::OsString]) -> bool {
 #[cfg(test)]
 mod process_boundary_tests {
     use super::*;
-
-    #[test]
-    fn macos_launcher_environment_matches_the_current_native_binding() {
-        assert_eq!(
-            MACOS_NATIVE_BRIDGE_ENVIRONMENT,
-            [
-                "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS",
-                "BROWSER_USE_CODEX_APP_VERSION",
-                "NODE_REPL_TRUSTED_CODE_PATHS",
-                "NODE_REPL_NODE_MODULE_DIRS",
-                "NODE_REPL_NODE_PATH",
-                "BROWSER_USE_AVAILABLE_BACKENDS",
-                "BROWSER_USE_TINYSKY_ENABLED",
-                "CODEX_HOME",
-                "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER",
-                "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME",
-                "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE",
-                "BROWSER_USE_CODEX_APP_BUILD_FLAVOR",
-                "CODEX_CLI_PATH",
-                "NODE_REPL_TRUSTED_SERVICES",
-            ]
-        );
-    }
 
     #[test]
     fn bearer_token_in_argument_zero_is_rejected() {
