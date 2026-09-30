@@ -155,56 +155,53 @@ fn windows_setup_adds_only_the_satelle_readiness_app_to_existing_config() {
 }
 
 #[test]
-fn windows_marketplace_inventory_identifies_only_one_canonical_registration() {
+fn windows_marketplace_registration_reads_hidden_raw_sources() {
+    // Codex's filtered inventory omits the protected AppX source, while its
+    // add command still reads and rejects this raw registration as a duplicate.
     let signed_root = Path::new(
-        r"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.5331.0_arm64__2p2nqsd0c76g0\app\resources\plugins\openai-bundled",
+        r"C:\Program Files\WindowsApps\OpenAI.Codex_26.908.9136.0_x64__2p2nqsd0c76g0\app\resources\plugins\openai-bundled",
     );
-    let absent = br#"{"marketplaces":[{"name":"openai-primary-runtime","root":"C:\\runtime"}]}"#;
+    let canonical_root =
+        Path::new(r"C:\Users\operator\.codex\.tmp\bundled-marketplaces\openai-bundled");
+    let unrelated = "[marketplaces.other]\nenabled = false\n";
+    assert_eq!(configured_windows_marketplace_root("").unwrap(), None);
     assert_eq!(
-        configured_windows_marketplace_root(absent).expect("parse inventory without bundle"),
+        configured_windows_marketplace_root(unrelated).unwrap(),
         None
     );
+    for source in [signed_root, canonical_root] {
+        let registration = toml::to_string(
+            &toml::Value::try_from(json!({
+                "marketplaces": {"openai-bundled": {"source_type": "local", "source": source}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let contents = format!("{unrelated}\n{registration}");
+        assert_eq!(
+            configured_windows_marketplace_root(&contents)
+                .expect("read authoritative registration"),
+            Some(source.to_path_buf())
+        );
+    }
+}
 
-    let current = serde_json::to_vec(&json!({
-        "marketplaces": [{"name": "openai-bundled", "root": signed_root}]
-    }))
-    .expect("serialize current marketplace inventory");
-    assert_eq!(
-        configured_windows_marketplace_root(&current).expect("parse current bundle"),
-        Some(signed_root.to_path_buf())
-    );
-
-    let stale_root =
-        Path::new(r"C:\Users\operator\.codex\.tmp\bundled-marketplaces\openai-bundled");
-    let stale = serde_json::to_vec(&json!({
-        "marketplaces": [{"name": "openai-bundled", "root": stale_root}]
-    }))
-    .expect("serialize stale marketplace inventory");
-    assert_eq!(
-        configured_windows_marketplace_root(&stale).expect("parse stale bundle"),
-        Some(stale_root.to_path_buf())
-    );
-
-    let duplicate = serde_json::to_vec(&json!({
-        "marketplaces": [
-            {"name": "openai-bundled", "root": signed_root},
-            {"name": "openai-bundled", "root": stale_root}
-        ]
-    }))
-    .expect("serialize ambiguous marketplace inventory");
-    let ambiguous = configured_windows_marketplace_root(&duplicate)
-        .expect_err("duplicate named marketplaces must fail closed");
-    assert_eq!(
-        ambiguous.details["reason"],
-        json!("plugin_marketplace_inventory_ambiguous")
-    );
-
-    let malformed = configured_windows_marketplace_root(br#"{"marketplaces":null}"#)
-        .expect_err("malformed marketplace inventory must fail closed");
-    assert_eq!(
-        malformed.details["reason"],
-        json!("plugin_marketplace_inventory_malformed")
-    );
+#[test]
+fn windows_marketplace_registration_rejects_malformed_config_without_disclosure() {
+    for contents in [
+        "marketplaces = []",
+        "[marketplaces.openai-bundled]\nsource = 42",
+        "[marketplaces.openai-bundled]\nsource = ''",
+        "[marketplaces.openai-bundled]\nsource = 'private-source-canary'\n[marketplaces.openai-bundled]",
+    ] {
+        let error = configured_windows_marketplace_root(contents)
+            .expect_err("malformed registration must fail before mutation");
+        assert_eq!(
+            error.details["reason"],
+            json!("plugin_marketplace_inventory_malformed")
+        );
+        assert!(!format!("{error:?}").contains("private-source-canary"));
+    }
 }
 
 #[test]

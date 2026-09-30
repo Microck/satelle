@@ -673,15 +673,15 @@ struct MarketplaceAddResult {
 
 #[cfg(any(windows, test))]
 #[derive(Deserialize)]
-struct MarketplaceInventory {
-    marketplaces: Vec<ConfiguredMarketplace>,
+struct ConfiguredMarketplaces {
+    #[serde(default)]
+    marketplaces: BTreeMap<String, toml::Value>,
 }
 
 #[cfg(any(windows, test))]
 #[derive(Deserialize)]
 struct ConfiguredMarketplace {
-    name: String,
-    root: PathBuf,
+    source: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -882,23 +882,22 @@ pub(super) fn windows_config_with_allowed_app(
 
 #[cfg(any(windows, test))]
 pub(super) fn configured_windows_marketplace_root(
-    inventory: &[u8],
+    contents: &str,
 ) -> Result<Option<PathBuf>, SatelleError> {
-    let inventory = serde_json::from_slice::<MarketplaceInventory>(inventory)
+    let mut config = toml::from_str::<ConfiguredMarketplaces>(contents)
         .map_err(|_| codex_isolation_error("plugin_marketplace_inventory_malformed"))?;
-    let mut roots = inventory
-        .marketplaces
-        .into_iter()
-        .filter_map(|marketplace| {
-            (marketplace.name == "openai-bundled").then_some(marketplace.root)
-        });
-    let root = roots.next();
-    if roots.next().is_some() {
+    let Some(marketplace) = config.marketplaces.remove("openai-bundled") else {
+        return Ok(None);
+    };
+    let marketplace: ConfiguredMarketplace = marketplace
+        .try_into()
+        .map_err(|_| codex_isolation_error("plugin_marketplace_inventory_malformed"))?;
+    if marketplace.source.as_os_str().is_empty() {
         return Err(codex_isolation_error(
-            "plugin_marketplace_inventory_ambiguous",
+            "plugin_marketplace_inventory_malformed",
         ));
     }
-    Ok(root)
+    Ok(Some(marketplace.source))
 }
 
 #[cfg(windows)]
@@ -1015,15 +1014,31 @@ fn provision_windows_computer_use(
 
     // Register only the verified managed snapshot accepted by current Codex.
     // Remove a conflicting registration before selecting that canonical source.
-    let mut marketplace_inventory_command = runtime.command()?;
-    marketplace_inventory_command.args(["plugin", "marketplace", "list", "--json"]);
-    let marketplace_inventory = bounded_inventory_command_output(
-        marketplace_inventory_command,
-        deadline,
-        "plugin_marketplace_inventory_unavailable",
-        "plugin_marketplace_inventory_failed",
-    )?;
-    let configured_marketplace = configured_windows_marketplace_root(&marketplace_inventory)?;
+    // Codex filters inadmissible reserved sources out of marketplace inventory,
+    // but its add command still rejects duplicate entries in the user config.
+    // Read that same registration so removal can precede the canonical add.
+    let marketplace_config_path = runtime.codex_home().join("config.toml");
+    let marketplace_config = match fs::symlink_metadata(&marketplace_config_path) {
+        Ok(metadata) => {
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > SCHEMA_FILE_LIMIT
+            {
+                return Err(codex_isolation_error(
+                    "plugin_marketplace_inventory_untrusted",
+                ));
+            }
+            fs::read_to_string(&marketplace_config_path)
+                .map_err(|_| codex_isolation_error("plugin_marketplace_inventory_unavailable"))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => {
+            return Err(codex_isolation_error(
+                "plugin_marketplace_inventory_unavailable",
+            ));
+        }
+    };
+    let configured_marketplace = configured_windows_marketplace_root(&marketplace_config)?;
     let marketplace_matches = configured_marketplace
         .as_deref()
         .is_some_and(|configured_root| {
