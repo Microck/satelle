@@ -2141,6 +2141,9 @@
 - label: a completed Codex probe turn without a successful native tool fails readiness immediately instead of waiting for an action callback that cannot be proven
   command: cargo test --locked -p satelle --features test-support --lib host::runtime::codex_adapter::tests::completed_turn_without_a_successful_native_tool_does_not_wait_for_callbacks -- --exact
   tags: [spec, mvp, implemented, ci]
+- label: native readiness preserves the closed Codex failed-turn classification without retaining provider messages or additional details
+  command: cargo test --locked -p satelle --features test-support --lib host::runtime::codex_adapter::tests::native_readiness_preserves_closed_failed_turn_classes -- --exact
+  tags: [spec, mvp, implemented, ci]
 - label: satelle does not allow prompt execution or remote-control flows on hosts that fail native Codex Computer Use readiness
   command: cargo test --locked -p satelle --lib tests::unsupported_or_unproven_production_execution_is_blocked_before_admission -- --exact
   tags: [spec, mvp, implemented, ci]
