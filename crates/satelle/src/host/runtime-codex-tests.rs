@@ -10,7 +10,7 @@ use super::control_plane::{
     configure_control_plane_probe_command, configure_mcp_inventory_command,
     configured_windows_marketplace_root, macos_authenticated_bridge_args, macos_codex_app_command,
     macos_setup_prerequisite_error, mcp_server_names_from_json, native_bridge_root_path,
-    path_is_absolute_for_platform, probe_control_plane_with,
+    path_is_absolute_for_platform, probe_control_plane_with, read_only_app_server_command,
     refresh_windows_native_pipe_binding_from_config, same_path_for_platform,
     trusted_macos_node_repl_env, trusted_windows_node_repl_env, windows_config_with_allowed_app,
     windows_locked_bridge_args,
@@ -434,6 +434,11 @@ fn main() {
         Some("version-with-descendant") => version_with_descendant(),
         Some("version-with-escaped-descendant") => version_with_escaped_descendant(),
         Some("version-then-slow") => version_then_slow(),
+        Some("mcp") => {
+            let home = std::env::var_os("CODEX_HOME").expect("inventory home");
+            assert!(std::path::Path::new(&home).join("private-home-marker").is_file());
+            println!("[]");
+        }
         Some("inventory-success") => println!("{{\"installed\":[]}}"),
         Some("inventory-with-escaped-descendant") => {
             spawn_escaped_descendant();
@@ -688,6 +693,33 @@ fn schema_generation_accepts_a_successful_leader_with_live_descendants() {
         ControlPlaneCapability::ALL
             .into_iter()
             .all(|capability| probe.supports(capability))
+    );
+}
+
+#[test]
+fn recovery_inventories_the_home_it_will_read() {
+    let fixture = compile_stdio_fixture();
+    let private_home = tempfile::tempdir().expect("private recovery home");
+    std::fs::write(private_home.path().join("private-home-marker"), b"")
+        .expect("mark the private inventory home");
+    let mut inventory = Command::new(fixture.executable());
+    inventory.env("CODEX_HOME", "unrelated-receipt-home");
+    let mut app_server = Command::new(fixture.executable());
+    app_server.env("CODEX_HOME", "unrelated-receipt-home");
+    let command = read_only_app_server_command(
+        inventory,
+        app_server,
+        Instant::now() + Duration::from_secs(2),
+        Some(private_home.path()),
+    )
+    .expect("inventory must select the recovery home before running");
+    assert!(command.get_envs().any(|(name, value)| {
+        name == "CODEX_HOME" && value == Some(private_home.path().as_os_str())
+    }));
+    assert!(
+        !command
+            .get_args()
+            .any(|argument| { argument.to_string_lossy().starts_with("mcp_servers.") })
     );
 }
 

@@ -359,6 +359,7 @@ pub(super) fn configure_control_plane_probe_command(
 
 pub(crate) fn installed_read_only_app_server_command(
     deadline: Instant,
+    codex_home: Option<&Path>,
 ) -> Result<Command, SatelleError> {
     // Recovery must read the exact receipt-recorded home that execution used.
     #[cfg(not(target_os = "macos"))]
@@ -369,14 +370,21 @@ pub(crate) fn installed_read_only_app_server_command(
         let runtime = crate::host::codex_install::admit_managed_codex_for_current_process()?;
         computer_use_runtime_commands(&runtime, deadline)?
     };
-    read_only_app_server_command(mcp_command, app_server_command, deadline)
+    read_only_app_server_command(mcp_command, app_server_command, deadline, codex_home)
 }
 
 pub(super) fn read_only_app_server_command(
     mut mcp_command: Command,
-    app_server_command: Command,
+    mut app_server_command: Command,
     deadline: Instant,
+    codex_home: Option<&Path>,
 ) -> Result<Command, SatelleError> {
+    // Inventory and startup must use the same home. Applying the recovery
+    // home only after inventory creates partial overrides for absent servers.
+    if let Some(codex_home) = codex_home {
+        mcp_command.env("CODEX_HOME", codex_home);
+        app_server_command.env("CODEX_HOME", codex_home);
+    }
     // The inventory subprocess consumes the caller's existing deadline before
     // the app-server command from the same verified batch can be returned.
     mcp_command = configure_mcp_inventory_command(mcp_command);

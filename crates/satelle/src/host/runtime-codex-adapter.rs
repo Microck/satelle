@@ -287,7 +287,7 @@ impl ProductionComputerUseAdapter {
                     .ok_or_else(codex_effective_defaults_unavailable)?;
                 let app_server =
                     crate::host::codex_capabilities::installed_read_only_app_server_command(
-                        deadline,
+                        deadline, None,
                     )?;
                 let defaults =
                     crate::host::codex_capabilities::probe_effective_codex_defaults(app_server)
@@ -1043,10 +1043,11 @@ impl ProductionComputerUseAdapter {
                 prepare_binding_runtime_paths(path, subject.desktop_binding()).ok()
             })?;
         let deadline = Instant::now().checked_add(PERSISTED_TURN_READ_TIMEOUT)?;
-        let mut app_server =
-            crate::host::codex_capabilities::installed_read_only_app_server_command(deadline)
-                .ok()?;
-        app_server.env("CODEX_HOME", &runtime_paths.codex_home);
+        let app_server = crate::host::codex_capabilities::installed_read_only_app_server_command(
+            deadline,
+            Some(&runtime_paths.codex_home),
+        )
+        .ok()?;
         read_codex_turn(
             app_server,
             CodexTurnReadRequest {
@@ -1072,10 +1073,11 @@ impl ProductionComputerUseAdapter {
                 prepare_binding_runtime_paths(path, subject.desktop_binding()).ok()
             })?;
         let deadline = Instant::now().checked_add(PERSISTED_TURN_READ_TIMEOUT)?;
-        let mut app_server =
-            crate::host::codex_capabilities::installed_read_only_app_server_command(deadline)
-                .ok()?;
-        app_server.env("CODEX_HOME", &runtime_paths.codex_home);
+        let app_server = crate::host::codex_capabilities::installed_read_only_app_server_command(
+            deadline,
+            Some(&runtime_paths.codex_home),
+        )
+        .ok()?;
         read_codex_turn(
             app_server,
             CodexTurnReadRequest {

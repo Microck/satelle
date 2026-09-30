@@ -892,9 +892,12 @@ fn probe_windows_app_policy(
     app_server_command: Command,
     deadline: Instant,
 ) -> EvidenceSurface {
-    let Ok(command) =
-        control_plane::read_only_app_server_command(mcp_command, app_server_command, deadline)
-    else {
+    let Ok(command) = control_plane::read_only_app_server_command(
+        mcp_command,
+        app_server_command,
+        deadline,
+        None,
+    ) else {
         return EvidenceSurface::Incomplete;
     };
     retry_app_server_handshake(&command, deadline)
