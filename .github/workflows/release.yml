@@ -122,7 +122,7 @@ jobs:
           curl --fail --location --retry 3 --connect-timeout 10 --max-time 300 \
             --output "$tool_root/$cargo_zigbuild_archive" \
             "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.0/$cargo_zigbuild_archive"
-          curl --fail --location --retry 3 --connect-timeout 10 --max-time 300 \
+          curl --fail --location --retry 3 --connect-timeout 10 --max-time 600 \
             --output "$tool_root/$zig_archive" \
             "https://ziglang.org/download/0.15.2/$zig_archive"
           printf '%s  %s\n' "$cargo_zigbuild_sha" "$tool_root/$cargo_zigbuild_archive" \
