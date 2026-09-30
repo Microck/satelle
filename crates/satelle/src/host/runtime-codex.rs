@@ -2405,16 +2405,43 @@ fn verified_windows_computer_use_marketplace_root(
             "computer_use_plugin_source_untrusted",
         ));
     }
-    for relative in [".agents", "plugins/computer-use"] {
-        verify_bundled_plugin_snapshot(&source.join(relative), &snapshot.join(relative))?;
-    }
+    verify_bundled_marketplace_snapshot(&source, &snapshot)?;
     Ok(snapshot)
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn verify_bundled_marketplace_snapshot(
+    source: &Path,
+    snapshot: &Path,
+) -> Result<(), SatelleError> {
+    // Codex filters unrelated catalog entries when materializing this snapshot.
+    // Only the catalog JSON is a projection; all other metadata and every
+    // Computer Use plugin byte must still match the protected AppX bundle.
+    let manifest = source.join(".agents/plugins/marketplace.json");
+    verify_bundled_snapshot(
+        &source.join(".agents"),
+        &snapshot.join(".agents"),
+        Some(&manifest),
+    )?;
+    verify_bundled_plugin_snapshot(
+        &source.join("plugins/computer-use"),
+        &snapshot.join("plugins/computer-use"),
+    )
 }
 
 #[cfg(any(windows, test))]
 pub(super) fn verify_bundled_plugin_snapshot(
     source: &Path,
     snapshot: &Path,
+) -> Result<(), SatelleError> {
+    verify_bundled_snapshot(source, snapshot, None)
+}
+
+#[cfg(any(windows, test))]
+fn verify_bundled_snapshot(
+    source: &Path,
+    snapshot: &Path,
+    filtered_manifest: Option<&Path>,
 ) -> Result<(), SatelleError> {
     let verify = || -> std::io::Result<bool> {
         let source_metadata = fs::symlink_metadata(source)?;
@@ -2433,16 +2460,35 @@ pub(super) fn verify_bundled_plugin_snapshot(
                 return Ok(false);
             }
             for name in source_names {
-                verify_bundled_plugin_snapshot(&source.join(&name), &snapshot.join(&name))
-                    .map_err(std::io::Error::other)?;
+                verify_bundled_snapshot(
+                    &source.join(&name),
+                    &snapshot.join(&name),
+                    filtered_manifest,
+                )
+                .map_err(std::io::Error::other)?;
             }
             return Ok(true);
         }
-        Ok(source_metadata.is_file()
-            && snapshot_metadata.is_file()
-            && source_metadata.len() == snapshot_metadata.len()
-            && source_metadata.len() <= INVENTORY_OUTPUT_LIMIT
-            && fs::read(source)? == fs::read(snapshot)?)
+        if !source_metadata.is_file()
+            || !snapshot_metadata.is_file()
+            || source_metadata.len() > INVENTORY_OUTPUT_LIMIT
+            || snapshot_metadata.len() > INVENTORY_OUTPUT_LIMIT
+            || (filtered_manifest != Some(source)
+                && source_metadata.len() != snapshot_metadata.len())
+        {
+            return Ok(false);
+        }
+        let source_bytes = fs::read(source)?;
+        let snapshot_bytes = fs::read(snapshot)?;
+        if filtered_manifest == Some(source) {
+            let source_manifest = serde_json::from_slice(&source_bytes)?;
+            let snapshot_manifest = serde_json::from_slice(&snapshot_bytes)?;
+            return Ok(bundled_marketplace_manifest_matches(
+                source_manifest,
+                snapshot_manifest,
+            ));
+        }
+        Ok(source_bytes == snapshot_bytes)
     };
     if verify().unwrap_or(false) {
         Ok(())
@@ -2451,6 +2497,41 @@ pub(super) fn verify_bundled_plugin_snapshot(
             "computer_use_plugin_source_untrusted",
         ))
     }
+}
+
+#[cfg(any(windows, test))]
+fn bundled_marketplace_manifest_matches(source: Value, snapshot: Value) -> bool {
+    let (Value::Object(mut source), Value::Object(mut snapshot)) = (source, snapshot) else {
+        return false;
+    };
+    let (Some(Value::Array(source_plugins)), Some(Value::Array(snapshot_plugins))) =
+        (source.remove("plugins"), snapshot.remove("plugins"))
+    else {
+        return false;
+    };
+    if source != snapshot || source.get("name").and_then(Value::as_str) != Some("openai-bundled") {
+        return false;
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut computer_use_present = false;
+    for plugin in &snapshot_plugins {
+        let Some(name) = plugin.get("name").and_then(Value::as_str) else {
+            return false;
+        };
+        if !names.insert(name) || !source_plugins.contains(plugin) {
+            return false;
+        }
+        if name == "computer-use" {
+            if plugin.pointer("/source/source").and_then(Value::as_str) != Some("local")
+                || plugin.pointer("/source/path").and_then(Value::as_str)
+                    != Some("./plugins/computer-use")
+            {
+                return false;
+            }
+            computer_use_present = true;
+        }
+    }
+    computer_use_present
 }
 
 #[cfg(windows)]

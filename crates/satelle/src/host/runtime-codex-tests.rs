@@ -2384,6 +2384,132 @@ fn bundled_plugin_snapshot_requires_all_protected_source_bytes() {
     assert!(super::control_plane::verify_bundled_plugin_snapshot(&source, &snapshot).is_err());
 }
 
+#[test]
+fn bundled_marketplace_snapshot_authenticates_filtered_catalog_and_plugin_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let snapshot = root.path().join("snapshot");
+    let computer_use = json!({
+        "name": "computer-use",
+        "source": {"source": "local", "path": "./plugins/computer-use"},
+        "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+        "category": "Productivity"
+    });
+    let catalog = json!({
+        "name": "openai-bundled",
+        "interface": {"displayName": "OpenAI"},
+        "plugins": [
+            {"name": "browser", "source": {"source": "local", "path": "./plugins/browser"}},
+            computer_use,
+            {"name": "deep-research", "source": {"source": "local", "path": "./plugins/deep-research"}}
+        ]
+    });
+    for directory in [&source, &snapshot] {
+        std::fs::create_dir_all(directory.join(".agents/plugins")).unwrap();
+        std::fs::create_dir_all(directory.join("plugins/computer-use/.codex-plugin")).unwrap();
+        std::fs::write(
+            directory.join("plugins/computer-use/.codex-plugin/plugin.json"),
+            b"protected manifest",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("plugins/computer-use/SKILL.md"),
+            b"protected instructions",
+        )
+        .unwrap();
+    }
+    let manifest_path = ".agents/plugins/marketplace.json";
+    std::fs::write(
+        source.join(manifest_path),
+        serde_json::to_vec_pretty(&catalog).unwrap(),
+    )
+    .unwrap();
+    let mut filtered = catalog.clone();
+    filtered["plugins"].as_array_mut().unwrap().pop();
+    // These files model the observed Codex projection: identical retained
+    // entries with an unrelated plugin omitted and different JSON formatting.
+    std::fs::write(
+        snapshot.join(manifest_path),
+        serde_json::to_vec(&filtered).unwrap(),
+    )
+    .unwrap();
+    let verify = || super::control_plane::verify_bundled_marketplace_snapshot(&source, &snapshot);
+    verify().expect("authentic filtered marketplace is admitted");
+    for change in [
+        "identity",
+        "metadata",
+        "computer-use-source",
+        "policy",
+        "unrelated-entry",
+        "extra-entry",
+        "duplicate-entry",
+        "missing-computer-use",
+        "malformed-catalog",
+    ] {
+        let mut altered = filtered.clone();
+        match change {
+            "identity" => altered["name"] = json!("other-marketplace"),
+            "metadata" => altered["interface"]["displayName"] = json!("changed"),
+            "computer-use-source" => {
+                altered["plugins"][1]["source"]["path"] = json!("./plugins/other")
+            }
+            "policy" => altered["plugins"][1]["policy"]["installation"] = json!("HIDDEN"),
+            "unrelated-entry" => altered["plugins"][0]["source"]["path"] = json!("./plugins/other"),
+            "extra-entry" => altered["plugins"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name": "injected"})),
+            "duplicate-entry" => altered["plugins"]
+                .as_array_mut()
+                .unwrap()
+                .push(computer_use.clone()),
+            "missing-computer-use" => {
+                altered["plugins"].as_array_mut().unwrap().pop();
+            }
+            "malformed-catalog" => altered["plugins"] = serde_json::Value::Null,
+            _ => unreachable!(),
+        }
+        std::fs::write(
+            snapshot.join(manifest_path),
+            serde_json::to_vec(&altered).unwrap(),
+        )
+        .unwrap();
+        let error = verify().expect_err(change);
+        assert_eq!(
+            error.details["reason"],
+            json!("computer_use_plugin_source_untrusted")
+        );
+    }
+    std::fs::write(snapshot.join(manifest_path), b"{").unwrap();
+    assert!(verify().is_err());
+    std::fs::write(
+        snapshot.join(manifest_path),
+        serde_json::to_vec(&filtered).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(snapshot.join(".agents/extra.json"), b"unexpected metadata").unwrap();
+    assert!(verify().is_err());
+    std::fs::remove_file(snapshot.join(".agents/extra.json")).unwrap();
+    std::fs::write(
+        snapshot.join("plugins/computer-use/SKILL.md"),
+        b"altered instructions",
+    )
+    .unwrap();
+    assert!(verify().is_err());
+    std::fs::write(
+        snapshot.join("plugins/computer-use/SKILL.md"),
+        b"protected instructions",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(snapshot.join(manifest_path)).unwrap();
+        std::os::unix::fs::symlink(source.join(manifest_path), snapshot.join(manifest_path))
+            .unwrap();
+        assert!(verify().is_err());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn bundled_plugin_snapshot_rejects_links_to_protected_files() {
