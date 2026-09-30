@@ -18,9 +18,9 @@ use crate::core::{
     SatelleEventBody, SessionId, TurnId, resolve_desktop_session_for,
 };
 use crate::host::codex_session::{
-    CodexApprovalPolicy, CodexSandboxPolicy, CodexSessionControl, CodexSessionError,
-    CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal, CodexThreadStatus,
-    CodexTurnReadRequest, TimedCodexSessionRun, read_codex_turn,
+    CodexApprovalPolicy, CodexFailedTurnKind, CodexSandboxPolicy, CodexSessionControl,
+    CodexSessionError, CodexSessionFailure, CodexSessionRequest, CodexSessionTerminal,
+    CodexThreadStatus, CodexTurnReadRequest, TimedCodexSessionRun, read_codex_turn,
     run_codex_session_with_native_action_completion, run_codex_session_with_timeout_cancellation,
 };
 use crate::host::provider_auth::{
@@ -1940,8 +1940,14 @@ fn classify_native_probe_failure_before_action_wait(
         {
             Some(native_smoke_session_failure(*failure))
         }
-        Ok(CodexSessionTerminal::Failed(_)) if run.cancellation.is_none() => {
-            Some(native_smoke_failure("native_readiness_session_failed"))
+        Ok(CodexSessionTerminal::Failed(kind)) if run.cancellation.is_none() => {
+            // This enum contains only the protocol classifier's closed error codes.
+            // Do not replace a useful auth, quota, or transport code with a generic failure.
+            let reason = match kind {
+                CodexFailedTurnKind::Classified(reason) => reason,
+                CodexFailedTurnKind::Other => "native_readiness_session_failed",
+            };
+            Some(native_smoke_failure(reason))
         }
         Ok(CodexSessionTerminal::Completed | CodexSessionTerminal::Interrupted)
         | Ok(CodexSessionTerminal::Failed(_))
@@ -3640,6 +3646,42 @@ mod tests {
 
         assert_eq!(failure.reason, "native_readiness_session_failed");
         assert!(!failure.dispatch_possible);
+    }
+
+    #[test]
+    fn native_readiness_preserves_closed_failed_turn_classes() {
+        for (kind, expected_reason) in [
+            (
+                CodexFailedTurnKind::Classified("codex_unauthorized"),
+                "codex_unauthorized",
+            ),
+            (
+                CodexFailedTurnKind::Classified("codex_usage_limit_exceeded"),
+                "codex_usage_limit_exceeded",
+            ),
+            (
+                CodexFailedTurnKind::Classified("codex_response_stream_disconnected"),
+                "codex_response_stream_disconnected",
+            ),
+            (
+                CodexFailedTurnKind::Other,
+                "native_readiness_session_failed",
+            ),
+        ] {
+            let run = || crate::host::codex_session::TimedCodexSessionRun {
+                result: Ok(CodexSessionTerminal::Failed(kind)),
+                cancellation: None,
+            };
+            let immediate = classify_native_probe_failure_before_action_wait(&run())
+                .expect("a failed turn must fail before waiting for native callbacks");
+            let completed = classify_native_probe_completion(run(), Ok(()))
+                .expect_err("even a successful native callback cannot hide a failed turn");
+            for failure in [immediate, completed] {
+                assert_eq!(failure.reason, expected_reason);
+                assert_eq!(failure.error.details["reason"], expected_reason);
+                assert!(failure.error.source_detail.is_none());
+            }
+        }
     }
 
     #[test]
