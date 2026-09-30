@@ -2350,3 +2350,39 @@ fn write_method_schema(path: &Path, methods: &[&str], nested_decoy: Option<&str>
     )
     .expect("write fixture schema");
 }
+
+#[test]
+fn bundled_plugin_snapshot_requires_all_protected_source_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let snapshot = root.path().join("snapshot");
+    for directory in [&source, &snapshot] {
+        std::fs::create_dir_all(directory.join(".codex-plugin")).unwrap();
+        std::fs::write(
+            directory.join(".codex-plugin/plugin.json"),
+            b"signed manifest",
+        )
+        .unwrap();
+        std::fs::write(directory.join("SKILL.md"), b"signed instructions").unwrap();
+    }
+    super::control_plane::verify_bundled_plugin_snapshot(&source, &snapshot).unwrap();
+    std::fs::write(snapshot.join("SKILL.md"), b"changed instruction").unwrap();
+    assert!(super::control_plane::verify_bundled_plugin_snapshot(&source, &snapshot).is_err());
+    std::fs::write(snapshot.join("SKILL.md"), b"signed instructions").unwrap();
+    std::fs::write(snapshot.join("extra.js"), b"unexpected").unwrap();
+    assert!(super::control_plane::verify_bundled_plugin_snapshot(&source, &snapshot).is_err());
+    std::fs::remove_file(snapshot.join("extra.js")).unwrap();
+    std::fs::remove_file(snapshot.join("SKILL.md")).unwrap();
+    assert!(super::control_plane::verify_bundled_plugin_snapshot(&source, &snapshot).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn bundled_plugin_snapshot_rejects_links_to_protected_files() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let snapshot = root.path().join("snapshot");
+    std::fs::write(&source, b"signed bytes").unwrap();
+    std::os::unix::fs::symlink(&source, &snapshot).unwrap();
+    assert!(super::control_plane::verify_bundled_plugin_snapshot(&source, &snapshot).is_err());
+}

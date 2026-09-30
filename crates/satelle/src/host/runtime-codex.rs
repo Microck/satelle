@@ -981,7 +981,7 @@ fn provision_windows_computer_use(
     let deadline = Instant::now()
         .checked_add(NATIVE_ISOLATION_TIMEOUT)
         .ok_or_else(|| codex_isolation_error("inventory_deadline_invalid"))?;
-    let marketplace_root = official_windows_computer_use_marketplace_root()?;
+    let marketplace_root = verified_windows_computer_use_marketplace_root(runtime.codex_home())?;
     let trusted_computer_use_plugin_root = marketplace_root.join("plugins").join("computer-use");
     let trusted_bridge_root = official_native_bridge_root("windows", runtime.codex_home())?;
 
@@ -1017,9 +1017,8 @@ fn provision_windows_computer_use(
     let remove_native_bridge =
         existing_native_bridge.is_some() && replacement_native_bridge.is_some();
 
-    // Codex refuses to add the current signed AppX bundle while the same name
-    // points anywhere else. Remove only that conflicting registration, then
-    // establish and verify the one canonical signed source.
+    // Register only the verified managed snapshot accepted by current Codex.
+    // Remove a conflicting registration before selecting that canonical source.
     let mut marketplace_inventory_command = runtime.command()?;
     marketplace_inventory_command.args(["plugin", "marketplace", "list", "--json"]);
     let marketplace_inventory = bounded_inventory_command_output(
@@ -1588,7 +1587,7 @@ fn official_computer_use_plugin_root(
 ) -> Result<PathBuf, SatelleError> {
     match platform {
         #[cfg(windows)]
-        "windows" => official_windows_computer_use_marketplace_root()
+        "windows" => verified_windows_computer_use_marketplace_root(codex_home)
             .map(|root| root.join("plugins").join("computer-use")),
         // The authenticated desktop CLI materializes its bundled marketplace
         // under the interactive user's Codex home before reporting inventory.
@@ -2382,6 +2381,80 @@ fn windows_package_roots(package_family: &str) -> Result<Vec<PathBuf>, SatelleEr
         return Err(codex_isolation_error("native_bridge_untrusted"));
     }
     Ok(roots)
+}
+
+#[cfg(windows)]
+fn verified_windows_computer_use_marketplace_root(
+    codex_home: &Path,
+) -> Result<PathBuf, SatelleError> {
+    let source = official_windows_computer_use_marketplace_root()?;
+    let mut snapshot = codex_home.to_path_buf();
+    for directory in [".tmp", "bundled-marketplaces", "openai-bundled"] {
+        snapshot.push(directory);
+        let metadata = fs::symlink_metadata(&snapshot)
+            .map_err(|_| codex_isolation_error("computer_use_plugin_source_untrusted"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(codex_isolation_error(
+                "computer_use_plugin_source_untrusted",
+            ));
+        }
+    }
+    // Current Codex reserves this marketplace name for its managed snapshot.
+    // Keep the protected AppX bundle as the authority for all admitted bytes;
+    // registration location alone is never evidence that a plugin is trusted.
+    let plugin_directory = fs::symlink_metadata(snapshot.join("plugins"))
+        .map_err(|_| codex_isolation_error("computer_use_plugin_source_untrusted"))?;
+    if !plugin_directory.is_dir() || plugin_directory.file_type().is_symlink() {
+        return Err(codex_isolation_error(
+            "computer_use_plugin_source_untrusted",
+        ));
+    }
+    for relative in [".agents", "plugins/computer-use"] {
+        verify_bundled_plugin_snapshot(&source.join(relative), &snapshot.join(relative))?;
+    }
+    Ok(snapshot)
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn verify_bundled_plugin_snapshot(
+    source: &Path,
+    snapshot: &Path,
+) -> Result<(), SatelleError> {
+    let verify = || -> std::io::Result<bool> {
+        let source_metadata = fs::symlink_metadata(source)?;
+        let snapshot_metadata = fs::symlink_metadata(snapshot)?;
+        if source_metadata.file_type().is_symlink() || snapshot_metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        if source_metadata.is_dir() && snapshot_metadata.is_dir() {
+            let names = |root: &Path| -> std::io::Result<std::collections::BTreeSet<_>> {
+                fs::read_dir(root)?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect()
+            };
+            let source_names = names(source)?;
+            if source_names != names(snapshot)? {
+                return Ok(false);
+            }
+            for name in source_names {
+                verify_bundled_plugin_snapshot(&source.join(&name), &snapshot.join(&name))
+                    .map_err(std::io::Error::other)?;
+            }
+            return Ok(true);
+        }
+        Ok(source_metadata.is_file()
+            && snapshot_metadata.is_file()
+            && source_metadata.len() == snapshot_metadata.len()
+            && source_metadata.len() <= INVENTORY_OUTPUT_LIMIT
+            && fs::read(source)? == fs::read(snapshot)?)
+    };
+    if verify().unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(codex_isolation_error(
+            "computer_use_plugin_source_untrusted",
+        ))
+    }
 }
 
 #[cfg(windows)]
