@@ -1,3 +1,9 @@
+## satelle@0.1.25
+
+### Recovery
+
+Read completed native readiness and session turns from their private Codex home without creating incomplete MCP server entries from another home. This lets supported recovery reconcile a failed turn before retrying readiness.
+
 ## satelle@0.1.24
 
 ### Native readiness diagnostics

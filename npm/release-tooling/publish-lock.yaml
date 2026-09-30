@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Host startup\n\nKeep setup reachable before a desktop is configured. Managed SSH and persistent daemons now use the Host user's desktop and provider bindings without changing service storage paths.\n"
-    filename: 2026-09-28-managed-desktop-bindings.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Recovery\n\nRead completed native readiness and session turns from their private Codex home without creating incomplete MCP server entries from another home. This lets supported recovery reconcile a failed turn before retrying readiness.\n"
+    filename: 2026-09-30-private-home-recovery.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - 2026-09-28-managed-desktop-bindings.md
+      - 2026-09-30-private-home-recovery.md
     id: cargo:satelle
     updated: true
 npm:packages:
