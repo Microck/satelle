@@ -1,3 +1,13 @@
+## satelle@0.1.22
+
+### Setup fixes
+
+Report an invalid existing managed Codex installation before changing its files, so setup can fail without leaving an uncertain maintenance operation.
+
+Prevent native app-server startup from creating incomplete entries for unrelated MCP servers in the private binding home. This fixes a Mac startup failure while preserving the verified Computer Use bridge.
+
+Use the verified official bundled Computer Use marketplace snapshot on Windows. This fixes setup failures when current Codex rejects the protected desktop resource directory as a marketplace source.
+
 ## satelle@0.1.21
 
 ### Installation
