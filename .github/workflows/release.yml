@@ -122,7 +122,8 @@ jobs:
           curl --fail --location --retry 3 --connect-timeout 10 --max-time 300 \
             --output "$tool_root/$cargo_zigbuild_archive" \
             "https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.23.0/$cargo_zigbuild_archive"
-          curl --fail --location --retry 3 --connect-timeout 10 --max-time 600 \
+          # The 47 MB Zig archive can take about fourteen minutes on cold runners.
+          curl --fail --location --retry 3 --retry-max-time 1200 --connect-timeout 10 --max-time 1200 \
             --output "$tool_root/$zig_archive" \
             "https://ziglang.org/download/0.15.2/$zig_archive"
           printf '%s  %s\n' "$cargo_zigbuild_sha" "$tool_root/$cargo_zigbuild_archive" \
