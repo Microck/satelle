@@ -836,7 +836,6 @@ fn installed_app_server_is_private_stdio_only() {
     };
     let command = configure_app_server_command(
         Command::new("receipt-recorded-codex"),
-        &["mcp-vnc".to_string(), "paper".to_string()],
         "node_repl",
         &native_binding,
     );
@@ -894,9 +893,7 @@ fn installed_app_server_is_private_stdio_only() {
         [
             "app-server",
             "--config",
-            "mcp_servers.mcp-vnc.enabled=false",
-            "--config",
-            "mcp_servers.paper.enabled=false",
+            "mcp_servers={}",
             "--config",
             "mcp_servers.node_repl.enabled=true",
             "--config",

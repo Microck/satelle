@@ -480,7 +480,6 @@ fn verified_computer_use_app_server_with_commands(
     Ok(VerifiedComputerUseAppServer {
         command: configure_app_server_command(
             app_server_command,
-            &isolation.disabled_mcp_server_names,
             &isolation.native_mcp_server_name,
             &isolation.native_mcp_binding,
         ),
@@ -495,7 +494,6 @@ fn verified_computer_use_app_server_with_commands(
 
 pub(crate) fn configure_app_server_command(
     mut command: Command,
-    mcp_server_names: &[String],
     native_mcp_server_name: &str,
     native_mcp_binding: &NativeMcpBinding,
 ) -> Command {
@@ -507,13 +505,11 @@ pub(crate) fn configure_app_server_command(
     // app-server process and in the canonical MCP child table; Sky reads the
     // explicit child values through nodeRepl.env.
     command.envs(&native_mcp_binding.env);
-    command.arg("app-server");
-    for server_name in mcp_server_names {
-        command.args([
-            "--config",
-            &format!("mcp_servers.{server_name}.enabled=false"),
-        ]);
-    }
+    // The private binding home does not inherit desktop server definitions.
+    // Setting only `enabled=false` would create incomplete transport tables,
+    // which Codex rejects even though those servers are disabled. Replace the
+    // whole table before installing the one authenticated native action path.
+    command.args(["app-server", "--config", "mcp_servers={}"]);
     for config in native_mcp_config_overrides(native_mcp_server_name, native_mcp_binding) {
         command.args(["--config", &config]);
     }
