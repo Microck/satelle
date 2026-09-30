@@ -2438,7 +2438,7 @@ dependencies = [
 
 [[package]]
 name = "satelle"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "assert_cmd",
  "async-trait",

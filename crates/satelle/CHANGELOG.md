@@ -1,3 +1,11 @@
+## satelle@0.1.23
+
+### Native Computer Use setup
+
+Launch the Mac native bridge with the same verified environment admitted by Satelle. This fixes a startup failure caused by requiring instruction fields that native isolation removes.
+
+Accept Codex's filtered Windows marketplace catalog while verifying every retained entry and all Computer Use plugin files against the protected desktop bundle. This fixes setup failures when Codex omits unrelated plugins from its catalog.
+
 ## satelle@0.1.22
 
 ### Setup fixes
