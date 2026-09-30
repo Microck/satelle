@@ -14,13 +14,16 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+use windows_sys::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_PUSHBUTTON, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HMENU, KillTimer, MSG, PostQuitMessage,
-    RegisterClassW, SW_SHOW, SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-    TranslateMessage, WM_COMMAND, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WM_TIMER,
-    WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
+    GetMessageW, GetWindowLongPtrW, HMENU, KillTimer, MSG, PostQuitMessage, RegisterClassW,
+    SW_SHOW, SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WM_COMMAND,
+    WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_POPUP,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 const WINDOW_TITLE: &str = "Satelle native readiness probe";
@@ -148,6 +151,13 @@ fn run_window(
     shutdown: Arc<AtomicBool>,
     ready_sender: mpsc::SyncSender<std::io::Result<()>>,
 ) {
+    // This worker owns only the transient readiness window. Physical pixels
+    // must match Sky screenshots; do not change the Host's process-wide DPI.
+    if unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }.is_null()
+    {
+        let _ = ready_sender.send(Err(std::io::Error::last_os_error()));
+        return;
+    }
     let class_name = wide("SatelleNativeReadinessProbe");
     let title = wide(WINDOW_TITLE);
     let instance = unsafe { GetModuleHandleW(null()) };
@@ -173,9 +183,9 @@ fn run_window(
             0,
             class_name.as_ptr(),
             title.as_ptr(),
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            WS_POPUP,
+            80,
+            80,
             WINDOW_WIDTH,
             WINDOW_HEIGHT,
             null_mut(),
@@ -548,6 +558,58 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_probe_surface_has_physical_pixel_geometry_and_no_frame_offset() {
+        use windows_sys::Win32::UI::HiDpi::{
+            AreDpiAwarenessContextsEqual, GetWindowDpiAwarenessContext,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, GetClientRect, GetWindowRect,
+        };
+
+        let probe = WindowsNativeProbeWindow::spawn(
+            SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 9),
+            "geometry-test",
+            "geometry-test",
+            &current_process_desktop_session_id(),
+        )
+        .expect("create the production native probe window");
+        let window = unsafe {
+            FindWindowW(
+                wide("SatelleNativeReadinessProbe").as_ptr(),
+                wide(WINDOW_TITLE).as_ptr(),
+            )
+        };
+        assert!(!window.is_null());
+        assert_ne!(
+            unsafe {
+                AreDpiAwarenessContextsEqual(
+                    GetWindowDpiAwarenessContext(window),
+                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                )
+            },
+            0,
+        );
+        // Observe from a DPI-aware caller too; otherwise Win32 virtualizes
+        // the observer's coordinates and hides the physical-pixel contract.
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        assert!(!previous.is_null());
+        let mut client = RECT::default();
+        let mut outer = RECT::default();
+        let client_ok = unsafe { GetClientRect(window, &mut client) };
+        let outer_ok = unsafe { GetWindowRect(window, &mut outer) };
+        unsafe { SetThreadDpiAwarenessContext(previous) };
+        assert_ne!(client_ok, 0);
+        assert_ne!(outer_ok, 0);
+        assert_eq!((client.right, client.bottom), (WINDOW_WIDTH, WINDOW_HEIGHT));
+        assert_eq!(
+            (outer.right - outer.left, outer.bottom - outer.top),
+            (WINDOW_WIDTH, WINDOW_HEIGHT),
+        );
+        drop(probe);
+    }
 
     #[test]
     fn native_probe_requires_the_selected_wts_session_to_own_the_host_process() {

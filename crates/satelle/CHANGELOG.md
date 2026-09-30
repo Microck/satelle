@@ -1,3 +1,13 @@
+## satelle@0.1.26
+
+### Native task results
+
+Report a task as blocked when native app approval was denied, even if an earlier tool call succeeded.
+
+### Windows readiness
+
+Keep the native click-and-drag readiness surface in physical pixels so display scaling and window borders do not move the targets away from the authenticated screenshot coordinates.
+
 ## satelle@0.1.25
 
 ### Recovery

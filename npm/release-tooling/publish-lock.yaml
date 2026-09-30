@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Recovery\n\nRead completed native readiness and session turns from their private Codex home without creating incomplete MCP server entries from another home. This lets supported recovery reconcile a failed turn before retrying readiness.\n"
-    filename: 2026-09-30-private-home-recovery.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Native task results\n\nReport a task as blocked when native app approval was denied, even if an earlier tool call succeeded.\n\n## Windows readiness\n\nKeep the native click-and-drag readiness surface in physical pixels so display scaling and window borders do not move the targets away from the authenticated screenshot coordinates.\n"
+    filename: 2026-09-30-native-approvals-and-windows-readiness.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - 2026-09-30-private-home-recovery.md
+      - 2026-09-30-native-approvals-and-windows-readiness.md
     id: cargo:satelle
     updated: true
 npm:packages:
