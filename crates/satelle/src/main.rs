@@ -407,12 +407,26 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum ActionCommand {
+    /// Show apps waiting for your consent on the selected Host.
+    List(ActionListCommand),
     /// Answer a detached native action request.
     Respond(ActionRespondCommand),
 }
 
 #[derive(Args, Debug)]
+struct ActionListCommand {
+    #[arg(long)]
+    host: Option<String>,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+#[derive(Args, Debug)]
 struct ActionRespondCommand {
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long, requires = "allow", conflicts_with = "deny")]
+    always: bool,
     action_request_id: String,
     #[arg(long, conflicts_with = "deny", required_unless_present = "deny")]
     allow: bool,
@@ -2637,7 +2651,10 @@ fn execute_command(
         Command::Steer(command) => steer_prompt(command, config, output),
         Command::Action {
             command: ActionCommand::Respond(command),
-        } => respond_to_native_action(command).map(|_| None),
+        } => respond_to_native_action(command, config).map(|_| None),
+        Command::Action {
+            command: ActionCommand::List(command),
+        } => show_native_app_approvals(command, config).map(|_| None),
         Command::Queue {
             command: QueueCommand::Status(command),
         } => show_queue_status(command, config, output).map(|_| None),
@@ -3292,10 +3309,16 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             explicit_host: command.host.as_deref(),
             session_id: canonical_history_session_id(&command.session_id),
         },
-        Command::Action { .. } => HistoryTarget {
-            family: "action-respond",
-            selects_host: false,
-            explicit_host: None,
+        Command::Action { command } => HistoryTarget {
+            family: match command {
+                ActionCommand::List(_) => "action-list",
+                ActionCommand::Respond(_) => "action-respond",
+            },
+            selects_host: true,
+            explicit_host: match command {
+                ActionCommand::List(command) => command.host.as_deref(),
+                ActionCommand::Respond(command) => command.host.as_deref(),
+            },
             session_id: None,
         },
         Command::Queue { command } => HistoryTarget {
@@ -16832,10 +16855,53 @@ fn print_queue_status(
     Ok(())
 }
 
-fn respond_to_native_action(command: ActionRespondCommand) -> Result<(), CliFailure> {
-    let _action_request_id = ActionRequestId::from_str(&command.action_request_id)
+fn show_native_app_approvals(
+    command: ActionListCommand,
+    config: ConfigContext<'_>,
+) -> Result<(), CliFailure> {
+    let host = config.resolve_host(command.host.as_deref())?;
+    let requests = transport::transport_for_session_control(&host)?
+        .app_approval_requests()
+        .map_err(failure)?;
+    let format = command.output.resolve(EventOutput::None).map_err(failure)?;
+    if format.is_structured() {
+        format.print(&json!({"schema_version":"satelle.app-approvals.v1", "host":host.alias, "requests":requests})).map_err(failure)?;
+    } else {
+        for request in requests {
+            println!(
+                "{}: {}{}",
+                request.action_request_id,
+                request.app_id,
+                if request.allow_always {
+                    " (Always allow available)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
+fn respond_to_native_action(
+    command: ActionRespondCommand,
+    config: ConfigContext<'_>,
+) -> Result<(), CliFailure> {
+    let id = ActionRequestId::from_str(&command.action_request_id)
         .map_err(|error| failure(error.into()))?;
-    Err(failure(SatelleError::native_action_relay_not_supported()))
+    let host = config.resolve_host(command.host.as_deref())?;
+    let decision = if command.deny {
+        satelle::host::AppApprovalDecision::Deny
+    } else if command.always {
+        satelle::host::AppApprovalDecision::Always
+    } else {
+        satelle::host::AppApprovalDecision::Allow
+    };
+    transport::transport_for_session_control(&host)?
+        .respond_to_app_approval(&id, decision)
+        .map_err(failure)?;
+    println!("App approval response sent: {id}");
+    Ok(())
 }
 
 fn show_status(

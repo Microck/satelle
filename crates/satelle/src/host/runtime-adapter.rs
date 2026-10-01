@@ -1820,6 +1820,20 @@ impl ExecuteResult {
 /// The only external Computer Use seam. SQLite remains concrete and internal;
 /// production and deterministic adapters vary only at this true I/O seam.
 pub trait ComputerUseAdapter: Send + Sync + 'static {
+    fn app_approval_requests(&self) -> Result<Vec<crate::host::AppApprovalRequest>, SatelleError> {
+        Ok(Vec::new())
+    }
+
+    fn respond_to_app_approval(
+        &self,
+        _id: &crate::core::ActionRequestId,
+        _decision: crate::host::AppApprovalDecision,
+    ) -> Result<(), SatelleError> {
+        Err(SatelleError::invalid_usage(
+            "the app approval request is no longer pending",
+        ))
+    }
+
     /// Adapters without an upstream control plane have no separate protocol
     /// admission step. Production Codex adapters must override this method.
     fn admit_operation(&self, _operation: ControlPlaneOperation) -> Result<(), SatelleError> {

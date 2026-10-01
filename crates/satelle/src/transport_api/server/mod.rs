@@ -993,6 +993,7 @@ fn router(state: Arc<DaemonState>) -> Router {
             auth::require_admin_read,
         ));
     let bodyless_read_routes = Router::new()
+        .route("/v1/actions", get(sessions::app_approval_requests))
         .route("/v1/setup/api-token/current", get(setup::confirm_api_token))
         .route("/v1/host/status", get(host_status))
         .route("/v1/host/telemetry", get(host_telemetry_status))
@@ -1210,6 +1211,10 @@ fn router(state: Arc<DaemonState>) -> Router {
         Router::new()
     };
     let control_routes = Router::new()
+        .route(
+            "/v1/actions/{action_request_id}/respond",
+            post(sessions::respond_to_app_approval),
+        )
         .route("/v1/sessions", post(sessions::create_session))
         .route(
             "/v1/sessions/{session_id}/turns",

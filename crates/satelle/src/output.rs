@@ -226,7 +226,12 @@ impl Command {
                     EventOutput::None
                 },
             ),
-            Self::Action { .. } => (OutputArgs::default(), EventOutput::None),
+            Self::Action {
+                command: super::ActionCommand::List(command),
+            } => (command.output, EventOutput::None),
+            Self::Action {
+                command: super::ActionCommand::Respond(_),
+            } => (OutputArgs::default(), EventOutput::None),
             Self::Queue { command } => match command {
                 super::QueueCommand::Status(command) => (command.output_args, EventOutput::None),
                 super::QueueCommand::Cancel(command) => (command.output_args, EventOutput::None),

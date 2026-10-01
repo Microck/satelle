@@ -1944,3 +1944,92 @@ mod tests {
         assert!(serde_json::from_value::<StopResponse>(wire).is_err());
     }
 }
+
+define_schema_token!(AppApprovalsSchema, "satelle.app-approvals.v1");
+define_schema_token!(
+    AppApprovalResponseSchema,
+    "satelle.app-approval-response.v1"
+);
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppApprovalResponseRequest {
+    schema_version: AppApprovalResponseSchema,
+    pub decision: crate::host::AppApprovalDecision,
+}
+impl AppApprovalResponseRequest {
+    pub fn new(decision: crate::host::AppApprovalDecision) -> Self {
+        Self {
+            schema_version: AppApprovalResponseSchema,
+            decision,
+        }
+    }
+}
+impl ApiRequestContract for AppApprovalResponseRequest {
+    const SCHEMA_VERSION: &'static str = "satelle.app-approval-response.v1";
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppApprovalsResponse {
+    schema_version: AppApprovalsSchema,
+    request_id: RequestId,
+    host_identity: String,
+    pub requests: Vec<crate::host::AppApprovalRequest>,
+}
+impl AppApprovalsResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        requests: Vec<crate::host::AppApprovalRequest>,
+    ) -> Self {
+        Self {
+            schema_version: AppApprovalsSchema,
+            request_id,
+            host_identity,
+            requests,
+        }
+    }
+}
+impl AuthenticatedResponseContract for AppApprovalsResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppApprovalResponse {
+    schema_version: AppApprovalResponseSchema,
+    request_id: RequestId,
+    host_identity: String,
+    pub action_request_id: crate::core::ActionRequestId,
+    pub decision: crate::host::AppApprovalDecision,
+}
+impl AppApprovalResponse {
+    pub(crate) fn new(
+        request_id: RequestId,
+        host_identity: String,
+        action_request_id: crate::core::ActionRequestId,
+        decision: crate::host::AppApprovalDecision,
+    ) -> Self {
+        Self {
+            schema_version: AppApprovalResponseSchema,
+            request_id,
+            host_identity,
+            action_request_id,
+            decision,
+        }
+    }
+}
+impl AuthenticatedResponseContract for AppApprovalResponse {
+    fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+    fn host_identity(&self) -> &str {
+        &self.host_identity
+    }
+}

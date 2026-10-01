@@ -150,6 +150,7 @@ pub(crate) struct ProductionComputerUseAdapter {
     snapshot: Arc<RwLock<crate::host::ProductionCapabilitySnapshot>>,
     working_directory: Result<PathBuf, SatelleError>,
     active_executions: Arc<Mutex<BTreeMap<String, ActiveCodexExecution>>>,
+    app_approvals: crate::host::app_approval::AppApprovals,
     native_readiness_timeout: Duration,
     native_readiness_ttl: time::Duration,
     provider_smoke_timeout: Duration,
@@ -205,6 +206,7 @@ impl ProductionComputerUseAdapter {
             snapshot,
             working_directory,
             active_executions: Arc::new(Mutex::new(BTreeMap::new())),
+            app_approvals: crate::host::app_approval::AppApprovals::default(),
             native_readiness_timeout: crate::host::DEFAULT_NATIVE_READINESS_TIMEOUT,
             native_readiness_ttl: crate::host::DEFAULT_NATIVE_READINESS_TTL,
             provider_smoke_timeout: Duration::from_secs(120),
@@ -233,6 +235,7 @@ impl ProductionComputerUseAdapter {
             snapshot,
             working_directory,
             active_executions: Arc::new(Mutex::new(BTreeMap::new())),
+            app_approvals: crate::host::app_approval::AppApprovals::default(),
             native_readiness_timeout: policy.native_readiness_timeout,
             native_readiness_ttl: policy.native_readiness_ttl,
             provider_smoke_timeout: policy.provider_smoke_timeout,
@@ -585,6 +588,18 @@ impl ProductionComputerUseAdapter {
             &native_action_evidence,
         )
         .map_err(native_smoke_failure)?;
+        let mut request_app_approval = |app_id: String, allow_always: bool| {
+            self.app_approvals
+                .request(
+                    app_id,
+                    allow_always,
+                    key.execution_policy().desktop_target().binding().as_str(),
+                    None,
+                    deadline,
+                )
+                .ok()
+                .map(|(_, pending)| pending)
+        };
         let expected_mcp_server_name = verified_app_server.native_mcp_server_name.clone();
         let run = run_codex_session_with_native_action_completion(
             command_for_binding(
@@ -606,6 +621,7 @@ impl ProductionComputerUseAdapter {
                 persist_thread_ref,
                 persist_turn_ref,
                 observe_native_approval: None,
+                request_app_approval: Some(&mut request_app_approval),
                 native_action_evidence: None,
                 expected_mcp_server_name: &expected_mcp_server_name,
                 computer_use_allowed_app_ids: allowed_app_ids,
@@ -852,26 +868,42 @@ impl ProductionComputerUseAdapter {
             &native_action_evidence,
         )
         .map_err(|reason| mark_probe_dispatch_possible(adapter_failure(reason), false))?;
+        let mut request_app_approval = |app_id: String, allow_always: bool| {
+            self.app_approvals
+                .request(
+                    app_id,
+                    allow_always,
+                    key.execution_policy().desktop_target().binding().as_str(),
+                    None,
+                    deadline,
+                )
+                .ok()
+                .map(|(_, pending)| pending)
+        };
         let expected_mcp_server_name = verified_app_server.native_mcp_server_name.clone();
         let run = run_codex_session_with_timeout_cancellation(
             command_for_binding(
                 verified_app_server.into_command(),
                 &runtime_paths.codex_home,
             ),
-            provider_smoke_session_request(
-                binding,
-                provider_secret,
-                &runtime_paths.working_directory,
-                &prompt,
-                deadline,
-                &expected_mcp_server_name,
-                ProviderSmokeSessionControl {
-                    computer_use_allowed_app_ids: allowed_app_ids,
-                    native_action_evidence: native_action_evidence.clone(),
-                    persist_thread_ref: persistence.persist_thread_ref,
-                    persist_turn_ref: persistence.persist_turn_ref,
-                },
-            ),
+            {
+                let mut request = provider_smoke_session_request(
+                    binding,
+                    provider_secret,
+                    &runtime_paths.working_directory,
+                    &prompt,
+                    deadline,
+                    &expected_mcp_server_name,
+                    ProviderSmokeSessionControl {
+                        computer_use_allowed_app_ids: allowed_app_ids,
+                        native_action_evidence: native_action_evidence.clone(),
+                        persist_thread_ref: persistence.persist_thread_ref,
+                        persist_turn_ref: persistence.persist_turn_ref,
+                    },
+                );
+                request.request_app_approval = Some(&mut request_app_approval);
+                request
+            },
             READINESS_CANCELLATION_GRACE,
             persistence.cancellation.cloned(),
         );
@@ -1164,6 +1196,7 @@ fn provider_smoke_session_request<'a>(
         persist_thread_ref,
         persist_turn_ref,
         observe_native_approval: None,
+        request_app_approval: None,
         native_action_evidence: Some(native_action_evidence),
         expected_mcp_server_name,
         computer_use_allowed_app_ids,
@@ -1501,10 +1534,9 @@ fn native_readiness_prompt(
             ))
         }
         crate::host::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
-            // Keep the same authorization boundary on both native platforms.
-            if !allowed_app_ids.contains("com.apple.Safari") {
-                return Err("native_app_approval_unavailable");
-            }
+            // The exact Host-owned cell reaches the official SDK consent gate.
+            // An unapproved Safari request remains pending in the same broker;
+            // executing this cell cannot grant app access by itself.
             let script = format!(
                 "globalThis.sky ??= (await import('@oai/sky')).sky; var state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); await sky.press_key({{ app: 'Safari', key: 'super+n' }}); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var addressLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('text field') && line.includes('ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD')); var addressMatch = addressLine && addressLine.trim().match(/^([0-9]+)/); if (!addressMatch) throw new Error('Safari address field missing'); await sky.set_value({{ app: 'Safari', element_index: Number(addressMatch[1]), value: {page_url} }}); await sky.press_key({{ app: 'Safari', key: 'Return' }}); var buttonMatch = null; for (var attempt = 0; attempt < 8 && !buttonMatch; attempt++) {{ await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1000 : 500)); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var buttonLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); }} if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({{ app: 'Safari', element_index: Number(buttonMatch[1]) }}); await sky.drag({{ app: 'Safari', from_x: 100, from_y: 320, to_x: 600, to_y: 425 }}); await sky.press_key({{ app: 'Safari', key: 'super+w' }}); nodeRepl.write('Native click and drag actions dispatched');"
             );
@@ -1529,7 +1561,7 @@ fn native_computer_use_prompt(
             "Use only the supported Windows window API: `list_apps()`, `launch_app({app})`, `list_windows()`, `get_window_state({window, include_screenshot, include_text})`, `activate_window({window})`, `click({window, element_index})` or screenshot coordinates, `set_value({window, element_index, value})`, `type_text({window, text})`, `press_key({window, key})`, `scroll(...)`, and `drag(...)`. Select a canonical app id from `list_apps()`. Every action must use a current `window` object returned by `list_apps()` or `list_windows()`; after `launch_app`, list again to obtain its window. Refresh `get_window_state` after each UI transition. Method names are snake_case."
         }
         crate::host::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl => {
-            "Use only the supported macOS window API: `list_apps()`, `get_app_state({app, disableDiff: true})`, `click({app, element_index})` or app-window coordinates, `set_value({app, element_index, value})`, `type_text({app, text})`, `press_key({app, key})`, `scroll(...)`, `drag(...)`, `paste(...)`, and `select_text(...)`. Select a canonical app id from `list_apps()` and pass it as `app` to every action. Refresh `get_app_state` after each UI transition. Method names are snake_case."
+            "Use only the supported macOS window API: `list_apps()`, `get_app_state({app, disableDiff: true})`, `click({app, element_index})` or app-window coordinates, `set_value({app, element_index, value})`, `type_text({app, text})`, `press_key({app, key})`, `scroll(...)`, `drag(...)`, `paste(...)`, and `select_text(...)`. When the task names an app, call `get_app_state` with that app name or known bundle identifier directly; it launches the app if needed. Use `list_apps()` only when the task does not identify an app. Pass `app` to every action. Refresh `get_app_state` after each UI transition. Method names are snake_case."
         }
     };
     format!(
@@ -2298,6 +2330,17 @@ fn annotate_provider_smoke_error(
 }
 
 impl ComputerUseAdapter for ProductionComputerUseAdapter {
+    fn app_approval_requests(&self) -> Result<Vec<crate::host::AppApprovalRequest>, SatelleError> {
+        self.app_approvals.list()
+    }
+    fn respond_to_app_approval(
+        &self,
+        id: &crate::core::ActionRequestId,
+        decision: crate::host::AppApprovalDecision,
+    ) -> Result<(), SatelleError> {
+        self.app_approvals.respond(id, decision)
+    }
+
     fn admit_operation(&self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
         let snapshot = crate::host::read_production_snapshot(&self.snapshot)?;
         // Preserve the operation-specific control-plane diagnosis before the
@@ -2420,6 +2463,37 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                         *persistence_error.borrow_mut() = Some(error);
                     })
                 };
+                let mut request_app_approval = |app_id: String, allow_always: bool| {
+                    let subject = request.subject();
+                    let (approval, pending) = self
+                        .app_approvals
+                        .request(
+                            app_id,
+                            allow_always,
+                            policy.desktop_target().binding().as_str(),
+                            Some((subject.session_id(), subject.turn_id())),
+                            deadline,
+                        )
+                        .ok()?;
+                    request.publish_live_event(
+                        SatelleEventBody::new(
+                            EventType::ActionRequired,
+                            EventSource::CodexAdapter,
+                            time::OffsetDateTime::now_utc(),
+                            subject.host_identity().as_str(),
+                            Some(EventSubject::Turn {
+                                session_id: subject.session_id().clone(),
+                                turn_id: subject.turn_id().clone(),
+                                session_state_revision: request.committed_session_revision(),
+                                turn_state_revision: request.committed_turn_revision(),
+                            }),
+                            "app access needs your decision",
+                            json!({"kind":"native_app_approval", "request":approval}),
+                        )
+                        .expect("bounded app approval produces a safe event"),
+                    );
+                    Some(pending)
+                };
                 let mut native_approval_published = false;
                 let mut observe_native_approval = || {
                     if native_approval_published {
@@ -2491,6 +2565,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                         persist_thread_ref: &mut persist_thread_ref,
                         persist_turn_ref: &mut persist_turn_ref,
                         observe_native_approval: Some(&mut observe_native_approval),
+                        request_app_approval: Some(&mut request_app_approval),
                         native_action_evidence: None,
                         expected_mcp_server_name: &expected_mcp_server_name,
                         computer_use_allowed_app_ids: admitted_app_approval.allowed_app_ids(),
@@ -5000,6 +5075,21 @@ mod tests {
     }
 
     #[test]
+    fn mac_readiness_reaches_the_sdk_consent_gate_without_inventing_app_authority() {
+        let evidence = crate::host::provider_probe::NativeActionEvidence::new();
+        let prompt = native_readiness_prompt(
+            "http://127.0.0.1:12345/probe/private-capability",
+            &crate::host::codex_capabilities::NativeComputerUseActionPath::MacosNodeRepl,
+            &BTreeSet::new(),
+            &evidence,
+        )
+        .unwrap();
+        assert!(prompt.contains("get_app_state"));
+        let (_, app) = evidence.expected_authorization().unwrap();
+        assert_eq!(app, "com.apple.Safari");
+    }
+
+    #[test]
     fn native_readiness_prompt_requires_current_app_authority() {
         let action_path =
             crate::host::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl;
@@ -5435,8 +5525,9 @@ mod tests {
         );
 
         assert!(prompt.contains("get_app_state({app, disableDiff: true})"));
-        assert!(prompt.contains("Select a canonical app id from `list_apps()`"));
-        assert!(prompt.contains("pass it as `app` to every action"));
+        assert!(prompt.contains("When the task names an app, call `get_app_state`"));
+        assert!(prompt.contains("Use `list_apps()` only when the task does not identify an app"));
+        assert!(prompt.contains("Pass `app` to every action."));
         assert!(!prompt.contains("launch_app({app})"));
     }
 }

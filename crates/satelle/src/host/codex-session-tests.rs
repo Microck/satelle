@@ -293,8 +293,22 @@ fn main() {
             }
         }
     }
+    if scenario == "native-app-allow" || scenario == "native-app-always" || scenario == "native-app-pending-interrupt" {
+        send(&mut output, &format!(r#"{{"id":"native-app","method":"mcpServer/elicitation/request","params":{{"_meta":{{"connector_id":"computer-use","persist":["session","always"],"tool_params":{{"app":"com.apple.calculator"}},"tool_params_display":[{{"value":"Calculator"}}]}},"message":"Allow Computer Use to use \"Calculator\"?","mode":"openai/form","requestedSchema":{{}},"serverName":"node_repl","threadId":"{thread_id}","turnId":"turn-1"}}}}"#));
+        let approval = receive(&mut input, &log);
+        if scenario == "native-app-pending-interrupt" {
+            assert!(approval.contains(r#""method":"turn/interrupt""#));
+            let declined = receive(&mut input, &log);
+            assert!(declined.contains(r#""action":"decline""#));
+            send(&mut output, r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted"}}}"#);
+            send(&mut output, r#"{"id":4,"result":{}}"#);
+            return;
+        }
+        assert!(approval.contains(r#""action":"accept""#));
+        assert!(approval.contains(r#""persist":"always""#) == (scenario == "native-app-always"));
+    }
     if scenario == "native-task-success-then-denied" {
-        send(&mut output, &format!(r#"{{"id":"native-app","method":"mcpServer/elicitation/request","params":{{"_meta":{{"connector_id":"computer-use","tool_params":{{"app":"com.apple.finder"}},"tool_params_display":[{{"value":"Finder"}}]}},"message":"Allow Codex to use Finder?","mode":"form","requestedSchema":{{"type":"object","properties":{{}}}},"serverName":"node_repl","threadId":"{thread_id}","turnId":"turn-1"}}}}"#));
+        send(&mut output, &format!(r#"{{"id":"native-app","method":"mcpServer/elicitation/request","params":{{"_meta":{{"connector_id":"computer-use","tool_params":{{"app":"com.apple.finder"}},"tool_params_display":[{{"value":"Finder"}}]}},"message":"Allow Computer Use to use \"Finder\"?","mode":"form","requestedSchema":{{"type":"object","properties":{{}}}},"serverName":"node_repl","threadId":"{thread_id}","turnId":"turn-1"}}}}"#));
         let approval = receive(&mut input, &log);
         assert!(approval.contains(r#""action":"decline""#));
     }
@@ -631,6 +645,7 @@ struct ScenarioExecution {
     approval_policy: CodexApprovalPolicy,
     sandbox_policy: CodexSandboxPolicy,
     native_apps_allowed: bool,
+    native_app_decision: Option<crate::host::AppApprovalDecision>,
     native_action_evidence: Option<NativeActionEvidence>,
 }
 
@@ -640,6 +655,7 @@ impl ScenarioExecution {
         approval_policy: CodexApprovalPolicy::OnRequest,
         sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
         native_apps_allowed: false,
+        native_app_decision: None,
         native_action_evidence: None,
     };
 
@@ -648,6 +664,7 @@ impl ScenarioExecution {
         approval_policy: CodexApprovalPolicy::Never,
         sandbox_policy: CodexSandboxPolicy::DangerFullAccess,
         native_apps_allowed: false,
+        native_app_decision: None,
         native_action_evidence: None,
     };
 
@@ -656,6 +673,7 @@ impl ScenarioExecution {
         approval_policy: CodexApprovalPolicy::OnRequest,
         sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
         native_apps_allowed: true,
+        native_app_decision: None,
         native_action_evidence: None,
     };
 
@@ -669,6 +687,7 @@ impl ScenarioExecution {
             approval_policy,
             sandbox_policy,
             native_apps_allowed: false,
+            native_app_decision: None,
             native_action_evidence: None,
         }
     }
@@ -815,6 +834,27 @@ fn run_scenario_with_options(
     } else {
         BTreeSet::default()
     };
+    let app_approvals = crate::host::app_approval::AppApprovals::default();
+    let mut request_app_approval = |app_id: String, allow_always: bool| {
+        let decision = execution.native_app_decision?;
+        let (request, pending) = app_approvals
+            .request(
+                app_id,
+                allow_always,
+                "operator",
+                None,
+                Instant::now() + timeout,
+            )
+            .unwrap();
+        let responder = app_approvals.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            responder
+                .respond(&request.action_request_id, decision)
+                .unwrap();
+        });
+        Some(pending)
+    };
     let session_started = Instant::now();
     let session_result = run_codex_session(
         command,
@@ -833,6 +873,7 @@ fn run_scenario_with_options(
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: Some(&mut observe_native_approval),
+            request_app_approval: Some(&mut request_app_approval),
             native_action_evidence: execution.native_action_evidence,
             expected_mcp_server_name: "computer-use",
             computer_use_allowed_app_ids: &computer_use_allowed_app_ids,
@@ -1017,6 +1058,7 @@ fn provider_child_overrides_are_process_scoped_and_secret_safe() {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
+            request_app_approval: None,
             native_action_evidence: None,
             expected_mcp_server_name: "computer-use",
             computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -1130,6 +1172,7 @@ fn builtin_openai_provider_secret_is_process_scoped_and_shell_excluded() {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
+            request_app_approval: None,
             native_action_evidence: None,
             expected_mcp_server_name: "computer-use",
             computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -1361,81 +1404,103 @@ fn configured_native_action_evidence_still_requires_a_native_tool() {
 
 #[test]
 fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
-    let fixture = compile_fixture();
-    let directory = tempfile::tempdir().expect("control scenario directory");
-    let log_path = directory.path().join("requests.jsonl");
-    let cwd_log_path = directory.path().join("child-cwd");
-    let thread_marker = directory.path().join("thread-persisted");
-    let turn_marker = directory.path().join("turn-persisted");
-    let descendant_marker = directory.path().join("descendant-escaped");
-    let mut command = Command::new(&fixture.executable);
-    command
-        .env("SATELLE_FIXTURE_SCENARIO", "controlled-interrupt")
-        .env("SATELLE_FIXTURE_LOG", &log_path)
-        .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
-        .env("SATELLE_THREAD_MARKER", &thread_marker)
-        .env("SATELLE_TURN_MARKER", &turn_marker)
-        .env("SATELLE_DESCENDANT_MARKER", &descendant_marker);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let control = CodexSessionControl::new(deadline);
-    let session_control = control.clone();
-    let session_directory = directory.path().to_path_buf();
-    let session_thread_marker = thread_marker.clone();
-    let session_turn_marker = turn_marker.clone();
-    let session = std::thread::spawn(move || {
-        let mut persist_thread = |_: &str| {
-            touch(&session_thread_marker);
-            Ok(())
-        };
-        let mut persist_turn = |_: &str| {
-            touch(&session_turn_marker);
-            Ok(())
-        };
-        run_codex_session(
-            command,
-            CodexSessionRequest {
-                working_directory: &session_directory,
-                prompt: "PRIVATE_CONTROLLED_STOP_PROMPT",
-                existing_thread_ref: None,
-                model: Some("gpt-fixture"),
-                model_provider: Some("fixture-provider"),
-                provider_endpoint: None,
-                provider_secret: None,
-                execution_mode: TurnExecutionMode::Standard,
-                approval_policy: CodexApprovalPolicy::OnRequest,
-                sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
-                deadline,
-                persist_thread_ref: &mut persist_thread,
-                persist_turn_ref: &mut persist_turn,
-                observe_native_approval: None,
-                native_action_evidence: None,
-                expected_mcp_server_name: "computer-use",
-                computer_use_allowed_app_ids: &BTreeSet::new(),
-                control: Some(session_control),
-                goal_set_supported: false,
-                image_input_mode: crate::host::codex_capabilities::CodexImageInputMode::Unsupported,
-                attachments: &[],
-                raw_protocol_capture: None,
-                recording_capture: None,
-            },
-        )
-    });
-    wait_for(&turn_marker);
+    for scenario in ["controlled-interrupt", "native-app-pending-interrupt"] {
+        let fixture = compile_fixture();
+        let directory = tempfile::tempdir().expect("control scenario directory");
+        let log_path = directory.path().join("requests.jsonl");
+        let cwd_log_path = directory.path().join("child-cwd");
+        let thread_marker = directory.path().join("thread-persisted");
+        let turn_marker = directory.path().join("turn-persisted");
+        let descendant_marker = directory.path().join("descendant-escaped");
+        let mut command = Command::new(&fixture.executable);
+        command
+            .env("SATELLE_FIXTURE_SCENARIO", scenario)
+            .env("SATELLE_FIXTURE_LOG", &log_path)
+            .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
+            .env("SATELLE_THREAD_MARKER", &thread_marker)
+            .env("SATELLE_TURN_MARKER", &turn_marker)
+            .env("SATELLE_DESCENDANT_MARKER", &descendant_marker);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let control = CodexSessionControl::new(deadline);
+        let session_control = control.clone();
+        let session_directory = directory.path().to_path_buf();
+        let session_thread_marker = thread_marker.clone();
+        let session_turn_marker = turn_marker.clone();
+        let approvals = crate::host::app_approval::AppApprovals::default();
+        let session_approvals = approvals.clone();
+        let session = std::thread::spawn(move || {
+            let mut persist_thread = |_: &str| {
+                touch(&session_thread_marker);
+                Ok(())
+            };
+            let mut persist_turn = |_: &str| {
+                touch(&session_turn_marker);
+                Ok(())
+            };
+            let mut request_app_approval = |app_id: String, allow_always: bool| {
+                session_approvals
+                    .request(app_id, allow_always, "operator", None, deadline)
+                    .ok()
+                    .map(|(_, pending)| pending)
+            };
+            run_codex_session(
+                command,
+                CodexSessionRequest {
+                    working_directory: &session_directory,
+                    prompt: "PRIVATE_CONTROLLED_STOP_PROMPT",
+                    existing_thread_ref: None,
+                    model: Some("gpt-fixture"),
+                    model_provider: Some("fixture-provider"),
+                    provider_endpoint: None,
+                    provider_secret: None,
+                    execution_mode: TurnExecutionMode::Standard,
+                    approval_policy: CodexApprovalPolicy::OnRequest,
+                    sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
+                    deadline,
+                    persist_thread_ref: &mut persist_thread,
+                    persist_turn_ref: &mut persist_turn,
+                    observe_native_approval: None,
+                    request_app_approval: Some(&mut request_app_approval),
+                    native_action_evidence: None,
+                    expected_mcp_server_name: "computer-use",
+                    computer_use_allowed_app_ids: &BTreeSet::new(),
+                    control: Some(session_control),
+                    goal_set_supported: false,
+                    image_input_mode:
+                        crate::host::codex_capabilities::CodexImageInputMode::Unsupported,
+                    attachments: &[],
+                    raw_protocol_capture: None,
+                    recording_capture: None,
+                },
+            )
+        });
+        wait_for(&turn_marker);
+        if scenario == "native-app-pending-interrupt" {
+            while approvals.list().unwrap().is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "app consent must become pending before interruption"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
 
-    assert_eq!(
-        control.interrupt(),
-        StopObservation::UpstreamInactiveConfirmed
-    );
-    assert!(
-        !session.is_finished(),
-        "execution must wait until the stopped state is durable"
-    );
-    control.stop_committed();
+        assert_eq!(
+            control.interrupt(),
+            StopObservation::UpstreamInactiveConfirmed
+        );
+        assert!(
+            !session.is_finished(),
+            "execution must wait until the stopped state is durable"
+        );
+        control.stop_committed();
 
-    assert_eq!(
-        session.join().expect("join controlled execution"),
-        Ok(CodexSessionTerminal::StoppedByControl)
-    );
+        assert_eq!(
+            session.join().expect("join controlled execution"),
+            Ok(CodexSessionTerminal::StoppedByControl)
+        );
+        assert!(approvals.list().unwrap().is_empty());
+    }
 }
 
 #[test]
@@ -1474,6 +1539,7 @@ fn interrupt_before_any_session_claims_control_confirms_inactive_upstream_and_sk
                 persist_thread_ref: &mut persist_thread,
                 persist_turn_ref: &mut persist_turn,
                 observe_native_approval: None,
+                request_app_approval: None,
                 native_action_evidence: None,
                 expected_mcp_server_name: "computer-use",
                 computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -1553,6 +1619,7 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
+            request_app_approval: None,
             native_action_evidence: None,
             expected_mcp_server_name: "computer-use",
             computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -1639,6 +1706,7 @@ fn native_action_completion_requests_correlated_upstream_cancellation() {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
+            request_app_approval: None,
             native_action_evidence: None,
             expected_mcp_server_name: "computer-use",
             computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -1942,4 +2010,45 @@ fn an_expired_writer_does_not_mark_turn_dispatch() {
         Err(CodexSessionError::Timeout)
     );
     assert!(!dispatched);
+}
+
+#[test]
+fn explicit_app_consent_resumes_the_same_protocol_operation() {
+    for (scenario, decision) in [
+        ("native-app-allow", crate::host::AppApprovalDecision::Allow),
+        (
+            "native-app-always",
+            crate::host::AppApprovalDecision::Always,
+        ),
+    ] {
+        let result = run_scenario_with_options(
+            scenario,
+            None,
+            Duration::from_secs(3),
+            "Use Calculator",
+            PersistFailure::None,
+            ScenarioExecution {
+                native_app_decision: Some(decision),
+                ..ScenarioExecution::STANDARD
+            },
+        );
+        assert_eq!(result.result, Ok(CodexSessionTerminal::Completed));
+        assert_eq!(result.native_approval_requests, 0);
+        assert_eq!(result.persisted_threads, ["thread-1"]);
+        assert_eq!(result.persisted_turns, ["turn-1"]);
+        let response = result
+            .requests
+            .iter()
+            .find(|request| request["id"] == "native-app")
+            .expect("exact app request response");
+        assert_eq!(response["result"]["action"], "accept");
+        assert_eq!(
+            response["result"]["_meta"],
+            if decision == crate::host::AppApprovalDecision::Always {
+                json!({"persist":"always"})
+            } else {
+                Value::Null
+            }
+        );
+    }
 }

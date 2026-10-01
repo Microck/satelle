@@ -1034,3 +1034,48 @@ mod admission_action_tests {
         assert_eq!(unchanged.code, crate::core::ErrorCode::InvalidUsage);
     }
 }
+
+pub(super) async fn app_approval_requests(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+) -> Response {
+    match state.service.app_approval_requests() {
+        Ok(requests) => authenticated_json_response(
+            StatusCode::OK,
+            &crate::transport::AppApprovalsResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                requests,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Err(error) => host_error::response(&state, &authorized, &error),
+    }
+}
+
+pub(super) async fn respond_to_app_approval(
+    State(state): State<Arc<DaemonState>>,
+    Extension(authorized): Extension<AuthorizedRequest>,
+    Path(id): Path<String>,
+    ApiJson(request): ApiJson<crate::transport::AppApprovalResponseRequest>,
+) -> Response {
+    let id = match crate::core::ActionRequestId::parse(&id) {
+        Ok(id) => id,
+        Err(_) => return request_error(&state, &authorized, "invalid app approval request id"),
+    };
+    match state.service.respond_to_app_approval(&id, request.decision) {
+        Ok(()) => authenticated_json_response(
+            StatusCode::OK,
+            &crate::transport::AppApprovalResponse::new(
+                authorized.request_id().clone(),
+                state.host_identity.clone(),
+                id,
+                request.decision,
+            ),
+            authorized.request_id(),
+            &state.host_identity,
+        ),
+        Err(error) => host_error::response(&state, &authorized, &error),
+    }
+}

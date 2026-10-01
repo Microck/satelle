@@ -1,6 +1,9 @@
 #[path = "api-auth.rs"]
 mod api_auth;
+#[path = "app-approval.rs"]
+mod app_approval;
 mod attachment;
+pub use app_approval::{AppApprovalDecision, AppApprovalRequest};
 mod codex_capabilities;
 #[path = "codex-install.rs"]
 mod codex_install;
@@ -2170,6 +2173,17 @@ pub(crate) const STORAGE_MIGRATION_ACTION_LABEL: &str =
     "Migrate Host storage to the verified destination";
 
 impl HostService {
+    pub fn app_approval_requests(&self) -> Result<Vec<AppApprovalRequest>, SatelleError> {
+        self.runtime.app_approval_requests()
+    }
+    pub fn respond_to_app_approval(
+        &self,
+        id: &crate::core::ActionRequestId,
+        decision: AppApprovalDecision,
+    ) -> Result<(), SatelleError> {
+        self.runtime.respond_to_app_approval(id, decision)
+    }
+
     pub fn begin_storage_migration_idempotent(
         &self,
         operation_id: &str,

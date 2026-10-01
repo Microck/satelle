@@ -104,6 +104,7 @@ pub(super) fn computer_use_elicitation_result(
     expected_native_action: Option<(&str, &str)>,
     expected_thread: Option<&str>,
     expected_turn: Option<&str>,
+    app_consent_available: bool,
 ) -> Result<(Value, ComputerUseAuthorization), CodexSessionError> {
     let params = object
         .get("params")
@@ -129,7 +130,12 @@ pub(super) fn computer_use_elicitation_result(
             expected_native_action.map_or_else(
                 || !allowed_app_ids.is_empty(),
                 |(expected_script, expected_app_id)| {
-                    allowed_app_ids.contains(expected_app_id) && *script == expected_script
+                    // This exact cell is Host-owned readiness code. The SDK
+                    // independently requests explicit app consent before it can
+                    // act; authorization of this code is not an app grant.
+                    !expected_app_id.is_empty()
+                        && *script == expected_script
+                        && (allowed_app_ids.contains(expected_app_id) || app_consent_available)
                 },
             )
         });
@@ -228,10 +234,7 @@ fn exact_tool_param_display(display: &Value, name: &str, value: &str) -> bool {
         && display.get("value").and_then(Value::as_str) == Some(value)
 }
 
-fn exact_computer_use_app_prompt(
-    params: &Map<String, Value>,
-    allowed_app_ids: &BTreeSet<String>,
-) -> bool {
+pub(super) fn computer_use_app_request(params: &Map<String, Value>) -> Option<(String, bool)> {
     const REQUIRED_PARAM_KEYS: [&str; 6] = [
         "_meta",
         "message",
@@ -254,38 +257,48 @@ fn exact_computer_use_app_prompt(
             Some("form" | "openai/form")
         )
     {
-        return false;
+        return None;
     }
-    let Some(metadata) = params.get("_meta").and_then(Value::as_object) else {
-        return false;
-    };
+    let metadata = params.get("_meta").and_then(Value::as_object)?;
     if metadata.get("connector_id").and_then(Value::as_str) != Some("computer-use") {
-        return false;
+        return None;
     }
-    let Some(tool_params) = metadata.get("tool_params").and_then(Value::as_object) else {
-        return false;
-    };
+    let tool_params = metadata.get("tool_params").and_then(Value::as_object)?;
     if tool_params.len() != 1 {
-        return false;
+        return None;
     }
-    let Some(app_id) = tool_params.get("app").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(display) = metadata
+    let app_id = tool_params.get("app").and_then(Value::as_str)?;
+    let display = metadata
         .get("tool_params_display")
         .and_then(Value::as_array)
         .filter(|display| display.len() == 1)
-        .and_then(|display| display[0].as_object())
-    else {
-        return false;
-    };
-    let display_value = display.get("value").and_then(Value::as_str);
-    display_value.is_some()
-        && params.get("message").and_then(Value::as_str)
-            == display_value
-                .map(|value| format!("Allow Codex to use {value}?"))
-                .as_deref()
-        && allowed_app_ids.contains(app_id)
+        .and_then(|display| display[0].as_object())?;
+    let display_value = display.get("value").and_then(Value::as_str)?;
+    if app_id.is_empty()
+        || app_id.len() > 256
+        || app_id.chars().any(char::is_control)
+        || !params.get("requestedSchema").is_some_and(|schema| {
+            schema == &json!({}) || schema == &json!({"type":"object", "properties":{}})
+        })
+        || params.get("message").and_then(Value::as_str)
+            != Some(format!("Allow Computer Use to use \"{display_value}\"?").as_str())
+    {
+        return None;
+    }
+    let allow_always = metadata.get("persist").is_some_and(|persist| {
+        persist.as_str() == Some("always")
+            || persist
+                .as_array()
+                .is_some_and(|modes| modes.iter().any(|mode| mode.as_str() == Some("always")))
+    });
+    Some((app_id.to_owned(), allow_always))
+}
+
+fn exact_computer_use_app_prompt(
+    params: &Map<String, Value>,
+    allowed_app_ids: &BTreeSet<String>,
+) -> bool {
+    computer_use_app_request(params).is_some_and(|(app_id, _)| allowed_app_ids.contains(&app_id))
 }
 
 fn required_value_string<'a>(
@@ -622,7 +635,7 @@ mod tests {
                         "value": "Firefox"
                     }]
                 },
-                "message": "Allow Codex to use Firefox?",
+                "message": "Allow Computer Use to use \"Firefox\"?",
                 "mode": "openai/form",
                 "requestedSchema": {},
                 "serverName": "node_repl",
@@ -667,6 +680,7 @@ mod tests {
                 None,
                 Some("thread-1"),
                 Some("turn-1"),
+                false,
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
@@ -687,6 +701,7 @@ mod tests {
                 Some((script, "MSEdge")),
                 Some("thread-1"),
                 Some("turn-1"),
+                false,
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
@@ -715,6 +730,7 @@ mod tests {
                 Some((script, "MSEdge")),
                 Some("thread-1"),
                 Some("turn-1"),
+                false,
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
@@ -736,6 +752,7 @@ mod tests {
                 Some((script, "MSEdge")),
                 Some("thread-1"),
                 Some("turn-1"),
+                false,
             );
             if request["params"]["turnId"].is_null() {
                 assert_eq!(
@@ -818,6 +835,7 @@ mod tests {
                     Some((script, "MSEdge")),
                     Some("thread-1"),
                     Some("turn-1"),
+                    false,
                 ),
                 Ok((
                     json!({"action": "decline", "content": null, "_meta": null}),
@@ -834,6 +852,7 @@ mod tests {
                 None,
                 Some("thread-1"),
                 Some("turn-1"),
+                false,
             ),
             Ok((
                 json!({"action": "decline", "content": null, "_meta": null}),
@@ -848,6 +867,7 @@ mod tests {
                 Some((script, "MSEdge")),
                 Some("thread-1"),
                 Some("turn-1"),
+                false,
             ),
             Ok((
                 json!({"action": "decline", "content": null, "_meta": null}),
@@ -868,6 +888,7 @@ mod tests {
                 None,
                 Some("thread-1"),
                 Some("turn-1"),
+                false,
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
@@ -882,6 +903,7 @@ mod tests {
                 None,
                 Some("thread-1"),
                 Some("turn-1"),
+                false,
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
@@ -896,7 +918,7 @@ mod tests {
         let mut request = computer_use_app_prompt("com.apple.Safari");
         request["params"]["serverName"] = json!("computer-use");
         request["params"]["_meta"]["tool_params_display"][0]["value"] = json!("Safari");
-        request["params"]["message"] = json!("Allow Codex to use Safari?");
+        request["params"]["message"] = json!("Allow Computer Use to use \"Safari\"?");
 
         assert_eq!(
             computer_use_elicitation_result(
@@ -905,6 +927,7 @@ mod tests {
                 None,
                 Some("thread-1"),
                 Some("turn-1"),
+                false,
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
@@ -932,6 +955,7 @@ mod tests {
                 None,
                 Some("thread-1"),
                 Some("turn-1"),
+                false,
             ),
             Ok((
                 json!({"action": "accept", "content": null, "_meta": null}),
@@ -974,6 +998,7 @@ mod tests {
                     None,
                     Some("thread-1"),
                     Some("turn-1"),
+                    false,
                 ),
                 Ok((
                     json!({"action": "decline", "content": null, "_meta": null}),
@@ -1129,5 +1154,38 @@ mod tests {
                 "method {method}"
             );
         }
+    }
+    #[test]
+    fn exact_readiness_code_can_reach_consent_only_with_a_live_broker() {
+        let script = "exact Host-owned readiness script";
+        let request = computer_use_script_prompt(script, "Use Safari");
+        let expected = Some((script, "com.apple.Safari"));
+        for (broker_available, accepted) in [(false, false), (true, true)] {
+            let (_, authorization) = computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &BTreeSet::new(),
+                expected,
+                Some("thread-1"),
+                Some("turn-1"),
+                broker_available,
+            )
+            .unwrap();
+            assert_eq!(authorization.accepted(), accepted);
+        }
+        let app = computer_use_app_prompt("com.apple.Safari");
+        let (_, authorization) = computer_use_elicitation_result(
+            app.as_object().unwrap(),
+            &BTreeSet::new(),
+            None,
+            Some("thread-1"),
+            Some("turn-1"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            authorization,
+            ComputerUseAuthorization::Declined,
+            "a broker is not consent"
+        );
     }
 }

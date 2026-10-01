@@ -2524,3 +2524,59 @@ async fn assert_exact_api_error(
     assert_eq!(error["docs_url"], Value::Null);
     assert_eq!(error["suggested_commands"], serde_json::json!([]));
 }
+
+#[tokio::test]
+async fn app_approval_responses_require_control_and_validate_the_exact_request() {
+    let request = satelle::transport::AppApprovalResponseRequest::new(
+        satelle::host::AppApprovalDecision::Always,
+    );
+    let id = satelle::core::ActionRequestId::new();
+    let path = format!("/v1/actions/{id}/respond");
+    let read_only = RunningServer::start(ApiScopes::READ).await;
+    assert_eq!(
+        read_only
+            .mutation(&path, "approval-read-only")
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let control = RunningServer::start(ApiScopes::CONTROL).await;
+    assert_eq!(
+        control
+            .mutation("/v1/actions/not-an-action/respond", "approval-invalid-id")
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let mut invalid = serde_json::to_value(&request).unwrap();
+    invalid["unexpected"] = serde_json::json!(true);
+    assert_eq!(
+        control
+            .mutation(&path, "approval-extra-authority")
+            .json(&invalid)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let mut mismatched = control.request("/v1/actions").build().unwrap();
+    mismatched.headers_mut().insert(
+        "Satelle-Expected-Host-Identity",
+        reqwest::header::HeaderValue::from_static("another-host"),
+    );
+    assert_eq!(
+        reqwest::Client::new()
+            .execute(mismatched)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+}
