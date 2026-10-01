@@ -1482,10 +1482,10 @@ fn native_readiness_prompt(
             if !allowed_app_ids.contains("satelle.exe") {
                 return Err("native_app_approval_unavailable");
             }
-            // The native probe has a fixed captured-window layout. Coordinate input keeps
+            // The native probe has a borderless physical-pixel layout. Coordinate input keeps
             // this generated cell short enough for the model to copy verbatim,
             // while the private callback remains the authority for both events.
-            let script = "globalThis.sky??=(await import('@oai/sky')).sky;var w=(await sky.list_windows()).find(x=>x.app.toLowerCase().endsWith('satelle.exe')&&x.title==='Satelle native readiness probe'),g=w=>sky.get_window_state({window:w,include_screenshot:true,include_text:true}),s=await g(w);await sky.click({window:s.window,x:190,y:173,screenshotId:s.screenshots[0].id});s=await g(s.window);await sky.drag({window:s.window,from_x:238,from_y:356,to_x:578,to_y:406,screenshotId:s.screenshots[0].id})".to_string();
+            let script = "globalThis.sky??=(await import('@oai/sky')).sky;var w=(await sky.list_windows()).find(x=>x.app.toLowerCase().endsWith('satelle.exe')&&x.title==='Satelle native readiness probe'),g=w=>sky.get_window_state({window:w,include_screenshot:true,include_text:true}),s=await g(w);await sky.click({window:s.window,x:190,y:142,screenshotId:s.screenshots[0].id});s=await g(s.window);await sky.drag({window:s.window,from_x:230,from_y:325,to_x:660,to_y:430,screenshotId:s.screenshots[0].id})".to_string();
             // The `exec` tool yields after roughly ten seconds and reports a
             // background cell instead of a result. On slow hosts the readiness
             // script outlives that window, and a model that obeys "no other
@@ -4963,9 +4963,9 @@ mod tests {
         assert!(!prompt.contains("sky.type_text"));
         assert!(prompt.contains("sky.get_window_state({window:w"));
         assert!(!prompt.contains("accessibility.tree"));
-        assert!(prompt.contains("sky.click({window:s.window,x:190,y:173"));
+        assert!(prompt.contains("sky.click({window:s.window,x:190,y:142"));
         assert!(
-            prompt.contains("sky.drag({window:s.window,from_x:238,from_y:356,to_x:578,to_y:406")
+            prompt.contains("sky.drag({window:s.window,from_x:230,from_y:325,to_x:660,to_y:430")
         );
         assert!(prompt.contains("screenshotId:s.screenshots[0].id"));
         let click = prompt
@@ -5340,9 +5340,9 @@ mod tests {
         assert!(prompt.contains("drag"));
         assert!(!prompt.contains("readiness-nonce"));
         assert_eq!(prompt.matches("sky.list_windows()").count(), 1);
-        assert!(prompt.contains("sky.click({window:s.window,x:190,y:173"));
+        assert!(prompt.contains("sky.click({window:s.window,x:190,y:142"));
         assert!(
-            prompt.contains("sky.drag({window:s.window,from_x:238,from_y:356,to_x:578,to_y:406")
+            prompt.contains("sky.drag({window:s.window,from_x:230,from_y:325,to_x:660,to_y:430")
         );
         assert!(prompt.contains("screenshotId:s.screenshots[0].id"));
         assert!(!prompt.contains("accessibility.tree"));
