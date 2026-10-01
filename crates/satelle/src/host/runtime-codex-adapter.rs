@@ -1537,13 +1537,15 @@ fn native_readiness_prompt(
             // The exact Host-owned cell reaches the official SDK consent gate.
             // An unapproved Safari request remains pending in the same broker;
             // executing this cell cannot grant app access by itself.
+            // Keep the cell short enough to copy without changing nested escapes.
+            // Helpers still refresh state; the target verifies both native events.
             let script = format!(
-                "globalThis.sky ??= (await import('@oai/sky')).sky; var state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); await sky.press_key({{ app: 'Safari', key: 'super+n' }}); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var addressLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('text field') && line.includes('ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD')); var addressMatch = addressLine && addressLine.trim().match(/^([0-9]+)/); if (!addressMatch) throw new Error('Safari address field missing'); await sky.set_value({{ app: 'Safari', element_index: Number(addressMatch[1]), value: {page_url} }}); await sky.press_key({{ app: 'Safari', key: 'Return' }}); var buttonMatch = null; for (var attempt = 0; attempt < 8 && !buttonMatch; attempt++) {{ await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 1000 : 500)); state = await sky.get_app_state({{ app: 'Safari', disableDiff: true }}); var buttonLine = state.text.split(String.fromCharCode(10)).find(line => line.includes('button Click to confirm')); buttonMatch = buttonLine && buttonLine.trim().match(/^([0-9]+)/); }} if (!buttonMatch) throw new Error('readiness button missing'); await sky.click({{ app: 'Safari', element_index: Number(buttonMatch[1]) }}); await sky.drag({{ app: 'Safari', from_x: 100, from_y: 320, to_x: 600, to_y: 425 }}); await sky.press_key({{ app: 'Safari', key: 'super+w' }}); nodeRepl.write('Native click and drag actions dispatched');"
+                "globalThis.sky??=(await import('@oai/sky')).sky;var app='Safari',g=()=>sky.get_app_state({{app,disableDiff:true}}),k=key=>sky.press_key({{app,key}}),index=(s,test)=>s.text.split(String.fromCharCode(10)).find(test)?.trim().match(/^([0-9]+)/),s=await g();await k('super+n');s=await g();var a=index(s,x=>x.includes('text field')&&x.includes('ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD'));if(!a)throw Error('Safari address field missing');await sky.set_value({{app,element_index:+a[1],value:{page_url}}});await k('Return');for(var i=0,b;i<8&&!b;i++){{await new Promise(r=>setTimeout(r,i?500:1000));b=index(await g(),x=>x.includes('button Click to confirm'))}}if(!b)throw Error('readiness button missing');await sky.click({{app,element_index:+b[1]}});await sky.drag({{app,from_x:100,from_y:320,to_x:600,to_y:425}});await k('super+w');nodeRepl.write('Native click and drag actions dispatched');"
             );
             native_action_evidence.expect_script_for_app(&script, "com.apple.Safari");
             let exec_source = node_repl_exec_source(&script);
             Ok(format!(
-                "Use the installed official Computer Use plugin immediately. Call the top-level `exec` tool exactly once with this exact JavaScript source: `{exec_source}`. That source calls the nested `mcp__node_repl__js` tool exactly once with the complete readiness script as the exact `code` argument. The tools are already available; do not call `tool_search` or inspect the tool inventory. Make no other discovery or tool calls. The private loopback target independently verifies both native events. It rejects a missing click or drag. The target has a fixed 1024 by 678 readiness surface, so the app-window drag coordinates are part of this probe contract. Use only the authenticated sky Computer Use API. Do not use shell, file, generic browser automation, or other network tools. Do not print the app list or inspect unrelated apps. Do not read documentation. If the `exec` result reports that the script is still running with a cell ID instead of a terminal result, call the top-level `wait` tool with that `cell_id` and `yield_time_ms` of 10000, repeating only until the cell returns a terminal result. That `wait` call is the only other tool call permitted. Stop immediately after the `exec` tool call reaches a terminal result."
+                "Use the installed official Computer Use plugin immediately. Call the top-level `exec` tool exactly once with this exact JavaScript source: `{exec_source}`. Copy the source verbatim without expanding or replacing any operation. That source calls the nested `mcp__node_repl__js` tool exactly once with the complete readiness script as the exact `code` argument. The tools are already available; do not call `tool_search` or inspect the tool inventory. Make no other discovery or tool calls. The private loopback target independently verifies both native events. It rejects a missing click or drag. The target has a fixed 1024 by 678 readiness surface, so the app-window drag coordinates are part of this probe contract. Use only the authenticated sky Computer Use API. Do not use shell, file, generic browser automation, or other network tools. Do not print the app list or inspect unrelated apps. Do not read documentation. If the `exec` result reports that the script is still running with a cell ID instead of a terminal result, call the top-level `wait` tool with that `cell_id` and `yield_time_ms` of 10000, repeating only until the cell returns a terminal result. That `wait` call is the only other tool call permitted. Stop immediately after the `exec` tool call reaches a terminal result."
             ))
         }
     }
@@ -5461,33 +5463,36 @@ mod tests {
         assert!(prompt.contains("only other tool call permitted"));
         assert!(!prompt.contains("functions.exec"));
         assert!(prompt.contains("import('@oai/sky')"));
-        let initial_state = prompt
-            .find("get_app_state({ app: 'Safari', disableDiff: true })")
-            .expect("the prompt must read current Safari state");
-        let new_window = prompt
-            .find("sky.press_key({ app: 'Safari', key: 'super+n' })")
-            .expect("the prompt must open a temporary Safari window");
-        let temporary_window_state = prompt[new_window..]
-            .find("get_app_state({ app: 'Safari', disableDiff: true })")
+        let (script, app_id) = evidence
+            .expected_authorization()
+            .expect("the exact macOS cell must retain current app authority");
+        assert_eq!(app_id, "com.apple.Safari");
+        assert!(script.len() <= 1200);
+        assert!(script.contains("g=()=>sky.get_app_state({app,disableDiff:true})"));
+        assert!(script.contains("k=key=>sky.press_key({app,key})"));
+        let initial_state = script.find("s=await g();").unwrap();
+        let new_window = script.find("await k('super+n');").unwrap();
+        let temporary_window_state = script[new_window..]
+            .find("s=await g();")
             .map(|offset| new_window + offset)
-            .expect("the prompt must refresh state for the temporary window");
-        assert!(initial_state < new_window);
-        assert!(new_window < temporary_window_state);
-        assert!(prompt.contains("get_app_state({ app: 'Safari', disableDiff: true })"));
-        assert!(prompt.contains("ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD"));
-        assert!(
-            !prompt
-                .contains("sky.click({ app: 'Safari', element_index: Number(addressMatch[1]) })")
-        );
-        assert!(prompt.contains("sky.set_value({ app: 'Safari', element_index:"));
-        assert!(prompt.contains("sky.press_key({ app: 'Safari', key: 'Return' })"));
-        assert!(prompt.contains("attempt < 8"));
-        assert!(prompt.contains("sky.click({ app: 'Safari', element_index:"));
-        assert!(!prompt.contains("finalState.text.includes"));
-        assert!(!prompt.contains("native events missing"));
-        assert!(prompt.contains("Native click and drag actions dispatched"));
-        assert!(prompt.contains("from_x: 100, from_y: 320, to_x: 600, to_y: 425"));
-        assert!(prompt.contains("sky.press_key({ app: 'Safari', key: 'super+w' })"));
+            .expect("the temporary window must get fresh state");
+        assert!(initial_state < new_window && new_window < temporary_window_state);
+        assert!(script.contains(
+            "x.includes('text field')&&x.includes('ID: WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD')"
+        ));
+        assert!(script.contains("Safari address field missing"));
+        assert!(script.contains("sky.set_value({app,element_index:"));
+        assert!(script.contains("value:'http://127.0.0.1:12345/probe/readiness-nonce'"));
+        assert!(script.contains("await k('Return')"));
+        assert!(script.contains("i<8&&!b"));
+        assert!(script.contains("setTimeout(r,i?500:1000)"));
+        assert!(script.contains("index(await g(),x=>x.includes('button Click to confirm'))"));
+        assert!(script.contains("readiness button missing"));
+        assert!(script.contains("sky.click({app,element_index:"));
+        assert!(script.contains("from_x:100,from_y:320,to_x:600,to_y:425"));
+        assert!(script.contains("await k('super+w')"));
+        assert!(script.contains("Native click and drag actions dispatched"));
+        assert!(prompt.contains("Copy the source verbatim"));
         assert!(prompt.contains("independently verifies both native events"));
         assert!(prompt.contains("Do not read documentation"));
         assert!(!prompt.contains("mcp__computer_use"));
