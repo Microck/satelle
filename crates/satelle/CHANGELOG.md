@@ -1,3 +1,15 @@
+## satelle@0.1.27
+
+### App access
+
+Show supported native app requests in Satelle and accept an explicit allow once, Always allow, or deny decision. Resume the same task after the response. Saved approval uses the official native SDK; OS permissions remain manual.
+
+Open named Mac apps directly instead of requiring Finder discovery first.
+
+### Readiness recovery
+
+Reconcile interrupted provider probes before checking native readiness, while preserving running and unknown-outcome guards.
+
 ## satelle@0.1.26
 
 ### Native task results

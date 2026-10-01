@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Native task results\n\nReport a task as blocked when native app approval was denied, even if an earlier tool call succeeded.\n\n## Windows readiness\n\nKeep the native click-and-drag readiness surface in physical pixels so display scaling and window borders do not move the targets away from the authenticated screenshot coordinates.\n"
-    filename: 2026-09-30-native-approvals-and-windows-readiness.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## App access\n\nShow supported native app requests in Satelle and accept an explicit allow once, Always allow, or deny decision. Resume the same task after the response. Saved approval uses the official native SDK; OS permissions remain manual.\n\nOpen named Mac apps directly instead of requiring Finder discovery first.\n\n## Readiness recovery\n\nReconcile interrupted provider probes before checking native readiness, while preserving running and unknown-outcome guards.\n"
+    filename: 2026-10-01-native-app-consent.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - 2026-09-30-native-approvals-and-windows-readiness.md
+      - 2026-10-01-native-app-consent.md
     id: cargo:satelle
     updated: true
 npm:packages:
