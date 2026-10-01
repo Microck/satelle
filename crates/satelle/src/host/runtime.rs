@@ -1595,6 +1595,11 @@ impl RuntimeEngine {
             self.readiness_probe_driver.as_ref(),
         ) {
             self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Native)?;
+            // Both probes own the desktop. Reconcile an earlier provider probe
+            // before native readiness attempts to acquire that same lease.
+            if owned_provider_probe.is_none() {
+                self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Provider)?;
+            }
         }
         let mut cached = match supplied_native {
             Some(evidence)
@@ -1642,12 +1647,6 @@ impl RuntimeEngine {
                 .provider_computer_use()
                 == crate::core::session::FeatureChoice::Enabled
         });
-        if owned_provider_probe.is_none()
-            && let (Some(key), Some(driver)) =
-                (cache_key.as_ref(), self.readiness_probe_driver.as_ref())
-        {
-            self.reconcile_readiness_probe(key, driver.as_ref(), ReadinessProbeKind::Provider)?;
-        }
         let cached_provider = if let Some(key) = cache_key.as_ref() {
             if provider_smoke_enabled && !provider_intent.refresh() {
                 self.lock_storage()?
@@ -4490,6 +4489,7 @@ impl RuntimeHandle {
             .as_ref()
             .ok_or_else(SatelleError::computer_use_not_ready)?;
         engine.reconcile_readiness_probe(&key, driver.as_ref(), ReadinessProbeKind::Native)?;
+        engine.reconcile_readiness_probe(&key, driver.as_ref(), ReadinessProbeKind::Provider)?;
         engine.run_live_native_probe(&key, driver.as_ref(), cancellation)
     }
 
