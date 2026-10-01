@@ -1436,6 +1436,82 @@ fn unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_recon
 }
 
 #[test]
+fn provider_probe_recovery_precedes_uncached_native_readiness() {
+    for setup_refresh in [false, true] {
+        let state = crate::host::TestStateDir::new().unwrap();
+        let adapter = ProviderProbeRecoveryAdapter::new([
+            RecoveryObservation::Running,
+            RecoveryObservation::Unknown,
+            RecoveryObservation::Completed,
+        ]);
+        let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+            Ok(state.path().to_path_buf()),
+            adapter.clone(),
+            adapter.clone(),
+        );
+        let intent = ProviderComputerUseIntent::new(None, None, false);
+        let engine = runtime.engine().unwrap();
+        let key = ProviderProbeRecoveryAdapter::key();
+        let native = adapter.readiness_with_id("provider-recovery-native");
+        engine
+            .lock_storage()
+            .unwrap()
+            .store_preflight_successes(
+                key.adapter(),
+                key.desktop_binding(),
+                key.execution_policy(),
+                &native,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .refresh_provider_smoke(LOCAL_DEMO_HOST, &intent)
+                .unwrap_err()
+                .code,
+            ErrorCode::ProviderSmokeTestTimeout,
+        );
+        runtime.invalidate_all_native_readiness().unwrap();
+        let refresh = || {
+            if setup_refresh {
+                runtime
+                    .refresh_setup_native_readiness(LOCAL_DEMO_HOST, &intent)
+                    .map(|_| ())
+            } else {
+                runtime
+                    .run(RunCommand::attached(LOCAL_DEMO_HOST, "recovered-prompt"))
+                    .map(|_| ())
+                    .map_err(|failure| failure.error().clone())
+            }
+        };
+        for _ in 0..2 {
+            let error = refresh().unwrap_err();
+            assert_eq!(error.details["reason"], "provider_probe_recovery_pending");
+            assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 0);
+        }
+        adapter
+            .provider_dispatch_possible
+            .store(false, Ordering::SeqCst);
+        if setup_refresh {
+            refresh().expect("terminal provider recovery permits native setup verification");
+        } else {
+            assert_eq!(
+                refresh().unwrap_err().code,
+                ErrorCode::ProviderSmokeTestTimeout
+            );
+        }
+        assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 1);
+        let remaining: i64 = engine
+            .lock_storage()
+            .unwrap()
+            .connection_for_test()
+            .query_row("SELECT count(*) FROM control_leases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+}
+
+#[test]
 fn active_provider_probe_blocks_without_external_reconciliation() {
     let state = crate::host::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = ProviderProbeRecoveryAdapter::new([]);

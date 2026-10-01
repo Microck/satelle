@@ -1505,6 +1505,10 @@
 - lease owner process identity includes a process-start discriminator and operating-system boot identity instead of relying on a reusable process id alone @spec @mvp @implemented
 - the Host Daemon refreshes live Control and Maintenance Lease heartbeats at least every 5 seconds, and a missing heartbeat becomes stale after 30 seconds by default without permitting automatic lease release @spec @mvp @implemented
 - Host Daemon startup treats an orphaned Control or Maintenance Lease as recovery_pending and blocks conflicting admission until reconciliation completes @spec @mvp @implemented
+- before acquiring a native readiness probe lease, Satelle reconciles any earlier provider probe for the same desktop; terminal upstream confirmation permits release, while running or unknown upstream activity remains blocked with provider probe recovery guidance @spec @mvp @implemented
+- label: before native readiness, an earlier provider probe remains blocked while upstream activity is running or unknown and is released only after terminal reconciliation
+  command: cargo test --locked -p satelle --lib host::runtime::tests::provider_probe_recovery_precedes_uncached_native_readiness -- --exact
+  tags: [spec, mvp, implemented, ci]
 - label: an orphaned non-Turn Control Lease for a readiness or provider probe is classified outcome_unknown, reconciled against its probe process and upstream capability state, and resolved to a durable terminal Readiness Result before lease release
   command: cargo test --locked -p satelle --lib runtime::tests::unknown_provider_probe_ownership_blocks_probe_and_prompt_until_terminal_reconciliation -- --exact && cargo test --locked -p satelle --lib runtime::tests::unknown_native_probe_timeout_blocks_until_terminal_reconciliation -- --exact
   tags: [spec, mvp, implemented, ci]
