@@ -6068,7 +6068,7 @@ fn native_action_relay_rejects_yolo_then_unsupported_adapters_before_turn_start(
 }
 
 #[test]
-fn native_action_response_validates_its_id_before_reporting_adapter_support() {
+fn native_action_response_rejects_stale_and_malformed_ids() {
     let state = state_dir();
     let action_request_id = "ra_01890a5d-ac96-7b7c-8f89-37c3d0a66f10";
 
@@ -6077,9 +6077,7 @@ fn native_action_response_validates_its_id_before_reporting_adapter_support() {
         .args(["action", "respond", action_request_id, "--deny"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "native-action-relay-not-supported",
-        ));
+        .stderr(predicate::str::contains("invalid-usage"));
 
     satelle()
         .env("SATELLE_STATE_DIR", state.path())

@@ -32,7 +32,8 @@ pub use read::{
 pub(crate) use session::ApiRequestContract;
 pub(crate) use session::TurnRequestParts;
 pub use session::{
-    AdmissionCancellationOutcome, AdmissionCancellationResponse, DesktopSnapshotAcknowledgeRequest,
+    AdmissionCancellationOutcome, AdmissionCancellationResponse, AppApprovalResponse,
+    AppApprovalResponseRequest, AppApprovalsResponse, DesktopSnapshotAcknowledgeRequest,
     DesktopSnapshotAcknowledgeResponse, DesktopSnapshotCaptureRequest,
     DesktopSnapshotCaptureResponse, DesktopSnapshotContractError, ImageAttachment,
     MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL, MAX_IMAGE_ATTACHMENT_COUNT,

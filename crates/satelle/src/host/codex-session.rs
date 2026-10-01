@@ -96,6 +96,8 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) observe_native_approval: Option<&'a mut dyn FnMut()>,
+    pub(crate) request_app_approval:
+        Option<&'a mut dyn FnMut(String, bool) -> Option<super::app_approval::PendingAppApproval>>,
     pub(crate) native_action_evidence: Option<crate::host::provider_probe::NativeActionEvidence>,
     pub(crate) expected_mcp_server_name: &'a str,
     pub(crate) computer_use_allowed_app_ids: &'a BTreeSet<String>,
@@ -565,6 +567,7 @@ struct SessionExchange<'a> {
     stop_committed: bool,
     active_native_tools: BTreeMap<String, String>,
     native_tool_succeeded: bool,
+    pending_app_approvals: Vec<(Value, super::app_approval::PendingAppApproval)>,
 }
 
 struct ServerResponse {
@@ -595,6 +598,7 @@ impl<'a> SessionExchange<'a> {
             stop_committed: false,
             active_native_tools: BTreeMap::new(),
             native_tool_succeeded: false,
+            pending_app_approvals: Vec::new(),
         }
     }
 
@@ -655,12 +659,38 @@ impl<'a> SessionExchange<'a> {
         }
     }
 
+    fn resolve_app_approvals(&mut self, writer: &ProtocolWriter) -> Result<(), CodexSessionError> {
+        let mut index = 0;
+        while index < self.pending_app_approvals.len() {
+            let decision = if self.interrupt_sent {
+                Some(super::AppApprovalDecision::Deny)
+            } else {
+                self.pending_app_approvals[index].1.decision()
+            };
+            let Some(decision) = decision else {
+                index += 1;
+                continue;
+            };
+            let (id, _operation_guard) = self.pending_app_approvals.remove(index);
+            let accepted = decision != super::AppApprovalDecision::Deny;
+            writer.write(&json!({"id": id, "result": {
+                "action": if accepted { "accept" } else { "decline" }, "content": null,
+                "_meta": if decision == super::AppApprovalDecision::Always { json!({"persist":"always"}) } else { Value::Null },
+            }}))?;
+            if !accepted && let Some(observer) = self.request.observe_native_approval.as_mut() {
+                observer();
+            }
+        }
+        Ok(())
+    }
+
     fn consume_next(
         &mut self,
         writer: &ProtocolWriter,
         receiver: &mpsc::Receiver<ReadEvent>,
     ) -> Result<(), CodexSessionError> {
         self.poll_control(writer)?;
+        self.resolve_app_approvals(writer)?;
         if self.controlled_stop {
             return Ok(());
         }
@@ -669,7 +699,7 @@ impl<'a> SessionExchange<'a> {
             .deadline
             .checked_duration_since(Instant::now())
             .ok_or(CodexSessionError::Timeout)?;
-        let wait = if self.control.is_some() {
+        let wait = if self.control.is_some() || !self.pending_app_approvals.is_empty() {
             remaining.min(CONTROL_POLL_INTERVAL)
         } else {
             remaining
@@ -790,7 +820,7 @@ impl<'a> SessionExchange<'a> {
             .as_object()
             .ok_or(CodexSessionError::MalformedMessage)?;
         if object.contains_key("id") && object.contains_key("method") {
-            self.consume_server_request(object).map(Some)
+            self.consume_server_request(object)
         } else if object.contains_key("id") {
             self.consume_response(object).map(|()| None)
         } else {
@@ -801,7 +831,7 @@ impl<'a> SessionExchange<'a> {
     fn consume_server_request(
         &mut self,
         object: &Map<String, Value>,
-    ) -> Result<ServerResponse, CodexSessionError> {
+    ) -> Result<Option<ServerResponse>, CodexSessionError> {
         let id = object
             .get("id")
             .filter(|id| {
@@ -825,11 +855,22 @@ impl<'a> SessionExchange<'a> {
                     .map(|(script, app_id)| (script.as_str(), app_id.as_str())),
                 self.thread_ref.as_deref(),
                 self.turn_ref.as_deref(),
+                self.request.request_app_approval.is_some(),
             )?;
-            return Ok(ServerResponse {
+            if !authorization.accepted()
+                && let Some(params) = object.get("params").and_then(Value::as_object)
+                && let Some((app_id, allow_always)) =
+                    codex_approval::computer_use_app_request(params)
+                && let Some(callback) = self.request.request_app_approval.as_mut()
+                && let Some(pending) = callback(app_id, allow_always)
+            {
+                self.pending_app_approvals.push((id.clone(), pending));
+                return Ok(None);
+            }
+            return Ok(Some(ServerResponse {
                 body: json!({"id": id, "result": result}),
                 observe_native_approval: !authorization.accepted(),
-            });
+            }));
         }
         if let Some(result) = codex_approval::approval_result(
             method,
@@ -838,10 +879,10 @@ impl<'a> SessionExchange<'a> {
             self.thread_ref.as_deref(),
             self.turn_ref.as_deref(),
         )? {
-            return Ok(ServerResponse {
+            return Ok(Some(ServerResponse {
                 body: json!({"id": id, "result": result}),
                 observe_native_approval: !auto_approve,
-            });
+            }));
         }
         if matches!(method, "item/tool/requestUserInput" | "item/tool/call") {
             let params = required_object(object, "params")?;
@@ -850,7 +891,7 @@ impl<'a> SessionExchange<'a> {
         let result = match method {
             "item/tool/call" => json!({"contentItems": [], "success": false}),
             _ => {
-                return Ok(ServerResponse {
+                return Ok(Some(ServerResponse {
                     body: json!({
                         "id": id,
                         "error": {
@@ -859,13 +900,13 @@ impl<'a> SessionExchange<'a> {
                         }
                     }),
                     observe_native_approval: false,
-                });
+                }));
             }
         };
-        Ok(ServerResponse {
+        Ok(Some(ServerResponse {
             body: json!({"id": id, "result": result}),
             observe_native_approval: false,
-        })
+        }))
     }
 
     fn validate_server_request_correlation(
@@ -998,6 +1039,16 @@ impl<'a> SessionExchange<'a> {
             .and_then(Value::as_str)
             .ok_or(CodexSessionError::MalformedMessage)?;
         match method {
+            "serverRequest/resolved" => {
+                let params = required_object(object, "params")?;
+                self.correlate_thread(required_string(params, "threadId")?)?;
+                let id = params
+                    .get("requestId")
+                    .ok_or(CodexSessionError::MalformedMessage)?;
+                self.pending_app_approvals
+                    .retain(|(pending_id, _)| pending_id != id);
+                Ok(())
+            }
             "mcpServer/startupStatus/updated" => {
                 let params = required_object(object, "params")?;
                 // Codex can report MCP startup before its thread/start response.

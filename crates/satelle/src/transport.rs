@@ -411,6 +411,19 @@ fn setup_provider_intent(
 /// The command surface is intentionally exhaustive. A new transport operation
 /// must be implemented or explicitly rejected by every backend.
 pub(crate) trait TransportClient: Send {
+    fn app_approval_requests(
+        &self,
+    ) -> Result<Vec<satelle::host::AppApprovalRequest>, SatelleError> {
+        Err(SatelleError::native_action_relay_not_supported())
+    }
+    fn respond_to_app_approval(
+        &self,
+        _id: &satelle::core::ActionRequestId,
+        _decision: satelle::host::AppApprovalDecision,
+    ) -> Result<(), SatelleError> {
+        Err(SatelleError::native_action_relay_not_supported())
+    }
+
     fn log_target_identity(&self) -> Result<String, SatelleError>;
 
     fn supported_image_media_types(&self) -> Result<Vec<String>, SatelleError> {
@@ -926,6 +939,19 @@ fn interrupted_admission_race_error(alias: &str) -> SatelleError {
 }
 
 impl TransportClient for LocalTransport {
+    fn app_approval_requests(
+        &self,
+    ) -> Result<Vec<satelle::host::AppApprovalRequest>, SatelleError> {
+        self.service.app_approval_requests()
+    }
+    fn respond_to_app_approval(
+        &self,
+        id: &satelle::core::ActionRequestId,
+        decision: satelle::host::AppApprovalDecision,
+    ) -> Result<(), SatelleError> {
+        self.service.respond_to_app_approval(id, decision)
+    }
+
     fn log_target_identity(&self) -> Result<String, SatelleError> {
         self.service
             .daemon_runtime_status()
@@ -7893,6 +7919,28 @@ impl TransportClient for SshSetupTransport {
 }
 
 impl TransportClient for DirectTransport {
+    fn app_approval_requests(
+        &self,
+    ) -> Result<Vec<satelle::host::AppApprovalRequest>, SatelleError> {
+        self.client
+            .app_approval_requests()
+            .map(|response| response.requests)
+            .map_err(|error| direct_transport_error(&self.alias, error))
+    }
+    fn respond_to_app_approval(
+        &self,
+        id: &satelle::core::ActionRequestId,
+        decision: satelle::host::AppApprovalDecision,
+    ) -> Result<(), SatelleError> {
+        self.client
+            .respond_to_app_approval(id, decision)
+            .map(|_| ())
+            .map_err(|error| match error {
+                DaemonClientError::Api { error, .. } if error.code() == ApiErrorCode::InvalidRequest => SatelleError::invalid_usage("the app approval request is no longer pending or does not support this decision"),
+                error => direct_transport_error(&self.alias, error),
+            })
+    }
+
     fn log_target_identity(&self) -> Result<String, SatelleError> {
         Ok(self.host_identity.clone())
     }

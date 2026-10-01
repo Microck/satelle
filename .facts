@@ -2006,8 +2006,13 @@
 - satelle MVP does not require local user confirmation before starting a remote Computer Use run on a ready host @spec @mvp @implemented
 - satelle prompt execution never bypasses host readiness, native Computer Use readiness, or unsupported-capability checks @spec @mvp @implemented
 - satelle treats instructions visible in remote desktop content as untrusted content that cannot override the operator prompt, consent gates, host policy, YOLO policy, or configured safety boundaries @spec @mvp @implemented
-- satelle MVP does not implement Satelle-owned confirmation prompts for individual native Computer Use actions after a prompt turn starts @spec @mvp @implemented
-- satelle surfaces detected native Codex Computer Use app approvals, operating-system permission prompts, administrator authentication prompts, security prompts, and sensitive-action prompts as action_required events or manual-action-required blockers instead of replacing them with Satelle confirmations @spec @mvp @implemented
+- supported native Computer Use app-consent requests are shown by the initiating Satelle terminal or chat and remain pending until an explicit human allow or deny decision; general OS, administrator, and security prompts remain manual @spec @mvp @implemented
+- satelle action list --host <alias> returns bounded pending app requests, and action respond <id> --host <alias> --allow [--always] or --deny answers only that exact live request through the authenticated control plane @spec @contract @mvp @implemented
+- saved app consent uses the supported upstream _meta.persist=always response only when the request advertises always; Satelle never edits native app policy files or infers consent from --yes or YOLO @spec @contract @mvp @implemented
+- the exact Host-owned macOS readiness cell can reach the official SDK app-consent gate before an app has saved approval; this authorizes only the registered code, and no native app access is granted without SDK consent @spec @contract @mvp @implemented
+- GET /v1/actions requires authenticated pinned read scope; POST /v1/actions/{action_request_id}/respond requires authenticated pinned control scope, protocol version, JSON schema, and mutation headers @spec @contract @mvp @implemented
+- app requests expire after five minutes or their owning operation terminates, whichever occurs first; cancellation keeps the protocol loop responsive and stale or conflicting decisions cannot grant access @spec @contract @mvp @implemented
+- supported app approvals emit action_required with the exact pending request; operating-system permission prompts, administrator authentication prompts, security prompts, and sensitive-action prompts remain manual-action-required blockers @spec @mvp @implemented
 - a Codex turn that completes after Satelle declined a native approval becomes blocked with reason native_approval_required even if an earlier native tool succeeded; persistence, containment, cancellation, and execution failures retain their existing outcomes @spec @mvp @implemented
 - satelle does not auto-answer native Codex Computer Use app approvals, operating-system permission prompts, administrator authentication prompts, security prompts, or sensitive-action prompts unless Codex exposes the specific prompt as a documented app-server approval callback that Satelle is allowed to answer @spec @mvp @implemented
 - satelle only adds Satelle-owned native action confirmation relay after MVP as an opt-in feature guarded by an explicit per-command flag and only when Codex exposes stable native Computer Use action events and accept or deny callbacks @spec @later @phase4 @implemented
@@ -2088,7 +2093,7 @@
 - the private Codex app-server execution session accepts only one response for each outstanding request id and rejects unknown, duplicate, or out-of-order responses @implemented @mvp
 - private Codex app-server messages containing both id and method are handled as server requests before outbound response-id matching @implemented @mvp
 - turn-scoped Codex app-server requests must match the active private thread and turn before Satelle responds @implemented @mvp
-- documented Codex app-server approval and elicitation requests are declined when no Satelle interactive relay is active @implemented @mvp
+- supported app-consent elicitations use the authenticated pending app approval resource; other documented approval requests retain their explicit execution policy and decline when no supported relay is active @spec @mvp @implemented
 - unsupported Codex app-server requests receive a closed JSON-RPC method-not-supported response without echoing raw parameters @implemented @mvp
 - Codex thread and turn identifiers are accepted only from correlated responses or matching lifecycle notifications @implemented @mvp
 - each accepted private Codex thread or turn identifier is durably persisted before the execution session consumes a later message that depends on that identifier @implemented @mvp

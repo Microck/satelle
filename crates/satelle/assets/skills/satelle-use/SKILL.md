@@ -45,6 +45,18 @@ Use `satelle stop <session_id>` when the active turn should stop. Do not treat s
 
 Completion criterion: the session remains inspectable and later steering is possible when the stored thread is available.
 
+## App access decisions
+
+When an `action_required` event has `kind: native_app_approval`, show the requested app and host to the human in the initiating chat or terminal. `satelle action list --host <alias> --json` also lists live requests, including those from readiness checks.
+
+Ask the human to choose allow once, Always allow when `allow_always` is true, or deny. Send only their explicit decision:
+
+- `satelle action respond <action_request_id> --host <alias> --allow`
+- `satelle action respond <action_request_id> --host <alias> --allow --always`
+- `satelle action respond <action_request_id> --host <alias> --deny`
+
+The same operation resumes after the response. Do not start a competing turn. Requests expire when the operation ends or after five minutes at most. Re-read pending requests before answering a stale ID. Do not infer app consent from task authorization, YOLO, or `--yes`, and never edit native app policy files. OS privacy and administrator prompts still require the human on the device.
+
 ## Output Formats
 
 - Use JSON for canonical automation.

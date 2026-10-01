@@ -940,6 +940,31 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::ACCEPTED)
     }
 
+    pub fn app_approval_requests(
+        &self,
+    ) -> Result<crate::transport::AppApprovalsResponse, DaemonClientError> {
+        let (request, request_id) = self.protected_request(Method::GET, "/v1/actions")?;
+        self.send_authenticated(request, request_id, StatusCode::OK)
+    }
+
+    pub fn respond_to_app_approval(
+        &self,
+        id: &crate::core::ActionRequestId,
+        decision: crate::host::AppApprovalDecision,
+    ) -> Result<crate::transport::AppApprovalResponse, DaemonClientError> {
+        let path = format!("/v1/actions/{id}/respond");
+        let (request, request_id) = self.mutation_request(&path, id.as_str())?;
+        let response: crate::transport::AppApprovalResponse = self.send_authenticated(
+            request.json(&crate::transport::AppApprovalResponseRequest::new(decision)),
+            request_id,
+            StatusCode::OK,
+        )?;
+        if response.action_request_id != *id || response.decision != decision {
+            return Err(DaemonClientError::ResponseContractViolation);
+        }
+        Ok(response)
+    }
+
     pub fn queue_status(
         &self,
         queue_request_id: &QueueRequestId,

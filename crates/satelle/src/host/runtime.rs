@@ -2999,6 +2999,19 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    pub(crate) fn app_approval_requests(
+        &self,
+    ) -> Result<Vec<crate::host::AppApprovalRequest>, SatelleError> {
+        self.adapter.app_approval_requests()
+    }
+    pub(crate) fn respond_to_app_approval(
+        &self,
+        id: &crate::core::ActionRequestId,
+        decision: crate::host::AppApprovalDecision,
+    ) -> Result<(), SatelleError> {
+        self.adapter.respond_to_app_approval(id, decision)
+    }
+
     pub(crate) fn queue_config(&self) -> Result<crate::core::queue::QueueConfig, SatelleError> {
         self.lazy
             .lock()
