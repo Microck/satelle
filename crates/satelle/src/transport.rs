@@ -1467,7 +1467,7 @@ fn validate_local_daemon_path_overrides(
     Ok(())
 }
 
-fn transport_proves_daemon_is_absent(error: &reqwest::Error) -> bool {
+fn transport_can_reflect_daemon_absence(error: &reqwest::Error) -> bool {
     if error.is_connect() {
         return true;
     }
@@ -2322,7 +2322,7 @@ impl SshSetupTransport {
             // failure proves absence; timeouts and other transport failures
             // leave the current Host state unknown and must fail closed.
             Err(DaemonClientError::Transport(error))
-                if transport_proves_daemon_is_absent(&error) =>
+                if transport_can_reflect_daemon_absence(&error) =>
             {
                 Ok(None)
             }
@@ -6464,7 +6464,13 @@ fn recover_selected_repair_daemon(
         },
         &mut bootstrap_lock,
         |lock| confirm_bootstrap_lock(&transport.alias, lock),
-        || observe_remote_durable_readiness(durable_client.capabilities()),
+        || {
+            observe_remote_durable_readiness(
+                &transport.alias,
+                durable_client.capabilities(),
+                || observe_durable_listener(&transport.alias, transport.binding.destination()),
+            )
+        },
         |lock| {
             let mut remote = ssh_bootstrap::PersistentServiceRemote::new(
                 transport.binding.destination(),
@@ -6510,7 +6516,13 @@ fn recover_selected_repair_daemon(
                 ssh_bootstrap::PersistentServiceObservation::Running,
             )
         },
-        || observe_remote_durable_readiness(durable_client.capabilities()),
+        || {
+            observe_remote_durable_readiness(
+                &transport.alias,
+                durable_client.capabilities(),
+                || observe_durable_listener(&transport.alias, transport.binding.destination()),
+            )
+        },
         Instant::now() + SSH_DAEMON_LAUNCH_TIMEOUT,
     ) {
         Ok(relaunched) => relaunched,
@@ -8608,9 +8620,12 @@ fn durable_ssh_clients(
         LockFirstOperationKind::MissingDaemonRepair,
     )?;
     match probe_durable_daemon_under_lock(
-        alias,
         || confirm_bootstrap_lock(alias, &mut bootstrap_lock),
-        || observe_remote_durable_readiness(client.capabilities()),
+        || {
+            observe_remote_durable_readiness(alias, client.capabilities(), || {
+                observe_durable_listener(alias, destination)
+            })
+        },
     )? {
         DurableDaemonProbe::Ready(readiness) => {
             require_durable_readiness(
@@ -8646,6 +8661,7 @@ fn durable_ssh_clients(
             .map_err(|error| direct_transport_error(alias, error))?;
             finish_durable_daemon_launch(
                 alias,
+                destination,
                 expected_host_identity,
                 &client,
                 &bootstrap_client,
@@ -8661,6 +8677,7 @@ fn durable_ssh_clients(
 
 fn finish_durable_daemon_launch(
     alias: &str,
+    destination: &str,
     expected_host_identity: &str,
     durable_client: &DaemonClient,
     bootstrap_client: &DaemonClient,
@@ -8682,7 +8699,11 @@ fn finish_durable_daemon_launch(
         alias,
         expected_host_identity,
         || Ok(()),
-        || observe_remote_durable_readiness(durable_client.capabilities()),
+        || {
+            observe_remote_durable_readiness(alias, durable_client.capabilities(), || {
+                observe_durable_listener(alias, destination)
+            })
+        },
         Instant::now() + SSH_DAEMON_LAUNCH_TIMEOUT,
     )
 }
@@ -8720,22 +8741,50 @@ impl DurableReadiness for DurableReadinessSnapshot {
 
 enum DurableReadinessObservation {
     Ready(DurableReadinessSnapshot),
-    ConnectFailure,
-    Failure(DaemonClientError),
+    ListenerAbsent,
+    ListenerPresentTransportFailure(SatelleError),
+    Failure(SatelleError),
+}
+
+fn observe_durable_listener(
+    host: &str,
+    destination: &str,
+) -> Result<ssh_bootstrap::LoopbackListenerObservation, SatelleError> {
+    let target = ssh_bootstrap::RemoteTarget::probe(destination)
+        .map_err(|error| map_ssh_daemon_bootstrap_error(host, error))?;
+    ssh_bootstrap::observe_loopback_listener(destination, target)
+        .map_err(|error| map_ssh_daemon_bootstrap_error(host, error))
 }
 
 fn observe_remote_durable_readiness<T: DurableReadiness>(
+    host: &str,
     readiness: Result<T, DaemonClientError>,
+    listener: impl FnOnce() -> Result<ssh_bootstrap::LoopbackListenerObservation, SatelleError>,
 ) -> DurableReadinessObservation {
     match readiness {
         Ok(capabilities) => DurableReadinessObservation::Ready(DurableReadinessSnapshot {
             daemon_version: capabilities.daemon_version().to_string(),
             host_identity: capabilities.host_identity().to_string(),
         }),
-        Err(DaemonClientError::Transport(error)) if error.is_connect() => {
-            DurableReadinessObservation::ConnectFailure
+        Err(DaemonClientError::Transport(error))
+            if transport_can_reflect_daemon_absence(&error) =>
+        {
+            // SSH accepts the local forwarding connection even when the remote
+            // port is closed. A reset alone is ambiguous; verify remote absence
+            // before the caller can authorize a missing-daemon launch.
+            match listener() {
+                Ok(ssh_bootstrap::LoopbackListenerObservation::Absent) => {
+                    DurableReadinessObservation::ListenerAbsent
+                }
+                Ok(ssh_bootstrap::LoopbackListenerObservation::Present) => {
+                    DurableReadinessObservation::ListenerPresentTransportFailure(
+                        direct_transport_error(host, DaemonClientError::Transport(error)),
+                    )
+                }
+                Err(error) => DurableReadinessObservation::Failure(error),
+            }
         }
-        Err(error) => DurableReadinessObservation::Failure(error),
+        Err(error) => DurableReadinessObservation::Failure(direct_transport_error(host, error)),
     }
 }
 
@@ -8745,7 +8794,6 @@ enum DurableDaemonProbe {
 }
 
 fn probe_durable_daemon_under_lock(
-    host: &str,
     mut confirm_lock_ownership: impl FnMut() -> Result<(), SatelleError>,
     readiness: impl FnOnce() -> DurableReadinessObservation,
 ) -> Result<DurableDaemonProbe, SatelleError> {
@@ -8754,8 +8802,9 @@ fn probe_durable_daemon_under_lock(
     confirm_lock_ownership()?;
     match readiness {
         DurableReadinessObservation::Ready(readiness) => Ok(DurableDaemonProbe::Ready(readiness)),
-        DurableReadinessObservation::ConnectFailure => Ok(DurableDaemonProbe::Missing),
-        DurableReadinessObservation::Failure(error) => Err(direct_transport_error(host, error)),
+        DurableReadinessObservation::ListenerAbsent => Ok(DurableDaemonProbe::Missing),
+        DurableReadinessObservation::Failure(error)
+        | DurableReadinessObservation::ListenerPresentTransportFailure(error) => Err(error),
     }
 }
 
@@ -8811,9 +8860,18 @@ fn authenticate_durable_with_confirmation(
                 );
             }
             DurableReadinessObservation::Failure(error) => {
-                return Err(direct_transport_error(host, error));
+                return Err(error);
             }
-            DurableReadinessObservation::ConnectFailure => {
+            DurableReadinessObservation::ListenerPresentTransportFailure(error) => {
+                // After launch, a bound listener can precede HTTP readiness.
+                // Retry within this deadline; this path cannot launch again.
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(SSH_DAEMON_LAUNCH_POLL_INTERVAL.min(deadline - now));
+            }
+            DurableReadinessObservation::ListenerAbsent => {
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(SatelleError::host_unreachable(host));
@@ -8839,11 +8897,7 @@ fn relaunch_durable_daemon_under_lock<C>(
     final_readiness: impl FnMut() -> DurableReadinessObservation,
     deadline: Instant,
 ) -> Result<bool, SatelleError> {
-    match probe_durable_daemon_under_lock(
-        target.host,
-        || confirm_lock_ownership(context),
-        initial_readiness,
-    )? {
+    match probe_durable_daemon_under_lock(|| confirm_lock_ownership(context), initial_readiness)? {
         DurableDaemonProbe::Ready(readiness) => {
             require_durable_readiness(
                 target.host,
@@ -11282,7 +11336,9 @@ pub(crate) fn discover_ssh_host(
         SSH_DAEMON_REQUEST_TIMEOUT,
     )
     .map_err(|error| direct_transport_error(&host.alias, error))?;
-    if first_trust_daemon_is_live(&host.alias, &liveness_client)? {
+    if first_trust_daemon_is_live(&host.alias, &liveness_client, || {
+        observe_durable_listener(&host.alias, binding.destination())
+    })? {
         let setup_transport = SshSetupTransport::new(host)?;
         let token = setup_transport.read_configured_durable_token()?;
         let raw_token = token.expose();
@@ -11397,15 +11453,27 @@ pub(crate) fn discover_ssh_host(
     })))
 }
 
-fn first_trust_daemon_is_live(alias: &str, client: &DaemonClient) -> Result<bool, SatelleError> {
+fn first_trust_daemon_is_live(
+    alias: &str,
+    client: &DaemonClient,
+    listener: impl FnOnce() -> Result<ssh_bootstrap::LoopbackListenerObservation, SatelleError>,
+) -> Result<bool, SatelleError> {
     match client.live() {
         Ok(_) => Ok(true),
         // The SSH forwarding listener can accept the HTTP connection and then
         // reset it when no daemon owns the remote loopback port. Only those
-        // typed absence signals permit durable-state inspection. A timeout or
+        // eligible signals trigger listener proof before state inspection. A timeout or
         // malformed response leaves daemon ownership unknown and fails closed.
-        Err(DaemonClientError::Transport(error)) if transport_proves_daemon_is_absent(&error) => {
-            Ok(false)
+        Err(DaemonClientError::Transport(error))
+            if transport_can_reflect_daemon_absence(&error) =>
+        {
+            match listener()? {
+                ssh_bootstrap::LoopbackListenerObservation::Absent => Ok(false),
+                ssh_bootstrap::LoopbackListenerObservation::Present => Err(direct_transport_error(
+                    alias,
+                    DaemonClientError::Transport(error),
+                )),
+            }
         }
         Err(error) => Err(direct_transport_error(alias, error)),
     }
