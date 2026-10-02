@@ -156,6 +156,16 @@ jobs:
           RUSTFLAGS: ${{ runner.os == 'Windows' && '-D warnings -C target-feature=+crt-static' || '-D warnings' }}
         run: cargo build --locked --release -p satelle --target ${{ matrix.rust-target }}
 
+      - name: Sign and verify macOS release executable
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.rust-target }}/release/${{ matrix.executable }}"
+          # Ad hoc signatures support execution without a paid Developer ID identity.
+          # Sign before packaging so the archive and npm package contain identical bytes.
+          codesign --force --sign - --identifier dev.microck.satelle "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+
       - name: Verify GNU ABI floor
         if: matrix.glibc-version != ''
         shell: bash

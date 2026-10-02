@@ -91,6 +91,26 @@ formats and archive roots, compares archive and npm executable digests, creates
 checksums, runs registry dry runs, and exercises install, upgrade, smoke, and
 uninstall paths.
 
+## macOS distribution
+
+Mac CLI archives and npm packages contain the same ad hoc signed executable.
+CI signs and verifies both Mac architectures before packaging. This does not
+require a paid Apple Developer account. These releases are not Apple-notarized
+and do not carry a Developer ID publisher identity.
+
+If macOS blocks the downloaded executable as coming from an unidentified
+developer, review the release source and checksums, then use Apple's
+[app-specific approval process](https://support.apple.com/en-ie/guide/mac-help/mh40616/mac)
+in System Settings, Privacy & Security. Do not disable Gatekeeper globally.
+Native app-access and macOS privacy permissions still require their own grants.
+Test these permissions again after an upgrade; an ad hoc signature does not
+provide a stable Apple-certified publisher identity across builds.
+
+Developer ID signing and notarization can improve the installation experience,
+but they are not prerequisites for distributing the CLI. The signed GitHub tag
+and npm provenance described below authenticate the release separately from
+Apple code signing.
+
 ## Signed release tag
 
 After the release pull request merges, an authorized releaser creates a signed
