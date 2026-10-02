@@ -557,7 +557,14 @@ fn run_follow_operation<T: Send + 'static>(
             None => INTERRUPT_POLL_INTERVAL,
         };
         match completion.recv_timeout(wait) {
-            Ok(result) => return result.map(FollowOperation::Completed),
+            Ok(result) => {
+                // A queued result can win recv_timeout after the receiving
+                // thread was descheduled. It still cannot extend the budget.
+                if receive_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Ok(FollowOperation::TimedOut);
+                }
+                return result.map(FollowOperation::Completed);
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(follow_runtime_error(
