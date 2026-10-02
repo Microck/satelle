@@ -102,6 +102,13 @@ bundled Codex executable, and the signed Computer Use service. Updating any one
 of those executables invalidates cached native-readiness and provider-smoke
 evidence.
 
+Explicit Windows Computer Use setup refreshes the managed `openai-bundled`
+snapshot from the authenticated current Desktop package before registering the
+marketplace. It stages and verifies the Computer Use bytes and the corresponding
+catalog projection before replacing the cache. Normal admission remains
+read-only and rejects a missing, stale, or altered snapshot. Refresh does not
+change credentials, app permissions, or unrelated plugin registrations.
+
 Inspection of the later Windows 26.803 plugin found that it removed the old
 `computer-use-client.mjs` shim. This inspection does not replace the dated
 26.727 live-readiness record below. The newer plugin's
