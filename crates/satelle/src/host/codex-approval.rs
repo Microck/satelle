@@ -274,14 +274,21 @@ pub(super) fn computer_use_app_request(params: &Map<String, Value>) -> Option<(S
         .filter(|display| display.len() == 1)
         .and_then(|display| display[0].as_object())?;
     let display_value = display.get("value").and_then(Value::as_str)?;
+    // Both current official bridges identify the app in `tool_params`, but
+    // Windows and macOS use different app-access questions. Recognize their
+    // exact operation shapes without accepting a question for another action.
+    let message = params.get("message").and_then(Value::as_str)?;
     if app_id.is_empty()
         || app_id.len() > 256
         || app_id.chars().any(char::is_control)
+        || display_value.is_empty()
+        || display_value.len() > 256
+        || display_value.chars().any(char::is_control)
         || !params.get("requestedSchema").is_some_and(|schema| {
             schema == &json!({}) || schema == &json!({"type":"object", "properties":{}})
         })
-        || params.get("message").and_then(Value::as_str)
-            != Some(format!("Allow Computer Use to use \"{display_value}\"?").as_str())
+        || (message != format!("Allow Codex to use {display_value}?")
+            && message != format!("Allow Computer Use to use \"{display_value}\"?"))
     {
         return None;
     }
@@ -874,6 +881,58 @@ mod tests {
                 ComputerUseAuthorization::Declined
             ))
         );
+    }
+
+    #[test]
+    fn current_native_app_questions_use_canonical_app_authority() {
+        let mut request = computer_use_app_prompt("satelle.exe");
+        request["params"]["_meta"]["tool_params_display"][0]["value"] = json!("satelle");
+        let allowed = BTreeSet::from(["satelle.exe".to_owned()]);
+        for wording in [
+            "Allow Codex to use satelle?",
+            "Allow Computer Use to use \"satelle\"?",
+        ] {
+            request["params"]["message"] = json!(wording);
+            assert_eq!(
+                computer_use_elicitation_result(
+                    request.as_object().unwrap(),
+                    &allowed,
+                    None,
+                    Some("thread-1"),
+                    Some("turn-1"),
+                    false
+                ),
+                Ok((
+                    json!({"action":"accept", "content":null, "_meta":null}),
+                    ComputerUseAuthorization::App
+                ))
+            );
+        }
+        request["params"]["message"] = json!("Allow Codex to use satelle?");
+        request["params"]["_meta"]["tool_params"]["app"] = json!("calculator.exe");
+        assert_eq!(
+            computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &allowed,
+                None,
+                Some("thread-1"),
+                Some("turn-1"),
+                false
+            ),
+            Ok((
+                json!({"action":"decline", "content":null, "_meta":null}),
+                ComputerUseAuthorization::Declined
+            ))
+        );
+        assert_eq!(
+            computer_use_app_request(request["params"].as_object().unwrap()),
+            Some(("calculator.exe".to_owned(), true))
+        );
+        for display in ["", "satelle\n", &"x".repeat(257)] {
+            request["params"]["_meta"]["tool_params_display"][0]["value"] = json!(display);
+            request["params"]["message"] = json!(format!("Allow Codex to use {display}?"));
+            assert!(computer_use_app_request(request["params"].as_object().unwrap()).is_none());
+        }
     }
 
     #[test]

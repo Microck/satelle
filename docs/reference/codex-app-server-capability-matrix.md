@@ -230,6 +230,16 @@ negotiated capability to enable form elicitation. Satelle keeps
 `experimentalApi` false.
 This capability check does not depend on a Codex or Desktop version.
 
+App authority comes from the authenticated connector's canonical `app`
+identifier. The current official Windows bridge asks `Allow Codex to use
+<display name>?`; the current macOS bridge asks `Allow Computer Use to use
+"<display name>"?`. Satelle recognizes these app-access questions and rejects
+questions for different actions. Satelle validates the
+connector, app parameter, display label, form schema and thread/Turn identity;
+it uses the canonical identifier for both the saved allow-list and the user
+approval broker. Display wording cannot grant access to another app. Exact
+Host-owned readiness script authorization remains a separate strict check.
+
 Satelle therefore advertises `native_action_relay = false` in the Host
 capabilities v7 response. `--relay-native-actions` fails before Turn admission
 with `native-action-relay-not-supported`. The generic approvals above and the
