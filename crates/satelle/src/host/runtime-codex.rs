@@ -3074,6 +3074,21 @@ pub(super) fn trusted_windows_node_repl_env(
     let trusted_code_paths =
         trusted_windows_node_repl_code_paths(reported_env, command, codex_home)?;
     let (node_modules, node) = windows_node_repl_runtime_paths(command)?;
+    // Inventory capabilities are a set; only the isolated Sky runtime's
+    // admitted backends are forwarded below, regardless of desktop ordering.
+    let backends = reported_env.get("BROWSER_USE_AVAILABLE_BACKENDS")?;
+    let backend_names = backends
+        .split(',')
+        .collect::<std::collections::BTreeSet<_>>();
+    if backend_names.len() != backends.split(',').count()
+        || !backend_names.contains("chrome")
+        || !backend_names.contains("iab")
+        || !backend_names
+            .iter()
+            .all(|name| matches!(*name, "chrome" | "iab" | "mcpapps"))
+    {
+        return None;
+    }
     if reported_env.get("NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS")? != "1000"
         || !same_path_for_platform(
             Path::new(reported_env.get("NODE_REPL_NODE_MODULE_DIRS")?),
@@ -3090,7 +3105,6 @@ pub(super) fn trusted_windows_node_repl_env(
             codex_home,
             "windows",
         )
-        || reported_env.get("BROWSER_USE_AVAILABLE_BACKENDS")? != "chrome,iab"
     {
         return None;
     }

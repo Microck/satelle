@@ -90,6 +90,11 @@ rejects a bridge parented by a separate standalone Codex release. Satelle keeps
 its managed `CODEX_HOME`, validates the exact regular bundle layout and both
 OpenAI code identities, then applies the same schema and live-readiness gates.
 
+Windows bridge inventory advertises a backend set. Satelle requires `chrome`
+and `iab`, admits the official `mcpapps` capability, and rejects duplicate or
+unknown backend names. The isolated native Sky runtime receives only
+`chrome,iab`; inventory discovery does not grant another backend access.
+
 Codex Desktop and bundled Computer Use component versions are evidence and
 cache identity, not admission pins. Satelle authenticates the platform package
 or OpenAI signing identity, validates bundled provenance and bridge shape, and
