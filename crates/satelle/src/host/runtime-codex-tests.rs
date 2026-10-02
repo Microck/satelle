@@ -2549,3 +2549,108 @@ fn bundled_plugin_snapshot_rejects_links_to_protected_files() {
     std::os::unix::fs::symlink(&source, &snapshot).unwrap();
     assert!(super::control_plane::verify_bundled_plugin_snapshot(&source, &snapshot).is_err());
 }
+
+#[test]
+fn bundled_marketplace_setup_refreshes_current_bytes_and_preserves_user_state() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("protected-package");
+    let home = root.path().join("codex-home");
+    std::fs::create_dir_all(source.join(".agents/plugins")).unwrap();
+    std::fs::create_dir_all(source.join("plugins/computer-use/.codex-plugin")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let catalog = json!({
+        "name": "openai-bundled",
+        "interface": {"displayName": "OpenAI"},
+        "plugins": [
+            {"name": "browser", "source": {"source": "local", "path": "./plugins/browser"}},
+            {"name": "computer-use", "source": {"source": "local", "path": "./plugins/computer-use"}}
+        ]
+    });
+    std::fs::write(
+        source.join(".agents/plugins/marketplace.json"),
+        catalog.to_string(),
+    )
+    .unwrap();
+    let plugin = "plugins/computer-use/.codex-plugin/plugin.json";
+    std::fs::write(source.join(plugin), b"current official manifest").unwrap();
+    std::fs::write(home.join("auth.json"), b"existing auth fixture").unwrap();
+    std::fs::write(home.join("config.toml"), b"existing consent fixture").unwrap();
+    let refresh = || super::control_plane::refresh_bundled_marketplace_snapshot(&source, &home);
+    assert!(refresh().unwrap());
+    let snapshot = home.join(".tmp/bundled-marketplaces/openai-bundled");
+    super::control_plane::verify_bundled_marketplace_snapshot(&source, &snapshot).unwrap();
+    assert!(!refresh().unwrap(), "current cache must remain untouched");
+
+    std::fs::create_dir_all(snapshot.join("plugins/browser")).unwrap();
+    let neighboring_asset = vec![42_u8; 2 * 1024 * 1024 + 1];
+    std::fs::write(
+        snapshot.join("plugins/browser/asset.bin"),
+        &neighboring_asset,
+    )
+    .unwrap();
+    std::fs::write(
+        snapshot.join("plugins/browser/SKILL.md"),
+        b"existing browser cache",
+    )
+    .unwrap();
+
+    std::fs::write(source.join(plugin), b"updated official manifest").unwrap();
+    assert!(super::control_plane::verify_bundled_marketplace_snapshot(&source, &snapshot).is_err());
+    assert!(refresh().unwrap());
+    assert_eq!(
+        std::fs::read(snapshot.join("plugins/browser/asset.bin")).unwrap(),
+        neighboring_asset
+    );
+    assert_eq!(
+        std::fs::read(snapshot.join("plugins/browser/SKILL.md")).unwrap(),
+        b"existing browser cache"
+    );
+    assert_eq!(
+        std::fs::read(snapshot.join(plugin)).unwrap(),
+        b"updated official manifest"
+    );
+    assert_eq!(
+        std::fs::read(home.join("auth.json")).unwrap(),
+        b"existing auth fixture"
+    );
+    assert_eq!(
+        std::fs::read(home.join("config.toml")).unwrap(),
+        b"existing consent fixture"
+    );
+
+    std::fs::write(source.join(".agents/plugins/marketplace.json"), b"{").unwrap();
+    assert!(refresh().is_err());
+    assert_eq!(
+        std::fs::read(snapshot.join(plugin)).unwrap(),
+        b"updated official manifest"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bundled_marketplace_setup_rejects_linked_cache_and_protected_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("codex-home");
+    let source = root.path().join("protected-package");
+    let unrelated = root.path().join("unrelated");
+    std::fs::create_dir_all(home.join(".tmp/bundled-marketplaces")).unwrap();
+    std::fs::create_dir_all(&unrelated).unwrap();
+    std::fs::write(unrelated.join("sentinel"), b"preserve").unwrap();
+    let snapshot = home.join(".tmp/bundled-marketplaces/openai-bundled");
+    std::os::unix::fs::symlink(&unrelated, &snapshot).unwrap();
+    assert!(super::control_plane::refresh_bundled_marketplace_snapshot(&source, &home).is_err());
+    assert!(snapshot.is_symlink());
+    assert_eq!(
+        std::fs::read(unrelated.join("sentinel")).unwrap(),
+        b"preserve"
+    );
+    std::fs::remove_file(&snapshot).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::os::unix::fs::symlink(&unrelated, source.join(".agents")).unwrap();
+    assert!(super::control_plane::refresh_bundled_marketplace_snapshot(&source, &home).is_err());
+    assert!(!snapshot.exists());
+    assert_eq!(
+        std::fs::read(unrelated.join("sentinel")).unwrap(),
+        b"preserve"
+    );
+}

@@ -984,8 +984,7 @@ fn provision_windows_computer_use(
     let deadline = Instant::now()
         .checked_add(NATIVE_ISOLATION_TIMEOUT)
         .ok_or_else(|| codex_isolation_error("inventory_deadline_invalid"))?;
-    let marketplace_root = verified_windows_computer_use_marketplace_root(runtime.codex_home())?;
-    let trusted_computer_use_plugin_root = marketplace_root.join("plugins").join("computer-use");
+    let source = official_windows_computer_use_marketplace_root()?;
     let trusted_bridge_root = official_native_bridge_root("windows", runtime.codex_home())?;
 
     // Resolve the complete desired desktop binding before any marketplace or
@@ -1047,12 +1046,17 @@ fn provision_windows_computer_use(
         }
     };
     let configured_marketplace = configured_windows_marketplace_root(&marketplace_config)?;
+    let refreshed = refresh_bundled_marketplace_snapshot(&source, runtime.codex_home())
+        .map_err(|error| mark_provision_changed(error, true))?;
+    let marketplace_root = verified_windows_computer_use_marketplace_root(runtime.codex_home())
+        .map_err(|error| mark_provision_changed(error, refreshed))?;
+    let trusted_computer_use_plugin_root = marketplace_root.join("plugins").join("computer-use");
     let marketplace_matches = configured_marketplace
         .as_deref()
         .is_some_and(|configured_root| {
             same_path_for_platform(configured_root, &marketplace_root, "windows")
         });
-    let mut changed = false;
+    let mut changed = refreshed;
     if configured_marketplace.is_some() && !marketplace_matches {
         let mut marketplace_remove_command = runtime
             .command()
@@ -2430,6 +2434,145 @@ fn verified_windows_computer_use_marketplace_root(
     }
     verify_bundled_marketplace_snapshot(&source, &snapshot)?;
     Ok(snapshot)
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn refresh_bundled_marketplace_snapshot(
+    source: &Path,
+    codex_home: &Path,
+) -> Result<bool, SatelleError> {
+    let refresh = || -> std::io::Result<bool> {
+        let mut parent = codex_home.to_path_buf();
+        let mut guards = Vec::new();
+        for directory in [".tmp", "bundled-marketplaces"] {
+            parent.push(directory);
+            match fs::symlink_metadata(&parent) {
+                Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                    return Err(std::io::Error::other("invalid managed snapshot directory"));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            guards.push(
+                crate::core::open_or_create_user_or_administrator_controlled_directory(&parent)
+                    .map_err(std::io::Error::other)?,
+            );
+        }
+        let snapshot = parent.join("openai-bundled");
+        let exists = match fs::symlink_metadata(&snapshot) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
+            Ok(_) => return Err(std::io::Error::other("invalid managed snapshot root")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        if exists && verify_bundled_marketplace_snapshot(source, &snapshot).is_ok() {
+            return Ok(false);
+        }
+        let neighbors: Vec<_> = match fs::symlink_metadata(snapshot.join("plugins")) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                fs::read_dir(snapshot.join("plugins"))?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()?
+                    .into_iter()
+                    .filter(|name| name != "computer-use")
+                    .collect()
+            }
+            Ok(_) => return Err(std::io::Error::other("invalid managed plugin directory")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+
+        // This is the Desktop app's derived cache, not an additional plugin
+        // source. Stage current protected bytes before changing the live root.
+        let transaction = tempfile::Builder::new()
+            .prefix(".satelle-bundled-")
+            .tempdir_in(&parent)?;
+        let staged = transaction.path().join("current");
+        copy_bundled_snapshot_tree(&source.join(".agents"), &staged.join(".agents"))?;
+        copy_bundled_snapshot_tree(
+            &source.join("plugins/computer-use"),
+            &staged.join("plugins/computer-use"),
+        )?;
+        let manifest = staged.join(".agents/plugins/marketplace.json");
+        let mut catalog: Value = serde_json::from_slice(&fs::read(&manifest)?)?;
+        let plugins = catalog
+            .get_mut("plugins")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| std::io::Error::other("invalid protected marketplace catalog"))?;
+        let retained: std::collections::BTreeSet<_> = neighbors
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .chain(std::iter::once("computer-use".to_string()))
+            .collect();
+        plugins.retain(|plugin| {
+            plugin
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| retained.contains(name))
+        });
+        fs::write(&manifest, serde_json::to_vec_pretty(&catalog)?)?;
+        verify_bundled_marketplace_snapshot(source, &staged).map_err(std::io::Error::other)?;
+
+        let previous = transaction.path().join("previous");
+        if exists {
+            fs::rename(&snapshot, &previous)?;
+        }
+        let mut moved = Vec::new();
+        let publish = (|| -> std::io::Result<()> {
+            // These entries belong to other plugins. Move their directory
+            // entries without following links or applying Computer Use limits.
+            for name in &neighbors {
+                fs::rename(
+                    previous.join("plugins").join(name),
+                    staged.join("plugins").join(name),
+                )?;
+                moved.push(name);
+            }
+            fs::rename(&staged, &snapshot)
+        })();
+        if let Err(error) = publish {
+            // Roll back every moved neighbor before restoring the old root.
+            // If rollback fails, retain all remaining bytes for explicit repair.
+            let mut rollback_failed = false;
+            for name in moved {
+                if fs::rename(
+                    staged.join("plugins").join(name),
+                    previous.join("plugins").join(name),
+                )
+                .is_err()
+                {
+                    rollback_failed = true;
+                }
+            }
+            if rollback_failed || (exists && fs::rename(&previous, &snapshot).is_err()) {
+                let _ = transaction.keep();
+            }
+            return Err(error);
+        }
+        Ok(true)
+    };
+    refresh().map_err(|_| codex_isolation_error("computer_use_plugin_source_refresh_failed"))
+}
+
+#[cfg(any(windows, test))]
+fn copy_bundled_snapshot_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other("linked protected plugin entry"));
+    }
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_bundled_snapshot_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else if metadata.is_file() && metadata.len() <= INVENTORY_OUTPUT_LIMIT {
+        fs::copy(source, destination)?;
+    } else {
+        return Err(std::io::Error::other("invalid protected plugin entry"));
+    }
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
