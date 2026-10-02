@@ -551,6 +551,12 @@ fn native_mcp_config_overrides(name: &str, binding: &NativeMcpBinding) -> Vec<St
         .map(|value| toml::Value::String(value.clone()).to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    let env_vars = binding
+        .env_vars
+        .iter()
+        .map(|value| toml::Value::String(value.clone()).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let env = binding
         .env
         .iter()
@@ -570,6 +576,7 @@ fn native_mcp_config_overrides(name: &str, binding: &NativeMcpBinding) -> Vec<St
             toml::Value::String(binding.command.clone())
         ),
         format!("mcp_servers.{name}.args=[{args}]"),
+        format!("mcp_servers.{name}.env_vars=[{env_vars}]"),
         format!("mcp_servers.{name}.env={{ {env} }}"),
     ]
 }
@@ -662,6 +669,7 @@ impl VerifiedComputerUseAppServer {
 pub(super) struct NativeMcpBinding {
     pub(super) command: String,
     pub(super) args: Vec<String>,
+    pub(super) env_vars: Vec<String>,
     pub(super) env: BTreeMap<String, String>,
 }
 
@@ -725,6 +733,8 @@ struct ConfiguredMcpTransport {
     command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
+    #[serde(default)]
+    env_vars: Vec<String>,
     #[serde(default)]
     env: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -908,8 +918,32 @@ pub(super) fn configured_windows_marketplace_root(
     Ok(Some(marketplace.source))
 }
 
+#[cfg(any(windows, test))]
+pub(super) fn windows_config_with_native_binding(
+    contents: &str,
+) -> Result<Option<String>, SatelleError> {
+    let updated = windows_config_with_allowed_app(contents, "satelle.exe")?
+        .unwrap_or_else(|| contents.to_string());
+    let mut config = updated
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| codex_isolation_error("native_bridge_inventory_untrusted"))?;
+    let server = config
+        .get_mut("mcp_servers")
+        .and_then(|servers| servers.get_mut("node_repl"))
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| codex_isolation_error("native_bridge_inventory_untrusted"))?;
+    // `codex mcp add` can persist explicit env values but has no env_vars flag.
+    // Keep the provider-owned core inheritance declaration in the managed home
+    // as well as the isolated app-server override, without copying its value.
+    let mut inherited_names = toml_edit::Array::new();
+    inherited_names.push("CODEX_WINDOWS_REGISTERED_CORE");
+    server.insert("env_vars", toml_edit::value(inherited_names));
+    let updated = config.to_string();
+    Ok((updated != contents).then_some(updated))
+}
+
 #[cfg(windows)]
-fn ensure_windows_readiness_app_allowed(codex_home: &Path) -> Result<bool, SatelleError> {
+fn ensure_windows_native_config(codex_home: &Path) -> Result<bool, SatelleError> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -928,7 +962,7 @@ fn ensure_windows_readiness_app_allowed(codex_home: &Path) -> Result<bool, Satel
     }
     let contents = fs::read_to_string(&config_path)
         .map_err(|_| codex_isolation_error("native_app_approval_config_unavailable"))?;
-    let Some(updated) = windows_config_with_allowed_app(&contents, "satelle.exe")? else {
+    let Some(updated) = windows_config_with_native_binding(&contents)? else {
         return Ok(false);
     };
 
@@ -1228,7 +1262,7 @@ fn provision_windows_computer_use(
         changed = true;
     }
 
-    changed = ensure_windows_readiness_app_allowed(runtime.codex_home())
+    changed = ensure_windows_native_config(runtime.codex_home())
         .map_err(|error| mark_provision_changed(error, changed))?
         || changed;
 
@@ -2894,7 +2928,8 @@ fn trusted_native_mcp_binding(
 
     match platform {
         "windows" => {
-            if !server.transport.args.is_empty()
+            if server.transport.env_vars != ["CODEX_WINDOWS_REGISTERED_CORE"]
+                || !server.transport.args.is_empty()
                 || server.transport.cwd.is_some()
                 || !trusted_windows_bridge_path(Path::new(command), trusted_root)
             {
@@ -2921,11 +2956,13 @@ fn trusted_native_mcp_binding(
             Some(NativeMcpBinding {
                 command: command.to_string(),
                 args: server.transport.args.clone(),
+                env_vars: server.transport.env_vars.clone(),
                 env,
             })
         }
         "macos" => {
-            if !server.transport.args.is_empty()
+            if !server.transport.env_vars.is_empty()
+                || !server.transport.args.is_empty()
                 || server.transport.cwd.is_some()
                 || !trusted_macos_node_repl_path(Path::new(command), trusted_root)
             {
@@ -2943,6 +2980,7 @@ fn trusted_native_mcp_binding(
                     trusted_root.to_string_lossy().replace('\\', "/")
                 ),
                 args: Vec::new(),
+                env_vars: Vec::new(),
                 env: expected_env,
             })
         }
@@ -3089,7 +3127,8 @@ pub(super) fn trusted_windows_node_repl_env(
     {
         return None;
     }
-    if reported_env.get("NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS")? != "1000"
+    if reported_env.get("NODE_REPL_UNTRUSTED_ENV_ALLOWLIST")? != "CODEX_WINDOWS_REGISTERED_CORE"
+        || reported_env.get("NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS")? != "1000"
         || !same_path_for_platform(
             Path::new(reported_env.get("NODE_REPL_NODE_MODULE_DIRS")?),
             Path::new(&node_modules),
@@ -3129,6 +3168,10 @@ pub(super) fn trusted_windows_node_repl_env(
     }
 
     Some(BTreeMap::from([
+        (
+            "NODE_REPL_UNTRUSTED_ENV_ALLOWLIST".to_string(),
+            "CODEX_WINDOWS_REGISTERED_CORE".to_string(),
+        ),
         (
             "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS".to_string(),
             "1000".to_string(),
