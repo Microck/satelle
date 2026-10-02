@@ -393,6 +393,48 @@ fn windows_sky_service_runtime_keeps_every_required_trusted_environment_value() 
 }
 
 #[test]
+fn windows_sky_service_runtime_validates_inventory_backend_set_without_expanding_access() {
+    let command = Path::new(
+        r"C:\Users\operator\AppData\Local\OpenAI\Codex\runtimes\cua_node\f1359d6e9a17bb1d\bin\node_repl.exe",
+    );
+    let codex_home = Path::new(r"C:\Users\operator\.codex");
+    for backends in [
+        "chrome,iab",
+        "chrome,iab,mcpapps",
+        "mcpapps,iab,chrome",
+        "iab,chrome",
+    ] {
+        let mut reported = windows_native_bridge_env();
+        reported.insert(
+            "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
+            backends.to_string(),
+        );
+        let env = trusted_windows_node_repl_env(&reported, command, codex_home)
+            .expect("official backend sets must be admitted");
+        assert_eq!(env["BROWSER_USE_AVAILABLE_BACKENDS"], "chrome,iab");
+    }
+    for backends in [
+        "",
+        "chrome",
+        "iab",
+        "chrome,iab,unknown",
+        "chrome,iab,iab",
+        "chrome,iab,",
+        "chrome, iab",
+    ] {
+        let mut reported = windows_native_bridge_env();
+        reported.insert(
+            "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
+            backends.to_string(),
+        );
+        assert!(
+            trusted_windows_node_repl_env(&reported, command, codex_home).is_none(),
+            "invalid backend set {backends:?} must fail closed"
+        );
+    }
+}
+
+#[test]
 fn windows_sky_service_runtime_admits_both_tinysky_flag_spellings_only() {
     let command = Path::new(
         r"C:\Users\operator\AppData\Local\OpenAI\Codex\runtimes\cua_node\f1359d6e9a17bb1d\bin\node_repl.exe",
