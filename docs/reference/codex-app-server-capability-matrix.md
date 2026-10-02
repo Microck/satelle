@@ -94,6 +94,12 @@ Windows bridge inventory advertises a backend set. Satelle requires `chrome`
 and `iab`, admits the official `mcpapps` capability, and rejects duplicate or
 unknown backend names. The isolated native Sky runtime receives only
 `chrome,iab`; inventory discovery does not grant another backend access.
+The Windows MCP transport must inherit exactly `CODEX_WINDOWS_REGISTERED_CORE`
+through `env_vars`, and the native execution environment must declare the same
+name in `NODE_REPL_UNTRUSTED_ENV_ALLOWLIST`. Satelle preserves these declarations
+so the official provider can forward its registered core to native execution.
+Satelle does not read, store, or export the opaque core value, and rejects
+missing declarations or additional inherited environment names.
 
 Codex Desktop and bundled Computer Use component versions are evidence and
 cache identity, not admission pins. Satelle authenticates the platform package

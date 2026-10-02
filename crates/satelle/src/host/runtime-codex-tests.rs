@@ -250,6 +250,10 @@ fn macos_runtime_identity_binds_every_authenticated_native_executable() {
 fn windows_native_bridge_env() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
+            "NODE_REPL_UNTRUSTED_ENV_ALLOWLIST".to_string(),
+            "CODEX_WINDOWS_REGISTERED_CORE".to_string(),
+        ),
+        (
             "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS".to_string(),
             "1000".to_string(),
         ),
@@ -317,6 +321,10 @@ fn windows_native_bridge_env() -> BTreeMap<String, String> {
 fn expected_windows_native_binding_env() -> BTreeMap<String, String> {
     let reported = windows_native_bridge_env();
     BTreeMap::from([
+        (
+            "NODE_REPL_UNTRUSTED_ENV_ALLOWLIST".to_string(),
+            "CODEX_WINDOWS_REGISTERED_CORE".to_string(),
+        ),
         (
             "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
             reported["BROWSER_USE_AVAILABLE_BACKENDS"].clone(),
@@ -893,10 +901,49 @@ fn handshake_ignores_unknown_notifications() {
 }
 
 #[test]
+fn windows_native_config_persists_core_inheritance_without_changing_user_state() {
+    let contents = r#"
+model = "gpt-6-luna"
+[computer_use.windows]
+always_allowed_app_ids = ["calculator.exe", "satelle.exe"]
+[mcp_servers.node_repl]
+command = 'C:\OpenAI\node_repl.exe'
+[mcp_servers.node_repl.env]
+NODE_REPL_UNTRUSTED_ENV_ALLOWLIST = "CODEX_WINDOWS_REGISTERED_CORE"
+"#;
+    let updated = super::control_plane::windows_config_with_native_binding(contents)
+        .expect("update the native binding")
+        .expect("missing inheritance must be persisted");
+    let before: toml::Value = toml::from_str(contents).unwrap();
+    let mut after: toml::Value = toml::from_str(&updated).unwrap();
+    let inherited = after["mcp_servers"]["node_repl"]
+        .as_table_mut()
+        .unwrap()
+        .remove("env_vars")
+        .unwrap();
+    assert_eq!(
+        inherited,
+        toml::Value::Array(vec![toml::Value::String(
+            "CODEX_WINDOWS_REGISTERED_CORE".to_string()
+        )])
+    );
+    assert_eq!(after, before);
+    assert!(
+        super::control_plane::windows_config_with_native_binding(&updated)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        super::control_plane::windows_config_with_native_binding("model = 'gpt-6-luna'").is_err()
+    );
+}
+
+#[test]
 fn installed_app_server_is_private_stdio_only() {
     let native_binding = NativeMcpBinding {
         command: "C:\\OpenAI\\node_repl.exe".to_string(),
         args: Vec::new(),
+        env_vars: vec!["CODEX_WINDOWS_REGISTERED_CORE".to_string()],
         env: BTreeMap::from([
             (
                 "BROWSER_USE_CODEX_APP_BUILD_FLAVOR".to_string(),
@@ -923,6 +970,10 @@ fn installed_app_server_is_private_stdio_only() {
         .iter()
         .find(|argument| argument.starts_with("mcp_servers.node_repl.args="))
         .expect("the native arguments must be pinned");
+    let native_env_vars_config = arguments
+        .iter()
+        .find(|argument| argument.starts_with("mcp_servers.node_repl.env_vars="))
+        .expect("the native environment inheritance must be pinned");
     let native_env_config = arguments
         .iter()
         .find(|argument| argument.starts_with("mcp_servers.node_repl.env="))
@@ -943,6 +994,12 @@ fn installed_app_server_is_private_stdio_only() {
             .as_array()
             .unwrap()
             .is_empty()
+    );
+    assert_eq!(
+        parse_value(native_env_vars_config, "mcp_servers.node_repl.env_vars="),
+        toml::Value::Array(vec![toml::Value::String(
+            "CODEX_WINDOWS_REGISTERED_CORE".to_string()
+        )])
     );
     assert_eq!(
         parse_value(native_env_config, "mcp_servers.node_repl.env=")
@@ -971,6 +1028,8 @@ fn installed_app_server_is_private_stdio_only() {
             native_command_config.as_str(),
             "--config",
             native_args_config.as_str(),
+            "--config",
+            native_env_vars_config.as_str(),
             "--config",
             native_env_config.as_str(),
             "--config",
@@ -1009,6 +1068,7 @@ fn windows_native_pipe_refresh_replaces_the_retired_managed_address() {
     let mut binding = NativeMcpBinding {
         command: r"C:\OpenAI\node_repl.exe".to_string(),
         args: Vec::new(),
+        env_vars: vec!["CODEX_WINDOWS_REGISTERED_CORE".to_string()],
         env: BTreeMap::from([(
             "SKY_CUA_NATIVE_PIPE_DIRECTORY".to_string(),
             r"\\.\pipe\codex-computer-use-11111111-1111-1111-1111-111111111111".to_string(),
@@ -1035,6 +1095,7 @@ fn windows_native_pipe_refresh_rejects_an_arbitrary_pipe() {
     let mut binding = NativeMcpBinding {
         command: r"C:\OpenAI\node_repl.exe".to_string(),
         args: Vec::new(),
+        env_vars: vec!["CODEX_WINDOWS_REGISTERED_CORE".to_string()],
         env: BTreeMap::new(),
     };
     let current_config = r#"
@@ -1330,6 +1391,7 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
                 "type": "stdio",
                 "command": "C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\f1359d6e9a17bb1d\\bin\\node_repl.exe",
                 "args": [],
+                "env_vars": ["CODEX_WINDOWS_REGISTERED_CORE"],
                 "env": windows_native_bridge_env()
             }
         }
@@ -1347,6 +1409,10 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
     .expect("the official Windows bridge must be admitted");
 
     assert_eq!(plan.native_mcp_server_name, "node_repl");
+    assert_eq!(
+        plan.native_mcp_binding.env_vars,
+        ["CODEX_WINDOWS_REGISTERED_CORE"]
+    );
     assert_eq!(plan.plugin_version, "26.802.7000");
     assert_eq!(
         plan.native_mcp_binding.env["BROWSER_USE_CODEX_APP_VERSION"],
@@ -1361,6 +1427,29 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
         expected_windows_native_binding_env()
     );
     assert_eq!(plan.disabled_mcp_server_names, ["paper"]);
+
+    for inherited_names in [
+        json!([]),
+        json!(["OPENAI_API_KEY"]),
+        json!(["CODEX_WINDOWS_REGISTERED_CORE", "OPENAI_API_KEY"]),
+        json!([
+            "CODEX_WINDOWS_REGISTERED_CORE",
+            "CODEX_WINDOWS_REGISTERED_CORE"
+        ]),
+    ] {
+        mcp_inventory[1]["transport"]["env_vars"] = inherited_names;
+        let error = codex_isolation_plan_from_json(
+            &plugins,
+            &serde_json::to_vec(&mcp_inventory).expect("serialize untrusted inheritance fixture"),
+            "windows",
+            Path::new(r"C:\Users\operator\.codex"),
+            fixture_computer_use_plugin_root("windows"),
+            Path::new(r"C:\Users\operator\AppData\Local\OpenAI\Codex\runtimes\cua_node"),
+        )
+        .expect_err("only the official registered core may be inherited");
+        assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
+    }
+    mcp_inventory[1]["transport"]["env_vars"] = json!(["CODEX_WINDOWS_REGISTERED_CORE"]);
 
     mcp_inventory[1]["transport"]["cwd"] = json!("C:\\Users\\operator");
     let error = codex_isolation_plan_from_json(
@@ -1393,6 +1482,15 @@ fn isolation_rejects_incomplete_or_tampered_windows_bridge_environment() {
     .expect("serialize plugin fixture");
     for mutate in [
         |env: &mut BTreeMap<String, String>| {
+            env.remove("NODE_REPL_UNTRUSTED_ENV_ALLOWLIST");
+        },
+        |env: &mut BTreeMap<String, String>| {
+            env.insert(
+                "NODE_REPL_UNTRUSTED_ENV_ALLOWLIST".to_string(),
+                "CODEX_WINDOWS_REGISTERED_CORE,OPENAI_API_KEY".to_string(),
+            );
+        },
+        |env: &mut BTreeMap<String, String>| {
             env.remove("NODE_REPL_TRUSTED_CODE_PATHS");
         },
         |env: &mut BTreeMap<String, String>| {
@@ -1416,6 +1514,7 @@ fn isolation_rejects_incomplete_or_tampered_windows_bridge_environment() {
                 "type": "stdio",
                 "command": "C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\f1359d6e9a17bb1d\\bin\\node_repl.exe",
                 "args": [],
+                "env_vars": ["CODEX_WINDOWS_REGISTERED_CORE"],
                 "env": env
             }
         }]))
@@ -2068,6 +2167,7 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
                 "type": "stdio",
                 "command": command,
                 "args": args,
+                "env_vars": if platform == "windows" { json!(["CODEX_WINDOWS_REGISTERED_CORE"]) } else { json!([]) },
                 "env": env
             }
         }]))
