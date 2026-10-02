@@ -2716,6 +2716,7 @@ fn rejected_durable_token_is_reported_after_launched_daemon_handoff_is_terminal(
 
             let error = finish_durable_daemon_launch(
                 "rejected-post-launch-token-host",
+                "fake-ssh-host",
                 host_identity,
                 &durable_client,
                 bootstrap_client,
@@ -2970,27 +2971,39 @@ fn first_trust_artifact_probe_treats_a_closed_daemon_port_as_not_installed() {
 
 #[cfg(unix)]
 #[test]
-fn first_trust_liveness_treats_a_closed_daemon_port_as_not_running() {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .expect("bind a real loopback endpoint for the missing daemon");
-    let address = listener.local_addr().expect("read loopback endpoint");
-    let closer = thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept liveness probe");
-        drop(stream);
-    });
-    let client = DaemonClient::loopback_with_timeout(
-        address,
-        ApiBearerToken::generate().expect("generate first-trust probe token"),
-        "trust-probe-test",
-        SSH_DAEMON_REQUEST_TIMEOUT,
-    )
-    .expect("construct first-trust liveness client");
-
-    assert!(
-        !first_trust_daemon_is_live("first-trust-host", &client)
-            .expect("a closed daemon port means no daemon is running")
-    );
-    closer.join().expect("join loopback endpoint");
+fn first_trust_liveness_requires_listener_proof_after_a_closed_forward() {
+    for listener_state in ["absent", "present", "probe-failed"] {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let closer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1];
+            stream.read_exact(&mut request).unwrap();
+        });
+        let client = DaemonClient::loopback_with_timeout(
+            address,
+            ApiBearerToken::generate().unwrap(),
+            "trust-probe-test",
+            SSH_DAEMON_REQUEST_TIMEOUT,
+        )
+        .unwrap();
+        let proof_calls = std::cell::Cell::new(0);
+        let result = first_trust_daemon_is_live("first-trust-host", &client, || {
+            proof_calls.set(proof_calls.get() + 1);
+            match listener_state {
+                "absent" => Ok(ssh_bootstrap::LoopbackListenerObservation::Absent),
+                "present" => Ok(ssh_bootstrap::LoopbackListenerObservation::Present),
+                _ => Err(SatelleError::host_unreachable("first-trust-host")),
+            }
+        });
+        assert_eq!(proof_calls.get(), 1);
+        if listener_state == "absent" {
+            assert!(!result.unwrap());
+        } else {
+            assert_eq!(result.unwrap_err().code, ErrorCode::HostUnreachable);
+        }
+        closer.join().unwrap();
+    }
 }
 
 #[cfg(unix)]
@@ -3011,8 +3024,10 @@ fn first_trust_liveness_preserves_a_stalled_transport_failure() {
     )
     .expect("construct first-trust liveness client");
 
-    let error = first_trust_daemon_is_live("first-trust-host", &client)
-        .expect_err("a stalled live endpoint does not prove that the daemon is absent");
+    let error = first_trust_daemon_is_live("first-trust-host", &client, || {
+        panic!("a timeout cannot authorize a listener absence check")
+    })
+    .expect_err("a stalled live endpoint does not prove that the daemon is absent");
 
     assert_eq!(error.code, ErrorCode::HostUnreachable);
     stalled.join().expect("join stalled loopback endpoint");
@@ -5803,6 +5818,137 @@ fn durable_readiness_allows_remote_patch_skew_and_keeps_local_version_ownership(
 }
 
 #[test]
+fn forwarded_connection_closure_requires_remote_listener_absence_before_relaunch() {
+    use std::io::Read as _;
+
+    for listener_state in ["absent", "present", "probe-failed"] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_listener = listener.try_clone().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = server_listener.accept().unwrap();
+            let mut request = [0_u8; 1];
+            connection.read_exact(&mut request).unwrap();
+            // A forwarding channel with no remote HTTP server closes after
+            // accepting the local connection, rather than refusing connect().
+        });
+        let error = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/v1/capabilities"))
+            .send()
+            .expect_err("accepted connection closes without an HTTP response");
+        server.join().unwrap();
+        assert!(!error.is_connect());
+        if listener_state == "absent" {
+            drop(listener);
+        }
+
+        let ownership_confirmations = std::cell::Cell::new(0);
+        let probe_calls = std::cell::Cell::new(0);
+        let result = probe_durable_daemon_under_lock(
+            || {
+                ownership_confirmations.set(ownership_confirmations.get() + 1);
+                Ok(())
+            },
+            || {
+                observe_remote_durable_readiness(
+                    "remote",
+                    Err::<DurableReadinessSnapshot, _>(DaemonClientError::Transport(error)),
+                    || {
+                        assert_eq!(ownership_confirmations.get(), 1);
+                        probe_calls.set(probe_calls.get() + 1);
+                        match listener_state {
+                            "absent" => {
+                                assert_eq!(
+                                    std::net::TcpStream::connect(address).unwrap_err().kind(),
+                                    std::io::ErrorKind::ConnectionRefused
+                                );
+                                Ok(ssh_bootstrap::LoopbackListenerObservation::Absent)
+                            }
+                            "present" => {
+                                std::net::TcpStream::connect(address).unwrap();
+                                Ok(ssh_bootstrap::LoopbackListenerObservation::Present)
+                            }
+                            _ => Err(SatelleError::host_unreachable("remote")),
+                        }
+                    },
+                )
+            },
+        );
+        assert_eq!(ownership_confirmations.get(), 2);
+        assert_eq!(probe_calls.get(), 1);
+        if listener_state == "absent" {
+            assert!(matches!(result, Ok(DurableDaemonProbe::Missing)));
+        } else {
+            assert!(matches!(result, Err(error) if error.code == ErrorCode::HostUnreachable));
+        }
+    }
+}
+
+#[test]
+fn post_launch_readiness_retries_bound_listener_transport_failure_until_ready_or_deadline() {
+    for becomes_ready in [true, false] {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let closer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1];
+            stream.read_exact(&mut request).unwrap();
+        });
+        let failure = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/v1/capabilities"))
+            .send()
+            .unwrap_err();
+        closer.join().unwrap();
+        let mut failure = Some(failure);
+        let mut observations = 0;
+        let confirmations = std::cell::Cell::new(0);
+        let result = authenticate_durable_with_confirmation(
+            "remote",
+            "host-exact",
+            || {
+                confirmations.set(confirmations.get() + 1);
+                Ok(())
+            },
+            || {
+                observations += 1;
+                if let Some(error) = failure.take() {
+                    observe_remote_durable_readiness(
+                        "remote",
+                        Err::<DurableReadinessSnapshot, _>(DaemonClientError::Transport(error)),
+                        || Ok(ssh_bootstrap::LoopbackListenerObservation::Present),
+                    )
+                } else {
+                    DurableReadinessObservation::Ready(DurableReadinessSnapshot {
+                        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                        host_identity: "host-exact".to_string(),
+                    })
+                }
+            },
+            Instant::now()
+                + if becomes_ready {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::ZERO
+                },
+        );
+        assert_eq!(observations, if becomes_ready { 2 } else { 1 });
+        assert_eq!(confirmations.get(), observations * 2);
+        if becomes_ready {
+            result.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().code, ErrorCode::HostUnreachable);
+        }
+    }
+}
+
+#[test]
 fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
     #[derive(Clone, Copy)]
     enum FixtureReadiness {
@@ -5897,7 +6043,9 @@ fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
             },
             || {
                 events.borrow_mut().push("initial-readiness");
-                observe_remote_durable_readiness(raw_readiness(initial))
+                observe_remote_durable_readiness("remote", raw_readiness(initial), || {
+                    Ok(ssh_bootstrap::LoopbackListenerObservation::Absent)
+                })
             },
             |_| {
                 events.borrow_mut().push("launch");
@@ -5906,7 +6054,9 @@ fn serialized_durable_relaunch_rechecks_readiness_under_the_remote_lock() {
             },
             || {
                 events.borrow_mut().push("durable-readiness");
-                observe_remote_durable_readiness(raw_readiness(final_readiness))
+                observe_remote_durable_readiness("remote", raw_readiness(final_readiness), || {
+                    Ok(ssh_bootstrap::LoopbackListenerObservation::Absent)
+                })
             },
             Instant::now(),
         );
@@ -6054,7 +6204,6 @@ fn durable_relaunch_rejects_success_when_remote_lock_ownership_is_lost() {
     let confirm_lock = Arc::clone(&lock_held);
     let readiness_lock = Arc::clone(&lock_held);
     let error = match probe_durable_daemon_under_lock(
-        "remote",
         || {
             if confirm_lock.load(Ordering::SeqCst) {
                 Ok(())
@@ -6064,10 +6213,14 @@ fn durable_relaunch_rejects_success_when_remote_lock_ownership_is_lost() {
         },
         || {
             readiness_lock.store(false, Ordering::SeqCst);
-            observe_remote_durable_readiness(Ok(DurableReadinessSnapshot {
-                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                host_identity: "host-exact".to_string(),
-            }))
+            observe_remote_durable_readiness(
+                "remote",
+                Ok(DurableReadinessSnapshot {
+                    daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                    host_identity: "host-exact".to_string(),
+                }),
+                || panic!("ready responses do not probe the listener"),
+            )
         },
     ) {
         Err(error) => error,

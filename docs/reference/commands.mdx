@@ -49,6 +49,15 @@ Direct and SSH-tunneled transports support ordinary Session operations. Live
 `doctor` probes run locally; unsupported transport/scope combinations fail
 with a typed error.
 
+When an SSH-forwarded daemon connection closes or resets, Satelle checks the
+remote loopback listener while holding its bootstrap lock. A proven absent
+listener permits missing-daemon recovery. During the initial probe, a present
+listener or an unavailable listener probe preserves the failure without
+launching another daemon. After launch, eligible transport failures from a
+present listener retry within the readiness deadline without another launch.
+First-time trust likewise requires listener absence before starting a daemon.
+Authentication, identity and protocol failures never authorize a restart.
+
 Use `satelle <command> --help` as the exact option reference for the binary you
 are running.
 The [generated CLI and schema reference](/docs/reference/generated-cli) records
