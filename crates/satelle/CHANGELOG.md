@@ -1,3 +1,19 @@
+## satelle@0.1.28
+
+### Native recovery
+
+Reconnect to a stopped Mac Host Daemon after an SSH connection reset.
+
+Refresh stale signed Windows Computer Use bundles during explicit setup and accept the current official backend inventory while keeping native runtime access restricted.
+
+Recognize current native app-access questions by canonical app identity. Preserve the official Windows registered-core inheritance declarations during setup and native execution.
+
+Keep the Mac control service reachable while a saved app-approval read waits on a macOS privacy decision. Report a bounded native-readiness error instead of hanging startup.
+
+Verify control connections and service restarts through host status without waiting for native readiness.
+
+Show the owning maintenance operation when setup or a task is blocked by host maintenance.
+
 ## satelle@0.1.27
 
 ### App access

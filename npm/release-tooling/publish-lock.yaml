@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## App access\n\nShow supported native app requests in Satelle and accept an explicit allow once, Always allow, or deny decision. Resume the same task after the response. Saved approval uses the official native SDK; OS permissions remain manual.\n\nOpen named Mac apps directly instead of requiring Finder discovery first.\n\n## Readiness recovery\n\nReconcile interrupted provider probes before checking native readiness, while preserving running and unknown-outcome guards.\n"
-    filename: 2026-10-01-native-app-consent.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Native recovery\n\nReconnect to a stopped Mac Host Daemon after an SSH connection reset.\n\nRefresh stale signed Windows Computer Use bundles during explicit setup and accept the current official backend inventory while keeping native runtime access restricted.\n\nRecognize current native app-access questions by canonical app identity. Preserve the official Windows registered-core inheritance declarations during setup and native execution.\n\nKeep the Mac control service reachable while a saved app-approval read waits on a macOS privacy decision. Report a bounded native-readiness error instead of hanging startup.\n\nVerify control connections and service restarts through host status without waiting for native readiness.\n\nShow the owning maintenance operation when setup or a task is blocked by host maintenance.\n"
+    filename: 2026-10-02-native-recovery.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - 2026-10-01-native-app-consent.md
+      - 2026-10-02-native-recovery.md
     id: cargo:satelle
     updated: true
 npm:packages:
