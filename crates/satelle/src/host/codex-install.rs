@@ -307,8 +307,15 @@ fn install_latest_managed_codex_for_target(
         // Admission only reads the existing receipt and package. A rejection
         // therefore has a confirmed no-change outcome for the setup fence.
         Ok(_) => Some(
-            admit_managed_codex_from_state_root_for_target(state_root, target)
-                .map_err(|error| install_error("admit-existing-codex", error))?,
+            admit_managed_codex_from_state_root_for_target(state_root, target).map_err(
+                |error| {
+                    // Admission reasons are closed identifiers, safe for public diagnostics.
+                    let reason = error.details["reason"].clone();
+                    let mut setup_error = install_error("admit-existing-codex", error);
+                    setup_error.details.insert("reason".to_string(), reason);
+                    setup_error
+                },
+            )?,
         ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(install_error("inspect-install-receipt", error)),
@@ -1723,6 +1730,14 @@ mod tests {
             assert_eq!(error.code, ErrorCode::SetupActionFailed);
             assert_eq!(error.details["failed_action"], "admit-existing-codex");
             assert_eq!(error.details["changed"], false);
+            assert_eq!(
+                error.details["reason"],
+                if outside_managed_root {
+                    "immutable_package_root_invalid"
+                } else {
+                    "receipt_metadata_invalid"
+                }
+            );
             assert_eq!(fs::read(&fixture.receipt_path).unwrap(), receipt_before);
             assert_eq!(fs::read(&fixture.binary_path).unwrap(), binary_before);
             assert!(!fixture.state_root.join(INSTALL_INTENT_FILE_NAME).exists());
