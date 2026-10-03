@@ -14,9 +14,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::SystemServices::SS_LEFT;
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
-};
+use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_UNAWARE, SetThreadDpiAwarenessContext};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
@@ -151,10 +149,10 @@ fn run_window(
     shutdown: Arc<AtomicBool>,
     ready_sender: mpsc::SyncSender<std::io::Result<()>>,
 ) {
-    // This worker owns only the transient readiness window. Physical pixels
-    // must match Sky screenshots; do not change the Host's process-wide DPI.
-    if unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }.is_null()
-    {
+    // The native Windows SDK uses logical window coordinates. Let Windows scale
+    // this transient surface so its 1024 by 678 layout and input coordinates
+    // agree at every monitor scale; keep the Host's process-wide DPI unchanged.
+    if unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) }.is_null() {
         let _ = ready_sender.send(Err(std::io::Error::last_os_error()));
         return;
     }
@@ -560,7 +558,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_probe_surface_has_physical_pixel_geometry_and_no_frame_offset() {
+    fn native_probe_surface_matches_sdk_logical_coordinates_and_has_no_frame_offset() {
         use windows_sys::Win32::UI::HiDpi::{
             AreDpiAwarenessContextsEqual, GetWindowDpiAwarenessContext,
         };
@@ -586,15 +584,14 @@ mod tests {
             unsafe {
                 AreDpiAwarenessContextsEqual(
                     GetWindowDpiAwarenessContext(window),
-                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                    DPI_AWARENESS_CONTEXT_UNAWARE,
                 )
             },
             0,
         );
-        // Observe from a DPI-aware caller too; otherwise Win32 virtualizes
-        // the observer's coordinates and hides the physical-pixel contract.
-        let previous =
-            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        // Observe in the same logical coordinate space as the native Windows SDK.
+        // This must remain 1024 by 678 even when Windows scales the surface.
+        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) };
         assert!(!previous.is_null());
         let mut client = RECT::default();
         let mut outer = RECT::default();

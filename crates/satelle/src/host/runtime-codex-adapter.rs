@@ -1515,7 +1515,7 @@ fn native_readiness_prompt(
             if !allowed_app_ids.contains("satelle.exe") {
                 return Err("native_app_approval_unavailable");
             }
-            // The native probe has a borderless physical-pixel layout. Coordinate input keeps
+            // The native probe shares the SDK's borderless logical-pixel layout. Coordinate input keeps
             // this generated cell short enough for the model to copy verbatim,
             // while the private callback remains the authority for both events.
             let script = "globalThis.sky??=(await import('@oai/sky')).sky;var w=(await sky.list_windows()).find(x=>x.app.toLowerCase().endsWith('satelle.exe')&&x.title==='Satelle native readiness probe'),g=w=>sky.get_window_state({window:w,include_screenshot:true,include_text:true}),s=await g(w);await sky.click({window:s.window,x:190,y:142,screenshotId:s.screenshots[0].id});s=await g(s.window);await sky.drag({window:s.window,from_x:230,from_y:325,to_x:660,to_y:430,screenshotId:s.screenshots[0].id})".to_string();
