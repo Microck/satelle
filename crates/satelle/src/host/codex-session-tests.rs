@@ -350,7 +350,7 @@ fn main() {
         "provider-probe-responses" | "provider-probe-invalidated-after-callbacks"
     ) {
         let next_request = provider_probe_request.as_deref().unwrap();
-        let script_start = next_request.find("globalThis.sky ??=").unwrap();
+        let script_start = next_request.find("globalThis.sky??=").unwrap();
         let script_end = script_start
             + next_request[script_start..]
                 .find(r#"\""#)
