@@ -501,6 +501,7 @@ fn current_windows_app_ids_are_loaded_only_for_ephemeral_callback_policy() {
     assert!(computer_use_allowed_app_ids_from_config("invalid = [").is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn current_macos_persistent_app_ids_are_loaded_from_the_signed_helpers_group_container() {
     let home = tempfile::TempDir::new().expect("create deterministic macOS home");
@@ -522,13 +523,17 @@ fn current_macos_persistent_app_ids_are_loaded_from_the_signed_helpers_group_con
     .expect("write OpenAI approval fixture");
 
     assert_eq!(
-        macos_computer_use_allowed_app_ids(home.path()),
+        macos_computer_use_allowed_app_ids(home.path()).unwrap(),
         BTreeSet::from(["com.apple.Safari".to_string()])
     );
 
     std::fs::write(&approvals, r#"{"approvedBundleIdentifiers":"Safari"}"#)
         .expect("write malformed OpenAI approval fixture");
-    assert!(macos_computer_use_allowed_app_ids(home.path()).is_empty());
+    assert!(
+        macos_computer_use_allowed_app_ids(home.path())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[cfg(unix)]
@@ -560,7 +565,11 @@ fn macos_persistent_app_ids_reject_a_redirected_container_ancestor() {
     )
     .expect("redirect the Software ancestor");
 
-    assert!(macos_computer_use_allowed_app_ids(home.path()).is_empty());
+    assert!(
+        macos_computer_use_allowed_app_ids(home.path())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1302,5 +1311,58 @@ fn slow_version_probe_child() {
         == Some(std::ffi::OsStr::new("slow"))
     {
         thread::sleep(Duration::from_secs(5));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn macos_app_policy_reader_bounds_and_reaps_a_stalled_process() {
+    let mut command = Command::new("/bin/sh");
+    let state = tempfile::TempDir::new().unwrap();
+    let process_ids = state.path().join("process-ids");
+    command.args([
+        "-c",
+        "sleep 10 & child=$!; printf '%s %s' \"$$\" \"$child\" > \"$1\"; wait \"$child\"",
+        "policy-reader",
+    ]);
+    command.arg(&process_ids);
+    let started = Instant::now();
+    let error = read_macos_app_policy_command(command, Duration::from_millis(200))
+        .expect_err("stalled approval read must fail explicitly");
+    assert_eq!(error.code, ErrorCode::ComputerUseNotReady);
+    assert_eq!(
+        error.details.get("reason"),
+        Some(&Value::String(
+            "macos_app_policy_read_timed_out".to_string()
+        ))
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let recorded =
+        std::fs::read_to_string(process_ids).expect("reader records leader and descendant");
+    let ids: Vec<u32> = recorded
+        .split_whitespace()
+        .map(|id| id.parse().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert!(
+        process_group_is_gone(ids[0]),
+        "no reader process group may remain"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn macos_app_policy_reader_rejects_failed_or_oversized_output() {
+    for script in ["printf '{}'; exit 1", "exec yes x"] {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        let error = read_macos_app_policy_command(command, Duration::from_secs(2))
+            .expect_err("failed or oversized reads cannot authorize app access");
+        assert_eq!(
+            error.details.get("reason"),
+            Some(&Value::String(
+                "macos_app_policy_read_unavailable".to_string()
+            ))
+        );
     }
 }

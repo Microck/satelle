@@ -798,15 +798,14 @@ impl HostService {
             .append_log_for_tests(timestamp, source, severity)
     }
 
-    pub fn daemon_runtime_capabilities(&self) -> Result<DaemonRuntimeCapabilities, SatelleError> {
+    /// Startup must not open protected app-policy files before control is available.
+    /// Native readiness remains unobserved until a capability request validates it.
+    pub fn daemon_startup_capabilities(&self) -> Result<DaemonRuntimeCapabilities, SatelleError> {
         match &self.mode {
-            HostMode::Production { snapshot, .. } => {
-                let native_computer_use = self.runtime.has_reusable_readiness(LOCAL_DEMO_HOST)?;
-                Ok(production_capabilities(
-                    &*crate::host::read_production_snapshot(snapshot)?,
-                    native_computer_use,
-                ))
-            }
+            HostMode::Production { snapshot, .. } => Ok(production_capabilities(
+                &*crate::host::read_production_snapshot(snapshot)?,
+                false,
+            )),
             #[cfg(any(test, feature = "test-support"))]
             HostMode::TestFake { image_attachments } => Ok(DaemonRuntimeCapabilities {
                 codex_runtime: false,
@@ -834,6 +833,20 @@ impl HostService {
                     ),
                 },
             }),
+        }
+    }
+
+    pub fn daemon_runtime_capabilities(&self) -> Result<DaemonRuntimeCapabilities, SatelleError> {
+        match &self.mode {
+            HostMode::Production { snapshot, .. } => {
+                let ready = self.runtime.has_reusable_readiness(LOCAL_DEMO_HOST)?;
+                Ok(production_capabilities(
+                    &*crate::host::read_production_snapshot(snapshot)?,
+                    ready,
+                ))
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            HostMode::TestFake { .. } => self.daemon_startup_capabilities(),
         }
     }
 
