@@ -318,6 +318,11 @@ permissions from app approvals:
   `ComputerUseAppApprovals.json`; and
 - app approvals may still require direct user action.
 
+The Windows readiness window uses a borderless 1024 by 678 logical-pixel
+layout on a DPI-unaware owner thread. Windows scales the surface while the
+official SDK coordinates and native window messages keep the same units. The
+probe still requires independently observed click and drag callbacks.
+
 The Windows Host probe obtains the active Codex home from the live app-server
 `initialize` response, not from a remembered default path. It reads the raw
 parsed base user layer through `config/read` and requires that layer to identify
