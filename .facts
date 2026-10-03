@@ -2262,6 +2262,7 @@
 - satelle setup and repair human partial-failure output states the failed action, the completed actions, the skipped actions, the preserved remote state, and the next repair command @spec @mvp @implemented
 - satelle setup and repair JSON partial-failure output includes status partial_failure, changed true, completed_actions, failed_action, skipped_actions, preserved_state, and recovery_command fields @spec @mvp @implemented
 - satelle setup and repair report a typed setup-action-failed error instead of setup-partially-applied when a required setup action fails before any remote mutation completes @spec @mvp @implemented
+- managed Codex setup preserves the closed receipt admission reason in setup-action-failed details alongside failed_action and changed false, without downloading or changing the rejected receipt or package @spec @contract @mvp @implemented
 - satelle setup supports --dry-run to preview planned setup actions without mutating the selected host @implemented @mvp
 - satelle setup supports --no-input for automation and fails with a typed input-required error when required interactive choices or confirmations are missing @implemented @mvp
 - satelle setup in non-interactive mode does not run remote install, update, service, or configuration mutations unless an explicit non-interactive consent option is provided @spec @mvp @implemented
