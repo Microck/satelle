@@ -1497,6 +1497,7 @@
 - setup, repair, host update, storage migration, and service restart acquire a Maintenance Lease before mutation @spec @mvp @implemented
 - a Maintenance Lease cannot coexist with a Control Lease for the same Host except when the same maintenance operation owns a postcheck Control sublease @spec @mvp @implemented
 - Turn admission requires both the selected Control Lease and absence of a Maintenance Lease for the same Host @spec @mvp @implemented
+- Maintenance Lease admission conflicts expose the owning Host and active operation id through the existing host-busy API contract; the CLI preserves host-busy instead of reporting an invalid daemon response @spec @mvp @implemented
 - a maintenance operation that requires a live Computer Use postcheck retains its Maintenance Lease and atomically acquires an operation-owned postcheck Control sublease before running the probe @spec @mvp @implemented
 - no other Turn, probe, or maintenance operation is admitted while a maintenance operation owns its postcheck Control sublease @spec @mvp @implemented
 - a queued Turn Request does not start while a Maintenance Lease exists for its Host @spec @phase4 @implemented

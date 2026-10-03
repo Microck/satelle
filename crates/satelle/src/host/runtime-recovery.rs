@@ -3,7 +3,7 @@ use super::RuntimeStartupState;
 use super::adapter::{AdapterSubject, RecoveryObservation};
 use super::{RuntimeEngine, model};
 use crate::core::session::{TurnState, TurnTransition};
-use crate::core::{ControlPlaneOperation, ErrorCode, SatelleError, SessionId, TurnId};
+use crate::core::{ControlPlaneOperation, LOCAL_DEMO_HOST, SatelleError, SessionId, TurnId};
 use crate::host::storage::{MaintenanceLeaseState, RecoverySubject, StorageErrorKind};
 use std::collections::VecDeque;
 use std::sync::MutexGuard;
@@ -356,7 +356,10 @@ fn maintenance_host_busy(
     recovery_pending: bool,
     freshness: Option<crate::host::storage::LeaseFreshness>,
 ) -> SatelleError {
-    let mut details = std::collections::BTreeMap::new();
+    // Use the same owner contract as every operation-scoped Host conflict so
+    // API projection retains the owner and the controller can explain it.
+    let mut error = SatelleError::host_busy_operation(LOCAL_DEMO_HOST, operation_id);
+    let details = &mut error.details;
     details.insert(
         "reason".to_string(),
         serde_json::Value::String(if recovery_pending {
@@ -386,17 +389,8 @@ fn maintenance_host_busy(
         );
     }
     details.insert("retryable".to_string(), serde_json::Value::Bool(true));
-    details.insert(
-        "operation_id".to_string(),
-        serde_json::Value::String(operation_id.to_string()),
-    );
-    SatelleError {
-        code: ErrorCode::HostBusy,
-        message: "Host maintenance ownership blocks conflicting admission".to_string(),
-        recovery_command: None,
-        source_detail: None,
-        details,
-    }
+    error.message = "Host maintenance ownership blocks conflicting admission".to_string();
+    error
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
