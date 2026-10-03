@@ -1,6 +1,10 @@
 use crate::command_group::{CommandGroup, GroupChild};
-use crate::core::ControlPlaneFailureReason;
-use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use crate::core::ErrorCode;
+use crate::core::{ControlPlaneFailureReason, SatelleError};
+#[cfg(unix)]
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -48,56 +52,61 @@ const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_millis(500);
 const LEGACY_APP_POLICY_LIMIT: u64 = 64 * 1024;
 const CURRENT_APP_POLICY_LIMIT: u64 = 1024 * 1024;
+#[cfg(unix)]
 const MACOS_APP_APPROVAL_LIMIT: u64 = 1024 * 1024;
+#[cfg(unix)]
 const MACOS_COMPUTER_USE_GROUP: &str = "2DC432GLL2.com.openai.sky.CUAService";
 
 /// Loads the exact current native Computer Use decisions for one app-server
 /// run. Identifiers stay in process memory and never enter capability evidence,
 /// diagnostics, persistence, or public events.
-pub(crate) fn configured_computer_use_allowed_app_ids() -> BTreeSet<String> {
+pub(crate) fn configured_computer_use_allowed_app_ids() -> Result<BTreeSet<String>, SatelleError> {
     let Ok(runtime) = crate::host::codex_install::admit_managed_codex_for_current_process() else {
-        return BTreeSet::new();
+        return Ok(BTreeSet::new());
     };
     match std::env::consts::OS {
         "windows" => {
             let path = runtime.codex_home().join("config.toml");
             let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-                return BTreeSet::new();
+                return Ok(BTreeSet::new());
             };
             if !metadata.is_file()
                 || metadata.file_type().is_symlink()
                 || metadata.len() > CURRENT_APP_POLICY_LIMIT
             {
-                return BTreeSet::new();
+                return Ok(BTreeSet::new());
             }
             let Ok(contents) = std::fs::read_to_string(path) else {
-                return BTreeSet::new();
+                return Ok(BTreeSet::new());
             };
-            computer_use_allowed_app_ids_from_config(&contents).unwrap_or_default()
+            Ok(computer_use_allowed_app_ids_from_config(&contents).unwrap_or_default())
         }
+        #[cfg(unix)]
         "macos" => directories::BaseDirs::new()
             .map(|directories| macos_computer_use_allowed_app_ids(directories.home_dir()))
-            .unwrap_or_default(),
-        _ => BTreeSet::new(),
+            .unwrap_or_else(|| Ok(BTreeSet::new())),
+        _ => Ok(BTreeSet::new()),
     }
 }
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct MacosPersistentAppApprovals {
     approved_bundle_identifiers: Vec<String>,
 }
 
-fn macos_computer_use_allowed_app_ids(home: &Path) -> BTreeSet<String> {
+#[cfg(unix)]
+fn macos_computer_use_allowed_app_ids(home: &Path) -> Result<BTreeSet<String>, SatelleError> {
     let group_root = home
         .join("Library")
         .join("Group Containers")
         .join(MACOS_COMPUTER_USE_GROUP);
     let Ok(group_metadata) = std::fs::symlink_metadata(&group_root) else {
-        return BTreeSet::new();
+        return Ok(BTreeSet::new());
     };
     if !group_metadata.is_dir() || group_metadata.file_type().is_symlink() {
-        return BTreeSet::new();
+        return Ok(BTreeSet::new());
     }
     let approval_path = Path::new("Library")
         .join("Application Support")
@@ -105,35 +114,120 @@ fn macos_computer_use_allowed_app_ids(home: &Path) -> BTreeSet<String> {
         .join("ComputerUseAppApprovals.json");
     let path = group_root.join(&approval_path);
     let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-        return BTreeSet::new();
+        return Ok(BTreeSet::new());
     };
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || metadata.len() > MACOS_APP_APPROVAL_LIMIT
     {
-        return BTreeSet::new();
+        return Ok(BTreeSet::new());
     }
     let Some((canonical_group_root, canonical_path)) = std::fs::canonicalize(&group_root)
         .ok()
         .zip(std::fs::canonicalize(&path).ok())
     else {
-        return BTreeSet::new();
+        return Ok(BTreeSet::new());
     };
     if canonical_path != canonical_group_root.join(approval_path) {
-        return BTreeSet::new();
+        return Ok(BTreeSet::new());
     }
-    let Ok(contents) = std::fs::read_to_string(canonical_path) else {
-        return BTreeSet::new();
-    };
-    serde_json::from_str::<MacosPersistentAppApprovals>(&contents)
-        .map(|approvals| {
-            approvals
-                .approved_bundle_identifiers
-                .into_iter()
-                .filter(|identifier| !identifier.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    // Opening another app's container can wait for a macOS privacy decision.
+    // Isolate the open in a bounded child so the Host never waits indefinitely.
+    let mut command = Command::new("/bin/cat");
+    command.arg(canonical_path);
+    let contents = read_macos_app_policy_command(command, APP_POLICY_PROBE_TIMEOUT)?;
+    Ok(
+        serde_json::from_str::<MacosPersistentAppApprovals>(&contents)
+            .map(|approvals| {
+                approvals
+                    .approved_bundle_identifiers
+                    .into_iter()
+                    .filter(|identifier| !identifier.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+#[cfg(unix)]
+fn read_macos_app_policy_command(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<String, SatelleError> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .group_spawn()
+        .map_err(|_| macos_app_policy_read_failure("macos_app_policy_read_unavailable"))?;
+    let output = (|| {
+        let mut stdout =
+            child.inner().stdout.take().ok_or_else(|| {
+                macos_app_policy_read_failure("macos_app_policy_read_unavailable")
+            })?;
+        set_nonblocking(&stdout)
+            .map_err(|_| macos_app_policy_read_failure("macos_app_policy_read_unavailable"))?;
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            if Instant::now() >= deadline {
+                return Err(macos_app_policy_read_failure(
+                    "macos_app_policy_read_timed_out",
+                ));
+            }
+            match stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if bytes.len() as u64 > MACOS_APP_APPROVAL_LIMIT {
+                        return Err(macos_app_policy_read_failure(
+                            "macos_app_policy_read_unavailable",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(VERSION_PROBE_POLL_INTERVAL);
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(_) => {
+                    return Err(macos_app_policy_read_failure(
+                        "macos_app_policy_read_unavailable",
+                    ));
+                }
+            }
+        }
+        match wait_for_leader(&mut child, deadline) {
+            GroupWaitOutcome::Exited(status) if status.success() => String::from_utf8(bytes)
+                .map_err(|_| macos_app_policy_read_failure("macos_app_policy_read_unavailable")),
+            GroupWaitOutcome::Deadline => Err(macos_app_policy_read_failure(
+                "macos_app_policy_read_timed_out",
+            )),
+            _ => Err(macos_app_policy_read_failure(
+                "macos_app_policy_read_unavailable",
+            )),
+        }
+    })();
+    // Always reap the reader and prove its group is gone, including on timeout.
+    if !terminate_group(&mut child) {
+        let mut error = macos_app_policy_read_failure("macos_app_policy_cleanup_failed");
+        error.code = ErrorCode::RemoteExecution;
+        error.message =
+            "Satelle could not confirm that the macOS app-approval reader stopped".to_string();
+        return Err(error);
+    }
+    output
+}
+
+#[cfg(unix)]
+fn macos_app_policy_read_failure(reason: &'static str) -> SatelleError {
+    SatelleError {
+        code: ErrorCode::ComputerUseNotReady,
+        message: "Satelle could not read saved macOS app approvals; check for a Satelle app-data privacy prompt on the Mac and retry".to_string(),
+        recovery_command: Some("satelle doctor --scope computer-use --refresh --json".to_string()),
+        source_detail: None,
+        details: std::collections::BTreeMap::from([("reason".to_string(), Value::String(reason.to_string()))]),
+    }
 }
 
 fn computer_use_allowed_app_ids_from_config(contents: &str) -> Option<BTreeSet<String>> {

@@ -566,7 +566,7 @@ impl DaemonServer {
             .map_err(DaemonServerError::HostInitializationFailed)?;
         service.prepare_queue_worker_for_daemon();
         let capabilities = service
-            .daemon_runtime_capabilities()
+            .daemon_startup_capabilities()
             .map_err(DaemonServerError::HostInitializationFailed)?;
         let listener = TcpListener::bind(config.bind_addr)
             .await
@@ -1390,15 +1390,24 @@ async fn capabilities(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
 ) -> Response {
+    // Fresh readiness can wait for OS approval. Run it only after the control
+    // service is available, outside the async request executor's threads.
+    let service = Arc::clone(&state.service);
+    let capabilities =
+        match tokio::task::spawn_blocking(move || service.daemon_runtime_capabilities()).await {
+            Ok(Ok(capabilities)) => capabilities,
+            Ok(Err(error)) => return host_error::response(&state, &authorized, &error),
+            Err(_) => return host_error::task_failure(&state, &authorized),
+        };
     let response = CapabilitiesResponse::new(
         authorized.request_id().clone(),
         state.host_identity.clone(),
         env!("CARGO_PKG_VERSION").to_string(),
-        state.capabilities.codex_runtime(),
-        state.capabilities.native_computer_use(),
-        state.capabilities.native_action_relay(),
-        state.capabilities.provider_computer_use(),
-        state.capabilities.image_attachments(),
+        capabilities.codex_runtime(),
+        capabilities.native_computer_use(),
+        capabilities.native_action_relay(),
+        capabilities.provider_computer_use(),
+        capabilities.image_attachments(),
         state.limits,
     );
     let mut response = authenticated_json_response(

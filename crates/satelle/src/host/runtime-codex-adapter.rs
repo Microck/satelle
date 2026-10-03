@@ -353,7 +353,7 @@ impl ProductionComputerUseAdapter {
         self.require_secure_desktop_handoff(&desktop_binding, desktop_selection)?;
         let desktop = resolve_desktop_session_for(platform, &desktops, desktop_selection)?;
         let allowed_app_ids =
-            crate::host::codex_capabilities::configured_computer_use_allowed_app_ids();
+            crate::host::codex_capabilities::configured_computer_use_allowed_app_ids()?;
         let observations = native_prerequisite_observations(
             platform,
             desktop,
@@ -2524,7 +2524,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                 }
                 let model_provider = provider_child_model_provider(binding);
                 let allowed_app_ids =
-                    crate::host::codex_capabilities::configured_computer_use_allowed_app_ids();
+                    crate::host::codex_capabilities::configured_computer_use_allowed_app_ids()?;
                 let current_app_approval_fingerprint = app_approval_fingerprint_for_policy(
                     crate::host::codex_capabilities::HostPlatform::current().as_str(),
                     snapshot.evidence.capabilities.approval_observation.surface,
@@ -2659,7 +2659,10 @@ impl ReadinessProbeDriver for ProductionComputerUseAdapter {
             return result;
         }
         let allowed_app_ids =
-            crate::host::codex_capabilities::configured_computer_use_allowed_app_ids();
+            match crate::host::codex_capabilities::configured_computer_use_allowed_app_ids() {
+                Ok(allowed_app_ids) => allowed_app_ids,
+                Err(error) => return NativeProbeResult::UncachedFailure(error),
+            };
         let platform = crate::host::codex_capabilities::HostPlatform::current().as_str();
         let app_policy_surface = crate::host::read_production_snapshot(&self.snapshot)
             .map(|snapshot| snapshot.evidence.capabilities.approval_observation.surface);
