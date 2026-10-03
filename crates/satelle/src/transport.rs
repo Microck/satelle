@@ -2860,7 +2860,7 @@ impl SshSetupTransport {
         )
         .map_err(|error| direct_transport_error(&self.alias, error))?;
         durable_client
-            .capabilities()
+            .host_status()
             .map_err(|error| direct_transport_error(&self.alias, error))?;
         Ok(verification_token)
     }
@@ -3400,7 +3400,7 @@ impl RemoteSetupExecution<'_> {
             .map_err(|error| map_ssh_daemon_bootstrap_error(&self.transport.alias, error))?;
         }
         let (durable_tunnel, durable_client) = self.transport.durable_service_client()?;
-        wait_for_durable_daemon(&self.transport.alias, || durable_client.capabilities())?;
+        wait_for_durable_daemon(&self.transport.alias, || durable_client.host_status())?;
         commit_verified_bootstrap_mutation(&self.transport.alias, self.bootstrap_lock)?;
         begin_setup_maintenance(
             &self.transport.alias,
@@ -3678,7 +3678,7 @@ pub(crate) fn manage_ssh_persistent_service(
     let operation_id = format!("service-lifecycle-{}", Uuid::now_v7());
     let (durable_tunnel, durable_client) = transport.durable_service_client()?;
     durable_client
-        .capabilities()
+        .host_status()
         .map_err(|error| direct_transport_error(&transport.alias, error))?;
     let mut bootstrap_lock = acquire_bootstrap_lock_for_operation(
         &transport.alias,
@@ -4377,7 +4377,7 @@ pub(crate) fn apply_ssh_storage_maintenance(
                 &mutation,
             )
         })?;
-    wait_for_durable_daemon(&transport.alias, || verification_client.capabilities()).map_err(
+    wait_for_durable_daemon(&transport.alias, || verification_client.host_status()).map_err(
         |error| {
             preserve_pending_storage_mutation(
                 storage_maintenance_partial_error(
@@ -5624,19 +5624,18 @@ fn apply_host_update_with_operation(
             ));
         }
     };
-    let new_capabilities =
-        match wait_for_durable_daemon(&transport.alias, || new_client.capabilities()) {
-            Ok(capabilities) => capabilities,
-            Err(source) => {
-                return Err(host_update_recovery_pending(
-                    &mut report,
-                    "restart-host-daemon",
-                    &operation_id,
-                    source,
-                ));
-            }
-        };
-    if new_capabilities.host_identity() != transport.binding.expected_host_identity().as_str() {
+    let new_status = match wait_for_durable_daemon(&transport.alias, || new_client.host_status()) {
+        Ok(status) => status,
+        Err(source) => {
+            return Err(host_update_recovery_pending(
+                &mut report,
+                "restart-host-daemon",
+                &operation_id,
+                source,
+            ));
+        }
+    };
+    if new_status.host_identity() != transport.binding.expected_host_identity().as_str() {
         let source = SatelleError::host_identity_mismatch(&transport.alias);
         return Err(host_update_recovery_pending(
             &mut report,
@@ -5645,7 +5644,7 @@ fn apply_host_update_with_operation(
             source,
         ));
     }
-    if new_capabilities.daemon_version() != target_version {
+    if new_status.daemon_version() != target_version {
         return Err(host_update_recovery_pending(
             &mut report,
             "restart-host-daemon",
@@ -6465,11 +6464,9 @@ fn recover_selected_repair_daemon(
         &mut bootstrap_lock,
         |lock| confirm_bootstrap_lock(&transport.alias, lock),
         || {
-            observe_remote_durable_readiness(
-                &transport.alias,
-                durable_client.capabilities(),
-                || observe_durable_listener(&transport.alias, transport.binding.destination()),
-            )
+            observe_remote_durable_readiness(&transport.alias, durable_client.host_status(), || {
+                observe_durable_listener(&transport.alias, transport.binding.destination())
+            })
         },
         |lock| {
             let mut remote = ssh_bootstrap::PersistentServiceRemote::new(
@@ -6517,11 +6514,9 @@ fn recover_selected_repair_daemon(
             )
         },
         || {
-            observe_remote_durable_readiness(
-                &transport.alias,
-                durable_client.capabilities(),
-                || observe_durable_listener(&transport.alias, transport.binding.destination()),
-            )
+            observe_remote_durable_readiness(&transport.alias, durable_client.host_status(), || {
+                observe_durable_listener(&transport.alias, transport.binding.destination())
+            })
         },
         Instant::now() + SSH_DAEMON_LAUNCH_TIMEOUT,
     ) {
@@ -7111,7 +7106,7 @@ fn restart_persistent_service(
         )?;
     }
     let (durable_tunnel, durable_client) = transport.durable_service_client()?;
-    wait_for_durable_daemon(&transport.alias, || durable_client.capabilities())?;
+    wait_for_durable_daemon(&transport.alias, || durable_client.host_status())?;
     commit_verified_bootstrap_mutation(&transport.alias, bootstrap_lock)?;
     begin_service_lifecycle_maintenance(
         &transport.alias,
@@ -8529,7 +8524,7 @@ fn ssh_transport(
                 .map_err(|error| direct_transport_error(&host.alias, error))?
                 .with_admission_timeout(admission_timeout),
             );
-            match durable_client.capabilities() {
+            match durable_client.host_status() {
                 Ok(_) => {
                     let event_client = DaemonEventClient::loopback(
                         tunnel.local_addr(),
@@ -8622,7 +8617,7 @@ fn durable_ssh_clients(
     match probe_durable_daemon_under_lock(
         || confirm_bootstrap_lock(alias, &mut bootstrap_lock),
         || {
-            observe_remote_durable_readiness(alias, client.capabilities(), || {
+            observe_remote_durable_readiness(alias, client.host_status(), || {
                 observe_durable_listener(alias, destination)
             })
         },
@@ -8686,7 +8681,7 @@ fn finish_durable_daemon_launch(
     // The daemon was launched with the operation-bound bootstrap credential.
     // Prove that exact authority and Host identity before committing daemon_start;
     // a stale durable credential cannot safely prove the launch it did not own.
-    wait_for_durable_daemon(alias, || bootstrap_client.capabilities())?;
+    wait_for_durable_daemon(alias, || bootstrap_client.host_status())?;
     commit_verified_bootstrap_mutation(alias, bootstrap_lock)?;
     complete_bootstrap_handoff(alias, bootstrap_client, bootstrap_lock)?;
     bootstrap_lock
@@ -8700,7 +8695,7 @@ fn finish_durable_daemon_launch(
         expected_host_identity,
         || Ok(()),
         || {
-            observe_remote_durable_readiness(alias, durable_client.capabilities(), || {
+            observe_remote_durable_readiness(alias, durable_client.host_status(), || {
                 observe_durable_listener(alias, destination)
             })
         },
@@ -8719,7 +8714,7 @@ trait DurableReadiness {
     fn host_identity(&self) -> &str;
 }
 
-impl DurableReadiness for satelle::transport::CapabilitiesResponse {
+impl DurableReadiness for satelle::transport::HostStatusResponse {
     fn daemon_version(&self) -> &str {
         self.daemon_version()
     }
@@ -9113,7 +9108,7 @@ fn bootstrap_ssh_clients(
         .with_admission_timeout(admission_timeout),
     );
     client
-        .capabilities()
+        .host_status()
         .map_err(|error| direct_transport_error(alias, error))?;
     commit_verified_bootstrap_mutation(alias, &mut bootstrap_lock)?;
     complete_bootstrap_handoff(alias, &client, &mut bootstrap_lock)?;
@@ -10497,7 +10492,7 @@ fn probe_local_daemon(
     raw_token: &str,
 ) -> Result<Option<DirectTransport>, SatelleError> {
     let transport = build_local_direct_transport(host, host_config, endpoint, raw_token)?;
-    match transport.client.capabilities() {
+    match transport.client.host_status() {
         Ok(readiness) => {
             let readiness = DurableReadinessSnapshot {
                 daemon_version: readiness.daemon_version().to_string(),
