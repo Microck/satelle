@@ -1503,6 +1503,7 @@
 - a maintenance operation without a live postcheck releases its Maintenance Lease only in the transaction that durably commits its final action-ledger state @spec @mvp @implemented
 - a maintenance operation with a live postcheck releases its postcheck Control sublease and Maintenance Lease only in the transaction that commits the final Readiness Result and final action-ledger state @spec @mvp @implemented
 - Control and Maintenance Leases contain an operation id, owner process identity, acquisition time, and heartbeat time @spec @mvp @implemented
+- Daemon authentication and service-start verification use authenticated Host status, independently of native Computer Use readiness; a pending OS privacy decision must not cause bootstrap recovery of a running Host @spec @mvp @implemented
 - lease owner process identity includes a process-start discriminator and operating-system boot identity instead of relying on a reusable process id alone @spec @mvp @implemented
 - the Host Daemon refreshes live Control and Maintenance Lease heartbeats at least every 5 seconds, and a missing heartbeat becomes stale after 30 seconds by default without permitting automatic lease release @spec @mvp @implemented
 - Host Daemon startup treats an orphaned Control or Maintenance Lease as recovery_pending and blocks conflicting admission until reconciliation completes @spec @mvp @implemented
