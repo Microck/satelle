@@ -381,6 +381,15 @@ The run fails if it substitutes a text-only Turn, terminal UI scraping,
 undocumented GUI automation, plugin presence, a feature flag, or a request
 acknowledgement for the required action-path and terminal-state evidence.
 
+Native readiness stops through the correlated interrupt path when the exact
+tool evidence becomes invalid, including a failed native tool item. After a
+confirmed upstream stop with a stopped terminal result, it reports
+`native_readiness_native_action_unavailable`
+instead of waiting for the full probe deadline. An uncertain stop remains a
+timeout failure. Deadline or admission cancellation keeps its own outcome even
+if the native item fails during the interrupt. A successful tool item still requires both independent native
+callbacks before readiness can pass.
+
 ### Windows native readiness record: 2026-08-04
 
 The real Host candidate used Windows 11 ARM64 build 26200 in the active console

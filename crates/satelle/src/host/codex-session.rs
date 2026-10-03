@@ -441,6 +441,7 @@ pub(crate) fn run_codex_session_with_timeout_cancellation(
 /// Runs native readiness until either the turn ends or its exact successful
 /// tool item and both OS action callbacks are observed. The latter still uses
 /// the normal correlated interrupt path and requires terminal stop evidence.
+/// Invalidated tool evidence stops through the same path but cannot pass readiness.
 pub(crate) fn run_codex_session_with_native_action_completion(
     command: impl Into<CodexCommand>,
     mut request: CodexSessionRequest<'_>,
@@ -494,21 +495,30 @@ fn run_timed_codex_session(
             // A fully successful native item plus both callback receipts is
             // already durable action proof. Stop its otherwise irrelevant
             // model follow-up before considering later timeout cancellation.
-            if native_action_completion
+            // Invalidated evidence cannot recover within this one-call probe,
+            // so stop that failed attempt through the same correlated path.
+            let invalid_native_evidence = native_action_completion
                 .as_ref()
-                .is_some_and(NativeActionEvidence::completed)
+                .is_some_and(NativeActionEvidence::invalidated);
+            if invalid_native_evidence
+                || native_action_completion
+                    .as_ref()
+                    .is_some_and(NativeActionEvidence::completed)
             {
-                return Some(interrupt_and_commit(&cancellation_control));
+                return Some((
+                    interrupt_and_commit(&cancellation_control),
+                    invalid_native_evidence,
+                ));
             }
             if admission_cancellation
                 .as_ref()
                 .is_some_and(crate::host::AdmissionCancellation::is_requested)
             {
-                return Some(interrupt_and_commit(&cancellation_control));
+                return Some((interrupt_and_commit(&cancellation_control), false));
             }
             let now = Instant::now();
             if now >= timeout_deadline {
-                return Some(interrupt_and_commit(&cancellation_control));
+                return Some((interrupt_and_commit(&cancellation_control), false));
             }
             let wait = timeout_deadline
                 .saturating_duration_since(now)
@@ -522,9 +532,33 @@ fn run_timed_codex_session(
 
     let result = run_codex_session_bound(command, request);
     let _ = finished_sender.send(());
-    let cancellation = watchdog
+    let (cancellation, invalid_native_evidence_triggered_stop) = watchdog
         .join()
-        .unwrap_or(Some(StopObservation::OutcomeUnknown));
+        .unwrap_or(Some((StopObservation::OutcomeUnknown, false)))
+        .map_or((None, false), |(observation, invalid_native_evidence)| {
+            (Some(observation), invalid_native_evidence)
+        });
+    // Keep uncertain cancellation and protocol failures intact. Only a
+    // confirmed stop caused by invalid native evidence becomes the existing
+    // typed native-action failure, never a successful readiness result.
+    let result = if invalid_native_evidence_triggered_stop
+        && matches!(
+            cancellation,
+            Some(
+                StopObservation::CancellationConfirmed | StopObservation::UpstreamInactiveConfirmed
+            )
+        )
+        && matches!(
+            result,
+            Ok(CodexSessionTerminal::StoppedByControl | CodexSessionTerminal::Interrupted)
+        ) {
+        Err(CodexSessionFailure::after_exchange(
+            CodexSessionError::NativeActionUnavailable,
+            true,
+        ))
+    } else {
+        result
+    };
     TimedCodexSessionRun {
         result,
         cancellation,

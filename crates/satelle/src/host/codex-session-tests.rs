@@ -322,16 +322,25 @@ fn main() {
         send(&mut output, r#"{"id":4,"result":{}}"#);
         return;
     }
-    if scenario == "native-controlled-interrupt" {
+    if matches!(scenario.as_str(), "native-controlled-interrupt" | "native-failed-controlled-interrupt" | "native-failed-unconfirmed-interrupt" | "native-failed-after-deadline") {
         let started = r#"{"id":"item-native","type":"mcpToolCall","server":"node_repl","tool":"js","arguments":{"code":"PRIVATE_NATIVE_SCRIPT"},"status":"inProgress"}"#;
         send(&mut output, &format!(r#"{{"method":"item/started","params":{{"threadId":"thread-1","turnId":"turn-1","item":{started}}}}}"#));
-        let completed = started.replace(r#""status":"inProgress""#, r#""status":"completed""#);
+        let terminal_status = if scenario != "native-controlled-interrupt" { "failed" } else { "completed" };
+        let completed = started.replace("inProgress", terminal_status);
+        if scenario != "native-failed-after-deadline" {
         send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"thread-1","turnId":"turn-1","item":{completed}}}}}"#));
+        }
         let interrupt = receive(&mut input, &log);
         assert!(interrupt.contains(r#""id":4"#));
         assert!(interrupt.contains(r#""method":"turn/interrupt""#));
         assert!(interrupt.contains(r#""threadId":"thread-1""#));
         assert!(interrupt.contains(r#""turnId":"turn-1""#));
+        if scenario == "native-failed-after-deadline" {
+        send(&mut output, &format!(r#"{{"method":"item/completed","params":{{"threadId":"thread-1","turnId":"turn-1","item":{completed}}}}}"#));
+        }
+        if scenario == "native-failed-unconfirmed-interrupt" {
+            hang();
+        }
         send(&mut output, r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted"}}}"#);
         send(&mut output, r#"{"id":4,"result":{}}"#);
         return;
@@ -1651,6 +1660,25 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
 
 #[test]
 fn native_action_completion_requests_correlated_upstream_cancellation() {
+    assert_native_action_stop("native-controlled-interrupt", false);
+}
+
+#[test]
+fn failed_native_action_stops_before_deadline_without_callback_receipts() {
+    assert_native_action_stop("native-failed-controlled-interrupt", true);
+}
+
+#[test]
+fn failed_native_action_preserves_unconfirmed_stop_outcome() {
+    assert_native_action_stop("native-failed-unconfirmed-interrupt", true);
+}
+
+#[test]
+fn native_failure_during_deadline_interrupt_preserves_the_stop_cause() {
+    assert_native_action_stop("native-failed-after-deadline", true);
+}
+
+fn assert_native_action_stop(scenario: &str, failed: bool) {
     let fixture = compile_fixture();
     let directory = tempfile::tempdir().expect("native completion scenario directory");
     let log_path = directory.path().join("requests.jsonl");
@@ -1659,7 +1687,7 @@ fn native_action_completion_requests_correlated_upstream_cancellation() {
     let turn_marker = directory.path().join("turn-persisted");
     let mut command = Command::new(&fixture.executable);
     command
-        .env("SATELLE_FIXTURE_SCENARIO", "native-controlled-interrupt")
+        .env("SATELLE_FIXTURE_SCENARIO", scenario)
         .env("SATELLE_FIXTURE_LOG", &log_path)
         .env("SATELLE_FIXTURE_CWD_LOG", &cwd_log_path)
         .env("SATELLE_THREAD_MARKER", &thread_marker)
@@ -1679,9 +1707,11 @@ fn native_action_completion_requests_correlated_upstream_cancellation() {
     let native_action_evidence = NativeActionEvidence::new();
     native_action_evidence.expect_script("PRIVATE_NATIVE_SCRIPT");
     let action_driver = native_action_evidence.clone();
-    let actions = std::thread::spawn(move || {
-        assert!(action_driver.observe_click_for_test());
-        assert!(action_driver.observe_drag_for_test());
+    let actions = (!failed).then(|| {
+        std::thread::spawn(move || {
+            assert!(action_driver.observe_click_for_test());
+            assert!(action_driver.observe_drag_for_test());
+        })
     });
     let timeout = process_startup_timeout(Duration::from_secs(3));
     let timeout_deadline = Instant::now() + timeout;
@@ -1721,14 +1751,38 @@ fn native_action_completion_requests_correlated_upstream_cancellation() {
         cancellation_grace,
         None,
     );
-    actions.join().expect("join native action driver");
+    if let Some(actions) = actions {
+        actions.join().expect("join native action driver");
+    }
 
-    assert!(started_at.elapsed() < timeout);
-    assert_eq!(
-        run.cancellation,
-        Some(StopObservation::UpstreamInactiveConfirmed)
-    );
-    assert_eq!(run.result, Ok(CodexSessionTerminal::StoppedByControl));
+    if scenario == "native-failed-unconfirmed-interrupt" {
+        assert!(started_at.elapsed() >= timeout);
+        assert_eq!(run.cancellation, Some(StopObservation::OutcomeUnknown));
+        assert_eq!(run.result.unwrap_err().error(), CodexSessionError::Timeout);
+    } else if scenario == "native-failed-after-deadline" {
+        assert!(started_at.elapsed() >= timeout);
+        assert_eq!(
+            run.cancellation,
+            Some(StopObservation::UpstreamInactiveConfirmed)
+        );
+        assert_eq!(run.result, Ok(CodexSessionTerminal::StoppedByControl));
+    } else if failed {
+        assert!(started_at.elapsed() < timeout);
+        assert_eq!(
+            run.cancellation,
+            Some(StopObservation::UpstreamInactiveConfirmed)
+        );
+        let failure = run.result.unwrap_err();
+        assert_eq!(failure.error(), CodexSessionError::NativeActionUnavailable);
+        assert!(failure.turn_dispatch_attempted());
+    } else {
+        assert!(started_at.elapsed() < timeout);
+        assert_eq!(
+            run.cancellation,
+            Some(StopObservation::UpstreamInactiveConfirmed)
+        );
+        assert_eq!(run.result, Ok(CodexSessionTerminal::StoppedByControl));
+    }
     assert!(thread_marker.exists());
     assert!(turn_marker.exists());
     let requests = read_to_string(log_path).expect("native completion protocol log");
