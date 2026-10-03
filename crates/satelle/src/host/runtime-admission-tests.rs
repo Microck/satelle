@@ -273,6 +273,15 @@ fn host_service_maintenance_authority_blocks_turns_and_finalizes_atomically() {
         crate::core::session::TurnAdmissionPhase::NotAdmitted,
         error.phase()
     );
+    assert_eq!(error.error().code, ErrorCode::HostBusy);
+    assert_eq!(
+        error.error().details.get("host"),
+        Some(&serde_json::json!(LOCAL_DEMO_HOST))
+    );
+    assert_eq!(
+        error.error().details.get("active_operation_id"),
+        Some(&serde_json::json!(operation_id))
+    );
     service
         .start_setup_action(
             &operation,
