@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Native recovery\n\nReconnect to a stopped Mac Host Daemon after an SSH connection reset.\n\nRefresh stale signed Windows Computer Use bundles during explicit setup and accept the current official backend inventory while keeping native runtime access restricted.\n\nRecognize current native app-access questions by canonical app identity. Preserve the official Windows registered-core inheritance declarations during setup and native execution.\n\nKeep the Mac control service reachable while a saved app-approval read waits on a macOS privacy decision. Report a bounded native-readiness error instead of hanging startup.\n\nVerify control connections and service restarts through host status without waiting for native readiness.\n\nShow the owning maintenance operation when setup or a task is blocked by host maintenance.\n"
-    filename: 2026-10-02-native-recovery.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Host recovery\n\nRun Windows interactive and persistent Host tasks at normal priority so managed SDK verification can finish promptly.\n\nRun Doctor on authenticated direct and SSH Hosts. Keep diagnostics on the Host that owns readiness and require control permission.\n\nKeep local daemon and SSH tunnel traffic away from unrelated HTTP proxy settings.\n\nCreate Windows bootstrap metadata and execution markers with explicit user ownership and protected permissions.\n\nRecover an orphaned setup begin only after exclusive local store ownership proves it has no retained ledger run. Preserve the original claim and a durable recovery receipt.\n\nShow safe startup stages when managed Codex admission stalls.\n"
+    filename: native-recovery.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - 2026-10-02-native-recovery.md
+      - native-recovery.md
     id: cargo:satelle
     updated: true
 npm:packages:

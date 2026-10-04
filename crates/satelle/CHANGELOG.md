@@ -1,3 +1,19 @@
+## satelle@0.1.29
+
+### Host recovery
+
+Run Windows interactive and persistent Host tasks at normal priority so managed SDK verification can finish promptly.
+
+Run Doctor on authenticated direct and SSH Hosts. Keep diagnostics on the Host that owns readiness and require control permission.
+
+Keep local daemon and SSH tunnel traffic away from unrelated HTTP proxy settings.
+
+Create Windows bootstrap metadata and execution markers with explicit user ownership and protected permissions.
+
+Recover an orphaned setup begin only after exclusive local store ownership proves it has no retained ledger run. Preserve the original claim and a durable recovery receipt.
+
+Show safe startup stages when managed Codex admission stalls.
+
 ## satelle@0.1.28
 
 ### Native recovery
