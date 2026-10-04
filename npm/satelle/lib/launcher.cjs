@@ -504,6 +504,7 @@ function executeNativeBinary(binaryPath, argumentsToForward, installContext) {
   const child = spawnSync(path.toNamespacedPath(binaryPath), argumentsToForward, {
     env: environment,
     stdio: "inherit",
+    windowsHide: true,
   });
   if (child.error) {
     throw new LauncherError(

@@ -4467,6 +4467,40 @@ fn xml_escape_text(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+// Task Scheduler launches the hidden PowerShell owner, which waits for the
+// no-console daemon so scheduler state and exit status still track its lifetime.
+const WINDOWS_TASK_LAUNCHER: &str = r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe";
+const WINDOWS_TASK_LAUNCH_PREFIX: &str =
+    "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ";
+const WINDOWS_TASK_DAEMON_SCRIPT_HEAD: &str = "$ErrorActionPreference = 'Stop'\n$start = New-Object System.Diagnostics.ProcessStartInfo\n$start.FileName = ";
+const WINDOWS_TASK_DAEMON_SCRIPT_MIDDLE: &str = "\n$start.Arguments = ";
+const WINDOWS_TASK_DAEMON_SCRIPT_TAIL: &str = r#"
+$start.UseShellExecute = $false
+$start.CreateNoWindow = $true
+$process = New-Object System.Diagnostics.Process
+$process.StartInfo = $start
+if (-not $process.Start()) { throw 'The managed Host Daemon did not start.' }
+$process.WaitForExit()
+exit $process.ExitCode
+"#;
+
+fn windows_task_launch_arguments(
+    task: &satelle::core::daemon_service::WindowsTaskDefinition,
+) -> String {
+    let script = format!(
+        "{WINDOWS_TASK_DAEMON_SCRIPT_HEAD}{}{WINDOWS_TASK_DAEMON_SCRIPT_MIDDLE}{}{WINDOWS_TASK_DAEMON_SCRIPT_TAIL}",
+        powershell_quote(&task.executable),
+        powershell_quote(&windows_task_arguments(task))
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    format!("{WINDOWS_TASK_LAUNCH_PREFIX}{encoded}")
+}
+
 fn windows_task_xml(
     task: &satelle::core::daemon_service::WindowsTaskDefinition,
 ) -> Result<String, SshBootstrapError> {
@@ -4493,8 +4527,8 @@ fn windows_task_xml(
             "<Arguments>{arguments}</Arguments></Exec></Actions></Task>"
         ),
         sid = xml_escape_text(&task.principal_sid),
-        executable = xml_escape_text(&task.executable),
-        arguments = xml_escape_text(&windows_task_arguments(task)),
+        executable = xml_escape_text(WINDOWS_TASK_LAUNCHER),
+        arguments = xml_escape_text(&windows_task_launch_arguments(task)),
     ))
 }
 
@@ -4517,8 +4551,8 @@ fn windows_task_definition_match_expression(
     windows_task_definition_match_expression_for_values(
         &powershell_quote(&task.principal_sid),
         &powershell_quote(&task.trigger_user_sid),
-        &powershell_quote(&task.executable),
-        &powershell_quote(&windows_task_arguments(task)),
+        &powershell_quote(WINDOWS_TASK_LAUNCHER),
+        &powershell_quote(&windows_task_launch_arguments(task)),
     )
 }
 
@@ -4829,6 +4863,32 @@ fn parse_offline_storage_completion_recovery_result(
     }
 }
 
+fn windows_task_action_decode_script(expected_arguments: &str) -> String {
+    format!(
+        r#"$command=$null
+$expectedTaskArguments=$null
+$taskArguments=[string]$root.Actions.Exec.Arguments
+try {{
+  if (-not $taskArguments.StartsWith({launch_prefix},[StringComparison]::Ordinal)) {{ throw 'Invalid background launch arguments.' }}
+  $childScript=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($taskArguments.Substring({launch_prefix_length})))
+  $paths=[regex]::Matches($childScript,{path_pattern})
+  if ($paths.Count -ne 1) {{ throw 'Invalid background executable declaration.' }}
+  $command=$paths[0].Groups[1].Value.Replace("''", "'")
+  $quotedCommand="'"+$command.Replace("'", "''")+"'"
+  $expectedScript={daemon_script_head}+$quotedCommand+{daemon_script_middle}+{quoted_expected_arguments}+{daemon_script_tail}
+  $expectedTaskArguments={launch_prefix}+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($expectedScript))
+}} catch {{ $command=$null }}
+"#,
+        launch_prefix = powershell_quote(WINDOWS_TASK_LAUNCH_PREFIX),
+        launch_prefix_length = WINDOWS_TASK_LAUNCH_PREFIX.len(),
+        path_pattern = powershell_quote(r"(?m)^\$start\.FileName = '((?:[^']|'')*)'$"),
+        daemon_script_head = powershell_quote(WINDOWS_TASK_DAEMON_SCRIPT_HEAD),
+        daemon_script_middle = powershell_quote(WINDOWS_TASK_DAEMON_SCRIPT_MIDDLE),
+        daemon_script_tail = powershell_quote(WINDOWS_TASK_DAEMON_SCRIPT_TAIL),
+        quoted_expected_arguments = powershell_quote(&powershell_quote(expected_arguments)),
+    )
+}
+
 fn registered_windows_task_command(
     task: &RegisteredWindowsTask,
     action: &str,
@@ -4848,8 +4908,8 @@ fn registered_windows_task_command(
     let definition_matches = windows_task_definition_match_expression_for_values(
         "$sid",
         "$sid",
-        "$command",
-        &powershell_quote(&expected_arguments),
+        &powershell_quote(WINDOWS_TASK_LAUNCHER),
+        "$expectedTaskArguments",
     );
     let lookup = format!(
         "-TaskPath {} -TaskName {}",
@@ -4887,7 +4947,7 @@ if ($null -eq $task) {{ {missing} }}
 [xml]$xml=Export-ScheduledTask {lookup}
 $root=$xml.Task
 $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$command=[string]$root.Actions.Exec.Command
+{decode_action}
 $executableIsSafe=$false
 try {{
   $item=Get-Item -LiteralPath $command -Force -ErrorAction Stop
@@ -4895,7 +4955,7 @@ try {{
   $requested=[IO.Path]::GetFullPath($command)
   $executableIsSafe=($item -is [IO.FileInfo]) -and (-not $item.PSIsContainer) -and
     (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
-    [IO.Path]::IsPathFullyQualified($command) -and
+    ($command -match '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)') -and
     [StringComparer]::OrdinalIgnoreCase.Equals($requested,$canonical)
 }} catch {{ $executableIsSafe=$false }}
 $matching=$executableIsSafe -and ({definition_matches})
@@ -4904,6 +4964,7 @@ $matching=$executableIsSafe -and ({definition_matches})
         missing = missing,
         definition_matches = definition_matches,
         operation = operation,
+        decode_action = windows_task_action_decode_script(&expected_arguments),
     );
     Ok(powershell_encoded_command(&script))
 }
@@ -4941,7 +5002,9 @@ fn service_path_overrides_observation_command(
             r#"$ErrorActionPreference='Stop'
 $task=Get-ScheduledTask -TaskPath '\Satelle\' -TaskName {task_name} -ErrorAction Stop
 [xml]$xml=Export-ScheduledTask -TaskPath '\Satelle\' -TaskName {task_name}
-if ($xml.Task.Actions.Exec.Arguments -ne {expected_arguments}) {{ exit 75 }}
+$root=$xml.Task
+{decode_action}
+if ($null -eq $command -or $root.Actions.Exec.Command -cne {launcher} -or $root.Actions.Exec.Arguments -cne $expectedTaskArguments) {{ exit 75 }}
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent().Name
 $path={config_path}
 $serviceDirectory={service_directory}
@@ -4958,7 +5021,8 @@ $file=Get-Item -LiteralPath $path -Force
 if (($file -isnot [IO.FileInfo]) -or $file.PSIsContainer -or $file.Length -eq 0 -or $file.Length -gt {limit}) {{ exit 75 }}
 [Console]::Out.Write([IO.File]::ReadAllText($file.FullName,[Text.UTF8Encoding]::new($false,$true)))"#,
             task_name = powershell_quote(&task_name),
-            expected_arguments = powershell_quote(&expected_arguments),
+            decode_action = windows_task_action_decode_script(&expected_arguments),
+            launcher = powershell_quote(WINDOWS_TASK_LAUNCHER),
             config_path = powershell_quote(&config_path),
             service_directory = powershell_quote(service_directory),
             limit = SERVICE_DEFINITION_LIMIT,
@@ -5668,7 +5732,7 @@ impl RemoteUserDirectories {
                     "$executableItem=Get-Item -LiteralPath $executable -Force; ",
                     "if (($executableItem.Attributes -band ",
                     "[IO.FileAttributes]::ReparsePoint) -ne 0 -or ",
-                    "-not [IO.Path]::IsPathFullyQualified($executable)) {{ ",
+                    "-not ($executable -match '^(?:[A-Za-z]:\\\\|\\\\\\\\[^\\\\]+\\\\[^\\\\]+\\\\)')) {{ ",
                     "[Console]::Out.Write('absent'); exit 0 }}; ",
                     "$resolvedExecutable=$executableItem.FullName; ",
                     "$normalizedExecutable=[IO.Path]::GetFullPath($executable); ",
@@ -8418,7 +8482,7 @@ mod tests {
             "Test-Path -LiteralPath $executable -PathType Leaf",
             "Get-Item -LiteralPath $executable -Force",
             "[IO.FileAttributes]::ReparsePoint",
-            "[IO.Path]::IsPathFullyQualified($executable)",
+            "($executable -match '^(?:[A-Za-z]:\\\\|\\\\\\\\[^\\\\]+\\\\[^\\\\]+\\\\)')",
             "$executableItem.FullName",
             "Get-FileHash -Algorithm SHA256",
         ] {
@@ -8671,7 +8735,15 @@ mod tests {
         assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
         assert!(xml.contains("<Priority>4</Priority>"));
-        assert!(xml.contains("--service-config C:\\Users\\operator"));
+        let launch = windows_task_launch_arguments(&task);
+        assert!(launch.starts_with(WINDOWS_TASK_LAUNCH_PREFIX));
+        let child = decode_powershell_command(&launch).expect("decode daemon launch");
+        assert!(child.contains("--service-config C:\\Users\\operator"));
+        assert!(child.contains("$start.CreateNoWindow = $true"));
+        assert!(child.contains("$process.WaitForExit()"));
+        assert!(child.contains("exit $process.ExitCode"));
+        assert!(xml.contains(WINDOWS_TASK_LAUNCHER));
+        assert!(xml.contains("-WindowStyle Hidden"));
         assert!(!xml.contains("Password"));
         assert!(!xml.contains("HighestAvailable"));
         assert!(!xml.contains("SYSTEM"));
@@ -8689,6 +8761,126 @@ mod tests {
         assert!(observe.contains("LeastPrivilege"));
         assert!(observe.contains("IgnoreNew"));
         assert!(observe.contains("$root.Settings.Priority -eq '4'"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_windows_hidden_task_roundtrips_and_rejects_script_drift() {
+        use std::os::windows::process::CommandExt;
+        let powershell =
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"))
+                .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+        let identity = std::process::Command::new(&powershell)
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+            ])
+            .output()
+            .expect("read task principal");
+        assert!(identity.status.success());
+        let sid = String::from_utf8(identity.stdout)
+            .expect("principal SID")
+            .trim()
+            .to_owned();
+        let local_app_data = std::env::var("LOCALAPPDATA").expect("Windows local app data");
+        let host_id = format!("host-{}", uuid::Uuid::now_v7());
+        let task_name = format!("Host-{host_id}");
+        let config_path = format!(r"{local_app_data}\Satelle\service\{host_id}.json");
+        let mut task = persistent_windows_task();
+        task.task_path = format!(r"\Satelle\{task_name}");
+        task.principal_sid = sid.clone();
+        task.trigger_user_sid = sid;
+        task.executable = std::env::current_exe()
+            .expect("test executable")
+            .to_string_lossy()
+            .into_owned();
+        task.arguments = vec![
+            "host".into(),
+            "start".into(),
+            "--service-config".into(),
+            config_path.clone(),
+        ];
+        task.service_config_path = config_path;
+        let registered =
+            RegisteredWindowsTask::new(&host_id, &local_app_data).expect("owned test task");
+        let register = decode_powershell_command(&windows_task_register_command(&task))
+            .expect("task registration");
+        let observe = decode_powershell_command(
+            &registered_windows_task_command(&registered, "observe").expect("task observer"),
+        )
+        .expect("decode observer");
+        let arguments = windows_task_launch_arguments(&task);
+        let drifted = decode_powershell_command(&arguments)
+            .expect("launch script")
+            .replace(
+                "$start.CreateNoWindow = $true",
+                "$start.CreateNoWindow = $false",
+            );
+        let drifted_arguments = format!(
+            "{WINDOWS_TASK_LAUNCH_PREFIX}{}",
+            base64::engine::general_purpose::STANDARD.encode(
+                drifted
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+            )
+        );
+        let script = format!(
+            r#"$ErrorActionPreference='Stop'
+$taskName={task_name}
+$created=$false
+$createdFolder=$false
+$scheduler=New-Object -ComObject Schedule.Service
+$scheduler.Connect()
+try {{
+  if (Get-ScheduledTask -TaskPath '\Satelle\' -TaskName $taskName -ErrorAction SilentlyContinue) {{ throw 'Test task already exists.' }}
+  try {{ $folder=$scheduler.GetFolder('\Satelle') }} catch {{ $folder=$scheduler.GetFolder('\').CreateFolder('Satelle'); $createdFolder=$true }}
+  {register}
+  $created=$true
+  {observe}
+  $existing=Get-ScheduledTask -TaskPath '\Satelle\' -TaskName $taskName
+  $existing.Actions[0].Arguments={drifted_arguments}
+  Set-ScheduledTask -TaskPath '\Satelle\' -TaskName $taskName -Action $existing.Actions | Out-Null
+  {observe}
+}} finally {{
+  if ($created) {{ Unregister-ScheduledTask -TaskPath '\Satelle\' -TaskName $taskName -Confirm:$false }}
+  if ($createdFolder -and $folder.GetTasks(0).Count -eq 0 -and $folder.GetFolders(0).Count -eq 0) {{ $scheduler.GetFolder('\').DeleteFolder('Satelle',0) }}
+}}"#,
+            task_name = powershell_quote(&task_name),
+            drifted_arguments = powershell_quote(&drifted_arguments)
+        );
+        let script_directory = tempfile::tempdir().expect("private task test directory");
+        let script_path = script_directory.path().join("task-roundtrip.ps1");
+        // The combined real-task fixture exceeds Windows' command-line limit.
+        // A UTF-8 BOM lets Windows PowerShell read the exact script from disk.
+        std::fs::write(&script_path, format!("\u{feff}{script}"))
+            .expect("write task roundtrip script");
+        let output = std::process::Command::new(powershell)
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&script_path)
+            .output()
+            .expect("real Task Scheduler roundtrip");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .expect("task observations")
+                .lines()
+                .collect::<Vec<_>>(),
+            vec![
+                "satelle-persistent-service-v1",
+                "stopped",
+                "satelle-persistent-service-v1",
+                "drifted"
+            ]
+        );
     }
 
     #[test]
@@ -8766,7 +8958,14 @@ mod tests {
         assert!(restart.contains("ReparsePoint"));
         assert!(restart.contains("$_.Name -cnotin @('Enabled','UserId')"));
         assert!(restart.contains("Actions.Exec.ChildNodes).Count -eq 2"));
-        assert!(restart.contains("$root.Actions.Exec.Command -eq $command"));
+        assert!(restart.contains(&format!(
+            "$root.Actions.Exec.Command -eq {}",
+            powershell_quote(WINDOWS_TASK_LAUNCHER)
+        )));
+        assert!(restart.contains("$root.Actions.Exec.Arguments -eq $expectedTaskArguments"));
+        assert!(restart.contains("$paths.Count -ne 1"));
+        assert!(restart.contains("$start.CreateNoWindow = $true"));
+        assert!(!restart.contains("Invoke-Expression"));
         assert!(!restart.contains("Get-FileHash"));
         assert!(restart.contains(
             r#"host start --service-config "C:\Users\Satelle Operator\AppData\Local\Satelle\service\host-123.json""#
