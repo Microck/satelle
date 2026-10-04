@@ -346,7 +346,8 @@ fn observe_transient_mutations(
 
 /// Runs an operation and asserts that its directory tree remains byte-for-byte unchanged.
 ///
-/// Native filesystem events detect transient create, data, name, and remove mutations. Final
+/// Native filesystem events detect transient create, data, name, and remove mutations. A final
+/// callback roundtrip retains events delivered after the completion signal in the same batch. Final
 /// snapshots record relative paths, entry kinds, regular-file bytes, symlink targets, and the
 /// access metadata and modification times exposed by the standard library. Symlinks are never
 /// followed. Reads can change access times, which remain excluded. Modification times retain
@@ -371,11 +372,17 @@ pub fn assert_directory_tree_unchanged<T>(
         })
     };
     let before = snapshot();
-    // Both barriers exist before the watcher starts and live outside the protected tree. Signaling
+    // All barriers exist before the watcher starts and live outside the protected tree. Signaling
     // them flushes event delivery without creating a directory entry that could be mistaken for
     // application work.
     let readiness_barrier = MutationBarrier::create(operation);
     let completion_barrier = MutationBarrier::create(operation);
+    let drain_barrier = MutationBarrier::create(operation);
+    let barrier_paths = [
+        readiness_barrier.path(),
+        completion_barrier.path(),
+        drain_barrier.path(),
+    ];
     let (event_sender, event_receiver) = mpsc::channel();
     let mut watcher =
         RecommendedWatcher::new(event_sender, Config::default().with_follow_symlinks(false))
@@ -393,7 +400,7 @@ pub fn assert_directory_tree_unchanged<T>(
                 root.display()
             )
         });
-    for barrier_path in [readiness_barrier.path(), completion_barrier.path()] {
+    for barrier_path in barrier_paths {
         watcher
             .watch(barrier_path, RecursiveMode::NonRecursive)
             .unwrap_or_else(|error| {
@@ -409,7 +416,7 @@ pub fn assert_directory_tree_unchanged<T>(
     let _ = observe_transient_mutations(
         operation,
         &root,
-        &[readiness_barrier.path(), completion_barrier.path()],
+        &barrier_paths,
         readiness_barrier.path(),
         &event_receiver,
     );
@@ -418,17 +425,28 @@ pub fn assert_directory_tree_unchanged<T>(
     let mut changed_paths = observe_transient_mutations(
         operation,
         &root,
-        &[readiness_barrier.path(), completion_barrier.path()],
+        &barrier_paths,
         completion_barrier.path(),
         &event_receiver,
     );
+    // A native callback can deliver the completion path before protected paths
+    // in the same batch. Request a fresh signal only after observing completion:
+    // its callback follows that batch, so those remaining paths are retained.
+    drain_barrier.signal(operation);
+    changed_paths.extend(observe_transient_mutations(
+        operation,
+        &root,
+        &barrier_paths,
+        drain_barrier.path(),
+        &event_receiver,
+    ));
     watcher.unwatch(&root).unwrap_or_else(|error| {
         panic!(
             "{operation} could not stop mutation watcher for {}: {error}",
             root.display()
         )
     });
-    for barrier_path in [readiness_barrier.path(), completion_barrier.path()] {
+    for barrier_path in barrier_paths {
         watcher.unwatch(barrier_path).unwrap_or_else(|error| {
             panic!(
                 "{operation} could not stop mutation barrier watcher for {}: {error}",
@@ -438,6 +456,7 @@ pub fn assert_directory_tree_unchanged<T>(
     }
     readiness_barrier.remove(operation);
     completion_barrier.remove(operation);
+    drain_barrier.remove(operation);
     let after = snapshot();
     changed_paths.extend(
         before
